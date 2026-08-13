@@ -173,7 +173,7 @@ def npu_format_cast(
         logger.warning_once(
             "Warning: The conversion from 'ND' to 'NZ' does not work on the CPU. "
             "Please disable offloading, otherwise the performance will be "
-            "significantly reduced. --dit-cpu-offload false"
+            "significantly reduced. Use --component-residency dit=resident"
         )
         return tensor
 

@@ -577,11 +577,22 @@ class TestStageAffinityAndValidation(_GlobalStageArgsMixin, unittest.TestCase):
             RoleType.DENOISER: ["shape_denoising"],
             RoleType.DECODER: ["shape_export", "shape_save"],
         }
+        expected_components = {
+            RoleType.ENCODER: ["hy3dshape_conditioner"],
+            RoleType.DENOISER: ["hy3dshape_model"],
+            RoleType.DECODER: ["hy3dshape_vae"],
+        }
 
         for role, stage_names in expected.items():
             pipeline = self._make_hunyuan_pipeline(role, paint_enable=False)
             pipeline.create_pipeline_stages(pipeline.server_args)
             self.assertEqual(list(pipeline._stage_name_mapping.keys()), stage_names)
+            component_names = [
+                use.component_name
+                for stage in pipeline._stage_name_mapping.values()
+                for use in stage.component_uses(pipeline.server_args)
+            ]
+            self.assertEqual(component_names, expected_components[role])
 
     def test_hunyuan3d_shape_stage_no_longer_stores_model_dtype(self):
         pipeline = self._make_hunyuan_pipeline(RoleType.ENCODER, paint_enable=False)

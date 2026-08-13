@@ -10,6 +10,9 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    is_fsdp_managed_module,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -55,10 +58,6 @@ def _module_ready_on_local_device(
     if tensor.device != get_local_torch_device():
         return False
     return dtype is None or tensor.dtype == dtype
-
-
-def is_fsdp_managed_module(module: nn.Module) -> bool:
-    return module.__class__.__name__.startswith("FSDP")
 
 
 class ComponentResidencyStrategy:

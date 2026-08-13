@@ -72,10 +72,17 @@ Or, more simply, with the CLI:
 
 ```bash
 sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-    --text-encoder-cpu-offload --pin-cpu-memory \
+    --component-residency text_encoder=component-offload --pin-cpu-memory \
     --prompt "A curious raccoon" \
     --save-output
 ```
+
+Use `--component-residency COMPONENT=MODE` to override placement for exact
+native pipeline component keys or the `dit`, `text_encoder`,
+`image_encoder`, `vae`, and `all` groups. The modes are `resident`,
+`component-offload`, and `layerwise-offload`; components not listed keep their
+automatic model policy. See the
+[CLI guide](../../../docs/docs/sglang-diffusion/api/cli.mdx#component-residency).
 
 ### LoRA support
 

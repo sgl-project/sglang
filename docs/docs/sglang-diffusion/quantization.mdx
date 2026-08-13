@@ -90,7 +90,7 @@ backend.
       <td><code>--transformer-path</code></td>
       <td>FLUX.1, FLUX.2, Wan2.2, HunyuanVideo, Qwen Image, Qwen Image Edit</td>
       <td>None</td>
-      <td>Serialized config stays <code>quant_method=modelopt</code> with <code>quant_algo=FP8</code>; <code>dit_layerwise_offload</code> is supported and <code>dit_cpu_offload</code> stays disabled</td>
+      <td>Serialized config stays <code>quant_method=modelopt</code> with <code>quant_algo=FP8</code>; DiT <code>layerwise-offload</code> is supported, while <code>component-offload</code> is not</td>
     </tr>
     <tr>
       <td><code>modelopt-nvfp4</code></td>
@@ -151,8 +151,7 @@ sglang serve \
   --num-gpus 4 \
   --ulysses-degree 4 \
   --kv-cache-quant int4 \
-  --dit-cpu-offload false \
-  --text-encoder-cpu-offload false
+  --component-residency dit=resident text_encoder=resident
 ```
 
 ### Storage Policy
@@ -485,8 +484,8 @@ sglang generate \
   the base model config.
 - `--transformer-weights-path` still works when you intentionally point at raw
   weight files or a directory that should be metadata-probed as weights first.
-- `dit_layerwise_offload` is supported for ModelOpt FP8 checkpoints.
-- `dit_cpu_offload` still stays disabled for ModelOpt FP8 checkpoints.
+- `--component-residency dit=layerwise-offload` is supported for ModelOpt FP8 checkpoints.
+- `--component-residency dit=component-offload` is not supported; keep the DiT resident or use layerwise offload.
 - The layerwise offload path now preserves the non-contiguous FP8 weight stride
   expected by the runtime FP8 GEMM path.
 - On disk, the quantization config stays `quant_method=modelopt` with

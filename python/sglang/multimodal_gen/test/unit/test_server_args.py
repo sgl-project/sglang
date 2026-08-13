@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import os
 import sys
@@ -53,6 +54,12 @@ from sglang.multimodal_gen.registry import (
     _get_config_info,
     get_non_diffusers_pipeline_name,
     is_known_non_diffusers_multimodal_model,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    ComponentResidencyMode,
+    normalize_component_residency,
+    resolve_diffusers_pipeline_offload,
+    resolve_explicit_component_residency,
 )
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
@@ -863,6 +870,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.should_cpu_offload_component("transformer_2"))
         self.assertTrue(args.should_cpu_offload_component("audio_vae"))
         self.assertTrue(args.should_cpu_offload_component("connectors"))
+        self.assertTrue(args.should_stage_transformer_on_cpu("transformer_2"))
         self.assertFalse(args.dit_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
 
@@ -910,6 +918,448 @@ class TestOffloadDefaults(unittest.TestCase):
                     "dit_cpu_offload": True,
                 },
             )
+
+    def test_component_residency_normalizes_assignments(self):
+        self.assertEqual(
+            normalize_component_residency(
+                [
+                    "all=resident,dit=layerwise_offload",
+                    "transformer_2=component-offload",
+                ]
+            ),
+            {
+                "all": "resident",
+                "dit": "layerwise-offload",
+                "transformer_2": "component-offload",
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "COMPONENT=MODE"):
+            normalize_component_residency(["dit"])
+        with self.assertRaisesRegex(ValueError, "Invalid component residency mode"):
+            normalize_component_residency(["dit=cpu"])
+
+    def test_component_residency_supports_groups_and_dynamic_components(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={
+                "component_residency": [
+                    "all=component-offload",
+                    "dit=layerwise-offload",
+                    "transformer_2=resident",
+                    "connectors=resident",
+                ]
+            },
+        )
+
+        self.assertEqual(
+            args.component_residency_mode("transformer"),
+            ComponentResidencyMode.LAYERWISE_OFFLOAD,
+        )
+        self.assertEqual(
+            args.component_residency_mode("transformer_2"),
+            ComponentResidencyMode.RESIDENT,
+        )
+        self.assertEqual(
+            args.component_residency_mode("transformer_3"),
+            ComponentResidencyMode.LAYERWISE_OFFLOAD,
+        )
+        self.assertEqual(
+            args.component_residency_mode("text_encoder_2"),
+            ComponentResidencyMode.COMPONENT_OFFLOAD,
+        )
+        self.assertEqual(
+            args.component_residency_mode("connectors"),
+            ComponentResidencyMode.RESIDENT,
+        )
+        self.assertTrue(args.should_stage_transformer_on_cpu("transformer"))
+        self.assertFalse(args.should_stage_transformer_on_cpu("transformer_2"))
+
+    def test_component_residency_group_predicates_cover_dynamic_encoders(self):
+        policies = normalize_component_residency(
+            ["all=resident", "image_encoder=component-offload"]
+        )
+
+        self.assertEqual(
+            resolve_explicit_component_residency("image_encoder_2", policies),
+            ComponentResidencyMode.COMPONENT_OFFLOAD,
+        )
+        self.assertEqual(
+            resolve_explicit_component_residency("condition_image_encoder", policies),
+            ComponentResidencyMode.COMPONENT_OFFLOAD,
+        )
+        self.assertIsNone(
+            resolve_explicit_component_residency(
+                "condition_image_encoder",
+                normalize_component_residency(["vae=component-offload"]),
+            )
+        )
+
+    def test_component_residency_groups_cover_hunyuan3d_shape_components(self):
+        policies = normalize_component_residency(
+            [
+                "dit=layerwise-offload",
+                "image_encoder=component-offload",
+                "vae=resident",
+            ]
+        )
+
+        self.assertEqual(
+            resolve_explicit_component_residency("hy3dshape_model", policies),
+            ComponentResidencyMode.LAYERWISE_OFFLOAD,
+        )
+        self.assertEqual(
+            resolve_explicit_component_residency("hy3dshape_conditioner", policies),
+            ComponentResidencyMode.COMPONENT_OFFLOAD,
+        )
+        self.assertEqual(
+            resolve_explicit_component_residency("hy3dshape_vae", policies),
+            ComponentResidencyMode.RESIDENT,
+        )
+
+    def test_component_residency_groups_exclude_auxiliary_components(self):
+        policies = normalize_component_residency(
+            ["dit=component-offload", "vae=component-offload"]
+        )
+
+        for component_name in (
+            "connectors",
+            "dual_tower_bridge",
+            "vision_language_encoder",
+            "condition_image_encoder",
+            "sound_tokenizer",
+            "spatial_upsampler",
+            "vocoder",
+        ):
+            with self.subTest(component_name=component_name):
+                self.assertIsNone(
+                    resolve_explicit_component_residency(component_name, policies)
+                )
+
+    def test_compatibility_flags_preserve_auxiliary_component_scope(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={
+                "performance_mode": "manual",
+                "dit_cpu_offload": True,
+                "vae_cpu_offload": True,
+            },
+        )
+
+        for component_name in (
+            "connectors",
+            "dual_tower_bridge",
+            "vision_language_encoder",
+            "condition_image_encoder",
+            "sound_tokenizer",
+            "spatial_upsampler",
+            "vocoder",
+        ):
+            with self.subTest(component_name=component_name):
+                self.assertTrue(args.should_cpu_offload_component(component_name))
+
+    def test_component_residency_tracks_explicit_hunyuan3d_placement(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.I2M,
+            kwargs={"component_residency": ["dit=layerwise-offload"]},
+        )
+
+        self.assertTrue(args.is_component_residency_explicitly_set("hy3dshape_model"))
+        self.assertFalse(args.is_component_residency_explicitly_set("hy3dshape_vae"))
+
+        legacy_args = self._from_dict_with_task_type(
+            ModelTaskType.I2M,
+            kwargs={"performance_mode": "manual", "dit_cpu_offload": True},
+        )
+        self.assertTrue(
+            legacy_args.is_component_residency_explicitly_set("hy3dshape_model")
+        )
+        self.assertFalse(
+            legacy_args.is_component_residency_explicitly_set("hy3dshape_vae")
+        )
+
+    def test_compatibility_image_and_vae_flags_cover_condition_encoder(self):
+        for flag_name in ("image_encoder_cpu_offload", "vae_cpu_offload"):
+            with self.subTest(flag_name=flag_name):
+                args = self._from_dict_with_task_type(
+                    ModelTaskType.T2V,
+                    kwargs={"performance_mode": "manual", flag_name: True},
+                )
+
+                self.assertTrue(
+                    args.should_cpu_offload_component("condition_image_encoder")
+                )
+
+    def test_exact_dynamic_dit_policy_is_detected_for_fsdp_validation(self):
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            self._from_dict_with_task_type(
+                ModelTaskType.T2V,
+                kwargs={
+                    "component_residency": ["transformer_3=component-offload"],
+                    "use_fsdp_inference": True,
+                },
+            )
+
+    def test_exact_group_selector_overrides_all(self):
+        policies = normalize_component_residency(
+            ["all=component-offload", "dit=resident"]
+        )
+
+        self.assertEqual(
+            resolve_explicit_component_residency("dit", policies),
+            ComponentResidencyMode.RESIDENT,
+        )
+
+    def test_component_residency_leaves_unspecified_components_on_model_policy(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "component_residency": ["vae=resident"],
+            },
+        )
+
+        self.assertEqual(
+            args.component_residency_mode("vae"), ComponentResidencyMode.RESIDENT
+        )
+        self.assertEqual(
+            args.component_residency_mode("transformer"),
+            ComponentResidencyMode.RESIDENT,
+        )
+        self.assertTrue(
+            args.any_component_uses_residency_mode(
+                ComponentResidencyMode.LAYERWISE_OFFLOAD
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "Invalid component residency mode"):
+            self._from_dict_with_pipeline_config(
+                QwenImagePipelineConfig(),
+                kwargs={
+                    "model_path": "Qwen/Qwen-Image",
+                    "component_residency": ["transformer=auto"],
+                },
+            )
+
+    def test_component_residency_excludes_selected_groups_from_auto_layerwise(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "component_residency": [
+                    "dit=resident",
+                    "text_encoder=component-offload",
+                ],
+            },
+        )
+
+        self.assertNotIn("dit", args.layerwise_offload_components or [])
+        self.assertNotIn("text_encoder", args.layerwise_offload_components or [])
+        self.assertIn("image_encoder", args.layerwise_offload_components or [])
+        self.assertIn("vae", args.layerwise_offload_components or [])
+
+    def test_all_resident_overrides_automatic_offload_detection(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "component_residency": ["all=resident"],
+            },
+        )
+
+        self.assertFalse(
+            args.any_component_uses_residency_mode(
+                ComponentResidencyMode.LAYERWISE_OFFLOAD
+            )
+        )
+        self.assertFalse(
+            args.any_component_uses_residency_mode(
+                ComponentResidencyMode.COMPONENT_OFFLOAD
+            )
+        )
+
+    def test_cpu_platform_treats_offload_policy_as_resident(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "component_residency": ["all=layerwise-offload"],
+            },
+        )
+
+        with (
+            patch.object(current_platform, "is_cpu", return_value=True),
+            patch.object(current_platform, "is_mps", return_value=False),
+        ):
+            args._adjust_platform_specific()
+
+        self.assertEqual(
+            args.component_residency_mode("transformer"),
+            ComponentResidencyMode.RESIDENT,
+        )
+        self.assertFalse(
+            args.any_component_uses_residency_mode(
+                ComponentResidencyMode.LAYERWISE_OFFLOAD
+            )
+        )
+
+    def test_component_residency_rejects_compatibility_options(self):
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            self._from_dict_with_task_type(
+                ModelTaskType.T2V,
+                kwargs={
+                    "component_residency": ["dit=resident"],
+                    "dit_cpu_offload": False,
+                },
+            )
+
+    def test_component_residency_rejects_composite_action_pipeline(self):
+        with self.assertRaisesRegex(ValueError, "VLA action pipelines"):
+            self._from_dict_with_task_type(
+                ModelTaskType.VLA_ACTION,
+                kwargs={"component_residency": ["all=component-offload"]},
+            )
+
+    def test_component_residency_survives_role_arg_reconstruction(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={"component_residency": ["dit=resident"]},
+        )
+        copied = {
+            field.name: getattr(args, field.name)
+            for field in dataclasses.fields(args)
+            if field.init and field.name != "pipeline_config"
+        }
+
+        pipeline_config = PipelineConfig()
+        pipeline_config.task_type = ModelTaskType.T2V
+        with (
+            patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
+            _mock_cuda_platform(),
+        ):
+            role_args = ServerArgs.from_kwargs(**copied)
+
+        self.assertEqual(role_args.component_residency, {"dit": "resident"})
+        self.assertEqual(role_args._explicit_arg_names, {"component_residency"})
+
+    def test_component_residency_rejects_explicit_fsdp_with_dit_offload(self):
+        for mode in (
+            ComponentResidencyMode.COMPONENT_OFFLOAD,
+            ComponentResidencyMode.LAYERWISE_OFFLOAD,
+        ):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(ValueError, "cannot be combined"),
+            ):
+                self._from_dict_with_task_type(
+                    ModelTaskType.T2V,
+                    kwargs={
+                        "component_residency": [f"dit={mode.value}"],
+                        "use_fsdp_inference": True,
+                    },
+                )
+
+    def test_legacy_dit_layerwise_preserves_explicit_fsdp_compatibility(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={
+                "dit_layerwise_offload": True,
+                "use_fsdp_inference": True,
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+
+    def test_diffusers_component_residency_requires_pipeline_wide_offload(self):
+        for mode in (
+            ComponentResidencyMode.RESIDENT,
+            ComponentResidencyMode.COMPONENT_OFFLOAD,
+        ):
+            with self.subTest(mode=mode):
+                args = self._from_dict_with_task_type(
+                    ModelTaskType.T2V,
+                    kwargs={
+                        "backend": "diffusers",
+                        "component_residency": [f"all={mode.value}"],
+                    },
+                )
+                self.assertEqual(
+                    args.component_residency,
+                    {"all": mode.value},
+                )
+                self.assertEqual(
+                    resolve_diffusers_pipeline_offload(args.component_residency),
+                    mode == ComponentResidencyMode.COMPONENT_OFFLOAD,
+                )
+
+        with self.assertRaisesRegex(ValueError, "pipeline-wide"):
+            self._from_dict_with_task_type(
+                ModelTaskType.T2V,
+                kwargs={
+                    "backend": "diffusers",
+                    "component_residency": ["dit=component-offload"],
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "pipeline-wide"):
+            self._from_dict_with_task_type(
+                ModelTaskType.T2V,
+                kwargs={
+                    "backend": "diffusers",
+                    "component_residency": ["dit=resident"],
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "native SGLang backend"):
+            self._from_dict_with_task_type(
+                ModelTaskType.T2V,
+                kwargs={
+                    "backend": "diffusers",
+                    "component_residency": ["all=layerwise-offload"],
+                },
+            )
+
+    def test_explicit_false_layerwise_keeps_dit_resident(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "dit_layerwise_offload": False,
+            },
+        )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertEqual(
+            args.component_residency_mode("transformer"),
+            ComponentResidencyMode.RESIDENT,
+        )
+
+    def test_explicit_false_layerwise_preserves_explicit_component_offload(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "dit_layerwise_offload": False,
+                "dit_cpu_offload": True,
+            },
+        )
+
+        self.assertEqual(
+            args.component_residency_mode("transformer"),
+            ComponentResidencyMode.COMPONENT_OFFLOAD,
+        )
+
+    def test_explicit_false_layerwise_preserves_explicit_layerwise_components(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "dit_layerwise_offload": False,
+                "layerwise_offload_components": ["dit"],
+            },
+        )
+
+        self.assertEqual(
+            args.component_residency_mode("transformer"),
+            ComponentResidencyMode.LAYERWISE_OFFLOAD,
+        )
 
     def test_vae_cpu_offload_defaults_false_on_low_memory_gpu(self):
         args = self._from_dict_with_task_type(
@@ -1663,6 +2113,29 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(args.ltx2_two_stage_device_mode, "resident")
         self.assertEqual(args.layerwise_offload_components, ["text_encoder"])
+
+    def test_explicit_ltx23_resident_overrides_automatic_dit_offload(self):
+        args = self._from_dict_with_pipeline_config(
+            LTX2PipelineConfig(),
+            memory_gb=24,
+            available_memory_gb=20,
+            kwargs={
+                "model_path": "Lightricks/LTX-2.3",
+                "num_gpus": 2,
+                "pipeline_class_name": "LTX2TwoStagePipeline",
+                "ltx2_two_stage_device_mode": "resident",
+            },
+        )
+
+        self.assertEqual(args.ltx2_two_stage_device_mode, "resident")
+        self.assertEqual(
+            args.component_residency_mode("transformer"),
+            ComponentResidencyMode.RESIDENT,
+        )
+        self.assertEqual(
+            args.component_residency_mode("transformer_2"),
+            ComponentResidencyMode.RESIDENT,
+        )
 
     def test_auto_multi_gpu_qwen_keeps_vae_resident_with_cfg(self):
         args = self._from_dict_with_pipeline_config(
@@ -2603,9 +3076,16 @@ class TestNcclNvlsArgs(unittest.TestCase):
 class TestDirectGpuWeightLoading(unittest.TestCase):
     def _args(self) -> ServerArgs:
         args = ServerArgs.__new__(ServerArgs)
+        args.component_residency = None
+        args._component_residency_runtime_overrides = {}
+        args.cpu_offload_components = None
         args.direct_gpu_weight_loading = True
         args.dit_cpu_offload = False
+        args.dit_layerwise_offload = False
         args.layerwise_offload_components = []
+        args.text_encoder_cpu_offload = False
+        args.image_encoder_cpu_offload = False
+        args.vae_cpu_offload = False
         args.use_fsdp_inference = False
         args.tp_size = 1
         return args
@@ -2637,6 +3117,14 @@ class TestDirectGpuWeightLoading(unittest.TestCase):
                 fsdp_args._validate_direct_gpu_weight_loading()
             with self.assertRaisesRegex(ValueError, "tp-size 1"):
                 tp_args._validate_direct_gpu_weight_loading()
+
+    def test_rejects_component_residency_dit_offload(self):
+        args = self._args()
+        args.component_residency = {"dit": "layerwise-offload"}
+
+        with patch.object(current_platform, "is_cuda", return_value=True):
+            with self.assertRaisesRegex(ValueError, "GPU-resident DiT"):
+                args._validate_direct_gpu_weight_loading()
 
 
 if __name__ == "__main__":

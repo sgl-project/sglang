@@ -54,7 +54,7 @@ Current supported optimization options are listed in the [SGLang diffusion suppo
 - `--sp-degree {SP_SIZE}`: Sequence parallelism degree.
 - `--ulysses-degree {ULYSSES_DEGREE}`: Degree of DeepSpeed-Ulysses-style SP in USP.
 - `--ring-degree {RING_DEGREE}`: Degree of ring attention-style SP in USP.
-- `--text-encoder-cpu-offload`, `--dit-cpu-offload`, `--vae-cpu-offload`: Use CPU offload to reduce peak GPU memory when needed.
+- `--component-residency COMPONENT=MODE`: Set selected DiT, encoder, or VAE components to `resident`, `component-offload`, or `layerwise-offload`; omitted components keep automatic placement.
 
 ## 4. Model Invocation
 
@@ -86,7 +86,7 @@ curl http://127.0.0.1:30000/v1/images/generations \
 ```bash Command
 SERVER_ARGS=(
   --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
-  --text-encoder-cpu-offload
+  --component-residency text_encoder=component-offload
   --pin-cpu-memory
   --num-gpus 4
   --ulysses-degree=2
@@ -132,10 +132,11 @@ SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Di
 
 #### 4.2.2 GPU Optimization
 
-- `--dit-cpu-offload`: Use CPU offload for DiT inference. Enable if you run out of memory with FSDP.
-- `--text-encoder-cpu-offload`: Use CPU offload for text encoder inference.
-- `--image-encoder-cpu-offload`: Use CPU offload for image encoder inference.
-- `--vae-cpu-offload`: Use CPU offload for VAE.
+- `--component-residency dit=component-offload`: Move the complete DiT to CPU between uses.
+- `--component-residency dit=layerwise-offload`: Stream supported DiT layers from CPU.
+- `--component-residency text_encoder=component-offload`: Move the text encoder to CPU between uses.
+- `--component-residency image_encoder=component-offload`: Move image encoders to CPU between uses.
+- `--component-residency vae=component-offload`: Move VAE components to CPU between uses.
 - `--pin-cpu-memory`: Pin memory for CPU offload. Use as a workaround if you see "CUDA error: invalid argument".
 
 #### 4.2.3 Supported LoRA Registry

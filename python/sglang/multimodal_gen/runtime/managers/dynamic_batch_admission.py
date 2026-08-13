@@ -16,6 +16,9 @@ from difflib import get_close_matches
 from typing import TYPE_CHECKING, Any
 
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    ComponentResidencyMode,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -160,7 +163,9 @@ class BatchAdmissionController:
         self._mode = getattr(server_args, "batching_mode", "dynamic")
         self._user_max_batch_size = max(1, int(server_args.batching_max_size))
         self._model_path = server_args.model_path
-        self._offload = bool(server_args.layerwise_offload_components)
+        self._offload = server_args.any_component_uses_residency_mode(
+            ComponentResidencyMode.LAYERWISE_OFFLOAD
+        )
         self._device_memory_gb = self._get_device_memory_gb(gpu_id)
         self._rules = load_batching_config(server_args.batching_config)
         self._pipeline_config = server_args.pipeline_config

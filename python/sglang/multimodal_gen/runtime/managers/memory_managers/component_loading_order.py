@@ -12,6 +12,7 @@ import os
 from dataclasses import dataclass
 
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    component_base_name,
     is_dit_component_name,
     is_image_encoder_component_name,
     is_text_encoder_component_name,
@@ -34,13 +35,6 @@ class ComponentLoadSpec:
 _WEIGHT_FILE_SUFFIXES = (".bin", ".pt", ".pth")
 
 
-def _component_base_name(component_name: str) -> str:
-    prefix, separator, suffix = component_name.rpartition("_")
-    if separator and suffix.isdigit():
-        return prefix
-    return component_name
-
-
 def _component_variant_priority(component_name: str) -> int:
     _, separator, suffix = component_name.rpartition("_")
     if separator and suffix.isdigit():
@@ -50,14 +44,27 @@ def _component_variant_priority(component_name: str) -> int:
 
 def component_load_risk_rank(component_name: str) -> int:
     """Fallback type rank when checkpoint size cannot be inferred."""
-    candidate_names = (component_name, _component_base_name(component_name))
-    if any(is_dit_component_name(name) for name in candidate_names):
+    candidate_names = (component_name, component_base_name(component_name))
+    if any(
+        is_dit_component_name(name) or name == "dual_tower_bridge"
+        for name in candidate_names
+    ):
         return 0
     if any(is_text_encoder_component_name(name) for name in candidate_names):
         return 1
     if any(is_image_encoder_component_name(name) for name in candidate_names):
         return 2
-    if any(is_vae_component_name(name) for name in candidate_names):
+    if any(
+        is_vae_component_name(name)
+        or name
+        in {
+            "condition_image_encoder",
+            "sound_tokenizer",
+            "spatial_upsampler",
+            "vocoder",
+        }
+        for name in candidate_names
+    ):
         return 3
     return 10
 

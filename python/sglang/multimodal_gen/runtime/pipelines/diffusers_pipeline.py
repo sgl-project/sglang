@@ -454,12 +454,15 @@ class DiffusersPipeline(ComposedPipelineBase):
             else:
                 raise
 
-        # Use CPU offload (all-or-nothing in diffusers) if any component offload is requested.
-        any_offload = (
-            server_args.dit_cpu_offload
-            or server_args.text_encoder_cpu_offload
-            or server_args.image_encoder_cpu_offload
-            or server_args.vae_cpu_offload
+        # diffusers exposes one pipeline-wide offload switch
+        any_offload = any(
+            server_args.should_cpu_offload_component(component_name)
+            for component_name in (
+                "transformer",
+                "text_encoder",
+                "image_encoder",
+                "vae",
+            )
         )
         if any_offload:
             device = get_local_torch_device()

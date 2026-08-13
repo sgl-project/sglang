@@ -9,6 +9,38 @@ from sglang.multimodal_gen.configs.pipeline_configs.ernie_image import (
     ErnieImagePipelineConfig,
     ernie_image_postprocess_text,
 )
+from sglang.multimodal_gen.runtime.loader.component_loaders.pe_loader import (
+    PEModelWrapper,
+    SGLangPEModelWrapper,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ernie_image_pe import (
+    PromptEnhancementStage,
+)
+
+
+class TestErnieImagePromptEnhancerResidency(unittest.TestCase):
+    def test_local_prompt_enhancer_is_a_managed_component(self) -> None:
+        wrapper = PEModelWrapper(
+            model=torch.nn.Linear(2, 2),
+            tokenizer=object(),
+            device=torch.device("cpu"),
+            model_max_length=8,
+        )
+        stage = PromptEnhancementStage(wrapper, object())
+
+        uses = stage.component_uses(SimpleNamespace(), "prompt_enhancement")
+
+        self.assertEqual([use.component_name for use in uses], ["pe"])
+        self.assertEqual(len(list(wrapper.parameters())), 2)
+
+    def test_external_prompt_enhancer_keeps_remote_placement(self) -> None:
+        stage = PromptEnhancementStage(
+            SGLangPEModelWrapper("http://127.0.0.1:30000"), object()
+        )
+
+        self.assertEqual(
+            stage.component_uses(SimpleNamespace(), "prompt_enhancement"), []
+        )
 
 
 class TestErnieImagePostprocessText(unittest.TestCase):

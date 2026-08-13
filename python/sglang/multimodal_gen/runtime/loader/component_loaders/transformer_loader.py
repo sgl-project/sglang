@@ -149,14 +149,16 @@ class TransformerLoader(ComponentLoader):
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         """Load the transformer based on the model path, and inference args."""
+        residency_component_name = component_name
         component_server_args = _server_args_for_transformer_component(
             server_args, component_name
         )
-        if server_args.cpu_offload_components is not None:
+        component_cpu_offload = server_args.should_stage_transformer_on_cpu(
+            component_name
+        )
+        if bool(component_server_args.dit_cpu_offload) != component_cpu_offload:
             component_server_args = copy.copy(component_server_args)
-            component_server_args.dit_cpu_offload = (
-                server_args.should_cpu_offload_component(component_name)
-            )
+            component_server_args.dit_cpu_offload = component_cpu_offload
 
         # 1. hf config
         config = get_diffusers_component_config(component_path=component_model_path)
@@ -188,6 +190,7 @@ class TransformerLoader(ComponentLoader):
             component_model_path=component_model_path,
             model_cls=model_cls,
             cls_name=cls_name,
+            component_name=residency_component_name,
         )
 
         logger.info(

@@ -15,7 +15,7 @@ Example:
         --model-path /path/to/model \
         --prompt "A futuristic cyberpunk city at night" \
         --width 512 --height 512 --num-inference-steps 8 --seed 42 \
-        --text-encoder-cpu-offload \
+        --component-residency text_encoder=component-offload \
         --candidate-transformer-path /tmp/modelopt_flux2_fp8/sglang_transformer \
         --output-json /tmp/flux2_similarity.json
 """
@@ -260,14 +260,36 @@ def build_server_kwargs(args: argparse.Namespace, *, variant: str) -> dict[str, 
         "model_id": args.model_id,
         "backend": args.backend,
         "num_gpus": args.num_gpus,
-        "dit_cpu_offload": args.dit_cpu_offload,
-        "dit_layerwise_offload": args.dit_layerwise_offload,
-        "text_encoder_cpu_offload": args.text_encoder_cpu_offload,
-        "vae_cpu_offload": args.vae_cpu_offload,
         "pin_cpu_memory": args.pin_cpu_memory,
         "enable_cfg_parallel": args.enable_cfg_parallel,
         "ulysses_degree": args.ulysses_degree,
     }
+    legacy_residency = {
+        "dit_cpu_offload": args.dit_cpu_offload,
+        "dit_layerwise_offload": args.dit_layerwise_offload,
+        "text_encoder_cpu_offload": args.text_encoder_cpu_offload,
+        "image_encoder_cpu_offload": args.image_encoder_cpu_offload,
+        "vae_cpu_offload": args.vae_cpu_offload,
+    }
+    legacy_offload_requested = any(
+        value is not None for value in legacy_residency.values()
+    )
+    if args.component_residency and legacy_offload_requested:
+        raise ValueError(
+            "--component-residency cannot be combined with compatibility "
+            "CPU/layerwise offload options"
+        )
+
+    if args.component_residency:
+        kwargs["component_residency"] = list(args.component_residency)
+    else:
+        kwargs.update(
+            {
+                name: value
+                for name, value in legacy_residency.items()
+                if value is not None
+            }
+        )
     if args.sp_degree is not None:
         kwargs["sp_degree"] = args.sp_degree
     if transformer_path is not None:
@@ -492,24 +514,43 @@ def main() -> None:
         default=False,
     )
     parser.add_argument(
+        "--component-residency",
+        nargs="+",
+        metavar="COMPONENT=MODE",
+        help=(
+            "Component residency assignments passed to ServerArgs, for example "
+            "dit=layerwise-offload text_encoder=component-offload."
+        ),
+    )
+    parser.add_argument(
         "--text-encoder-cpu-offload",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
+        help="Compatibility alias for text_encoder=component-offload.",
+    )
+    parser.add_argument(
+        "--image-encoder-cpu-offload",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Compatibility alias for image_encoder=component-offload.",
     )
     parser.add_argument(
         "--vae-cpu-offload",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
+        help="Compatibility alias for vae=component-offload.",
     )
     parser.add_argument(
         "--dit-cpu-offload",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
+        help="Compatibility alias for dit=component-offload.",
     )
     parser.add_argument(
         "--dit-layerwise-offload",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
+        help="Compatibility alias for dit=layerwise-offload.",
     )
     parser.add_argument(
         "--pin-cpu-memory",

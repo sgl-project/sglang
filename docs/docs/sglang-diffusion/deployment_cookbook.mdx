@@ -95,7 +95,7 @@ See [OpenAI API: Served model name](/docs/sglang-diffusion/api/openai_api#served
 
 ## Performance Modes
 
-`--performance-mode` applies safe presets without overriding explicit offload, FSDP, or parallelism flags. `auto` is the default. Use `manual` when you need to keep performance-related server args under explicit user control. `--mode` is a short alias.
+`--performance-mode` applies safe presets. `auto` is the default. Use `manual` when you need to keep performance-related server args under explicit user control. `--mode` is a short alias. `--component-residency` overrides only selected components, so the remaining components still receive preset and model-specific defaults. Explicit FSDP and parallelism flags also take precedence.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -137,7 +137,19 @@ When `torch.compile` is enabled, `--offload-during-compile` stays on by default.
 Breakable CUDA graph is a separate manual opt-in for supported image pipelines. If you enable `--enable-breakable-cuda-graph`, declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 
 > [!NOTE]
-> The preset is intentionally coarse. A future continuous value such as `0.0` to `1.0` could express the speed-memory tradeoff more precisely, but it would need model-specific memory models and clearer user expectations. Until then, use the preset plus explicit flags for overrides.
+Use `--component-residency` for explicit placement overrides. Each selected component has exactly one mode: `resident`, `component-offload`, or `layerwise-offload`. Select an exact native pipeline key such as `transformer_2` or a `dit`, `text_encoder`, `image_encoder`, `vae`, or `all` group. Exact keys override groups, groups override `all`, and omitted components keep their automatic policy.
+
+```bash
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --performance-mode auto \
+  --component-residency dit=layerwise-offload text_encoder=component-offload \
+  --dit-offload-prefetch-size 0
+```
+
+See [Component Residency](/docs/sglang-diffusion/api/cli#component-residency) for selector precedence and compatibility-option migration.
+
+FSDP owns DiT sharding and placement, so combine explicit FSDP only with a resident DiT. Encoders and VAEs can still use component or layerwise offload independently.
 
 Examples:
 
@@ -154,7 +166,7 @@ sglang generate \
   --performance-mode memory
 ```
 
-Explicit flags win over the mode:
+Explicit component, FSDP, and parallelism settings win over the mode:
 
 ```bash
 sglang generate \
@@ -168,11 +180,11 @@ In this example, `auto` will not re-enable FSDP. The same applies to parallelism
 
 ## Interpreting The Levers
 
-**No offload** keeps model components resident on GPU. It is usually fastest when memory is sufficient.
+**Resident** keeps a complete component on GPU. It is usually fastest when memory is sufficient.
 
-**Component CPU offload** lowers GPU memory by moving large components to CPU. It is simple and robust, but it usually trades latency for memory.
+**Component offload** lowers GPU memory by moving a complete component to CPU between uses. It is simple and robust, but it usually trades latency for memory.
 
-**Layerwise DiT offload** lowers DiT memory further for supported Wan/MOVA models by moving DiT layers between CPU and GPU. It can be the best single-GPU memory mode, but may increase latency and lower throughput.
+**Layerwise offload** lowers memory further for components that implement it by streaming layers between CPU and GPU. It can be the best single-GPU memory mode, but may increase latency and lower throughput.
 
 **FSDP** shards DiT weights across multiple GPUs and all-gathers weights during forward. It can reduce DiT CPU offload cost on multi-GPU deployments, especially for validated Wan I2V workloads.
 

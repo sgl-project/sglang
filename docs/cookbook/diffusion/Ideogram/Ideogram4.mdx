@@ -119,8 +119,7 @@ If the distilled DiT does not fit in GPU memory, enable transformer layerwise of
 HF_TOKEN=$HF_TOKEN sglang serve \
   --model-path fal/ideogram-v4-instant \
   --num-gpus 1 \
-  --dit-layerwise-offload \
-  --layerwise-offload-components transformer \
+  --component-residency transformer=layerwise-offload \
   --port 30010
 ```
 

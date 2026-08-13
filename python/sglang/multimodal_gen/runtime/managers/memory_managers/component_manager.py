@@ -7,12 +7,15 @@ from typing import Mapping, MutableMapping, Protocol, Sequence
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    ComponentResidencyMode,
+    is_fsdp_managed_module,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     ComponentResidencyStrategy,
     LayerwiseOffloadStrategy,
     ResidentStrategy,
     VanillaD2HStrategy,
-    is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
@@ -92,13 +95,21 @@ def build_component_residency_strategy(
     module: nn.Module,
     server_args: ServerArgs,
 ) -> ComponentResidencyStrategy:
+    residency_mode = server_args.component_residency_mode(component_name)
     if is_layerwise_offloaded_module(module):
         return LayerwiseOffloadStrategy()
+    if is_fsdp_managed_module(module):
+        return ResidentStrategy()
+    if residency_mode == ComponentResidencyMode.LAYERWISE_OFFLOAD:
+        if (
+            server_args.explicit_component_residency_mode(component_name)
+            == ComponentResidencyMode.LAYERWISE_OFFLOAD
+        ):
+            return VanillaD2HStrategy()
+        return ResidentStrategy()
     if (
         not current_platform.is_mps()
-        and not server_args.use_fsdp_inference
-        and not is_fsdp_managed_module(module)
-        and server_args.should_cpu_offload_component(component_name)
+        and residency_mode == ComponentResidencyMode.COMPONENT_OFFLOAD
     ):
         return VanillaD2HStrategy()
     return ResidentStrategy()

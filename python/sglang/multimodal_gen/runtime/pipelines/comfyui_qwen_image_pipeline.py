@@ -248,7 +248,9 @@ class ComfyUIQwenImagePipelineBase(LoRAPipeline, ComposedPipelineBase):
                 )
                 shard_model(
                     model,
-                    cpu_offload=server_args.dit_cpu_offload,
+                    cpu_offload=server_args.should_stage_transformer_on_cpu(
+                        "transformer"
+                    ),
                     reshard_after_forward=True,
                     mp_policy=mp_policy,
                     mesh=device_mesh,
@@ -281,7 +283,7 @@ class ComfyUIQwenImagePipelineBase(LoRAPipeline, ComposedPipelineBase):
             get_local_torch_device(),
             default_dtype,
             strict=True,
-            cpu_offload=server_args.dit_cpu_offload,
+            cpu_offload=server_args.should_stage_transformer_on_cpu("transformer"),
             param_names_mapping=param_names_mapping_fn,
         )
 

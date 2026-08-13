@@ -25,6 +25,9 @@ from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     set_default_torch_dtype,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    ComponentResidencyMode,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -325,20 +328,48 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         dtype = torch.float16
         if config.shape_variant and "bf16" in config.shape_variant:
             dtype = torch.bfloat16
-        device = get_local_torch_device()
+        local_device = get_local_torch_device()
+
+        shape_component_names = (
+            "hy3dshape_model",
+            "hy3dshape_vae",
+            "hy3dshape_conditioner",
+        )
+        for component_name in shape_component_names:
+            if not server_args.is_component_residency_explicitly_set(component_name):
+                server_args.set_component_residency_runtime_override(
+                    component_name, ComponentResidencyMode.RESIDENT
+                )
+
+        def load_device(component_name: str) -> torch.device:
+            if (
+                server_args.component_residency_mode(component_name)
+                == ComponentResidencyMode.RESIDENT
+            ):
+                return local_device
+            return torch.device("cpu")
 
         components: dict[str, Any] = {}
 
         components["hy3dshape_model"] = self._load_dit_model(
-            model_config["model"], ckpt["model"], device, dtype
+            model_config["model"],
+            ckpt["model"],
+            load_device("hy3dshape_model"),
+            dtype,
         )
 
         components["hy3dshape_vae"] = self._load_simple_component(
-            model_config["vae"], ckpt.get("vae"), device, dtype
+            model_config["vae"],
+            ckpt.get("vae"),
+            load_device("hy3dshape_vae"),
+            dtype,
         )
 
         components["hy3dshape_conditioner"] = self._load_simple_component(
-            model_config["conditioner"], ckpt.get("conditioner"), device, dtype
+            model_config["conditioner"],
+            ckpt.get("conditioner"),
+            load_device("hy3dshape_conditioner"),
+            dtype,
         )
 
         components["hy3dshape_scheduler"] = self._instantiate_component(

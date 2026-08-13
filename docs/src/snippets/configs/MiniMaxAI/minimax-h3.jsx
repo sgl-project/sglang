@@ -627,7 +627,7 @@ export const config = {
         "--tp-size 2",
         "--ulysses-degree 1",
         "--performance-mode memory",
-        "--layerwise-offload-components dit,text_encoder,vae",
+        "--component-residency dit=layerwise-offload text_encoder=layerwise-offload vae=layerwise-offload",
         "--dit-offload-prefetch-size 1",
         "--dit-layerwise-resident-layers 20",
         "--enable-torch-compile false",

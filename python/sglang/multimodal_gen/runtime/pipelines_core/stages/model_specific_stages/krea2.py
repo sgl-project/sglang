@@ -47,8 +47,7 @@ class Krea2BeforeDenoisingStage(PipelineStage):
         self.scheduler = scheduler
 
     def component_uses(self, server_args: ServerArgs, stage_name: str | None = None):
-        # Declare the text encoder so the residency manager can CPU-offload it
-        # (with --text-encoder-cpu-offload) for the denoise loop, where it is idle.
+        # Declare the text encoder so residency can release it before denoising
         return [
             ComponentUse(
                 self._component_stage_name(stage_name),
@@ -102,9 +101,7 @@ class Krea2BeforeDenoisingStage(PipelineStage):
         patch = arch.patch
         vsf = pipeline_config.get_vae_scale_factor()
 
-        # Text conditioning (positive + negative for CFG). The residency manager
-        # pages the encoder to GPU for this block only, then offloads it for the
-        # denoise loop (frees ~8GB) when --text-encoder-cpu-offload is set.
+        # Text conditioning uses the encoder only for this block
         neg_prompts = (
             batch.negative_prompt
             if isinstance(batch.negative_prompt, list)

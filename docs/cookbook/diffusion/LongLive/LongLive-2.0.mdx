@@ -28,9 +28,7 @@ If the GPU runs out of memory, move the text encoder, VAE, and DiT to CPU betwee
 ```bash Command
 sglang serve \
   --model-path Rabinovich/LongLive-2.0-5B-Diffusers \
-  --dit-cpu-offload \
-  --text-encoder-cpu-offload \
-  --vae-cpu-offload
+  --component-residency dit=component-offload text_encoder=component-offload vae=component-offload
 ```
 
 `Rabinovich/LongLive-2.0-5B-Diffusers` is the Diffusers-format conversion of the official `Efficient-Large-Model/LongLive-2.0-5B` weights.

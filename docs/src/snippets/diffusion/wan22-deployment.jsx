@@ -185,7 +185,7 @@
           return command;
         }
 
-        let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --dit-layerwise-offload true`;
+        let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --component-residency dit=layerwise-offload`;
         if (bestPractice === 'on') {
           if (hardware === 'b300') {
             command += ` \\\n  --tp-size 2 \\\n  --num-gpus 8 \\\n  --sp-degree 2 \\\n  --ulysses-degree 2 \\\n  --enable-cfg-parallel`;

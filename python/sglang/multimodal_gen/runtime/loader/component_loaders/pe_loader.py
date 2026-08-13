@@ -33,9 +33,10 @@ def _read_model_max_length(model_path: str) -> int | None:
     return None
 
 
-class PEModelWrapper:
+class PEModelWrapper(torch.nn.Module):
 
     def __init__(self, model, tokenizer, device, model_max_length: int):
+        super().__init__()
         self.model = model
         self.pe_tokenizer = tokenizer
         self.device = device
@@ -71,12 +72,10 @@ class PEModelWrapper:
         return {"text": text}
 
     def to(self, *args, **kwargs):
-        """Move underlying model to device."""
-        self.model = self.model.to(*args, **kwargs)
-        if args:
-            device = args[0]
-            if isinstance(device, (str, torch.device)):
-                self.device = torch.device(device)
+        super().to(*args, **kwargs)
+        device = kwargs.get("device", args[0] if args else None)
+        if isinstance(device, (str, torch.device)):
+            self.device = torch.device(device)
         return self
 
 

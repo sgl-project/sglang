@@ -683,8 +683,7 @@ class Krea2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # GELU(tanh) is applied in the forward; the linear matches time_mod_proj.weight.
         self.time_mod_proj = nn.Linear(ac.features, ac.features * 6)
         self.seq_multiple_of = ac.seq_multiple_of
-        # The 28 single-stream blocks (the ~24GB bulk) are streamed layer-by-layer
-        # under --dit-layerwise-offload, keeping only a small working set resident.
+        # The 28 single-stream blocks are the layerwise streaming unit
         self.layer_names = ["transformer_blocks"]
 
     def _forward_impl(

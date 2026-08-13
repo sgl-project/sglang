@@ -439,11 +439,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         ):
             return []
 
-        # Declare every component this stage forwards through so
-        # ComponentResidencyManager moves them onto GPU before the stage runs.
-        # Without this, `dit_cpu_offload=True` keeps refiner sub-modules on CPU
-        # and the first matmul fails with "mat2 is on cpu" vs cuda inputs.
-        # The tokenizer stays on CPU (no nn.Module weights to ferry).
+        # The tokenizer stays on CPU; all forwarded modules declare residency uses
         stage_name = self._component_stage_name(stage_name)
         return [
             ComponentUse(

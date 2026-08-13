@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
@@ -19,6 +20,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
     build_component_residency_strategy,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    ComponentResidencyMode,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     LayerwiseOffloadStrategy,
@@ -164,16 +168,29 @@ class _LayerwiseComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
 
 class _TestServerArgs(SimpleNamespace):
     should_cpu_offload_component = ServerArgs.should_cpu_offload_component
+    explicit_component_residency_mode = ServerArgs.explicit_component_residency_mode
+    set_component_residency_runtime_override = (
+        ServerArgs.set_component_residency_runtime_override
+    )
+    _legacy_should_cpu_offload_component = (
+        ServerArgs._legacy_should_cpu_offload_component
+    )
+    _legacy_layerwise_offload_matches = ServerArgs._legacy_layerwise_offload_matches
+    component_residency_mode = ServerArgs.component_residency_mode
 
 
 def _server_args(**kwargs):
     defaults = dict(
         cpu_offload_components=None,
+        component_residency=None,
+        _component_residency_runtime_overrides={},
+        layerwise_offload_components=None,
         use_fsdp_inference=False,
         dit_cpu_offload=False,
         text_encoder_cpu_offload=False,
         image_encoder_cpu_offload=False,
         vae_cpu_offload=False,
+        disagg_role=RoleType.MONOLITHIC,
         dit_offload_prefetch_size=1,
         dit_layerwise_resident_layers=0.0,
         pin_cpu_memory=False,
@@ -495,6 +512,117 @@ def test_layerwise_configuration_all_selects_every_capable_component(monkeypatch
     assert is_layerwise_offloaded_module(transformer)
 
 
+def test_component_residency_layerwise_selects_dynamic_components(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    transformer = _NestedDummyModel()
+    transformer_2 = _NestedDummyModel()
+    text_encoder = _NestedEncoderDummyModel()
+    modules = {
+        "transformer": transformer,
+        "transformer_2": transformer_2,
+        "text_encoder": text_encoder,
+    }
+    server_args = _server_args(
+        component_residency={
+            "dit": "layerwise-offload",
+            "transformer_2": "resident",
+        }
+    )
+
+    configured = configure_layerwise_offload_modules(modules, server_args)
+
+    assert configured == ["transformer"]
+    assert is_layerwise_offloaded_module(transformer)
+    assert not is_layerwise_offloaded_module(transformer_2)
+    assert not is_layerwise_offloaded_module(text_encoder)
+
+
+def test_disaggregated_role_does_not_warn_for_remote_exact_component(caplog):
+    server_args = _server_args(
+        component_residency={"transformer": "layerwise-offload"},
+        disagg_role=RoleType.ENCODER,
+    )
+
+    configure_layerwise_offload_modules(
+        {"text_encoder": _NestedEncoderDummyModel()}, server_args
+    )
+
+    assert "not currently loaded" not in caplog.text
+
+
+def test_layerwise_offload_does_not_warn_for_lazy_condition_encoder(caplog):
+    server_args = _server_args(
+        component_residency={"condition_image_encoder": "layerwise-offload"}
+    )
+
+    configure_layerwise_offload_modules({"transformer": _DummyModel()}, server_args)
+
+    assert "not currently loaded" not in caplog.text
+
+
+def test_unsupported_layerwise_component_becomes_component_offload():
+    server_args = _server_args(
+        component_residency={"text_encoder": "layerwise-offload"}
+    )
+
+    configured = configure_layerwise_offload_modules(
+        {"text_encoder": _DummyModel(), "scheduler": object()}, server_args
+    )
+
+    assert configured == []
+    assert (
+        server_args.component_residency_mode("text_encoder")
+        == ComponentResidencyMode.COMPONENT_OFFLOAD
+    )
+    assert "scheduler" not in server_args._component_residency_runtime_overrides
+
+
+def test_layerwise_component_without_usable_layers_becomes_component_offload():
+    class _EmptyLayerwiseModel(_DummyModel, LayerwiseOffloadableModuleMixin):
+        layer_names = ["blocks"]
+
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList()
+
+    server_args = _server_args(
+        component_residency={"text_encoder": "layerwise-offload"}
+    )
+
+    configured = configure_layerwise_offload_modules(
+        {"text_encoder": _EmptyLayerwiseModel()}, server_args
+    )
+
+    assert configured == []
+    assert (
+        server_args.component_residency_mode("text_encoder")
+        == ComponentResidencyMode.COMPONENT_OFFLOAD
+    )
+
+
+def test_legacy_unsupported_layerwise_component_remains_resident():
+    server_args = _server_args(layerwise_offload_components=["text_encoder"])
+
+    configured = configure_layerwise_offload_modules(
+        {"text_encoder": _DummyModel()},
+        server_args,
+        component_names=["text_encoder"],
+    )
+
+    assert configured == []
+    assert (
+        server_args.component_residency_mode("text_encoder")
+        == ComponentResidencyMode.LAYERWISE_OFFLOAD
+    )
+    strategy = build_component_residency_strategy(
+        "text_encoder", _DummyModel(), server_args
+    )
+    assert isinstance(strategy, ResidentStrategy)
+
+
 def test_component_cpu_offload_strategy_remains_flag_driven():
     strategy = build_component_residency_strategy(
         "text_encoder", _DummyModel(), _server_args(text_encoder_cpu_offload=True)
@@ -503,6 +631,26 @@ def test_component_cpu_offload_strategy_remains_flag_driven():
 
     strategy = build_component_residency_strategy(
         "unknown_component", _DummyModel(), _server_args(text_encoder_cpu_offload=True)
+    )
+    assert isinstance(strategy, ResidentStrategy)
+
+
+def test_component_cpu_offload_remains_independent_from_fsdp():
+    strategy = build_component_residency_strategy(
+        "text_encoder",
+        _DummyModel(),
+        _server_args(use_fsdp_inference=True, text_encoder_cpu_offload=True),
+    )
+    assert isinstance(strategy, VanillaD2HStrategy)
+
+    fsdp_module = type("FSDPDummyModel", (_DummyModel,), {})()
+    strategy = build_component_residency_strategy(
+        "transformer",
+        fsdp_module,
+        _server_args(
+            use_fsdp_inference=True,
+            component_residency={"dit": "component-offload"},
+        ),
     )
     assert isinstance(strategy, ResidentStrategy)
 

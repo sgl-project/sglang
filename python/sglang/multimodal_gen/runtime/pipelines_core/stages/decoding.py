@@ -266,7 +266,7 @@ class DecodingStage(PipelineStage):
                             logger.warning(
                                 "OOM detected during VAE decoding with tiling enabled. "
                                 "Please reduce the resolution or enable "
-                                "--vae-cpu-offload."
+                                "--component-residency vae=component-offload."
                             )
                     raise
                 image = _ensure_tensor_decode_output(decode_output)

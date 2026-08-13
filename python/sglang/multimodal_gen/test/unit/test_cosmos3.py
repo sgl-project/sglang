@@ -623,7 +623,7 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
             metrics=None,
         )
 
-        output = stage.forward(batch, types.SimpleNamespace(vae_cpu_offload=False))
+        output = stage.forward(batch, types.SimpleNamespace())
 
         self.assertEqual(output.output[0]["actions"].shape, (4, 3))
         self.assertEqual(output.output[0]["domain_id"], 8)
