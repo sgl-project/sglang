@@ -92,10 +92,10 @@ on:
         type: string
         default: ""
       image_formats:
-        description: "CSV of image formats to build and push: oci (default), zstd, nydus"
+        description: "CSV of image formats to build and push. Default builds all three (oci,zstd,nydus); pass a subset to narrow."
         required: false
         type: string
-        default: "oci"
+        default: "oci,zstd,nydus"
 
 jobs:
   build-and-publish:
@@ -200,10 +200,10 @@ jobs:
           import os
           import sys
 
-          raw = os.environ.get("IMAGE_FORMATS", "oci")
+          raw = os.environ.get("IMAGE_FORMATS", "oci,zstd,nydus")
           tokens = [token.strip() for token in raw.split(",") if token.strip()]
           if not tokens:
-              tokens = ["oci"]
+              tokens = ["oci", "zstd", "nydus"]
           allowed = {"oci", "zstd", "nydus"}
           unknown = [token for token in tokens if token not in allowed]
           if unknown:

@@ -50,6 +50,10 @@ on:
         description: "Volcengine fork only: CSV of image formats for the debug base build (oci, zstd, nydus). Applies only when private_debug_base_only is set."
         required: false
         default: "oci,zstd,nydus"
+      private_debug_docker_target:
+        description: "Volcengine fork only: Dockerfile target stage for the debug base build (framework_final or runtime). Applies only when private_debug_base_only is set."
+        required: false
+        default: "framework_final"
   schedule:
     - cron: "0 0 * * *"
 
@@ -353,7 +357,7 @@ jobs:
     if: ${{ github.repository == 'bytedance-iaas/sglang' && inputs.private_debug_base_only && inputs.private_debug_verify_image == '' }}
     uses: ./.github/workflows/_docker-build-and-publish.yml
     with:
-      docker_target: framework_final
+      docker_target: ${{ inputs.private_debug_docker_target || 'framework_final' }}
       checkout_ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
       cuda_key: cu130
       cuda_version: 13.0.1
