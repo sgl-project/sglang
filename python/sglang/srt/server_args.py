@@ -3172,6 +3172,16 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     # Model weight update and weight loading
     # -------------------------------------------------------------------------
+    startup_weight_load_mode: A[
+        Literal["serial", "overlap"],
+        (
+            "Control startup weight loading relative to CUDA graph capture. "
+            "'serial' preserves the existing startup order; 'overlap' stages "
+            "checkpoint files while CUDA graphs are captured and commits the "
+            "real weights afterward."
+        ),
+        NS("model"),
+    ] = "serial"
     custom_weight_loader: A[
         Optional[List[str]],
         Arg(
@@ -8832,6 +8842,10 @@ class ServerArgs:
     @property
     def is_ep_scale_joiner(self) -> bool:
         return self.ep_join_mode == "scale"
+
+    @property
+    def is_startup_weight_load_overlap(self) -> bool:
+        return self.startup_weight_load_mode == "overlap"
 
     def ssl_verify(self):
         """Return the value for the requests library's verify= parameter.
