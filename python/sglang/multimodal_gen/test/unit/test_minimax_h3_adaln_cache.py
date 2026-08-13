@@ -48,5 +48,12 @@ def test_minimax_h3_adaln_cache_matches_bf16_embedding(tmp_path):
     block = cache.block(1, cache_plan_index, 2)
     final = cache.final(cache_plan_index, 2)
 
-    assert torch.equal(torch.cat(block, dim=-1), block_params[1, :, 1])
+    # block() hands the forward pass six [num_timesteps * modality, hidden]
+    # chunks, while the checkpoint stores a plan as one flat
+    # [num_timesteps, 6 * modality * hidden] row -- same elements, and the
+    # modality axis folds into the leading one rather than staying separate.
+    assert torch.equal(
+        torch.cat(block, dim=-1).reshape(block_params[1, :, 1].shape),
+        block_params[1, :, 1],
+    )
     assert torch.equal(torch.cat(final, dim=-1), final_params[1])
