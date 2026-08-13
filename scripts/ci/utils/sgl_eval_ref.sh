@@ -10,8 +10,4 @@
 # test/registered/eval/test_text_models_gsm8k_eval.py, and the mmlu thresholds
 # of run_eval's other callers, before changing this.
 SGL_EVAL_REF="6690895609dcbc5df1e7b00dd57c9502b868ec4d"
-# No spaces around the "@": PEP 508 allows omitting them, and a spec with
-# spaces breaks any caller that expands $SGL_EVAL_SPEC unquoted (the AMD CI
-# installer flattens its argv through `eval`, which re-split this into
-# "sgl-eval" / "@" / "git+https://..." and made pip reject a bare "@").
 SGL_EVAL_SPEC="sgl-eval@git+https://github.com/sgl-project/sgl-eval.git@${SGL_EVAL_REF}"
