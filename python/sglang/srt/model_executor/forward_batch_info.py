@@ -1205,9 +1205,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         extend_prefix_len : extend_prefix_len + extend_seq_len,
                     ]
                     if mrope_positions.numel() == 0:
+                        # The precomputed mrope_positions only cover the original
+                        # prompt. Once decoding moves past it (e.g. the draft-extend
+                        # of EAGLE speculative decoding, which extends by
+                        # num_draft_tokens per request), the slice above is empty.
+                        # _expand_mrope_from_input is decode-shaped and yields a
+                        # single position, so it cannot be used here: extend needs
+                        # extend_seq_len of them, otherwise mrope_positions ends up
+                        # with batch_size entries instead of sum(extend_lens) and the
+                        # rotary embedding reads out of bounds.
+                        #
+                        # Text-only extend above uses positions
+                        # [extend_prefix_len, extend_prefix_len + extend_seq_len);
+                        # multimodal positions are those shifted by
+                        # mrope_position_delta, which is what the decode branch
+                        # applies as (mrope_position_delta - 1) + seq_len.
                         mrope_positions = self._expand_mrope_from_input(
-                            mm_input, self.seq_lens_cpu[batch_idx]
-                        )
+                            mm_input, extend_prefix_len + 1
+                        ) + torch.arange(extend_seq_len, dtype=torch.int64)
                 mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(
