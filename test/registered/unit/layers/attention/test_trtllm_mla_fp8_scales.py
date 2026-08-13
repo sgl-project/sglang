@@ -54,9 +54,7 @@ def test_trtllm_mla_decode_propagates_k_and_v_descales(monkeypatch):
         trtllm_mla_backend,
         "flashinfer",
         SimpleNamespace(
-            decode=SimpleNamespace(
-                trtllm_batch_decode_with_kv_cache_mla=fake_decode
-            )
+            decode=SimpleNamespace(trtllm_batch_decode_with_kv_cache_mla=fake_decode)
         ),
         raising=False,
     )

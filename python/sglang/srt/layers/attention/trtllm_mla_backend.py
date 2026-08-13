@@ -1168,9 +1168,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Save KV cache if requested (the fused fp8 path already wrote it)
         query = fused_fp8_query
         if query is None and save_kv_cache:
-            assert k is not None and k_rope is not None, (
-                "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-            )
+            assert (
+                k is not None and k_rope is not None
+            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             cache_k, cache_k_rope = k, k_rope
             if self.data_type == torch.float8_e4m3fn:
                 if k.dtype == torch.float8_e4m3fn:
@@ -1363,9 +1363,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Save KV cache if requested
         if save_kv_cache:
-            assert k is not None and k_rope is not None, (
-                "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-            )
+            assert (
+                k is not None and k_rope is not None
+            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             cache_k, cache_k_rope = k, k_rope
             if self.data_type == torch.float8_e4m3fn:
                 if k.dtype == torch.float8_e4m3fn:

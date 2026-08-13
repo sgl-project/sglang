@@ -3246,12 +3246,8 @@ class DeepseekSparseAttnBackend(
 
         q_scale = 1.0
         if self.kv_cache_dtype == torch.float8_e4m3fn:
-            k_scale, _ = require_mla_kv_cache_scales(
-                layer, path="dsa_trtllm_bmm1"
-            )
-            _, v_scale = require_mla_kv_cache_scales(
-                layer, path="dsa_trtllm_bmm2"
-            )
+            k_scale, _ = require_mla_kv_cache_scales(layer, path="dsa_trtllm_bmm1")
+            _, v_scale = require_mla_kv_cache_scales(layer, path="dsa_trtllm_bmm2")
         else:
             k_scale = v_scale = 1.0
         bmm1_scale = q_scale * k_scale * layer.scaling

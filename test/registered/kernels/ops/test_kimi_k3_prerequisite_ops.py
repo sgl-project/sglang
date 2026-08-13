@@ -177,9 +177,7 @@ class TestKimiK3PrerequisiteOps(CustomTestCase):
             )
         )
         self.assertTrue(
-            torch.equal(
-                scaled_query.view(torch.uint8), fp8_query_ref.view(torch.uint8)
-            )
+            torch.equal(scaled_query.view(torch.uint8), fp8_query_ref.view(torch.uint8))
         )
 
     def test_replayssm_ring_fold(self):
