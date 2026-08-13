@@ -392,6 +392,7 @@ class Engine(EngineScoreMixin, EngineBase):
         bootstrap_room: Optional[Union[List[int], int]] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
+        do_local_prefill: bool = False,
         # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
@@ -436,6 +437,7 @@ class Engine(EngineScoreMixin, EngineBase):
             bootstrap_room=bootstrap_room,
             routed_dp_rank=routed_dp_rank,
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
+            do_local_prefill=do_local_prefill,
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,
@@ -505,6 +507,7 @@ class Engine(EngineScoreMixin, EngineBase):
         bootstrap_room: Optional[Union[List[int], int]] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
+        do_local_prefill: bool = False,
         # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
@@ -549,6 +552,7 @@ class Engine(EngineScoreMixin, EngineBase):
             bootstrap_room=bootstrap_room,
             routed_dp_rank=routed_dp_rank,
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
+            do_local_prefill=do_local_prefill,
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,
