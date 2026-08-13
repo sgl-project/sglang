@@ -193,7 +193,6 @@ test = [
   "pytest",
   "sentence_transformers",
   "sglang[load-reporter]",
-  "smg-grpc-servicer==0.8.0",
   "tabulate",
 ]
 

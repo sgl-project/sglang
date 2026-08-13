@@ -1,17 +1,14 @@
-"""Pure report builder for the embedded load reporter.
-
-Converts a SnapshotView into a pb.LoadReport proto, applying staleness logic
-and assigning monotonically increasing sequence IDs.
-"""
+"""Pure report builder for the embedded load reporter."""
 
 from __future__ import annotations
 
-import dataclasses
-from typing import Optional
+from typing import Optional, Sequence
+
+import msgspec
 
 from sglang.srt.load_reporter.config import WorkerMetadata
 from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
-from sglang.srt.load_reporter.store import SnapshotView
+from sglang.srt.load_reporter.snapshot_validation import RankSnapshot
 
 # ---------------------------------------------------------------------------
 # Sequence allocator
@@ -37,7 +34,7 @@ class SequenceAllocator:
 
 
 class ReportBuilder:
-    """Convert validated snapshot views into protocol load reports."""
+    """Convert validated rank tuples into protocol load reports."""
 
     def __init__(
         self,
@@ -52,26 +49,58 @@ class ReportBuilder:
 
     def build(
         self,
-        view: SnapshotView,
+        ranks: Sequence[RankSnapshot],
         identity: WorkerMetadata,
         *,
         report_time_unix_ms: int,
     ) -> pb.LoadReport:
-        """Build one report from the latest full snapshot."""
-        if not view.ranks:
-            status = pb.REPORT_STATUS_UNREACHABLE
-            error: Optional[str] = view.last_error or "no authoritative rank snapshot"
+        """Build one report from this attempt's validated rank tuple."""
+        if not ranks:
+            raise ValueError("a healthy/stale report requires at least one rank")
+        oldest_age_ms = max(
+            report_time_unix_ms - rank.snapshot_time_unix_ms for rank in ranks
+        )
+        if oldest_age_ms > self._stale_after_ms:
+            status = pb.REPORT_STATUS_STALE
+            error: Optional[str] = f"load snapshot stale by {oldest_age_ms} ms"
         else:
-            oldest_age_ms = max(
-                report_time_unix_ms - rank.snapshot_time_unix_ms for rank in view.ranks
-            )
-            if oldest_age_ms > self._stale_after_ms:
-                status = pb.REPORT_STATUS_STALE
-                error = view.last_error or f"load snapshot stale by {oldest_age_ms} ms"
-            else:
-                status = pb.REPORT_STATUS_HEALTHY
-                error = None
+            status = pb.REPORT_STATUS_HEALTHY
+            error = None
+        return self._new_report(
+            ranks=ranks,
+            identity=identity,
+            report_time_unix_ms=report_time_unix_ms,
+            status=status,
+            error=error,
+        )
 
+    def build_unreachable(
+        self,
+        identity: WorkerMetadata,
+        *,
+        report_time_unix_ms: int,
+        error: BaseException | str,
+    ) -> pb.LoadReport:
+        """Build one empty report describing a failed pull attempt."""
+        message = str(error).strip() or "load snapshot unavailable"
+        return self._new_report(
+            ranks=(),
+            identity=identity,
+            report_time_unix_ms=report_time_unix_ms,
+            status=pb.REPORT_STATUS_UNREACHABLE,
+            error=message,
+        )
+
+    def _new_report(
+        self,
+        *,
+        ranks: Sequence[RankSnapshot],
+        identity: WorkerMetadata,
+        report_time_unix_ms: int,
+        status: int,
+        error: Optional[str],
+    ) -> pb.LoadReport:
+        """Allocate one protobuf report; success and failure share this path."""
         report = pb.LoadReport(
             source_instance_id=self._source_instance_id,
             sequence_id=self._sequence.next(),
@@ -81,7 +110,7 @@ class ReportBuilder:
                 worker_type=identity.worker_type,
             ),
             status=status,
-            ranks=[pb.RankLoad(**dataclasses.asdict(rank)) for rank in view.ranks],
+            ranks=[pb.RankLoad(**msgspec.structs.asdict(rank)) for rank in ranks],
         )
         if identity.model is not None:
             report.worker.model = identity.model

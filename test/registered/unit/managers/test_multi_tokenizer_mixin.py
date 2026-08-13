@@ -86,9 +86,15 @@ class TestAwaitReporterStartup(unittest.TestCase):
         import asyncio
         import threading
 
+        from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
+
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
         self._thread.start()
+        # Skip the heavy MultiTokenizerRouter.__init__ (zmq sockets, router
+        # thread, disagg service): _await_reporter_startup only reads self._loop.
+        self._router = MultiTokenizerRouter.__new__(MultiTokenizerRouter)
+        self._router._loop = self._loop
 
     def tearDown(self):
         self._loop.call_soon_threadsafe(self._loop.stop)
@@ -98,10 +104,6 @@ class TestAwaitReporterStartup(unittest.TestCase):
     def test_timeout_cancels_pending_startup(self):
         import asyncio
         import threading
-
-        from sglang.srt.managers.multi_tokenizer_mixin import (
-            _await_reporter_startup,
-        )
 
         started = threading.Event()
         cancelled = threading.Event()
@@ -119,7 +121,7 @@ class TestAwaitReporterStartup(unittest.TestCase):
         self.assertTrue(started.wait(timeout=1.0))
 
         with self.assertRaises(TimeoutError):
-            _await_reporter_startup(future, self._loop, timeout=0.1)
+            self._router._await_reporter_startup(future, timeout=0.1)
 
         self.assertTrue(cancelled.wait(timeout=1.0))
         self.assertTrue(future.cancelled())
@@ -130,10 +132,6 @@ class TestAwaitReporterStartup(unittest.TestCase):
         closed, not leaked."""
         import concurrent.futures
         import threading
-
-        from sglang.srt.managers.multi_tokenizer_mixin import (
-            _await_reporter_startup,
-        )
 
         closed = threading.Event()
 
@@ -147,7 +145,7 @@ class TestAwaitReporterStartup(unittest.TestCase):
         future.set_running_or_notify_cancel()
 
         with self.assertRaises(TimeoutError):
-            _await_reporter_startup(future, self._loop, timeout=0.05)
+            self._router._await_reporter_startup(future, timeout=0.05)
 
         # The startup coroutine settles with a real handle just after timeout.
         future.set_result(FakeHandle())

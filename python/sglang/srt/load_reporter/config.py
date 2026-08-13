@@ -2,40 +2,37 @@
 
 from __future__ import annotations
 
-import dataclasses
 from typing import TYPE_CHECKING, Optional
+
+import msgspec
 
 from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
-INITIAL_SAMPLE_TIMEOUT_SECONDS = 1.0
+SNAPSHOT_PULL_TIMEOUT_SECONDS = 1.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
 SNAPSHOT_STALE_AFTER_MS = 3000
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class LoadReporterConfig:
+class LoadReporterConfig(msgspec.Struct, frozen=True):
     """Timing configuration for the load reporter."""
 
-    snapshot_stale_after_ms: int
+    snapshot_stale_after_ms: int = SNAPSHOT_STALE_AFTER_MS
 
     @classmethod
     def from_server_args(cls, args: ServerArgs) -> LoadReporterConfig:
         """Build reporter timing configuration from ServerArgs."""
-        return cls(
-            snapshot_stale_after_ms=SNAPSHOT_STALE_AFTER_MS,
-        )
+        return cls()
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class WorkerMetadata:
+class WorkerMetadata(msgspec.Struct, frozen=True):
     """Stable identity fields reported with every load snapshot."""
 
     worker_addr: str
     worker_type: int
-    model: Optional[str]
+    model: Optional[str] = None
 
     @classmethod
     def from_server_args(cls, args: ServerArgs) -> WorkerMetadata:

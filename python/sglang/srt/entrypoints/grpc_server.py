@@ -224,13 +224,13 @@ async def serve_grpc(server_args, model_info=None):
 
         if server_args.load_reporter_port is not None:
             from sglang.srt.load_reporter import start_load_reporter
-            from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
+            from sglang.srt.load_reporter.snapshot_source import (
+                ManagerLoadSnapshotSource,
+            )
 
             reporter_handle = await start_load_reporter(
                 server_args,
                 ManagerLoadSnapshotSource(request_manager, range(server_args.dp_size)),
-                event_owner=request_manager,
-                request_lifecycle_method="generate_request",
             )
 
     # Older smg-grpc-servicer releases (≤ 0.5.2) accept only (server_args,

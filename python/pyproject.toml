@@ -186,7 +186,6 @@ test = [
   "sentence_transformers",
   "sglang[fastokens]",
   "sglang[load-reporter]",
-  "smg-grpc-servicer==0.8.0",
   "tabulate",
 ]
 

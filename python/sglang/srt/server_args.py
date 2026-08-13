@@ -8402,13 +8402,7 @@ class ServerArgs:
             self.soft_watchdog_timeout = 300
 
     def _handle_load_reporter_config(self):
-        """Validate load reporter configuration.
-
-        Only the listener port is user-facing. The snapshot stale threshold and
-        gRPC transport knobs (connect timeout, reconnect backoff, keepalive,
-        message size, shutdown timeout) are reporter-internal constants and are
-        not part of ServerArgs.
-        """
+        """Validate the reporter port range; transport and staleness knobs live in the reporter, not ServerArgs."""
         if self.load_reporter_port is not None and not (
             1 <= self.load_reporter_port <= 65535
         ):

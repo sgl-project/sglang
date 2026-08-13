@@ -117,7 +117,6 @@ test = [
   "peft>=0.18.0",
   "sentence_transformers",
   "sglang[load-reporter]",
-  "smg-grpc-servicer==0.8.0",
 ]
 all = []
 dev = ["sglang[test]"]

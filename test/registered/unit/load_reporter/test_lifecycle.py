@@ -357,14 +357,6 @@ class TestHandleDelegation:
         finally:
             await handle.close()
 
-    @pytest.mark.asyncio
-    async def test_update_expected_dp_ranks_noop_without_runtime(self):
-        """update_expected_dp_ranks returns False when there is no runtime."""
-        from sglang.srt.load_reporter.lifecycle import LoadReporterHandle
-
-        handle = LoadReporterHandle()
-        assert handle.update_expected_dp_ranks(range(2)) is False
-
 
 class TestCloseCancellationSafety:
     """I1: a close() cancelled mid-await must not abandon remaining teardown."""
@@ -388,9 +380,7 @@ class TestCloseCancellationSafety:
             async def close(self):
                 steps.append("runtime.close")
 
-        handle = LoadReporterHandle()
-        handle._server = FakeServer()
-        handle._runtime = FakeRuntime()
+        handle = LoadReporterHandle(runtime=FakeRuntime(), server=FakeServer())
 
         # First caller enters close() and is cancelled while inside server.stop.
         first = asyncio.create_task(handle.close())
@@ -423,8 +413,11 @@ class TestCloseCancellationSafety:
                 await release_runtime.wait()
                 steps.append("runtime.close")
 
-        handle = LoadReporterHandle()
-        handle._runtime = FakeRuntime()
+        class FakeServer:
+            async def stop(self, grace=None):
+                steps.append("server.stop")
+
+        handle = LoadReporterHandle(runtime=FakeRuntime(), server=FakeServer())
 
         first = asyncio.create_task(handle.close())
         await asyncio.wait_for(runtime_closed.wait(), timeout=1.0)
@@ -437,7 +430,7 @@ class TestCloseCancellationSafety:
         release_runtime.set()
         await asyncio.gather(first, second)
         # Teardown ran exactly once even though two callers awaited it.
-        assert steps == ["runtime.close"]
+        assert steps == ["server.stop", "runtime.close"]
 
 
 if __name__ == "__main__":
