@@ -73,7 +73,10 @@ from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
-from ..hf_transformers_patches import normalize_rope_scaling_compat
+from ..hf_transformers_patches import (
+    normalize_deepseek_v4_compat,
+    normalize_rope_scaling_compat,
+)
 
 if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
     from modelscope import AutoConfig, GenerationConfig
@@ -459,6 +462,9 @@ def get_hf_text_config(config: PretrainedConfig):
 
     # Ensure rope_scaling dicts have "type" for remote-code compat (v5).
     normalize_rope_scaling_compat(config)
+
+    # Backfill DeepSeek V4 field renames from transformers >= 4.57 (#34092).
+    normalize_deepseek_v4_compat(config)
 
     if text_config is not None:
         return _patch_text_config(config, text_config)
