@@ -11,6 +11,7 @@ Registry: extra-b 8-GPU CUDA (nightly-class runtime).
 """
 
 import os
+import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
