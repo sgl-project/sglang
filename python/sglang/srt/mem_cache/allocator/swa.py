@@ -382,11 +382,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         self.full_attn_allocator.free_segment(free_index, start_pos=start_pos)
-        if swa_alive_from is None:
+
+        # The full side tolerates an unaligned start (it emits the partial head
+        # page as its own rep); the SWA side cannot, since a page's mapping is
+        # read at its first token. Fall back rather than assert -- callers get
+        # cache_protected_len from prefix matching, which is not page aligned.
+        alive = max(start_pos, swa_alive_from) if swa_alive_from is not None else None
+        if alive is None or alive % self.page_size != 0:
             self.free_swa(free_index)
             return
 
-        alive = max(start_pos, swa_alive_from)
         self.free_swa_segment(
             free_index[alive - start_pos :], start_pos=alive, swa_alive_from=alive
         )
