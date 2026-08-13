@@ -44,9 +44,9 @@ on:
           # 8-GPU GPT-OSS (MI30x + MI35x)
           - nightly-accuracy-8-gpu
           - nightly-accuracy-8-gpu-mi35x
-          # 8-GPU Grok1-INT4 (MI35x accuracy only)
+          # 8-GPU Grok1-INT4 (MI35x)
           - nightly-8-gpu-mi35x-grok1-int4
-          # 8-GPU Grok2 (MI35x accuracy only)
+          # 8-GPU Grok2 (MI35x)
           - nightly-8-gpu-mi35x-grok2
           # 8-GPU DeepSeek-V3.x (MI30x)
           - nightly-8-gpu-deepseek-v31
@@ -536,7 +536,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 8-GPU Grok1-INT4 (MI35x accuracy only)
+  # 8-GPU Grok1-INT4 (MI35x)
   # ==============================================================================
 
   nightly-8-gpu-mi35x-grok1-int4:
@@ -575,8 +575,20 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
+      - name: Performance Test MI35x (8-GPU Grok1-INT4)
+        timeout-minutes: 60
+        continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e RCCL_MSCCL_ENABLE=0 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-grok1-int4 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
   # ==============================================================================
-  # 8-GPU Grok2 (MI35x accuracy only)
+  # 8-GPU Grok2 (MI35x)
   # ==============================================================================
 
   nightly-8-gpu-mi35x-grok2:
@@ -612,6 +624,18 @@ jobs:
             -e RCCL_MSCCL_ENABLE=0 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-grok2 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test MI35x (8-GPU Grok2)
+        timeout-minutes: 60
+        continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e RCCL_MSCCL_ENABLE=0 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-grok2 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -1771,9 +1795,9 @@ jobs:
       # 8-GPU GPT-OSS (MI30x + MI35x)
       - nightly-accuracy-8-gpu
       - nightly-accuracy-8-gpu-mi35x
-      # 8-GPU Grok1-INT4 (MI35x accuracy only)
+      # 8-GPU Grok1-INT4 (MI35x)
       - nightly-8-gpu-mi35x-grok1-int4
-      # 8-GPU Grok2 (MI35x accuracy only)
+      # 8-GPU Grok2 (MI35x)
       - nightly-8-gpu-mi35x-grok2
       # 8-GPU DeepSeek-V3.x (MI30x)
       - nightly-8-gpu-deepseek-v31
