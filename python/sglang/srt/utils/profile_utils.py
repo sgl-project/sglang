@@ -81,6 +81,7 @@ class ProfileManager:
         self.first_rank_in_node = ps.gpu_id == get_device().base_gpu_id
         self.profiler_kwargs = None
         self.profiler = None
+        self.detailed_annotations = False
 
     def step(self, forward_mode: ForwardMode):
         stage = _get_stage_from_forward_mode(forward_mode)
@@ -103,7 +104,9 @@ class ProfileManager:
         merge_profiles: bool,
         profile_prefix: str,
         profile_stages: Optional[List[str]] = None,
+        detailed_annotations: bool = False,
     ):
+        self.detailed_annotations = detailed_annotations
         # not supported yet
         assert start_step is None
         assert (
@@ -146,6 +149,9 @@ class ProfileManager:
         )
 
         assert self.profiler is None
+        # Fold the per-phase c_/g_ aggregates into the step span while this
+        # stage's profile is active (v2 auto-start path; reset in _do_stop).
+        set_detailed_annotations_enabled(self.detailed_annotations)
         self.profiler = _ProfilerBase.create(
             **self.profiler_kwargs,
             ps=self.ps,
