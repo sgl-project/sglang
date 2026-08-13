@@ -133,6 +133,7 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+_DEEPGEMM_SUPPORT_SITU_NO_HACK = get_bool_env_var("_DEEPGEMM_SUPPORT_SITU_NO_HACK")
 _k3_shared_experts_attn_tp = envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
 _k3_dense_mlp_attn_tp = envs.SGLANG_K3_DENSE_MLP_ATTN_TP.get()
 
@@ -796,16 +797,24 @@ class KimiK3MoE(nn.Module):
             dtype=torch.bfloat16,
             device=routed_input.device,
         )
+        # TODO: Remove this temporary compatibility branch once OSS DeepGEMM
+        # supports activation="situ" directly.
+        if _DEEPGEMM_SUPPORT_SITU_NO_HACK:
+            activation_kwargs = {"activation": "situ"}
+        else:
+            activation_kwargs = {
+                "activation": "swiglu",
+                # Sentinel: selects the K3 SiTU branch in the DeepGEMM mega kernel
+                # (beta=4.0 / linear_beta=25.0 baked in).
+                "activation_clamp": _K3_MEGA_SITU_SENTINEL_CLAMP,
+            }
         deep_gemm.fp8_fp4_mega_moe(
             y,
             self.experts.mega_l1_weights,
             self.experts.mega_l2_weights,
             buf,
             recipe=(1, 1, 32),
-            activation="swiglu",
-            # Sentinel: selects the K3 SiTU branch in the DeepGEMM mega kernel
-            # (beta=4.0 / linear_beta=25.0 baked in).
-            activation_clamp=_K3_MEGA_SITU_SENTINEL_CLAMP,
+            **activation_kwargs,
             fast_math=True,
         )
         y = y[:num_tokens]
