@@ -383,24 +383,75 @@ Poll and download any conditioned request with the same job-status and
 content endpoints used in the T2VA example. Server-local `file://` URIs must
 refer to files visible inside the SGLang server environment.
 
-## 5. Turbo LoRA for few-step generation
+## 5. LoRA recipes
 
-[`larryvrh/MiniMax-H3-Turbo-Lora`](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora) distills the native **FL2VA** DiT for usable **4–8 step** generation. On `--model-variant fl2va`, use it with **`t2va`** or **`fl2va`** from section 4 and set `"num_inference_steps": 4` or `8` instead of `50`. **`ref2va`** uses a separate checkpoint partition and is not validated with this LoRA.
+H3 accepts both native fused adapters and standard Diffusers/PEFT adapters.
+Native adapters target modules such as `blocks.*.attn.qkv_proj`; PEFT adapters
+may instead provide separate `to_q`, `to_k`, and `to_v` projections and the
+`default` adapter namespace. SGLang normalizes both layouts.
+
+The following FL2VA adapters have distinct purposes:
+
+| Recipe | Repository and pinned file | Request setting | Prompt requirement |
+| --- | --- | --- | --- |
+| Recommended speed/quality balance | [`larryvrh/MiniMax-H3-Turbo-Lora`](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora), `minimax_h3_turbo_v4_step600_ema.safetensors` | `num_inference_steps: 9` (8 denoiser evaluations), `lora_scale: 1.0` | None |
+| Most aggressive speed preset (standard PEFT layout) | [`lightx2v/Minimax-h3-Turbo`](https://huggingface.co/lightx2v/Minimax-h3-Turbo), `minimax_h3_fl2v_turbo_4step_v0.1.safetensors` | `num_inference_steps: 5` (4 denoiser evaluations), `lora_scale: 1.0`, `lora_alpha: 8` | None |
+| Realistic people style | [`fal/MiniMax-H3-Realism-People-LoRA`](https://huggingface.co/fal/MiniMax-H3-Realism-People-LoRA), `h3-realism-people-t2v-i2v-r2v.safetensors` | Keep the normal `num_inference_steps: 50` schedule; start with `lora_scale: 0.7` | Include `r34l1sm` in the prompt |
+
+The H3 request field controls the number of sigma grid points, including the
+terminal zero; the denoising loop therefore runs one fewer model evaluation.
+This is why an adapter described as 8-step uses `9`, and a 4-step adapter uses
+`5`, in the request.
+
+All three use the same launch shape. Pinning the filename is required for
+repositories that publish multiple revisions, and is also recommended for a
+reproducible single-file recipe:
 
 ```bash Command
-curl -sS -X POST http://127.0.0.1:30010/v1/set_lora \
-  -H "Content-Type: application/json" \
-  -d '{
-    "lora_nickname": "h3-turbo",
-    "lora_path": "larryvrh/MiniMax-H3-Turbo-Lora",
-    "strength": 1.0
-  }'
+LORA_REPO=larryvrh/MiniMax-H3-Turbo-Lora
+LORA_FILE=minimax_h3_turbo_v4_step600_ema.safetensors
+LORA_NAME=h3-turbo-v4
+LORA_SCALE=1.0
+LORA_ALPHA_ARGS=()
+# LightX2V only: LORA_ALPHA_ARGS=(--lora-alpha 8)
+
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 4 \
+  --ulysses-degree 4 \
+  --performance-mode speed \
+  --lora-path "$LORA_REPO" \
+  --lora-weight-name "$LORA_FILE" \
+  --lora-nickname "$LORA_NAME" \
+  --lora-scale "$LORA_SCALE" \
+  "${LORA_ALPHA_ARGS[@]}" \
+  --lora-merge-mode auto \
+  --port 30010
 ```
 
-When the repository contains multiple safetensors files, prefer `minimax_h3_turbo_4step_ckpt500.safetensors` (upstream default) via `--lora-path` and `--lora-weight-name` on `sglang serve`, or pass the local path to that file as `lora_path`.
+`auto` merges an adapter into ordinary resident weights to avoid per-step LoRA
+matmuls, but keeps the dynamic path for FSDP-sharded weights where a full
+gather can increase peak memory. Use `dynamic` when one resident server must
+switch repeatedly between base and LoRA output.
+
+Use the filename, scale, and request schedule from the table together. The
+4-evaluation LightX2V recipe is the more aggressive latency/quality tradeoff.
+Its checkpoint has rank 128 but omits the training alpha from both the file and
+repository metadata, so `--lora-alpha 8` is required to reproduce the author's
+reference implementation. Start with the Larry 8-evaluation recipe when
+preserving fine visual detail is more important than minimum latency.
+
+These adapters were trained for the **FL2VA** partition and apply to `t2va` or
+`fl2va` requests. Do not use them with the separate `ref2va` weights unless
+the adapter author explicitly provides Ref2VA-compatible weights. Also avoid
+stacking a distilled adapter with `quality: "high"`: both alter denoising, and
+that combination has not been quality-validated.
 
 <Warning>
-LoRAs for the ComfyUI pruned MiniMax-H3 graph (for example H3-GalaxyAce) are not compatible with SGLang's native FL2VA weights.
+LoRAs trained for a pruned or structurally modified ComfyUI graph are not
+automatically compatible with the native H3 weights. Use only adapters whose
+architecture and target modules match the full native H3 checkpoint.
 </Warning>
 
 ## 6. Sampling and output controls
