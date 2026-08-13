@@ -377,7 +377,32 @@ html.dark table tbody tr:nth-child(even) td,
   color: var(--sgdb-ink);
 }
 
-.sgd-builder-hardware:disabled, .sgd-builder-choice:disabled { cursor: not-allowed; opacity: 0.42; }
+.sgd-builder-hardware:disabled,
+.sgd-builder-choice:disabled,
+.sgd-builder-choice[data-blocked="true"] { cursor: not-allowed; opacity: 0.42; }
+
+/* Tap/click feedback for a blocked option — the reason the tooltip carries,
+   surfaced where touch readers can see it. */
+.sgd-builder-blocked-note {
+  margin: 8px 2px 0;
+  color: var(--sgdb-warn);
+  font-size: 11px;
+  line-height: 1.45;
+  animation: sgdb-note-in 220ms var(--sgdb-ease);
+}
+@keyframes sgdb-note-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* A soft (selectable-but-unverified) pick declares itself in place. */
+.sgd-builder-choice[data-soft="true"][data-selected="true"]::after {
+  content: "Not verified yet";
+  color: var(--sgdb-warn);
+  font-size: 10px;
+  line-height: 1.3;
+  margin-top: 1px;
+}
 .sgd-builder-resource-grid { display: grid; gap: 8px; }
 .sgd-builder-stepper-field {
   display: flex;
@@ -625,10 +650,10 @@ html.dark table tbody tr:nth-child(even) td,
 /* Hover only changes tone. Lifting the card on hover (translateY) made the
    whole grid twitch as the pointer crossed it. */
 @media (hover: hover) and (pointer: fine) {
-  .sgd-command-builder button:not(:disabled):hover { color: var(--sgdb-ink); }
+  .sgd-command-builder button:not(:disabled):not([data-blocked="true"]):hover { color: var(--sgdb-ink); }
   .sgd-builder-scope-tabs button:not(:disabled):hover { background: var(--sgdb-pick-hover); }
   .sgd-builder-hardware:not(:disabled):not([data-selected="true"]):hover,
-  .sgd-builder-choice:not(:disabled):not([data-selected="true"]):hover {
+  .sgd-builder-choice:not(:disabled):not([data-blocked="true"]):not([data-selected="true"]):hover {
     background: var(--sgdb-pick-hover);
   }
   .sgd-builder-setting-row:not(:disabled):hover { background: color-mix(in oklch, var(--sgdb-serve) 5%, transparent); }
@@ -641,7 +666,7 @@ html.dark table tbody tr:nth-child(even) td,
 
 .sgd-command-builder :where(button, input, select, a):focus-visible { outline: 2px solid color-mix(in oklch, var(--sgdb-brand) 76%, white); outline-offset: 2px; }
 /* Press reads as the control yielding under the finger, not jumping. */
-.sgd-command-builder button:not(:disabled):active { transform: scale(0.97); transition-duration: 60ms; }
+.sgd-command-builder button:not(:disabled):not([data-blocked="true"]):active { transform: scale(0.97); transition-duration: 60ms; }
 
 @container builder-controls (min-width: 560px) {
   .sgd-builder-setting-layout { display: grid; grid-template-columns: minmax(240px, 0.9fr) minmax(0, 1.1fr); }

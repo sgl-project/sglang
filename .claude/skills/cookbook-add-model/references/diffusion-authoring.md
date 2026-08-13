@@ -64,15 +64,19 @@ verified.
 
 Expose topology-dependent best values explicitly. A Server row may remain `Auto`, but its summary
 and generated flag must show the effective policy—for example, encoder `auto` resolving to
-`replicate` across nodes. Disable hardware-gated options rather than generating commands outside
-their validated capability boundary. Keep `torch.compile` and similarly narrow experiments in
-the detailed prose until they have a broadly compatible recipe.
+`replicate` across nodes. Reserve `disabled` for combinations that cannot work (a kernel the
+platform does not ship, a mode the checkpoint cannot serve); an option that runs but has not
+been through a verification round should declare `soft` instead, which keeps it selectable and
+labels the pick as unverified. Keep `torch.compile` and similarly narrow experiments in the
+detailed prose until they have a broadly compatible recipe.
 
 Each dimension should provide a concise `description`, an optional quality label, and a
 `learnMore` anchor. Each option should provide at most two lines of decision-relevant explanation,
-its exact `flags`/`stripPrefixes`/`env`/`hints`, and a `disabled` or `verifiedWhen` predicate when
-support is conditional. The builder stores all semantic choices in the URL hash; active scope,
-expanded state, head address, and node rank stay local.
+its exact `flags`/`stripPrefixes`/`env`/`hints`, and a `disabled` (with `disableReason`), `soft`
+(with `softReason`), or `verifiedWhen` predicate when support is conditional — the reason strings
+are user-facing: blocked options flash theirs under the row on tap and expose it as a tooltip.
+The builder stores all semantic choices in the URL hash; active scope, expanded state, head
+address, and node rank stay local.
 
 Legacy configs without `commandBuilder` continue to use the old matrix renderer. Do not migrate
 an existing page opportunistically; use the new schema for new diffusion models and deliberate

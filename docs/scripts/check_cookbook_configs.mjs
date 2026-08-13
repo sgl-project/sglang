@@ -310,6 +310,7 @@ for (const path of walk(CONFIGS)) {
       const tag = `${dim.id}.${opt.id}`;
       if (typeof opt.showWhen === "function") probe(opt.showWhen, `${tag}.showWhen`);
       if (typeof opt.disabled === "function") probe(opt.disabled, `${tag}.disabled`);
+      if (typeof opt.soft === "function") probe(opt.soft, `${tag}.soft`);
       if (typeof opt.verifiedWhen === "function") probe(opt.verifiedWhen, `${tag}.verifiedWhen`);
       for (const key of ["flags", "env", "hints"]) {
         if (typeof opt[key] !== "function") continue;

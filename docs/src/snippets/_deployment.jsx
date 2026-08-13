@@ -18,8 +18,14 @@
 //                      `single` or `multi-N` → --nnodes N)
 //   matchDims          optional — replaces the legacy four. {id, title, options}[]
 //                      where each option is {id, label, showWhen?(sel), disabled?,
-//                      disableReason?}. `hw` is always the implicit first dim.
-//                      Cells are then keyed on (hw × <these ids>).
+//                      disableReason?, soft?, softReason?}. `hw` is always the
+//                      implicit first dim. Cells are then keyed on (hw × <these
+//                      ids>). `disabled` is for combinations that cannot work;
+//                      an option that runs but sits outside the verified matrix
+//                      should declare `soft` instead — it stays selectable and
+//                      announces itself as unverified (tooltip + in-cell note).
+//                      Blocked options flash their disableReason under the row
+//                      when tapped, so the reason also reaches touch readers.
 //   overlayDims        optional — rows that do NOT participate in cell lookup; the
 //                      picked option layers onto the matched cell, so an orthogonal
 //                      knob does not multiply the cell count. Same option shape plus
@@ -549,6 +555,11 @@ export const Deployment = ({ config, benchmarks }) => {
     return out;
   };
   // ==== end MIRROR ====
+  // `soft` marks an option that is plausible but outside the verified matrix:
+  // it stays selectable (the status badge reports verification separately),
+  // where `disabled` is reserved for combinations that cannot work at all.
+  const optionSoft = (opt, sel) =>
+    typeof opt.soft === "function" ? opt.soft(sel) : !!opt.soft;
   const findCell = (cells, sel) =>
     cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
 
@@ -1281,6 +1292,15 @@ export const Deployment = ({ config, benchmarks }) => {
   const [requestExpanded, setRequestExpanded] = useState(false);
   const [builderHeadAddress, setBuilderHeadAddress] = useState("<head-node-ip>");
   const [builderNodeRank, setBuilderNodeRank] = useState(0);
+  // Tapping a disabled option surfaces its reason under the row — hover-only
+  // tooltips never reach touch readers. {dim, reason}; each note clears only
+  // itself, so a newer note is never cut short by an older timer.
+  const [blockedNote, setBlockedNote] = useState(null);
+  const flashBlockedNote = (dim, reason) => {
+    const note = { dim, reason };
+    setBlockedNote(note);
+    setTimeout(() => setBlockedNote((cur) => (cur === note ? null : cur)), 4000);
+  };
   useEffect(() => {
     if (builderNodeRank >= Number(sel.nodes || 1)) setBuilderNodeRank(0);
   }, [sel.nodes, builderNodeRank]);
@@ -1658,16 +1678,30 @@ export const Deployment = ({ config, benchmarks }) => {
     const renderBuilderChoice = (item, dim) => {
       const checked = sel[dim.id] === item.id;
       const disabled = !isEnabled(dim.id, item.id);
+      const soft = !disabled && optionSoft(item, sel);
+      const reason = disabled
+        ? item.disableReason || "Not available for this configuration"
+        : soft
+          ? item.softReason || "Runs, but this combination is not a verified recipe yet."
+          : "";
+      // aria-disabled instead of the disabled attribute: the control stays
+      // focusable and hoverable, so the reason is reachable by tooltip, by
+      // keyboard, and by the tap-feedback note below the row.
       return (
         <button
           key={item.id}
           type="button"
           className="sgd-builder-choice"
           data-selected={checked ? "true" : "false"}
-          disabled={disabled}
+          data-blocked={disabled ? "true" : undefined}
+          data-soft={soft ? "true" : undefined}
+          aria-disabled={disabled}
           aria-pressed={checked}
-          title={disabled ? item.disableReason || "Not available for this configuration" : ""}
-          onClick={() => handleSelect(dim.id, item.id)}
+          title={reason}
+          onClick={() => {
+            if (disabled) { flashBlockedNote(dim.id, reason); return; }
+            handleSelect(dim.id, item.id);
+          }}
         >
           <span className="sgd-builder-choice-dot" aria-hidden="true" />
           <span>{item.label}</span>
@@ -1685,6 +1719,9 @@ export const Deployment = ({ config, benchmarks }) => {
         <div className="sgd-builder-choice-grid" data-density={(dim.options || []).length > 5 ? "compact" : "normal"}>
           {visibleOptions(dim, sel).map((option) => renderBuilderChoice(option, dim))}
         </div>
+        {blockedNote && blockedNote.dim === dim.id && (
+          <p className="sgd-builder-blocked-note" role="status">{blockedNote.reason}</p>
+        )}
       </section>
     );
 
@@ -1873,6 +1910,9 @@ export const Deployment = ({ config, benchmarks }) => {
             <div className="sgd-builder-context-options">
               {options.map((option) => renderBuilderChoice(option, dim))}
             </div>
+          )}
+          {blockedNote && blockedNote.dim === dim.id && (
+            <p className="sgd-builder-blocked-note" role="status">{blockedNote.reason}</p>
           )}
           {(currentOption?.description || dim.learnMore) && (
             <div className="sgd-builder-context-note">
