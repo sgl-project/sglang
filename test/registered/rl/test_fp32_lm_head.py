@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.srt.layers import logits_processor
 from sglang.srt.layers.logits_processor import (
     LogitsProcessor,
     _supports_mm_fp32_out_dtype,
@@ -44,11 +45,10 @@ class TestLMHeadFP32(unittest.TestCase):
 
     @staticmethod
     def _expected_operation(dtype):
-        # The fused mm(out_dtype=fp32) path is only taken where the BLAS
-        # backend implements it (notably not on some ROCm backends), so the
-        # expectation has to be probed the same way the kernel selects it.
-        # Warm the cache here: the probe itself calls torch.mm, which would
-        # otherwise be intercepted by the mock inside _run_case.
+        # The fused mm(out_dtype=fp32) path is only taken where torch
+        # implements it (not on pre-2.9.0 ROCm builds, not for BF16 below
+        # sm80), so the expectation has to be resolved the same way the
+        # kernel selects it.
         supported = torch.cuda.is_available() and _supports_mm_fp32_out_dtype(
             torch.device(get_device()).type, dtype
         )
@@ -73,7 +73,7 @@ class TestLMHeadFP32(unittest.TestCase):
         expected_operation,
         force_support=None,
     ):
-        # force_support pins what the capability probe reports, so both
+        # force_support pins what the capability check reports, so both
         # branches of the selection are covered on every runner instead of
         # only the one this host happens to support. The intercepted op is
         # then emulated rather than executed, since a host that reports no
@@ -227,6 +227,68 @@ class TestLMHeadFP32(unittest.TestCase):
             torch.bfloat16,
             "matmul",
         )
+
+
+class TestMMFP32OutDtypeGate(unittest.TestCase):
+    """Pure-metadata gate, so these run on every runner including CPU-only."""
+
+    def setUp(self):
+        _supports_mm_fp32_out_dtype.cache_clear()
+        self.addCleanup(_supports_mm_fp32_out_dtype.cache_clear)
+
+    def test_torch_version_compare_is_prerelease_aware(self):
+        # 2.9.0a0+git7bcbafe is the rocm700 CI image's torch: an alpha that
+        # predates pytorch#161540 and must NOT satisfy >= 2.9.0. A .release
+        # tuple comparison would read it as (2, 9, 0) and wrongly pass.
+        cases = {
+            "2.8.0": False,
+            "2.9.0a0+git7bcbafe": False,
+            "2.9.0": True,
+            "2.9.1": True,
+            "2.9.1+rocm7.2.0.git7e1940d4": True,
+            "2.10.0a0+gitdeadbee": True,
+            "not-a-version": False,
+        }
+        for version, expected in cases.items():
+            with self.subTest(version=version):
+                with patch.object(torch, "__version__", version):
+                    self.assertEqual(
+                        logits_processor._torch_at_least("2.9.0"), expected
+                    )
+
+    def test_rocm_gate_follows_torch_version(self):
+        for has_fix in (True, False):
+            with self.subTest(has_fix=has_fix):
+                _supports_mm_fp32_out_dtype.cache_clear()
+                with (
+                    patch.object(logits_processor, "_is_hip", True),
+                    patch.object(
+                        logits_processor, "_TORCH_HAS_ROCM_MM_FP32_OUT", has_fix
+                    ),
+                ):
+                    self.assertEqual(
+                        _supports_mm_fp32_out_dtype("cuda", torch.bfloat16), has_fix
+                    )
+
+    def test_cuda_bf16_requires_sm80(self):
+        for capability, expected in (((7, 5), False), ((8, 0), True), ((9, 0), True)):
+            with self.subTest(capability=capability):
+                _supports_mm_fp32_out_dtype.cache_clear()
+                with (
+                    patch.object(logits_processor, "_is_hip", False),
+                    patch.object(
+                        torch.cuda, "get_device_capability", lambda: capability
+                    ),
+                ):
+                    self.assertEqual(
+                        _supports_mm_fp32_out_dtype("cuda", torch.bfloat16), expected
+                    )
+                    # FP16 carries no compute-capability restriction.
+                    _supports_mm_fp32_out_dtype.cache_clear()
+                    self.assertTrue(_supports_mm_fp32_out_dtype("cuda", torch.float16))
+
+    def test_non_cuda_device_never_selects_mm(self):
+        self.assertFalse(_supports_mm_fp32_out_dtype("cpu", torch.bfloat16))
 
 
 if __name__ == "__main__":
