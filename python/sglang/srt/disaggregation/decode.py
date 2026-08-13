@@ -1368,6 +1368,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return (
             len(self.scheduler.running_batch.reqs)
             + len(self.transfer_queue.queue)
+            + len(self.scheduler.disagg_decode_prebuilt_queue)
             + len(self.scheduler.waiting_queue)
             + extra_reserved_reqs
         )
@@ -2157,7 +2158,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
-                running_batch=self.running_batch
+                running_batch=self.running_batch, last_batch=self.last_batch
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
@@ -2196,7 +2197,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
-                running_batch=self.running_batch
+                running_batch=self.running_batch, last_batch=self.last_batch
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
@@ -2247,13 +2248,20 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_decode_batch_to_run(
-        self: Scheduler, running_batch: ScheduleBatch
+        self: Scheduler,
+        running_batch: ScheduleBatch,
+        last_batch: Optional[ScheduleBatch],
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
+        local_chunk_stalled = self._conditional_local_chunk_is_stalled()
         # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        new_prebuilt_batch = (
+            self.get_new_prebuilt_batch(running_batch)
+            if not (self.conditional_agg_enabled and self.chunked_req is not None)
+            or local_chunk_stalled
+            else None
+        )
         if new_prebuilt_batch:
-            assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
                 new_prebuilt_batch
             )
@@ -2265,6 +2273,43 @@ class SchedulerDisaggregationDecodeMixin:
                         running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
+
+        if self.conditional_agg_enabled:
+            if local_chunk_stalled:
+                # A chunked prefill normally must run on every pass, but remote
+                # decode preallocation can consume the next chunk's pages. Run
+                # transferred requests until enough pages are free. The normal
+                # decision path must still stash the completed chunk and merge
+                # last_batch before prefill is suppressed.
+                return self.get_next_batch_to_run(
+                    running_batch=running_batch,
+                    last_batch=last_batch,
+                    allow_prefill=False,
+                )
+
+            # Remote preallocation and KV transfer can release capacity without
+            # changing the running batch. Retry local-prefill admission only
+            # after capacity has increased; clearing batch_is_full on every
+            # pass can over-admit chunked prefills and exhaust the KV pool.
+            if self.waiting_queue and running_batch.batch_is_full:
+                capacity = (
+                    self.token_to_kv_pool_allocator.available_size(),
+                    self.req_to_token_pool.available_size(),
+                )
+                full_capacity = self._conditional_agg_full_capacity
+                if full_capacity is not None and any(
+                    current > previous
+                    for current, previous in zip(capacity, full_capacity)
+                ):
+                    running_batch.batch_is_full = False
+                    self._conditional_agg_full_capacity = None
+                elif full_capacity is None:
+                    self._conditional_agg_full_capacity = capacity
+            else:
+                self._conditional_agg_full_capacity = None
+            return self.get_next_batch_to_run(
+                running_batch=running_batch, last_batch=last_batch
+            )
 
         # Schedule decode batch
         if running_batch.is_empty():
@@ -2278,6 +2323,21 @@ class SchedulerDisaggregationDecodeMixin:
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _conditional_local_chunk_is_stalled(self: Scheduler) -> bool:
+        if not self.conditional_agg_enabled or self.chunked_req is None:
+            return False
+
+        remaining_tokens = len(self.chunked_req.full_untruncated_fill_ids) - len(
+            self.chunked_req.prefix_indices
+        )
+        next_chunk_tokens = min(
+            remaining_tokens,
+            self.max_prefill_tokens,
+            self.chunked_prefill_size or remaining_tokens,
+        )
+        required_tokens = next_chunk_tokens + self.token_to_kv_pool_allocator.page_size
+        return self.token_to_kv_pool_allocator.available_size() < required_tokens
+
     def get_new_prebuilt_batch(
         self: Scheduler, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
@@ -2287,11 +2347,16 @@ class SchedulerDisaggregationDecodeMixin:
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if len(self.waiting_queue) == 0:
+        prebuilt_queue = (
+            self.disagg_decode_prebuilt_queue
+            if self.conditional_agg_enabled
+            else self.waiting_queue
+        )
+        if len(prebuilt_queue) == 0:
             return None
 
         if self.enable_priority_scheduling:
-            self.policy.calc_priority(self.waiting_queue, running_batch)
+            self.policy.calc_priority(prebuilt_queue, running_batch)
 
         curr_batch_size = running_batch.batch_size()
 
@@ -2299,12 +2364,12 @@ class SchedulerDisaggregationDecodeMixin:
 
         num_not_used_batch = batch_size - curr_batch_size
 
-        # pop req from waiting queue
+        # Pop requests from the queue of transferred KV.
         can_run_list: List[Req] = []
-        waiting_queue: List[Req] = []
+        remaining_prebuilt: List[Req] = []
 
-        for i in range(len(self.waiting_queue)):
-            req = self.waiting_queue[i]
+        for i in range(len(prebuilt_queue)):
+            req = prebuilt_queue[i]
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
@@ -2322,9 +2387,12 @@ class SchedulerDisaggregationDecodeMixin:
                 if req.kv_committed_len is not None:
                     req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
             else:
-                waiting_queue.append(req)
+                remaining_prebuilt.append(req)
 
-        self.waiting_queue = waiting_queue
+        if self.conditional_agg_enabled:
+            self.disagg_decode_prebuilt_queue = remaining_prebuilt
+        else:
+            self.waiting_queue = remaining_prebuilt
         if len(can_run_list) == 0:
             return None
 
@@ -2354,12 +2422,23 @@ class SchedulerDisaggregationDecodeMixin:
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
-        # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
-        resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
-        self.waiting_queue.extend(resumed_reqs)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
-            # if there are still retracted requests, we do not allocate new requests
-            return
+        local_chunk_active = (
+            self.conditional_agg_enabled and self.chunked_req is not None
+        )
+        prebuilt_queue = (
+            self.disagg_decode_prebuilt_queue
+            if self.conditional_agg_enabled
+            else self.waiting_queue
+        )
+        if not local_chunk_active:
+            # Try to resume retracted requests if there is enough space for
+            # another `num_reserved_decode_tokens` decode steps.
+            resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
+            prebuilt_queue.extend(resumed_reqs)
+            if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
+                # If there are still retracted requests, do not allocate new
+                # requests.
+                return
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
@@ -2368,8 +2447,9 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-            self.disagg_decode_transfer_queue.extend(req_conns)
+            if not local_chunk_active:
+                req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+                self.disagg_decode_transfer_queue.extend(req_conns)
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
@@ -2377,4 +2457,4 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.extend(transferred_reqs)
+            prebuilt_queue.extend(transferred_reqs)

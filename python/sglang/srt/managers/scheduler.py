@@ -1281,11 +1281,17 @@ class Scheduler(
         self.disagg_prefill_inflight_queue = None
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
+        self.disagg_decode_prebuilt_queue = None
 
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         self.transfer_backend = TransferBackend(
             get_disagg().disaggregation_transfer_backend
         )
+        self.conditional_agg_enabled = (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and get_disagg().disaggregation_decode_enable_conditional_agg
+        )
+        self._conditional_agg_full_capacity: Optional[Tuple[int, int]] = None
 
         # In rust-server mode the KV bootstrap registry is already serving on
         # the rust api listener (maybe_init_rust_server runs before this
@@ -1374,6 +1380,9 @@ class Scheduler(
                 num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
+            # Conditional aggregation reserves waiting_queue for requests that
+            # the decode worker must prefill locally.
+            self.disagg_decode_prebuilt_queue: List[Req] = []
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -2413,6 +2422,7 @@ class Scheduler(
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
+                do_local_prefill=recv_req.do_local_prefill,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
@@ -2440,6 +2450,7 @@ class Scheduler(
                 if (
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
+                    and not (self.conditional_agg_enabled and req.do_local_prefill)
                 ):
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
@@ -2728,11 +2739,19 @@ class Scheduler(
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
-            if not is_retracted:
-                req.time_stats.set_decode_prealloc_queue_entry_time()
+            if self.conditional_agg_enabled and req.do_local_prefill:
+                self._prefetch_kvcache(req)
+                self.waiting_queue.append(req)
+                if is_retracted:
+                    req.time_stats.set_retract_time()
+                else:
+                    req.time_stats.set_wait_queue_entry_time()
             else:
-                req.time_stats.set_retract_time()
+                self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
+                if is_retracted:
+                    req.time_stats.set_retract_time()
+                else:
+                    req.time_stats.set_decode_prealloc_queue_entry_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
@@ -3010,7 +3029,10 @@ class Scheduler(
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(
-        self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
+        self,
+        running_batch: ScheduleBatch,
+        last_batch: Optional[ScheduleBatch],
+        allow_prefill: bool = True,
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
 
@@ -3098,7 +3120,9 @@ class Scheduler(
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
-        if self.dllm_config is not None:
+        if not allow_prefill:
+            new_batch = None
+        elif self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
@@ -4093,6 +4117,8 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
+        if (prebuilt_queue := self.disagg_decode_prebuilt_queue) is not None:
+            idle &= len(prebuilt_queue) == 0
 
         if (
             for_health_check
@@ -4456,8 +4482,12 @@ class Scheduler(
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
-            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
+            # Remote-prefilled decode requests have KV allocated. A local-prefill
+            # request can still be waiting for its first allocation.
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and req.req_pool_idx is not None
+            ):
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -4525,6 +4555,22 @@ class Scheduler(
                         req.disagg_kv_sender.abort()
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            if self.disagg_decode_prebuilt_queue:
+                remaining_prebuilt = []
+                for req in self.disagg_decode_prebuilt_queue:
+                    if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                        logger.debug(f"Abort prebuilt queue request. {req.rid=}")
+                        if self.enable_hicache_storage:
+                            self.tree_cache.release_aborted_request(req.rid)
+                        self.ipc_channels.send_to_tokenizer.send_output(
+                            AbortReq(rid=req.rid), req
+                        )
+                        if req.req_pool_idx is not None:
+                            release_kv_cache(req, self.tree_cache)
+                    else:
+                        remaining_prebuilt.append(req)
+                self.disagg_decode_prebuilt_queue = remaining_prebuilt
+
             # Abort requests that have not yet finished preallocation
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
@@ -4632,11 +4678,14 @@ class Scheduler(
         self.running_batch.reqs = []
         for req in retract_reqs:
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                if req.output_ids:
-                    req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
-                req.pd_rebootstrap_in_progress = True
-                req.time_stats.set_retract_time()
-                self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
+                if self.conditional_agg_enabled and req.do_local_prefill:
+                    self._add_request_to_queue(req, is_retracted=True)
+                else:
+                    if req.output_ids:
+                        req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+                    req.pd_rebootstrap_in_progress = True
+                    req.time_stats.set_retract_time()
+                    self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
             else:
                 self._add_request_to_queue(req)
         self.running_batch.batch_is_full = False

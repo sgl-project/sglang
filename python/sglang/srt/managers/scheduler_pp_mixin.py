@@ -414,7 +414,7 @@ class SchedulerPPMixin:
 
                 # get batch to run and proxy tensors if needed
                 plan = self.get_next_disagg_decode_batch_to_run(
-                    running_batch=self.running_batch
+                    running_batch=self.running_batch, last_batch=self.last_batch
                 )
                 self.running_batch = plan.running_batch
                 batch = plan.batch_to_run
