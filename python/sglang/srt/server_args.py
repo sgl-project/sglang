@@ -2382,6 +2382,10 @@ class ServerArgs:
         "Choose the computation precision of flashinfer mxfp4 moe",
         NS("exec.moe"),
     ] = "default"
+    flashinfer_megamoe_mxfp8_precision: A[
+        Literal["default", "bf16"],
+        "Choose the computation precision of FlashInfer MegaMOE MXFP8 experts.",
+    ] = "default"
     deepep_mode: A[
         Literal["auto", "normal", "low_latency"],
         "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",

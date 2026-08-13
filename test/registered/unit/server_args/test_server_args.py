@@ -2433,5 +2433,21 @@ class TestDcpKvEventContract(CustomTestCase):
         self.assertEqual(args.kv_event_block_size, 8)
 
 
+class TestFlashInferMegaMoeMxfp8Precision(CustomTestCase):
+    def test_defaults_to_existing_mxfp8_path(self):
+        self.assertEqual(
+            ServerArgs(model_path="dummy").flashinfer_megamoe_mxfp8_precision,
+            "default",
+        )
+
+    def test_accepts_bf16_path(self):
+        self.assertEqual(
+            ServerArgs(
+                model_path="dummy", flashinfer_megamoe_mxfp8_precision="bf16"
+            ).flashinfer_megamoe_mxfp8_precision,
+            "bf16",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

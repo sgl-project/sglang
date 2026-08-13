@@ -14,8 +14,10 @@ from sglang.srt.layers.moe.flashinfer_megamoe import (
     _validate_nvfp4_fc1_alpha,
     ensure_bf16_moe_layer_for_flashinfer_megamoe,
     ensure_fp4_moe_layer_for_flashinfer_megamoe,
+    ensure_mxfp8_bf16_moe_layer_for_flashinfer_megamoe,
     prepare_bf16_moe_weights_for_flashinfer_megamoe,
     prepare_fp4_moe_weights_for_flashinfer_megamoe,
+    prepare_mxfp8_bf16_moe_weights_for_flashinfer_megamoe,
     run_flashinfer_megamoe,
 )
 from sglang.srt.layers.moe.moe_runner.base import FusedOpPool, MoeRunnerConfig
@@ -223,6 +225,105 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
         transformed = mega.kwargs["backend"].kwargs["transformed_weights"]
         self.assertIsNone(transformed[0][1])
         self.assertIsNone(transformed[1][1])
+
+    def test_prepares_mxfp8_bf16_weights_then_lazily_builds_layer(self):
+        preprocess_args = {}
+        transformed_weights = (
+            (
+                torch.empty(2, dtype=torch.float8_e4m3fn),
+                torch.empty(3, dtype=torch.uint8),
+            ),
+            (
+                torch.empty(4, dtype=torch.float8_e4m3fn),
+                torch.empty(5, dtype=torch.uint8),
+            ),
+        )
+
+        class FakeConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        def fake_preprocess(weights, **kwargs):
+            preprocess_args.update(weights=weights, **kwargs)
+            return transformed_weights
+
+        flashinfer = types.ModuleType("flashinfer")
+        flashinfer.__spec__ = importlib.machinery.ModuleSpec("flashinfer", loader=None)
+        moe_ep = types.ModuleType("flashinfer.moe_ep")
+        for name in (
+            "BootstrapConfig",
+            "FleetParams",
+            "MegaConfig",
+            "MoEEpMegaLayer",
+            "MoEWeightPack",
+            "Mxfp8Bf16CutedslMegaMoeConfig",
+        ):
+            setattr(moe_ep, name, FakeConfig)
+        moe_ep.preprocess_mxfp8_bf16_cutedsl_mega_weights = fake_preprocess
+        flashinfer.moe_ep = moe_ep
+        layer = SimpleNamespace(
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            num_experts=8,
+            hidden_size=128,
+            intermediate_size_per_partition=128,
+            top_k=2,
+            w13_weight=torch.nn.Parameter(
+                torch.empty(1, dtype=torch.float8_e4m3fn), requires_grad=False
+            ),
+            w2_weight=torch.nn.Parameter(
+                torch.empty(1, dtype=torch.float8_e4m3fn), requires_grad=False
+            ),
+            w13_weight_scale_inv=torch.nn.Parameter(
+                torch.empty(1, dtype=torch.uint8), requires_grad=False
+            ),
+            w2_weight_scale_inv=torch.nn.Parameter(
+                torch.empty(1, dtype=torch.uint8), requires_grad=False
+            ),
+            moe_runner_config=SimpleNamespace(
+                activation="silu", is_gated=True, swiglu_limit=None
+            ),
+        )
+
+        with (
+            patch.dict(
+                sys.modules,
+                {"flashinfer": flashinfer, "flashinfer.moe_ep": moe_ep},
+            ),
+            patch(
+                "sglang.srt.layers.moe.flashinfer_megamoe._resolve_max_tokens_per_rank",
+                return_value=1024,
+            ),
+            patch(
+                "sglang.srt.layers.moe.flashinfer_megamoe._get_moe_ep_process_group",
+                return_value=object(),
+            ),
+        ):
+            prepare_mxfp8_bf16_moe_weights_for_flashinfer_megamoe(layer)
+            mega = ensure_mxfp8_bf16_moe_layer_for_flashinfer_megamoe(layer)
+            self.assertIs(
+                ensure_mxfp8_bf16_moe_layer_for_flashinfer_megamoe(layer), mega
+            )
+
+        self.assertEqual(preprocess_args["intermediate_size"], 128)
+        self.assertEqual(preprocess_args["hidden_size"], 128)
+        self.assertEqual(preprocess_args["kind"], "mxfp8_bf16_e4m3")
+        weights = preprocess_args["weights"].kwargs
+        self.assertEqual(weights["w13_scale"].dtype, torch.uint8)
+        self.assertEqual(weights["w2_scale"].dtype, torch.uint8)
+        backend = mega.kwargs["backend"]
+        self.assertFalse(backend.kwargs["preprocess_weights"])
+        config = backend.kwargs["megakernel"]
+        self.assertEqual(config.kwargs["kind"], "mxfp8_bf16_e4m3")
+        transformed = backend.kwargs["transformed_weights"]
+        self.assertEqual(transformed[0][0].data_ptr(), layer.w13_weight.data.data_ptr())
+        self.assertEqual(transformed[1][0].data_ptr(), layer.w2_weight.data.data_ptr())
+        self.assertEqual(
+            transformed[0][1].data_ptr(), layer.w13_weight_scale_inv.data.data_ptr()
+        )
+        self.assertEqual(
+            transformed[1][1].data_ptr(), layer.w2_weight_scale_inv.data.data_ptr()
+        )
 
     def test_bf16_weight_preparation_rejects_unsupported_experts(self):
         layer = SimpleNamespace(

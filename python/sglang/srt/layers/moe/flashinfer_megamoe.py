@@ -384,6 +384,26 @@ def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     )
 
 
+def ensure_mxfp8_bf16_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
+    mega = getattr(layer, "_flashinfer_megamoe_layer", None)
+    if mega is not None:
+        return mega
+
+    from flashinfer.moe_ep import Mxfp8Bf16CutedslMegaMoeConfig
+
+    return _ensure_flashinfer_megamoe_layer(
+        layer,
+        megakernel_config=Mxfp8Bf16CutedslMegaMoeConfig(
+            intermediate_size=layer.intermediate_size_per_partition,
+            top_k=layer.top_k,
+            kind="mxfp8_bf16_e4m3",
+            gate_up_clamp=layer.moe_runner_config.swiglu_limit,
+        ),
+        w13_scale_name="w13_weight_scale_inv",
+        w2_scale_name="w2_weight_scale_inv",
+    )
+
+
 def ensure_bf16_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     mega = getattr(layer, "_flashinfer_megamoe_layer", None)
     if mega is not None:
@@ -536,6 +556,62 @@ def prepare_mxfp8_moe_weights_for_flashinfer_megamoe(
         kind="mxfp8_e4m3",
         gate_up_clamp=layer.moe_runner_config.swiglu_limit,
         activation_clamp=None,
+    )
+    _bind_transformed_weights(
+        layer,
+        transformed_weights,
+        w13_scale_name="w13_weight_scale_inv",
+        w2_scale_name="w2_weight_scale_inv",
+    )
+
+
+def prepare_mxfp8_bf16_moe_weights_for_flashinfer_megamoe(
+    layer: FusedMoE,
+) -> None:
+    from flashinfer.moe_ep import (
+        MoEWeightPack,
+        preprocess_mxfp8_bf16_cutedsl_mega_weights,
+    )
+
+    if not layer.moe_runner_config.is_gated:
+        raise ValueError(
+            "FlashInfer MXFP8 x BF16 MegaMOE requires gated SwiGLU experts."
+        )
+    if layer.moe_runner_config.activation != "silu":
+        raise ValueError(
+            "FlashInfer MXFP8 x BF16 MegaMOE requires silu activation for SwiGLU experts."
+        )
+    if hasattr(layer, "w13_weight_bias") or hasattr(layer, "w2_weight_bias"):
+        raise ValueError(
+            "FlashInfer MXFP8 x BF16 MegaMOE does not support expert biases."
+        )
+    if layer.hidden_size % 32 != 0:
+        raise ValueError(
+            "FlashInfer MXFP8 x BF16 MegaMOE requires hidden_size to be a multiple "
+            f"of 32, got {layer.hidden_size}."
+        )
+    if layer.intermediate_size_per_partition % 64 != 0:
+        raise ValueError(
+            "FlashInfer MXFP8 x BF16 MegaMOE requires intermediate_size_per_partition "
+            f"to be a multiple of 64, got {layer.intermediate_size_per_partition}."
+        )
+    if layer.num_experts % layer.moe_ep_size != 0:
+        raise ValueError(
+            "FlashInfer MXFP8 x BF16 MegaMOE requires num_experts to be divisible by "
+            f"ep_size, got {layer.num_experts=} and {layer.moe_ep_size=}."
+        )
+
+    weights = MoEWeightPack(
+        w13=layer.w13_weight.data,
+        w2=layer.w2_weight.data,
+        w13_scale=layer.w13_weight_scale_inv.data,
+        w2_scale=layer.w2_weight_scale_inv.data,
+    )
+    transformed_weights = preprocess_mxfp8_bf16_cutedsl_mega_weights(
+        weights,
+        intermediate_size=layer.intermediate_size_per_partition,
+        hidden_size=layer.hidden_size,
+        kind="mxfp8_bf16_e4m3",
     )
     _bind_transformed_weights(
         layer,
