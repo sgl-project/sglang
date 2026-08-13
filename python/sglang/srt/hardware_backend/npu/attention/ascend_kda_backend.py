@@ -459,7 +459,6 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             intermediate_states_buffer=intermediate_state,
             intermediate_state_indices=intermediate_indices,
             cache_steps=draft_token_num,
-            lower_bound=None,
             gates_are_preactivated=True,
         )
         if dense_token_indices is None:
