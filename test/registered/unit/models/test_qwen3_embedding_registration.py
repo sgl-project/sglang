@@ -21,8 +21,10 @@ class TestQwen3ModelEmbeddingRegistration(CustomTestCase):
         """The bare arch string maps to a native EntryClass named 'Qwen3Model'."""
         from sglang.srt.models import qwen3_embedding
 
-        entry = qwen3_embedding.EntryClass
-        self.assertEqual(entry.__name__, "Qwen3Model")
+        entries = qwen3_embedding.EntryClass
+        entries = entries if isinstance(entries, list) else [entries]
+        by_name = {c.__name__: c for c in entries}
+        entry = by_name["Qwen3Model"]
         self.assertEqual(entry.__module__, "sglang.srt.models.qwen3_embedding")
         # It carries a LAST-token / normalized pooler, i.e. an embedding head.
         self.assertTrue(hasattr(entry, "forward"))
