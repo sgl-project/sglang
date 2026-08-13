@@ -221,7 +221,7 @@ def _finalize(
     policy,
     mode="world",
     group_size=2,
-    batched=False,
+    prefer_dp=False,
     measured=True,
 ):
     monkeypatch.setattr(
@@ -234,7 +234,7 @@ def _finalize(
     )
     enc = _enc(hidden, heads, inter)
     enc.parallel_folding_mode = mode
-    finalize_encoder_folding(enc, policy, batched=batched)
+    finalize_encoder_folding(enc, policy, prefer_dp=prefer_dp)
     return enc.parallel_folding_mode
 
 
@@ -249,11 +249,13 @@ def test_finalize_auto_keeps_wide_clears_narrow(monkeypatch):
     assert _finalize(monkeypatch, 2560, 32, 9728, "auto") is None  # below threshold
 
 
-def test_finalize_auto_leaves_dp_capable_unsharded_when_batched(monkeypatch):
+def test_finalize_auto_leaves_dp_capable_unsharded_when_dp_preferred(monkeypatch):
     # with a batch, dp (one all_gather) beats folding (an all_reduce per layer)
-    assert _finalize(monkeypatch, 4096, 64, 10240, "auto", batched=True) is None
+    assert _finalize(monkeypatch, 4096, 64, 10240, "auto", prefer_dp=True) is None
+    # TP or DiT-DP makes encoder DP ineligible, so keep the useful fold
+    assert _finalize(monkeypatch, 4096, 64, 10240, "auto") == "world"
     # CLIP-L cannot dp either, so folding remains the only question
-    assert _finalize(monkeypatch, 768, 12, 3072, "auto", batched=True) is None
+    assert _finalize(monkeypatch, 768, 12, 3072, "auto", prefer_dp=True) is None
 
 
 def test_finalize_auto_needs_a_measured_topology(monkeypatch):

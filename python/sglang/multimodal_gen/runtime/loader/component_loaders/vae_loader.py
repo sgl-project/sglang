@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 
-from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -99,11 +98,6 @@ class VAELoader(ComponentLoader):
     component_names = ["vae", "audio_vae", "video_vae"]
     expected_library = "diffusers"
 
-    def should_offload(
-        self, server_args: ServerArgs, model_config: ModelConfig | None = None
-    ):
-        return server_args.vae_cpu_offload
-
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
@@ -139,13 +133,15 @@ class VAELoader(ComponentLoader):
             # NOTE: some post init logics are only available after updated with config
             vae_config.post_init()
 
-        should_offload = self.should_offload(server_args)
+        should_offload = server_args.should_cpu_offload_component(component_name)
         target_device = self.target_device(should_offload)
 
-        # Check for auto_map first (custom VAE classes)
+        native_only = component_name in getattr(
+            server_args.pipeline_config, "native_only_components", ()
+        )
         auto_map = config.get("auto_map", {})
         auto_model_map = auto_map.get("AutoModel")
-        if auto_model_map:
+        if auto_model_map and not native_only:
             module_path, cls_name = auto_model_map.rsplit(".", 1)
             custom_module_file = os.path.join(component_model_path, f"{module_path}.py")
             spec = importlib.util.spec_from_file_location("_custom", custom_module_file)
@@ -191,16 +187,18 @@ class VAELoader(ComponentLoader):
         for sf_path in safetensors_list:
             loaded.update(safetensors_load_file(sf_path))
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_name)
-        vae.load_state_dict(loaded, strict=False)
+        strict_load = native_only
+        vae.load_state_dict(loaded, strict=strict_load)
 
-        state_keys = set(vae.state_dict().keys())
-        loaded_keys = set(loaded.keys())
-        missing_keys = sorted(state_keys - loaded_keys)
-        unexpected_keys = sorted(loaded_keys - state_keys)
-        if missing_keys:
-            logger.warning("VAE missing keys: %s", missing_keys)
-        if unexpected_keys:
-            logger.warning("VAE unexpected keys: %s", unexpected_keys)
+        if not strict_load:
+            state_keys = set(vae.state_dict().keys())
+            loaded_keys = set(loaded.keys())
+            missing_keys = sorted(state_keys - loaded_keys)
+            unexpected_keys = sorted(loaded_keys - state_keys)
+            if missing_keys:
+                logger.warning("VAE missing keys: %s", missing_keys)
+            if unexpected_keys:
+                logger.warning("VAE unexpected keys: %s", unexpected_keys)
 
         if _should_use_channels_last_3d(server_args, component_name):
             n = _convert_conv3d_weights_to_channels_last_3d(vae)
