@@ -505,11 +505,11 @@ _FakeW4A16HeadMethod.__name__ = "ModelOptNvFp4A16LinearMethod"
 class TestDFlashGreedyHead(unittest.TestCase):
     @staticmethod
     def _worker_stub():
-        return SimpleNamespace(
-            _draft_greedy_local_cap=0,
-            _draft_greedy_local_max_buf=None,
-            _draft_greedy_local_arg_buf=None,
-        )
+        worker = object.__new__(dflash_worker_v2.DFlashWorkerV2)
+        worker._draft_greedy_local_cap = 0
+        worker._draft_greedy_local_max_buf = None
+        worker._draft_greedy_local_arg_buf = None
+        return worker
 
     @staticmethod
     def _shard_indices(*, num_org, num_org_padded, num_added):
@@ -521,7 +521,12 @@ class TestDFlashGreedyHead(unittest.TestCase):
             added_vocab_start_index=100,
         )
 
-    def test_quantized_head_uses_quant_method_instead_of_packed_weight(self):
+    @patch.object(
+        dflash_worker_v2,
+        "get_tp_group",
+        return_value=SimpleNamespace(world_size=1),
+    )
+    def test_quantized_head_uses_quant_method_instead_of_packed_weight(self, _tp_group):
         hidden_states = torch.tensor([[1.0, -2.0, 0.5, 3.0]])
         dense_weight = torch.tensor(
             [
@@ -542,7 +547,7 @@ class TestDFlashGreedyHead(unittest.TestCase):
 
         actual = (
             dflash_worker_v2.DFlashWorkerV2._greedy_sample_from_vocab_parallel_head(
-                SimpleNamespace(), hidden_states=hidden_states, lm_head=lm_head
+                self._worker_stub(), hidden_states=hidden_states, lm_head=lm_head
             )
         )
         expected = torch.argmax(hidden_states @ dense_weight.T, dim=-1)
@@ -636,7 +641,7 @@ class TestDFlashGreedyHead(unittest.TestCase):
         "get_tp_group",
         return_value=SimpleNamespace(world_size=1),
     )
-    def test_quantized_added_vocab_path_applies_head_once(self, _tp_group):
+    def test_quantized_head_path_applies_once_and_excludes_padding(self, _tp_group):
         dense_weight = torch.tensor(
             [
                 [1.0, 0.0],
@@ -655,7 +660,7 @@ class TestDFlashGreedyHead(unittest.TestCase):
             workspace=torch.empty(1),
             input_size_per_partition=2,
             output_size_per_partition=5,
-            shard_indices=self._shard_indices(num_org=2, num_org_padded=3, num_added=2),
+            org_vocab_size=2,
         )
 
         actual = (
@@ -666,7 +671,7 @@ class TestDFlashGreedyHead(unittest.TestCase):
             )
         )
 
-        torch.testing.assert_close(actual, torch.tensor([100]))
+        torch.testing.assert_close(actual, torch.tensor([0]))
         self.assertEqual(quant_method.calls, 1)
 
 

@@ -1747,6 +1747,7 @@ class ServerArgs:
             help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
             cli_name="--fp4-gemm-backend",
             choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
+            resolvable=True,
         ),
         NS("exec.kernel"),
     ] = "auto"
@@ -2161,6 +2162,20 @@ class ServerArgs:
         Arg(
             help="Attention backend for speculative decoding drafting.",
             resolvable=True,
+        ),
+        NS("spec"),
+    ] = None
+    speculative_draft_kv_cache_dtype: A[
+        Optional[str],
+        Arg(
+            help="KV cache dtype for the speculative draft model only. The draft pool is "
+            "allocated with one slot per target token (draft and target share a slot index "
+            "space), so for a small draft it can still rival the target pool: a 5-layer "
+            "DFLASH draft costs 10240 bytes/token in bf16. Setting fp8_e4m3 halves the draft "
+            "pool; the saving shows up as free device memory, so raise "
+            "--mem-fraction-static to convert it into KV capacity. Default follows "
+            "--kv-cache-dtype.",
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
         ),
         NS("spec"),
     ] = None
@@ -3099,6 +3114,14 @@ class ServerArgs:
     language_only: A[
         bool, "For VLM, load weights for the language model only.", NS("disagg")
     ] = False
+    language_model_only: A[
+        bool,
+        "Skip the multimodal encoder entirely: its weights are never loaded and the "
+        "tower is never built, freeing that GPU memory for KV cache. Multimodal "
+        "requests are rejected. Unlike --language-only this is a standalone mode, "
+        "not part of encoder/decoder disaggregation.",
+        NS("disagg"),
+    ] = False
     encoder_transfer_backend: A[
         str,
         Arg(
@@ -3555,6 +3578,7 @@ class ServerArgs:
         # resolution (the declarative registry materializes too late to affect
         # it). Inkling opts into full-graph prefill capture here.
         self._apply_inkling_prefill_cuda_graph_default()
+        self._apply_muse_glimmer_prefill_cuda_graph_max_bs_default()
 
         # must run before _handle_cuda_graph_config and _handle_data_parallelism
         self._handle_dwdp()
@@ -3858,6 +3882,8 @@ class ServerArgs:
 
     def _handle_model_source_paths(self):
         """Prepare metadata for model paths backed by remote object stores."""
+        self._resolve_hf_gguf_model_path()
+
         seen_paths = set()
         for model_path in (
             self.model_path,
@@ -4308,6 +4334,16 @@ class ServerArgs:
             "InklingForConditionalGenerationMTP",
         ):
             self.cuda_graph_backend_prefill = Backend.FULL
+
+    def _apply_muse_glimmer_prefill_cuda_graph_max_bs_default(self):
+        if (
+            self.cuda_graph_max_bs_prefill is not None
+            or parse_connector_type(self.model_path) == ConnectorType.INSTANCE
+        ):
+            return
+        arch = self.get_model_config().hf_config.architectures[0]
+        if arch in ("MuseGlimmerForCausalLM", "MuseGlimmerForConditionalGeneration"):
+            self.cuda_graph_max_bs_prefill = 512
 
     def _handle_cuda_graph_config(self):
         from sglang.srt.arg_groups.kimi_k3_hook import disable_kimi_k3_symm_mem
@@ -4867,6 +4903,7 @@ class ServerArgs:
             if (
                 model_config.is_multimodal
                 and not self.language_only
+                and not self.language_model_only
                 and self.disaggregation_mode != "decode"
             ):
                 self.adjust_mem_fraction_for_vlm(model_config)
@@ -6390,7 +6427,11 @@ class ServerArgs:
                     raise ValueError(
                         "MiMo V2 CP-v2 only supports --cp-strategy zigzag."
                     )
-                if model_config.is_multimodal and not self.language_only:
+                if (
+                    model_config.is_multimodal
+                    and not self.language_only
+                    and not self.language_model_only
+                ):
                     raise ValueError(
                         "MiMo V2 CP-v2 only supports text inference; add "
                         "--language-only."
@@ -7318,6 +7359,32 @@ class ServerArgs:
             f"switching to {new_layout} layout for {self.hicache_io_backend} io backend"
         )
 
+    def _resolve_hf_gguf_model_path(self):
+        """Turn a Hub reference to a .gguf into a local file path."""
+        from sglang.srt.utils.hf_transformers_utils import resolve_hf_gguf_reference
+
+        resolved = resolve_hf_gguf_reference(self.model_path, revision=self.revision)
+        if resolved is not None:
+            logger.info("Resolved GGUF %s -> %s", self.model_path, resolved)
+            if self.tokenizer_path == self.model_path:
+                self.tokenizer_path = resolved
+            self.model_path = resolved
+
+        # A speculative draft can be a .gguf too, and it is loaded by path, so it
+        # needs the same Hub-reference resolution as the target.
+        if self.speculative_draft_model_path:
+            resolved_draft = resolve_hf_gguf_reference(
+                self.speculative_draft_model_path,
+                revision=self.speculative_draft_model_revision,
+            )
+            if resolved_draft is not None:
+                logger.info(
+                    "Resolved draft GGUF %s -> %s",
+                    self.speculative_draft_model_path,
+                    resolved_draft,
+                )
+                self.speculative_draft_model_path = resolved_draft
+
     def _handle_load_format(self):
         # The quantization side of the gguf coupling moved to the pipeline
         # (arg_groups/overrides.py: _gguf_quantization); load_format itself is
@@ -7472,7 +7539,39 @@ class ServerArgs:
         except Exception:
             return False
 
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
+
+    def _handle_language_model_only(self):
+        if not self.language_model_only:
+            return
+        for flag, name in (
+            (self.encoder_only, "--encoder-only"),
+            (self.language_only, "--language-only"),
+            (self.enable_prefix_mm_cache, "--enable-prefix-mm-cache"),
+            (
+                self.enable_broadcast_mm_inputs_process,
+                "--enable-broadcast-mm-inputs-process",
+            ),
+            (self.mm_enable_dp_encoder, "--mm-enable-dp-encoder"),
+        ):
+            if flag:
+                raise ValueError(
+                    f"--language-model-only cannot be combined with {name}"
+                )
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "--language-model-only is incompatible with --disaggregation-mode "
+                "prefill/decode"
+            )
+        architectures = self.get_model_config().hf_config.architectures
+        if not any(a in self.LANGUAGE_MODEL_ONLY_ARCHITECTURES for a in architectures):
+            raise ValueError(
+                f"--language-model-only does not support {architectures}. "
+                f"Supported: {list(self.LANGUAGE_MODEL_ONLY_ARCHITECTURES)}."
+            )
+
     def _handle_encoder_disaggregation(self):
+        self._handle_language_model_only()
         if self.enable_prefix_mm_cache and not self.encoder_only:
             raise ValueError(
                 "--enable-prefix-mm-cache requires --encoder-only to be enabled"

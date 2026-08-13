@@ -740,6 +740,39 @@ class TestEmbeddingReqInputGetItem(CustomTestCase):
             [cross_encoder_req[0].priority, cross_encoder_req[1].priority], [3, 3]
         )
 
+    def test_lora_identity_survives_batch_split(self):
+        """Each embedding subrequest must retain its adapter path and resolved ID."""
+        cases = (
+            (["Hello", "World"], False),
+            (
+                [["query 1", "document 1"], ["query 2", "document 2"]],
+                True,
+            ),
+        )
+        for text, is_cross_encoder_request in cases:
+            with self.subTest(cross_encoder=is_cross_encoder_request):
+                req = EmbeddingReqInput(
+                    text=text,
+                    is_cross_encoder_request=is_cross_encoder_request,
+                    lora_path="adapter",
+                    lora_id=["id-0", "id-1"],
+                )
+                req.normalize_batch_and_arguments()
+
+                self.assertEqual(req.lora_path, ["adapter", "adapter"])
+                self.assertEqual(
+                    [(req[i].lora_path, req[i].lora_id) for i in range(2)],
+                    [("adapter", "id-0"), ("adapter", "id-1")],
+                )
+
+    def test_lora_path_count_must_match_embedding_batch(self):
+        """A partial adapter list must not silently route remaining items to base."""
+        req = EmbeddingReqInput(
+            text=["first", "second"], lora_path=["only-one-adapter"]
+        )
+        with self.assertRaisesRegex(ValueError, "must match batch size"):
+            req.normalize_batch_and_arguments()
+
 
 if __name__ == "__main__":
     unittest.main()
