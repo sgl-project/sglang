@@ -22,7 +22,12 @@ _MAX_M = 64
 # (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps) per M bucket. BLOCK_M == 1 is
 # the GEMV formulation (weight re-read per row); above it the rows share one
 # weight read through an MFMA tile, which is what a decode batch needs.
-_CONFIGS = ((8, (1, 16, 512, 4, 16)), (_MAX_M, (16, 16, 256, 8, 4)))
+_CONFIGS = (
+    (8, (1, 16, 512, 4, 16)),
+    (16, (16, 16, 512, 8, 4)),
+    (32, (16, 32, 512, 8, 4)),
+    (_MAX_M, (32, 32, 512, 8, 4)),
+)
 
 
 def _config(m: int):
