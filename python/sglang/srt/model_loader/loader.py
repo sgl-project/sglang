@@ -242,6 +242,7 @@ def _get_quantization_config(
                         "q_a_proj",
                         "kv_a_proj_with_mqa",
                     ],
+                    "index_qkv_proj": ["index_q_proj", "index_k_proj"],
                 },
             }
         )
@@ -3038,8 +3039,14 @@ class GGUFModelLoader(BaseModelLoader):
                 "Please install gguf via `pip install gguf` to use gguf quantizer."
             ) from err
 
+        from sglang.srt.model_loader.gguf_name_maps import GGUF_HF_NAME_MAP_BUILDERS
+
         config = model_config.hf_config
         model_type = config.model_type
+        name_map_builder = GGUF_HF_NAME_MAP_BUILDERS.get(model_type)
+        if name_map_builder is not None:
+            return name_map_builder(config)
+
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
             model_type = "command-r"

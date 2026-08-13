@@ -104,7 +104,8 @@ class AccuracyTwoPassMixin:
             )
             self.assertLessEqual(
                 diff,
-                self.max_accuracy_diff,
+                # Allow floating-point noise at the exact threshold (e.g. 0.98 - 0.96).
+                self.max_accuracy_diff + 1e-12,
                 f"{name} accuracy diff {diff:.3f} exceeds max {self.max_accuracy_diff} "
                 f"(pass1={acc1:.3f}, pass2={acc2:.3f})",
             )
