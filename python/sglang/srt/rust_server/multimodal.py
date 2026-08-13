@@ -247,10 +247,11 @@ class RustMmProcessor:
         )
 
     @staticmethod
-    def build_output(spec: RustMmSpec, entry):
-        """Drain-time adapter: wrap the Rust-produced buffers of one ``MmEncodeResult``
-        into the scheduler's ``MultimodalProcessorOutput``. Wrapping only — load,
-        resize, patchify, token expansion and M-RoPE all ran in Rust.
+    def build_output(spec: RustMmSpec, encoded):
+        """Drain-time adapter: wrap the Rust-produced buffers of one
+        ``MmEncodedResult`` into the scheduler's ``MultimodalProcessorOutput``.
+        Wrapping only — load, resize, patchify, token expansion and M-RoPE all
+        ran in Rust.
 
         Runs on the scheduler loop, so it must stay copy-free *and* hash-free:
         ``take_mm_result``'s numpy arrays own the Rust buffers, ``torch.from_numpy`` just
@@ -267,13 +268,13 @@ class RustMmProcessor:
             MultimodalProcessorOutput,
         )
 
-        shm_names = entry.shm_names
+        shm_names = encoded.shm_names
         if shm_names is None:
-            features = torch.from_numpy(entry.features.reshape(-1, spec.feature_dim))
+            features = torch.from_numpy(encoded.features.reshape(-1, spec.feature_dim))
         items = []
         row = 0
         for index, ((t, h, w), item_hash, offset) in enumerate(
-            zip(entry.grids, entry.hashes, entry.offsets)
+            zip(encoded.grids, encoded.hashes, encoded.offsets)
         ):
             n = t * h * w
             if shm_names is None:
@@ -314,6 +315,6 @@ class RustMmProcessor:
             im_start_id=spec.vision_start_token_id,
             im_end_id=spec.vision_end_token_id,
             video_token_id=spec.video_token_id,
-            mrope_positions=torch.from_numpy(entry.mrope.reshape(3, -1)),
-            mrope_position_delta=torch.tensor([[entry.mrope_delta]], dtype=torch.long),
+            mrope_positions=torch.from_numpy(encoded.mrope.reshape(3, -1)),
+            mrope_position_delta=torch.tensor([[encoded.mrope_delta]], dtype=torch.long),
         )

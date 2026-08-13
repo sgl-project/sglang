@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use super::sidecar::{FeatureStore, MmSidecarEntry, Sidecar, park_features_in_shm};
+use super::result_store::{FeatureStore, MmEncodedEntry, MmResultStore, park_features_in_shm};
 use crate::message::config::MmSpec;
 use crate::message::ids::Rid;
 use crate::message::request::MmRequest;
@@ -46,27 +46,27 @@ fn parse_caller_hash(entry: &str) -> Option<u64> {
 }
 
 /// Shared state of the mm path, built once at `start_mm_workers`.
-pub struct Context {
+pub struct MmContext {
     pub family: Box<dyn sglang_mm::pipeline::MmFamilyProcessor>,
     /// `None` under `skip_tokenizer_init` (requests must carry `input_ids`).
     pub tokenizer: Option<Arc<dyn TextTokenizer>>,
-    pub sidecar: Sidecar,
+    pub results: MmResultStore,
     /// Park feature buffers in POSIX shm. Set by the Python launcher
     /// (`RustMmProcessor._use_feature_shm`) exactly when the scheduler broadcasts
     /// across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
 }
 
-impl Context {
+impl MmContext {
     pub fn new(
         spec: MmSpec,
         tokenizer: Option<Arc<dyn TextTokenizer>>,
-        sidecar: Sidecar,
+        results: MmResultStore,
     ) -> Result<Self, String> {
         Ok(Self {
             family: sglang_mm::registry::build_pipeline(spec.pipeline)?,
             tokenizer,
-            sidecar,
+            results,
             feature_shm: spec.feature_shm,
         })
     }
@@ -75,7 +75,7 @@ impl Context {
 /// Run the pipeline for one request. `Ok` returns the final expanded ids, the
 /// buffers already parked; `Err` rejects the request back to the client.
 fn process(
-    ctx: &Context,
+    ctx: &MmContext,
     rid: &Rid,
     mut work: crate::message::request::MmWorkItem,
 ) -> Result<Vec<i32>, String> {
@@ -87,25 +87,25 @@ fn process(
         })?;
         tokenizer.encode(text).map_err(|error| error.to_string())
     })?;
-    let mut drain = sglang_mm::qwen_vl::pack_drain(output)?;
-    apply_caller_hashes(&mut drain.hashes, &caller_hashes);
+    let mut packed = sglang_mm::qwen_vl::pack_result(output)?;
+    apply_caller_hashes(&mut packed.hashes, &caller_hashes);
     let features = if ctx.feature_shm {
-        park_features_in_shm(&drain.features, &drain.grids)
+        park_features_in_shm(&packed.features, &packed.grids)
     } else {
-        FeatureStore::Inline(drain.features)
+        FeatureStore::Inline(packed.features)
     };
-    ctx.sidecar.park(
+    ctx.results.park(
         rid.as_str().to_owned(),
-        MmSidecarEntry {
+        MmEncodedEntry {
             features,
-            grids: drain.grids,
-            hashes: drain.hashes,
-            offsets: drain.offsets,
-            mrope: drain.mrope,
-            mrope_delta: drain.mrope_delta,
+            grids: packed.grids,
+            hashes: packed.hashes,
+            offsets: packed.offsets,
+            mrope: packed.mrope,
+            mrope_delta: packed.mrope_delta,
         },
     );
-    Ok(drain.input_ids)
+    Ok(packed.input_ids)
 }
 
 /// One MM worker, spawned via `Runtime::spawn_mm_pool` (which owns the
@@ -113,14 +113,14 @@ fn process(
 pub struct MmWorker {
     rx: flume::Receiver<MmRequest>,
     tm: flume::Sender<TmEvent>,
-    ctx: Arc<Context>,
+    ctx: Arc<MmContext>,
 }
 
 impl MmWorker {
     pub fn new(
         rx: flume::Receiver<MmRequest>,
         tm: flume::Sender<TmEvent>,
-        ctx: Arc<Context>,
+        ctx: Arc<MmContext>,
     ) -> Self {
         Self { rx, tm, ctx }
     }
