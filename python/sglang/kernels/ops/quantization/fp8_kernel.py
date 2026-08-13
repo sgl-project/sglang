@@ -35,8 +35,6 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_musa,
-    is_sm100_supported,
-    is_sm120_supported,
     is_xpu,
     log_info_on_rank0,
 )
@@ -48,8 +46,6 @@ _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
-_is_sm100_supported = is_sm100_supported()
-_is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
