@@ -234,6 +234,87 @@ class TestFusedRMSNormGated:
         torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
 
+class TestFusedQKRMSNorm:
+
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize(
+        "batch_size,q_size,k_size,v_size",
+        [(1, 256, 64, 64), (17, 512, 128, 128)],
+    )
+    def test_fused_qk_rmsnorm(
+        self, batch_size: int, q_size: int, k_size: int, v_size: int, dtype
+    ):
+        """Q and K split views must be normalized over their distinct full widths."""
+        qkv = torch.randn([batch_size, q_size + k_size + v_size], dtype=dtype)
+        q, k, _ = qkv.split([q_size, k_size, v_size], dim=-1)
+        q_weight = torch.randn(q_size, dtype=dtype)
+        k_weight = torch.randn(k_size, dtype=dtype)
+
+        q_out, k_out = torch.ops.sgl_kernel.fused_qk_rmsnorm_cpu(
+            q, k, q_weight, k_weight, eps
+        )
+        ref_q_out = TestNorm()._forward_native(q, q_weight, eps)
+        ref_k_out = TestNorm()._forward_native(k, k_weight, eps)
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(q_out, ref_q_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_out, ref_k_out, atol=atol, rtol=rtol)
+
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize(
+        "batch_size,q_size,k_size,tp_world_size",
+        [(1, 256, 64, 2), (17, 512, 128, 4)],
+    )
+    def test_fused_qk_rmsnorm_tp(
+        self,
+        batch_size: int,
+        q_size: int,
+        k_size: int,
+        tp_world_size: int,
+        dtype,
+    ):
+        q = torch.randn([batch_size, q_size], dtype=dtype)
+        k = torch.randn([batch_size, k_size], dtype=dtype)
+        q_weight = torch.randn(q_size, dtype=dtype)
+        k_weight = torch.randn(k_size, dtype=dtype)
+
+        q_shards = q.chunk(tp_world_size, dim=-1)
+        k_shards = k.chunk(tp_world_size, dim=-1)
+        q_weight_shards = q_weight.chunk(tp_world_size)
+        k_weight_shards = k_weight.chunk(tp_world_size)
+        local_sum_sq = [
+            torch.ops.sgl_kernel.fused_qk_rmsnorm_sumsq_cpu(q_shard, k_shard)
+            for q_shard, k_shard in zip(q_shards, k_shards)
+        ]
+        global_sum_sq = torch.stack(local_sum_sq).sum(dim=0)
+
+        shard_outputs = [
+            torch.ops.sgl_kernel.fused_qk_rmsnorm_apply_from_stats_cpu(
+                q_shard,
+                k_shard,
+                q_weight_shard,
+                k_weight_shard,
+                global_sum_sq,
+                tp_world_size,
+                eps,
+            )
+            for q_shard, k_shard, q_weight_shard, k_weight_shard in zip(
+                q_shards, k_shards, q_weight_shards, k_weight_shards
+            )
+        ]
+        q_out = torch.cat([output[0] for output in shard_outputs], dim=-1)
+        k_out = torch.cat([output[1] for output in shard_outputs], dim=-1)
+
+        ref_q_out = TestNorm()._forward_native(q, q_weight, eps)
+        ref_k_out = TestNorm()._forward_native(k, k_weight, eps)
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(q_out, ref_q_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_out, ref_k_out, atol=atol, rtol=rtol)
+
+        assert global_sum_sq.shape == (batch_size, 2)
+        assert global_sum_sq.dtype == torch.float32
+
+
 class TestLayerNorm:
 
     def _forward_native(

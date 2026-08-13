@@ -2769,6 +2769,21 @@ class ServerArgs:
         "environment override when this argument is 0.",
         NS("mm"),
     ] = 0
+    mm_preprocess_cache_size_mb: A[
+        Optional[int],
+        "CPU memory budget for content-addressed multimodal preprocessing "
+        "artifacts. Unset selects a model-specific default (256 MiB for "
+        "Kimi-K3); 0 disables the cache. The budget is divided across "
+        "tokenizer workers and does not reserve GPU memory.",
+        NS("mm"),
+    ] = None
+    trust_mm_content_hashes: A[
+        bool,
+        "Trust caller-provided multimodal SHA-256 content hashes. This can "
+        "skip reading media on a hot metadata-cache hit; only enable it when "
+        "the caller guarantees that hashes identify immutable media bytes.",
+        NS("mm"),
+    ] = False
     limit_mm_data_per_request: A[
         Optional[Union[str, Dict[str, int]]],
         Arg(
@@ -3157,6 +3172,16 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     # Model weight update and weight loading
     # -------------------------------------------------------------------------
+    startup_weight_load_mode: A[
+        Literal["serial", "overlap"],
+        (
+            "Control startup weight loading relative to CUDA graph capture. "
+            "'serial' preserves the existing startup order; 'overlap' stages "
+            "checkpoint files while CUDA graphs are captured and commits the "
+            "real weights afterward."
+        ),
+        NS("model"),
+    ] = "serial"
     custom_weight_loader: A[
         Optional[List[str]],
         Arg(
@@ -4008,6 +4033,11 @@ class ServerArgs:
 
     def _handle_multimodal(self):
         """Validate mm_process_config structure before model loading."""
+        if (
+            self.mm_preprocess_cache_size_mb is not None
+            and self.mm_preprocess_cache_size_mb < 0
+        ):
+            raise ValueError("mm_preprocess_cache_size_mb must be non-negative")
         if self.mm_process_config is not None:
             if not isinstance(self.mm_process_config, dict):
                 raise TypeError(
@@ -4568,17 +4598,10 @@ class ServerArgs:
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
-        from sglang.srt.configs.model_config import is_deepseek_v4, is_nemotron_h
+        from sglang.srt.configs.model_config import is_deepseek_v4
         from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
         rules = [
-            # NemotronH's hybrid Mamba2 prefill is not BCG-safe: the mamba
-            # state-track write is not wired into the captured buffers, so a
-            # replay can commit a cache slot it never wrote.
-            (
-                "NemotronH (hybrid Mamba2 prefill)",
-                lambda: is_nemotron_h(self.get_model_config().hf_config),
-            ),
             # DSV4 is BCG-compatible but introduces heavy memory pressure: the
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
             (
@@ -8797,6 +8820,10 @@ class ServerArgs:
     @property
     def is_ep_scale_joiner(self) -> bool:
         return self.ep_join_mode == "scale"
+
+    @property
+    def is_startup_weight_load_overlap(self) -> bool:
+        return self.startup_weight_load_mode == "overlap"
 
     def ssl_verify(self):
         """Return the value for the requests library's verify= parameter.
