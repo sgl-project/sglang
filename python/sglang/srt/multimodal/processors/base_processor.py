@@ -426,7 +426,7 @@ class BaseMultimodalProcessor(ABC):
 
     @property
     def keep_mm_features_on_device(self) -> bool:
-        return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm", "cuda_ipc")
+        return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm", "npu_ipc")
 
     def preprocess_fingerprint_payload(self) -> dict[str, Any]:
         """Stable processor choices that may change per-media artifacts."""
