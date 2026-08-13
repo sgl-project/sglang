@@ -702,7 +702,9 @@ class Envs:
     # With the dense block-convert: batches of at most this many tokens run the
     # dense linear through the rowwise-fp8 aiter GEMM above instead of the
     # block-fp8 GEMM (fast at large M). Takes precedence over the BF16 hybrid.
-    SGLANG_OPT_MXFP8_DENSE_PTPC_DECODE_M = EnvInt(0)
+    # Costs one rowwise-fp8 copy of each dense linear weight; coarsens the
+    # 1x32 weight scales to per-row for batches at or below the threshold.
+    SGLANG_OPT_MXFP8_DENSE_PTPC_DECODE_M = EnvInt(128)
     # Fuse the per-token fp8 quant of the ptpc decode path above into the
     # producing Gemma fused-add-RMSNorm Triton kernel; the consumer GEMM picks
     # the (fp8, scale) pair off the norm output instead of re-quantizing.
