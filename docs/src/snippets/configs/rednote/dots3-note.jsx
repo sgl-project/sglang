@@ -73,7 +73,7 @@ export const config = {
       ],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--context-length 393216",
+        "--context-length 524288",
         "--enable-dp-attention",
         "--dp-size 8",
         "--tp-size 8",
@@ -104,6 +104,7 @@ export const config = {
         "--enable-multimodal",
         "--enable-metrics",
         "--tool-call-parser dots",
+        "--reasoning-parser qwen3",
         "--watchdog-timeout 1800",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -123,7 +124,7 @@ export const config = {
       ],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--context-length 393216",
+        "--context-length 524288",
         "--enable-dp-attention",
         "--dp-size 8",
         "--tp-size 8",
@@ -153,6 +154,7 @@ export const config = {
         "--enable-nccl-nvls",
         "--enable-multimodal",
         "--enable-metrics",
+        "--reasoning-parser qwen3",
         "--tool-call-parser dots",
         "--watchdog-timeout 1800",
         "--host {{HOST_IP}}",
