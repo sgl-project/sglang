@@ -140,6 +140,23 @@ class MHASubPoolSpec(SubPoolSpec):
             + page_size * self.k_row_bytes()
         )
 
+    def is_uniform_row(self) -> bool:
+        """True when K and V rows have equal byte width — the precondition for
+        exposing this sub-pool as DENSE per-layer views (`build_dense_mha_views`):
+        the page envelope is then a uniform array of `dense_blocks_per_page()`
+        row-blocks, addressable by one shared block table. Asymmetric-KV models
+        (e.g. MiMoV2's 192/128) keep the strided layout."""
+        return self.k_row_bytes() == self.v_row_bytes()
+
+    def dense_blocks_per_page(self) -> int:
+        """Row-blocks per page in the dense id space (one K + one V per layer);
+        also this sub-pool's `kernel_page_multiplier` when dense."""
+        assert self.is_uniform_row(), (
+            f"sub-pool {self.name!r}: the dense id space requires uniform rows; "
+            f"got k_row_bytes={self.k_row_bytes()} != v_row_bytes={self.v_row_bytes()}"
+        )
+        return 2 * self.layer_num
+
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
 
