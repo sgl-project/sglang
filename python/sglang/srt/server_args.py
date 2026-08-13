@@ -2359,8 +2359,8 @@ class ServerArgs:
         NS("exec.moe"),
     ] = "auto"
     fuseep_mode: A[
-        Literal[1, 2],
-        "Select the mode when enable Ascend FuseEP MoE, 1 -> dispatch_gmm_combine_decode is executed；2 -> dispatch_ffn_combine is executed (support hybrid deployment when 2).",
+        Literal[1, 2, 3],
+        "Select the mode when enabling Ascend FuseEP MoE: 1 runs dispatch_gmm_combine_decode; 2 runs dispatch_ffn_combine (and supports hybrid deployment); 3 runs the MegaMoE fused operator for ModelSlim W4A8 Kimi-K3.",
         NS("exec.moe"),
     ] = 2
     deepep_dispatcher_output_dtype: A[
@@ -9610,10 +9610,10 @@ def _apply_fuseep_mode_env_compat(
         return
 
     fuseep_mode = envs.SGLANG_NPU_FUSED_MOE_MODE.get()
-    if fuseep_mode not in (1, 2):
+    if fuseep_mode not in (1, 2, 3):
         raise ValueError(
             f"Wrong value of SGLANG_NPU_FUSED_MOE_MODE={fuseep_mode}, "
-            "the NPU only supports 1 or 2."
+            "the NPU only supports 1, 2, or 3."
         )
 
     logger.warning(
