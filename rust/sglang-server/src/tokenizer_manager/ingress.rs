@@ -1489,7 +1489,7 @@ mod tests {
         ingress.mm.results.park(
             "mm-gone".into(),
             crate::mm::MmEncodedEntry {
-                features: crate::mm::FeatureStore::Inline(vec![]),
+                features: vec![],
                 grids: vec![],
                 hashes: vec![],
                 offsets: vec![],
