@@ -371,7 +371,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     """
     Handles the /rerun-failed-ci command.
     Reruns workflows that ended in 'failure', 'skipped', 'cancelled' or
-    'timed_out'.
+    'timed_out', restarting only the jobs that didn't succeed.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_failed_ci", False):
@@ -439,10 +439,13 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   label-gated workflow, add the missing label (the `labeled` event
     #   dispatches a fresh run with the current label set); this function
     #   cannot recover those by rerun alone.
-    # - cancelled / timed_out: also full run.rerun(). rerun_failed_jobs()
-    #   rejects a run whose jobs were all cancelled ("no failed jobs"), and
-    #   for a run holding both a failed job and cancelled ones it would
-    #   restart only the failed job, leaving the cancelled stages unrun.
+    # - cancelled / timed_out: rerun_failed_jobs() as well. GitHub restarts
+    #   every job that didn't succeed — cancelled ones included — plus their
+    #   dependents, and carries the passing jobs over untouched. A full
+    #   rerun here would re-execute dozens of already-green GPU jobs to
+    #   recover one cancelled partition.
+    #   A run cancelled before any job failed has nothing for the endpoint to
+    #   target, so fall back to run.rerun() when it rejects the request.
     # - kernel wheel escape: if the PR touches sgl-kernel and not all wheel
     #   builds are success yet, full-rerun failure runs too — Build Wheel
     #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
@@ -461,14 +464,18 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
 
         print(f"Processing {run.conclusion} workflow: {run.name} (ID: {run.id})")
         try:
-            if run.conclusion != "failure" or (
+            if run.conclusion == "skipped" or (
                 sgl_kernel_changes and not kernel_wheel_built
             ):
                 print("  Full rerun")
                 run.rerun()
             else:
-                print("  rerun_failed_jobs")
-                run.rerun_failed_jobs()
+                try:
+                    print("  rerun_failed_jobs")
+                    run.rerun_failed_jobs()
+                except Exception as e:
+                    print(f"  rerun_failed_jobs rejected ({e}) - full rerun")
+                    run.rerun()
             rerun_count += 1
         except Exception as e:
             print(f"Failed to rerun workflow {run.id}: {e}")
