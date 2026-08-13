@@ -44,6 +44,30 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+def _logical_fc_weight_shape(
+    param: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    *,
+    output_features: int,
+) -> Tuple[int, ...]:
+    """Return the checkpoint weight shape in logical (unpacked) elements.
+
+    Quantized loaders that expose ``pack_factor`` store multiple logical values
+    in each parameter element.  The checkpoint may already have the logical
+    two-dimensional shape, so only expand a packed tensor when it has the same
+    stored shape as the destination parameter.
+    """
+    loaded_shape = tuple(loaded_weight.shape)
+    pack_factor = getattr(param, "pack_factor", None)
+    if pack_factor is None or loaded_shape != tuple(param.shape):
+        return loaded_shape
+
+    logical_numel = int(loaded_weight.numel() * pack_factor)
+    if logical_numel % output_features == 0:
+        return (output_features, logical_numel // output_features)
+    return (logical_numel,)
+
+
 def _get_dflash_layer_attention_params(
     config, layer_id: int
 ) -> Tuple[int, AttentionType]:
@@ -540,18 +564,39 @@ class DFlashDraftModel(nn.Module):
                     # Ignore unexpected weights (e.g., HF rotary caches).
                     continue
                 param = params_dict[resolved_name]
-                if (
-                    resolved_name.endswith("fc.weight")
-                    and not hasattr(param, "pack_factor")
-                    and tuple(loaded_weight.shape) != tuple(param.shape)
-                ):
-                    raise ValueError(
-                        "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
-                        "number of context features (K) does not match this config. "
-                        f"Expected fc.weight.shape={tuple(param.shape)} "
-                        f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
-                        f"but got {tuple(loaded_weight.shape)} for weight '{name}'."
+                if resolved_name.endswith("fc.weight"):
+                    expected_logical_shape = (
+                        int(self.config.hidden_size),
+                        int(self.num_context_features * self.config.hidden_size),
                     )
+                    loaded_logical_shape = _logical_fc_weight_shape(
+                        param,
+                        loaded_weight,
+                        output_features=expected_logical_shape[0],
+                    )
+                    stored_shape_matches = tuple(loaded_weight.shape) == tuple(
+                        param.shape
+                    )
+                    logical_shape_matches = (
+                        loaded_logical_shape == expected_logical_shape
+                    )
+                    # ModelOpt NVFP4 weights are packed on disk but their
+                    # ModelWeightParameter does not expose ``pack_factor``.
+                    # Its destination shape is derived from the logical input
+                    # size, so an exact stored-shape match remains authoritative.
+                    shape_matches = logical_shape_matches or (
+                        getattr(param, "pack_factor", None) is None
+                        and stored_shape_matches
+                    )
+                    if not shape_matches:
+                        raise ValueError(
+                            "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
+                            "number of context features (K) does not match this config. "
+                            f"Expected logical fc.weight.shape={expected_logical_shape} "
+                            f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
+                            f"but got stored shape={tuple(loaded_weight.shape)}, "
+                            f"logical shape={loaded_logical_shape} for weight '{name}'."
+                        )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
@@ -559,8 +604,15 @@ class DFlashDraftModel(nn.Module):
 class DFlashLagunaAttention(DFlashAttention):
     """Laguna DFlash attention with the trained Laguna softplus gate."""
 
-    def __init__(self, config, layer_id: int, quant_config=None) -> None:
-        super().__init__(config=config, layer_id=layer_id, quant_config=quant_config)
+    def __init__(
+        self, config, layer_id: int, quant_config=None, prefix: str = ""
+    ) -> None:
+        super().__init__(
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
         hidden_size = int(config.hidden_size)
         total_num_heads = self.total_num_heads
         gating = normalize_gating(getattr(config, "gating", True))
@@ -579,7 +631,7 @@ class DFlashLagunaAttention(DFlashAttention):
                 g_out,
                 bias=False,
                 quant_config=quant_config,
-                prefix="g_proj",
+                prefix=f"{prefix}.g_proj" if prefix else "g_proj",
             )
 
     def apply_attention_output(
