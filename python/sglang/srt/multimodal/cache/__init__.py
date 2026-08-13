@@ -8,6 +8,7 @@ from sglang.srt.multimodal.cache.contracts import (
 from sglang.srt.multimodal.cache.identity import (
     CONTENT_HASH_PREFIX,
     MediaSnapshot,
+    PreprocessFingerprintProvider,
     build_artifact_key,
     build_feature_hash,
     build_feature_identity,
@@ -15,6 +16,7 @@ from sglang.srt.multimodal.cache.identity import (
     build_mm_radix_cache_namespace,
     build_processor_fingerprint,
     compact_feature_hash,
+    media_preprocess_kwargs,
     parse_content_hash,
     snapshot_media,
 )
@@ -34,6 +36,7 @@ __all__ = [
     "MediaSnapshot",
     "MultimodalPreprocessCache",
     "PreprocessCacheLookup",
+    "PreprocessFingerprintProvider",
     "build_artifact_key",
     "build_feature_identity",
     "build_feature_hash",
@@ -42,6 +45,7 @@ __all__ = [
     "build_processor_fingerprint",
     "compact_feature_hash",
     "estimate_cache_size_bytes",
+    "media_preprocess_kwargs",
     "parse_content_hash",
     "snapshot_media",
 ]

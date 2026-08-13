@@ -9,7 +9,7 @@ import struct
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 from urllib.parse import unquote, urlparse
 
 import numpy as np
@@ -19,6 +19,16 @@ from PIL import Image
 
 CONTENT_HASH_PREFIX = "sha256:"
 _SHA256_HEX_LENGTH = 64
+_MEDIA_ENVELOPE_FIELDS = frozenset(
+    {"type", "format", "url", "image", "video", "audio", "content_hash"}
+)
+
+
+@runtime_checkable
+class PreprocessFingerprintProvider(Protocol):
+    """Explicit source for settings that can change processor artifacts."""
+
+    def preprocess_fingerprint_payload(self) -> Any: ...
 
 
 def parse_content_hash(value: Optional[str]) -> Optional[str]:
@@ -157,6 +167,43 @@ def snapshot_media(media: Any) -> MediaSnapshot:
     raise TypeError(f"Unsupported media identity input: {type(media).__name__}")
 
 
+def media_preprocess_kwargs(
+    source: Any, *, defaults: Optional[Mapping[str, Any]] = None
+) -> dict[str, Any]:
+    """Conservatively capture per-request options that can affect an artifact.
+
+    Unknown options are included instead of allow-listed. This may create a safe
+    false miss for a metadata-only option, but it prevents a new model option
+    from silently creating a false cache hit.
+    """
+    defaults = defaults or {}
+    if dataclasses.is_dataclass(source):
+        values = {
+            field.name: value
+            for field, value in zip(
+                dataclasses.fields(source), dataclasses.astuple(source)
+            )
+            if field.name not in _MEDIA_ENVELOPE_FIELDS
+        }
+    elif isinstance(source, Mapping):
+        values = {
+            key: value
+            for key, value in source.items()
+            if key not in _MEDIA_ENVELOPE_FIELDS
+        }
+    else:
+        return {}
+
+    result = {}
+    for key, value in values.items():
+        if value is None or (isinstance(value, Mapping) and not value):
+            continue
+        if key in defaults and _canonicalize(value) == _canonicalize(defaults[key]):
+            continue
+        result[key] = value
+    return result
+
+
 def _qualified_type_name(value: Any) -> str:
     value_type = type(value)
     return f"{value_type.__module__}.{value_type.__qualname__}"
@@ -173,8 +220,10 @@ def _canonicalize(value: Any) -> Any:
             "type": "dataclass",
             "class": _qualified_type_name(value),
             "fields": [
-                [field.name, _canonicalize(getattr(value, field.name))]
-                for field in dataclasses.fields(value)
+                [field.name, _canonicalize(field_value)]
+                for field, field_value in zip(
+                    dataclasses.fields(value), dataclasses.astuple(value)
+                )
             ],
         }
     if isinstance(value, Enum):
@@ -368,20 +417,19 @@ def build_processor_fingerprint(
     """Fingerprint preprocessing choices that can change processor output."""
     processor_payload = (
         processor.preprocess_fingerprint_payload()
-        if hasattr(processor, "preprocess_fingerprint_payload")
+        if isinstance(processor, PreprocessFingerprintProvider)
         else {}
     )
+    hf_payload = hf_config.to_dict()
     payload = {
         "transformers": transformers.__version__,
         "processor_class": f"{type(processor).__module__}.{type(processor).__qualname__}",
-        "model_type": getattr(hf_config, "model_type", None),
-        "architectures": getattr(hf_config, "architectures", None),
-        "model_revision": getattr(server_args, "revision", None),
-        "tokenizer_revision": getattr(server_args, "tokenizer_revision", None),
-        "disable_fast_image_processor": getattr(
-            server_args, "disable_fast_image_processor", False
-        ),
-        "mm_process_config": getattr(server_args, "mm_process_config", None) or {},
+        "model_type": hf_payload.get("model_type"),
+        "architectures": hf_payload.get("architectures"),
+        "model_revision": server_args.revision,
+        "tokenizer_revision": server_args.tokenizer_revision,
+        "disable_fast_image_processor": server_args.disable_fast_image_processor,
+        "mm_process_config": server_args.mm_process_config or {},
         "processor": processor_payload,
         "extra": extra or {},
     }

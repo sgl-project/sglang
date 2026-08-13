@@ -6,7 +6,15 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import torch
@@ -22,6 +30,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
     PreprocessCacheLookup,
+    PreprocessFingerprintProvider,
     build_processor_fingerprint,
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
@@ -211,9 +220,7 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
-        configured_mm_feature_transport = getattr(
-            server_args, "mm_feature_transport", "cpu"
-        )
+        configured_mm_feature_transport = server_args.mm_feature_transport
         self.mm_feature_transport = (
             configured_mm_feature_transport
             if configured_mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm")
@@ -223,7 +230,10 @@ class BaseMultimodalProcessor(ABC):
         self.use_ipc_pool_handle_cache = (
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
-        self.disable_fast_image_processor = server_args.disable_fast_image_processor
+        self.image_processor_backend = server_args.image_processor_backend
+        if server_args.disable_fast_image_processor:
+            self.image_processor_backend = "pil"
+        self.disable_fast_image_processor = self.image_processor_backend == "pil"
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
 
         mm_process_config = self.server_args.mm_process_config
@@ -231,25 +241,19 @@ class BaseMultimodalProcessor(ABC):
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
 
-        requested_cache_mb = getattr(
-            self.server_args, "mm_preprocess_cache_size_mb", None
-        )
+        requested_cache_mb = self.server_args.mm_preprocess_cache_size_mb
         total_cache_mb = (
             self.auto_mm_preprocess_cache_size_mb
             if requested_cache_mb is None
             else requested_cache_mb
         )
-        tokenizer_worker_num = max(
-            int(getattr(self.server_args, "tokenizer_worker_num", 1)), 1
-        )
+        tokenizer_worker_num = max(int(self.server_args.tokenizer_worker_num), 1)
         worker_cache_bytes = total_cache_mb * 1024 * 1024 // tokenizer_worker_num
         self.mm_preprocess_cache = MultimodalPreprocessCache(
             max_size_bytes=worker_cache_bytes,
             max_entries=8192,
         )
-        self.trust_mm_content_hashes = bool(
-            getattr(self.server_args, "trust_mm_content_hashes", False)
-        )
+        self.trust_mm_content_hashes = bool(self.server_args.trust_mm_content_hashes)
         self._preprocess_metrics_callback = None
         self.processor_fingerprint = (
             build_processor_fingerprint(self, hf_config, server_args)
@@ -423,7 +427,7 @@ class BaseMultimodalProcessor(ABC):
         self._preprocess_metrics_callback = callback
 
     def observe_preprocess_phase(self, phase: str, seconds: float) -> None:
-        callback = getattr(self, "_preprocess_metrics_callback", None)
+        callback = self._preprocess_metrics_callback
         if callback is not None:
             callback(phase, seconds)
 
@@ -433,15 +437,23 @@ class BaseMultimodalProcessor(ABC):
 
     def preprocess_fingerprint_payload(self) -> dict[str, Any]:
         """Stable processor choices that may change per-media artifacts."""
+        wrapped_processor = (
+            self._processor.preprocess_fingerprint_payload()
+            if isinstance(self._processor, PreprocessFingerprintProvider)
+            else None
+        )
         return {
             "wrapper_class": (
                 f"{type(self._processor).__module__}."
                 f"{type(self._processor).__qualname__}"
             ),
             "gpu_image_decode": self.gpu_image_decode,
+            "image_processor_backend": self.image_processor_backend,
+            "feature_transport": self.mm_feature_transport,
             "image_config": self.image_config,
             "video_config": self.video_config,
             "audio_config": self.audio_config,
+            "wrapped_processor": wrapped_processor,
         }
 
     def clear_preprocess_cache(self) -> None:
@@ -592,6 +604,22 @@ class BaseMultimodalProcessor(ABC):
             return "xpu"
         if not _is_npu:
             return f"cuda:{server_args.base_gpu_id}"
+        if processor.__class__.__name__ == "MiniMaxVLProcessor":
+            # MiniMax's image/video processors create 10-dim tensors during
+            # patch extraction, exceeding the Ascend 8-dim limit; patch them
+            # (same pattern as qwen-vl / GLM-4.6V) and run on NPU.
+            from sglang.srt.hardware_backend.npu.modules.minimax_m3_processor import (
+                npu_apply_minimax_m3_image_preprocess_patch,
+                npu_apply_minimax_m3_video_preprocess_patch,
+            )
+
+            npu_apply_minimax_m3_image_preprocess_patch(processor.image_processor)
+            if (
+                hasattr(processor, "video_processor")
+                and processor.video_processor is not None
+            ):
+                npu_apply_minimax_m3_video_preprocess_patch(processor.video_processor)
+            return "npu"
         if processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
             # For qwen-vl, the processor hits a reshape issue from the Ascend
             # dims restriction.

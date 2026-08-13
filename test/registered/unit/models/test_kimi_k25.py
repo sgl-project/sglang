@@ -48,6 +48,7 @@ from sglang.srt.multimodal.processors.kimi_k3 import (
 from sglang.srt.multimodal.processors.kimi_k3_artifact import (
     KimiK3DeferredConfig,
     KimiK3ImageArtifact,
+    KimiK3PreprocessConfig,
     KimiK3ResizeConfig,
 )
 from sglang.srt.multimodal.processors.kimi_k25 import (
@@ -611,12 +612,15 @@ class _HFProcessor:
 def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls):
     server_args = SimpleNamespace(
         mm_feature_transport="cpu",
+        image_processor_backend="auto",
         disable_fast_image_processor=False,
         skip_tokenizer_init=False,
         mm_process_config={},
         mm_io_worker_num=0,
         mm_processor_worker_num=0,
         tokenizer_worker_num=1,
+        mm_preprocess_cache_size_mb=0,
+        trust_mm_content_hashes=False,
         base_gpu_id=0,
     )
     processor = processor_cls(
@@ -632,6 +636,12 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
         assert isinstance(processor._processor, wrapper_cls)
         assert isinstance(worker_processor, wrapper_cls)
         assert worker_processor is not processor._processor
+        if processor_cls is KimiK3ImageProcessor:
+            fingerprint_config = processor.preprocess_fingerprint_payload()[
+                "wrapped_processor"
+            ]
+            assert isinstance(fingerprint_config, KimiK3PreprocessConfig)
+            assert fingerprint_config.patch_size == 14
     finally:
         processor.mm_processor_executor.shutdown()
         processor.io_executor.shutdown()
@@ -885,13 +895,13 @@ def test_kimi_k3_trusted_hot_hit_skips_media_read():
 
     try:
         with patch(
-            "sglang.srt.multimodal.processors.kimi_k3.snapshot_media",
+            "sglang.srt.multimodal.processors.media_artifact.snapshot_media",
             side_effect=AssertionError("trusted cache hit must not read media"),
         ):
             result = asyncio.run(
                 processor.prepare_media_artifacts(
                     ["unread-source"],
-                    SimpleNamespace(mm_content_hashes=[digest]),
+                    content_hashes=[digest],
                 )
             )
     finally:
@@ -930,6 +940,10 @@ def test_kimi_k3_output_affecting_media_options_do_not_share_artifacts():
         digest,
         ImageData(url="image.png", preprocess_kwargs={"max_pixels": 1024}),
     )
+    assert base != processor._artifact_key(
+        digest,
+        {"url": "image.png", "future_model_option": "new-behavior"},
+    )
 
 
 def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
@@ -953,11 +967,7 @@ def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
     processor._run_artifact_batch = prepare
     try:
         with pytest.raises(ValueError, match="feature identity or hash changed"):
-            asyncio.run(
-                processor.prepare_media_artifacts(
-                    [image], SimpleNamespace(mm_content_hashes=None)
-                )
-            )
+            asyncio.run(processor.prepare_media_artifacts([image]))
     finally:
         processor.io_executor.shutdown()
 
@@ -1012,8 +1022,12 @@ def test_kimi_k3_untrusted_path_change_is_a_cache_miss():
 
     async def prepare(entries):
         return [
-            _cached_k3_artifact(digest, key, image.getpixel((0, 0))[0])
-            for digest, key, image in entries
+            _cached_k3_artifact(
+                entry.content_digest,
+                entry.artifact_key,
+                entry.media.getpixel((0, 0))[0],
+            )
+            for entry in entries
         ]
 
     processor._run_artifact_batch = prepare
@@ -1021,17 +1035,9 @@ def test_kimi_k3_untrusted_path_change_is_a_cache_miss():
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mutable.png"
             Image.new("RGB", (2, 2), color=(1, 0, 0)).save(path)
-            first = asyncio.run(
-                processor.prepare_media_artifacts(
-                    [str(path)], SimpleNamespace(mm_content_hashes=None)
-                )
-            )[0]
+            first = asyncio.run(processor.prepare_media_artifacts([str(path)]))[0]
             Image.new("RGB", (2, 2), color=(2, 0, 0)).save(path)
-            second = asyncio.run(
-                processor.prepare_media_artifacts(
-                    [str(path)], SimpleNamespace(mm_content_hashes=None)
-                )
-            )[0]
+            second = asyncio.run(processor.prepare_media_artifacts([str(path)]))[0]
     finally:
         processor.io_executor.shutdown()
 
@@ -1061,10 +1067,14 @@ def test_kimi_k3_partial_hits_deduplicate_misses_and_preserve_order():
         batches.append(entries)
         return [
             replace(
-                _cached_k3_artifact(digest, key, image.getpixel((0, 0))[0]),
+                _cached_k3_artifact(
+                    entry.content_digest,
+                    entry.artifact_key,
+                    entry.media.getpixel((0, 0))[0],
+                ),
                 feature_hash=456,
             )
-            for digest, key, image in entries
+            for entry in entries
         ]
 
     processor._run_artifact_batch = prepare
@@ -1072,7 +1082,6 @@ def test_kimi_k3_partial_hits_deduplicate_misses_and_preserve_order():
         artifacts = asyncio.run(
             processor.prepare_media_artifacts(
                 [cached_image, missed_image, missed_image, cached_image],
-                SimpleNamespace(mm_content_hashes=None),
             )
         )
     finally:
@@ -1080,9 +1089,9 @@ def test_kimi_k3_partial_hits_deduplicate_misses_and_preserve_order():
 
     assert len(batches) == 1
     assert len(batches[0]) == 1
-    assert batches[0][0][:2] == (
-        missed_digest,
-        processor._artifact_key(missed_digest, missed_image),
+    assert batches[0][0].content_digest == missed_digest
+    assert batches[0][0].artifact_key == processor._artifact_key(
+        missed_digest, missed_image
     )
     assert [artifact.content_digest for artifact in artifacts] == [
         cached_digest,
@@ -1110,24 +1119,20 @@ def test_kimi_k3_cancelled_artifact_owner_does_not_fail_joiner():
         started.set()
         await release.wait()
         return [
-            _cached_k3_artifact(digest, key, image.getpixel((0, 0))[0])
-            for digest, key, image in entries
+            _cached_k3_artifact(
+                entry.content_digest,
+                entry.artifact_key,
+                entry.media.getpixel((0, 0))[0],
+            )
+            for entry in entries
         ]
 
     processor._run_artifact_batch = prepare
 
     async def run():
-        owner = asyncio.create_task(
-            processor.prepare_media_artifacts(
-                [image], SimpleNamespace(mm_content_hashes=None)
-            )
-        )
+        owner = asyncio.create_task(processor.prepare_media_artifacts([image]))
         await started.wait()
-        joiner = asyncio.create_task(
-            processor.prepare_media_artifacts(
-                [image], SimpleNamespace(mm_content_hashes=None)
-            )
-        )
+        joiner = asyncio.create_task(processor.prepare_media_artifacts([image]))
         await asyncio.sleep(0)
         owner.cancel()
         with pytest.raises(asyncio.CancelledError):

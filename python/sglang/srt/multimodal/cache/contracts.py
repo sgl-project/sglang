@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Optional
 
 from sglang.srt.multimodal.cache.identity import MediaSnapshot
 
@@ -32,7 +32,7 @@ class EncoderPreprocessArtifact:
     feature_identity: str
     feature_hash: int
     grid_thw: tuple[int, ...]
-    original_size: tuple[int, int]
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

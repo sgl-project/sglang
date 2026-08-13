@@ -33,10 +33,14 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Modality, Req
+from sglang.srt.multimodal.cache import media_preprocess_kwargs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
 from sglang.srt.utils.common import safe_pickle_loads
-from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.utils.hf_transformers_utils import (
+    get_processor,
+    resolve_image_processor_backend,
+)
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
@@ -724,11 +728,13 @@ def extract_original_req_id(part_req_id: str) -> str:
 
 
 def _encoder_media_item(mm_item: dict):
-    """Keep optional content identity aligned with one encoder media item."""
-    content_hash = mm_item.get("content_hash")
-    if content_hash is None:
-        return mm_item.get("url")
-    return {"url": mm_item.get("url"), "content_hash": content_hash}
+    """Keep per-media options aligned while preserving the legacy URL shape."""
+    item = {
+        key: value
+        for key, value in mm_item.items()
+        if key != "modality" and value is not None
+    }
+    return item["url"] if set(item) == {"url"} else item
 
 
 def calculate_modality_num_parts(modalities, num_items_assigned):
@@ -1682,32 +1688,14 @@ class MMReceiverBase(ABC):
         if getattr(server_args, "tokenizer_backend", None) is not None:
             extra_kwargs["tokenizer_backend"] = server_args.tokenizer_backend
 
-        _processor = None
-        try:
-            _processor = get_processor(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
-                **extra_kwargs,
-            )
-        except ValueError as e:
-            error_message = str(e)
-            if "does not have a slow version" in error_message:
-                logger.info(
-                    f"Processor {server_args.tokenizer_path} does not have a slow version. Automatically use fast version"
-                )
-                _processor = get_processor(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                    use_fast=True,
-                    **extra_kwargs,
-                )
-            else:
-                raise e
+        _processor = get_processor(
+            server_args.tokenizer_path,
+            tokenizer_mode=server_args.tokenizer_mode,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+            image_processor_backend=resolve_image_processor_backend(server_args),
+            **extra_kwargs,
+        )
 
         enable_adaptive_dispatch_to_encoder = (
             server_args.enable_adaptive_dispatch_to_encoder
@@ -2127,6 +2115,8 @@ class MMReceiverBase(ABC):
                 if self.scheduler.metrics_reporter.enable_metrics
                 else None
             ),
+            extra_key=recv_req.extra_key,
+            cache_salt=recv_req.cache_salt,
             http_worker_ipc=recv_req.http_worker_ipc,
             dllm_config=self.scheduler.dllm_config,
         )
@@ -2229,26 +2219,18 @@ class MMReceiverBase(ABC):
                         "url": to_raw_url(mm_item),
                         "modality": modality,
                     }
+                    entry.update(
+                        media_preprocess_kwargs(mm_item, defaults={"detail": "auto"})
+                    )
                     if modality == Modality.IMAGE:
-                        if isinstance(mm_item, ImageData):
-                            if mm_item.detail not in (None, "auto"):
-                                entry["detail"] = mm_item.detail
-                            if mm_item.max_dynamic_patch is not None:
-                                entry["max_dynamic_patch"] = mm_item.max_dynamic_patch
-                            if mm_item.preprocess_kwargs:
-                                entry["preprocess_kwargs"] = mm_item.preprocess_kwargs
-                        elif isinstance(mm_item, dict):
-                            for key in (
-                                "detail",
-                                "max_dynamic_patch",
-                                "preprocess_kwargs",
-                            ):
-                                if key in mm_item:
-                                    entry[key] = mm_item[key]
                         inline_hash = (
                             mm_item.content_hash
                             if isinstance(mm_item, ImageData)
-                            else None
+                            else (
+                                mm_item.get("content_hash")
+                                if isinstance(mm_item, dict)
+                                else None
+                            )
                         )
                         explicit_hash = (
                             image_hashes[image_index]

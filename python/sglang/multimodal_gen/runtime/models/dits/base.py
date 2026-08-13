@@ -22,6 +22,9 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 # TODO
 class BaseDiT(nn.Module, ABC):
+    # These are runtime implementation capabilities, not checkpoint metadata.
+    # Concrete DiT implementations override them when their tensor layout or
+    # execution semantics support only a subset of the available backends.
     _fsdp_shard_conditions: list = []
     _compile_conditions: list = []
     param_names_mapping: dict
@@ -29,10 +32,21 @@ class BaseDiT(nn.Module, ABC):
     hidden_size: int
     num_attention_heads: int
     num_channels_latents: int
-    # always supports torch_sdpa
-    _supported_attention_backends: set[AttentionBackendEnum] = (
-        DiTConfig()._supported_attention_backends
-    )
+    _supported_attention_backends: set[AttentionBackendEnum] = {
+        AttentionBackendEnum.SLIDING_TILE_ATTN,
+        AttentionBackendEnum.SAGE_ATTN,
+        AttentionBackendEnum.FA,
+        AttentionBackendEnum.AITER,
+        AttentionBackendEnum.AITER_SAGE,
+        AttentionBackendEnum.TORCH_SDPA,
+        AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+        AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
+        AttentionBackendEnum.VMOBA_ATTN,
+        AttentionBackendEnum.SAGE_ATTN_3,
+        AttentionBackendEnum.LASER_ATTN,
+        AttentionBackendEnum.BLOCK_SPARSE_ATTN,
+        AttentionBackendEnum.RAIN_FUSION_ATTN,
+    }
 
     def __init_subclass__(cls) -> None:
         required_class_attrs = [
@@ -49,8 +63,8 @@ class BaseDiT(nn.Module, ABC):
 
     def __init__(self, config: DiTConfig, hf_config: dict[str, Any], **kwargs) -> None:
         super().__init__()
-        # runtime models expose checkpoint architecture through `config`; load
-        # settings such as the model prefix stay separate
+        # `config.arch_config` contains static model metadata. Runtime
+        # capabilities remain class attributes on the model implementation.
         self.config: DiTArchConfig = config.arch_config
         self.prefix = config.prefix
         self.hf_config = hf_config
@@ -111,10 +125,6 @@ class CachableDiT(SpectrumMixin, TeaCacheMixin, BaseDiT):
     hidden_size: int
     num_attention_heads: int
     num_channels_latents: int
-    # always supports torch_sdpa
-    _supported_attention_backends: set[AttentionBackendEnum] = (
-        DiTConfig()._supported_attention_backends
-    )
 
     def __init__(self, config: DiTConfig, **kwargs) -> None:
         super().__init__(config, **kwargs)

@@ -152,6 +152,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
+    resolve_image_processor_backend,
 )
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
@@ -312,7 +313,7 @@ def _namespace_mm_radix_cache(extra_key: Optional[str], mm_inputs) -> Optional[s
     processor must provide one identity for every item; mixing strong and legacy
     items would make the request namespace incomplete, so fail closed instead.
     """
-    items = getattr(mm_inputs, "mm_items", None)
+    items = None if mm_inputs is None else mm_inputs.mm_items
     if not items:
         return extra_key
     identities = [
@@ -519,7 +520,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         server_args = self.server_args
 
         # Initialize tokenizer and processor
-        if self.model_config.is_multimodal:
+        if self.model_config.is_multimodal and not server_args.language_model_only:
             import_processors("sglang.srt.multimodal.processors")
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
@@ -1094,6 +1095,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         contains_mm_input = obj.contains_mm_input()
+        if contains_mm_input and self.server_args.language_model_only:
+            raise ValueError(
+                "Multimodal inputs are not supported when --language-model-only "
+                "is set; the encoder is not loaded. Restart without the flag."
+            )
         is_mossvl = (
             "MossVLForConditionalGeneration"
             in self.model_config.hf_config.architectures
@@ -1724,6 +1730,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
                 extra_key=extra_key,
+                cache_salt=obj.cache_salt,
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
@@ -2776,9 +2783,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
 
-                mm_cache_context = getattr(self, "_mm_cache_retry_contexts", {}).pop(
-                    rid, None
-                )
+                mm_cache_context = self._mm_cache_retry_contexts.pop(rid, None)
                 if mm_cache_context is not None:
                     # Consumption normally removes the lease. This also covers
                     # validation failures that finish before MM scheduling.
@@ -3475,7 +3480,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         # The scheduler owns an admitted lease and releases it before sending
         # this acknowledgement. Drop only the tokenizer retry context here.
-        getattr(self, "_mm_cache_retry_contexts", {}).pop(recv_obj.rid, None)
+        self._mm_cache_retry_contexts.pop(recv_obj.rid, None)
         # Two scheduler messages can race in handle_loop for the same rid: a
         # batch output that finishes it normally (deletes rid_to_state[rid])
         # and this abort echo. If the finish wins, the rid is already gone and
@@ -3742,16 +3747,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self._release_pending_mm_cache_lease(rid)
 
     def _release_pending_mm_cache_lease(self, rid: str) -> None:
-        contexts = getattr(self, "_mm_cache_retry_contexts", {})
-        context = contexts.get(rid)
+        context = self._mm_cache_retry_contexts.get(rid)
         if context is not None and context.dispatched is True:
             return
-        context = contexts.pop(rid, None)
+        context = self._mm_cache_retry_contexts.pop(rid, None)
         if context is not None:
             self._release_mm_embedding_cache(context.lease_id, context.routed_dp_rank)
 
     def _mark_mm_cache_lease_dispatched(self, rid: str) -> None:
-        context = getattr(self, "_mm_cache_retry_contexts", {}).get(rid)
+        context = self._mm_cache_retry_contexts.get(rid)
         if context is not None and context.dispatched is False:
             self._mm_cache_retry_contexts[rid] = dataclasses.replace(
                 context, dispatched=True
@@ -3925,34 +3929,15 @@ async def print_exception_wrapper(func):
 
 
 def get_processor_wrapper(server_args):
-    try:
-        processor = get_processor(
-            server_args.tokenizer_path,
-            tokenizer_mode=server_args.tokenizer_mode,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            use_fast=not server_args.disable_fast_image_processor,
-            tokenizer_backend=server_args.tokenizer_backend,
-            model_name=server_args.model_path,
-        )
-    except ValueError as e:
-        error_message = str(e)
-        if "does not have a slow version" in error_message:
-            logger.info(
-                f"Processor {server_args.tokenizer_path} does not have a slow version. Automatically use fast version"
-            )
-            processor = get_processor(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-                use_fast=True,
-                tokenizer_backend=server_args.tokenizer_backend,
-                model_name=server_args.model_path,
-            )
-        else:
-            raise e
-    return processor
+    return get_processor(
+        server_args.tokenizer_path,
+        tokenizer_mode=server_args.tokenizer_mode,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.revision,
+        image_processor_backend=resolve_image_processor_backend(server_args),
+        tokenizer_backend=server_args.tokenizer_backend,
+        model_name=server_args.model_path,
+    )
 
 
 def determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:

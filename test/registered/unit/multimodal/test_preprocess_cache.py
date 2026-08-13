@@ -218,7 +218,11 @@ class TestMediaIdentity(unittest.TestCase):
             def preprocess_fingerprint_payload(self):
                 return {"backend": self.backend, "antialias": True}
 
-        config = SimpleNamespace(model_type="vlm", architectures=["VLM"])
+        class Config:
+            def to_dict(self):
+                return {"model_type": "vlm", "architectures": ["VLM"]}
+
+        config = Config()
         args = SimpleNamespace(
             revision="model-revision",
             tokenizer_revision="tokenizer-revision",
@@ -313,6 +317,31 @@ class TestMultimodalPreprocessCache(unittest.TestCase):
         self.assertIn("a", cache)
         self.assertIn("c", cache)
         self.assertEqual(cache.current_size_bytes, 6)
+
+    def test_compatible_lookup_is_atomic_and_does_not_count_bypass_as_miss(self):
+        cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
+        cache.put("key", b"metadata-only")
+
+        self.assertIsNone(cache.get_if_present("key", lambda value: False))
+        self.assertEqual((cache.hits, cache.misses), (0, 0))
+        self.assertEqual(
+            cache.get_if_present("key", lambda value: value.startswith(b"metadata")),
+            b"metadata-only",
+        )
+        self.assertEqual((cache.hits, cache.misses), (1, 0))
+
+    def test_reservation_rejects_an_incompatible_racing_entry(self):
+        cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
+        cache.put("key", b"metadata-only")
+
+        reservation = cache.reserve_many(
+            ["key"], predicate=lambda key, value: value == b"full-feature"
+        )[0]
+
+        self.assertIsInstance(reservation, CacheReservation)
+        self.assertTrue(reservation.owner)
+        self.assertNotIn("key", cache)
+        self.assertEqual(cache.current_size_bytes, 0)
 
     def test_gpu_backed_values_are_not_implicitly_copied(self):
         if not torch.cuda.is_available():
