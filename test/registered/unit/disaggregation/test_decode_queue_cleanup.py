@@ -71,6 +71,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._swa_aware_allocatable_token_budgets = MagicMock(
             return_value=(physical_available, physical_available)
         )
+        queue._swa_tail_allocatable_token_budget = MagicMock(
+            side_effect=lambda **_: physical_available
+        )
 
         def pre_alloc(_req):
             nonlocal physical_available
