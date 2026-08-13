@@ -18,7 +18,6 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.perf_baseline import ThroughputBaseline, check_output_throughput
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -37,20 +36,11 @@ DEEPSEEK_V4_FP4_MODEL_PATH = os.environ.get(
 SERVER_LAUNCH_TIMEOUT = 3600
 FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
 
-_BASELINE_SOURCE = "median of 11 MI35x nightly runs, 2026-07-30..2026-08-11"
-
-# Output throughput (tok/s) per batch size at input_len=8192 output_len=1024,
-# one baseline per SGLANG_HACK_FLASHMLA_BACKEND the nightly job runs. A backend
-# with no entry here is reported without being gated.
-PERF_BASELINES = {
-    "unified_kv_triton": ThroughputBaseline(
-        {1: 115.4, 2: 214.1, 4: 415.2, 8: 794.5, 16: 1486.1, 32: 2840.1},
-        recorded_from=_BASELINE_SOURCE,
-    ),
-    "triton": ThroughputBaseline(
-        {1: 88.6, 2: 166.2, 4: 325.4, 8: 633.1, 16: 1202.3, 32: 2322.7},
-        recorded_from=_BASELINE_SOURCE,
-    ),
+# 15% below the per-BS median of 11 MI35x nightlies, 2026-07-30..2026-08-11.
+# Ordered by batch size: 1, 2, 4, 8, 16, 32.
+MIN_OUTPUT_THROUGHPUT = {
+    "unified_kv_triton": (98.1, 182.0, 352.9, 675.3, 1263.2, 2414.1),
+    "triton": (75.3, 141.3, 276.6, 538.1, 1022.0, 1974.3),
 }
 
 COMMON_ENV_VARS = {
@@ -209,18 +199,15 @@ class TestDeepseekV4Fp4(CustomTestCase):
                 f"in_tp={in_tp:.2f} tok/s out_tp={out_tp:.2f} tok/s ITL={itl:.2f}ms"
             )
 
-        check = check_output_throughput(
-            report_results,
-            PERF_BASELINES.get(FLASHMLA_BACKEND),
-            f"deepseek-v4-flash-fp4 ({FLASHMLA_BACKEND})",
-        )
-        summary_lines.extend(["", check.markdown])
-        print(check.markdown)
-
         if is_in_ci():
             write_github_step_summary("\n".join(summary_lines) + "\n")
-            if not check.ok:
-                self.fail(check.failure_message())
+            thresholds = MIN_OUTPUT_THROUGHPUT[FLASHMLA_BACKEND]
+            for r, threshold in zip(report_results, thresholds, strict=True):
+                self.assertGreaterEqual(
+                    r["output_throughput"],
+                    threshold,
+                    f"{FLASHMLA_BACKEND} bs={r['batch_size']} output throughput regression",
+                )
 
 
 if __name__ == "__main__":
