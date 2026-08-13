@@ -2713,6 +2713,48 @@ class DeepseekV2Model(nn.Module):
         backend = getattr(backend, "primary", backend)
         return not getattr(backend, "use_mha", False)
 
+    def _forward_layer_range(
+        self,
+        start_layer: int,
+        end_layer: int,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: Optional[BumpAllocator],
+        llama_4_scaling: Optional[torch.Tensor],
+        topk_indices: Optional[torch.Tensor],
+        aux_hidden_states: List[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        for i in range(start_layer, end_layer):
+            # NOTE: torch dynamo does not support graph break in context manager.
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
+                layer = self.layers[i]
+                hidden_states, residual, topk_indices = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    zero_allocator,
+                    gemm_output_zero_allocator,
+                    llama_4_scaling,
+                    prev_topk_indices=topk_indices,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states if i in self.layers_to_capture else None
+                    ),
+                    next_full_attention_layer_id=self.next_full_attention_layer_id.get(
+                        i
+                    ),
+                )
+
+        return hidden_states, residual, topk_indices
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2804,31 +2846,19 @@ class DeepseekV2Model(nn.Module):
         aux_hidden_states = AuxHiddenStatePacker(len(self.layers_to_capture))
         if self.pp_group.is_first_rank:
             topk_indices = None
-        for i in range(normal_start_layer, normal_end_layer):
-            # NOTE: torch dynamo does not support graph break in context manager
-            ctx = (
-                nullcontext()
-                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                else get_global_expert_distribution_recorder().with_current_layer(i)
-            )
-            with ctx:
-                layer = self.layers[i]
-                hidden_states, residual, topk_indices = layer(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                    zero_allocator,
-                    gemm_output_zero_allocator,
-                    llama_4_scaling,
-                    prev_topk_indices=topk_indices,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states if i in self.layers_to_capture else None
-                    ),
-                    next_full_attention_layer_id=self.next_full_attention_layer_id.get(
-                        i
-                    ),
-                )
+        hidden_states, residual, topk_indices = self._forward_layer_range(
+            normal_start_layer,
+            normal_end_layer,
+            positions,
+            hidden_states,
+            forward_batch,
+            residual,
+            zero_allocator,
+            gemm_output_zero_allocator,
+            llama_4_scaling,
+            topk_indices,
+            aux_hidden_states,
+        )
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -2888,6 +2918,89 @@ class DeepseekV2Model(nn.Module):
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states.finalize()
+
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: torch.Tensor = None,
+    ) -> Optional[Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]]:
+        start, end = split_interval
+
+        if start == 0:
+            hidden_states = (
+                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            )
+            total_num_layers = self.end_layer - self.start_layer
+            gemm_output_zero_allocator = (
+                BumpAllocator(
+                    buffer_size=self.gemm_output_zero_allocator_size,
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+                if self.gemm_output_zero_allocator_size > 0
+                else None
+            )
+            llama_4_scaling = None
+            if self.llama_4_scaling_config is not None:
+                llama_4_scaling = _get_llama_4_scaling(
+                    original_max_position_embeddings=self.llama_4_scaling_config[
+                        "original_max_position_embeddings"
+                    ],
+                    scaling_beta=self.llama_4_scaling_config["beta"],
+                    positions=positions,
+                )
+
+            forward_batch.hidden_states = hidden_states
+            forward_batch.residual = None
+            forward_batch.model_specific_states = {
+                "deepseek_zero_allocator": BumpAllocator(
+                    buffer_size=total_num_layers * 2,
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                ),
+                "deepseek_gemm_output_zero_allocator": gemm_output_zero_allocator,
+                "deepseek_llama_4_scaling": llama_4_scaling,
+                "deepseek_topk_indices": None,
+                "deepseek_aux_hidden_states": [],
+            }
+
+        states = forward_batch.model_specific_states
+        assert states is not None, "Missing DeepSeek split-prefill state"
+        hidden_states, residual, topk_indices = self._forward_layer_range(
+            start,
+            end,
+            positions,
+            forward_batch.hidden_states,
+            forward_batch,
+            forward_batch.residual,
+            states["deepseek_zero_allocator"],
+            states["deepseek_gemm_output_zero_allocator"],
+            states["deepseek_llama_4_scaling"],
+            states["deepseek_topk_indices"],
+            states["deepseek_aux_hidden_states"],
+        )
+        forward_batch.hidden_states = hidden_states
+        forward_batch.residual = residual
+        states["deepseek_topk_indices"] = topk_indices
+
+        if end != self.end_layer:
+            return None
+
+        if residual is None:
+            hidden_states = self.norm(hidden_states)
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
+        forward_batch.hidden_states = hidden_states
+
+        aux_hidden_states = states["deepseek_aux_hidden_states"]
+        forward_batch.residual = None
+        forward_batch.model_specific_states = None
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
@@ -3100,6 +3213,39 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             )
         else:
             return hidden_states
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: torch.Tensor = None,
+    ):
+        _, end = split_interval
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            hidden_states = self.model.forward_split_prefill(
+                input_ids,
+                positions,
+                forward_batch,
+                split_interval,
+                input_embeds,
+            )
+
+        if end != self.end_layer:
+            return None
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+        return self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            aux_hidden_states,
+        )
 
     @property
     def start_layer(self):
