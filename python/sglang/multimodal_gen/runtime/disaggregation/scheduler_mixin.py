@@ -943,7 +943,7 @@ class SchedulerDisaggMixin:
                     if is_multi_rank:
                         self._broadcast_to_all_ranks(("compute",))
                         self._broadcast_req_to_all_ranks(req)
-                    self._disagg_glm_denoiser_compute(req, request_id)
+                    self._execute_glm_distributed_denoiser_request(req, request_id)
 
                 self._consecutive_error_count = 0
 
@@ -1510,7 +1510,7 @@ class SchedulerDisaggMixin:
             and self.server_args.srt_encoder_url is not None
         )
 
-    def _disagg_glm_denoiser_compute(
+    def _execute_glm_distributed_denoiser_request(
         self: Scheduler, req: Req, request_id: str
     ) -> None:
         req.save_output = False

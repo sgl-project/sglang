@@ -347,12 +347,12 @@ class DiffusionServer:
 
                 for worker_idx, monitor in enumerate(denoiser_monitors):
                     if monitor in events:
-                        self._handle_glm_worker_monitor(worker_idx, monitor)
+                        self._handle_glm_denoiser_monitor_event(worker_idx, monitor)
 
                 if self._glm_distributed_state is not None:
-                    self._poll_glm_ar_result()
-                    self._drain_glm_ar_queue()
-                    self._drain_glm_shard_queue()
+                    self._process_glm_ar_batch_result_if_ready()
+                    self._dispatch_glm_ar_batch_if_ready()
+                    self._dispatch_queued_glm_denoiser_requests()
                 else:
                     self._drain_all_queues()
 
@@ -374,7 +374,7 @@ class DiffusionServer:
             return
 
         if self._glm_distributed_state is not None and role == RoleType.DENOISER:
-            self._handle_glm_shard_result_frames(frames)
+            self._handle_glm_denoiser_result_frames(frames)
         elif role == RoleType.DECODER:
             self._handle_decoder_result_frames(frames)
         else:
@@ -496,7 +496,7 @@ class DiffusionServer:
             request_id,
         )
 
-    def _drain_glm_ar_queue(self) -> None:
+    def _dispatch_glm_ar_batch_if_ready(self) -> None:
         state = self._glm_distributed_state
         assert state is not None
         if state.ar_inflight is not None or not state.ar_queue:
@@ -543,7 +543,7 @@ class DiffusionServer:
             except ValueError:
                 pass
         state.ar_inflight = (
-            state.executor.submit(self._execute_glm_ar_batch, clients),
+            state.executor.submit(self._generate_glm_prior_tokens_batch, clients),
             clients,
         )
         logger.info(
@@ -552,7 +552,7 @@ class DiffusionServer:
             output_slots,
         )
 
-    def _execute_glm_ar_batch(self, clients: list[_GlmClientEntry]):
+    def _generate_glm_prior_tokens_batch(self, clients: list[_GlmClientEntry]):
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
             _num_outputs_per_prompt,
             _seed_for_output,
@@ -578,7 +578,7 @@ class DiffusionServer:
             device=torch.device("cpu"),
         )
 
-    def _poll_glm_ar_result(self) -> None:
+    def _process_glm_ar_batch_result_if_ready(self) -> None:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
             _merge_srt_usages,
         )
@@ -648,7 +648,7 @@ class DiffusionServer:
             state.shard_queue.append(shard)
             output_start = output_end
 
-    def _drain_glm_shard_queue(self) -> None:
+    def _dispatch_queued_glm_denoiser_requests(self) -> None:
         from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
             extract_transfer_fields,
         )
@@ -687,7 +687,9 @@ class DiffusionServer:
                 worker_idx,
             )
 
-    def _handle_glm_worker_monitor(self, worker_idx: int, monitor: zmq.Socket) -> None:
+    def _handle_glm_denoiser_monitor_event(
+        self, worker_idx: int, monitor: zmq.Socket
+    ) -> None:
         state = self._glm_distributed_state
         assert state is not None
         event = recv_monitor_message(monitor, flags=zmq.NOBLOCK)["event"]
@@ -707,7 +709,7 @@ class DiffusionServer:
                 registered,
             )
 
-    def _handle_glm_shard_result_frames(self, frames: list) -> None:
+    def _handle_glm_denoiser_result_frames(self, frames: list) -> None:
         state = self._glm_distributed_state
         assert state is not None
         tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
@@ -1460,8 +1462,8 @@ class DiffusionServer:
                 {
                     "glm_ar_queue_depth": len(state.ar_queue),
                     "glm_ar_in_flight": state.ar_inflight is not None,
-                    "glm_shard_queue_depth": len(state.shard_queue),
-                    "glm_worker_available": list(state.worker_available),
+                    "glm_denoiser_queue_depth": len(state.shard_queue),
+                    "glm_denoiser_worker_available": list(state.worker_available),
                 }
             )
         return stats
