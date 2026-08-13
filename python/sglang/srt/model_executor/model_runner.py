@@ -783,20 +783,6 @@ class ModelRunner:
     ) -> int:
         """Logits rows per decode batch slot."""
         if self.spec_algorithm.is_speculative():
-            if self.spec_algorithm.is_dspark() and self.is_draft_worker:
-                from sglang.srt.speculative.dspark_components.dspark_config import (
-                    parse_dspark_draft_config,
-                )
-
-                if num_draft_tokens is None:
-                    num_draft_tokens = self.server_args.speculative_num_draft_tokens
-                draft_config = parse_dspark_draft_config(
-                    draft_hf_config=self.model_config.hf_config
-                )
-                # The verify width is gamma + 1. A sample-from-anchor draft
-                # queries only gamma positions; a bonus-anchor draft queries
-                # the entire verify-width block (anchor + gamma masks).
-                return int(num_draft_tokens) - int(draft_config.sample_from_anchor)
             return resolve_num_tokens_per_req(
                 phase="target_verify",
                 server_args=self.server_args,

@@ -12,6 +12,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     _resolve_corrected_logits_dtype,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
@@ -70,19 +71,36 @@ def test_gamma_override_warning_names_resolved_config_gamma(caplog):
 
 
 def test_draft_graph_width_tracks_dspark_query_layout():
-    from sglang.srt.model_executor.model_runner import ModelRunner
-
-    def width(config):
-        runner = SimpleNamespace(
-            spec_algorithm=SpeculativeAlgorithm.DSPARK,
-            is_draft_worker=True,
-            server_args=SimpleNamespace(speculative_num_draft_tokens=8),
-            model_config=SimpleNamespace(hf_config=config),
+    def width(*, sample_from_anchor, is_draft_worker=True):
+        server_args = SimpleNamespace(
+            speculative_num_draft_tokens=8,
+            speculative_dspark_sample_from_anchor=sample_from_anchor,
         )
-        return ModelRunner.decode_num_tokens_per_req(runner, num_draft_tokens=8)
+        return resolve_num_tokens_per_req(
+            phase="target_verify",
+            server_args=server_args,
+            spec_algorithm=SpeculativeAlgorithm.DSPARK,
+            is_draft_worker=is_draft_worker,
+        )
 
-    assert width(_config(sample_from_anchor=False, dspark_bonus_anchor=True)) == 8
-    assert width(_config(sample_from_anchor=True, dspark_bonus_anchor=False)) == 7
+    assert width(sample_from_anchor=False) == 8
+    assert width(sample_from_anchor=True) == 7
+    assert width(sample_from_anchor=False, is_draft_worker=False) == 8
+    assert width(sample_from_anchor=True, is_draft_worker=False) == 8
+
+
+def test_non_dspark_target_verify_width_is_unchanged():
+    server_args = SimpleNamespace(speculative_num_draft_tokens=8)
+
+    assert (
+        resolve_num_tokens_per_req(
+            phase="target_verify",
+            server_args=server_args,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            is_draft_worker=True,
+        )
+        == 8
+    )
 
 
 def test_folded_sampler_skips_bonus_anchor_hidden_state():
@@ -147,3 +165,11 @@ def test_folded_sampler_uses_logit_dtype_for_quantized_lm_head():
     )
 
     assert sampler.corrected_out.dtype == torch.bfloat16
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

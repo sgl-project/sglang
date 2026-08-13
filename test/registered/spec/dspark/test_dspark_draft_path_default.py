@@ -64,6 +64,19 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
         _handle_dspark(server_args)
         self.assertEqual(server_args.speculative_draft_model_path, _BUNDLED_MODEL_PATH)
         self.assertEqual(server_args.speculative_num_draft_tokens, 6)
+        self.assertTrue(server_args.speculative_dspark_sample_from_anchor)
+
+    def test_bundled_checkpoint_caches_bonus_anchor_layout(self):
+        hf_config = _bundled_hf_config()
+        hf_config.sample_from_anchor = False
+        hf_config.dspark_bonus_anchor = True
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=hf_config
+        )
+
+        _handle_dspark(server_args)
+
+        self.assertFalse(server_args.speculative_dspark_sample_from_anchor)
 
     def test_plain_target_without_draft_path_raises(self):
         server_args = _make_dspark_server_args(

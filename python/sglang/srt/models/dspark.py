@@ -488,6 +488,16 @@ class DSparkDraftMixin:
         for name, loaded_weight in weights:
             if any(name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES):
                 continue
+            normalized_name = name.removeprefix("model.")
+            if normalized_name.startswith("embed_tokens.") and not bool(
+                getattr(self, "has_embed_tokens", False)
+            ):
+                raise ValueError(
+                    "DSpark checkpoint contains embed_tokens weights, but "
+                    "has_embed_tokens is false or absent from its config. "
+                    "Refusing to ignore the checkpoint embedding and silently "
+                    "fall back to the target model embedding."
+                )
             if name.startswith("confidence_head."):
                 if self.confidence_head is None:
                     continue

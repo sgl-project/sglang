@@ -50,6 +50,23 @@ class _FakeW4A16HeadMethod:
 _FakeW4A16HeadMethod.__name__ = "ModelOptNvFp4A16LinearMethod"
 
 
+class _LoadWeightsBase(nn.Module):
+    def __init__(self):
+        nn.Module.__init__(self)
+        self.forwarded_weights = []
+
+    def load_weights(self, weights):
+        self.forwarded_weights.extend(weights)
+
+
+class _LoadWeightsDraft(DSparkDraftMixin, _LoadWeightsBase):
+    def __init__(self, *, has_embed_tokens):
+        _LoadWeightsBase.__init__(self)
+        self.has_embed_tokens = has_embed_tokens
+        self.confidence_head = None
+        self.markov_head = nn.Module()
+
+
 class TestDSparkDraftModel(unittest.TestCase):
     @patch.object(dspark, "ReplicatedLinear", _FakeReplicatedLinear)
     def test_markov_projection_receives_quant_config_and_full_prefix(self):
@@ -101,6 +118,25 @@ class TestDSparkDraftModel(unittest.TestCase):
         self.assertIs(model.embed_tokens, target_embedding)
         self.assertIs(model.lm_head, target_lm_head)
 
+    def test_checkpoint_embedding_requires_matching_config_declaration(self):
+        for name in ("embed_tokens.weight", "model.embed_tokens.weight"):
+            with self.subTest(name=name):
+                model = _LoadWeightsDraft(has_embed_tokens=False)
+                with self.assertRaisesRegex(
+                    ValueError, "contains embed_tokens weights"
+                ):
+                    model.load_weights([(name, torch.empty((2, 2)))])
+
+    def test_declared_checkpoint_embedding_is_forwarded_to_backbone_loader(self):
+        model = _LoadWeightsDraft(has_embed_tokens=True)
+        weight = torch.empty((2, 2))
+
+        model.load_weights([("embed_tokens.weight", weight)])
+
+        self.assertEqual(len(model.forwarded_weights), 1)
+        self.assertEqual(model.forwarded_weights[0][0], "embed_tokens.weight")
+        self.assertIs(model.forwarded_weights[0][1], weight)
+
     @patch.object(dspark, "gather_and_crop_vocab", side_effect=lambda logits, _: logits)
     def test_quantized_target_head_uses_quant_method(self, _gather):
         hidden = torch.tensor([[1.0, -2.0, 0.5, 3.0]])
@@ -120,7 +156,10 @@ class TestDSparkDraftModel(unittest.TestCase):
             input_size_per_partition=4,
             output_size_per_partition=3,
         )
-        draft = SimpleNamespace(lm_head=lm_head)
+        draft = SimpleNamespace(
+            lm_head=lm_head,
+            logits_mup_width_multiplier=None,
+        )
 
         actual, confidence = DSparkDraftMixin.compute_base_logits(draft, hidden)
 
