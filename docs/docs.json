@@ -1280,6 +1280,12 @@
                     ]
                   },
                   {
+                    "group": "RedNote",
+                    "pages": [
+                      "cookbook/autoregressive/RedNote/Dots3-Note"
+                    ]
+                  },
+                  {
                     "group": "Google",
                     "pages": [
                       "cookbook/autoregressive/Google/EmbeddingGemma",
