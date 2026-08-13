@@ -156,6 +156,32 @@ class TestKimiK3PrerequisiteOps(CustomTestCase):
             )
         )
 
+        # A calibrated MLA cache stores latent K/V divided by its descale,
+        # while query quantization remains unit-scaled.
+        kv_descale = 0.25
+        scaled_pool = torch.zeros_like(fp8_pool)
+        scaled_query = set_mla_kv_concat_q_fp8(
+            scaled_pool,
+            loc,
+            k_nope,
+            k_rope,
+            q_nope,
+            q_rope,
+            quant_scale_kv=1.0 / kv_descale,
+        )
+        scaled_row = torch.cat([k_nope, k_rope], dim=-1)
+        scaled_row = (scaled_row / kv_descale).to(torch.float8_e4m3fn)
+        self.assertTrue(
+            torch.equal(
+                scaled_pool[loc].view(torch.uint8), scaled_row.view(torch.uint8)
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                scaled_query.view(torch.uint8), fp8_query_ref.view(torch.uint8)
+            )
+        )
+
     def test_replayssm_ring_fold(self):
         batch_size, num_steps = 8, 4
         num_value_heads, num_key_heads = 8, 2

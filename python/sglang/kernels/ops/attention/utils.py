@@ -1,3 +1,5 @@
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -104,6 +106,7 @@ def mla_quantize_and_rope_for_fp8(
     is_neox: bool,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    kv_descale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     import flashinfer.rope
 
@@ -129,6 +132,9 @@ def mla_quantize_and_rope_for_fp8(
             is_neox: Whether to use NeoX-style RoPE (interleaved) or GPT-style (half rotation)
             kv_lora_rank: Dimension of the no-position-encoding component
             qk_rope_head_dim: Dimension of the RoPE component
+            kv_descale: Static per-tensor scale used to restore the cached
+                latent K/V values during attention. Cache writes multiply by
+                its reciprocal.
 
         Returns:
             tuple: (merged_q_out, k_nope_out, k_rope_out) quantized to FP8
@@ -152,6 +158,12 @@ def mla_quantize_and_rope_for_fp8(
     k_rope_out = k_rope.new_empty(k_rope.shape, dtype=attn_dtype)
     k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
 
+    kv_descale = float(kv_descale)
+    if not math.isfinite(kv_descale) or kv_descale <= 0.0:
+        raise ValueError(
+            f"MLA KV descale must be finite and positive, got {kv_descale!r}"
+        )
+
     # Apply RoPE and quantize all components in a single fused kernel call
     # This kernel handles:
     # 1. RoPE application to q_rope and k_rope using cos_sin_cache and positions
@@ -171,9 +183,10 @@ def mla_quantize_and_rope_for_fp8(
         k_rope_out=k_rope_out,
         q_nope_out=q_out[..., :kv_lora_rank],  # Nope part goes to beginning
         k_nope_out=k_nope_out,
-        # Quantization scales (set to 1.0 for no additional scaling)
+        # FlashInfer's quant_scale_kv is a quantization multiplier. Attention
+        # consumes k/v descales, so cache write and read must be reciprocal.
         quant_scale_q=1.0,
-        quant_scale_kv=1.0,
+        quant_scale_kv=1.0 / kv_descale,
         enable_pdl=is_arch_support_pdl(),
     )
 
@@ -185,11 +198,26 @@ def mla_quantize_without_rope_for_fp8(
     q_rope: torch.Tensor,
     k_nope: torch.Tensor,
     k_rope: torch.Tensor,
+    kv_descale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize MLA components to FP8 without applying rotary embeddings."""
+    """Quantize MLA components to FP8 without applying rotary embeddings.
+
+    Query components retain unit scaling. The shared latent K/V cache row and
+    its rotary tail are multiplied by ``1 / kv_descale`` before conversion.
+    """
     attn_dtype = torch.float8_e4m3fn
+    kv_descale = float(kv_descale)
+    if not math.isfinite(kv_descale) or kv_descale <= 0.0:
+        raise ValueError(
+            f"MLA KV descale must be finite and positive, got {kv_descale!r}"
+        )
+    quant_scale_kv = 1.0 / kv_descale
     q = concat_mla_absorb_q_general(q_nope, q_rope).to(attn_dtype)
-    return q, k_nope.to(attn_dtype), k_rope.to(attn_dtype)
+    return (
+        q,
+        (k_nope * quant_scale_kv).to(attn_dtype),
+        (k_rope * quant_scale_kv).to(attn_dtype),
+    )
 
 
 def concat_mla_absorb_q_general(q_nope, q_rope):

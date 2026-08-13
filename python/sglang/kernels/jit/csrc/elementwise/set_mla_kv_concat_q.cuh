@@ -14,6 +14,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cuda_fp8.h>
 
@@ -328,6 +329,7 @@ struct SetMlaKVConcatQFp8Params {
   // (loc % world == rank) writes. world=1/rank=0 = identity (non-DCP).
   int32_t dcp_world_size;
   int32_t dcp_rank;
+  float quant_scale_kv;
   // Q quantize + concat side.
   const bf16_t* __restrict__ q_nope;
   const bf16_t* __restrict__ q_rope;
@@ -343,17 +345,19 @@ struct SetMlaKVConcatQFp8Params {
 };
 
 // 2x bf16 -> 2x fp8 e4m3, float-mediated cvt.rn NOSAT (matches aten: overflow -> NaN).
-SGL_DEVICE uint16_t bf16x2_to_fp8x2(const bf16x2_t v) {
+SGL_DEVICE uint16_t bf16x2_to_fp8x2(const bf16x2_t v, float scale) {
   const float2 f = __bfloat1622float2(v);
-  return __nv_cvt_float2_to_fp8x2(f, __NV_NOSAT, __NV_E4M3);
+  return __nv_cvt_float2_to_fp8x2(make_float2(f.x * scale, f.y * scale), __NV_NOSAT, __NV_E4M3);
 }
 
 // Convert 8 bf16 (one int4 load) to 8 fp8 packed in a uint2.
-SGL_DEVICE uint2 bf16x8_to_fp8x8(const int4 v) {
+SGL_DEVICE uint2 bf16x8_to_fp8x8(const int4 v, float scale) {
   const bf16x2_t* p = reinterpret_cast<const bf16x2_t*>(&v);
   uint2 out;
-  out.x = static_cast<uint32_t>(bf16x2_to_fp8x2(p[0])) | (static_cast<uint32_t>(bf16x2_to_fp8x2(p[1])) << 16);
-  out.y = static_cast<uint32_t>(bf16x2_to_fp8x2(p[2])) | (static_cast<uint32_t>(bf16x2_to_fp8x2(p[3])) << 16);
+  out.x =
+      static_cast<uint32_t>(bf16x2_to_fp8x2(p[0], scale)) | (static_cast<uint32_t>(bf16x2_to_fp8x2(p[1], scale)) << 16);
+  out.y =
+      static_cast<uint32_t>(bf16x2_to_fp8x2(p[2], scale)) | (static_cast<uint32_t>(bf16x2_to_fp8x2(p[3], scale)) << 16);
   return out;
 }
 
@@ -388,15 +392,15 @@ __global__ void set_mla_kv_concat_q_fp8_kernel(const __grid_constant__ SetMlaKVC
     // nope: 512 bf16 -> 512 fp8; 16 elems/lane (2 int4 loads -> 1 int4 store).
     {
       const int4* src = reinterpret_cast<const int4*>(nope_src);
-      uint2 lo = bf16x8_to_fp8x8(src[lane_id * 2]);
-      uint2 hi = bf16x8_to_fp8x8(src[lane_id * 2 + 1]);
+      uint2 lo = bf16x8_to_fp8x8(src[lane_id * 2], params.quant_scale_kv);
+      uint2 hi = bf16x8_to_fp8x8(src[lane_id * 2 + 1], params.quant_scale_kv);
       reinterpret_cast<int4*>(&smem[warp_in_cta][0])[lane_id] =
           make_int4(static_cast<int>(lo.x), static_cast<int>(lo.y), static_cast<int>(hi.x), static_cast<int>(hi.y));
     }
     // rope: 64 bf16 -> 64 fp8; 2 elems/lane.
     {
       const bf16x2_t v = reinterpret_cast<const bf16x2_t*>(rope_src)[lane_id];
-      reinterpret_cast<uint16_t*>(&smem[warp_in_cta][kFp8NopeDim])[lane_id] = bf16x2_to_fp8x2(v);
+      reinterpret_cast<uint16_t*>(&smem[warp_in_cta][kFp8NopeDim])[lane_id] = bf16x2_to_fp8x2(v, params.quant_scale_kv);
     }
 
     // TMA reads smem via the async proxy; fence so it can't observe stale sts.
@@ -427,14 +431,14 @@ __global__ void set_mla_kv_concat_q_fp8_kernel(const __grid_constant__ SetMlaKVC
 
     {
       const int4* src = reinterpret_cast<const int4*>(a_row);
-      uint2 lo = bf16x8_to_fp8x8(src[lane_id * 2]);
-      uint2 hi = bf16x8_to_fp8x8(src[lane_id * 2 + 1]);
+      uint2 lo = bf16x8_to_fp8x8(src[lane_id * 2], 1.0f);
+      uint2 hi = bf16x8_to_fp8x8(src[lane_id * 2 + 1], 1.0f);
       reinterpret_cast<int4*>(o_row)[lane_id] =
           make_int4(static_cast<int>(lo.x), static_cast<int>(lo.y), static_cast<int>(hi.x), static_cast<int>(hi.y));
     }
     {
       const bf16x2_t v = reinterpret_cast<const bf16x2_t*>(b_row)[lane_id];
-      reinterpret_cast<uint16_t*>(o_row + kFp8NopeDim)[lane_id] = bf16x2_to_fp8x2(v);
+      reinterpret_cast<uint16_t*>(o_row + kFp8NopeDim)[lane_id] = bf16x2_to_fp8x2(v, 1.0f);
     }
   }
 
@@ -456,7 +460,8 @@ struct SetMlaKVConcatQFp8Kernel {
       tvm::ffi::TensorView q_out,
       int64_t num_warps_per_block,
       int64_t dcp_world_size,
-      int64_t dcp_rank) {
+      int64_t dcp_rank,
+      double quant_scale_kv) {
     using namespace host;
 
     auto B = SymbolicSize{"batch_size"};
@@ -526,6 +531,8 @@ struct SetMlaKVConcatQFp8Kernel {
     CHECK_HOST(D_buf.unwrap() >= kFp8RowBytes) << "kv_buffer last dim too small";
     CHECK_HOST(dcp_world_size >= 1 && dcp_rank >= 0 && dcp_rank < dcp_world_size)
         << "invalid dcp world/rank: " << dcp_world_size << "/" << dcp_rank;
+    CHECK_HOST(std::isfinite(quant_scale_kv) && quant_scale_kv > 0.0)
+        << "quant_scale_kv must be finite and positive; got " << quant_scale_kv;
     CHECK_HOST(S_loc.unwrap() == 1) << "loc must be contiguous; got stride " << S_loc.unwrap();
 
     // Alignment tripwires (mirrored by python covered() so uncovered layouts
@@ -562,6 +569,7 @@ struct SetMlaKVConcatQFp8Kernel {
         .batch_size = batch,
         .dcp_world_size = static_cast<int32_t>(dcp_world_size),
         .dcp_rank = static_cast<int32_t>(dcp_rank),
+        .quant_scale_kv = static_cast<float>(quant_scale_kv),
         .q_nope = static_cast<const bf16_t*>(q_nope.data_ptr()),
         .q_rope = static_cast<const bf16_t*>(q_rope.data_ptr()),
         .q_out = static_cast<uint8_t*>(q_out.data_ptr()),

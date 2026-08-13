@@ -270,6 +270,7 @@ def set_mla_kv_concat_q_fp8(
     num_warps: int = 0,
     dcp_world_size: int = 1,
     dcp_rank: int = 0,
+    quant_scale_kv: float = 1.0,
 ) -> torch.Tensor:
     """Quantize bf16 [k_nope | k_rope] rows to fp8-e4m3 and scatter them into
     ``kv_buffer`` at ``loc``, and return the fp8 concatenated query
@@ -314,5 +315,6 @@ def set_mla_kv_concat_q_fp8(
         num_warps,
         dcp_world_size,
         dcp_rank,
+        quant_scale_kv,
     )
     return q_out
