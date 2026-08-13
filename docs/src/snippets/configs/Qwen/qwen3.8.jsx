@@ -272,6 +272,7 @@ export const config = {
       ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
       // Ports come from the engine's PD_PORTS, not literals — the decode role
       // serves on 30100, so a hardcoded target would not reach it.
+      // In PD mode, --policy is the prefill fallback; keep decode explicit.
       router: {
         port: 8000,
         command:
@@ -279,6 +280,8 @@ export const config = {
   --pd-disaggregation \\
   --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
   --decode http://<decode-host>:{{DECODE_PORT}} \\
+  --policy round_robin \\
+  --decode-policy round_robin \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
   --worker-startup-timeout-secs 7200 \\
   --request-timeout-secs 6900 \\
