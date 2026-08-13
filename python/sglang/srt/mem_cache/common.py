@@ -88,13 +88,21 @@ def free_swa_out_of_window_slots(
         free_slots = req_to_token_pool.req_to_token[
             req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
-        # Both ends are page aligned (swa_evicted_seqlen only ever advances to an
-        # aligned value) and the range starts exactly at the liveness frontier.
-        token_to_kv_pool_allocator.free_swa_segment(
-            free_slots,
-            start_pos=req.kv.swa_evicted_seqlen,
-            swa_alive_from=req.kv.swa_evicted_seqlen,
-        )
+        if is_chunk_cache:
+            # Only a chunk cache can state liveness here. swa_evicted_seqlen is
+            # a floor, not a frontier: it jumps to cache_protected_len above
+            # without freeing anything, and with a radix tree the tombstone
+            # paths release (and zero) mappings above it. free_swa's `> 0`
+            # filter tolerates that; free_swa_segment would read the zero and
+            # release the reserved page 0. A chunk cache builds no tree, so
+            # nothing tombstones above the floor.
+            token_to_kv_pool_allocator.free_swa_segment(
+                free_slots,
+                start_pos=req.kv.swa_evicted_seqlen,
+                swa_alive_from=req.kv.swa_evicted_seqlen,
+            )
+        else:
+            token_to_kv_pool_allocator.free_swa(free_slots)
         maybe_evict_dsv4_state_on_swa(
             token_to_kv_pool_allocator, req_to_token_pool, req, new_swa_evicted_seqlen
         )
