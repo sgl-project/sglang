@@ -26,6 +26,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
@@ -34,8 +35,14 @@ from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
+    cpu_offload_component_matches,
     cpu_offload_flags_for_layerwise_components,
+    is_dit_component_name,
+    is_image_encoder_component_name,
+    is_text_encoder_component_name,
+    is_vae_component_name,
     layerwise_component_matches_any_selection,
+    normalize_cpu_offload_components,
     normalize_layerwise_offload_components,
 )
 from sglang.multimodal_gen.runtime.platforms import (
@@ -71,6 +78,10 @@ LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 LORA_MERGE_MODES = ("auto", "merge", "dynamic")
+MAX_SCHEDULER_RPC_TIMEOUT_S = 2_147_483
+# Mirrors AttentionBackend.supports_ring_rotation; the name-level check
+# runs before backend classes are importable on every platform.
+RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn")
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -129,6 +140,8 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
         "comfy-org/ideogram-4",
+        "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
+        "sana1.5_1.6b_1024px_diffusers",
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
         "glm-image",
@@ -139,6 +152,8 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ideogram-v4-instant",
         "ideogram-ai/ideogram-4-fp8",
         "ideogram-ai/ideogram-4-nf4",
+        "lightricks/ltx-2",
+        "ltx-2",
         "minimax-h3",
         "minimaxai/minimax-h3",
         "qwen/qwen-image",
@@ -157,8 +172,10 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
+        "LTX2PipelineConfig",
         "MiniMaxH3PipelineConfig",
         "QwenImagePipelineConfig",
+        "SanaPipelineConfig",
         "ZImagePipelineConfig",
     }
 )
@@ -188,6 +205,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # explicit model ID override (e.g. "Qwen-Image")
     model_id: str | None = None
 
+    # served model name exposed via /v1/models and generation responses
+    served_model_name: str | None = None
+
     # Model backend (sglang native or diffusers)
     backend: Backend = Backend.AUTO
 
@@ -203,6 +223,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Distributed executor backend
     nccl_port: Optional[int] = None
+    enable_nccl_nvls: bool = False
 
     # HuggingFace specific parameters
     trust_remote_code: bool = False
@@ -213,11 +234,23 @@ class ServerArgs(DisaggServerArgsMixin):
     performance_mode: str = "auto"
     base_gpu_id: int = 0
     gpu_ids: list[int] | None = None
+    # cross-node: num_gpus is the total world size across all nodes; each
+    # node runs num_gpus // nnodes local GPU workers (mirrors srt's
+    # tp_size_per_node convention)
+    nnodes: int = 1
+    node_rank: int = 0
+    dist_init_addr: str | None = None
     tp_size: Optional[int] = None
     sp_degree: Optional[int] = None
     # sequence parallelism
     ulysses_degree: Optional[int] = None
     ring_degree: Optional[int] = None
+    # rows split inside attention, exchanged with one K/V all-gather instead
+    # of Ulysses a2a or ring rotation; auto-assigned at sp_degree=2 when no SP
+    # degree is set explicitly
+    kv_gather_degree: Optional[int] = None
+    # whether the SP split was auto-assigned (lets layers fall back per call)
+    sp_split_auto: bool = False
     # data parallelism
     # number of data parallelism groups
     dp_size: int = 1
@@ -235,6 +268,7 @@ class ServerArgs(DisaggServerArgsMixin):
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
     dist_timeout: int | None = 3600  # 1 hour
+    scheduler_rpc_timeout: int | None = None
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
@@ -248,6 +282,7 @@ class ServerArgs(DisaggServerArgsMixin):
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
+    lora_alpha: int | None = None  # Override training alpha when metadata omits it
     lora_merge_mode: str = "auto"
     lora_weight_name: str | None = None
 
@@ -273,7 +308,11 @@ class ServerArgs(DisaggServerArgsMixin):
     lora_target_modules: list[str] | None = None
 
     # CPU offload parameters
+    # Exact component keys from model_index.json, or a legacy component group.
+    cpu_offload_components: list[str] | None = None
     dit_cpu_offload: bool | None = None
+    # trade checkpoint-loading peak memory for faster ordinary DiT startup
+    direct_gpu_weight_loading: bool = False
     # if true, select the DiT layerwise group
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
@@ -332,6 +371,12 @@ class ServerArgs(DisaggServerArgsMixin):
     # Quantization / Nunchaku SVDQuant configuration
     nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
         default_factory=NunchakuSVDQuantArgs, repr=False
+    )
+
+    # KV-cache quantization (Quant-VideoGen PRQ). Off by default; mirrors the
+    # SRT --kv-cache-dtype pattern (typed config, not a pile of env vars).
+    kv_cache_quant_config: QVGKVQuantArgs = field(
+        default_factory=QVGKVQuantArgs, repr=False
     )
 
     # Master port for distributed inference
@@ -450,15 +495,18 @@ class ServerArgs(DisaggServerArgsMixin):
         """set defaults and normalize values."""
         auto_tuner = ServerArgsAutoTuner(self)
         auto_tuner.adjust_based_on_performance_mode()
+        self._adjust_cpu_offload_components()
         if auto_tuner.could_override_server_args():
             self._adjust_offload()
             auto_tuner.maybe_adjust_auto_default_layerwise_offload()
         self._adjust_ltx2_two_stage_device_mode()
         if auto_tuner.could_override_server_args():
-            auto_tuner.maybe_adjust_auto_component_residency_after_offload()
             auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
+            auto_tuner.maybe_adjust_auto_component_residency_after_offload()
             auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
         self._adjust_path()
+        if self.served_model_name is None:
+            self.served_model_name = self.model_id or self.model_path
         self._adjust_quant_config()
         self._adjust_breakable_cuda_graph_support()
         self._adjust_warmup()
@@ -474,14 +522,32 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
+        self._validate_scheduler_rpc_timeout()
         self._validate_pipeline()
         self._validate_offload()
+        self._validate_direct_gpu_weight_loading()
+        if self.lora_alpha is not None and self.lora_alpha <= 0:
+            raise ValueError("lora_alpha must be a positive integer")
         if not current_platform.is_cpu():
             self._validate_parallelism()
         self._validate_cfg_parallel()
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_scheduler_rpc_timeout(self) -> None:
+        timeout = self.scheduler_rpc_timeout
+        if timeout is None:
+            return
+        if (
+            not isinstance(timeout, int)
+            or isinstance(timeout, bool)
+            or not 0 < timeout <= MAX_SCHEDULER_RPC_TIMEOUT_S
+        ):
+            raise ValueError(
+                "scheduler_rpc_timeout must be None or an integer between "
+                f"1 and {MAX_SCHEDULER_RPC_TIMEOUT_S} seconds"
+            )
 
     def resolved_bcg_text_buckets(self) -> tuple[int, ...]:
         """Sorted, de-duplicated, positive BCG text buckets.
@@ -503,11 +569,16 @@ class ServerArgs(DisaggServerArgsMixin):
         # latent shape, so the user must declare the resolutions up front. We
         # capture every one of them at warmup; serving then never re-captures.
         if not self.warmup_resolutions:
-            raise ValueError(
-                "--enable-breakable-cuda-graph requires --warmup-resolutions: "
-                "diffusion CUDA graphs only replay for a fixed resolution, so "
-                "every served resolution must be declared and captured at "
-                "warmup, e.g. --warmup-resolutions 1024x1024 1328x1328."
+            # No explicit resolutions: capture the model's default warmup
+            # resolution (derived by build_warmup_reqs) so
+            # --enable-breakable-cuda-graph works standalone. BCG graphs are
+            # resolution-specific; a request at any other resolution simply
+            # falls back to eager (the runner never re-captures at serving
+            # time). Pass --warmup-resolutions to capture additional shapes.
+            logger.info(
+                "[Diffusion BCG] --warmup-resolutions unset; capturing the "
+                "model default warmup resolution. Requests at other "
+                "resolutions run eager."
             )
         if self.bcg_text_buckets is not None and not any(
             int(b) > 0 for b in self.bcg_text_buckets
@@ -526,11 +597,13 @@ class ServerArgs(DisaggServerArgsMixin):
             pipeline_config_name in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
             and self._is_breakable_cuda_graph_supported_model()
         ):
+            if not self.warmup_resolutions:
+                self._default_bcg_warmup_resolution()
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only Ideogram-4, MiniMax-H3, "
-            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
+            "[Diffusion BCG] disabled for %s: only Ideogram-4, Lightricks/LTX-2, MiniMax-H3, "
+            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, "
             "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
             "currently supported.",
             pipeline_config_name,
@@ -541,6 +614,39 @@ class ServerArgs(DisaggServerArgsMixin):
         refs = _normalized_bcg_model_refs(self.model_id)
         refs.update(_normalized_bcg_model_refs(self.model_path))
         return bool(refs & BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
+
+    def _default_bcg_warmup_resolution(self) -> None:
+        """Seed --warmup-resolutions with the model default for BCG.
+
+        BCG graphs are resolution-specific and captured at warmup. When the
+        user does not pre-declare resolutions we capture the model's default
+        warmup resolution so --enable-breakable-cuda-graph works standalone;
+        requests at any other resolution fall back to eager.
+        """
+        from sglang.multimodal_gen.runtime.warmup_request_builder import (
+            _resolve_default_warmup_resolution,
+            get_model_sampling_defaults,
+        )
+
+        try:
+            sampling_defaults = get_model_sampling_defaults(self)
+            width, height = _resolve_default_warmup_resolution(
+                self, sampling_defaults, server_based_warmup=True
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "[Diffusion BCG] could not derive a default warmup resolution "
+                "(%s); no graph will be captured and serving runs eager.",
+                exc,
+            )
+            return
+        self.warmup_resolutions = [f"{width}x{height}"]
+        logger.info(
+            "[Diffusion BCG] --warmup-resolutions unset; capturing the model "
+            "default %dx%d. Requests at other resolutions run eager.",
+            width,
+            height,
+        )
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
@@ -644,6 +750,44 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.text_encoder_cpu_offload = True
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = True
+
+    def _adjust_cpu_offload_components(self) -> None:
+        """Apply the unified CPU offload component selector, when provided."""
+        if self.cpu_offload_components is None:
+            return
+
+        legacy_flags = (
+            "dit_cpu_offload",
+            "text_encoder_cpu_offload",
+            "image_encoder_cpu_offload",
+            "vae_cpu_offload",
+        )
+        conflicting_flags = [
+            flag_name
+            for flag_name in legacy_flags
+            if self.is_arg_explicitly_set(flag_name)
+        ]
+        if conflicting_flags:
+            formatted_flags = ", ".join(
+                "--" + flag_name.replace("_", "-") for flag_name in conflicting_flags
+            )
+            raise ValueError(
+                "--cpu-offload-components cannot be combined with the legacy "
+                f"CPU offload flags: {formatted_flags}"
+            )
+
+        selected_components = (
+            normalize_cpu_offload_components(self.cpu_offload_components) or []
+        )
+        self.cpu_offload_components = selected_components
+        self.dit_cpu_offload = self.should_cpu_offload_component("transformer")
+        self.text_encoder_cpu_offload = self.should_cpu_offload_component(
+            "text_encoder"
+        )
+        self.image_encoder_cpu_offload = self.should_cpu_offload_component(
+            "image_encoder"
+        )
+        self.vae_cpu_offload = self.should_cpu_offload_component("vae")
 
     def _adjust_ltx2_two_stage_device_mode(self):
         if not self._is_ltx23_two_stage_pipeline():
@@ -749,18 +893,21 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
         if self.ring_degree > 1:
-            if self.attention_backend is not None and self.attention_backend not in (
-                "fa",
-                "sage_attn",
+            if (
+                self.attention_backend is not None
+                and self.attention_backend not in RING_CAPABLE_ATTENTION_BACKENDS
             ):
                 raise ValueError(
-                    "Ring Attention is only supported for flash attention or sage attention backend for now"
+                    "Ring Attention requires one of the ring-capable backends "
+                    f"({', '.join(RING_CAPABLE_ATTENTION_BACKENDS)}), got "
+                    f"{self.attention_backend!r}"
                 )
             if self.attention_backend is None:
-                self.attention_backend = "fa"
+                self.attention_backend = RING_CAPABLE_ATTENTION_BACKENDS[0]
                 logger.info(
-                    "Ring Attention is currently only supported for flash attention or sage attention; "
-                    "attention_backend has been automatically set to flash attention"
+                    "Ring Attention requires a ring-capable backend; "
+                    "attention_backend has been automatically set to %s",
+                    self.attention_backend,
                 )
 
         if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
@@ -1041,12 +1188,35 @@ class ServerArgs(DisaggServerArgsMixin):
         if (
             self.ulysses_degree is None
             and self.ring_degree is None
+            and self.kv_gather_degree is None
             and self.sp_degree != 1
         ):
-            self.ulysses_degree = self.sp_degree
-            logger.info(
-                f"Automatically set ulysses_degree=sp_degree={self.ulysses_degree} for best performance"
-            )
+            if self.sp_degree == 2:
+                # measured-win zone for the K/V-gather exchange; layers whose
+                # calls the gather path cannot take fall back to Ulysses
+                self.kv_gather_degree = 2
+                self.sp_split_auto = True
+                logger.info(
+                    "Automatically set kv_gather_degree=sp_degree=2; set "
+                    "--ulysses-degree explicitly to keep the Ulysses exchange"
+                )
+            else:
+                self.ulysses_degree = self.sp_degree
+                logger.info(
+                    "Automatically set ulysses_degree=sp_degree=%d for the "
+                    "sequence-parallel process-group layout",
+                    self.ulysses_degree,
+                )
+
+        if self.kv_gather_degree is None:
+            self.kv_gather_degree = 1
+
+        if self.kv_gather_degree > 1:
+            if (self.ulysses_degree or 1) != 1 or (self.ring_degree or 1) != 1:
+                raise ValueError(
+                    "kv_gather_degree does not compose with ulysses_degree or "
+                    "ring_degree yet; set exactly one of them above 1"
+                )
 
         if self.ulysses_degree is None:
             self.ulysses_degree = 1
@@ -1057,6 +1227,13 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.ring_degree is None:
             self.ring_degree = 1
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
+
+        if self.kv_gather_degree > 1:
+            # K/V-gather rows occupy the contiguous inner SP dimension; the
+            # process groups are built from ulysses_degree, so alias it until
+            # gather gets a first-class dimension (needed only once it
+            # composes with Ulysses).
+            self.ulysses_degree = self.kv_gather_degree
 
     def _model_default_uses_cfg(self) -> bool:
         """
@@ -1112,6 +1289,25 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def is_arg_explicitly_set(self, arg_name: str) -> bool:
         return arg_name in self._explicit_arg_names
+
+    def should_cpu_offload_component(self, component_name: str) -> bool:
+        if self.cpu_offload_components is not None:
+            return cpu_offload_component_matches(
+                component_name, self.cpu_offload_components
+            )
+        if is_dit_component_name(component_name) or component_name in (
+            "connectors",
+            "unconditional_transformer",
+            "vision_language_encoder",
+        ):
+            return bool(self.dit_cpu_offload)
+        if is_text_encoder_component_name(component_name):
+            return bool(self.text_encoder_cpu_offload)
+        if is_image_encoder_component_name(component_name):
+            return bool(self.image_encoder_cpu_offload)
+        if is_vae_component_name(component_name) or component_name == "sound_tokenizer":
+            return bool(self.vae_cpu_offload)
+        return False
 
     def should_configure_layerwise_offload_for_lazy_component(
         self, component_name: str
@@ -1307,6 +1503,15 @@ class ServerArgs(DisaggServerArgsMixin):
             ),
         )
         parser.add_argument(
+            "--served-model-name",
+            type=str,
+            default=ServerArgs.served_model_name,
+            help=(
+                "Override the model name exposed by /v1/models and used in generation "
+                "responses. Defaults to --model-id if set, otherwise --model-path."
+            ),
+        )
+        parser.add_argument(
             "--pipeline",
             "--pipeline-class-name",
             dest="pipeline_class_name",
@@ -1383,6 +1588,12 @@ class ServerArgs(DisaggServerArgsMixin):
         )
         # Parallelism
         parser.add_argument(
+            "--enable-nccl-nvls",
+            action=StoreBoolean,
+            default=ServerArgs.enable_nccl_nvls,
+            help="Enable NCCL NVLS when available.",
+        )
+        parser.add_argument(
             "--num-gpus",
             type=int,
             default=ServerArgs.num_gpus,
@@ -1394,6 +1605,27 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.base_gpu_id,
             help="The starting GPU ID for this instance. Used with --disagg-role "
             "to place role instances on specific GPUs without CUDA_VISIBLE_DEVICES.",
+        )
+        parser.add_argument(
+            "--nnodes",
+            type=int,
+            default=ServerArgs.nnodes,
+            help="The number of nodes for cross-node parallelism. --num-gpus is "
+            "the total GPU count across all nodes; each node runs "
+            "num_gpus // nnodes local workers.",
+        )
+        parser.add_argument(
+            "--node-rank",
+            type=int,
+            default=ServerArgs.node_rank,
+            help="The rank of this node among --nnodes nodes, in [0, nnodes).",
+        )
+        parser.add_argument(
+            "--dist-init-addr",
+            type=str,
+            default=ServerArgs.dist_init_addr,
+            help="The host:port distributed rendezvous address, reachable from "
+            "every node. Required when --nnodes > 1.",
         )
         parser.add_argument(
             "--gpu-ids",
@@ -1445,6 +1677,20 @@ class ServerArgs(DisaggServerArgsMixin):
             ),
         )
         parser.add_argument(
+            "--kv-gather-degree",
+            type=int,
+            default=ServerArgs.kv_gather_degree,
+            help=(
+                "Sequence-parallel degree that splits rows inside attention "
+                "and exchanges with one K/V all-gather (queries stay local) "
+                "instead of Ulysses all-to-all. Non-causal attention only; "
+                "does not compose with --ulysses-degree/--ring-degree yet. "
+                "When no SP degree is set explicitly, sp_degree=2 defaults to "
+                "kv_gather_degree=2 (its measured-win zone) and higher "
+                "degrees default to Ulysses."
+            ),
+        )
+        parser.add_argument(
             "--enable-cfg-parallel",
             action=StoreBoolean,
             default=None,
@@ -1489,6 +1735,16 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.dist_timeout,
             help="Timeout for torch.distributed operations in seconds. "
             "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
+        )
+        parser.add_argument(
+            "--scheduler-rpc-timeout",
+            type=int,
+            default=ServerArgs.scheduler_rpc_timeout,
+            help=(
+                "Optional end-to-end timeout in seconds for a scheduler RPC, including "
+                "time spent in the scheduler queue. By default no transport-level "
+                "deadline is imposed; callers may still cancel their request."
+            ),
         )
 
         ServerArgs.add_disagg_cli_args(parser)
@@ -1602,6 +1858,28 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Use CPU offload for DiT inference. Enable if run out of memory with FSDP.",
         )
         parser.add_argument(
+            "--direct-gpu-weight-loading",
+            action=StoreBoolean,
+            default=ServerArgs.direct_gpu_weight_loading,
+            help="Load the full unquantized DiT checkpoint state dict directly "
+            "onto GPU before assigning model parameters. This may reduce startup "
+            "time depending on the model, but temporarily requires checkpoint "
+            "weights and model weights to coexist on GPU. Disabled by default.",
+        )
+        parser.add_argument(
+            "--cpu-offload-components",
+            type=str,
+            nargs="+",
+            default=ServerArgs.cpu_offload_components,
+            help=(
+                "Select component keys from model_index.json for coarse CPU offload. "
+                "Use dit, text_encoder, image_encoder, or vae as group aliases; "
+                "all selects every loaded module and none disables component offload. "
+                "This unified option cannot be combined with the legacy "
+                "per-component CPU offload flags."
+            ),
+        )
+        parser.add_argument(
             "--dit-layerwise-offload",
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
@@ -1689,6 +1967,67 @@ class ServerArgs(DisaggServerArgsMixin):
             "--disable-autocast",
             action=StoreBoolean,
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
+        )
+
+        # KV-cache quantization (Quant-VideoGen PRQ)
+        parser.add_argument(
+            "--kv-cache-quant",
+            type=str,
+            default=None,
+            choices=["off", "int4", "int2"],
+            help="Enable Quant-VideoGen PRQ KV-cache quantization (off|int4|int2). "
+            "Defaults reproduce the tuned per-chunk config (stages=1, "
+            "centroids=128, block=64, symmetric, iters=2, recent=1, "
+            "per-chunk sink).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-centroids",
+            type=int,
+            default=None,
+            help="PRQ k-means centroids per stage (default 128).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-block-size",
+            type=int,
+            default=None,
+            help="PRQ residual scale block size (default 64).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-stages",
+            type=int,
+            default=None,
+            help="PRQ k-means stages (default 1).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-iters",
+            type=int,
+            default=None,
+            help="PRQ k-means iterations (default 2).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-asymmetric",
+            action="store_true",
+            default=None,
+            help="Use KIVI-style asymmetric residual quantization.",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-keep-recent",
+            type=int,
+            default=None,
+            help="Completed chunks kept bf16 before quantizing (default 1).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-sink",
+            type=int,
+            default=None,
+            choices=[0, 1],
+            help="Quantize the attention sink too (1, default) " "or keep it bf16 (0).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-sink-keep",
+            type=int,
+            default=None,
+            help="Leading sink chunks kept bf16 forever (default 0).",
         )
 
         # quantization
@@ -1833,6 +2172,15 @@ class ServerArgs(DisaggServerArgsMixin):
             type=float,
             default=ServerArgs.lora_scale,
             help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
+        )
+        parser.add_argument(
+            "--lora-alpha",
+            type=int,
+            default=ServerArgs.lora_alpha,
+            help=(
+                "Override the LoRA training alpha when neither the checkpoint nor "
+                "adapter_config.json records it"
+            ),
         )
         parser.add_argument(
             "--lora-merge-mode",
@@ -2188,6 +2536,19 @@ class ServerArgs(DisaggServerArgsMixin):
             elif attr == "nunchaku_config":
                 nunchaku_config = NunchakuSVDQuantArgs.from_dict(kwargs)
                 server_args_kwargs["nunchaku_config"] = nunchaku_config
+            elif attr == "kv_cache_quant_config":
+                kv_quant_config = kwargs.get("kv_cache_quant_config")
+                if kv_quant_config is None:
+                    kv_quant_config = QVGKVQuantArgs.from_dict(kwargs)
+                elif isinstance(kv_quant_config, dict):
+                    kv_quant_config = QVGKVQuantArgs(**kv_quant_config).validate()
+                elif isinstance(kv_quant_config, QVGKVQuantArgs):
+                    kv_quant_config.validate()
+                else:
+                    raise TypeError(
+                        "kv_cache_quant_config must be QVGKVQuantArgs or a dict"
+                    )
+                server_args_kwargs["kv_cache_quant_config"] = kv_quant_config
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
 
@@ -2390,7 +2751,46 @@ class ServerArgs(DisaggServerArgsMixin):
                     "--performance-mode speed for GPU-resident defaults when memory allows."
                 )
 
+    def _validate_direct_gpu_weight_loading(self) -> None:
+        if not self.direct_gpu_weight_loading:
+            return
+        if not current_platform.is_cuda():
+            raise ValueError("--direct-gpu-weight-loading requires CUDA")
+        if self.dit_cpu_offload or self.is_dit_layerwise_offload_selected:
+            raise ValueError(
+                "--direct-gpu-weight-loading requires a GPU-resident DiT; disable "
+                "DiT CPU and layerwise offload"
+            )
+        if self.use_fsdp_inference:
+            raise ValueError(
+                "--direct-gpu-weight-loading does not support FSDP inference"
+            )
+        if self.tp_size != 1:
+            raise ValueError("--direct-gpu-weight-loading requires --tp-size 1")
+
     def _validate_parallelism(self):
+        if self.kv_gather_degree < 1:
+            raise ValueError("kv_gather_degree must be >= 1")
+        if self.kv_gather_degree > 1 and self.sp_degree != self.kv_gather_degree:
+            raise ValueError(
+                f"kv_gather_degree ({self.kv_gather_degree}) must equal "
+                f"sp_degree ({self.sp_degree}); check how many GPUs remain for "
+                "sequence parallelism after dp/tp/cfg"
+            )
+
+        if self.nnodes < 1:
+            raise ValueError("--nnodes must be a natural number")
+        if not (0 <= self.node_rank < self.nnodes):
+            raise ValueError(
+                f"--node-rank ({self.node_rank}) must be in [0, nnodes={self.nnodes})"
+            )
+        if self.nnodes > 1 and self.dist_init_addr is None:
+            raise ValueError("--dist-init-addr is required when --nnodes > 1")
+        if self.num_gpus % self.nnodes != 0:
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) must be divisible by nnodes ({self.nnodes})"
+            )
+
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:
             raise ValueError(
                 f"num_gpus ({self.num_gpus}) must be >= and divisible by sp_degree ({self.sp_degree})"

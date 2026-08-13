@@ -27,7 +27,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TORCH_VERSION: "2.11.0"
+  TORCH_VERSION: "2.13.0"
 
 jobs:
   build-cu129-matrix:

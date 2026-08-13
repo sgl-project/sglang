@@ -316,6 +316,8 @@ class ServingChatTestCase(unittest.TestCase):
             input_ids=[101, 102, 103],
             stop=["STOP"],
             return_prompt_token_ids=True,
+            cache_salt="tenant-a",
+            extra_key="classification",
         )
 
         with patch(
@@ -329,6 +331,8 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(adapted.input_ids, [101, 102, 103])
         self.assertTrue(adapted.return_prompt_token_ids)
         self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
+        self.assertEqual(adapted.cache_salt, "tenant-a")
+        self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
 
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
@@ -3053,6 +3057,26 @@ class InklingReasoningEffortTest(unittest.TestCase):
                     get()
         finally:
             env.clear()
+
+    def test_thinking_disabled_maps_to_no_thinking_effort(self):
+        """Bug regression: Inkling is an always-on parser, so Anthropic
+        thinking={"type": "disabled"} was rejected outright even though effort
+        "none" (0.0) expresses exactly that."""
+        serving = object.__new__(OpenAIServingChat)
+        serving.reasoning_parser = "inkling"
+        serving.template_manager = Mock(reasoning_config=None)
+        serving._reasoning_detector = Mock(reasoning_default="always")
+        request = ChatCompletionRequest(
+            model="test-model", messages=[{"role": "user", "content": "hi"}]
+        )
+
+        serving.apply_reasoning_enabled(request, False)
+        self.assertEqual(request.reasoning_effort, "none")
+
+        # Enabling leaves an effort set via output_config.effort alone.
+        request.reasoning_effort = "low"
+        serving.apply_reasoning_enabled(request, True)
+        self.assertEqual(request.reasoning_effort, "low")
 
     def test_serving_does_not_prefill_model_message(self):
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
