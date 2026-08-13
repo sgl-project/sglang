@@ -2093,7 +2093,9 @@ class ModelRunner:
 
     def _sync_random_seed_via_store(self, is_source: bool) -> None:
         """Broadcast random_seed via TCPStore (not broadcast_pyobj: retirees may have exited)."""
+        import datetime
         from sglang.srt.distributed.utils import get_global_tcp_store
+        from sglang.srt.utils import set_random_seed
 
         try:
             store = get_global_tcp_store()
@@ -2103,25 +2105,23 @@ class ModelRunner:
         if store is None:
             return
 
+        key = self._RANDOM_SEED_STORE_KEY
+
         if is_source:
             try:
-                store.set(self._RANDOM_SEED_STORE_KEY, str(int(self.server_args.random_seed)))
+                store.set(key, str(int(self.server_args.random_seed)))
             except Exception as exc:
                 logger.warning("[Elastic EP] random_seed source write failed (%s)", exc)
             return
 
-        # Bounded poll via non-blocking check() (store.get blocks up to store.timeout).
-        deadline = time.monotonic() + 30.0
-        while time.monotonic() < deadline:
-            try:
-                if store.check([self._RANDOM_SEED_STORE_KEY]):
-                    raw = store.get(self._RANDOM_SEED_STORE_KEY)
-                    self.server_args.random_seed = int(raw.decode() if isinstance(raw, bytes) else raw)
-                    return
-            except Exception:
-                pass
-            time.sleep(0.05)
-        logger.warning("[Elastic EP] random_seed sync timeout; keeping boot-time value")
+        # torch 2.13 libuv-TCPStore check() polls stall 30s; wait() uses the
+        # notify channel. server_args is read-only, so apply to RNGs directly.
+        try:
+            store.wait([key], datetime.timedelta(seconds=30))
+            raw = store.get(key)
+            set_random_seed(int(raw.decode() if isinstance(raw, bytes) else raw))
+        except Exception as exc:
+            logger.warning("[Elastic EP] random_seed sync failed (%s); keeping boot-time value", exc)
 
     def _finalize_scale_recover(
         self,

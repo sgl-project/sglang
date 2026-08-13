@@ -984,13 +984,11 @@ class Scheduler(
             self.draft_worker.init_cuda_graphs()
 
     def init_model_worker(self):
-        # Load model weights.
         self.init_tp_model_worker()
         if self.server_args.is_startup_weight_load_overlap:
             self.tp_worker.start_startup_weight_load()
         self.maybe_init_draft_worker()
 
-        # Prepare KV cache pools for all workers
         tic = time.perf_counter()
         self.init_memory_pools()
         self.kv_cache_allocation_time = time.perf_counter() - tic
@@ -5139,9 +5137,10 @@ def run_scheduler_process(
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
-        # Ex-joiners: clear ep_join_mode (keep ep_join_rank_offset for _elastic_global_rank).
+        # Ex-joiner: clear ep_join_mode via context.override (server_args
+        # is read-only post-publish); keep ep_join_rank_offset intact.
         if scheduler.server_args.ep_join_mode in ("recover", "scale"):
-            scheduler.server_args.override("elastic_ep.joined", ep_join_mode=None)
+            get_context().override("elastic_ep.joined", ep_join_mode=None)
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()

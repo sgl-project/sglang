@@ -195,14 +195,18 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
 
         out_dir = os.path.join(tempfile.gettempdir(), "symm_allocator")
         os.makedirs(out_dir, exist_ok=True)
-        # Make sure to clean up leftover pytorch lock files
-        # from previous runs and synchronize across processes
-        # right after
+        # Clean up leftover pytorch lock files from previous runs. Barrier
+        # only when WORLD has real peers -- offset joiner boots solo and the
+        # primary never posts the matching barrier.
         try:
             os.remove(os.path.join(out_dir, "lock"))
         except FileNotFoundError:
             pass
-        torch.distributed.barrier()
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            torch.distributed.barrier()
 
         nccl_allocator_libname = "nccl_allocator"
         lib_path = torch.utils.cpp_extension.load_inline(

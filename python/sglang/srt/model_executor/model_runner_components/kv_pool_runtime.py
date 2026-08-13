@@ -45,10 +45,14 @@ def compute_post_capture_kv_resize(
     post-capture GPU memory + the pool objects it must resize in place."""
     pool = model_runner.token_to_kv_pool
     torch.cuda.synchronize()
+    # Offset joiner boots solo; skip WORLD all_reduce the primary never posts.
+    is_solo_join = bool(
+        getattr(model_runner.server_args, "is_ep_offset_joiner", False)
+    )
     free_gb = get_available_gpu_memory(
         model_runner.device,
         model_runner.gpu_id,
-        distributed=get_world_group().world_size > 1,
+        distributed=(not is_solo_join) and get_world_group().world_size > 1,
         cpu_group=get_world_group().cpu_group,
     )
     headroom_gb = model_runner.pre_model_load_memory * (

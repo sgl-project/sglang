@@ -118,6 +118,9 @@ class ElasticEPStateManager:
                 f"world_size ({world_size})."
             )
 
+            if server_args.elastic_ep_backend == "mooncake":
+                cls._shrink_mooncake_fault_reconciliation_window()
+
             inst = cls._build_state(ep_size=active_rank_capacity, device=None)
             inst.effective_ep_size = world_size
             inst.original_ep_size = world_size
@@ -136,6 +139,17 @@ class ElasticEPStateManager:
             cls._instance = inst
 
         return cls._instance
+
+    @classmethod
+    def _shrink_mooncake_fault_reconciliation_window(cls) -> None:
+        # Mooncake PR #2455 buffers positive link events for 30s after any
+        # negative event, stalling grow-into-retired-slot in ``_try_recover_world``.
+        # Retire/regrow is locally sequenced here, so shrink to 1s. Process-local.
+        try:
+            from mooncake.pg import set_fault_reconciliation_window_us
+        except ImportError:
+            return
+        set_fault_reconciliation_window_us(1_000_000)
 
     @classmethod
     def _init_joiner_state(cls, inst: ElasticEPState, server_args: ServerArgs) -> None:

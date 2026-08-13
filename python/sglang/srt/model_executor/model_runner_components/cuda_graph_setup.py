@@ -95,7 +95,6 @@ def capture_cuda_graphs(
     because they capture their own decode-style graphs separately.
 
     """
-
     model_runner.graph_shared_output = GraphSharedOutput.create_for_model_runner(
         model_runner
     )
@@ -145,10 +144,13 @@ def capture_cuda_graphs(
         )
 
         world_group = get_world_group()
+        # Offset joiner boots solo; skip WORLD all_reduce that deep_gemm.py:181
+        # would issue (primary never posts it -> whole cluster deadlocks).
+        is_solo_join = model_runner.server_args.is_ep_offset_joiner
         available_memory_gb = get_available_gpu_memory(
             model_runner.device,
             model_runner.gpu_id,
-            distributed=world_group.world_size > 1,
+            distributed=(not is_solo_join) and world_group.world_size > 1,
             cpu_group=world_group.cpu_group,
         )
         budget_bytes = set_masked_standard_layout_memory_budget(

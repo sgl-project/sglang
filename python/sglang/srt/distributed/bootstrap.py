@@ -109,10 +109,12 @@ def init_torch_distributed(
                 tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
             )
 
+    # Offset joiner boots solo; skip WORLD all_reduce the primary never posts.
+    _is_solo_join = bool(getattr(server_args, "is_ep_offset_joiner", False))
     pre_model_load_memory = get_available_gpu_memory(
         device,
         ps.gpu_id,
-        distributed=get_world_group().world_size > 1,
+        distributed=(not _is_solo_join) and get_world_group().world_size > 1,
         cpu_group=get_world_group().cpu_group,
     )
     tp_group = get_tp_group()
