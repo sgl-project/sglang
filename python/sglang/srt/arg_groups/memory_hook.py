@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Any
+import math
+from typing import Any, Optional
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
@@ -21,6 +22,66 @@ from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
+
+
+def generate_dllm_prefill_cuda_graph_batch_sizes(
+    server_args: Any, max_bs: int
+) -> Optional[list[int]]:
+    """Generate exact aggregate-token buckets for multi-block dLLM prefill."""
+    cfg = resolving_view(server_args)
+    if cfg.dllm_algorithm is None:
+        return None
+    if cfg.cuda_graph_config.prefill.backend != Backend.BREAKABLE:
+        return None
+
+    from sglang.srt.arg_groups.overrides import (
+        resolve_default_page_size,
+        resolve_dllm_page_size,
+    )
+    from sglang.srt.dllm.config import DllmConfig
+
+    dllm_config = DllmConfig.from_server_args(server_args)
+    if dllm_config.prefill_block_size <= dllm_config.block_size:
+        return None
+
+    page_size = resolve_dllm_page_size(
+        page_size=resolve_default_page_size(cfg),
+        block_size=dllm_config.block_size,
+        disable_radix_cache=cfg.disable_radix_cache,
+    )
+    alignment = math.lcm(page_size, dllm_config.block_size)
+    max_tokens = dllm_config.prefill_block_size * dllm_config.max_running_requests
+    if cfg.max_prefill_tokens is not None:
+        max_tokens = min(max_tokens, cfg.max_prefill_tokens)
+    max_tokens = min(max_tokens, max_bs)
+    max_tokens = max_tokens // alignment * alignment
+    capture_bs = (
+        list(range(alignment, max_tokens + 1, alignment)) if max_tokens > 0 else []
+    )
+    logger.info(
+        "Configured %d exact multi-block dLLM prefill CUDA graph buckets: "
+        "alignment=%d, max_tokens=%d",
+        len(capture_bs),
+        alignment,
+        max_tokens,
+    )
+    return capture_bs
+
+
+def generate_effective_prefill_cuda_graph_batch_sizes(
+    server_args: Any, max_bs: int
+) -> list[int]:
+    """Use dLLM exact buckets when applicable, otherwise generic buckets."""
+    from sglang.srt.arg_groups.cuda_graph_hook import (
+        generate_prefill_cuda_graph_batch_sizes,
+    )
+
+    dllm_capture_bs = generate_dllm_prefill_cuda_graph_batch_sizes(server_args, max_bs)
+    return (
+        dllm_capture_bs
+        if dllm_capture_bs is not None
+        else generate_prefill_cuda_graph_batch_sizes(max_bs)
+    )
 
 
 def handle_gpu_memory_settings(server_args: Any, gpu_mem):
@@ -50,7 +111,6 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
     from sglang.srt.arg_groups.cuda_graph_hook import (
         generate_cpu_graph_batch_sizes,
         generate_decode_cuda_graph_batch_sizes,
-        generate_prefill_cuda_graph_batch_sizes,
     )
 
     cfg = resolving_view(server_args)
@@ -217,8 +277,10 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
             )
 
     if prefill_cuda_graph_config.bs is None:
-        prefill_cuda_graph_config.bs = generate_prefill_cuda_graph_batch_sizes(
-            prefill_cuda_graph_config.max_bs
+        prefill_cuda_graph_config.bs = (
+            generate_effective_prefill_cuda_graph_batch_sizes(
+                server_args, prefill_cuda_graph_config.max_bs
+            )
         )
 
     if cuda_graph_config != cfg.cuda_graph_config:

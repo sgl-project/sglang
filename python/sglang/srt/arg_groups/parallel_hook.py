@@ -162,8 +162,8 @@ def handle_dcp_validation(server_args: Any):
 def handle_data_parallelism(server_args: Any):
     # The dp_size==1 resets moved to the resolution pipeline
     # (arg_groups/overrides.py: _data_parallelism_defaults).
-    from sglang.srt.arg_groups.cuda_graph_hook import (
-        generate_prefill_cuda_graph_batch_sizes,
+    from sglang.srt.arg_groups.memory_hook import (
+        generate_effective_prefill_cuda_graph_batch_sizes,
     )
 
     cfg = resolving_view(server_args)
@@ -221,8 +221,8 @@ def handle_data_parallelism(server_args: Any):
         ):
             clamped = {"max_bs": cfg.chunked_prefill_size}
             if (Phase.PREFILL, "bs") not in server_args._cuda_graph_config_locked:
-                clamped["bs"] = generate_prefill_cuda_graph_batch_sizes(
-                    clamped["max_bs"]
+                clamped["bs"] = generate_effective_prefill_cuda_graph_batch_sizes(
+                    server_args, clamped["max_bs"]
                 )
             declare_resolution(
                 server_args,

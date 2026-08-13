@@ -220,6 +220,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
         current_platform.apply_server_args_defaults,
     )
 
+    from sglang.srt.arg_groups.dllm_hook import handle_dllm_cuda_graph_compatibility
+
+    # HIP dLLM graph incompatibility must be declared before memory sizing.
+    handle_dllm_cuda_graph_compatibility(server_args)
+
     gpu_mem = get_device_memory_capacity(cfg.device)
 
     # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
@@ -344,8 +349,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.dllm_hook import handle_dllm_inference
 
     handle_dllm_inference(server_args)
-    # Finalize exact dLLM prefill buckets after backend/config declarations.
-    server_args._configure_dllm_prefill_cuda_graph_buckets()
 
     # Handle crash dump environment variables (must run before CUDA init).
     handle_crash_dump_env(server_args)
