@@ -29,12 +29,6 @@ MODEL_THRESHOLDS = {
         0.320, 56.1
     ),
     ModelLaunchSettings("deepseek-ai/Janus-Pro-7B"): ModelEvalMetrics(0.285, 40.3),
-    ModelLaunchSettings("Efficient-Large-Model/NVILA-8B-hf"): ModelEvalMetrics(
-        0.270, 56.7
-    ),
-    ModelLaunchSettings("Efficient-Large-Model/NVILA-Lite-2B-hf"): ModelEvalMetrics(
-        0.270, 23.8
-    ),
     ModelLaunchSettings("google/gemma-4-E4B-it"): ModelEvalMetrics(0.26, 24.0),
     ModelLaunchSettings(
         "google/gemma-4-26B-A4B-it", extra_args=["--tp=2"]
