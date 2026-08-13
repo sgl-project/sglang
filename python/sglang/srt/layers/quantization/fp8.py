@@ -1243,7 +1243,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
+        native_aiter_mxfp8 = (
+            self.use_mxfp8
+            and _is_gfx95_supported
+            and get_moe_runner_backend().is_aiter()
+        )
+        self.convert_mxfp8_to_block = (
+            self.use_mxfp8
+            and _mxfp8_to_block_fp8_required
+            and not native_aiter_mxfp8
+        )
         self.weight_block_size = self.quant_config.weight_block_size
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
@@ -2109,6 +2118,44 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
+        # AITER's native per-1x32 FlyDSL MoE consumes preshuffled weights and
+        # matching scale layouts. Other runners retain their existing layouts.
+        runner_is_aiter = (
+            getattr(self, "runner", None) is not None
+            and self.runner.runner_backend.is_aiter()
+        )
+        if _use_aiter and runner_is_aiter:
+            # The gfx950 FP8xFP8 stage-1 family is registered only for the
+            # gate/up-interleaved layout.
+            gate_up_interleaved = (
+                True
+                if self.use_mxfp8
+                else envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+            )
+            for scale_name, is_gate_up in (
+                ("w13_weight_scale_inv", True),
+                ("w2_weight_scale_inv", False),
+            ):
+                scale = getattr(layer, scale_name)
+                scale.data = shuffle_scale(
+                    scale.reshape(-1, scale.shape[-1]),
+                    scale.shape[0],
+                    gate_up_interleaved,
+                    is_gate_up,
+                )
+            layer.w13_weight.data = shuffle_weight(
+                layer.w13_weight,
+                is_guinterleave=gate_up_interleaved,
+                gate_up=True,
+            )
+            layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight,
+                is_guinterleave=gate_up_interleaved,
+                gate_up=False,
+            )
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
+
         if (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -2680,7 +2727,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.block_quant:
             quant_type = (
                 AiterQuantType.PER_1X32
-                if self.is_fp4_expert
+                if (self.is_fp4_expert or self.use_mxfp8)
                 else AiterQuantType.PER_128X128
             )
 

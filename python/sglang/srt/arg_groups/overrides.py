@@ -1984,7 +1984,9 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         is_gfx95_mxfp8 = is_hip() and is_gfx95_supported()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
         if is_gfx95_mxfp8:
-            allowed.append("triton")
+            # gfx950 can consume native per-1x32 MXFP8 experts through either
+            # the canonical Triton runner or the AITER/FlyDSL integration.
+            allowed.extend(("triton", "aiter"))
         mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
         if moe_runner_backend == "auto":
             moe_runner_backend = mxfp8_default

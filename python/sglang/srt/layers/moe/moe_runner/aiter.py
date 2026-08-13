@@ -119,6 +119,14 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
     return "no_combine" in inspect.signature(fused_moe).parameters
 
 
+@functools.cache
+def _aiter_fused_moe_supports_fake_topk_slot() -> bool:
+    """Return whether AITER exposes explicit EP top-k key normalization."""
+    from aiter.fused_moe import fused_moe
+
+    return "has_fake_topk_slot" in inspect.signature(fused_moe).parameters
+
+
 class AiterRunnerCore(MoeRunnerCore):
     def run(
         self,
@@ -132,6 +140,15 @@ class AiterRunnerCore(MoeRunnerCore):
                 "no_combine=True requested but the installed aiter.fused_moe does "
                 "not accept a `no_combine` kwarg. Install an aiter build that "
                 "supports fused_moe no_combine output."
+            )
+        if (
+            quant_info.expert_mask is not None
+            and not _aiter_fused_moe_supports_fake_topk_slot()
+        ):
+            raise NotImplementedError(
+                "Standard SGLang expert parallelism requires an AITER build "
+                "whose fused_moe accepts `has_fake_topk_slot`. Build and deploy "
+                "the paired AITER v0.1.19.post2 release-port branch."
             )
 
         if runner_input.hidden_states.shape[0] == 0:
@@ -162,7 +179,19 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
-        if quant_info.swiglu_limit > 0:
+        # MiniMax-M3 declares a gated "silu" MoE, but its activation is the
+        # clamped SwiGLU-OAI form. A non-None gemm1_alpha is the model-level
+        # signal used by the other runners for that form.
+        is_gated_swiglu = self.config.gemm1_alpha is not None
+        effective_swiglu_limit = quant_info.swiglu_limit
+        if is_gated_swiglu and not effective_swiglu_limit:
+            effective_swiglu_limit = self.config.gemm1_clamp_limit or 0.0
+        activation = (
+            _aiter_activation("swiglu")
+            if is_gated_swiglu
+            else _aiter_activation(self.config.activation)
+        )
+        if effective_swiglu_limit > 0:
             # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
             # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
             # swiglu_limit==0) still run on aiter builds where this module
@@ -174,14 +203,26 @@ class AiterRunnerCore(MoeRunnerCore):
             # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
             # matches the layout produced by `Mxfp4MoEMethod` (gpt-oss
             # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
+            requires_mxfp8_interleave = (
+                quant_info.quant_type == AiterQuantType.PER_1X32
+                and quant_info.w13_weight.dtype == torch.float8_e4m3fn
+            )
             extra["gate_mode"] = (
                 GateMode.INTERLEAVE.value
-                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                if (
+                    requires_mxfp8_interleave
+                    or envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                )
                 else GateMode.SEPARATED.value
             )
-            extra["swiglu_limit"] = quant_info.swiglu_limit
+            extra["swiglu_limit"] = effective_swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
+        if quant_info.expert_mask is not None:
+            # Standard SGLang EP keeps exactly the routed top-k columns and
+            # masks non-local experts separately; it does not append AITER's
+            # legacy fake top-k slot.
+            extra["has_fake_topk_slot"] = False
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
@@ -190,7 +231,7 @@ class AiterRunnerCore(MoeRunnerCore):
             topk_weight=runner_input.topk_weights,
             topk_ids=runner_input.topk_ids,
             quant_type=_aiter_quant_type(runner_input.quant_type),
-            activation=_aiter_activation(self.config.activation),
+            activation=activation,
             w1_scale=quant_info.w13_scale,
             w2_scale=quant_info.w2_scale,
             a1_scale=a1_scale,
