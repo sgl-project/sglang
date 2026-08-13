@@ -25,6 +25,7 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import (
@@ -278,19 +279,41 @@ class BaseRunner(ABC):
         )
 
     def _pre_initialize_fi_a2a_workspace(self):
-        """Allocate the FlashInfer MNNVL all-to-all workspace for the fi_a2a DCP
-        comm backend; must run before CG capture (it syncs the stream + barriers
-        cross-rank, uncapturable) and raises early on non-MNNVL platforms.
+        """Allocate the FlashInfer MNNVL all-to-all workspace and send buffers for
+        the fi_a2a DCP comm backend; must run before CG capture (the init syncs
+        the stream + barriers cross-rank, uncapturable, and buffers allocated
+        during capture come from the graph's private pool). Raises early on
+        non-MNNVL platforms.
         """
-        if (
-            not get_parallel().dcp_enabled
-            or get_parallel().dcp_comm_backend != "fi_a2a"
-        ):
+        ps = get_parallel()
+        if not ps.dcp_enabled or ps.dcp_comm_backend != "fi_a2a":
             return
 
         from sglang.srt.layers.dcp import init_fi_a2a_workspace
 
-        init_fi_a2a_workspace(get_parallel().dcp_group)
+        mr = self.model_runner
+        if mr.model_config.attention_arch != AttentionArch.MLA:
+            # The exchange is only reachable from the MLA decode path, so leave
+            # the send buffers unsized rather than guess at a non-MLA shape.
+            init_fi_a2a_workspace(ps.dcp_group)
+            return
+
+        server_args = mr.server_args
+        # One reduce row per decode token. is_dcp_mla_decode_phase() also fires
+        # on TARGET_VERIFY, so scale by the draft width; batches past this (eager
+        # decode above the captured max) fall back to a transient allocation.
+        max_reqs = (
+            server_args.cuda_graph_config.decode.max_bs
+            or server_args.max_running_requests
+            or 1
+        )
+        init_fi_a2a_workspace(
+            ps.dcp_group,
+            max_batch=max_reqs * mr.decode_num_tokens_per_req(),
+            h_per_rank=mr.model_config.num_attention_heads // ps.attn_tp_size,
+            head_dim=mr.model_config.kv_lora_rank,
+            dtype=mr.dtype,
+        )
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
