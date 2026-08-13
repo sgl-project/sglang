@@ -167,6 +167,26 @@ def _jit_rmsnorm_module(
 
 
 @cache_once
+def _jit_rmsnorm_modules(
+    hidden_size: int,
+    dtype: torch.dtype,
+    cast_x_before_out_mul: bool,
+    schedules: Tuple[Schedule, ...],
+) -> Tuple[Module, ...]:
+    """Build every schedule this hidden size can dispatch to, in one go.
+
+    The two schedules are selected by token count, so the throughput one is
+    first needed part way through CUDA graph capture -- which is where its JIT
+    compile would land, inflating the captured graph. Compiling both on the
+    first call keeps that off the capture path.
+    """
+    return tuple(
+        _jit_rmsnorm_module(hidden_size, dtype, cast_x_before_out_mul, schedule)
+        for schedule in schedules
+    )
+
+
+@cache_once
 def _jit_fused_add_rmsnorm_module(
     dim: int,
     dtype: torch.dtype,
@@ -250,12 +270,10 @@ def rmsnorm(
         out = torch.empty_like(input)
     num_tokens, hidden_size = input.size()
     *schedules, threshold = _schedule_rmsnorm(hidden_size, input.element_size())
-    module = _jit_rmsnorm_module(
-        hidden_size,
-        input.dtype,
-        cast_x_before_out_mul,
-        schedules[0 if num_tokens <= threshold else 1],
+    modules = _jit_rmsnorm_modules(
+        hidden_size, input.dtype, cast_x_before_out_mul, tuple(schedules)
     )
+    module = modules[0 if num_tokens <= threshold else 1]
     module.rmsnorm(input, weight, out, eps)
     return out
 
