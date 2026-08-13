@@ -317,27 +317,28 @@ jobs:
 
           echo "Running test: ${tc_name}"
           test_exit_code=0
-
-          # --- DIAGNOSTIC: surface the exact failure point (temporary) ---
-          echo "--- DEBUG pwd: $(pwd)"
-          echo "--- DEBUG ls -la:"; ls -la
-          echo "--- DEBUG test/ exists?"; ls -ld test 2>&1 || echo "--- DEBUG: test/ NOT FOUND in $(pwd)"
-          echo "--- DEBUG PYTHON_FOR_SGLANG=${PYTHON_FOR_SGLANG} ($(command -v ${PYTHON_FOR_SGLANG} 2>&1))"
-          # --- END DIAGNOSTIC ---
-
           cd test
 
           # Append `--nightly` and `--continue-on-error` arguments when the job belongs to the nightly pipeline.
           # --nightly: Collect test cases registered for nightly runs.
           # --continue-on-error: Keep running remaining cases even if one fails.
-          NIGHTLY_FLAG="$([ "${{ inputs.is_nightly_pipeline_job }}" = "true" ] && echo "--nightly --continue-on-error")"
+          NIGHTLY_FLAG=""
+          if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
+            NIGHTLY_FLAG="--nightly --continue-on-error"
+          fi
 
           # Append configuration arguments when the test suite is split into multiple parallel jobs.
-          PARTITION_ARGS="$([ "${PARTITION_SIZE}" -gt 1 ] && echo "--auto-partition-id ${PARTITION_ID} --auto-partition-size ${PARTITION_SIZE}")"
+          PARTITION_ARGS=""
+          if [ "${PARTITION_SIZE}" -gt 1 ] 2>/dev/null; then
+            PARTITION_ARGS="--auto-partition-id ${PARTITION_ID} --auto-partition-size ${PARTITION_SIZE}"
+          fi
 
           # Append `--timeout-from-est‑time` when the job belongs to the nightly pipeline.
           # per‑case timeout is derived from each case's est_time.
-          TIMEOUT_FLAG="$([ "${{ inputs.is_nightly_pipeline_job }}" = "true" ] && echo "--timeout-from-est-time")"
+          TIMEOUT_FLAG=""
+          if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
+            TIMEOUT_FLAG="--timeout-from-est-time"
+          fi
 
           # Run NPU test suite with run_suite.py.
           ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
