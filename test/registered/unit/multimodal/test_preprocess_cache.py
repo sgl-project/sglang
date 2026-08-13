@@ -210,7 +210,11 @@ class TestMediaIdentity(unittest.TestCase):
             def preprocess_fingerprint_payload(self):
                 return {"backend": self.backend, "antialias": True}
 
-        config = SimpleNamespace(model_type="vlm", architectures=["VLM"])
+        class Config:
+            def to_dict(self):
+                return {"model_type": "vlm", "architectures": ["VLM"]}
+
+        config = Config()
         args = SimpleNamespace(
             revision="model-revision",
             tokenizer_revision="tokenizer-revision",

@@ -203,6 +203,28 @@ class TestMediaArtifactProcessor(unittest.TestCase):
         self.assertEqual(artifacts, [artifact])
         self.assertEqual(processor.batches, [])
 
+    def test_cached_artifact_must_match_content_identity(self):
+        processor = _Processor()
+        digest = snapshot_media(b"fresh").content_digest
+        key = processor._artifact_key(digest, b"fresh")
+        processor.mm_preprocess_cache.put(
+            key,
+            _Artifact(
+                snapshot_media(b"stale").content_digest,
+                key,
+                1,
+                b"stale",
+            ),
+        )
+        try:
+            artifacts = asyncio.run(processor.prepare_media_artifacts([b"fresh"]))
+        finally:
+            processor.close()
+
+        self.assertEqual(artifacts[0].content_digest, digest)
+        self.assertEqual(artifacts[0].feature, b"fresh")
+        self.assertEqual(len(processor.batches), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

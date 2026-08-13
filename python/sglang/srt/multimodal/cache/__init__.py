@@ -3,6 +3,7 @@
 from sglang.srt.multimodal.cache.identity import (
     CONTENT_HASH_PREFIX,
     MediaSnapshot,
+    PreprocessFingerprintProvider,
     build_artifact_key,
     build_feature_hash,
     build_processor_fingerprint,
@@ -23,6 +24,7 @@ __all__ = [
     "CacheReservation",
     "MediaSnapshot",
     "MultimodalPreprocessCache",
+    "PreprocessFingerprintProvider",
     "build_artifact_key",
     "build_feature_hash",
     "build_processor_fingerprint",

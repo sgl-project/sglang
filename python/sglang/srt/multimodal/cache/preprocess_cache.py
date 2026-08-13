@@ -8,6 +8,7 @@ import dataclasses
 import sys
 import threading
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Generic, Optional, TypeVar
 
@@ -73,7 +74,7 @@ def estimate_cache_size_bytes(value: Any) -> Optional[int]:
                     return None
                 total += child_size
             return total
-        if isinstance(item, dict):
+        if isinstance(item, Mapping):
             total = 0
             for key, child in item.items():
                 key_size = visit(key)
@@ -142,7 +143,11 @@ class MultimodalPreprocessCache(Generic[K, V]):
         """Atomically use a compatible entry without counting an absent miss."""
         with self._lock:
             entry = self._entries.get(key)
-            if entry is None or not predicate(entry.value):
+            if entry is None:
+                return None
+            if not predicate(entry.value):
+                self._entries.pop(key)
+                self.current_size_bytes -= entry.size_bytes
                 return None
             self._entries.move_to_end(key)
             self.hits += 1

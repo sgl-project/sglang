@@ -9,7 +9,7 @@ import struct
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 from urllib.parse import unquote, urlparse
 
 import numpy as np
@@ -22,6 +22,13 @@ _SHA256_HEX_LENGTH = 64
 _MEDIA_ENVELOPE_FIELDS = frozenset(
     {"type", "format", "url", "image", "video", "audio", "content_hash"}
 )
+
+
+@runtime_checkable
+class PreprocessFingerprintProvider(Protocol):
+    """Explicit source for settings that can change processor artifacts."""
+
+    def preprocess_fingerprint_payload(self) -> Any: ...
 
 
 def parse_content_hash(value: Optional[str]) -> Optional[str]:
@@ -172,8 +179,10 @@ def media_preprocess_kwargs(
     defaults = defaults or {}
     if dataclasses.is_dataclass(source):
         values = {
-            field.name: getattr(source, field.name)
-            for field in dataclasses.fields(source)
+            field.name: value
+            for field, value in zip(
+                dataclasses.fields(source), dataclasses.astuple(source)
+            )
             if field.name not in _MEDIA_ENVELOPE_FIELDS
         }
     elif isinstance(source, Mapping):
@@ -211,8 +220,10 @@ def _canonicalize(value: Any) -> Any:
             "type": "dataclass",
             "class": _qualified_type_name(value),
             "fields": [
-                [field.name, _canonicalize(getattr(value, field.name))]
-                for field in dataclasses.fields(value)
+                [field.name, _canonicalize(field_value)]
+                for field, field_value in zip(
+                    dataclasses.fields(value), dataclasses.astuple(value)
+                )
             ],
         }
     if isinstance(value, Enum):
@@ -347,20 +358,19 @@ def build_processor_fingerprint(
     """Fingerprint preprocessing choices that can change processor output."""
     processor_payload = (
         processor.preprocess_fingerprint_payload()
-        if hasattr(processor, "preprocess_fingerprint_payload")
+        if isinstance(processor, PreprocessFingerprintProvider)
         else {}
     )
+    hf_payload = hf_config.to_dict()
     payload = {
         "transformers": transformers.__version__,
         "processor_class": f"{type(processor).__module__}.{type(processor).__qualname__}",
-        "model_type": getattr(hf_config, "model_type", None),
-        "architectures": getattr(hf_config, "architectures", None),
-        "model_revision": getattr(server_args, "revision", None),
-        "tokenizer_revision": getattr(server_args, "tokenizer_revision", None),
-        "disable_fast_image_processor": getattr(
-            server_args, "disable_fast_image_processor", False
-        ),
-        "mm_process_config": getattr(server_args, "mm_process_config", None) or {},
+        "model_type": hf_payload.get("model_type"),
+        "architectures": hf_payload.get("architectures"),
+        "model_revision": server_args.revision,
+        "tokenizer_revision": server_args.tokenizer_revision,
+        "disable_fast_image_processor": server_args.disable_fast_image_processor,
+        "mm_process_config": server_args.mm_process_config or {},
         "processor": processor_payload,
         "extra": extra or {},
     }

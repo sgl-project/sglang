@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Generic, Optional, Protocol, TypeVar, cast
+from typing import Any, Generic, Optional, Protocol, TypeVar, cast, runtime_checkable
 
 import numpy as np
 import torch
@@ -24,6 +24,7 @@ from sglang.srt.multimodal.cache import (
 from sglang.srt.utils import load_image
 
 
+@runtime_checkable
 class MediaArtifact(Protocol):
     """Minimum contract required by the shared artifact cache path."""
 
@@ -161,14 +162,28 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
         )
 
     def _get_cached_artifact(
-        self, key: str, *, allow_featureless: bool
+        self,
+        key: str,
+        content_digest: str,
+        modality: Modality,
+        *,
+        allow_featureless: bool,
     ) -> Optional[ArtifactT]:
-        return self.mm_preprocess_cache.get_if_present(
+        artifact = self.mm_preprocess_cache.get_if_present(
             key,
-            lambda artifact: self.artifact_usable(
-                artifact, allow_featureless=allow_featureless
+            lambda value: (
+                isinstance(value, MediaArtifact)
+                and value.artifact_key == key
+                and value.content_digest == content_digest
+                and self.artifact_usable(value, allow_featureless=allow_featureless)
             ),
         )
+        if artifact is not None:
+            self.validate_artifact(
+                artifact,
+                MediaArtifactInput(content_digest, key, modality, None),
+            )
+        return artifact
 
     async def prepare_media_artifacts(
         self,
@@ -208,7 +223,10 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
                 key = self._artifact_key(caller_hash, source, modality=modality)
                 keys[index] = key
                 artifact = self._get_cached_artifact(
-                    key, allow_featureless=allow_featureless
+                    key,
+                    caller_hash,
+                    modality,
+                    allow_featureless=allow_featureless,
                 )
                 if artifact is not None:
                     artifacts[index] = artifact
@@ -235,7 +253,10 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
             )
             keys[index] = key
             artifacts[index] = self._get_cached_artifact(
-                key, allow_featureless=featureless_hit_mask[index]
+                key,
+                snapshot.content_digest,
+                modality,
+                allow_featureless=featureless_hit_mask[index],
             )
 
         # Deduplicate misses before decode and reserve them across requests.

@@ -682,7 +682,7 @@ class KimiK3ImageProcessor(
         *args,
         **kwargs,
     ):
-        if getattr(request_obj, "video_data", None) or kwargs.get("audio_data"):
+        if request_obj.video_data or kwargs.get("audio_data"):
             raise ValueError("Kimi-K3 supports image input only")
 
         expected_image_count = len(image_data or [])
@@ -706,7 +706,7 @@ class KimiK3ImageProcessor(
 
         artifacts = await self.prepare_media_artifacts(
             image_data,
-            content_hashes=getattr(request_obj, "mm_content_hashes", None),
+            content_hashes=request_obj.mm_content_hashes,
         )
         return self.compose_request(input_text, artifacts)
 

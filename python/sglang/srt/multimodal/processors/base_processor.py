@@ -12,10 +12,8 @@ from typing import (
     Iterator,
     List,
     Optional,
-    Protocol,
     Tuple,
     Union,
-    runtime_checkable,
 )
 
 import numpy as np
@@ -31,6 +29,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
+    PreprocessFingerprintProvider,
     build_processor_fingerprint,
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
@@ -55,13 +54,6 @@ from sglang.srt.utils import (
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
-
-
-@runtime_checkable
-class PreprocessFingerprintProvider(Protocol):
-    """A wrapped processor with explicit artifact-producing configuration."""
-
-    def preprocess_fingerprint_payload(self) -> Any: ...
 
 
 @dataclasses.dataclass
@@ -216,9 +208,7 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
-        configured_mm_feature_transport = getattr(
-            server_args, "mm_feature_transport", "cpu"
-        )
+        configured_mm_feature_transport = server_args.mm_feature_transport
         self.mm_feature_transport = (
             configured_mm_feature_transport
             if configured_mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm")
@@ -228,10 +218,8 @@ class BaseMultimodalProcessor(ABC):
         self.use_ipc_pool_handle_cache = (
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
-        self.image_processor_backend = getattr(
-            server_args, "image_processor_backend", "auto"
-        )
-        if getattr(server_args, "disable_fast_image_processor", False):
+        self.image_processor_backend = server_args.image_processor_backend
+        if server_args.disable_fast_image_processor:
             self.image_processor_backend = "pil"
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -241,25 +229,19 @@ class BaseMultimodalProcessor(ABC):
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
 
-        requested_cache_mb = getattr(
-            self.server_args, "mm_preprocess_cache_size_mb", None
-        )
+        requested_cache_mb = self.server_args.mm_preprocess_cache_size_mb
         total_cache_mb = (
             self.auto_mm_preprocess_cache_size_mb
             if requested_cache_mb is None
             else requested_cache_mb
         )
-        tokenizer_worker_num = max(
-            int(getattr(self.server_args, "tokenizer_worker_num", 1)), 1
-        )
+        tokenizer_worker_num = max(int(self.server_args.tokenizer_worker_num), 1)
         worker_cache_bytes = total_cache_mb * 1024 * 1024 // tokenizer_worker_num
         self.mm_preprocess_cache = MultimodalPreprocessCache(
             max_size_bytes=worker_cache_bytes,
             max_entries=8192,
         )
-        self.trust_mm_content_hashes = bool(
-            getattr(self.server_args, "trust_mm_content_hashes", False)
-        )
+        self.trust_mm_content_hashes = bool(self.server_args.trust_mm_content_hashes)
         self.processor_fingerprint = (
             build_processor_fingerprint(self, hf_config, server_args)
             if self.mm_preprocess_cache.enabled
