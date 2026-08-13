@@ -175,6 +175,38 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertEqual(result.finish_reason["type"], "tool_calls")
 
+    def test_required_tool_call_maps_bare_parameters_to_sole_tool(self):
+        """Models also emit just the parameters object with no {name,
+        parameters} wrapper; with a single tool on offer the target is
+        unambiguous."""
+        self.chat.tool_call_parser = None
+        tool = Mock()
+        tool.function.name = "web_search"
+        result = self.chat._process_tool_calls(
+            '{"q": "weather berlin"}',
+            [tool],
+            {"type": "stop", "matched": None},
+            tool_choice="required",
+        )
+        self.assertIsNotNone(result.tool_calls)
+        self.assertEqual(result.tool_calls[0].function.name, "web_search")
+        self.assertEqual(
+            result.tool_calls[0].function.arguments, '{"q": "weather berlin"}'
+        )
+
+    def test_required_tool_call_bare_parameters_ambiguous_falls_back(self):
+        """With several tools and no named tool_choice the bare object is
+        ambiguous — keep the text fallback instead of guessing."""
+        self.chat.tool_call_parser = None
+        result = self.chat._process_tool_calls(
+            '{"q": "weather berlin"}',
+            [Mock(), Mock()],
+            {"type": "stop", "matched": None},
+            tool_choice="required",
+        )
+        self.assertIsNone(result.tool_calls)
+        self.assertEqual(result.finish_reason["type"], "stop")
+
     def test_required_tool_call_rejects_non_object_entries(self):
         """A JSON array of bare strings is not a tool call payload — fall back
         to text with the original finish reason instead of raising TypeError."""

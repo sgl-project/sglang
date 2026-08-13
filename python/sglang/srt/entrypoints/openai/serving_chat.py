@@ -2046,12 +2046,27 @@ class OpenAIServingChat(OpenAIServingBase):
                     tool_call_data = [tool_call_data]
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
+                    if isinstance(tool, dict) and not isinstance(
+                        tool.get("name"), str
+                    ):
+                        # Bare-parameters object: the model skipped the
+                        # {name, parameters} wrapper entirely. Unambiguous
+                        # only when the target tool is known — a named
+                        # tool_choice, or exactly one tool on offer.
+                        target = None
+                        if isinstance(tool_choice, ToolChoice):
+                            target = tool_choice.function.name
+                        elif len(tools) == 1:
+                            target = tools[0].function.name
+                        if target is not None and "parameters" not in tool:
+                            tool = {"name": target, "parameters": tool}
                     if not isinstance(tool, dict) or not isinstance(
                         tool.get("name"), str
                     ):
                         raise ValueError(
                             f"tool call entry {i} is not an object with a "
-                            f"'name' field (got {type(tool).__name__})"
+                            f"'name' field (got {type(tool).__name__}: "
+                            f"{str(tool)[:120]})"
                         )
                     arguments = json.dumps(
                         tool.get("parameters") or {}, ensure_ascii=False
