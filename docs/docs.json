@@ -82,6 +82,10 @@
       "destination": "/docs/advanced_features/cuda_graph_for_multi_modal_encoder"
     },
     {
+      "source": "/advanced_features/dcp.html",
+      "destination": "/docs/advanced_features/dcp"
+    },
+    {
       "source": "/advanced_features/deterministic_inference.html",
       "destination": "/docs/advanced_features/deterministic_inference"
     },
@@ -933,6 +937,7 @@
               "docs/advanced_features/quantization",
               "docs/advanced_features/quantized_kv_cache",
               "docs/advanced_features/dp_dpa_smg_guide",
+              "docs/advanced_features/dcp",
               "docs/advanced_features/expert_parallelism",
               "docs/advanced_features/lora",
               "docs/advanced_features/pd_disaggregation",

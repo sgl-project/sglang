@@ -54,7 +54,7 @@ def _make_num_token_non_padded(
 ) -> Optional[torch.Tensor]:
     if not enable_num_token_non_padded():
         return None
-    return torch.tensor(num_tokens, dtype=torch.int32, device=device)
+    return torch.tensor(num_tokens, dtype=torch.int32).to(device, non_blocking=True)
 
 
 class DraftBlockResult(msgspec.Struct, frozen=True):
