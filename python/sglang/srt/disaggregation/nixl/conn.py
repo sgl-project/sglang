@@ -2750,6 +2750,7 @@ class NixlKVSender(CommonKVSender):
         self._send_failed = False
         self._send_error: Optional[Exception] = None
         self._transfer_start_time: Optional[float] = None
+        self.init_time = time.time()
 
     def send(
         self,
@@ -2790,6 +2791,10 @@ class NixlKVSender(CommonKVSender):
         if self._send_failed:
             return KVPoll.Failed  # type: ignore
         status = self.kv_mgr.check_status(self.bootstrap_room)
+        if status == KVPoll.Bootstrapping:
+            timeout_result = self._check_bootstrap_timeout()
+            if timeout_result is not None:
+                return timeout_result
         # Hold Success until all staging chunks transferred: a deferred chunk
         # can still be pending, and concluding now would drop it.
         if (

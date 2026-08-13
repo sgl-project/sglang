@@ -340,6 +340,38 @@ class TestNixlKVSenderChunkPolicy(CustomTestCase):
         self.assertTrue(sender.should_send_kv_chunk(3, last_chunk=False))
 
 
+class TestNixlKVSenderBootstrapTimeout(CustomTestCase):
+    @patch("sglang.srt.disaggregation.nixl.conn.time.time", return_value=123.0)
+    def test_init_records_bootstrap_start_time(self, mock_time):
+        with patch(
+            "sglang.srt.disaggregation.nixl.conn.CommonKVSender.__init__",
+            return_value=None,
+        ):
+            sender = NixlKVSender(MagicMock(), "decode:8998", 11, [0], 0)
+
+        self.assertEqual(sender.init_time, 123.0)
+
+    @patch("sglang.srt.disaggregation.common.conn.time.time", return_value=20.0)
+    def test_bootstrap_timeout_records_failure_and_updates_status(self, mock_time):
+        mgr = MagicMock()
+        mgr.bootstrap_timeout = 5
+        mgr.check_status.return_value = KVPoll.Bootstrapping
+        mgr._staging_outstanding = {}
+
+        sender = object.__new__(NixlKVSender)
+        sender.kv_mgr = mgr
+        sender.bootstrap_room = 11
+        sender.init_time = 10.0
+        sender._send_failed = False
+        sender._transfer_start_time = None
+        sender._transfer_metric = MagicMock()
+
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        mgr.record_failure.assert_called_once()
+        self.assertIn("timed out", mgr.record_failure.call_args[0][1])
+        mgr.update_status.assert_called_once_with(11, KVPoll.Failed)
+
+
 class TestNixlAbortHandling(CustomTestCase):
     def _make_manager(self, request_status=None):
         mgr = object.__new__(NixlKVManager)
