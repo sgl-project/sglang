@@ -443,11 +443,18 @@ class RMSNorm(BaseFusedOp):
 
     @cached_property
     def _can_use_cuda_jit(self) -> bool:
+        """Whether the JIT kernel supports this layer at all.
+
+        Only the parts that cannot change after construction belong here. The
+        weight dtype is not one of them: `__init__` makes `weight` fp32 and the
+        loader replaces it later, so caching a dtype check would latch False on
+        any layer whose first read lands before the weights arrive, and every
+        forward after that would fall back to `forward_native`. `forward_cuda`
+        already re-checks the dtypes on each call.
+        """
         from sglang.kernels.ops.layernorm.norm import is_jit_rmsnorm_supported
 
-        if not _is_cuda or self.weight.dtype not in (torch.float16, torch.bfloat16):
-            return False
-        return is_jit_rmsnorm_supported(self.hidden_size)
+        return _is_cuda and is_jit_rmsnorm_supported(self.hidden_size)
 
     def forward_cuda(
         self,
