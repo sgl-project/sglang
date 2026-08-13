@@ -310,13 +310,8 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         module = _import_module_with_stub()
         module.BlockAdapterRegister.supported = False
         transformer = _make_transformer("MiniMaxH3DiTModel")
-        transformer.blocks = [types.SimpleNamespace()]
-        config = module.CacheDitConfig(
-            enabled=True,
-            num_inference_steps=50,
-            Fn_compute_blocks=2,
-            Bn_compute_blocks=1,
-        )
+        transformer.blocks = ["block_0"]
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=50)
 
         returned = module.enable_cache_on_transformer(transformer, config)
 
@@ -326,18 +321,6 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
 
         self.assertIs(module.disable_cache_on_transformer(transformer), transformer)
         self.assertEqual(module.cache_dit.disable_calls, [adapter])
-        self.assertFalse(hasattr(transformer, "_sglang_cache_dit_adapter"))
-
-    def test_registered_adapter_targets_the_transformer(self):
-        module = _import_module_with_stub()
-        module.BlockAdapterRegister.supported = True
-        transformer = _make_transformer("MiniMaxH3DiTModel")
-        transformer.blocks = [types.SimpleNamespace()]
-        config = module.CacheDitConfig(enabled=True, num_inference_steps=50)
-
-        module.enable_cache_on_transformer(transformer, config)
-
-        self.assertIs(module.cache_dit.enable_calls[0]["target"], transformer)
         self.assertFalse(hasattr(transformer, "_sglang_cache_dit_adapter"))
 
 

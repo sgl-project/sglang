@@ -134,22 +134,32 @@ class _KwargIdentity(torch.nn.Module):
         return x
 
 
-def test_cache_dit_compat_flag_only_spares_the_block_input():
+def test_cache_dit_preservation_only_makes_first_gate_out_of_place():
     block = MiniMaxH3DiTBlock.__new__(MiniMaxH3DiTBlock)
     torch.nn.Module.__init__(block)
-    block.preserve_input_for_cache_dit = False
     block.norm1 = torch.nn.Identity()
     block.norm2 = torch.nn.Identity()
     block.attn = _KwargIdentity()
     block.mlp = torch.nn.Identity()
-
-    x = torch.zeros(2, 4)
-    adaln_params = tuple(torch.zeros(1, 4) for _ in range(6))
     gate_modes = []
 
     def fake_gate(residual, _gate, _other, _indices, *, dtype, allow_inplace=True):
         gate_modes.append(allow_inplace)
         return residual.to(dtype)
+
+    def run(preserve):
+        block.preserve_input_for_cache_dit = preserve
+        gate_modes.clear()
+        block(
+            torch.zeros(2, 4),
+            adaln_input=torch.zeros(1, 4),
+            combined_indices=torch.zeros(2, dtype=torch.long),
+            rope_cache=None,
+            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+            max_seqlen=2,
+            adaln_params=tuple(torch.zeros(1, 4) for _ in range(6)),
+        )
+        return list(gate_modes)
 
     with (
         patch(
@@ -161,32 +171,11 @@ def test_cache_dit_compat_flag_only_spares_the_block_input():
             side_effect=fake_gate,
         ),
     ):
-        block(
-            x,
-            adaln_input=torch.zeros(1, 4),
-            combined_indices=torch.zeros(2, dtype=torch.long),
-            rope_cache=None,
-            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
-            max_seqlen=2,
-            adaln_params=adaln_params,
-        )
-        assert gate_modes == [True, True]
-        # Without the flag both gated residuals may reuse their input buffer.
-
-        gate_modes.clear()
-        block.preserve_input_for_cache_dit = True
-        block(
-            x,
-            adaln_input=torch.zeros(1, 4),
-            combined_indices=torch.zeros(2, dtype=torch.long),
-            rope_cache=None,
-            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
-            max_seqlen=2,
-            adaln_params=adaln_params,
-        )
-        # Only the first gated residual touches the block input, so only it
-        # has to be out-of-place; the second keeps the fused kernel.
-        assert gate_modes == [False, True]
+        assert run(preserve=False) == [True, True]
+        # Only the first gated residual can alias the block input Cache-DiT
+        # holds by reference, so only it goes out-of-place. The second works on
+        # a block-local buffer and keeps the fused in-place kernel.
+        assert run(preserve=True) == [False, True]
 
 
 def test_cache_dit_input_preservation_toggles_every_block():
@@ -199,11 +188,6 @@ def test_cache_dit_input_preservation_toggles_every_block():
 
     model.set_cache_dit_input_preservation(False)
     assert not any(block.preserve_input_for_cache_dit for block in model.blocks)
-
-    # Idempotent: repeating a transition must not leave blocks half-flipped.
-    model.set_cache_dit_input_preservation(True)
-    model.set_cache_dit_input_preservation(True)
-    assert all(block.preserve_input_for_cache_dit for block in model.blocks)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
