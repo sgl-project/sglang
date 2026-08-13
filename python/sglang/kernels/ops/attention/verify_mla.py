@@ -591,7 +591,7 @@ def can_handle(
     be read inside a captured HIP graph without a host sync). The kernel always
     computes pure-causal attention, which equals the tree mask ONLY at
     speculative topk == 1. The caller therefore MUST gate enablement on topk == 1
-    (TritonAttnBackend does: ``use_verify_mla = ... and self.topk == 1``).
+    (TritonAttnBackend does: ``use_verify_shared_kv = ... and self.topk == 1``).
     At topk > 1 the tree is not causal and this path must stay disabled."""
     # No exotic features.
     if sinks is not None:
@@ -648,7 +648,7 @@ def can_handle(
     return True
 
 
-def verify_mla_fwd(
+def verify_shared_kv_fwd(
     q_extend,
     k_extend,
     v_extend,

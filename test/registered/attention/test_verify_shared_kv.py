@@ -7,9 +7,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
-from sglang.kernels.ops.attention.verify_mla import verify_mla_fwd
+from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
 from sglang.srt.layers.attention.triton_backend import (
-    _should_use_grouped_head_verify,
+    _should_use_verify_shared_kv,
 )
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -101,7 +101,7 @@ class TestVerifySharedKV(CustomTestCase):
             v_scale,
             sm_scale=scale,
         )
-        ran = verify_mla_fwd(
+        ran = verify_shared_kv_fwd(
             q,
             k,
             v,
@@ -167,7 +167,7 @@ class TestVerifySharedKV(CustomTestCase):
         q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = inputs
         output = torch.empty_like(q)
         self.assertFalse(
-            verify_mla_fwd(
+            verify_shared_kv_fwd(
                 q,
                 k,
                 v,
@@ -203,11 +203,11 @@ class TestVerifySharedKV(CustomTestCase):
             )
 
         qwen = model_config("Qwen3_5MoeForCausalLM")
-        self.assertTrue(_should_use_grouped_head_verify(qwen, 1, False, True))
-        self.assertFalse(_should_use_grouped_head_verify(qwen, 2, False, True))
-        self.assertFalse(_should_use_grouped_head_verify(qwen, 1, False, False))
+        self.assertTrue(_should_use_verify_shared_kv(qwen, 1, False, True))
+        self.assertFalse(_should_use_verify_shared_kv(qwen, 2, False, True))
+        self.assertFalse(_should_use_verify_shared_kv(qwen, 1, False, False))
         self.assertFalse(
-            _should_use_grouped_head_verify(
+            _should_use_verify_shared_kv(
                 model_config("Qwen3_5MoeForCausalLM", local_kv_heads=2),
                 1,
                 False,
@@ -215,12 +215,12 @@ class TestVerifySharedKV(CustomTestCase):
             )
         )
         self.assertFalse(
-            _should_use_grouped_head_verify(
+            _should_use_verify_shared_kv(
                 model_config("LlamaForCausalLM"), 1, False, True
             )
         )
         self.assertTrue(
-            _should_use_grouped_head_verify(
+            _should_use_verify_shared_kv(
                 model_config("KimiK3ForConditionalGeneration"), 1, True, False
             )
         )
@@ -228,7 +228,7 @@ class TestVerifySharedKV(CustomTestCase):
             "sglang.srt.layers.attention.triton_backend.is_gfx95_supported",
             return_value=False,
         ):
-            self.assertFalse(_should_use_grouped_head_verify(qwen, 1, False, True))
+            self.assertFalse(_should_use_verify_shared_kv(qwen, 1, False, True))
 
 
 if __name__ == "__main__":

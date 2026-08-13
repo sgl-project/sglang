@@ -76,7 +76,7 @@ def _mla_decode_kv_splits_cap(
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
-def _should_use_grouped_head_verify(model_config, topk, use_mla, use_verify_splitkv):
+def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv):
     if not is_gfx95_supported() or topk != 1:
         return False
     if use_mla:
@@ -149,7 +149,7 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd_unified,
         )
         from sglang.kernels.ops.attention.verify_mla import (
-            verify_mla_fwd,
+            verify_shared_kv_fwd,
         )
         from sglang.kernels.ops.attention.verify_splitkv import (
             verify_splitkv_fwd,
@@ -166,7 +166,7 @@ class TritonAttnBackend(AttentionBackend):
         # Split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
         self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
         # Grouped-head split-KV verify kernel for MLA or one shared local KV head.
-        self.verify_mla_fwd = torch.compiler.disable(verify_mla_fwd)
+        self.verify_shared_kv_fwd = torch.compiler.disable(verify_shared_kv_fwd)
 
         # Parse args
         self.skip_prefill = skip_prefill
@@ -201,7 +201,7 @@ class TritonAttnBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5
         # GQA with exactly one TP-local KV head.
-        self.use_verify_mla = _should_use_grouped_head_verify(
+        self.use_verify_shared_kv = _should_use_verify_shared_kv(
             model_runner.model_config,
             self.topk,
             self.use_mla,
@@ -1422,8 +1422,8 @@ class TritonAttnBackend(AttentionBackend):
         # extend_attention_fwd below. Correctness is never at risk.
         # Route target-verify to the grouped-head kernel when eligible, else the
         # per-head split-KV kernel.
-        if self.use_verify_mla:
-            verify_fwd = self.verify_mla_fwd
+        if self.use_verify_shared_kv:
+            verify_fwd = self.verify_shared_kv_fwd
         elif self.use_verify_splitkv:
             verify_fwd = self.verify_splitkv_fwd
         else:
