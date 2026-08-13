@@ -72,15 +72,27 @@ class TestQwenE2eParity(CustomTestCase):
 
     def run_native(self, spec, sources):
         """The Rust path: the `process_native_mm` driver, then the drain
-        adapter — the same two steps `RustServer.drain` performs."""
+        adapter — the same two steps `RustServer.drain` performs. Recreates
+        the worker's one-segment-per-item parking from the flat buffer."""
+        from multiprocessing import shared_memory
+
         ids, features, grids, hashes, offsets, mrope, delta = DRIVER(
             PROMPT_PER_IMAGE * len(sources), sources, spec.rust_json()
         )
-        # The shape of Rust's MmEncodedResult, inline transport
-        # (test_wrap_encoded pins the shm shape).
+        shm_names, row = [], 0
+        for t, h, w in grids:
+            n = t * h * w
+            payload = features[
+                row * spec.feature_dim : (row + n) * spec.feature_dim
+            ].tobytes()
+            shm = shared_memory.SharedMemory(create=True, size=len(payload))
+            shm.buf[:] = payload
+            shm.close()  # the fixture is tp_size=1: wrap_encoded unlinks
+            shm_names.append(shm.name)
+            row += n
+        # The shape of Rust's MmEncodedResult.
         encoded = SimpleNamespace(
-            features=features,
-            shm_names=None,
+            shm_names=shm_names,
             grids=grids,
             hashes=hashes,
             offsets=offsets,

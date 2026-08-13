@@ -349,9 +349,9 @@ pub fn mrope_image_only(
 /// different shape.
 pub struct QwenPackedOutput {
     pub input_ids: Vec<i32>,
-    /// All items' `pixel_values`, concatenated in prompt order; flattened
-    /// `[Σ t·h·w, 3·temporal_patch_size·patch_size²]`.
-    pub features: Vec<f32>,
+    /// Per item `pixel_values` in prompt order, each flattened
+    /// `[t·h·w, 3·temporal_patch_size·patch_size²]` (one shm segment each).
+    pub features: Vec<Vec<f32>>,
     /// Per item `[t, h, w]` patch grid.
     pub grids: Vec<[u32; 3]>,
     pub hashes: Vec<u64>,
@@ -368,14 +368,14 @@ pub fn pack_output(output: crate::driver::Output) -> Result<QwenPackedOutput, St
     let PositionOutput::MRope { positions, delta } = output.positions else {
         return Err("qwen_vl pack: expected M-RoPE positions".into());
     };
-    let mut features = Vec::new();
+    let mut features = Vec::with_capacity(output.items.len());
     let mut grids = Vec::with_capacity(output.items.len());
     let mut hashes = Vec::with_capacity(output.items.len());
     for item in output.items {
         let TensorData::F32(pixel_values) = item.feature.data else {
             return Err("qwen_vl pack: expected f32 feature".into());
         };
-        features.extend(pixel_values);
+        features.push(pixel_values);
         let grid = item
             .aux
             .into_iter()
@@ -518,9 +518,12 @@ mod python {
                 pack_output(output)
             })
             .map_err(PyValueError::new_err)?;
+        // The parity API keeps the flat concatenated shape; the per-item
+        // split in QwenPackedOutput serves the server's per-item segments.
+        let features: Vec<f32> = packed.features.into_iter().flatten().collect();
         Ok((
             packed.input_ids,
-            packed.features.into_pyarray(py),
+            features.into_pyarray(py),
             packed
                 .grids
                 .into_iter()

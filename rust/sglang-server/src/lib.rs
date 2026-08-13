@@ -32,15 +32,14 @@ use pyo3::types::PyBytes;
 
 use crate::runtime::{Runtime, RuntimeConfig};
 
-/// One drained MM result (see [`Server::take_mm`]). Exactly one of
-/// `features`/`shm_names` is `Some`: inline features for single-rank serving
-/// (zero-copy into numpy), or one POSIX segment name per item when the scheduler
-/// broadcasts across TP ranks and Python wraps each in a `ShmPointerMMData`.
+/// One drained MM result (see [`Server::take_mm`]). Feature buffers travel
+/// as one POSIX segment name per item; Python wraps each in a
+/// `ShmPointerMMData` and applies its drain policy.
 #[pyclass(frozen, get_all)]
 struct MmEncodedResult {
-    /// Flattened; the drain reshapes to `(-1, feature_dim)`.
-    features: Option<Py<numpy::PyArray1<f32>>>,
-    shm_names: Option<Vec<String>>,
+    /// One POSIX segment name per item, each holding that item's features
+    /// (reshaped by Python to `(t*h*w, feature_dim)`).
+    shm_names: Vec<String>,
     /// Per item `(t, h, w)` patch grid.
     grids: Vec<(u32, u32, u32)>,
     hashes: Vec<u64>,
@@ -231,7 +230,8 @@ impl Server {
     }
 
     /// Pop the MM result for `rid` — parked strictly before the request reached
-    /// the ingress ring — or `None` if there is none. The numeric buffers become
+    /// the ingress ring — or `None` if there is none. Features stay in their
+    /// per-item segments (only names cross); the small numeric buffers become
     /// 1-D numpy arrays that take **ownership** of the Rust vectors, no copy.
     ///
     /// Runs on the scheduler loop (`RustServer.drain`, under the GIL) between
@@ -242,18 +242,9 @@ impl Server {
         use numpy::IntoPyArray;
 
         let res = self.rt.mm_results.take(rid)?;
-        let (features, shm_names) = match res.features {
-            mm::FeatureStore::Inline(v) => (Some(v.into_pyarray(py).unbind()), None),
-            // The segments — and the duty to unlink — move to Python here;
-            // `materialize()` unlinks after the post-broadcast clone on each rank.
-            mm::FeatureStore::Shm(segments) => (
-                None,
-                Some(segments.into_iter().map(|s| s.into_name()).collect()),
-            ),
-        };
         Some(MmEncodedResult {
-            features,
-            shm_names,
+            // The segments — and the duty to unlink — move to Python here.
+            shm_names: res.features.into_iter().map(|s| s.into_name()).collect(),
             grids: res.grids.iter().map(|g| (g[0], g[1], g[2])).collect(),
             hashes: res.hashes,
             offsets: res.offsets,

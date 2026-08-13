@@ -18,11 +18,10 @@ use crate::tokenizer_manager::TmEvent;
 
 /// A named POSIX shared-memory segment owning its name: dropped → unlinked.
 ///
-/// Written by an MM worker so the TP broadcast carries a ~100-byte
-/// `ShmPointerMMData` stub instead of the ~20 MB feature tensor, and every
-/// rank maps it in parallel. Python's `materialize()` unlinks after cloning;
-/// this `Drop` covers the paths where the buffers never reach Python (aborted
-/// while parked, late result purged).
+/// Written by an MM worker — the single feature transport across topologies;
+/// Python decides at the drain who materializes it. Python unlinks once it
+/// owns the buffers; this `Drop` covers the paths where they never reach
+/// Python (aborted while parked, late result purged).
 pub struct ShmSegment {
     name: String,
 }
@@ -141,7 +140,9 @@ fn parse_caller_hash(entry: &str) -> Option<u64> {
 /// (qwen_vl) produces; generalize to a named-tensor handoff when a family
 /// needs a different one.
 pub struct MmEncodedEntry {
-    pub features: FeatureStore,
+    /// One POSIX segment per item; only names cross the drain. See
+    /// [`ShmSegment`].
+    pub features: Vec<ShmSegment>,
     /// Per item `[t, h, w]` patch grid.
     pub grids: Vec<[u32; 3]>,
     pub hashes: Vec<u64>,
@@ -150,16 +151,6 @@ pub struct MmEncodedEntry {
     /// Flattened row-major `[3, input_len]` M-RoPE positions.
     pub mrope: Vec<i64>,
     pub mrope_delta: i64,
-}
-
-/// Where a result's feature buffers live between worker and drain.
-pub enum FeatureStore {
-    /// In-process; the drain wraps them zero-copy. Single-rank serving, or the
-    /// shm fallback. Under TP the whole buffer would ride `broadcast_pyobj`.
-    Inline(Vec<f32>),
-    /// One POSIX segment per item, written by the worker; only the names cross
-    /// ranks. See [`ShmSegment`].
-    Shm(Vec<ShmSegment>),
 }
 
 /// Results parked between a worker's `MmEncoded` and the scheduler drain, keyed
@@ -201,10 +192,6 @@ pub struct MmContext {
     /// `None` under `skip_tokenizer_init` (requests must carry `input_ids`).
     pub tokenizer: Option<Arc<dyn TextTokenizer>>,
     pub results: MmResultStore,
-    /// Park feature buffers in POSIX shm. Set by the Python launcher
-    /// (`_use_feature_shm`) exactly when the scheduler broadcasts
-    /// across TP ranks and will unwrap `ShmPointerMMData`.
-    pub feature_shm: bool,
 }
 
 impl MmContext {
@@ -213,15 +200,10 @@ impl MmContext {
         tokenizer: Option<Arc<dyn TextTokenizer>>,
         results: MmResultStore,
     ) -> Result<Self, String> {
-        let feature_shm = serde_json::from_str::<serde_json::Value>(spec_json)
-            .ok()
-            .and_then(|v| v.get("feature_shm").and_then(|b| b.as_bool()))
-            .unwrap_or(false);
         Ok(Self {
             family: sglang_mm::registry::pipeline_from_spec(spec_json)?,
             tokenizer,
             results,
-            feature_shm,
         })
     }
 }
@@ -246,11 +228,7 @@ fn process(
     // second family lands.
     let mut packed = sglang_mm::qwen_vl::pack_output(output)?;
     apply_caller_hashes(&mut packed.hashes, &caller_hashes);
-    let features = if ctx.feature_shm {
-        park_features_in_shm(&packed.features, &packed.grids)
-    } else {
-        FeatureStore::Inline(packed.features)
-    };
+    let features = park_features_in_shm(packed.features)?;
     ctx.results.park(
         rid.as_str().to_owned(),
         MmEncodedEntry {
@@ -265,34 +243,19 @@ fn process(
     Ok(packed.input_ids)
 }
 
-/// Split the flat feature buffer per item (`t*h*w` rows per grid) and park each
-/// slice in its own segment. Any shm failure (`/dev/shm` full, odd shape) falls
-/// back to inline, as Python's `_wrap_shm_or_inline` does: degrade to the slow
-/// path, never fail the request.
-fn park_features_in_shm(features: &[f32], grids: &[[u32; 3]]) -> FeatureStore {
-    let total_rows: usize = grids
-        .iter()
-        .map(|g| g[0] as usize * g[1] as usize * g[2] as usize)
-        .sum();
-    if total_rows == 0 || !features.len().is_multiple_of(total_rows) {
-        return FeatureStore::Inline(features.to_vec());
-    }
-    let dim = features.len() / total_rows;
-    let mut segments = Vec::with_capacity(grids.len());
-    let mut row = 0usize;
-    for (item, grid) in grids.iter().enumerate() {
-        let rows = grid[0] as usize * grid[1] as usize * grid[2] as usize;
-        let slice = &features[row * dim..(row + rows) * dim];
-        row += rows;
-        match ShmSegment::create(shm_name(item), bytemuck::cast_slice(slice)) {
-            Ok(segment) => segments.push(segment),
-            Err(error) => {
-                tracing::warn!(%error, "mm: shm feature transport failed; falling back to inline");
-                return FeatureStore::Inline(features.to_vec());
-            }
-        }
-    }
-    FeatureStore::Shm(segments)
+/// Park each item's feature buffer in its own POSIX segment. A failure — in
+/// practice `/dev/shm` exhaustion (the launcher warns when it looks small) —
+/// rejects the request; there is no inline fallback.
+fn park_features_in_shm(items: Vec<Vec<f32>>) -> Result<Vec<ShmSegment>, String> {
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(item, features)| {
+            ShmSegment::create(shm_name(item), bytemuck::cast_slice(&features)).map_err(|error| {
+                format!("mm feature transport: {error}; is /dev/shm mounted large enough?")
+            })
+        })
+        .collect()
 }
 
 /// One MM worker, spawned via `Runtime::spawn_mm_pool` (which owns the
@@ -400,36 +363,22 @@ mod tests {
         unsafe { libc::shm_unlink(c.as_ptr()) };
     }
 
-    /// Per-item slicing follows the grid row counts, so Python's
+    /// One segment per item holding exactly that item's bytes, so Python's
     /// `(rows, feature_dim)` reshape of a segment sees only its own item.
     #[test]
-    fn park_splits_features_by_grid() {
-        // Two items: grids (1,2,2)=4 rows and (1,1,2)=2 rows, dim=3.
-        let features: Vec<f32> = (0..18).map(|i| i as f32).collect();
-        let grids = [[1, 2, 2], [1, 1, 2]];
-        let FeatureStore::Shm(segments) = park_features_in_shm(&features, &grids) else {
-            panic!("expected shm store");
-        };
+    fn park_creates_one_segment_per_item() {
+        let items = vec![
+            (0..12).map(|i| i as f32).collect::<Vec<_>>(),
+            (12..18).map(|i| i as f32).collect::<Vec<_>>(),
+        ];
+        let expected: Vec<Vec<u8>> = items
+            .iter()
+            .map(|v| bytemuck::cast_slice::<f32, u8>(v).to_vec())
+            .collect();
+        let segments = park_features_in_shm(items).unwrap();
         assert_eq!(segments.len(), 2);
-        let read = |seg: &ShmSegment| -> Vec<u8> { std::fs::read(shm_path(&seg.name)).unwrap() };
-        assert_eq!(
-            read(&segments[0]),
-            bytemuck::cast_slice::<f32, u8>(&features[..12])
-        );
-        assert_eq!(
-            read(&segments[1]),
-            bytemuck::cast_slice::<f32, u8>(&features[12..])
-        );
-    }
-
-    /// A degenerate shape must degrade to inline, never a shm-side panic.
-    #[test]
-    fn shape_surprise_falls_back_inline() {
-        let features = vec![0.0f32; 7]; // not divisible by 2 rows
-        let grids = [[1, 1, 2]];
-        assert!(matches!(
-            park_features_in_shm(&features, &grids),
-            FeatureStore::Inline(_)
-        ));
+        for (segment, bytes) in segments.iter().zip(&expected) {
+            assert_eq!(&std::fs::read(shm_path(&segment.name)).unwrap(), bytes);
+        }
     }
 }

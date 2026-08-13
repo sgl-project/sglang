@@ -54,7 +54,6 @@ class MmSpec(msgspec.Struct, frozen=True, kw_only=True):
     (:meth:`wrap_encoded`)."""
 
     family: str
-    feature_shm: bool
     image_token_id: int
     patch_size: int
     merge_size: int
@@ -69,9 +68,17 @@ class MmSpec(msgspec.Struct, frozen=True, kw_only=True):
     vision_start_token_id: Optional[int]
     vision_end_token_id: Optional[int]
     video_token_id: Optional[int]
+    # Drain policy (see `_stub_survives_broadcast`): True → the shm stub
+    # crosses the TP broadcast; False → rank 0 materializes at the drain.
+    stub_broadcast: bool
 
     # Used by the drain adapter only; every other field goes to Rust.
-    DRAIN_ONLY = ("vision_start_token_id", "vision_end_token_id", "video_token_id")
+    DRAIN_ONLY = (
+        "vision_start_token_id",
+        "vision_end_token_id",
+        "video_token_id",
+        "stub_broadcast",
+    )
 
     @property
     def feature_dim(self) -> int:
@@ -89,11 +96,12 @@ class MmSpec(msgspec.Struct, frozen=True, kw_only=True):
         ran in Rust.
 
         Runs on the scheduler loop, so it must stay copy-free *and* hash-free:
-        ``take_mm``'s numpy arrays own the Rust buffers, ``torch.from_numpy`` just
-        views them, and each item's ``hash`` is worker-precomputed so
-        ``set_pad_value`` skips ``hash_feature``. Any per-byte work here — memcpy,
-        sha256, tens of MB per image-heavy request — measurably inflates every
-        running request's inter-token latency."""
+        features stay in their per-item POSIX segments (only names crossed
+        ``take_mm``), the small numpy buffers own the Rust vectors, and each
+        item's ``hash`` is worker-precomputed so ``set_pad_value`` skips
+        ``hash_feature``. Any per-byte work here — memcpy, sha256, tens of MB
+        per image-heavy request — measurably inflates every running request's
+        inter-token latency."""
         import torch
 
         from sglang.srt.managers.mm_utils import ShmPointerMMData
@@ -103,32 +111,27 @@ class MmSpec(msgspec.Struct, frozen=True, kw_only=True):
             MultimodalProcessorOutput,
         )
 
-        shm_names = encoded.shm_names
-        if shm_names is None:
-            features = torch.from_numpy(encoded.features.reshape(-1, self.feature_dim))
         items = []
-        row = 0
         for index, ((t, h, w), item_hash, offset) in enumerate(
             zip(encoded.grids, encoded.hashes, encoded.offsets)
         ):
             n = t * h * w
-            if shm_names is None:
-                feature = features[row : row + n]
-            else:
-                # The worker parked this item's buffer in a named POSIX
-                # segment (see `_use_feature_shm`). Build the stub in its
-                # post-`__setstate__` form: rank 0 never pickle-roundtrips its
-                # own copy, and `materialize()` needs the mapped view.
-                # Ownership of the unlink moved here with `take_mm`.
-                feature = ShmPointerMMData.__new__(ShmPointerMMData)
-                feature.__setstate__(
-                    {
-                        "shm_name": shm_names[index],
-                        "shape": (n, self.feature_dim),
-                        "dtype": torch.float32,
-                        "precomputed_hash": item_hash,
-                    }
-                )
+            # The item's buffer sits in a worker-written POSIX segment; build
+            # the stub in its post-`__setstate__` form (rank 0 never
+            # pickle-roundtrips its own copy). Unlink duty came with take_mm.
+            feature = ShmPointerMMData.__new__(ShmPointerMMData)
+            feature.__setstate__(
+                {
+                    "shm_name": encoded.shm_names[index],
+                    "shape": (n, self.feature_dim),
+                    "dtype": torch.float32,
+                    "precomputed_hash": item_hash,
+                }
+            )
+            if not self.stub_broadcast:
+                # No rank will unwrap the stub later, so rank 0 takes
+                # ownership now; any broadcast then carries plain tensors.
+                feature = feature.materialize()
             items.append(
                 MultimodalDataItem(
                     modality=Modality.IMAGE,
@@ -140,7 +143,6 @@ class MmSpec(msgspec.Struct, frozen=True, kw_only=True):
                     },
                 )
             )
-            row += n
         if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
             for item in items:
                 item.set_pad_value()
@@ -213,19 +215,18 @@ def native_mm_family_for(
     )
 
 
-def _use_feature_shm(server_args: ServerArgs) -> bool:
-    """Whether to park feature buffers in POSIX shm rather than inline.
+def _stub_survives_broadcast(server_args: ServerArgs) -> bool:
+    """Drain policy: may the ``ShmPointerMMData`` stub cross ``broadcast_pyobj``?
 
-    On exactly when the drained request is broadcast across TP ranks *and*
-    the receiver's ``unwrap_shm_features`` will materialize the stubs (its
-    gates: non-default tensor transport, no ``skip_tokenizer_init``).
-
-    Inline, the whole ~20 MB/image buffer rides ``broadcast_pyobj`` serially
-    on the scheduler loop, so ranks 1..n start the TP-sharded ViT ~30 ms
-    after rank 0 and every rank then stalls that long at the first
-    collective. With shm the broadcast carries a ~100-byte stub and all ranks
-    map in parallel — the transport the Python TokenizerManager already uses.
-    Single-rank serving stays inline, where shm would only add a copy.
+    The worker always parks features in per-item POSIX segments; this only
+    decides who materializes. True exactly when the request is broadcast
+    across TP ranks *and* the receiver's ``unwrap_shm_features`` will
+    materialize the stubs (non-default tensor transport, no
+    ``skip_tokenizer_init``): the broadcast carries ~100 B instead of
+    ~20 MB/image and ranks map the segment in parallel. Otherwise (tp_size 1,
+    multinode, skip_tokenizer_init) rank 0 materializes at the drain, so
+    later broadcasts carry plain tensor bytes — a shm name means nothing on
+    a remote node.
     """
     from sglang.srt.managers.tokenizer_manager import (
         determine_tensor_transport_mode,
@@ -236,6 +237,25 @@ def _use_feature_shm(server_args: ServerArgs) -> bool:
         and determine_tensor_transport_mode(server_args) != "default"
         and not server_args.skip_tokenizer_init
     )
+
+
+def _warn_if_dev_shm_small(min_free_bytes: int = 1 << 30) -> None:
+    """MM features travel via /dev/shm (~20 MB per in-flight image) and
+    exhaustion rejects requests; warn at launch (Docker defaults --shm-size
+    to 64 MB) so the first rejection is no mystery."""
+    import shutil
+
+    try:
+        free = shutil.disk_usage("/dev/shm").free
+    except OSError:
+        return
+    if free < min_free_bytes:
+        logger.warning(
+            "/dev/shm has only %.0f MB free; multimodal feature transport "
+            "parks ~20 MB per in-flight image there and rejects requests when "
+            "it fills. Increase it (e.g. docker run --shm-size).",
+            free / 1e6,
+        )
 
 
 def resolve_mm_spec(
@@ -310,7 +330,7 @@ def resolve_mm_spec(
     try:
         spec = MmSpec(
             family=family.name,
-            feature_shm=_use_feature_shm(server_args),
+            stub_broadcast=_stub_survives_broadcast(server_args),
             image_token_id=hf_config.image_token_id,
             patch_size=image_processor.patch_size,
             merge_size=image_processor.merge_size,
@@ -425,6 +445,7 @@ class RustServer:
                     f"(supported: {', '.join(supported)}; "
                     "images only). Unset SGLANG_RUST_SERVER to serve this model."
                 )
+            _warn_if_dev_shm_small()
             server.start_mm_workers(mm_spec.rust_json(), mm_workers)
 
         # Narrow the scheduler thread only after the server threads are launched.

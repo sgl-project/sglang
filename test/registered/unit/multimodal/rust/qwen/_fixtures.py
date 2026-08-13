@@ -71,8 +71,8 @@ def make_processor(config, image_processor_cls=None):
         mm_feature_transport="cpu",
         disable_fast_image_processor=True,
         skip_tokenizer_init=False,
-        # Read by `_use_feature_shm` (single-rank fixture → the
-        # inline zero-copy transport, like the 1-GPU e2e).
+        # Read by `_stub_survives_broadcast` (single-rank fixture → rank 0
+        # materializes the shm segments at the drain, like the 1-GPU e2e).
         tp_size=1,
         dist_init_addr=None,
         mm_process_config={},
