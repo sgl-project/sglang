@@ -75,11 +75,10 @@ def _decode_query_width(forward_batch: ForwardBatch) -> int:
 def build_detailed_annotation_suffix(forward_batch: ForwardBatch) -> str:
     """Compute the detailed-annotation aggregates from the batch's CPU-side length mirrors.
 
-    All aggregates are emitted, always prefixed by phase: ``c_`` for
-    context (EXTEND) and ``g_`` for generation (DECODE, TARGET_VERIFY), with
-    MIXED emitting both groups. The per-phase ``sq`` (Σ N_Q) is always emitted
-    so the suffix is self-contained, even where it duplicates the base label's
-    ``bs`` (vanilla decode) or ``toks`` (pure extend).
+    All aggregates are emitted, prefixed by the roofline compute-shape bucket:
+    ``c_`` for context/extend-shaped work (EXTEND and DRAFT_EXTEND_V2) and ``g_`` for
+    single-query generation (DECODE, TARGET_VERIFY), with MIXED emitting both
+    groups.
     """
     mode = forward_batch.forward_mode
     seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -107,13 +106,11 @@ def build_detailed_annotation_suffix(forward_batch: ForwardBatch) -> str:
     if ext_seq is None or ext_prefix is None:
         return ""
 
-    if mode == ForwardMode.EXTEND:
+    if mode == ForwardMode.EXTEND or mode == ForwardMode.DRAFT_EXTEND_V2:
+        # Both are extend-shaped, multi-query context 
         nqs = [int(q) for q in ext_seq]
         nkvs = [int(p) + int(q) for p, q in zip(ext_prefix, ext_seq)]
         sq, sk, sqsq, sqsk = _agg(nqs, nkvs)
-        # Pure context phase -> ``c_`` prefix, matching the MIXED split.
-        # ``c_sq`` is always emitted (self-contained suffix), even though it
-        # equals the base label's ``toks`` for a pure EXTEND.
         return f"c_sq={sq} c_sqsq={sqsq} c_sqsk={sqsk} c_sk={sk}"
 
     if mode == ForwardMode.MIXED:

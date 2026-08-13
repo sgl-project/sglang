@@ -164,6 +164,26 @@ class TestStepSpanDetailedAnnotations(CustomTestCase):
         )
         self.assertEqual(self._name(fb), "step[TARGET_VERIFY bs=2]")
 
+    def test_draft_extend_v2_uses_extend_mirrors_with_context_prefix(self):
+        # EAGLE/MTP draft-extend is extend-shaped 
+        # req a: nq=2, nkv=12 -> sqsq=4, sqsk=24
+        # req b: nq=3, nkv=23 -> sqsq=9, sqsk=69
+        # sq=5, sk=35, sqsq=13, sqsk=93.
+        fb = _fb(
+            ForwardMode.DRAFT_EXTEND_V2,
+            batch_size=2,
+            extend_seq_lens_cpu=[2, 3],
+            extend_prefix_lens_cpu=[10, 20],
+        )
+        self.assertEqual(
+            self._name(fb),
+            "step[DRAFT_EXTEND_V2 bs=2 c_sq=5 c_sqsq=13 c_sqsk=93 c_sk=35]",
+        )
+
+    def test_draft_extend_v2_without_extend_mirrors_falls_back_to_base(self):
+        fb = _fb(ForwardMode.DRAFT_EXTEND_V2, batch_size=2)
+        self.assertEqual(self._name(fb), "step[DRAFT_EXTEND_V2 bs=2]")
+
     def test_missing_cpu_mirror_falls_back_to_base(self):
         # No seq_lens_cpu (some overlap paths) -> emit the base label unchanged.
         fb = _fb(ForwardMode.DECODE, batch_size=2, seq_lens_cpu=None)
