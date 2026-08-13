@@ -399,7 +399,10 @@ def _alloc_fi_a2a_send(
     partial_o = torch.empty(
         batch, h_per_rank, cp_size, head_dim, dtype=dtype, device=device
     )
-    # Slot 1 is transported but never read; zero it once instead of per call.
+    # Note(kpham-sgl): the a2a wants softmax_stats as [..., cp_size, S] with
+    # S >= 2, but never reads it -- it moves the field as opaque bytes, and S=2
+    # is the one size that skips TMA for it. So slot 0 carries our LSE and slot
+    # 1 is dead weight we still ship; zero it once here, not per call.
     softmax_stats = torch.zeros(
         batch, h_per_rank, cp_size, 2, dtype=torch.float32, device=device
     )
@@ -415,11 +418,8 @@ def init_fi_a2a_workspace(
     dtype: Optional[torch.dtype] = None,
 ) -> None:
     # Call once per process BEFORE CUDA-graph capture: the FlashInfer init syncs
-    # the stream and barriers cross-rank, neither of which is capturable.
-    #
-    # Note(kpham-sgl): the DCP a2a only ever runs inside the decode graph, so a
-    # lazy alloc would come from the graph's private pool, and once captured its
-    # address can never be freed to grow.
+    # the stream and barriers cross-rank, neither of which is capturable. Send
+    # buffers too -- allocated lazily they would come from the graph's pool.
     global _FI_A2A_STATE
     if _FI_A2A_STATE is not None:
         return
@@ -476,7 +476,6 @@ def init_fi_a2a_workspace(
     # REQUIRED barrier before the first alltoall: every rank must finish init,
     # else a rank writes a peer's FIFO before it is ready -> deadlock.
     dist.barrier(group=cp_group.device_group)
-    # dtype is None when the caller could not derive the shape (non-MLA).
     send_buffers = {}
     if dtype is not None:
         send_buffers[(h_per_rank, cp_size, head_dim, dtype)] = _alloc_fi_a2a_send(

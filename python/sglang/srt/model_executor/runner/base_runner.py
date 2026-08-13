@@ -297,8 +297,6 @@ class BaseRunner(ABC):
             return
 
         server_args = mr.server_args
-        # One reduce row per decode token, and is_dcp_mla_decode_phase() also
-        # fires on TARGET_VERIFY, so scale by the draft width.
         max_reqs = (
             server_args.cuda_graph_config.decode.max_bs
             or server_args.max_running_requests
