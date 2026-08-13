@@ -5,6 +5,11 @@ _FLASHMLA_CREATE_KV_BLOCK_SIZE = 4096
 FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SIZE)
 
 
+# Tokens copied per CTA when the caller opts into a 2D grid (axis 1 spans the
+# sequence). Must be a multiple of the 512-token vector width below.
+KV_INDICES_CTA_SPAN = 4096
+
+
 @triton.jit
 def create_flashinfer_kv_indices_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]
@@ -14,6 +19,7 @@ def create_flashinfer_kv_indices_triton(
     kv_start_idx,
     kv_indices_ptr,
     req_to_token_ptr_stride: tl.constexpr,
+    ONE_CTA_PER_SPAN: tl.constexpr = False,
 ):
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
@@ -29,19 +35,46 @@ def create_flashinfer_kv_indices_triton(
         kv_end = kv_start
     kv_end += tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
 
-    num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
-    for i in range(num_loop):
-        # index into req_to_token_ptr needs to be int64
-        offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
-        mask = offset < kv_end - kv_start
-        data = tl.load(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + kv_start
-            + offset,
-            mask=mask,
-        )
-        tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
+    if ONE_CTA_PER_SPAN:
+        # 2D grid: axis 1 CTAs each copy one 4096-token span of this request.
+        # Grid axis 1 is sized for the max context (graph-safe static grid);
+        # CTAs past this sequence's span count exit at the guard.
+        SPAN: tl.constexpr = 4096
+        span = tl.program_id(axis=1)
+        span_start = span * SPAN
+        seq_len = kv_end - kv_start
+        if span_start < seq_len:
+            for j in range(SPAN // BLOCK_SIZE):
+                offset = (
+                    tl.arange(0, BLOCK_SIZE).to(tl.int64)
+                    + span_start
+                    + j * BLOCK_SIZE
+                )
+                mask = offset < seq_len
+                data = tl.load(
+                    req_to_token_ptr
+                    + req_pool_index * req_to_token_ptr_stride
+                    + kv_start
+                    + offset,
+                    mask=mask,
+                )
+                tl.store(
+                    kv_indices_ptr + kv_indices_offset + offset, data, mask=mask
+                )
+    else:
+        num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
+        for i in range(num_loop):
+            # index into req_to_token_ptr needs to be int64
+            offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
+            mask = offset < kv_end - kv_start
+            data = tl.load(
+                req_to_token_ptr
+                + req_pool_index * req_to_token_ptr_stride
+                + kv_start
+                + offset,
+                mask=mask,
+            )
+            tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
 
 
 @triton.jit

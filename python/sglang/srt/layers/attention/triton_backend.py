@@ -8,6 +8,7 @@ import triton
 
 from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.kernels.ops.kvcache.kv_indices import (
+    KV_INDICES_CTA_SPAN,
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.configs.hybrid_arch import (
@@ -424,7 +425,11 @@ class TritonAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         kv_indptr = self.kv_indptr[: bs + 1]
         kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
-        create_flashinfer_kv_indices_triton[(bs,)](
+        # 2D grid: one CTA per 4096-token span instead of one CTA looping the
+        # whole sequence. Axis 1 is sized for max context so the grid is static
+        # under graph capture; out-of-range CTAs exit at the kernel guard.
+        num_spans = triton.cdiv(self.max_context_len, KV_INDICES_CTA_SPAN)
+        create_flashinfer_kv_indices_triton[(bs, num_spans)](
             self.req_to_token,
             req_pool_indices,
             seq_lens,
@@ -432,6 +437,7 @@ class TritonAttnBackend(AttentionBackend):
             None,
             kv_indices,
             self.req_to_token.stride(0),
+            ONE_CTA_PER_SPAN=True,
         )
         return kv_indptr
 
