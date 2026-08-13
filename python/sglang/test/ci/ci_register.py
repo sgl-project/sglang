@@ -1,5 +1,4 @@
 import ast
-import os
 import warnings
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -28,14 +27,6 @@ _PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
 _KWARG_ONLY = ("stage", "runner_config")
 _ALL_PARAMS = _PARAM_ORDER + _KWARG_ONLY
 _UNSET = object()
-
-
-def is_registered_test_file(path: str) -> bool:
-    """Whether a file under test/registered/ must carry a CI registration.
-
-    No helper exemptions: shared helpers live in python/sglang/test/.
-    """
-    return os.path.basename(path) not in {"conftest.py", "__init__.py"}
 
 
 class HWBackend(Enum):

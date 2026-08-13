@@ -12,7 +12,6 @@ from sglang.test.ci.ci_register import (
     HWBackend,
     auto_partition,
     collect_tests,
-    is_registered_test_file,
 )
 from sglang.test.ci.ci_utils import run_unittest_files
 
@@ -319,7 +318,9 @@ def run_a_suite(args):
         for f in glob.glob(
             os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
         )
-        if is_registered_test_file(f)
+        # conftest.py / __init__.py are pytest+package structure, never
+        # registered tests, and must not be executed as one.
+        if os.path.basename(f) not in ("conftest.py", "__init__.py")
     ]
 
     # Strict: all discovered files must have proper registration

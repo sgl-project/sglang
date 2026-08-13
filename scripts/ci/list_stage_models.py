@@ -267,12 +267,13 @@ def collect_suite_files(
     ci_register = _load_ci_register(repo_root)
     backend = getattr(ci_register.HWBackend, backend_name.upper())
 
+    # Same exclusion as run_suite.py: pytest+package structure files.
     files = sorted(
         f
         for f in glob.glob(
             os.path.join(repo_root, "test", "registered", "**", "*.py"), recursive=True
         )
-        if ci_register.is_registered_test_file(f)
+        if os.path.basename(f) not in ("conftest.py", "__init__.py")
     )
 
     suite_files: Dict[str, List[str]] = {}
