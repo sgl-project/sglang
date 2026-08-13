@@ -392,11 +392,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         alive = max(start_pos, swa_alive_from) if swa_alive_from is not None else None
         if alive is None or alive % self.page_size != 0:
             self.free_swa(free_index)
-            return
+        else:
+            self.free_swa_segment(
+                free_index[alive - start_pos :], start_pos=alive, swa_alive_from=alive
+            )
 
-        self.free_swa_segment(
-            free_index[alive - start_pos :], start_pos=alive, swa_alive_from=alive
+        # Same guards free() carries: a double free shows up here as an
+        # allocator handing back more than it owns.
+        assert (
+            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
+        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def free_swa_segment(
         self, free_index: torch.Tensor, *, start_pos: int, swa_alive_from: int
@@ -440,12 +446,19 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         ``mapping[idx] = 0``: the scalar setitem form synchronizes on CUDA."""
         ps = self.page_size
         if ps == 1:
-            self.full_to_swa_index_mapping.index_fill_(0, page_starts, 0)
-            return
-        offsets = torch.arange(ps, dtype=torch.int64, device=page_starts.device)
-        self.full_to_swa_index_mapping.index_fill_(
-            0, (page_starts[:, None] + offsets[None, :]).reshape(-1), 0
-        )
+            indices = page_starts
+        else:
+            offsets = torch.arange(ps, dtype=torch.int64, device=page_starts.device)
+            indices = (page_starts[:, None] + offsets[None, :]).reshape(-1)
+
+        if _is_npu:
+            # index_fill_ is unverified on NPU, where writes to this table go
+            # through a dedicated op in alloc (npu_scatter_nd_update_). free_swa
+            # clears it with plain setitem, so stay on the form NPU already runs
+            # -- the sync it costs is CUDA-specific anyway.
+            self.full_to_swa_index_mapping[indices] = 0
+        else:
+            self.full_to_swa_index_mapping.index_fill_(0, indices, 0)
 
     def free_group_begin(self):
         super().free_group_begin()
