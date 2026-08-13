@@ -15,7 +15,19 @@ from sglang.srt.layers.moe.fused_moe_triton import override_config
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device, is_hip
+
+_initialized = False
+
+
+def _ensure_initialized(model_path: str = None):
+    global _initialized
+    if not _initialized:
+        path = model_path or "/root/models/models/Qwen--Qwen2.5-32B-Instruct/snapshots/master"
+        args = ServerArgs(model_path=path, log_level="error", skip_tokenizer_init=True)
+        set_global_server_args_for_scheduler(args)
+        _initialized = True
 
 
 def benchmark_config(
@@ -33,7 +45,9 @@ def benchmark_config(
     per_channel_quant: bool = False,
     block_shape: List[int] = None,
     num_iters: int = 100,
+    model_path: str = None,
 ) -> float:
+    _ensure_initialized(model_path)
     torch.set_default_device(get_device())
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
@@ -142,7 +156,9 @@ def tune_moe_kernel(
     dtype: torch.dtype, use_fp8_w8a8=False, use_int8_w8a8=False,
     use_int8_w8a16=False, use_int4_w4a16=False, per_channel_quant=False,
     block_shape=None, batch_sizes=None, search_space=None, num_iters=10, verbose=True,
+    model_path=None,
 ) -> Dict[int, Dict]:
+    _ensure_initialized(model_path)
     if batch_sizes is None:
         batch_sizes = get_default_batch_sizes()
     if search_space is None:
@@ -167,7 +183,7 @@ def tune_moe_kernel(
                     config, num_tokens, num_experts, shard_intermediate_size,
                     hidden_size, topk, dtype, use_fp8_w8a8, use_int8_w8a8,
                     use_int8_w8a16, use_int4_w4a16, per_channel_quant,
-                    block_shape, num_iters=num_iters,
+                    block_shape, num_iters=num_iters, model_path=model_path,
                 )
             except (triton.runtime.autotuner.OutOfResources, RuntimeError, Exception):
                 continue
