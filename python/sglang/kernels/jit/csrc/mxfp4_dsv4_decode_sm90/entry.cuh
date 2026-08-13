@@ -130,6 +130,13 @@ __global__ void get_dsv4_mxfp4_decoding_sched_meta_kernel(__grid_constant__ cons
     }
     params.tile_scheduler_metadata_ptr[part] = metadata;
   }
+
+  // Requests the partition loop never reached (batch not evenly divisible by
+  // the per-part payload) get zero splits so the combine kernel reads a
+  // defined prefix sum instead of whatever the buffer held before.
+  for (int i = request_idx + 1; i <= params.b; ++i) {
+    params.num_splits_ptr[i] = cumulative_num_splits;
+  }
 }
 
 }  // namespace

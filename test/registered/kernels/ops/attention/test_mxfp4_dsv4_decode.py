@@ -357,6 +357,35 @@ def test_flashmla_dsv4_mxfp4_dual_source_correctness(
 
 @pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")
 @torch.inference_mode()
+def test_flashmla_dsv4_mxfp4_multirequest_parts_no_deadlock() -> None:
+    """Batches larger than the SM-part count used to deadlock the GPU.
+
+    The tile scheduler caps each SM part at a fixed block payload, so a part
+    can serve more than one request. The producer's epilogue-drain barrier
+    then waited on the wrong phase parity (one phase past the one the
+    consumers had completed) and never released, spinning the persistent
+    kernel forever. b = num_sm_parts + 1 guarantees every active part serves
+    two requests; 2 * num_sm_parts exactly fills the per-part capacity.
+    """
+    native = _require_native()
+    assert FlashMLASchedMeta is not None
+    from sglang.kernels.ops.attention.mxfp4_dsv4_decode_sm90 import _num_sm_parts
+
+    num_sm_parts = _num_sm_parts(1, 1, 64, torch.device("cuda"))
+    for batch_size in (num_sm_parts + 1, 2 * num_sm_parts):
+        case = _build_case(h_q=64, batch_size=batch_size)
+        out, lse = _run_native(native, case, FlashMLASchedMeta())
+        out_ref, lse_ref = _reference(case)
+
+        assert out.shape == out_ref.shape == (batch_size, 1, 64, _HEAD_DIM)
+        assert bool(torch.isfinite(out).all())
+        assert bool(torch.isfinite(lse).all())
+        torch.testing.assert_close(out, out_ref, atol=_OUTPUT_ATOL, rtol=_OUTPUT_RTOL)
+        torch.testing.assert_close(lse, lse_ref, atol=_LSE_ATOL, rtol=_LSE_RTOL)
+
+
+@pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")
+@torch.inference_mode()
 def test_flashmla_dsv4_mxfp4_rejects_invalid_contracts() -> None:
     native = _require_native()
     assert FlashMLASchedMeta is not None

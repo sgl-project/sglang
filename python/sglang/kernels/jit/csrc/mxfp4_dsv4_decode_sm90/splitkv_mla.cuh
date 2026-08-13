@@ -540,7 +540,7 @@ __device__ void KernelTemplate<NUM_HEADS>::devfunc(const SparseAttnDecodeParams&
       // (The first request has no prior epilogue; the phase then advances one
       // flip per request, matching the 256 consumer arrivals above.)
       if (batch_idx != sched_meta.begin_req_idx) {
-        plan.bar_o_done.wait(bar_phase_o ^ 1);
+        plan.bar_o_done.wait(bar_phase_o);
         bar_phase_o ^= 1;
       }
 
