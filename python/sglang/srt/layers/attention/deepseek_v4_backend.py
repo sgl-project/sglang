@@ -685,7 +685,7 @@ class DeepseekV4AttnBackend(
         self.trtllm_attn: bool = get_exec().kernel.dsv4_attn_backend == "trtllm"
         # trtllm + speculative + DP attention prepares metadata on the host:
         # in-graph prep degrades draft acceptance under DP's padded/idle-rank
-        # batches. Otherwise prep metadata in-graph. 
+        # batches. Otherwise prep metadata in-graph.
         self._prep_in_cuda_graph: bool = envs.SGLANG_PREP_IN_CUDA_GRAPH.get() and not (
             self.trtllm_attn
             and self.mtp_enabled
