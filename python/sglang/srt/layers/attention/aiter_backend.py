@@ -303,9 +303,7 @@ class AiterAttnBackend(AttentionBackend):
             _valid_heads = (
                 self.num_head in _mla_low_head_repeat
                 or self.num_head in _mla_low_head_zero_pad
-                or (
-                    self.num_head % 16 == 0 and 16 <= self.num_head <= 128
-                )
+                or (self.num_head % 16 == 0 and 16 <= self.num_head <= 128)
             )
             assert _valid_heads, (
                 f"Aiter MLA supports num_head of 4, 8, 12, or multiples of 16 "
@@ -346,12 +344,9 @@ class AiterAttnBackend(AttentionBackend):
             # Native 16-head persist is slow on TP8; keep disabled unless zero-pad
             # (e.g. Kimi K3 h12 -> qh16) where persist ASM is the fast path.
             if (
-                (
-                    (self.num_head_padded == 16 and self.head_pad_mode != "zero")
-                    or self.num_head_padded == 128
-                )
-                and self.kv_cache_dtype is not fp8_dtype
-            ):
+                (self.num_head_padded == 16 and self.head_pad_mode != "zero")
+                or self.num_head_padded == 128
+            ) and self.kv_cache_dtype is not fp8_dtype:
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
@@ -874,9 +869,7 @@ class AiterAttnBackend(AttentionBackend):
             and max_q_len == 1
         ):
             kv_scale = self._resolve_fp8_kv_scale_float(layer, k_descale)
-            min_kv_seq_len = self._resolve_mla_gluon_min_kv_seq_len(
-                forward_batch
-            )
+            min_kv_seq_len = self._resolve_mla_gluon_min_kv_seq_len(forward_batch)
             gluon_out = mla_gluon_decode(
                 q=q_mla,
                 k_buffer=k_buffer,

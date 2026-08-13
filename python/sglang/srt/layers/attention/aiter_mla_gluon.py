@@ -7,7 +7,7 @@ Gluon is unavailable or fails to compile (known on some Triton 3.6.0 builds).
 from __future__ import annotations
 
 import logging
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
