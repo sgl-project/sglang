@@ -142,6 +142,27 @@ class TestSWAFreeSegment(unittest.TestCase):
 
 
 class TestOptOuts(unittest.TestCase):
+    def _pure_swa(self):
+        return PureSWATokenToKVPoolAllocator(
+            size_swa=SIZE,
+            page_size=1,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=_pool(),
+            need_sort=False,
+        )
+
+    def test_pure_swa_free_segment_releases_each_slot_once(self):
+        # full_attn_allocator IS swa_attn_allocator here, so the parent's
+        # two-sided release would hand every slot back twice -- silently, and
+        # a later alloc would then serve one slot to two requests.
+        for alive in (0, None):
+            a = self._pure_swa()
+            before = a.available_size()
+            row = a.alloc(4)
+            a.free_segment(row, start_pos=0, swa_alive_from=alive)
+            self.assertEqual(a.available_size(), before, f"{alive=}")
+
     def test_pure_swa_keeps_its_identity_mapping(self):
         # full == swa and the mapping is a constant identity table; zeroing it
         # would break every later translate.

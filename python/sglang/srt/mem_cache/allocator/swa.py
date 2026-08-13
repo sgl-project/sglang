@@ -604,6 +604,18 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.free_group.append(self._copy_for_free_group(free_index))
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
+    def free_segment(
+        self,
+        free_index: torch.Tensor,
+        *,
+        start_pos: int,
+        swa_alive_from: Optional[int] = None,
+    ):
+        """One pool backs both sides here, so the parent's two-sided release
+        would free every index twice. Nothing is lost by taking free(): this
+        allocator pins page_size to 1, where free() has no unique to skip."""
+        self.free(free_index)
+
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
