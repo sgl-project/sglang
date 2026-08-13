@@ -35,6 +35,7 @@ import torch
 import torch_npu
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.hardware_backend.npu.utils import has_npu_a5_support
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     ONLINE_C128,
@@ -42,7 +43,6 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
 )
-from sglang.srt.utils import is_npu_before_atlas_a5
 
 # A5 stores KV as FP8 with one e8m0 scale byte per 64 nope elements; the RoPE
 # half stays bf16 (2 bytes/element) because it is rotated, not quantized.
@@ -51,9 +51,8 @@ _A5_KV_ROW_ALIGNMENT = 128
 
 
 def _is_atlas_a5() -> bool:
-    """See ``ascend_dsv4_backend._is_atlas_a5``. Kept as a call, not a module
-    constant, so the device query happens after the rank pins its die."""
-    return not is_npu_before_atlas_a5()
+    """See ``ascend_dsv4_backend._is_atlas_a5``."""
+    return has_npu_a5_support()
 
 
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):

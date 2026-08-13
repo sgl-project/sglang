@@ -335,6 +335,11 @@ def npu_w8a8_block_fp8_linear(
             f"got {weight.dtype}"
         )
 
+    original_dtype = input.dtype
+    if original_dtype not in (torch.float16, torch.bfloat16):
+        input = input.to(torch.bfloat16)
+        original_dtype = torch.bfloat16
+
     orig_shape = input.shape
     input_2d = input.reshape(-1, orig_shape[-1]).contiguous()
 
@@ -342,6 +347,11 @@ def npu_w8a8_block_fp8_linear(
         input_2d, dst_type=torch.float8_e4m3fn
     )
     e8m0_dtype = _get_float8_e8m0fnu_dtype()
+    quant_bias = (
+        bias.to(torch.float32)
+        if bias is not None and bias.dtype != torch.float32
+        else bias
+    )
     output_2d = torch.ops.npu.npu_quant_matmul(
         x_fp8,
         weight,
@@ -349,8 +359,8 @@ def npu_w8a8_block_fp8_linear(
         scale_dtype=e8m0_dtype,
         pertoken_scale=x_scale,
         pertoken_scale_dtype=e8m0_dtype,
-        bias=bias,
-        output_dtype=torch.bfloat16,
+        bias=quant_bias,
+        output_dtype=original_dtype,
         group_sizes=(1, 1, MXFP8_BLOCK_SIZE),
     )
 

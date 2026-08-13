@@ -186,26 +186,6 @@ def is_npu() -> bool:
 
 
 @lru_cache(maxsize=1)
-def is_npu_before_atlas_a5() -> bool:
-    """True on Ascend NPUs older than Atlas A5 (Ascend 950).
-
-    A5 exposes FP8/MXFP8 KV, GEMM and sparse-attention kernels that earlier
-    parts (910B/910C) do not have, so NPU code paths that depend on them are
-    gated on this being False. Non-NPU platforms return False as well; callers
-    must combine it with :func:`is_npu`.
-    """
-    if not is_npu():
-        return False
-
-    import torch_npu
-
-    # current_device(), not 0: querying device 0 from a rank pinned elsewhere
-    # would create an ACL context on the wrong die.
-    device_name = torch_npu.npu.get_device_name(torch_npu.npu.current_device())
-    return not device_name.startswith("Ascend950")
-
-
-@lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (

@@ -11,6 +11,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     sglang_per_token_group_quant_fp8_row_padded,
 )
+from sglang.srt.hardware_backend.npu.utils import has_npu_a5_support
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -48,7 +49,6 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
-    is_npu_before_atlas_a5,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -641,7 +641,7 @@ def _dispatch_auto_backend() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
-    elif _is_npu and not is_npu_before_atlas_a5():
+    elif _is_npu and has_npu_a5_support():
         # A5 only: the NPU implementation is an MXFP8 GEMM, which earlier parts
         # do not have — they keep the Triton fallback below.
         # Imported here, not at module scope: the NPU module is only importable

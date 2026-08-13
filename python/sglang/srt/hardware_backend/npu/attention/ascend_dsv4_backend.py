@@ -9,12 +9,12 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
+from sglang.srt.hardware_backend.npu.utils import has_npu_a5_support
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel, get_spec
-from sglang.srt.utils import is_npu_before_atlas_a5
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -27,10 +27,8 @@ logger = logging.getLogger(__name__)
 def _is_atlas_a5() -> bool:
     """Atlas A5 (Ascend 950) ships kv-quant sparse attention and an FP8
     lightning indexer; pre-A5 parts (910B/910C) keep the bf16 / int8 kernel
-    chain. Cheap to call — ``is_npu_before_atlas_a5`` is lru_cached — and
-    deliberately not a module constant so the device query happens after the
-    rank has pinned its die."""
-    return not is_npu_before_atlas_a5()
+    chain."""
+    return has_npu_a5_support()
 
 
 # A5 kv-quant KV layout: nope is quantized in groups of 64 and the RoPE half is

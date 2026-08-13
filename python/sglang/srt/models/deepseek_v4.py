@@ -45,6 +45,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
+from sglang.srt.hardware_backend.npu.utils import has_npu_a5_support
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
@@ -154,7 +155,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx942_supported,
-    is_npu_before_atlas_a5,
     log_info_on_rank0,
     make_layers,
 )
@@ -216,7 +216,7 @@ def _use_npu_a5_mxfp8_wo_a(quant_config) -> bool:
     ``Fp8LinearMethod.process_weights_after_loading`` can reinterpret into the
     A5 MXFP8 scale layout.
     """
-    if not _is_npu or is_npu_before_atlas_a5() or quant_config is None:
+    if not _is_npu or not has_npu_a5_support() or quant_config is None:
         return False
     if not getattr(quant_config, "is_checkpoint_fp8_serialized", False):
         return False
@@ -1645,7 +1645,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if _is_npu:
-            if is_npu_before_atlas_a5():
+            if not has_npu_a5_support():
                 return torch.ops.custom.npu_hc_post(x, residual, post, comb)
             # The A5 build of npu_hc_post is batched — it requires a leading
             # batch axis on every operand.

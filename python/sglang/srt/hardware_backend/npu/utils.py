@@ -18,6 +18,12 @@ indexer_weight_stream = None
 gva_is_inited = False
 
 
+@functools.lru_cache(maxsize=1)
+def has_npu_a5_support() -> bool:
+    """Whether the installed NPU kernel wheel provides the A5 operator set."""
+    return hasattr(torch.ops.custom, "npu_kv_quant_sparse_attn_sharedkv")
+
+
 class NPUACLFormat(IntEnum):
     ACL_FORMAT_UNDEFINED = -1
     ACL_FORMAT_ND = 2
