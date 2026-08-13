@@ -746,8 +746,8 @@ class SWAComponent(TreeComponent):
         is_finished: bool,
     ) -> Optional[int]:
         if getattr(self.cache, "aoh_radix_anchor_only", False):
-            # UnifiedRadixCache only receives [0:sink) for AoH. The request's
-            # dynamic middle eviction frontier must not tombstone that anchor.
+            # UnifiedRadixCache only receives the page-rounded AoH anchor. The
+            # request's dynamic middle eviction frontier must not tombstone it.
             insert_params.swa_evicted_seqlen = 0
             return None
 

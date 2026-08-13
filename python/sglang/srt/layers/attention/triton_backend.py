@@ -1389,6 +1389,7 @@ class TritonAttnBackend(AttentionBackend):
                     )
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
+        is_aoh_streaming = self.is_aoh and layer.aoh_mode == "streaming"
 
         causal = True
         if (
@@ -1426,9 +1427,9 @@ class TritonAttnBackend(AttentionBackend):
 
         # Normal mode: use original 2-stage kernel
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-            sliding_window_size = (
-                layer.sliding_window_size
-            )  # Needed for sliding window mask
+            # AoH's anchor span is outside the contiguous recent window. Its
+            # dedicated kernel mask below is the sole positional constraint.
+            sliding_window_size = -1 if is_aoh_streaming else layer.sliding_window_size
             kv_indptr = self.forward_metadata.window_kv_indptr
             kv_indices = self.forward_metadata.window_kv_indices
             window_kv_offsets = self.forward_metadata.window_kv_offsets
@@ -1517,6 +1518,8 @@ class TritonAttnBackend(AttentionBackend):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            aoh_sink_size=self.aoh_sink_size if is_aoh_streaming else 0,
+            aoh_recent_size=self.aoh_recent_size if is_aoh_streaming else 0,
         )
         return o
 
@@ -1679,10 +1682,10 @@ class TritonAttnBackend(AttentionBackend):
         Unified 1-stage extend attention for deterministic inference.
         Both prefix and extend KV are accessed through unified kv_indices.
         """
+        is_aoh_streaming = self.is_aoh and layer.aoh_mode == "streaming"
         bs = forward_batch.batch_size
 
         # Determine sliding window settings
-        is_aoh_streaming = self.is_aoh and layer.aoh_mode == "streaming"
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             # AoH already supplies an explicit anchor-and-tail key list. Passing
             # a contiguous window size here would discard the anchor prefix.
@@ -1695,7 +1698,7 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_lens = prefix_kv_indptr[1 : bs + 1] - prefix_kv_indptr[:bs]
             # Handle TARGET_VERIFY mode where extend_prefix_lens might not be set
             if is_aoh_streaming:
-                window_start_pos = None
+                window_start_pos = self.forward_metadata.window_kv_offsets
             elif forward_batch.extend_prefix_lens is not None:
                 window_start_pos = (
                     forward_batch.extend_prefix_lens[:bs] - window_kv_lens
@@ -1815,6 +1818,8 @@ class TritonAttnBackend(AttentionBackend):
             page_size=self.page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            aoh_sink_size=self.aoh_sink_size if is_aoh_streaming else 0,
+            aoh_recent_size=self.aoh_recent_size if is_aoh_streaming else 0,
         )
 
         return o
@@ -2222,9 +2227,10 @@ def update_aoh_window_buffer(
     """Build physical KV indices for [anchors, recent-tail] attention.
 
     AoH's two spans are intentionally gathered into one ragged key list. The
-    Triton paged kernels consume that list directly, so no new attention kernel
-    is needed for the GPU eager path.
+    Triton paged kernels consume that list and apply the per-query rolling
+    recent boundary.
     """
+    seq_lens = seq_lens[:bs]
     anchor_lens = torch.clamp(seq_lens, max=sink_size)
     tail_lens = torch.clamp(seq_lens - sink_size, min=0, max=recent_size)
     aoh_lens = anchor_lens + tail_lens
@@ -2236,13 +2242,14 @@ def update_aoh_window_buffer(
         )
 
     positions_anchor = torch.arange(sink_size, device=seq_lens.device)
-    tail_starts = torch.clamp(seq_lens[:bs] - recent_size, min=sink_size)
+    tail_starts = torch.clamp(seq_lens - recent_size, min=sink_size)
     positions_tail = tail_starts.unsqueeze(1) + torch.arange(
         recent_size, device=seq_lens.device
     )
     positions = torch.cat((positions_anchor.expand(bs, -1), positions_tail), dim=1)
-    valid = positions < seq_lens[:bs].unsqueeze(1)
-    full_indices = req_to_token[req_pool_indices[:bs].unsqueeze(1), positions]
+    valid = positions < seq_lens.unsqueeze(1)
+    safe_positions = positions.clamp(max=req_to_token.shape[1] - 1)
+    full_indices = req_to_token[req_pool_indices[:bs].unsqueeze(1), safe_positions]
     window_kv_indices[: window_kv_indptr[-1]] = full_indices[valid]
 
     if not skip_full_to_swa_translation and hasattr(

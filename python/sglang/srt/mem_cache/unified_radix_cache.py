@@ -651,7 +651,9 @@ class UnifiedRadixCache(BasePrefixCache):
         """Limit AoH radix reuse to the permanent, content-stable anchor."""
         if not getattr(self, "aoh_radix_anchor_only", False):
             return sequence_len
-        return get_aoh_cacheable_prefix_len(sequence_len, self.aoh_sink_size)
+        return get_aoh_cacheable_prefix_len(
+            sequence_len, self.aoh_sink_size, self.page_size
+        )
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs

@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_write_pad,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.model_executor.aoh import get_aoh_max_kv_pages
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     ceil_align,
@@ -629,11 +630,10 @@ class AoHPoolConfigurator(MemoryPoolConfigurator):
     def __init__(self, kvc: KVCacheConfigurator):
         assert kvc.is_aoh
         assert kvc.server_args.max_running_requests is not None
-        assert kvc.server_args.chunked_prefill_size not in (None, -1)
         self._page_size = kvc.page_size
         self._retrieval_layers = len(kvc.aoh_retrieval_layer_ids)
         self._streaming_layers = len(kvc.aoh_streaming_layer_ids)
-        assert self._retrieval_layers > 0 and self._streaming_layers > 0
+        assert self._streaming_layers > 0
 
         kv_bytes = torch._utils._element_size(kvc.kv_cache_dtype)
         self._bytes_per_layer_token = (
@@ -643,12 +643,31 @@ class AoHPoolConfigurator(MemoryPoolConfigurator):
         )
 
         sa = kvc.server_args
-        num_reqs = sa.max_running_requests // kvc.ps.attn_dp_size
+        num_reqs = (
+            sa.max_running_requests + kvc.ps.attn_dp_size - 1
+        ) // kvc.ps.attn_dp_size
         chunks_in_flight = 1 if sa.disable_overlap_schedule else 2
-        per_request = sa.aoh_sink_size + sa.aoh_recent_size + self._page_size
+        eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
+        chunked_limit = (
+            sa.chunked_prefill_size
+            if sa.chunked_prefill_size is not None and sa.chunked_prefill_size >= 0
+            else sa.max_prefill_tokens
+        )
+        max_extend_tokens = min(sa.max_prefill_tokens, chunked_limit)
+        # The compact page table may retain one partial page at each side of
+        # the evicted middle. Size from rounded runtime arguments, not a
+        # particular sink/window configuration.
+        per_request = (
+            get_aoh_max_kv_pages(
+                sa.aoh_sink_size,
+                sa.aoh_recent_size + eviction_interval,
+                self._page_size,
+            )
+            * self._page_size
+        )
         self._stream_capacity = ceil_align(
             per_request * num_reqs
-            + chunks_in_flight * sa.chunked_prefill_size
+            + chunks_in_flight * max_extend_tokens
             + self._page_size,
             self._page_size,
         )
@@ -673,6 +692,15 @@ class AoHPoolConfigurator(MemoryPoolConfigurator):
         stream_bytes = (
             self._stream_capacity * self._streaming_layers * self._bytes_per_layer_token
         )
+        if available_bytes < stream_bytes:
+            raise RuntimeError(
+                "AoH streaming KV pool exceeds the available memory. Reduce "
+                "--max-running-requests or --chunked-prefill-size."
+            )
+        if self._retrieval_layers == 0:
+            # The full side is still the allocator's logical address space even
+            # though this rank has no physical full-attention layer storage.
+            return self._to_config(self._stream_capacity)
         full_cell_bytes = self._retrieval_layers * self._bytes_per_layer_token
         full_tokens = (available_bytes - stream_bytes) // full_cell_bytes
         if full_tokens <= 0:
@@ -992,7 +1020,7 @@ def create_memory_pool_configurator(
     kvc: KVCacheConfigurator,
 ) -> MemoryPoolConfigurator:
     """Factory: select the right configurator for the model architecture."""
-    if kvc.is_aoh:
+    if kvc.is_aoh and kvc.aoh_streaming_layer_ids:
         return AoHPoolConfigurator(kvc)
     if is_deepseek_v4(kvc.model_config.hf_config) and kvc.is_hybrid_swa:
         return DSV4PoolConfigurator(kvc)

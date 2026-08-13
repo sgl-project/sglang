@@ -894,7 +894,7 @@ class ServerArgs:
         Arg(
             help=(
                 "Path to an AoH v1 JSON sidecar. AoH uses offline effective-rank "
-                "head labels to route Qwen3.6 full-attention KV groups into "
+                "head labels to route full-attention KV groups into "
                 "retrieval or anchor-and-recent streaming pools."
             )
         ),

@@ -102,6 +102,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
     free_aoh_out_of_window_slots,
     free_swa_out_of_window_slots,
+    get_aoh_evictable_end,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -3291,10 +3292,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
+            is_aoh = getattr(self.tree_cache, "is_aoh", False)
 
             release_leaf_lock = (
                 envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
                 and hasattr(self.tree_cache, "dec_swa_lock_only")
+                and not is_aoh
             )
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
@@ -3309,13 +3312,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # budget reserves. Gating on accumulated tokens (rather
                     # than an iteration-counter phase) cannot starve because
                     # seqlen progress is monotonic per KV handle.
-                    if (
-                        req.decode_batch_idx >= 1
-                        and req.kv is not None
-                        and req.seqlen - 1 - sliding_window_size
-                        >= req.kv.swa_evicted_seqlen + eviction_interval
-                    ):
-                        self._evict_swa(req, req.seqlen - 1)
+                    if req.decode_batch_idx >= 1 and req.kv is not None:
+                        pre_len = req.seqlen - 1
+                        if is_aoh:
+                            evictable_end = get_aoh_evictable_end(
+                                pre_len,
+                                sink_size=self.tree_cache.aoh_sink_size,
+                                recent_size=self.tree_cache.aoh_recent_size,
+                                page_size=self.tree_cache.page_size,
+                            )
+                            should_evict = (
+                                evictable_end
+                                >= req.kv.swa_evicted_seqlen + eviction_interval
+                            )
+                        else:
+                            should_evict = (
+                                pre_len - sliding_window_size
+                                >= req.kv.swa_evicted_seqlen + eviction_interval
+                            )
+                        if should_evict:
+                            self._evict_swa(req, pre_len)
 
                     # DSV4-NPU only (no-op elsewhere): the small paged compress-state
                     # pool must drain every decode step, independent of SWA cadence.
@@ -3338,7 +3354,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             skip_lock_node_ids=req.skip_lock_node_ids,
                         )
                         req.swa_prefix_lock_released = True
-                elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
+                elif self.forward_mode.is_extend() and (
+                    self.tree_cache.is_chunk_cache() or is_aoh
+                ):
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:
                         # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens

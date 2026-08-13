@@ -92,7 +92,11 @@ from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.model_executor.aoh import AoHConfig
+from sglang.srt.model_executor.aoh import (
+    AoHConfig,
+    get_aoh_kv_groups,
+    normalize_aoh_window,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
@@ -342,6 +346,7 @@ class ModelRunner:
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.is_aoh = False
+        self.aoh_has_streaming = False
         self.aoh_streaming_layer_ids: list[int] = []
         self.aoh_retrieval_layer_ids: list[int] = []
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
@@ -672,7 +677,7 @@ class ModelRunner:
         self.configure_kv_cache_dtype()
 
     def configure_aoh(self) -> None:
-        """Apply an offline AoH sidecar to Qwen3.6's local GQA attention layers."""
+        """Apply an offline AoH sidecar to locally uniform KV-head groups."""
         if self.server_args.aoh_config is None:
             return
         if self.is_draft_worker:
@@ -681,10 +686,6 @@ class ModelRunner:
             raise ValueError("AoH v1 supports pp-size=1 only.")
         if get_parallel().attn_dcp_size != 1:
             raise ValueError("AoH v1 supports attention DCP=1 only.")
-        if get_parallel().attn_tp_size < 2:
-            raise ValueError(
-                "AoH v1 requires TP>=2 so each rank owns one Qwen3.6 KV group."
-            )
         if not self.spec_algorithm.is_none():
             raise ValueError("AoH v1 does not support speculative decoding.")
         if self.server_args.disaggregation_mode != "null":
@@ -708,52 +709,98 @@ class ModelRunner:
             raise ValueError("AoH v1 does not support --enable-unified-memory.")
         if self.server_args.max_running_requests is None:
             raise ValueError("AoH v1 requires an explicit --max-running-requests.")
-        if self.server_args.chunked_prefill_size in (None, -1):
-            raise ValueError(
-                "AoH v1 requires chunked prefill; set --chunked-prefill-size."
-            )
         if self.server_args.aoh_sink_size <= 0 or self.server_args.aoh_recent_size <= 0:
             raise ValueError("AoH sink and recent sizes must both be positive.")
-        if self.server_args.aoh_sink_size > self.model_config.context_len:
-            raise ValueError("AoH sink size cannot exceed the model context length.")
-        if (
-            self.server_args.aoh_sink_size % self.page_size
-            or self.server_args.aoh_recent_size % self.page_size
+        raw_window = (
+            self.server_args.aoh_sink_size,
+            self.server_args.aoh_recent_size,
+        )
+        (
+            self.server_args.aoh_sink_size,
+            self.server_args.aoh_recent_size,
+        ) = normalize_aoh_window(*raw_window, self.model_config.context_len)
+        if raw_window != (
+            self.server_args.aoh_sink_size,
+            self.server_args.aoh_recent_size,
         ):
-            raise ValueError(
-                "AoH sink and recent sizes must be multiples of --page-size."
-            )
-        if self.server_args.chunked_prefill_size < self.page_size:
-            raise ValueError("AoH chunked prefill size must be at least one KV page.")
-
-        model_type = getattr(self.model_config.hf_text_config, "model_type", "")
-        if not model_type.startswith("qwen3_5"):
-            raise ValueError(
-                "AoH v1 currently supports Qwen3.6 (qwen3_5) models only; "
-                f"got model_type={model_type!r}."
+            logger.warning(
+                "AoH window %s exceeds the model context and was normalized to %s.",
+                raw_window,
+                (
+                    self.server_args.aoh_sink_size,
+                    self.server_args.aoh_recent_size,
+                ),
             )
 
         sidecar = AoHConfig.load(self.server_args.aoh_config)
+        self.aoh_has_streaming = any(
+            mode == "streaming"
+            for modes in sidecar.layer_modes.values()
+            for mode in modes
+        )
+        native_swa_layer_ids = (
+            getattr(self.model_config, "swa_attention_layer_ids", None) or []
+        )
+        if native_swa_layer_ids:
+            raise ValueError(
+                "AoH cannot currently be combined with model-native sliding-window "
+                "attention because the Triton backend needs independent native-SWA "
+                "and AoH window metadata."
+            )
+        configured_full_layer_ids = self.model_config.full_attention_layer_ids
+        full_attention_layer_ids = (
+            None
+            if configured_full_layer_ids is None
+            else set(configured_full_layer_ids)
+        )
         attention_layers = [
             module
             for module in self.model.modules()
-            if isinstance(module, RadixAttention) and hasattr(module, "aoh_kv_group")
+            if isinstance(module, RadixAttention)
+            and not module.is_cross_attention
+            and self.layer_info.start_layer
+            <= module.layer_id
+            < self.layer_info.end_layer
+            and (
+                full_attention_layer_ids is None
+                or module.layer_id in full_attention_layer_ids
+            )
         ]
         if not attention_layers:
-            raise ValueError(
-                "AoH v1 requires Qwen3.6 full-attention RadixAttention layers."
-            )
+            raise ValueError("AoH requires full-attention RadixAttention layers.")
+
+        total_kv_heads = self.model_config.get_total_num_kv_heads()
+        kv_tp_size = get_parallel().attn_tp_size
+        kv_tp_rank = get_parallel().attn_tp_rank
 
         self.aoh_streaming_layer_ids = []
         self.aoh_retrieval_layer_ids = []
         for layer in attention_layers:
-            if layer.tp_k_head_num != 1 or layer.aoh_total_kv_heads != 2:
+            configured_modes = sidecar.layer_modes.get(layer.layer_id)
+            if configured_modes is None:
                 raise ValueError(
-                    "AoH v1 expects one local KV head from Qwen3.6's two-group GQA; "
-                    f"layer {layer.layer_id} has local={layer.tp_k_head_num}, "
-                    f"global={layer.aoh_total_kv_heads}."
+                    f"AoH config is missing full-attention layer {layer.layer_id}."
                 )
-            mode = sidecar.mode_for(layer.layer_id, layer.aoh_kv_group)
+            if len(configured_modes) != total_kv_heads:
+                raise ValueError(
+                    f"AoH layer {layer.layer_id} defines {len(configured_modes)} "
+                    f"KV-group modes, but the model has {total_kv_heads} KV groups."
+                )
+            kv_groups = get_aoh_kv_groups(
+                total_kv_heads=total_kv_heads,
+                kv_tp_size=kv_tp_size,
+                kv_tp_rank=kv_tp_rank,
+                local_kv_heads=layer.tp_k_head_num,
+            )
+            modes = {sidecar.mode_for(layer.layer_id, group) for group in kv_groups}
+            if len(modes) != 1:
+                raise ValueError(
+                    "AoH cannot route mixed retrieval/streaming KV groups within "
+                    f"one local attention module: layer={layer.layer_id}, "
+                    f"rank={kv_tp_rank}, groups={kv_groups}. Increase attention TP "
+                    "or use a sidecar with one mode per local shard."
+                )
+            mode = modes.pop()
             layer.aoh_mode = mode
             if mode == "streaming":
                 layer.sliding_window_size = (
@@ -771,20 +818,19 @@ class ModelRunner:
                 "AoH config contains non-attention layers for this model: "
                 f"{sorted(unexpected_layer_ids)}."
             )
-        if not self.aoh_streaming_layer_ids or not self.aoh_retrieval_layer_ids:
-            raise ValueError(
-                "AoH v1 requires at least one streaming and one retrieval layer per rank."
-            )
-
         # AoH reuses the hybrid-SWA scheduler and allocator, but replaces the
-        # contiguous-window eviction rule with an anchor-and-recent rule.
+        # contiguous-window eviction rule with an anchor-and-recent rule. A TP
+        # rank may own only retrieval groups, in which case it keeps the normal
+        # full-attention pool while matching the global radix anchor boundary.
         self.is_aoh = True
-        self.is_hybrid_swa = True
-        self.sliding_window_size = (
-            self.server_args.aoh_sink_size + self.server_args.aoh_recent_size
-        )
+        self.is_hybrid_swa = bool(self.aoh_streaming_layer_ids)
+        if self.is_hybrid_swa:
+            self.sliding_window_size = (
+                self.server_args.aoh_sink_size + self.server_args.aoh_recent_size
+            )
         logger.info(
-            "AoH enabled: rank=%s streaming_layers=%s retrieval_layers=%s sink=%s recent=%s radix_cache=%s cuda_graph=%s",
+            "AoH enabled: rank=%s streaming_layers=%s retrieval_layers=%s "
+            "sink=%s recent=%s radix_cache=%s cuda_graph=%s",
             self.ps.tp_rank,
             self.aoh_streaming_layer_ids,
             self.aoh_retrieval_layer_ids,
@@ -1059,6 +1105,22 @@ class ModelRunner:
         # Resolve before building: backends read the pair off the runner while
         # they construct (the FlashInfer KV-access check).
         resolved = resolve_attention_backend_strs(model_runner=self)
+        if self.is_aoh:
+            required_backend = {
+                "cuda": "triton",
+                "npu": "ascend",
+            }.get(self.device)
+            if (
+                required_backend is None
+                or resolved.prefill != required_backend
+                or resolved.decode != required_backend
+            ):
+                raise ValueError(
+                    "AoH requires the implemented attention backend for both "
+                    f"prefill and decode: device={self.device!r}, "
+                    f"required={required_backend!r}, "
+                    f"resolved=({resolved.prefill!r}, {resolved.decode!r})."
+                )
         self.prefill_attention_backend_str = resolved.prefill
         self.decode_attention_backend_str = resolved.decode
         backends = build_attention_backends(model_runner=self)
