@@ -28,8 +28,8 @@ def test_fused_ln_modulate_is_bit_exact(shape):
     shift, scale = chunks[0], chunks[2]
     out = _glm_ln_modulate(norm, x, scale, shift, x.dtype)
     assert torch.equal(out, _eager_ln_modulate(norm, x, scale, shift, x.dtype))
-    assert glm_image._GLM_FUSED_LN_MOD_VERIFIED
-    assert not glm_image._GLM_FUSED_LN_MOD_DISABLED
+    assert glm_image._GLM_LN_MOD.verified
+    assert not glm_image._GLM_LN_MOD.disabled
 
 
 @pytest.mark.parametrize("shape", [(1, 4360, 32, 128), (2, 37, 3, 40), (1, 129, 5, 64)])
@@ -45,8 +45,8 @@ def test_fused_qk_head_layernorm_is_bit_exact(shape):
     q_out, k_out = _glm_qk_layernorm(norm_q, norm_k, q, k, q.dtype)
     assert torch.equal(q_out, norm_q(q).to(q.dtype))
     assert torch.equal(k_out, norm_k(k).to(k.dtype))
-    assert glm_image._GLM_FUSED_QK_LN_VERIFIED
-    assert not glm_image._GLM_FUSED_QK_LN_DISABLED
+    assert glm_image._GLM_QK_LN.verified
+    assert not glm_image._GLM_QK_LN.disabled
 
 
 if __name__ == "__main__":
