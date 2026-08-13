@@ -65,7 +65,7 @@ pub struct QwenVlProcessor {
     lut: [[f32; 256]; 3],
 }
 
-/// `1 / rescale_factor`; `resolve_native_spec` rejects any other factor.
+/// `1 / rescale_factor`; `resolve_mm_spec` rejects any other factor.
 const INV_RESCALE: f32 = 255.0;
 
 /// u8 → normalized f32, rounded as the mirrored processor rounds. The slow one

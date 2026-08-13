@@ -22,7 +22,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.mm_utils import hash_feature  # noqa: E402
-from sglang.srt.managers.rust_server import NativeMmHost  # noqa: E402
+from sglang.srt.managers.rust_server import resolve_mm_spec  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -58,11 +58,11 @@ class TestQwenNativeMmHashes(CustomTestCase):
 
     def native_hashes(self, sources):
         """Per-item hashes the Rust driver returns, via the production gate."""
-        host = NativeMmHost.__new__(NativeMmHost)
-        host.model_config = SimpleNamespace(hf_config=self.processor.hf_config)
-        host._processor = self.processor._processor
-        host.server_args = self.processor.server_args
-        spec = host.resolve_native_spec()
+        spec = resolve_mm_spec(
+            server_args=self.processor.server_args,
+            model_config=SimpleNamespace(hf_config=self.processor.hf_config),
+            processor=self.processor._processor,
+        )
         self.assertIsNotNone(spec, "gate rejected the fixture processor")
         input_ids = [t for _ in sources for t in (1, 2, 3, 4)]
         return DRIVER(input_ids, sources, spec.rust_json())[3]

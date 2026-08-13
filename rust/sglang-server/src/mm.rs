@@ -183,7 +183,7 @@ pub struct MmContext {
     pub tokenizer: Option<Arc<dyn TextTokenizer>>,
     pub results: MmResultStore,
     /// Park feature buffers in POSIX shm. Set by the Python launcher
-    /// (`NativeMmHost._use_feature_shm`) exactly when the scheduler broadcasts
+    /// (`_use_feature_shm`) exactly when the scheduler broadcasts
     /// across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
 }

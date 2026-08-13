@@ -216,7 +216,7 @@ impl Server {
     }
 
     /// Spawn the MM worker pool for the pipeline in `spec_json` (built from the
-    /// resolved processor config; see `NativeMmHost.resolve_native_spec`).
+    /// resolved processor config; see `resolve_mm_spec`).
     /// Image-only requests are processed entirely in Rust and parked for
     /// [`Server::take_mm`]; anything the pipeline cannot serve is rejected back to
     /// the client — there is no Python fallback.

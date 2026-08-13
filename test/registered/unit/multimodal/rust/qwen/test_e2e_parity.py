@@ -1,7 +1,7 @@
 """End-to-end parity at the scheduler-input boundary.
 
 `test_preprocess.py` pins the `preprocess` binding; this drives the whole native
-path — the `process_native_mm` driver, then `NativeMmHost.build_native_mm` — and
+path — the `process_native_mm` driver, then `MmSpec.wrap_encoded` — and
 compares every field the scheduler reads against the Python `mm_processor`.
 Bitwise, for both HF backends: the Rust resize clones PIL's fixed-point bicubic
 and ATen's uint8 antialias kernel, so whichever one a server is configured with
@@ -23,7 +23,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.rust_server import NativeMmHost  # noqa: E402
+from sglang.srt.managers.rust_server import resolve_mm_spec  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -62,15 +62,11 @@ class TestQwenE2eParity(CustomTestCase):
     def native_spec(self):
         """Resolve the spec through the production gate, so a gate that stops
         recognizing this image processor fails here too."""
-        from sglang.srt.managers.multimodal_processor import import_processors
-
-        import_processors("sglang.srt.multimodal.processors")
-        # Skip __init__: it would build a processor; reuse the fixture's.
-        host = NativeMmHost.__new__(NativeMmHost)
-        host.model_config = SimpleNamespace(hf_config=self.processor.hf_config)
-        host._processor = self.processor._processor
-        host.server_args = self.processor.server_args
-        spec = host.resolve_native_spec()
+        spec = resolve_mm_spec(
+            server_args=self.processor.server_args,
+            model_config=SimpleNamespace(hf_config=self.processor.hf_config),
+            processor=self.processor._processor,
+        )
         self.assertIsNotNone(spec, f"gate rejected {self.image_processor}")
         return spec
 
@@ -81,7 +77,7 @@ class TestQwenE2eParity(CustomTestCase):
             PROMPT_PER_IMAGE * len(sources), sources, spec.rust_json()
         )
         # The shape of Rust's MmEncodedResult, inline transport
-        # (test_build_native_mm pins the shm shape).
+        # (test_wrap_encoded pins the shm shape).
         encoded = SimpleNamespace(
             features=features,
             shm_names=None,
@@ -91,7 +87,7 @@ class TestQwenE2eParity(CustomTestCase):
             mrope=mrope,
             mrope_delta=delta,
         )
-        return snapshot(ids, NativeMmHost.build_native_mm(spec, encoded))
+        return snapshot(ids, spec.wrap_encoded(encoded))
 
     def run_python(self, sources):
         """The reference path: the Python `mm_processor` the scheduler would use."""
