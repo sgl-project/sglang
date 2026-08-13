@@ -30,6 +30,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     PhaseConfig,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -1051,17 +1052,15 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
         self.assertIsNone(server_args.flashinfer_a2a_dispatch_type)
         self.assertTrue(envs.SGLANG_MOE_NVFP4_DISPATCH.get())
 
-    @patch("sglang.srt.layers.moe.utils.get_server_args")
-    def test_unspecified_getter_preserves_legacy_bf16_fallback(self, get_server_args):
-        get_server_args.return_value = SimpleNamespace(
+    def test_unspecified_getter_preserves_legacy_bf16_fallback(self):
+        with get_context().override_server_args(
             flashinfer_a2a_dispatch_type=None,
             quantization="mxfp8",
-        )
-
-        self.assertEqual(
-            get_flashinfer_a2a_dispatch_type(),
-            FlashinferA2ADispatchType.BF16,
-        )
+        ):
+            self.assertEqual(
+                get_flashinfer_a2a_dispatch_type(),
+                FlashinferA2ADispatchType.BF16,
+            )
 
     def test_explicit_nvfp4_checks_hybrid_metadata_for_mxfp8_quantization(self):
         server_args = self._make_args(quantization="mxfp8", dispatch_type="nvfp4")

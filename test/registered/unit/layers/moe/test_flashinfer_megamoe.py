@@ -37,8 +37,17 @@ def _load_megamoe_module(monkeypatch):
         "sglang.srt.layers.moe.token_dispatcher": types.ModuleType(
             "sglang.srt.layers.moe.token_dispatcher"
         ),
+        "sglang.srt.runtime_context": types.ModuleType("sglang.srt.runtime_context"),
+        "deep_gemm": types.ModuleType("deep_gemm"),
+        "deep_gemm.utils": types.ModuleType("deep_gemm.utils"),
+        "deep_gemm.utils.math": types.ModuleType("deep_gemm.utils.math"),
     }
-    fake_modules["sglang.srt.environ"].envs = types.SimpleNamespace()
+    fake_modules["sglang.srt.environ"].envs = types.SimpleNamespace(
+        SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK=types.SimpleNamespace(
+            get=lambda: 0
+        )
+    )
+    fake_modules["sglang.srt.runtime_context"].cutedsl_moe_max_num_tokens = lambda: 2048
     base = fake_modules["sglang.srt.layers.moe.moe_runner.base"]
     base.MoeQuantInfo = MoeQuantInfo
     base.MoeRunnerConfig = MoeRunnerConfig
@@ -64,6 +73,16 @@ def _load_megamoe_module(monkeypatch):
     monkeypatch.setitem(sys.modules, module_name, module)
     spec.loader.exec_module(module)
     return module
+
+
+def test_max_tokens_uses_runtime_context_accessor(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+
+    assert module._resolve_max_tokens_per_rank() == 2048
+
+    runtime_context = sys.modules["sglang.srt.runtime_context"]
+    runtime_context.cutedsl_moe_max_num_tokens = lambda: 0
+    assert module._resolve_max_tokens_per_rank() == 1024
 
 
 def test_adapter_keeps_router_ids_int32(monkeypatch):

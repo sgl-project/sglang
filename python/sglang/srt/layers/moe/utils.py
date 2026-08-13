@@ -12,7 +12,13 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.runtime_context import get_exec, get_flags, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_forward,
+    get_model,
+    get_parallel,
+)
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
@@ -239,8 +245,7 @@ class FlashinferA2ADispatchType(Enum):
 
 
 def get_flashinfer_a2a_dispatch_type() -> FlashinferA2ADispatchType:
-    server_args = get_server_args()
-    dispatch_type = getattr(server_args, "flashinfer_a2a_dispatch_type", None)
+    dispatch_type = get_exec().moe.flashinfer_a2a_dispatch_type
 
     if dispatch_type is None:
         if envs.SGLANG_MOE_NVFP4_DISPATCH.is_set():
@@ -256,7 +261,7 @@ def get_flashinfer_a2a_dispatch_type() -> FlashinferA2ADispatchType:
 
     assert not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set()
 
-    quantization = getattr(server_args, "quantization", None)
+    quantization = get_model().quantization
     if quantization == "mxfp8":
         dispatch_type = "mxfp8"
     elif quantization == "modelopt_fp4":

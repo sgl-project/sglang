@@ -139,12 +139,9 @@ def _resolve_max_tokens_per_rank() -> int:
     if configured > 0:
         return configured
 
-    from sglang.srt.server_args import get_global_server_args
+    from sglang.srt.runtime_context import cutedsl_moe_max_num_tokens
 
-    server_args = get_global_server_args()
-    derived = 0
-    if server_args is not None:
-        derived = server_args.cutedsl_moe_max_num_tokens()
+    derived = cutedsl_moe_max_num_tokens()
     return derived if derived > 0 else 1024
 
 
