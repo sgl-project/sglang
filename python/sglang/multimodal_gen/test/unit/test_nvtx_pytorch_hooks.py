@@ -16,9 +16,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentResidencyManager,
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.residency_strategies import (
+    ComponentOffloadStrategy,
     ResidentStrategy,
-    VanillaD2HStrategy,
 )
 from sglang.multimodal_gen.runtime.utils import nvtx_pytorch_hooks
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import (
@@ -222,7 +222,7 @@ def _test_manager(
     pipeline = SimpleNamespace(
         modules=modules,
         _stage_name_mapping={},
-        component_residency_strategies={},
+        custom_residency_strategies={},
     )
     server_args = SimpleNamespace(enable_layerwise_nvtx_marker=enable_flag)
     manager = ComponentResidencyManager(pipeline, server_args)
@@ -239,7 +239,9 @@ class TestComponentResidencyNvtxHooks(unittest.TestCase):
         manager.strategy_for = lambda _component_name, _module: ResidentStrategy()
         self.assertTrue(manager._should_keep_single_dit("transformer", module))
 
-        manager.strategy_for = lambda _component_name, _module: VanillaD2HStrategy()
+        manager.strategy_for = (
+            lambda _component_name, _module: ComponentOffloadStrategy()
+        )
         self.assertFalse(manager._should_keep_single_dit("transformer", module))
 
     def test_disabled_flag_is_noop(self) -> None:

@@ -9,7 +9,7 @@ from torch.distributed.tensor import DTensor
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_RESIDENCY_GROUPS,
-    ComponentResidencyMode,
+    LAYERWISE_OFFLOAD_STRATEGY,
     is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     RESIDENCY_POLICIES,
     RESIDENCY_POLICY_LEADING,
     RESIDENCY_POLICY_STRIDED,
+    is_dit_component_name,
     layerwise_component_matches_any_selection,
     normalize_layerwise_offload_components,
 )
@@ -334,8 +335,13 @@ class LayerwiseOffloadManager:
 
         self.register_forward_hooks()
         self._configured = True
-        logger.info(
-            f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, num resident layers: {self.resident_layers}, total num layers: {self.num_layers}, residency policy: {self.residency_policy}"
+        logger.debug(
+            "Initialized layerwise offload manager: prefetch=%d, resident=%d, "
+            "layers=%d, layer_selection=%s",
+            self.prefetch_size,
+            self.resident_layers,
+            self.num_layers,
+            self.residency_policy,
         )
         if self.residency_policy == RESIDENCY_POLICY_STRIDED and self._streamed_order:
             logger.debug(
@@ -803,7 +809,7 @@ class LayerwiseOffloadableModuleMixin:
             configured_layer_names.append(layer_name)
 
         if configured_layer_names:
-            logger.info(
+            logger.debug(
                 "Enabled layerwise offload for %s on modules: %s",
                 self.__class__.__name__,
                 configured_layer_names,
@@ -902,7 +908,8 @@ def get_layerwise_offload_component_names_for_pipeline(
 ) -> list[str]:
     """Resolve layerwise selectors against the current pipeline modules.
 
-    Explicit unsupported component names are kept so callers can report them.
+    Explicit selectors are resolved by component identity so capability checks
+    happen in one place after selection.
     """
     normalized_component_names = normalize_layerwise_offload_components(component_names)
     selected_component_names = (
@@ -923,7 +930,7 @@ def get_layerwise_offload_component_names_for_pipeline(
         return [
             component_name
             for component_name, module in modules.items()
-            if isinstance(module, LayerwiseOffloadableModuleMixin)
+            if isinstance(module, torch.nn.Module)
         ]
 
     explicit_component_names = selected_component_names - {LAYERWISE_OFFLOAD_DIT_GROUP}
@@ -935,11 +942,7 @@ def get_layerwise_offload_component_names_for_pipeline(
         ):
             selected_pipeline_component_names.append(component_name)
             continue
-        if (
-            select_dit_group
-            and isinstance(module, LayerwiseOffloadableModuleMixin)
-            and module.layerwise_offload_dit_group_enabled
-        ):
+        if select_dit_group and is_dit_component_name(component_name):
             selected_pipeline_component_names.append(component_name)
     return selected_pipeline_component_names
 
@@ -950,16 +953,12 @@ def configure_layerwise_offload_modules(
     component_names: Sequence[str] | None = None,
     warn_missing: bool = True,
 ) -> list[str]:
-    """Configure layerwise offload for the given modules, from the given component_names
+    """Configure selected pipeline modules for layerwise offload.
 
-    Args:
-        modules: the dict of {component_name: component}, containing the components to be chosen from
-        component_names: list of component names. component with names not in this list shouldn't be configured
-
-    Returns a list of component names of modules configured to be layerwise-offload
+    An explicitly selected component must support layerwise offload and expose at
+    least one usable layer list. Automatic selection considers capable modules only.
     """
 
-    # components which has already been configured to be layerwise-offload
     configured_component_names: list[str] = []
     configured_module_ids: set[int] = set()
     normalized_component_names = normalize_layerwise_offload_components(component_names)
@@ -977,8 +976,8 @@ def configure_layerwise_offload_modules(
             component_name
             for component_name, module in modules.items()
             if isinstance(module, torch.nn.Module)
-            if server_args.component_residency_mode(component_name)
-            == ComponentResidencyMode.LAYERWISE_OFFLOAD
+            if server_args.residency_strategy_name(component_name)
+            == LAYERWISE_OFFLOAD_STRATEGY
         ]
     else:
         selected_pipeline_component_names = (
@@ -992,8 +991,8 @@ def configure_layerwise_offload_modules(
         if warn_missing and server_args.disagg_role == RoleType.MONOLITHIC:
             explicit_component_names = {
                 selector
-                for selector, mode in server_args.component_residency.items()
-                if mode == ComponentResidencyMode.LAYERWISE_OFFLOAD.value
+                for selector, strategy_name in server_args.component_residency.items()
+                if strategy_name == LAYERWISE_OFFLOAD_STRATEGY
                 and selector not in COMPONENT_RESIDENCY_GROUPS
             }
             missing_component_names = sorted(
@@ -1030,89 +1029,48 @@ def configure_layerwise_offload_modules(
                 sorted(modules),
             )
 
-    unsupported_component_names = [
+    fsdp_managed_components = sorted(
+        component_name
+        for component_name in selected_pipeline_component_names
+        if is_fsdp_managed_module(modules[component_name])
+    )
+    if fsdp_managed_components:
+        raise ValueError(
+            "Layerwise offload cannot manage components already managed by FSDP: "
+            f"{fsdp_managed_components}"
+        )
+
+    unsupported_component_names = sorted(
         component_name
         for component_name in selected_pipeline_component_names
         if not isinstance(modules[component_name], LayerwiseOffloadableModuleMixin)
-    ]
-    component_offload_fallbacks = []
-    fsdp_managed_fallbacks = []
-    legacy_unsupported_components = []
-    for component_name in unsupported_component_names:
-        module = modules[component_name]
-        explicitly_selected = (
-            server_args.explicit_component_residency_mode(component_name)
-            == ComponentResidencyMode.LAYERWISE_OFFLOAD
+    )
+    if unsupported_component_names:
+        raise ValueError(
+            "Layerwise offload was selected for components that do not implement "
+            f"LayerwiseOffloadableModuleMixin: {unsupported_component_names}"
         )
-        if not explicitly_selected:
-            legacy_unsupported_components.append(component_name)
-            continue
-        if is_fsdp_managed_module(module):
-            server_args.set_component_residency_runtime_override(
-                component_name, ComponentResidencyMode.RESIDENT
-            )
-            fsdp_managed_fallbacks.append(component_name)
-            continue
-        server_args.set_component_residency_runtime_override(
-            component_name, ComponentResidencyMode.COMPONENT_OFFLOAD
-        )
-        module.to("cpu")
-        component_offload_fallbacks.append(component_name)
+
+    unconfigured_component_names: list[str] = []
     for component_name in selected_pipeline_component_names:
         module = modules[component_name]
-        if not isinstance(module, LayerwiseOffloadableModuleMixin):
-            continue
+        assert isinstance(module, LayerwiseOffloadableModuleMixin)
         module_id = id(module)
         if module_id in configured_module_ids:
-            # avoid duplicated configures on a same module
             continue
 
         configured_module_ids.add(module_id)
-
-        if server_args.explicit_component_residency_mode(
-            component_name
-        ) == ComponentResidencyMode.LAYERWISE_OFFLOAD and is_fsdp_managed_module(
-            module
-        ):
-            server_args.set_component_residency_runtime_override(
-                component_name, ComponentResidencyMode.RESIDENT
-            )
-            fsdp_managed_fallbacks.append(component_name)
-            continue
-
         if not is_layerwise_offloaded_module(module):
             module.configure_layerwise_offload(server_args)
         if is_layerwise_offloaded_module(module):
             configured_component_names.append(component_name)
             continue
+        unconfigured_component_names.append(component_name)
 
-        if (
-            server_args.explicit_component_residency_mode(component_name)
-            != ComponentResidencyMode.LAYERWISE_OFFLOAD
-        ):
-            continue
-        server_args.set_component_residency_runtime_override(
-            component_name, ComponentResidencyMode.COMPONENT_OFFLOAD
-        )
-        module.to("cpu")
-        component_offload_fallbacks.append(component_name)
-
-    if warn_missing and component_offload_fallbacks:
-        logger.warning(
-            "Layerwise offload components do not support layerwise offload: %s; "
-            "using component offload instead",
-            sorted(component_offload_fallbacks),
-        )
-    if warn_missing and fsdp_managed_fallbacks:
-        logger.warning(
-            "Layerwise offload components are managed by FSDP and cannot use "
-            "external layer streaming: %s; keeping FSDP placement instead",
-            sorted(fsdp_managed_fallbacks),
-        )
-    if warn_missing and legacy_unsupported_components:
-        logger.warning(
-            "Layerwise offload components do not support layerwise offload: %s",
-            sorted(legacy_unsupported_components),
+    if unconfigured_component_names:
+        raise ValueError(
+            "Layerwise offload was selected but no usable layers were configured "
+            f"for components: {sorted(unconfigured_component_names)}"
         )
 
     if configured_component_names:

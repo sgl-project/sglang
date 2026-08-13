@@ -36,18 +36,18 @@ def _batch():
 
 
 class _TestServerArgs(SimpleNamespace):
-    explicit_component_residency_mode = ServerArgs.explicit_component_residency_mode
+    explicit_residency_strategy_name = ServerArgs.explicit_residency_strategy_name
     _legacy_should_cpu_offload_component = (
         ServerArgs._legacy_should_cpu_offload_component
     )
     _legacy_layerwise_offload_matches = ServerArgs._legacy_layerwise_offload_matches
-    component_residency_mode = ServerArgs.component_residency_mode
+    residency_strategy_name = ServerArgs.residency_strategy_name
 
 
 def _server_args(**overrides):
     values = {
         "component_residency": None,
-        "_component_residency_runtime_overrides": {},
+        "_residency_strategy_overrides": {},
         "cpu_offload_components": None,
         "use_fsdp_inference": False,
         "dit_cpu_offload": False,

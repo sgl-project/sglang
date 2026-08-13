@@ -30,7 +30,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_loading_or
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
-    ComponentResidencyStrategy,
+    ResidencyStrategy,
     get_global_component_residency_manager,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
@@ -109,7 +109,7 @@ class ComposedPipelineBase(ABC):
         self.model_path: str = model_path
         self._stages: list[PipelineStage] = []
         self._stage_name_mapping: dict[str, PipelineStage] = {}
-        self.component_residency_strategies: dict[str, ComponentResidencyStrategy] = {}
+        self.custom_residency_strategies: dict[str, ResidencyStrategy] = {}
         self.executor = executor or self.build_executor(server_args=server_args)
         self.component_residency_manager: ComponentResidencyManager | None = None
 

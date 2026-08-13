@@ -43,11 +43,17 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader imp
     SchedulerLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     DomainAwareLinear,
     compute_mrope_position_ids_action,
     compute_mrope_position_ids_sound,
     compute_mrope_position_ids_vision,
+)
+from sglang.multimodal_gen.runtime.models.vaes.cosmos3_avae import (
+    Cosmos3AVAEAudioTokenizer,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
@@ -68,6 +74,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 def _apply(mapping_fn, key):
     """Return (target_key, merge_index, total_splits) for a diffusers weight key."""
     return mapping_fn(key)
+
+
+class TestCosmos3SoundTokenizerResidency(unittest.TestCase):
+    def test_decoder_declares_layerwise_blocks(self):
+        self.assertTrue(
+            issubclass(Cosmos3AVAEAudioTokenizer, LayerwiseOffloadableModuleMixin)
+        )
+        self.assertEqual(Cosmos3AVAEAudioTokenizer.layer_names, ["decoder.block"])
 
 
 def _cosmos3_server_args(config=None):

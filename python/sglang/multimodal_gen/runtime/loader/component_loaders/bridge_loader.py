@@ -75,6 +75,9 @@ class BridgeLoader(ComponentLoader):
         )
 
         component_cpu_offload = server_args.should_cpu_offload_component(component_name)
+        stage_on_cpu = server_args.should_load_component_on_cpu(
+            component_name, can_configure_layerwise_after_load=True
+        )
 
         # Use the FSDP loader when FSDP is requested or shard rules are declared.
         fsdp_shard_conditions = getattr(model_cls, "_fsdp_shard_conditions", None)
@@ -106,7 +109,7 @@ class BridgeLoader(ComponentLoader):
             model = model_cls.from_pretrained(
                 component_model_path, torch_dtype=default_dtype
             )
-            target_device = self.target_device(component_cpu_offload)
+            target_device = self.target_device(stage_on_cpu)
             model = model.to(device=target_device, dtype=default_dtype)
 
         total_params = sum(p.numel() for p in model.parameters())

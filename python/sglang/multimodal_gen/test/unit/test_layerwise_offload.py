@@ -1,6 +1,7 @@
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -12,22 +13,14 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _ModelOptFp8OffloadAdapter,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
-    component_resident_strategies as component_resident_strategies_mod,
+    layerwise_offload as layerwise_offload_mod,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
-    layerwise_offload as layerwise_offload_mod,
+    residency_strategies as residency_strategies_mod,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
-    build_component_residency_strategy,
-)
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    ComponentResidencyMode,
-)
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
-    LayerwiseOffloadStrategy,
-    ResidentStrategy,
-    VanillaD2HStrategy,
+    build_residency_strategy,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -41,6 +34,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     RESIDENCY_POLICY_LEADING,
     RESIDENCY_POLICY_STRIDED,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.residency_strategies import (
+    ComponentOffloadStrategy,
+    LayerwiseOffloadStrategy,
+    ResidentStrategy,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -173,22 +171,20 @@ class _LayerwiseComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
 
 class _TestServerArgs(SimpleNamespace):
     should_cpu_offload_component = ServerArgs.should_cpu_offload_component
-    explicit_component_residency_mode = ServerArgs.explicit_component_residency_mode
-    set_component_residency_runtime_override = (
-        ServerArgs.set_component_residency_runtime_override
-    )
+    explicit_residency_strategy_name = ServerArgs.explicit_residency_strategy_name
+    set_residency_strategy_override = ServerArgs.set_residency_strategy_override
     _legacy_should_cpu_offload_component = (
         ServerArgs._legacy_should_cpu_offload_component
     )
     _legacy_layerwise_offload_matches = ServerArgs._legacy_layerwise_offload_matches
-    component_residency_mode = ServerArgs.component_residency_mode
+    residency_strategy_name = ServerArgs.residency_strategy_name
 
 
 def _server_args(**kwargs):
     defaults = dict(
         cpu_offload_components=None,
         component_residency=None,
-        _component_residency_runtime_overrides={},
+        _residency_strategy_overrides={},
         layerwise_offload_components=None,
         use_fsdp_inference=False,
         dit_cpu_offload=False,
@@ -379,8 +375,10 @@ def test_layerwise_capability_selects_layerwise_strategy_for_any_component():
     module = _LayerwiseComponent(enabled=True)
 
     assert is_layerwise_offloaded_module(module)
-    strategy = build_component_residency_strategy(
-        "text_encoder", module, _server_args(text_encoder_cpu_offload=True)
+    strategy = build_residency_strategy(
+        "text_encoder",
+        module,
+        _server_args(component_residency={"text_encoder": "layerwise-offload"}),
     )
 
     assert isinstance(strategy, LayerwiseOffloadStrategy)
@@ -569,24 +567,21 @@ def test_layerwise_offload_does_not_warn_for_lazy_condition_encoder(caplog):
     assert "not currently loaded" not in caplog.text
 
 
-def test_unsupported_layerwise_component_becomes_component_offload():
+def test_unsupported_layerwise_component_fails():
     server_args = _server_args(
         component_residency={"text_encoder": "layerwise-offload"}
     )
 
-    configured = configure_layerwise_offload_modules(
-        {"text_encoder": _DummyModel(), "scheduler": object()}, server_args
-    )
-
-    assert configured == []
-    assert (
-        server_args.component_residency_mode("text_encoder")
-        == ComponentResidencyMode.COMPONENT_OFFLOAD
-    )
-    assert "scheduler" not in server_args._component_residency_runtime_overrides
+    with pytest.raises(
+        ValueError,
+        match="do not implement LayerwiseOffloadableModuleMixin.*text_encoder",
+    ):
+        configure_layerwise_offload_modules(
+            {"text_encoder": _DummyModel(), "scheduler": object()}, server_args
+        )
 
 
-def test_layerwise_component_without_usable_layers_becomes_component_offload():
+def test_layerwise_component_without_usable_layers_fails():
     class _EmptyLayerwiseModel(_DummyModel, LayerwiseOffloadableModuleMixin):
         layer_names = ["blocks"]
 
@@ -598,67 +593,56 @@ def test_layerwise_component_without_usable_layers_becomes_component_offload():
         component_residency={"text_encoder": "layerwise-offload"}
     )
 
-    configured = configure_layerwise_offload_modules(
-        {"text_encoder": _EmptyLayerwiseModel()}, server_args
-    )
-
-    assert configured == []
-    assert (
-        server_args.component_residency_mode("text_encoder")
-        == ComponentResidencyMode.COMPONENT_OFFLOAD
-    )
+    with pytest.raises(
+        ValueError, match="no usable layers were configured.*text_encoder"
+    ):
+        configure_layerwise_offload_modules(
+            {"text_encoder": _EmptyLayerwiseModel()}, server_args
+        )
 
 
-def test_legacy_unsupported_layerwise_component_remains_resident():
+def test_legacy_unsupported_layerwise_component_fails():
     server_args = _server_args(layerwise_offload_components=["text_encoder"])
 
-    configured = configure_layerwise_offload_modules(
-        {"text_encoder": _DummyModel()},
-        server_args,
-        component_names=["text_encoder"],
+    with pytest.raises(
+        ValueError,
+        match="do not implement LayerwiseOffloadableModuleMixin.*text_encoder",
+    ):
+        configure_layerwise_offload_modules(
+            {"text_encoder": _DummyModel()},
+            server_args,
+            component_names=["text_encoder"],
+        )
+
+
+def test_layerwise_strategy_requires_configured_layers():
+    server_args = _server_args(
+        component_residency={"text_encoder": "layerwise-offload"}
     )
 
-    assert configured == []
-    assert (
-        server_args.component_residency_mode("text_encoder")
-        == ComponentResidencyMode.LAYERWISE_OFFLOAD
-    )
-    strategy = build_component_residency_strategy(
-        "text_encoder", _DummyModel(), server_args
-    )
-    assert isinstance(strategy, ResidentStrategy)
+    with pytest.raises(ValueError, match="did not configure"):
+        build_residency_strategy("text_encoder", _DummyModel(), server_args)
 
 
 def test_component_cpu_offload_strategy_remains_flag_driven():
-    strategy = build_component_residency_strategy(
+    strategy = build_residency_strategy(
         "text_encoder", _DummyModel(), _server_args(text_encoder_cpu_offload=True)
     )
-    assert isinstance(strategy, VanillaD2HStrategy)
+    assert isinstance(strategy, ComponentOffloadStrategy)
 
-    strategy = build_component_residency_strategy(
+    strategy = build_residency_strategy(
         "unknown_component", _DummyModel(), _server_args(text_encoder_cpu_offload=True)
     )
     assert isinstance(strategy, ResidentStrategy)
 
 
-def test_component_cpu_offload_remains_independent_from_fsdp():
-    strategy = build_component_residency_strategy(
+def test_auxiliary_component_offload_selection_ignores_global_fsdp_flag():
+    strategy = build_residency_strategy(
         "text_encoder",
         _DummyModel(),
         _server_args(use_fsdp_inference=True, text_encoder_cpu_offload=True),
     )
-    assert isinstance(strategy, VanillaD2HStrategy)
-
-    fsdp_module = type("FSDPDummyModel", (_DummyModel,), {})()
-    strategy = build_component_residency_strategy(
-        "transformer",
-        fsdp_module,
-        _server_args(
-            use_fsdp_inference=True,
-            component_residency={"dit": "component-offload"},
-        ),
-    )
-    assert isinstance(strategy, ResidentStrategy)
+    assert isinstance(strategy, ComponentOffloadStrategy)
 
 
 def test_resident_strategy_prepares_local_device_without_dtype(monkeypatch):
@@ -668,7 +652,7 @@ def test_resident_strategy_prepares_local_device_without_dtype(monkeypatch):
         calls.append((module, dtype))
 
     monkeypatch.setattr(
-        component_resident_strategies_mod,
+        residency_strategies_mod,
         "_module_to_local_device",
         fake_module_to_local_device,
     )
@@ -690,17 +674,41 @@ def test_resident_strategy_keeps_fsdp_managed_module_owned_by_fsdp(monkeypatch):
         calls.append((module, dtype))
 
     monkeypatch.setattr(
-        component_resident_strategies_mod,
+        residency_strategies_mod,
         "_module_to_local_device",
         fake_module_to_local_device,
     )
-    module = type("FSDPDummyModel", (_DummyModel,), {})()
+    monkeypatch.setattr(
+        residency_strategies_mod, "is_fsdp_managed_module", lambda _module: True
+    )
+    module = _DummyModel()
 
     ResidentStrategy().prepare_for_use(
         module,
         ComponentUse(stage_name="TextEncodingStage", component_name="text_encoder"),
         SimpleNamespace(),
     )
+
+    assert calls == []
+
+
+def test_component_offload_strategy_defers_fsdp_placement(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        residency_strategies_mod, "is_fsdp_managed_module", lambda _module: True
+    )
+    monkeypatch.setattr(
+        residency_strategies_mod,
+        "_module_to_local_device",
+        lambda module, *, dtype=None: calls.append((module, dtype)),
+    )
+    module = _DummyModel()
+    strategy = ComponentOffloadStrategy()
+    use = ComponentUse(stage_name="TextEncodingStage", component_name="text_encoder")
+
+    strategy.prepare_for_use(module, use, SimpleNamespace())
+    assert not strategy.prefetch_for_use(module, use, SimpleNamespace())
+    strategy.finish_use(module, use, SimpleNamespace())
 
     assert calls == []
 

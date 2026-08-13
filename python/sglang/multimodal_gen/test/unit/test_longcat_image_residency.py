@@ -5,12 +5,30 @@ from unittest.mock import MagicMock, patch
 import torch
 import transformers
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.models.encoders.hf_qwen2_5vl import (
+    LayerwiseQwen2_5VLForConditionalGeneration,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.longcat_image import (
     LongCatPromptRewriteStage,
 )
 
 
 class TestLongCatImageResidency(unittest.TestCase):
+    def test_text_encoder_declares_layerwise_layers(self):
+        self.assertTrue(
+            issubclass(
+                LayerwiseQwen2_5VLForConditionalGeneration,
+                LayerwiseOffloadableModuleMixin,
+            )
+        )
+        self.assertEqual(
+            LayerwiseQwen2_5VLForConditionalGeneration.layer_names,
+            ["model.language_model.layers"],
+        )
+
     def test_text_encoder_initial_device_uses_effective_residency(self):
         accelerator = torch.device("cuda", 0)
 
@@ -49,7 +67,7 @@ class TestLongCatImageResidency(unittest.TestCase):
 
                 self.assertIs(stage.text_encoder, text_encoder)
                 server_args.should_load_component_on_cpu.assert_called_once_with(
-                    "text_encoder"
+                    "text_encoder", can_configure_layerwise_after_load=True
                 )
                 self.assertEqual(
                     text_encoder.to.call_args_list[0].args, (expected_device,)

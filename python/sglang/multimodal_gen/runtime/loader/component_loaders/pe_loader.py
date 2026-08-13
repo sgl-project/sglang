@@ -10,6 +10,9 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -33,7 +36,10 @@ def _read_model_max_length(model_path: str) -> int | None:
     return None
 
 
-class PEModelWrapper(torch.nn.Module):
+class PEModelWrapper(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+
+    layerwise_offload_dit_group_enabled = False
+    layer_names = ["model.model.layers"]
 
     def __init__(self, model, tokenizer, device, model_max_length: int):
         super().__init__()
@@ -175,7 +181,13 @@ class PELoader(ComponentLoader):
                 attn_implementation=attn_impl,
             )
 
-        device = get_local_torch_device()
+        device = (
+            torch.device("cpu")
+            if server_args.should_load_component_on_cpu(
+                component_name, can_configure_layerwise_after_load=True
+            )
+            else get_local_torch_device()
+        )
         model = model.to(device).eval()
 
         logger.info(

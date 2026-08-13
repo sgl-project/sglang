@@ -18,9 +18,9 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     PipelineComponentLoader,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ComponentResidencyStrategy,
     ComponentUse,
     ResidencyState,
+    ResidencyStrategy,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
@@ -333,9 +333,7 @@ class LTX2Pipeline(_BaseLTX2Pipeline):
         _add_ltx2_decoding_stage(self)
 
 
-class LTX2TwoStageResidencyStrategy(ComponentResidencyStrategy):
-    name = "ltx2_original"
-
+class LTX2TwoStageStrategy(ResidencyStrategy):
     def __init__(self, manager: "LTX2TwoStageResidencyController") -> None:
         self.manager = manager
 
@@ -410,14 +408,12 @@ class LTX2TwoStageResidencyStrategy(ComponentResidencyStrategy):
             module.to(get_local_torch_device(), non_blocking=True)
 
 
-class LTX2OriginalResidencyStrategy(LTX2TwoStageResidencyStrategy):
+class LTX2OriginalTwoStageStrategy(LTX2TwoStageStrategy):
     pass
 
 
-class LTX2ResidentResidencyStrategy(LTX2TwoStageResidencyStrategy):
+class LTX2ResidentTwoStageStrategy(LTX2TwoStageStrategy):
     """A residency strategy for ltx two-stage pipeline with pre-merged lora, that keep both dits always resident"""
-
-    name = "ltx2_resident"
 
     def initialize(self) -> None:
         self._ensure_on_gpu("transformer")
@@ -437,7 +433,7 @@ class LTX2ResidentResidencyStrategy(LTX2TwoStageResidencyStrategy):
 class LTX2TwoStageResidencyController:
     """
     LTX-2.3 two-stage residency controller.
-    It builds the selected LTX2 ComponentResidencyStrategy and keeps the
+    It builds the selected LTX-2 strategy and keeps the
     thin stage adapter methods that are specific to two-stage LoRA flow.
 
     Modes:
@@ -473,13 +469,13 @@ class LTX2TwoStageResidencyController:
             )
         return mode
 
-    def _build_strategy(self) -> LTX2TwoStageResidencyStrategy:
+    def _build_strategy(self) -> LTX2TwoStageStrategy:
         if self.mode == "resident":
-            return LTX2ResidentResidencyStrategy(self)
-        return LTX2OriginalResidencyStrategy(self)
+            return LTX2ResidentTwoStageStrategy(self)
+        return LTX2OriginalTwoStageStrategy(self)
 
     @property
-    def strategy(self) -> ComponentResidencyStrategy:
+    def strategy(self) -> ResidencyStrategy:
         return self._strategy
 
     @property
@@ -541,10 +537,10 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         )
         self._ltx2_residency.initialize()
         if self._use_premerged_stage2_transformer:
-            self.component_residency_strategies["transformer"] = (
+            self.custom_residency_strategies["transformer"] = (
                 self._ltx2_residency.strategy
             )
-            self.component_residency_strategies["transformer_2"] = (
+            self.custom_residency_strategies["transformer_2"] = (
                 self._ltx2_residency.strategy
             )
 

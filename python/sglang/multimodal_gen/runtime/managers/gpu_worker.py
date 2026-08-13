@@ -49,7 +49,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    ComponentResidencyMode,
+    LAYERWISE_OFFLOAD_STRATEGY,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
@@ -292,8 +292,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
-        if self.server_args.any_component_uses_residency_mode(
-            ComponentResidencyMode.LAYERWISE_OFFLOAD
+        if self.server_args.any_component_uses_residency_strategy(
+            LAYERWISE_OFFLOAD_STRATEGY
         ):
             configure_layerwise_offload_modules(
                 self.pipeline.modules,

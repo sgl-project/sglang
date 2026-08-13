@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     SanaWMTextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.refiner import (
+    OfficialDiffusersLTX2ConnectorsModule,
     OfficialDiffusersLTX2RefinerModule,
     OfficialGemma3TextEncoderModule,
     SanaWMLTX2RefinerStage,
@@ -253,6 +254,7 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
                 component_path,
                 torch_dtype=dtype,
             ).eval()
+            module = OfficialDiffusersLTX2ConnectorsModule(module)
         elif module_name == "text_encoder_2":
             from transformers import Gemma3ForConditionalGeneration
 

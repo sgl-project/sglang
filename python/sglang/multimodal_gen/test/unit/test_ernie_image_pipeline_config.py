@@ -13,6 +13,9 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.pe_loader import (
     PEModelWrapper,
     SGLangPEModelWrapper,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ernie_image_pe import (
     PromptEnhancementStage,
 )
@@ -32,6 +35,8 @@ class TestErnieImagePromptEnhancerResidency(unittest.TestCase):
 
         self.assertEqual([use.component_name for use in uses], ["pe"])
         self.assertEqual(len(list(wrapper.parameters())), 2)
+        self.assertIsInstance(wrapper, LayerwiseOffloadableModuleMixin)
+        self.assertEqual(wrapper.layer_names, ["model.model.layers"])
 
     def test_external_prompt_enhancer_keeps_remote_placement(self) -> None:
         stage = PromptEnhancementStage(

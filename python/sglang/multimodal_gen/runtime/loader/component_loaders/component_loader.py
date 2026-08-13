@@ -26,7 +26,8 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     get_memory_usage_of_component,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    ComponentResidencyMode,
+    COMPONENT_OFFLOAD_STRATEGY,
+    LAYERWISE_OFFLOAD_STRATEGY,
     is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -122,24 +123,25 @@ class ComponentLoader(ABC):
         )
         return component_name in native_only_components
 
-    def _maybe_configure_layerwise_after_startup_cpu_staging(
+    def _apply_startup_residency(
         self,
         component: AutoModel,
         server_args: ServerArgs,
         component_name: str,
-        load_kwargs: dict[str, Any],
     ) -> AutoModel:
-        if not load_kwargs.get("cpu_offload_flag"):
-            return component
         if not isinstance(component, nn.Module):
             return component
-        residency_mode = server_args.component_residency_mode(component_name)
-        if residency_mode != ComponentResidencyMode.LAYERWISE_OFFLOAD:
-            if residency_mode == ComponentResidencyMode.COMPONENT_OFFLOAD:
-                return component
+        if is_fsdp_managed_module(component):
+            return component
+
+        strategy_name = server_args.residency_strategy_name(component_name)
+        if strategy_name == COMPONENT_OFFLOAD_STRATEGY:
+            return component.to("cpu")
+        if strategy_name != LAYERWISE_OFFLOAD_STRATEGY:
             return component.to(get_local_torch_device())
 
-        # try to configure layerwise-offload with the component
+        component = component.to("cpu")
+
         configure_layerwise_offload_modules(
             {component_name: component},
             server_args,
@@ -147,29 +149,11 @@ class ComponentLoader(ABC):
             warn_missing=False,
         )
         if is_layerwise_offloaded_module(component):
-            logger.info(
-                "Configured layerwise offload for %s immediately after startup CPU staging",
-                component_name,
-            )
             return component
-
-        if (
-            server_args.component_residency_mode(component_name)
-            == ComponentResidencyMode.COMPONENT_OFFLOAD
-        ):
-            logger.warning(
-                "Layerwise startup CPU staging was requested for %s, but the loaded "
-                "module did not enable layerwise offload; using component offload instead.",
-                component_name,
-            )
-            return component
-
-        logger.warning(
-            "Layerwise startup CPU staging was requested for %s, but the loaded "
-            "module did not enable layerwise offload. Moving it to GPU.",
-            component_name,
+        raise ValueError(
+            f"Component {component_name!r} selected layerwise-offload but did not "
+            "configure any layerwise-offloadable layers"
         )
-        return component.to(get_local_torch_device())
 
     def _load_customized_with_context(
         self,
@@ -188,9 +172,7 @@ class ComponentLoader(ABC):
             component = self.load_customized(
                 component_model_path, server_args, component_name, **load_kwargs
             )
-            return self._maybe_configure_layerwise_after_startup_cpu_staging(
-                component, server_args, component_name, load_kwargs
-            )
+            return self._apply_startup_residency(component, server_args, component_name)
 
     def _load_native_with_context(
         self,
@@ -210,9 +192,7 @@ class ComponentLoader(ABC):
                 transformers_or_diffusers,
                 component_name,
             )
-        should_offload = self.should_offload(server_args, component_name=component_name)
-        target_device = self.target_device(should_offload)
-        return component.to(device=target_device)
+        return self._apply_startup_residency(component, server_args, component_name)
 
     def load(
         self,
@@ -296,15 +276,6 @@ class ComponentLoader(ABC):
         else:
             if isinstance(component, nn.Module):
                 component = component.eval()
-                if (
-                    (
-                        server_args.component_residency is not None
-                        or server_args.cpu_offload_components is not None
-                    )
-                    and server_args.should_cpu_offload_component(component_name)
-                    and not is_fsdp_managed_module(component)
-                ):
-                    component = component.to("cpu")
             current_gpu_mem = current_platform.get_available_gpu_memory()
             model_size = get_memory_usage_of_component(component) or "NA"
             consumed = gpu_mem_before_loading - current_gpu_mem

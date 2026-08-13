@@ -516,7 +516,7 @@ def main() -> None:
     parser.add_argument(
         "--component-residency",
         nargs="+",
-        metavar="COMPONENT=MODE",
+        metavar="COMPONENT=STRATEGY",
         help=(
             "Component residency assignments passed to ServerArgs, for example "
             "dit=layerwise-offload text_encoder=component-offload."

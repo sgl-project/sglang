@@ -17,6 +17,9 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.encoders.hf_qwen2_5vl import (
+    LayerwiseQwen2_5VLForConditionalGeneration,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -204,12 +207,12 @@ class LongCatPromptRewriteStage(PipelineStage):
     ):
         super().__init__()
         self.text_encoder_dtype = text_encoder_dtype
-        from transformers import Qwen2_5_VLForConditionalGeneration
-
-        stage_on_cpu = self.server_args.should_load_component_on_cpu("text_encoder")
+        stage_on_cpu = self.server_args.should_load_component_on_cpu(
+            "text_encoder", can_configure_layerwise_after_load=True
+        )
         init_device = torch.device("cpu") if stage_on_cpu else get_local_torch_device()
         self.text_encoder = (
-            Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            LayerwiseQwen2_5VLForConditionalGeneration.from_pretrained(
                 model_path, subfolder="text_encoder"
             )
             .to(init_device)
@@ -222,8 +225,6 @@ class LongCatPromptRewriteStage(PipelineStage):
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         stage_name = self._component_stage_name(stage_name)
-        # plain HF modules use standard D2H component offload;
-        # memory_intensive releases cached CUDA memory
         return [
             ComponentUse(
                 stage_name,

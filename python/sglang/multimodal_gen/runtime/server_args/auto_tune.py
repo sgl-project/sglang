@@ -426,7 +426,7 @@ class ServerArgsAutoTuner:
             component_name
             for component_name, arg_name in DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES
             if not args.is_arg_explicitly_set(arg_name)
-            and args.explicit_component_residency_mode(component_name) is None
+            and args.explicit_residency_strategy_name(component_name) is None
         ]
         components = self._filter_high_memory_resident_components(components)
         if self._should_auto_enable_dit_layerwise_offload():
@@ -479,7 +479,7 @@ class ServerArgsAutoTuner:
             or not current_platform.enable_dit_layerwise_offload_by_default()
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference
-            or args.explicit_component_residency_mode(LAYERWISE_OFFLOAD_DIT_GROUP)
+            or args.explicit_residency_strategy_name(LAYERWISE_OFFLOAD_DIT_GROUP)
             is not None
             or args.is_arg_explicitly_set("dit_layerwise_offload")
             or args.is_arg_explicitly_set("dit_cpu_offload")
@@ -597,7 +597,7 @@ class ServerArgsAutoTuner:
     def _can_apply_fsdp_policy(self, *, require_memory_headroom: bool) -> bool:
         args = self.server_args
         deployment_config = self._deployment_config()
-        if args.has_explicit_dit_offload_policy():
+        if args.has_explicit_dit_offload_strategy():
             return False
         if not self._supports_high_confidence_fsdp():
             return False

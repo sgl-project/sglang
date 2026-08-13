@@ -21,7 +21,7 @@ from PIL import Image
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ComponentResidencyStrategy,
+    ResidencyStrategy,
     get_global_component_residency_manager,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -374,7 +374,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         self._stage_name_mapping: dict[str, PipelineStage] = {}
         self.modules: dict[str, Any] = {}
         self.memory_usages: dict[str, float] = {}
-        self.component_residency_strategies: dict[str, ComponentResidencyStrategy] = {}
+        self.custom_residency_strategies: dict[str, ResidencyStrategy] = {}
         self.component_residency_manager = None
         self.post_init_called = False
         self.executor = executor or SyncExecutor(server_args=server_args)

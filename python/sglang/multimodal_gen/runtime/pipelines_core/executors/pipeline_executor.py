@@ -14,7 +14,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    ComponentResidencyMode,
+    COMPONENT_OFFLOAD_STRATEGY,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -191,8 +191,8 @@ class PipelineExecutor(ABC):
         stage_name = stage._active_component_stage_name()
         for use in stage.component_uses(server_args, stage_name):
             if (
-                server_args.component_residency_mode(use.component_name)
-                == ComponentResidencyMode.COMPONENT_OFFLOAD
+                server_args.residency_strategy_name(use.component_name)
+                == COMPONENT_OFFLOAD_STRATEGY
             ):
                 return True
         return False

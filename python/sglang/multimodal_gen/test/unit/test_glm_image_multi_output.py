@@ -111,7 +111,7 @@ def test_ar_stage_generates_one_prior_per_requested_output():
     with patch.object(
         glm_stage, "get_local_torch_device", return_value=torch.device("cpu")
     ):
-        result = stage.forward(batch, SimpleNamespace())
+        result = stage.forward(batch, SimpleNamespace(srt_encoder_url=None))
 
     assert result.prior_token_id.shape == (2, 4)
     assert result.prior_token_id.tolist() == [[1, 1, 1, 1], [2, 2, 2, 2]]

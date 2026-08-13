@@ -130,14 +130,14 @@ See [OpenAI API: Served model name](/docs/sglang-diffusion/api/openai_api#served
 
 `auto` checks selected GPU memory before applying FSDP. In multi-GPU runs it uses the least available memory across selected GPUs, and only turns on FSDP automatically when doing so can replace DiT offload. For image workloads with at least 45 GiB available per selected GPU, it keeps the repeatedly reused DiT resident and uses layerwise offload for large auxiliary encoders; below that threshold it keeps the DiT offloaded. Video DiT residency remains model- and workload-specific because frame count and resolution change its peak memory substantially. When the model default uses CFG and the user did not set a parallelism policy, `auto` may also enable CFG parallelism. `speed` intentionally does not check memory; it is the mode for users who prefer latency/throughput and accept OOM risk. It keeps `torch.compile` disabled by default because its effect varies by model and workload. A model-specific deployment config may enable a validated compile path, and `--enable-torch-compile true` always opts in explicitly.
 
-The modes tune residency for native pipeline components declared to the component residency manager. Today this covers the major DiT, text/image encoder, VAE, vocoder, and upsampler components; DiT can use layerwise offload when supported, while text encoders use either resident execution or component CPU offload. Do not assume text-encoder layerwise offload unless a model implements and validates it.
+The presets tune residency for native pipeline components declared to the component residency manager. Today this covers the major DiT, text/image encoder, VAE, vocoder, and upsampler components. Weighted native components are expected to implement layerwise offload; selecting it for a component without usable layers fails during startup instead of silently changing strategies.
 
 When `torch.compile` is enabled, `--offload-during-compile` stays on by default. During compile warmup it temporarily offloads the DiT and evicts resident non-DiT components so `max-autotune` fits on tighter-memory GPUs, then restores the configured serving residency before real traffic.
 
 Breakable CUDA graph is a separate manual opt-in for supported image pipelines. If you enable `--enable-breakable-cuda-graph`, declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 
 > [!NOTE]
-Use `--component-residency` for explicit placement overrides. Each selected component has exactly one mode: `resident`, `component-offload`, or `layerwise-offload`. Select an exact native pipeline key such as `transformer_2` or a `dit`, `text_encoder`, `image_encoder`, `vae`, or `all` group. Exact keys override groups, groups override `all`, and omitted components keep their automatic policy.
+Use `--component-residency` for explicit placement overrides. Each selected component has exactly one strategy: `resident`, `component-offload`, or `layerwise-offload`. Select an exact native pipeline key such as `transformer_2` or a `dit`, `text_encoder`, `image_encoder`, `vae`, or `all` group. Exact keys override groups, groups override `all`, and omitted components keep their automatic strategy.
 
 ```bash
 sglang generate \
@@ -184,7 +184,7 @@ In this example, `auto` will not re-enable FSDP. The same applies to parallelism
 
 **Component offload** lowers GPU memory by moving a complete component to CPU between uses. It is simple and robust, but it usually trades latency for memory.
 
-**Layerwise offload** lowers memory further for components that implement it by streaming layers between CPU and GPU. It can be the best single-GPU memory mode, but may increase latency and lower throughput.
+**Layerwise offload** lowers memory further by streaming layers between CPU and GPU. It can be the best single-GPU memory strategy, but may increase latency and lower throughput.
 
 **FSDP** shards DiT weights across multiple GPUs and all-gathers weights during forward. It can reduce DiT CPU offload cost on multi-GPU deployments, especially for validated Wan I2V workloads.
 

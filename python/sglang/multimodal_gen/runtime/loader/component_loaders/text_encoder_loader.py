@@ -39,7 +39,7 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    ComponentResidencyMode,
+    RESIDENT_STRATEGY,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     TextEncoder,
@@ -106,12 +106,12 @@ class TextEncoderLoader(ComponentLoader):
     def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str
     ) -> dict[str, bool]:
-        residency_mode = server_args.component_residency_mode(component_name)
-        if residency_mode != ComponentResidencyMode.RESIDENT:
+        strategy_name = server_args.residency_strategy_name(component_name)
+        if strategy_name != RESIDENT_STRATEGY:
             logger.info(
-                "Loading %s on CPU first because its residency mode is %s",
+                "Loading %s on CPU first for the %s residency strategy",
                 component_name,
-                residency_mode.value,
+                strategy_name,
             )
             return {"cpu_offload_flag": True}
         return {}
@@ -431,12 +431,11 @@ class TextEncoderLoader(ComponentLoader):
             model_config.arch_config, "requires_gpu_resident_text_encoder", False
         )
         requested_offload = (
-            server_args.component_residency_mode(component_name)
-            != ComponentResidencyMode.RESIDENT
+            server_args.residency_strategy_name(component_name) != RESIDENT_STRATEGY
         )
         if requires_gpu_residency and requested_offload:
-            server_args.set_component_residency_runtime_override(
-                component_name, ComponentResidencyMode.RESIDENT
+            server_args.set_residency_strategy_override(
+                component_name, RESIDENT_STRATEGY
             )
             logger.warning(
                 "Keeping bitsandbytes 4-bit text encoder GPU-resident; CUDA "

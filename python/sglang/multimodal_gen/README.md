@@ -77,11 +77,11 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --save-output
 ```
 
-Use `--component-residency COMPONENT=MODE` to override placement for exact
+Use `--component-residency COMPONENT=STRATEGY` to override placement for exact
 native pipeline component keys or the `dit`, `text_encoder`,
-`image_encoder`, `vae`, and `all` groups. The modes are `resident`,
+`image_encoder`, `vae`, and `all` groups. The strategies are `resident`,
 `component-offload`, and `layerwise-offload`; components not listed keep their
-automatic model policy. See the
+automatic strategy. See the
 [CLI guide](../../../docs/docs/sglang-diffusion/api/cli.mdx#component-residency).
 
 ### LoRA support

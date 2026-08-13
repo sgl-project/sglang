@@ -211,7 +211,7 @@ sglang generate \
   --prompt "A quiet city street after rain"
 ```
 
-Each assignment is `COMPONENT=MODE`:
+Each assignment is `COMPONENT=STRATEGY`:
 
 - `resident`: keep the complete component on its accelerator.
 - `component-offload`: keep the complete component on CPU between uses and transfer it as one runtime unit.
@@ -226,7 +226,7 @@ sglang generate \
   --prompt "A quiet city street after rain"
 ```
 
-Omit a component to preserve its automatic model and `--performance-mode` policy. This is different from setting `resident`, which explicitly disables offload for that selector. Residency applies to weighted `torch.nn.Module` entries in the native pipeline module registry. Tokenizers, schedulers, processors, externally served components, and lazily created third-party subpipelines are unaffected. If a selected module does not implement layerwise offload, SGLang warns and falls back to component offload for that module. Prefer the smallest layerwise set that solves the memory issue because layer streaming can increase latency.
+Omit a component to preserve its automatic model and `--performance-mode` selection. This is different from setting `resident`, which explicitly disables offload for that selector. Residency applies to weighted `torch.nn.Module` entries in the native pipeline module registry. Tokenizers, schedulers, processors, externally served components, and lazily created third-party subpipelines are unaffected. Every weighted native component is expected to implement layerwise offload. Selecting `layerwise-offload` for a component without a usable layerwise implementation fails during startup instead of changing to another strategy. Prefer the smallest layerwise set that solves the memory issue because layer streaming can increase latency.
 
 Exact and group-level residency requires the native SGLang backend. The diffusers backend exposes only pipeline-wide placement, represented as `--component-residency all=resident` or `--component-residency all=component-offload`; it does not support `layerwise-offload`.
 
@@ -234,7 +234,7 @@ VLA action pipelines use model-specific controls for residency inside their comp
 
 FSDP owns DiT sharding and placement. Combine explicit FSDP only with a resident DiT; explicit DiT `component-offload` or `layerwise-offload` cannot be combined with `--use-fsdp-inference true`. Auxiliary encoders and VAEs may still use either offload mode independently.
 
-When DiT layerwise offload is selected, `--dit-layerwise-resident-layers` keeps part of the DiT on the accelerator. Use `--dit-layerwise-residency-policy leading` (the compatibility default) or `strided` to choose how those resident layers are distributed. These options tune the selected layerwise mode; they do not select component placement by themselves.
+When DiT layerwise offload is selected, `--dit-layerwise-resident-layers` keeps part of the DiT on the accelerator. Use `--dit-layerwise-residency-policy leading` (the compatibility default) or `strided` to choose how those resident layers are distributed. These options tune the selected layerwise strategy; they do not select component placement by themselves.
 
 The previous `--dit-cpu-offload`, `--text-encoder-cpu-offload`, `--image-encoder-cpu-offload`, `--vae-cpu-offload`, `--cpu-offload-components`, `--dit-layerwise-offload`, and `--layerwise-offload-components` options remain accepted for compatibility and emit a deprecation warning. Do not mix them with `--component-residency` in one command. Migration examples:
 

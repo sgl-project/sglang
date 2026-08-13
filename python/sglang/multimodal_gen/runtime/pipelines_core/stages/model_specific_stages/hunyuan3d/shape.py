@@ -304,6 +304,19 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
     def __init__(self, transformer: Any, scheduler: Any, **kwargs) -> None:
         super().__init__(transformer=transformer, scheduler=scheduler, **kwargs)
 
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        return [
+            ComponentUse(
+                self._component_stage_name(stage_name),
+                "hy3dshape_model",
+                phase="hy3dshape_model",
+                preferred_ready_after_request=False,
+                memory_intensive=True,
+            )
+        ]
+
     def _prepare_denoising_loop(self, batch: Req, server_args: ServerArgs):
         """Prepare Hunyuan3D-specific variables for the base denoising loop."""
         assert self.transformer is not None

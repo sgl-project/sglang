@@ -50,7 +50,9 @@ class AdapterLoader(ComponentLoader):
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
         target_device = self.target_device(
-            server_args.should_cpu_offload_component("connectors")
+            server_args.should_load_component_on_cpu(
+                "connectors", can_configure_layerwise_after_load=True
+            )
         )
         default_dtype = resolve_precision(
             server_args, "connectors", precision_attr="dit_precision"

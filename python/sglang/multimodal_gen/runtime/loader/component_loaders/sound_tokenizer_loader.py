@@ -41,7 +41,9 @@ class SoundTokenizerLoader(ComponentLoader):
             precision = "bf16"
         dtype = PRECISION_TO_TYPE[precision]
         target_device = self.target_device(
-            server_args.should_cpu_offload_component(component_name)
+            server_args.should_load_component_on_cpu(
+                component_name, can_configure_layerwise_after_load=True
+            )
         )
 
         with set_default_torch_dtype(dtype), skip_init_modules():

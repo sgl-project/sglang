@@ -8,18 +8,19 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    ComponentResidencyMode,
+    COMPONENT_OFFLOAD_STRATEGY,
+    LAYERWISE_OFFLOAD_STRATEGY,
     is_fsdp_managed_module,
-)
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
-    ComponentResidencyStrategy,
-    LayerwiseOffloadStrategy,
-    ResidentStrategy,
-    VanillaD2HStrategy,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
     is_resident_layerwise_module,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.residency_strategies import (
+    ComponentOffloadStrategy,
+    LayerwiseOffloadStrategy,
+    ResidencyStrategy,
+    ResidentStrategy,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -87,31 +88,31 @@ class ComponentResidencyStage(Protocol):
 class ComponentResidencyPipeline(Protocol):
     modules: Mapping[str, object]
     _stage_name_mapping: Mapping[str, ComponentResidencyStage]
-    component_residency_strategies: MutableMapping[str, "ComponentResidencyStrategy"]
+    custom_residency_strategies: MutableMapping[str, "ResidencyStrategy"]
 
 
-def build_component_residency_strategy(
+def build_residency_strategy(
     component_name: str,
     module: nn.Module,
     server_args: ServerArgs,
-) -> ComponentResidencyStrategy:
-    residency_mode = server_args.component_residency_mode(component_name)
-    if is_layerwise_offloaded_module(module):
+) -> ResidencyStrategy:
+    strategy_name = server_args.residency_strategy_name(component_name)
+    if strategy_name == LAYERWISE_OFFLOAD_STRATEGY:
+        if is_fsdp_managed_module(module):
+            raise ValueError(
+                f"Component {component_name!r} selected layerwise-offload but is "
+                "already managed by FSDP"
+            )
+        if not is_layerwise_offloaded_module(module):
+            raise ValueError(
+                f"Component {component_name!r} selected layerwise-offload but "
+                "did not configure any layerwise-offloadable layers"
+            )
         return LayerwiseOffloadStrategy()
-    if is_fsdp_managed_module(module):
-        return ResidentStrategy()
-    if residency_mode == ComponentResidencyMode.LAYERWISE_OFFLOAD:
-        if (
-            server_args.explicit_component_residency_mode(component_name)
-            == ComponentResidencyMode.LAYERWISE_OFFLOAD
-        ):
-            return VanillaD2HStrategy()
-        return ResidentStrategy()
-    if (
-        not current_platform.is_mps()
-        and residency_mode == ComponentResidencyMode.COMPONENT_OFFLOAD
-    ):
-        return VanillaD2HStrategy()
+    if strategy_name == COMPONENT_OFFLOAD_STRATEGY:
+        if current_platform.is_mps():
+            raise ValueError("Component offload is not supported on MPS")
+        return ComponentOffloadStrategy()
     return ResidentStrategy()
 
 
@@ -146,13 +147,13 @@ class ComponentResidencyManager:
             tuple[str, str, str | None], tuple[int, DiffusionNvtxHooks]
         ] = {}
         self._prefetched_use_keys: set[tuple[str, str, str | None]] = set()
-        self._custom_strategies: dict[str, ComponentResidencyStrategy] = dict(
-            pipeline.component_residency_strategies
+        self._custom_strategies: dict[str, ResidencyStrategy] = dict(
+            pipeline.custom_residency_strategies
         )
         self._uses_seen: dict[str, ComponentUse] = {}
 
     def refresh_pipeline(self, pipeline: ComponentResidencyPipeline) -> None:
-        custom_strategies = dict(pipeline.component_residency_strategies)
+        custom_strategies = dict(pipeline.custom_residency_strategies)
         if pipeline is not self.pipeline:
             self._remove_nvtx_hooks()
             self.strategy_for.cache_clear()
@@ -407,8 +408,11 @@ class ComponentResidencyManager:
         if module is None:
             return
         strategy = self.strategy_for(use.component_name, module)
-        if isinstance(strategy, VanillaD2HStrategy) and self._active_use is not None:
-            # Avoid making two vanilla-offloaded heavy components resident before
+        if (
+            isinstance(strategy, ComponentOffloadStrategy)
+            and self._active_use is not None
+        ):
+            # Avoid making two component-offloaded heavy components resident before
             # a budget-aware planner can prove the overlap is safe.
             return
         if is_resident_layerwise_module(module):
@@ -428,7 +432,7 @@ class ComponentResidencyManager:
         module: nn.Module | None = None,
         keep_on_warmup: bool,
     ) -> None:
-        """finish a specific use by keeping them resident or call finish_use hook"""
+        """Finish a component use unless its next use should keep it ready."""
         module = module or self.get_module(use.component_name)
         if module is None:
             return
@@ -492,16 +496,12 @@ class ComponentResidencyManager:
         return module if isinstance(module, nn.Module) else None
 
     @lru_cache(maxsize=None)
-    def strategy_for(
-        self, component_name: str, module: nn.Module
-    ) -> ComponentResidencyStrategy:
-        """Return the pre-registered strategy for a specific component"""
+    def strategy_for(self, component_name: str, module: nn.Module) -> ResidencyStrategy:
+        """Return the strategy for a specific component."""
         custom_strategy = self._custom_strategies.get(component_name)
         if custom_strategy is not None:
             return custom_strategy
-        return build_component_residency_strategy(
-            component_name, module, self.server_args
-        )
+        return build_residency_strategy(component_name, module, self.server_args)
 
     def _next_stage_name(self, stage_index: int) -> str | None:
         next_index = stage_index + 1
@@ -616,11 +616,11 @@ class ComponentResidencyManager:
     def _empty_cache_after_large_release(
         self,
         use: ComponentUse,
-        strategy: ComponentResidencyStrategy,
+        strategy: ResidencyStrategy,
         module: nn.Module,
         was_on_cuda: bool,
     ) -> None:
-        """explicitly empty cache after potential release of large component"""
+        """Empty the allocator cache after releasing a large component."""
         if not use.memory_intensive:
             return
         released_cuda_storage = was_on_cuda and not self._module_on_cuda(module)

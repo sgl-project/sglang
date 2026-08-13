@@ -22,7 +22,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 )
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    ComponentResidencyMode,
+    COMPONENT_OFFLOAD_STRATEGY,
+    RESIDENT_STRATEGY,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -229,12 +230,12 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
         text_encoder_component_offload = bool(server_args.text_encoder_cpu_offload)
         if component_name is not None:
             dit_component_offload = (
-                server_args.component_residency_mode(component_name)
-                == ComponentResidencyMode.COMPONENT_OFFLOAD
+                server_args.residency_strategy_name(component_name)
+                == COMPONENT_OFFLOAD_STRATEGY
             )
             text_encoder_component_offload = (
-                server_args.component_residency_mode("text_encoder")
-                == ComponentResidencyMode.COMPONENT_OFFLOAD
+                server_args.residency_strategy_name("text_encoder")
+                == COMPONENT_OFFLOAD_STRATEGY
             )
 
         if dit_component_offload or text_encoder_component_offload:
@@ -242,12 +243,12 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
             server_args.text_encoder_cpu_offload = False
             if component_name is not None:
                 if dit_component_offload:
-                    server_args.set_component_residency_runtime_override(
-                        component_name, ComponentResidencyMode.RESIDENT
+                    server_args.set_residency_strategy_override(
+                        component_name, RESIDENT_STRATEGY
                     )
                 if text_encoder_component_offload:
-                    server_args.set_component_residency_runtime_override(
-                        "text_encoder", ComponentResidencyMode.RESIDENT
+                    server_args.set_residency_strategy_override(
+                        "text_encoder", RESIDENT_STRATEGY
                     )
             logger.warning(
                 "FLUX.2 mixed NVFP4 is using the ModelOpt FP4 path with tp_size=%d; "
@@ -297,14 +298,14 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
         component_offload = bool(server_args.dit_cpu_offload)
         if component_name is not None:
             component_offload = (
-                server_args.component_residency_mode(component_name)
-                == ComponentResidencyMode.COMPONENT_OFFLOAD
+                server_args.residency_strategy_name(component_name)
+                == COMPONENT_OFFLOAD_STRATEGY
             )
         if component_offload:
             server_args.dit_cpu_offload = False
             if component_name is not None:
-                server_args.set_component_residency_runtime_override(
-                    component_name, ComponentResidencyMode.RESIDENT
+                server_args.set_residency_strategy_override(
+                    component_name, RESIDENT_STRATEGY
                 )
             logger.warning(
                 "ModelOpt FP8 diffusion checkpoints require the DiT to avoid "
@@ -346,15 +347,15 @@ class _BitsAndBytes4BitAdapter(_TransformerQuantAdapter):
         component_offload = bool(server_args.dit_cpu_offload)
         if component_name is not None:
             component_offload = (
-                server_args.component_residency_mode(component_name)
-                == ComponentResidencyMode.COMPONENT_OFFLOAD
+                server_args.residency_strategy_name(component_name)
+                == COMPONENT_OFFLOAD_STRATEGY
             )
         if component_offload:
             server_args.dit_cpu_offload = False
             changed.append("dit_cpu_offload=False")
             if component_name is not None:
-                server_args.set_component_residency_runtime_override(
-                    component_name, ComponentResidencyMode.RESIDENT
+                server_args.set_residency_strategy_override(
+                    component_name, RESIDENT_STRATEGY
                 )
         if server_args.use_fsdp_inference:
             server_args.use_fsdp_inference = False

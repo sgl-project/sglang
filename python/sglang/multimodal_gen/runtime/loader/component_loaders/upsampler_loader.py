@@ -207,8 +207,10 @@ class UpsamplerLoader(ComponentLoader):
 
         logger.info("Loading LatentUpsampler with config: %s", config)
 
-        should_offload = server_args.should_cpu_offload_component(component_name)
-        target_device = self.target_device(should_offload)
+        stage_on_cpu = server_args.should_load_component_on_cpu(
+            component_name, can_configure_layerwise_after_load=True
+        )
+        target_device = self.target_device(stage_on_cpu)
 
         with torch.device("meta"):
             model = LatentUpsampler(**config)

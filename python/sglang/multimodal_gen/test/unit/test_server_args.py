@@ -56,10 +56,12 @@ from sglang.multimodal_gen.registry import (
     is_known_non_diffusers_multimodal_model,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    ComponentResidencyMode,
+    COMPONENT_OFFLOAD_STRATEGY,
+    LAYERWISE_OFFLOAD_STRATEGY,
+    RESIDENT_STRATEGY,
     normalize_component_residency,
     resolve_diffusers_pipeline_offload,
-    resolve_explicit_component_residency,
+    resolve_residency_strategy_name,
 )
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
@@ -937,9 +939,9 @@ class TestOffloadDefaults(unittest.TestCase):
                 "transformer_2": "component-offload",
             },
         )
-        with self.assertRaisesRegex(ValueError, "COMPONENT=MODE"):
+        with self.assertRaisesRegex(ValueError, "COMPONENT=STRATEGY"):
             normalize_component_residency(["dit"])
-        with self.assertRaisesRegex(ValueError, "Invalid component residency mode"):
+        with self.assertRaisesRegex(ValueError, "Invalid component residency strategy"):
             normalize_component_residency(["dit=cpu"])
 
     def test_component_residency_supports_groups_and_dynamic_components(self):
@@ -956,24 +958,24 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertEqual(
-            args.component_residency_mode("transformer"),
-            ComponentResidencyMode.LAYERWISE_OFFLOAD,
+            args.residency_strategy_name("transformer"),
+            LAYERWISE_OFFLOAD_STRATEGY,
         )
         self.assertEqual(
-            args.component_residency_mode("transformer_2"),
-            ComponentResidencyMode.RESIDENT,
+            args.residency_strategy_name("transformer_2"),
+            RESIDENT_STRATEGY,
         )
         self.assertEqual(
-            args.component_residency_mode("transformer_3"),
-            ComponentResidencyMode.LAYERWISE_OFFLOAD,
+            args.residency_strategy_name("transformer_3"),
+            LAYERWISE_OFFLOAD_STRATEGY,
         )
         self.assertEqual(
-            args.component_residency_mode("text_encoder_2"),
-            ComponentResidencyMode.COMPONENT_OFFLOAD,
+            args.residency_strategy_name("text_encoder_2"),
+            COMPONENT_OFFLOAD_STRATEGY,
         )
         self.assertEqual(
-            args.component_residency_mode("connectors"),
-            ComponentResidencyMode.RESIDENT,
+            args.residency_strategy_name("connectors"),
+            RESIDENT_STRATEGY,
         )
         self.assertTrue(
             args.should_load_component_on_cpu(
@@ -983,22 +985,24 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.should_load_component_on_cpu("transformer_2"))
 
     def test_dynamic_component_cpu_staging_preserves_legacy_layerwise_behavior(self):
-        new_policy = self._from_dict_with_task_type(
+        strategy_args = self._from_dict_with_task_type(
             ModelTaskType.T2V,
             kwargs={"component_residency": ["text_encoder=layerwise-offload"]},
         )
-        self.assertTrue(new_policy.should_load_component_on_cpu("text_encoder"))
+        self.assertTrue(strategy_args.should_load_component_on_cpu("text_encoder"))
 
-        legacy_policy = self._from_dict_with_task_type(
+        compatibility_args = self._from_dict_with_task_type(
             ModelTaskType.T2V,
             kwargs={
                 "performance_mode": "manual",
                 "layerwise_offload_components": ["text_encoder"],
             },
         )
-        self.assertFalse(legacy_policy.should_load_component_on_cpu("text_encoder"))
+        self.assertFalse(
+            compatibility_args.should_load_component_on_cpu("text_encoder")
+        )
         self.assertTrue(
-            legacy_policy.should_load_component_on_cpu(
+            compatibility_args.should_load_component_on_cpu(
                 "text_encoder", can_configure_layerwise_after_load=True
             )
         )
@@ -1009,15 +1013,15 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertEqual(
-            resolve_explicit_component_residency("image_encoder_2", policies),
-            ComponentResidencyMode.COMPONENT_OFFLOAD,
+            resolve_residency_strategy_name("image_encoder_2", policies),
+            COMPONENT_OFFLOAD_STRATEGY,
         )
         self.assertEqual(
-            resolve_explicit_component_residency("condition_image_encoder", policies),
-            ComponentResidencyMode.COMPONENT_OFFLOAD,
+            resolve_residency_strategy_name("condition_image_encoder", policies),
+            COMPONENT_OFFLOAD_STRATEGY,
         )
         self.assertIsNone(
-            resolve_explicit_component_residency(
+            resolve_residency_strategy_name(
                 "condition_image_encoder",
                 normalize_component_residency(["vae=component-offload"]),
             )
@@ -1033,16 +1037,16 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertEqual(
-            resolve_explicit_component_residency("hy3dshape_model", policies),
-            ComponentResidencyMode.LAYERWISE_OFFLOAD,
+            resolve_residency_strategy_name("hy3dshape_model", policies),
+            LAYERWISE_OFFLOAD_STRATEGY,
         )
         self.assertEqual(
-            resolve_explicit_component_residency("hy3dshape_conditioner", policies),
-            ComponentResidencyMode.COMPONENT_OFFLOAD,
+            resolve_residency_strategy_name("hy3dshape_conditioner", policies),
+            COMPONENT_OFFLOAD_STRATEGY,
         )
         self.assertEqual(
-            resolve_explicit_component_residency("hy3dshape_vae", policies),
-            ComponentResidencyMode.RESIDENT,
+            resolve_residency_strategy_name("hy3dshape_vae", policies),
+            RESIDENT_STRATEGY,
         )
 
     def test_component_residency_groups_exclude_auxiliary_components(self):
@@ -1061,7 +1065,7 @@ class TestOffloadDefaults(unittest.TestCase):
         ):
             with self.subTest(component_name=component_name):
                 self.assertIsNone(
-                    resolve_explicit_component_residency(component_name, policies)
+                    resolve_residency_strategy_name(component_name, policies)
                 )
 
     def test_compatibility_flags_preserve_auxiliary_component_scope(self):
@@ -1092,18 +1096,18 @@ class TestOffloadDefaults(unittest.TestCase):
             kwargs={"component_residency": ["dit=layerwise-offload"]},
         )
 
-        self.assertTrue(args.is_component_residency_explicitly_set("hy3dshape_model"))
-        self.assertFalse(args.is_component_residency_explicitly_set("hy3dshape_vae"))
+        self.assertTrue(args.is_residency_strategy_explicitly_set("hy3dshape_model"))
+        self.assertFalse(args.is_residency_strategy_explicitly_set("hy3dshape_vae"))
 
         legacy_args = self._from_dict_with_task_type(
             ModelTaskType.I2M,
             kwargs={"performance_mode": "manual", "dit_cpu_offload": True},
         )
         self.assertTrue(
-            legacy_args.is_component_residency_explicitly_set("hy3dshape_model")
+            legacy_args.is_residency_strategy_explicitly_set("hy3dshape_model")
         )
         self.assertFalse(
-            legacy_args.is_component_residency_explicitly_set("hy3dshape_vae")
+            legacy_args.is_residency_strategy_explicitly_set("hy3dshape_vae")
         )
 
     def test_compatibility_image_and_vae_flags_cover_condition_encoder(self):
@@ -1134,8 +1138,8 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertEqual(
-            resolve_explicit_component_residency("dit", policies),
-            ComponentResidencyMode.RESIDENT,
+            resolve_residency_strategy_name("dit", policies),
+            RESIDENT_STRATEGY,
         )
 
     def test_component_residency_leaves_unspecified_components_on_model_policy(self):
@@ -1147,20 +1151,16 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
+        self.assertEqual(args.residency_strategy_name("vae"), RESIDENT_STRATEGY)
         self.assertEqual(
-            args.component_residency_mode("vae"), ComponentResidencyMode.RESIDENT
-        )
-        self.assertEqual(
-            args.component_residency_mode("transformer"),
-            ComponentResidencyMode.RESIDENT,
+            args.residency_strategy_name("transformer"),
+            RESIDENT_STRATEGY,
         )
         self.assertTrue(
-            args.any_component_uses_residency_mode(
-                ComponentResidencyMode.LAYERWISE_OFFLOAD
-            )
+            args.any_component_uses_residency_strategy(LAYERWISE_OFFLOAD_STRATEGY)
         )
 
-        with self.assertRaisesRegex(ValueError, "Invalid component residency mode"):
+        with self.assertRaisesRegex(ValueError, "Invalid component residency strategy"):
             self._from_dict_with_pipeline_config(
                 QwenImagePipelineConfig(),
                 kwargs={
@@ -1184,7 +1184,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertNotIn("dit", args.layerwise_offload_components or [])
         self.assertNotIn("text_encoder", args.layerwise_offload_components or [])
         self.assertIn("image_encoder", args.layerwise_offload_components or [])
-        self.assertIn("vae", args.layerwise_offload_components or [])
+        self.assertNotIn("vae", args.layerwise_offload_components or [])
 
     def test_all_resident_overrides_automatic_offload_detection(self):
         args = self._from_dict_with_pipeline_config(
@@ -1196,14 +1196,10 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertFalse(
-            args.any_component_uses_residency_mode(
-                ComponentResidencyMode.LAYERWISE_OFFLOAD
-            )
+            args.any_component_uses_residency_strategy(LAYERWISE_OFFLOAD_STRATEGY)
         )
         self.assertFalse(
-            args.any_component_uses_residency_mode(
-                ComponentResidencyMode.COMPONENT_OFFLOAD
-            )
+            args.any_component_uses_residency_strategy(COMPONENT_OFFLOAD_STRATEGY)
         )
 
     def test_cpu_platform_treats_offload_policy_as_resident(self):
@@ -1222,13 +1218,11 @@ class TestOffloadDefaults(unittest.TestCase):
             args._adjust_platform_specific()
 
         self.assertEqual(
-            args.component_residency_mode("transformer"),
-            ComponentResidencyMode.RESIDENT,
+            args.residency_strategy_name("transformer"),
+            RESIDENT_STRATEGY,
         )
         self.assertFalse(
-            args.any_component_uses_residency_mode(
-                ComponentResidencyMode.LAYERWISE_OFFLOAD
-            )
+            args.any_component_uses_residency_strategy(LAYERWISE_OFFLOAD_STRATEGY)
         )
 
     def test_component_residency_rejects_compatibility_options(self):
@@ -1268,21 +1262,23 @@ class TestOffloadDefaults(unittest.TestCase):
             role_args = ServerArgs.from_kwargs(**copied)
 
         self.assertEqual(role_args.component_residency, {"dit": "resident"})
-        self.assertEqual(role_args._explicit_arg_names, {"component_residency"})
+        self.assertEqual(
+            role_args._explicit_arg_names, {"model_path", "component_residency"}
+        )
 
     def test_component_residency_rejects_explicit_fsdp_with_dit_offload(self):
-        for mode in (
-            ComponentResidencyMode.COMPONENT_OFFLOAD,
-            ComponentResidencyMode.LAYERWISE_OFFLOAD,
+        for strategy_name in (
+            COMPONENT_OFFLOAD_STRATEGY,
+            LAYERWISE_OFFLOAD_STRATEGY,
         ):
             with (
-                self.subTest(mode=mode),
+                self.subTest(strategy_name=strategy_name),
                 self.assertRaisesRegex(ValueError, "cannot be combined"),
             ):
                 self._from_dict_with_task_type(
                     ModelTaskType.T2V,
                     kwargs={
-                        "component_residency": [f"dit={mode.value}"],
+                        "component_residency": [f"dit={strategy_name}"],
                         "use_fsdp_inference": True,
                     },
                 )
@@ -1299,25 +1295,25 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.use_fsdp_inference)
 
     def test_diffusers_component_residency_requires_pipeline_wide_offload(self):
-        for mode in (
-            ComponentResidencyMode.RESIDENT,
-            ComponentResidencyMode.COMPONENT_OFFLOAD,
+        for strategy_name in (
+            RESIDENT_STRATEGY,
+            COMPONENT_OFFLOAD_STRATEGY,
         ):
-            with self.subTest(mode=mode):
+            with self.subTest(strategy_name=strategy_name):
                 args = self._from_dict_with_task_type(
                     ModelTaskType.T2V,
                     kwargs={
                         "backend": "diffusers",
-                        "component_residency": [f"all={mode.value}"],
+                        "component_residency": [f"all={strategy_name}"],
                     },
                 )
                 self.assertEqual(
                     args.component_residency,
-                    {"all": mode.value},
+                    {"all": strategy_name},
                 )
                 self.assertEqual(
                     resolve_diffusers_pipeline_offload(args.component_residency),
-                    mode == ComponentResidencyMode.COMPONENT_OFFLOAD,
+                    strategy_name == COMPONENT_OFFLOAD_STRATEGY,
                 )
 
         with self.assertRaisesRegex(ValueError, "pipeline-wide"):
@@ -1356,8 +1352,8 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.dit_cpu_offload)
         self.assertEqual(
-            args.component_residency_mode("transformer"),
-            ComponentResidencyMode.RESIDENT,
+            args.residency_strategy_name("transformer"),
+            RESIDENT_STRATEGY,
         )
 
     def test_explicit_false_layerwise_preserves_explicit_component_offload(self):
@@ -1371,8 +1367,8 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertEqual(
-            args.component_residency_mode("transformer"),
-            ComponentResidencyMode.COMPONENT_OFFLOAD,
+            args.residency_strategy_name("transformer"),
+            COMPONENT_OFFLOAD_STRATEGY,
         )
 
     def test_explicit_false_layerwise_preserves_explicit_layerwise_components(self):
@@ -1386,8 +1382,8 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertEqual(
-            args.component_residency_mode("transformer"),
-            ComponentResidencyMode.LAYERWISE_OFFLOAD,
+            args.residency_strategy_name("transformer"),
+            LAYERWISE_OFFLOAD_STRATEGY,
         )
 
     def test_vae_cpu_offload_defaults_false_on_low_memory_gpu(self):
@@ -2158,12 +2154,12 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(args.ltx2_two_stage_device_mode, "resident")
         self.assertEqual(
-            args.component_residency_mode("transformer"),
-            ComponentResidencyMode.RESIDENT,
+            args.residency_strategy_name("transformer"),
+            RESIDENT_STRATEGY,
         )
         self.assertEqual(
-            args.component_residency_mode("transformer_2"),
-            ComponentResidencyMode.RESIDENT,
+            args.residency_strategy_name("transformer_2"),
+            RESIDENT_STRATEGY,
         )
 
     def test_auto_multi_gpu_qwen_keeps_vae_resident_with_cfg(self):
@@ -3106,7 +3102,7 @@ class TestDirectGpuWeightLoading(unittest.TestCase):
     def _args(self) -> ServerArgs:
         args = ServerArgs.__new__(ServerArgs)
         args.component_residency = None
-        args._component_residency_runtime_overrides = {}
+        args._residency_strategy_overrides = {}
         args.cpu_offload_components = None
         args.direct_gpu_weight_loading = True
         args.dit_cpu_offload = False

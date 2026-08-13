@@ -26,7 +26,7 @@ from sglang.multimodal_gen.runtime.loader.fsdp_load import (
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    ComponentResidencyMode,
+    RESIDENT_STRATEGY,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -336,16 +336,13 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
             "hy3dshape_conditioner",
         )
         for component_name in shape_component_names:
-            if not server_args.is_component_residency_explicitly_set(component_name):
-                server_args.set_component_residency_runtime_override(
-                    component_name, ComponentResidencyMode.RESIDENT
+            if not server_args.is_residency_strategy_explicitly_set(component_name):
+                server_args.set_residency_strategy_override(
+                    component_name, RESIDENT_STRATEGY
                 )
 
         def load_device(component_name: str) -> torch.device:
-            if (
-                server_args.component_residency_mode(component_name)
-                == ComponentResidencyMode.RESIDENT
-            ):
+            if server_args.residency_strategy_name(component_name) == RESIDENT_STRATEGY:
                 return local_device
             return torch.device("cpu")
 
