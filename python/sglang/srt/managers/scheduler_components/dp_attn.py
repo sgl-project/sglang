@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -37,6 +38,9 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+_MLP_SYNC_TRANSPORT_LOGGED = False
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_elastic_world_dp_size(
@@ -196,6 +200,35 @@ class MLPSyncBatchInfo:
             )
 
 
+def _log_mlp_sync_transport_once(
+    *,
+    group: torch.distributed.ProcessGroup,
+    group_kind: str,
+    device: torch.device | str,
+    overlap_schedule: bool,
+    sync_info: MLPSyncBatchInfo,
+) -> None:
+    global _MLP_SYNC_TRANSPORT_LOGGED
+    if _MLP_SYNC_TRANSPORT_LOGGED:
+        return
+
+    logger.info(
+        "Entering DP-attention MLP sync collective: "
+        "backend=%s, group=%s, group_size=%s, global_rank=%s, group_rank=%s, "
+        "device=%s, overlap_schedule=%s, num_tokens=%s, forward_mode=%s",
+        torch.distributed.get_backend(group),
+        group_kind,
+        torch.distributed.get_world_size(group),
+        torch.distributed.get_rank(),
+        torch.distributed.get_rank(group),
+        device,
+        overlap_schedule,
+        sync_info.num_tokens,
+        sync_info.local_forward_mode,
+    )
+    _MLP_SYNC_TRANSPORT_LOGGED = True
+
+
 def _update_gather_batch(
     batch: ScheduleBatch,
     mlp_sync_info: MLPSyncBatchInfo,
@@ -306,15 +339,18 @@ def prepare_mlp_sync_batch_raw(
 
         world = get_world_group()
         group = torch.distributed.group.WORLD
+        group_kind = "world"
         device = world.device
     elif len(offload_tags) == 0 and (
         disable_overlap_schedule
         or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
     ):
         group = tp_group.device_group
+        group_kind = "device"
         device = tp_group.device
     else:
         group = tp_group.cpu_group
+        group_kind = "cpu"
         device = "cpu"
 
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
@@ -340,6 +376,13 @@ def prepare_mlp_sync_batch_raw(
     )
 
     if not skip_all_gather:
+        _log_mlp_sync_transport_once(
+            group=group,
+            group_kind=group_kind,
+            device=device,
+            overlap_schedule=not disable_overlap_schedule,
+            sync_info=mlp_sync_info,
+        )
         mlp_sync_info.all_gather(
             device=device,
             group=group,
