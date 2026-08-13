@@ -172,7 +172,7 @@ class ComponentLoader(ABC):
             component = self.load_customized(
                 component_model_path, server_args, component_name, **load_kwargs
             )
-            return self._apply_startup_residency(component, server_args, component_name)
+            return component
 
     def _load_native_with_context(
         self,
@@ -192,7 +192,7 @@ class ComponentLoader(ABC):
                 transformers_or_diffusers,
                 component_name,
             )
-        return self._apply_startup_residency(component, server_args, component_name)
+        return component
 
     def load(
         self,
@@ -269,6 +269,10 @@ class ComponentLoader(ABC):
                 component_name,
                 component.__class__.__name__,
             )
+
+        component = self._apply_startup_residency(
+            component, server_args, component_name
+        )
 
         if component is None:
             logger.error("Load %s failed", component_name)
