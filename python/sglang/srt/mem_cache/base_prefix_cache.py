@@ -377,6 +377,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_swa(self) -> bool:
         return False
 
+    def swa_retain_floor(self, req) -> int | None:
+        # Caches that pair SWA with a second state stream (mamba/conv checkpoints)
+        # cannot free SWA to the window behind the tail: a match lands on a
+        # checkpoint, not on the tail, so the window that matters sits behind the
+        # last checkpoint. Those caches override this; everyone else has nothing
+        # deeper than the tail to protect.
+        return None
+
     def swa_reprefill_tail_tokens(self) -> int:
         # Only the unified_kv compress-only HiCache layout needs to hold back a
         # trailing sliding window for re-prefill; every other cache keeps SWA
