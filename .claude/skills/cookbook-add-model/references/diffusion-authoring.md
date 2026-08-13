@@ -84,7 +84,8 @@ model-by-model migrations.
 - Quick start puts installation and the generated commands before detailed model background;
 - the capability section explains strength and boundary without marketing filler;
 - checkpoint variants and request modes are unambiguous;
-- the builder separates Setup, Server, and Request inputs while keeping both output commands available;
+- Setup keeps both commands visible as a deployment overview; Server and Request each show only
+  the command controlled by that scope;
 - command bodies grow naturally up to their collapsed limit and do not reserve empty height;
 - topology-dependent recommended defaults are explicit in the setting summary and generated command;
 - legal custom topologies are Unverified and copyable; statically illegal combinations block Copy;

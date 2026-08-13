@@ -1481,6 +1481,18 @@ export const Deployment = ({ config, benchmarks }) => {
     });
   };
 
+  const setBuilderResource = (key, rawValue) => {
+    if (!commandBuilder) return;
+    const value = Number.parseInt(rawValue, 10);
+    if (!Number.isFinite(value)) return;
+    const bounds = commandBuilder.resource?.limits?.[key] || { min: 1, max: 8 };
+    setSel((prev) => normalizeBuilderSelection({
+      ...prev,
+      [key]: Math.min(bounds.max, Math.max(bounds.min, value)),
+      topology_mode: "auto",
+    }));
+  };
+
   const editBuilderTopology = (key, value) => {
     if (!commandBuilder) return;
     setSel((prev) => normalizeBuilderSelection({
@@ -1691,7 +1703,17 @@ export const Deployment = ({ config, benchmarks }) => {
               disabled={Number(sel[key]) <= bounds.min}
               onClick={() => updateBuilderResource(key, -1)}
             >−</button>
-            <output aria-live="polite">{sel[key]}</output>
+            <input
+              type="number"
+              inputMode="numeric"
+              min={bounds.min}
+              max={bounds.max}
+              step="1"
+              value={sel[key]}
+              aria-label={label}
+              onFocus={(event) => event.currentTarget.select()}
+              onChange={(event) => setBuilderResource(key, event.target.value)}
+            />
             <button
               type="button"
               aria-label={`Increase ${label}`}
@@ -1755,14 +1777,12 @@ export const Deployment = ({ config, benchmarks }) => {
           <div className="sgd-builder-resource-grid">
             {renderStepper("nodes", "Nodes")}
             {renderStepper("gpus_per_node", "GPUs / node")}
-            <div className="sgd-builder-resource-total">
-              <strong>{totalGpus}</strong>
-              <span>GPUs total</span>
-            </div>
           </div>
-          <p className="sgd-builder-resource-equation">
-            {sel.nodes} {Number(sel.nodes) === 1 ? "node" : "nodes"} × {sel.gpus_per_node} {sel.hw.toUpperCase()} = {totalGpus} GPUs
-          </p>
+          {Number(sel.nodes) > 1 && (
+            <p className="sgd-builder-resource-summary">
+              {sel.nodes} nodes × {sel.gpus_per_node} {sel.hw.toUpperCase()} = {totalGpus} GPUs
+            </p>
+          )}
         </section>
 
         <section className="sgd-builder-section sgd-builder-topology">
@@ -2032,8 +2052,8 @@ export const Deployment = ({ config, benchmarks }) => {
             {renderScopeControls()}
           </div>
           <div className="sgd-builder-output-rail">
-            {renderOutputCard("serve")}
-            {renderOutputCard("request")}
+            {builderScope !== "request" && renderOutputCard("serve")}
+            {builderScope !== "serve" && renderOutputCard("request")}
           </div>
         </div>
 
