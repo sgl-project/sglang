@@ -740,7 +740,6 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
-            params.mamba_state_seqlen = len(key)
         return cache.insert(params)
 
     def test_insert_and_match_basic(self):
@@ -854,7 +853,6 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
-            params.mamba_state_seqlen = len(key_2p)
         result = cache.insert(params)
         self.assertEqual(result.prefix_len, len(seq_1p))
         self.assertEqual(
@@ -874,7 +872,6 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
-            params.mamba_state_seqlen = len(key_3p)
         result = cache.insert(params)
         self.assertEqual(result.prefix_len, len(seq_2p))
         # alloc(3p), freed 0 (prev_prefix_len covers entire overlap), stored 1p new → net -3p
@@ -1100,29 +1097,6 @@ class UnifiedRadixCacheSuite:
         torch.testing.assert_close(req.mamba_ping_pong_track_buffer, track_slots_before)
         self.assertIsNone(req.mamba_last_track_seqlen)
         cache.sanity_check()
-
-    def test_mamba_insert_rejects_wrong_semantic_length(self):
-        if self.cfg.components != (ComponentType.FULL, ComponentType.MAMBA):
-            self.skipTest("requires Full + Mamba")
-        if self.cfg.page_size != 4:
-            self.skipTest("uses a widened page_size=4 tree")
-
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        tokens = self._make_seq(1, 2)
-        key = RadixKey(array("q", tokens))
-        value = self._alloc(allocator, len(tokens))
-        req = self._make_req(req_to_token_pool)
-        with self.assertRaisesRegex(
-            AssertionError, r"checkpoint H\(7\).*node at depth 8"
-        ):
-            cache.insert(
-                InsertParams(
-                    key=key,
-                    value=value,
-                    mamba_value=req.mamba_pool_idx.unsqueeze(0),
-                    mamba_state_seqlen=len(tokens) - 1,
-                )
-            )
 
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
@@ -5225,7 +5199,6 @@ class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
                     key=RadixKey(array("q", tokens)),
                     value=value[: len(tokens)],
                     mamba_value=req.mamba_pool_idx.unsqueeze(0),
-                    mamba_state_seqlen=len(tokens),
                 )
             )
 

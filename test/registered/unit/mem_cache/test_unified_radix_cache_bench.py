@@ -338,14 +338,7 @@ def _insert_seq(env, seq):
         req = env.make_req()
         mamba_val = req.mamba_pool_idx.unsqueeze(0)
     key = RadixKey(array("q", seq))
-    env.tree.insert(
-        InsertParams(
-            key=key,
-            value=v[: len(key)],
-            mamba_value=mamba_val,
-            mamba_state_seqlen=len(key) if mamba_val is not None else None,
-        )
-    )
+    env.tree.insert(InsertParams(key=key, value=v[: len(key)], mamba_value=mamba_val))
     return True
 
 
@@ -368,12 +361,7 @@ def _fill_no_evict(env):
             mamba_val = req.mamba_pool_idx.unsqueeze(0)
         key = RadixKey(array("q", seq))
         env.tree.insert(
-            InsertParams(
-                key=key,
-                value=v[: len(key)],
-                mamba_value=mamba_val,
-                mamba_state_seqlen=len(key) if mamba_val is not None else None,
-            )
+            InsertParams(key=key, value=v[: len(key)], mamba_value=mamba_val)
         )
         inserted += 1
     return inserted

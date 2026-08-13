@@ -221,16 +221,6 @@ class MambaComponent(TreeComponent):
         if params.mamba_value is None:
             result.mamba_exist = True
             return
-
-        assert (
-            params.mamba_state_seqlen is not None
-        ), "mamba_state_seqlen is required when inserting a Mamba checkpoint"
-        assert params.key is not None
-        radix_node_seqlen = len(params.key.page_aligned(self.cache.page_size))
-        assert params.mamba_state_seqlen == radix_node_seqlen, (
-            f"Mamba checkpoint H({params.mamba_state_seqlen}) cannot be attached "
-            f"to radix node at depth {radix_node_seqlen}"
-        )
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
@@ -567,8 +557,6 @@ class MambaComponent(TreeComponent):
             if is_finished:
                 return None
             return 0
-
-        insert_params.mamba_state_seqlen = cache_len
 
         if is_finished:
             if self.cache.enable_mamba_extra_buffer:
