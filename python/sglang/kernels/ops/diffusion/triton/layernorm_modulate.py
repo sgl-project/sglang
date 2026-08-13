@@ -344,7 +344,7 @@ def _is_bf16_cuda(t: torch.Tensor) -> bool:
 def _qk_head_launch_config() -> tuple[int, int]:
     arch = get_jit_cuda_arch()
     if arch.major == 10 and arch.minor == 3:
-        return 16, 1
+        return 32, 1
     if arch.major * 10 + arch.minor >= 120:
         return 8, 4
     return 64, 2
@@ -464,7 +464,7 @@ def fused_qk_head_layernorm(
     launch, bit-exact vs the eager aten kernel."""
     head_dim = q.shape[-1]
     n_rows = q.numel() // head_dim
-    # Architecture sweeps at the production GLM shape select 16 rows / 1 warp
+    # Architecture sweeps at the production GLM shape select 32 rows / 1 warp
     # on B300 (SM103) and 8 rows / 4 warps on RTX 5090 (SM120). Preserve the
     # independently tuned H100/H200 launch on all other architectures.
     rows, num_warps = _qk_head_launch_config()

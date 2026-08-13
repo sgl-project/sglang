@@ -362,6 +362,16 @@ def _build_sglang_payload(case: dict) -> dict:
     ):
         if key in case:
             payload[key] = case[key]
+
+    # Model-specific request fields outside the common schema -- MiniMax-H3
+    # derives its shape from `target` and rejects an explicit num_frames, so a
+    # case needs to both add keys and drop common ones. A null value removes
+    # the key rather than sending null.
+    for key, value in (case.get("sglang_request_extra") or {}).items():
+        if value is None:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
     return payload
 
 
