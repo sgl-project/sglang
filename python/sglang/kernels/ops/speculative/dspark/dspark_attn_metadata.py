@@ -229,21 +229,15 @@ def compute_dspark_window_gather_triton(
     )
 
 
-# The SM120 sparse-MLA kernels only instantiate a fixed set of index widths, and
-# aligning to page_index_aligned_size alone can land outside it: DSPARK's
-# swa_window + block_size aligns to 192, which no prefill variant provides, so the
-# host gate rejects it (a hard abort, not a fallback). Widen to the next
-# instantiated width instead. The tail is -1 and the kernel masks per row through
-# topk_length, so this only costs padding -- measured identical end-to-end against
-# an exact-192 build at bs=1/8/32.
-# 128 must stay in the set -- it is the only width the DSv4 dual (SWA extra-cache)
-# dispatch instantiates, and rounding it up to 512 breaks the MTP path.
+# FlashInfer's SM120 sparse-MLA prefill instantiates only these widths and aborts on
+# anything else; DSPARK's swa_window + block_size lands on 192. Widen to the next
+# instantiated width -- the padded tail is -1 and masked per row via topk_length.
+# 128 must stay: it is the only width the DSv4 dual (SWA extra-cache) dispatch
+# instantiates, and widening it breaks MTP.
 _SM120_INDEX_WIDTHS = (128, 512, 1024, 2048)
 
 
 def _sm120_index_width(width: int) -> int:
-    # is_sm120_supported() is lru_cached; call it here rather than at import so
-    # arch detection does not pull CUDA into module import.
     if width in _SM120_INDEX_WIDTHS or not is_sm120_supported():
         return width
     return next((w for w in _SM120_INDEX_WIDTHS if w > width), width)
