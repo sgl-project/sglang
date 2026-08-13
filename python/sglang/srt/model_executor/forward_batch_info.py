@@ -1623,6 +1623,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dim=0,
             )
 
+    @property
+    def logical_forward_mode(self) -> ForwardMode:
+        """The mode these rows actually carry.
+
+        ``prepare_mlp_sync_batch`` may relabel a decode batch as a 1-token
+        extend so every DP rank presents one shape to the collectives.
+        Consumers that need the decode semantics behind the label -- mamba
+        state updates, linear-attention gates -- read through it here.
+        """
+        original = self._original_forward_mode
+        if (
+            original is not None
+            and original.is_decode()
+            and self.forward_mode.is_extend()
+        ):
+            return original
+        return self.forward_mode
+
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
@@ -1742,7 +1760,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # empty (idle) rank. Ranks reach this once MAX_LEN is forced for
                 # the prefill breakable CUDA graph (idle + prefill), which needs
                 # every DP rank to run the same captured shape. The `else`
-                # branch handles decode rows padded to a 1-token extend.
+                # branch handles decode rows padded to a 1-token extend: full
+                # attention runs them as real 1-token extends, while the mamba
+                # layers read back through the relabel via logical_forward_mode.
                 if self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
                     self.extend_num_tokens = num_tokens
