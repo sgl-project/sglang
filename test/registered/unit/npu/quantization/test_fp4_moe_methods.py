@@ -10,52 +10,61 @@ register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
 
 from sglang.srt.hardware_backend.npu.quantization import fp4_moe_methods
 from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
+    NPUW4A4Fp4MoEMethod,
+    _apply_swiglu_limit_npu,
     _pair_pack_mxfp_act_scale,
-    _set_fp4_dispatcher_output_dtype,
-    _swiglu_limit_mx_quant,
+    _reshape_mxfp4_scale_for_npu,
     _w4a8_mxfp_gmm,
     npu_apply_without_routing_weights_w4a4_mxfp,
 )
-from sglang.srt.layers.moe.token_dispatcher.ascend_tp import AscendTPDispatcher
 
 
-class TestFp4DispatcherOutputDtype(unittest.TestCase):
-    @staticmethod
-    def _ascend_tp_layer():
-        dispatcher = AscendTPDispatcher.__new__(AscendTPDispatcher)
-        dispatcher.set_quant_config = MagicMock()
-        return SimpleNamespace(dispatcher=dispatcher)
+class TestApplySwiGLULimitNpu(unittest.TestCase):
+    def test_clamps_gate_and_up_asymmetrically(self):
+        # DeepSeek-V4 clamps gate (first half) to <= limit but only the upper
+        # bound, while up (second half) is clamped symmetrically to [-limit, limit].
+        # A regression that swapped these would silently change expert activations.
+        gate_up = torch.tensor([[8.0, -9.0, 9.0, -9.0]])
+        _apply_swiglu_limit_npu(gate_up, 7.0)
+        self.assertTrue(torch.equal(gate_up, torch.tensor([[7.0, -9.0, 7.0, -7.0]])))
 
-    def test_a5_ascend_tp_uses_mxfp8(self):
-        layer = self._ascend_tp_layer()
-        with patch.object(
-            fp4_moe_methods, "is_npu_before_atlas_a5", return_value=False
-        ):
-            _set_fp4_dispatcher_output_dtype(layer)
+    def test_noop_when_limit_none(self):
+        gate_up = torch.tensor([[8.0, -9.0]])
+        _apply_swiglu_limit_npu(gate_up, None)
+        self.assertTrue(torch.equal(gate_up, torch.tensor([[8.0, -9.0]])))
 
-        layer.dispatcher.set_quant_config.assert_called_once_with(
-            {"dispatcher_output_dtype": "mxfp8"}
-        )
+    def test_noop_when_limit_nonpositive(self):
+        gate_up = torch.tensor([[8.0, -9.0]])
+        _apply_swiglu_limit_npu(gate_up, 0.0)
+        self.assertTrue(torch.equal(gate_up, torch.tensor([[8.0, -9.0]])))
 
-    def test_deepep_stays_bf16(self):
-        layer = SimpleNamespace(dispatcher=MagicMock())
-        with patch.object(
-            fp4_moe_methods, "is_npu_before_atlas_a5", return_value=False
-        ):
-            _set_fp4_dispatcher_output_dtype(layer)
 
-        layer.dispatcher.set_quant_config.assert_called_once_with(
-            {"dispatcher_output_dtype": "bf16"}
-        )
+class TestReshapeMxfp4ScaleForNpu(unittest.TestCase):
+    def test_packs_scale_to_gmm_layout(self):
+        # [E, N, K/32] -> [E, K/64, N, 2] is the packed-pair layout the GMM reads;
+        # getting the transpose axis wrong silently dequantizes with the wrong scale.
+        scale = torch.arange(8, dtype=torch.uint8).view(1, 2, 4)
+        out = _reshape_mxfp4_scale_for_npu(scale)
+        self.assertEqual(tuple(out.shape), (1, 2, 2, 2))
+        self.assertTrue(torch.equal(out, scale.view(1, 2, 2, 2).transpose(1, 2)))
 
-    def test_pre_a5_ascend_tp_stays_bf16(self):
-        layer = self._ascend_tp_layer()
-        with patch.object(fp4_moe_methods, "is_npu_before_atlas_a5", return_value=True):
-            _set_fp4_dispatcher_output_dtype(layer)
+    def test_rejects_odd_k_dim(self):
+        with self.assertRaises(ValueError):
+            _reshape_mxfp4_scale_for_npu(torch.zeros(1, 2, 3, dtype=torch.uint8))
 
-        layer.dispatcher.set_quant_config.assert_called_once_with(
-            {"dispatcher_output_dtype": "bf16"}
-        )
+
+class TestPairPackMxfpActScale(unittest.TestCase):
+    def test_packs_as_view(self):
+        # The GMM expects a pair-packed *view* of the per-token scale, not a copy;
+        # materializing a copy here would break the kernel's aliasing contract.
+        flat = torch.arange(8).view(2, 4)
+        packed = _pair_pack_mxfp_act_scale(flat)
+        self.assertEqual(tuple(packed.shape), (2, 2, 2))
+        self.assertEqual(packed.data_ptr(), flat.data_ptr())
+
+    def test_rejects_odd_scale_dim(self):
+        with self.assertRaises(ValueError):
+            _pair_pack_mxfp_act_scale(torch.zeros(2, 3))
 
 
 class TestW4A8MxfpGmmInputScale(unittest.TestCase):
@@ -124,20 +133,15 @@ class TestW4A8MxfpGmmInputScale(unittest.TestCase):
             grouped_matmul.call_args.kwargs["per_token_scale"][0], quantized_scale
         )
 
-    def test_flat_dispatch_scale_is_pair_packed_as_a_view(self):
-        flat_scale = torch.arange(8).view(2, 4)
-        packed_scale = _pair_pack_mxfp_act_scale(flat_scale)
-
-        self.assertEqual(packed_scale.shape, (2, 2, 2))
-        self.assertEqual(packed_scale.data_ptr(), flat_scale.data_ptr())
-
 
 class TestW4A8MxfpGmmChain(unittest.TestCase):
-    def test_gmm2_reuses_swiglu_quant_scale(self):
-        gate_up = torch.randn(2, 64)
-        quantized = torch.empty(2, 32, dtype=torch.float8_e4m3fn)
-        quantized_scale = torch.ones(2, 1, 2)
-        expected = torch.randn(2, 64)
+    def test_applies_swiglu_limit_before_swiglu(self):
+        # The clamp must be wired in *before* npu_swiglu using the layer's
+        # configured swiglu_limit; dropping the clamp (or applying it after)
+        # silently changes routed-expert output on near-limit activations.
+        gate_up = torch.tensor([[8.0, -9.0, 9.0, -9.0]])
+        activated = torch.randn(1, 2)
+        expected = torch.randn(1, 2)
         layer = SimpleNamespace(
             w13_weight=MagicMock(),
             w13_weight_scale_inv=MagicMock(),
@@ -148,92 +152,61 @@ class TestW4A8MxfpGmmChain(unittest.TestCase):
 
         with (
             patch.object(
-                fp4_moe_methods,
-                "w4a4_mxfp_gmm_npu",
-                side_effect=[gate_up, expected],
+                fp4_moe_methods, "w4a4_mxfp_gmm_npu", side_effect=[gate_up, expected]
             ) as gmm,
             patch.object(
-                fp4_moe_methods,
-                "_swiglu_limit_mx_quant",
-                return_value=(quantized, quantized_scale),
-            ),
+                torch.ops.npu, "npu_swiglu", return_value=activated, create=True
+            ) as swiglu,
         ):
             output = npu_apply_without_routing_weights_w4a4_mxfp(
                 layer,
-                torch.randn(2, 32),
-                torch.ones(2, 1, 2),
+                torch.randn(1, 4),
+                torch.ones(1, 1, 2),
                 group_list_type=1,
-                group_list=torch.tensor([1, 1], dtype=torch.int64),
+                group_list=torch.tensor([1], dtype=torch.int64),
                 output_dtype=torch.bfloat16,
             )
 
         self.assertIs(output, expected)
-        self.assertIs(gmm.call_args_list[1].kwargs["input"], quantized)
-        self.assertIs(gmm.call_args_list[1].kwargs["input_scale"], quantized_scale)
-
-    def test_swiglu_quant_fallback_preserves_asymmetric_clamp(self):
-        gate_up = torch.tensor([[8.0, -9.0, 9.0, -9.0]])
-        activated = torch.randn(1, 2)
-        quantized = torch.empty(1, 2, dtype=torch.float8_e4m3fn)
-        quantized_scale = torch.ones(1, 1, 2)
-
-        with (
-            patch.object(
-                fp4_moe_methods,
-                "_get_swiglu_group_quant_op",
-                return_value=None,
-            ),
-            patch.object(
-                torch.ops.npu,
-                "npu_swiglu",
-                return_value=activated,
-                create=True,
-            ) as swiglu,
-            patch.object(
-                torch.ops.npu,
-                "npu_dynamic_mx_quant",
-                return_value=(quantized, quantized_scale),
-                create=True,
-            ) as dynamic_quant,
-        ):
-            output = _swiglu_limit_mx_quant(gate_up, 7.0)
-
         self.assertTrue(
             torch.equal(
                 swiglu.call_args.args[0], torch.tensor([[7.0, -9.0, 7.0, -7.0]])
             )
         )
-        self.assertIs(dynamic_quant.call_args.args[0], activated)
-        self.assertEqual(output, (quantized, quantized_scale))
+        self.assertIs(gmm.call_args_list[1].kwargs["input"], activated)
 
-    def test_swiglu_group_quant_fuses_middle_path(self):
-        gate_up = torch.randn(2, 128)
-        quantized = torch.empty(2, 64, dtype=torch.float8_e4m3fn)
-        quantized_scale = torch.ones(2, 1, 2)
-        unused_origin = torch.empty(2, 64, dtype=torch.bfloat16)
-        fused_op = MagicMock(return_value=(quantized, quantized_scale, unused_origin))
 
-        with (
-            patch.object(
-                fp4_moe_methods,
-                "_get_swiglu_group_quant_op",
-                return_value=fused_op,
+class TestProcessWeightsAfterLoadingZeroScale(unittest.TestCase):
+    @staticmethod
+    def _method():
+        return NPUW4A4Fp4MoEMethod(fp8_method=MagicMock(), prefix="test")
+
+    def test_raises_when_w13_scales_never_loaded(self):
+        # An all-zero scale is the signature of a checkpoint whose scale names
+        # never matched; without this guard every routed expert computes silently
+        # as zero instead of failing loudly.
+        layer = SimpleNamespace(
+            w13_weight_scale_inv=torch.nn.Parameter(
+                torch.zeros(2, 2, 4, dtype=torch.uint8)
             ),
-            patch.object(torch.ops.npu, "npu_swiglu", create=True) as separate_swiglu,
-            patch.object(
-                torch.ops.npu, "npu_dynamic_mx_quant", create=True
-            ) as separate_quant,
-        ):
-            output = _swiglu_limit_mx_quant(gate_up, 7.0)
+            w2_weight_scale_inv=torch.nn.Parameter(
+                torch.zeros(2, 2, 4, dtype=torch.uint8)
+            ),
+        )
+        with self.assertRaises(RuntimeError):
+            self._method().process_weights_after_loading(layer)
 
-        self.assertEqual(output, (quantized, quantized_scale))
-        separate_swiglu.assert_not_called()
-        separate_quant.assert_not_called()
-        call_kwargs = fused_op.call_args.kwargs
-        self.assertIs(fused_op.call_args.args[0], gate_up)
-        self.assertEqual(call_kwargs["dst_type"], torch.float8_e4m3fn)
-        self.assertEqual(call_kwargs["quant_mode"], 2)
-        self.assertEqual(call_kwargs["clamp_value"], 7.0)
+    def test_raises_when_w2_scales_never_loaded(self):
+        layer = SimpleNamespace(
+            w13_weight_scale_inv=torch.nn.Parameter(
+                torch.ones(2, 2, 4, dtype=torch.uint8)
+            ),
+            w2_weight_scale_inv=torch.nn.Parameter(
+                torch.zeros(2, 2, 4, dtype=torch.uint8)
+            ),
+        )
+        with self.assertRaises(RuntimeError):
+            self._method().process_weights_after_loading(layer)
 
 
 if __name__ == "__main__":
