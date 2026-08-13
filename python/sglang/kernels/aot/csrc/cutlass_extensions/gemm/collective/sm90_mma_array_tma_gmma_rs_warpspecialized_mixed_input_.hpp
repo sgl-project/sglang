@@ -298,7 +298,8 @@ struct CollectiveMmaArrayMixedInput<
   // The packed scale operand is an Array<ElementScale, PackedScalesNum> where
   // PackedScalesNum == TileK / GroupSize. Therefore GroupSize == TileK / kElements.
   // This yields 128 for int4a8 (Array<bf16,4>, bit-identical to the old
-  // hardcoded `#define GROUP_SIZE 128`) and 32 for mxfp4a8 (Array<bf16,16>),
+  // hardcoded `#define GROUP_SIZE 128`) and 32 for mxfp4a8 (Array<bf16,4> with
+  // TileK=128, i.e. PackedScalesNum=4 = TileK/GroupSize),
   // without threading an extra template parameter. For the DirectConvert path
   // (no scale) we fall back to the tile-K size so no chunking is introduced.
   static constexpr int MxScalePackedNum =

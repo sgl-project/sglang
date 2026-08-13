@@ -426,7 +426,18 @@ def cutlass_mxfp4a8_moe_deepep_ll(
     swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """MXFP4A8 DeepEP-low-latency fused MoE. Mirrors
-    ``cutlass_w4a8_moe_deepep_ll`` with MXFP4 weights and ``chunk_size=32``."""
+    ``cutlass_w4a8_moe_deepep_ll`` with MXFP4 weights and ``chunk_size=32``.
+
+    NOTE (activation-quant granularity): unlike the main / deepep-normal entries
+    (which do per-token + per-block(32) mxfp8 quant and feed the block-scale via
+    the mainloop's 4th TMA), this low-latency decode path quantizes activations
+    **per-tensor** (``fp8_per_token_to_per_tensor_quant_triton`` /
+    ``silu_and_mul_masked_post_per_tensor_quant_fwd``) and applies the scalar
+    scale through the epilogue ``alpha`` (``a1_scale``/``a2_scale``); no
+    activation block-scale is passed. This is intentional: at decode M is tiny,
+    so per-tensor scaling avoids the block-scale build/TMA overhead. The weight
+    side stays per-block(32) mxfp4 in both paths, so only the activation scale
+    granularity differs (per-tensor here vs per-block on the prefill path)."""
     assert w1_q.dtype == torch.int8
     assert w2_q.dtype == torch.int8
     assert a_states.shape[2] // 2 == w1_q.shape[2], "Hidden size mismatch w1"

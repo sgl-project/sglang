@@ -483,8 +483,8 @@ def interleave_act_scale_mxfp8(
     layout was verified bit-exact (rel_mean = 0.0000) by the single-GEMM test
     ``tests/test_cutlass_mxfp4a8_moe_mm.py::run_case_mxfp8_act``.
 
-    ``K//block`` must be a multiple of ``alignment`` (=8 for TileK=256); for K a
-    multiple of 256 and block=32 this holds (K/32 multiple of 8).
+    ``K//block`` must be a multiple of ``alignment`` (=4 for TileK=128); for K a
+    multiple of 128 and block=32 this holds (K/32 multiple of 4).
     """
     m, nblk = scale.shape
     assert nblk % alignment == 0, f"K//block={nblk} not divisible by {alignment}"

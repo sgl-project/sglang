@@ -114,7 +114,8 @@ def interleave_scales(scales: torch.Tensor, group: int = 4) -> torch.Tensor:
     ``group`` MUST equal the kernel's ``PackedScalesNum = TileK / GroupSizeK`` so
     the innermost contiguous run matches the ``Array<bf16, PackedScalesNum>`` TMA
     element. int4a8 (TileK=512, GroupSizeK=128) -> 4 (the default, byte-identical).
-    mxfp4a8 (TileK=256, GroupSizeK=32) -> 8.
+    mxfp4a8 (TileK=128, GroupSizeK=32) -> 4 (SM90 TMA caps the packed element at
+    64-bit = Array<bf16,4>, so TileK is hard-locked to 128).
     """
     s_shape = scales.shape
     # Reshape to separate groups of ``group``

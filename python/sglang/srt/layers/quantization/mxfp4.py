@@ -338,14 +338,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.use_marlin = get_moe_runner_backend().is_marlin()
-        # CUTLASS w4a8 grouped-GEMM MXFP4A8 path (SM90/Hopper).
-        # Distinct from FlashInfer's cutlass_sm90 kernel above: this reuses the
-        # int4a8 DirectConvert mainloop with the E2M1 converter + group_size=32.
-        self.use_cutlass = get_moe_runner_backend().is_cutlass()
-        if self.use_cutlass and not is_sm90_supported():
-            raise RuntimeError(
-                "moe_runner_backend=cutlass MXFP4A8 requires SM90 (Hopper)."
-            )
         # True W4A8: DeepGEMM fp8_fp4 grouped GEMM (SM100 MXF8F6F4 UMMA).
         # Weights stay MXFP4 (e2m1 + ue8m0 g32, zero requantization);
         # activations are quantized to fp8 per-token-group-128.
@@ -464,13 +456,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad
                 - layer.intermediate_size_per_partition
             )
-        elif self.use_cutlass:
-            # sglang CUTLASS w4a8 MXFP4A8 path: keep the HF ``[gate; up]``
-            # concatenated layout unpadded (identical to the int4a8 w4afp8
-            # loader). CUTLASS grouped-GEMM dims must be % 128 == 0; DeepSeek-V4
-            # experts already satisfy this, so no padding / re-layout is needed
-            # and the loader's naive per-shard copy stays correct.
-            intermediate_size_per_partition_after_pad = intermediate_size_per_partition
         elif has_triton_kernels:
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, triton_kernels_padding_alignment
@@ -558,89 +543,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
-        if self.use_cutlass:
-            self._create_cutlass_strides(
-                layer,
-                num_experts=layer.num_local_experts,
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size_per_partition_after_pad,
-            )
-
-    def _create_cutlass_strides(
-        self, layer, num_experts, hidden_size, intermediate_size
-    ):
-        """Pre-populate the per-expert CUTLASS grouped-GEMM strides / offsets,
-        mirroring ``W4AFp8MoEMethod.create_weights`` (int4a8). Shared by the
-        MXFP4A8 cutlass path so both quant formats reuse the same host-side
-        grouped-GEMM plumbing."""
-        device = layer.w13_weight.device
-        self.a_strides1 = torch.full(
-            (num_experts, 3), hidden_size, device=device, dtype=torch.int64
-        )
-        self.c_strides1 = torch.full(
-            (num_experts, 3), 2 * intermediate_size, device=device, dtype=torch.int64
-        )
-        self.a_strides2 = torch.full(
-            (num_experts, 3), intermediate_size, device=device, dtype=torch.int64
-        )
-        self.c_strides2 = torch.full(
-            (num_experts, 3), hidden_size, device=device, dtype=torch.int64
-        )
-        self.b_strides1 = self.a_strides1
-        self.s_strides13 = self.c_strides1
-        self.b_strides2 = self.a_strides2
-        self.s_strides2 = self.c_strides2
-        self.expert_offsets = torch.empty(
-            (num_experts + 1), dtype=torch.int32, device=device
-        )
-        self.problem_sizes1 = torch.empty(
-            (num_experts, 3), dtype=torch.int32, device=device
-        )
-        self.problem_sizes2 = torch.empty(
-            (num_experts, 3), dtype=torch.int32, device=device
-        )
-
-    def _process_weights_for_sglang_cutlass(self, layer):
-        """Convert HF-packed MXFP4 weights into the sglang CUTLASS w4a8
-        MXFP4A8 kernel layout (reusing the int4a8 DirectConvert mainloop).
-
-        Steps (run once at load time):
-          1. E2M1 weights: re-interleave nibbles HF-natural -> order_map
-             ``[0,2,4,6,1,3,5,7]`` (same LUT layout as int4a8), keep as int8.
-          2. E8M0 scales: expand losslessly to bf16 (power-of-2) then apply the
-             4-wide ``interleave_scales`` used by the post-MMA group-scale path
-             (4 = PackedScalesNum = mxfp4 TileK(128)/GroupSize(32); the 64-bit
-             TMA element cap forbids TileK=256 / 8-wide).
-        The ``[gate; up]`` concatenated layout from the standard per-shard MoE
-        loader already matches the kernel, so no de-interleave is needed.
-        """
-        from sglang.srt.layers.mxfp4a8_utils import (
-            e8m0_to_bf16,
-            repack_hf_mxfp4_to_kernel,
-        )
-        from sglang.srt.layers.quantization.w4afp8 import interleave_scales
-
-        device = layer.w13_weight.device
-
-        # --- weights: nibble re-interleave to kernel order_map, view as int8 ---
-        w13 = repack_hf_mxfp4_to_kernel(layer.w13_weight.data).contiguous()
-        w2 = repack_hf_mxfp4_to_kernel(layer.w2_weight.data).contiguous()
-        layer.w13_weight = Parameter(w13, requires_grad=False)
-        layer.w2_weight = Parameter(w2, requires_grad=False)
-
-        # --- scales: E8M0 uint8 -> bf16 (lossless), then 4-wide interleave ---
-        w13_scale = e8m0_to_bf16(layer.w13_weight_scale.data.to(device))
-        w13_scale = interleave_scales(w13_scale.to(torch.bfloat16), group=4)
-        layer.w13_weight_scale = Parameter(w13_scale, requires_grad=False)
-
-        w2_scale = e8m0_to_bf16(layer.w2_weight_scale.data.to(device))
-        w2_scale = interleave_scales(w2_scale.to(torch.bfloat16), group=4)
-        layer.w2_weight_scale = Parameter(w2_scale, requires_grad=False)
-
     def process_weights_after_loading(self, layer):
-        if self.use_cutlass:
-            self._process_weights_for_sglang_cutlass(layer)
-            return
         if self.use_marlin:
             from sglang.srt.layers.quantization.marlin_utils import (
                 check_moe_marlin_supports_layer,
@@ -1484,33 +1387,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-        if self.use_cutlass:
-            from sglang.srt.layers.moe.cutlass_mxfp4a8_moe import cutlass_mxfp4a8_moe
-
-            topk_weights, topk_ids, _ = topk_output
-            output = cutlass_mxfp4a8_moe(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale,
-                layer.w2_weight_scale,
-                topk_weights,
-                topk_ids,
-                self.a_strides1,
-                self.b_strides1,
-                self.c_strides1,
-                self.a_strides2,
-                self.b_strides2,
-                self.c_strides2,
-                self.s_strides13,
-                self.s_strides2,
-                self.expert_offsets,
-                self.problem_sizes1,
-                self.problem_sizes2,
-                routed_scaling_factor=self.moe_runner_config.routed_scaling_factor
-                or 1.0,
-            )
-            return StandardCombineInput(hidden_states=output)
         if _is_cpu:
             if use_intel_amx_backend(layer):
                 from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
