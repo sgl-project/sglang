@@ -538,27 +538,14 @@ class GlmImageAR(PipelineStage):
             usages.append(_extract_srt_usage(item.get("meta_info")))
         return prior_token_ids, usages
 
-    def run_grouped_requests(
+    def populate_prior_tokens_for_requests(
         self,
         batches: list[Req],
         server_args: ServerArgs,
+        device: Optional[torch.device] = None,
     ) -> list[Req]:
-        can_batch_ar = (
-            len(batches) > 1
-            and server_args.srt_encoder_url is not None
-            and all(
-                isinstance(batch.prompt, str) and batch.image_path is None
-                for batch in batches
-            )
-        )
-        if not can_batch_ar:
-            return super().run_grouped_requests(batches, server_args)
-
         height = batches[0].height
         width = batches[0].width
-        if any(batch.height != height or batch.width != width for batch in batches[1:]):
-            return super().run_grouped_requests(batches, server_args)
-
         start_time = time.time()
         output_counts = [_num_outputs_per_prompt(batch) for batch in batches]
         prompts = [
@@ -577,6 +564,7 @@ class GlmImageAR(PipelineStage):
             height=height,
             width=width,
             server_args=server_args,
+            device=device,
         )
         duration = time.time() - start_time
         logger.info(
@@ -602,6 +590,29 @@ class GlmImageAR(PipelineStage):
                 batch.metrics.record_stage(stage_name, duration)
             output_offset += output_count
         return batches
+
+    def run_grouped_requests(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> list[Req]:
+        can_batch_ar = (
+            len(batches) > 1
+            and server_args.srt_encoder_url is not None
+            and all(
+                isinstance(batch.prompt, str) and batch.image_path is None
+                for batch in batches
+            )
+        )
+        if not can_batch_ar:
+            return super().run_grouped_requests(batches, server_args)
+
+        height = batches[0].height
+        width = batches[0].width
+        if any(batch.height != height or batch.width != width for batch in batches[1:]):
+            return super().run_grouped_requests(batches, server_args)
+
+        return self.populate_prior_tokens_for_requests(batches, server_args)
 
     def iter_sequential_requests(
         self, batch: Req, server_args: ServerArgs

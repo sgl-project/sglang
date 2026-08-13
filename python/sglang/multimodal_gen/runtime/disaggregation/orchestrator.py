@@ -53,17 +53,10 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class _GlmClientEntry:
-    request_id: str
+class _GlmDistributedRequest:
+    client_request_id: str
     req: Req
     enqueue_time: float
-
-
-@dataclass
-class _GlmShardEntry:
-    request_id: str
-    req: Req
-    client: _GlmClientEntry
     worker_idx: int | None = None
 
 
@@ -72,11 +65,15 @@ class _GlmDistributedModeState:
     server_args: "ServerArgs"
     ar_stage: "GlmImageAR"
     executor: ThreadPoolExecutor
-    worker_available: list[bool]
-    ar_queue: deque[_GlmClientEntry] = field(default_factory=deque)
-    shard_queue: deque[_GlmShardEntry] = field(default_factory=deque)
-    shards: dict[str, _GlmShardEntry] = field(default_factory=dict)
-    ar_inflight: tuple[Future, list[_GlmClientEntry]] | None = None
+    denoiser_worker_available: list[bool]
+    pending_ar_requests: deque[_GlmDistributedRequest] = field(default_factory=deque)
+    pending_denoiser_requests: deque[_GlmDistributedRequest] = field(
+        default_factory=deque
+    )
+    denoiser_requests: dict[str, _GlmDistributedRequest] = field(
+        default_factory=dict
+    )
+    active_ar_batch: tuple[Future, list[_GlmDistributedRequest]] | None = None
 
 
 @dataclass
@@ -196,7 +193,7 @@ class DiffusionServer:
                 executor=ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="glm-distributed-ar"
                 ),
-                worker_available=[False] * self._num_denoisers,
+                denoiser_worker_available=[False] * self._num_denoisers,
             )
         self._transfer_state: dict[str, _TransferRequestState] = {}
 
@@ -479,8 +476,8 @@ class DiffusionServer:
                 )
                 return
             now = time.monotonic()
-            self._glm_distributed_state.ar_queue.append(
-                _GlmClientEntry(request_id, req, now)
+            self._glm_distributed_state.pending_ar_requests.append(
+                _GlmDistributedRequest(request_id, req, now)
             )
             return
 
@@ -499,7 +496,7 @@ class DiffusionServer:
     def _dispatch_glm_ar_batch_if_ready(self) -> None:
         state = self._glm_distributed_state
         assert state is not None
-        if state.ar_inflight is not None or not state.ar_queue:
+        if state.active_ar_batch is not None or not state.pending_ar_requests:
             return
 
         batch_max_size = (
@@ -507,13 +504,13 @@ class DiffusionServer:
             if state.server_args.batching_mode == "dynamic"
             else 1
         )
-        base = state.ar_queue[0]
+        base = state.pending_ar_requests[0]
         indices = [0]
         output_slots = max(1, int(base.req.num_outputs_per_prompt or 1))
-        for index in range(1, len(state.ar_queue)):
+        for index in range(1, len(state.pending_ar_requests)):
             if output_slots >= batch_max_size:
                 break
-            candidate = state.ar_queue[index]
+            candidate = state.pending_ar_requests[index]
             if (base.req.height, base.req.width) == (
                 candidate.req.height,
                 candidate.req.width,
@@ -531,122 +528,66 @@ class DiffusionServer:
         if output_slots < batch_max_size and waited < batch_delay_s:
             return
 
-        clients = [state.ar_queue[index] for index in indices]
+        requests = [state.pending_ar_requests[index] for index in indices]
         for index in reversed(indices):
-            del state.ar_queue[index]
+            del state.pending_ar_requests[index]
 
-        for client in clients:
+        for request in requests:
             try:
                 self._tracker.transition(
-                    client.request_id, RequestState.ENCODER_RUNNING
+                    request.client_request_id, RequestState.ENCODER_RUNNING
                 )
             except ValueError:
                 pass
-        state.ar_inflight = (
-            state.executor.submit(self._generate_glm_prior_tokens_batch, clients),
-            clients,
+        state.active_ar_batch = (
+            state.executor.submit(
+                state.ar_stage.populate_prior_tokens_for_requests,
+                [request.req for request in requests],
+                state.server_args,
+                device=torch.device("cpu"),
+            ),
+            requests,
         )
         logger.info(
             "GLM distributed AR dispatched batch size=%d requests, %d outputs",
-            len(clients),
+            len(requests),
             output_slots,
         )
 
-    def _generate_glm_prior_tokens_batch(self, clients: list[_GlmClientEntry]):
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
-            _num_outputs_per_prompt,
-            _seed_for_output,
-        )
-
-        requests = [client.req for client in clients]
-        prompts = [
-            req.prompt for req in requests for _ in range(_num_outputs_per_prompt(req))
-        ]
-        seeds = [
-            _seed_for_output(req.seed, output_index)
-            for req in requests
-            for output_index in range(_num_outputs_per_prompt(req))
-        ]
-        state = self._glm_distributed_state
-        assert state is not None
-        return state.ar_stage.generate_prior_tokens_batch(
-            prompts=prompts,
-            seeds=seeds,
-            height=requests[0].height,
-            width=requests[0].width,
-            server_args=state.server_args,
-            device=torch.device("cpu"),
-        )
-
     def _process_glm_ar_batch_result_if_ready(self) -> None:
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
-            _merge_srt_usages,
-        )
-
         state = self._glm_distributed_state
         assert state is not None
-        inflight = state.ar_inflight
-        if inflight is None or not inflight[0].done():
+        active_batch = state.active_ar_batch
+        if active_batch is None or not active_batch[0].done():
             return
-        future, clients = inflight
-        state.ar_inflight = None
+        future, requests = active_batch
+        state.active_ar_batch = None
         try:
-            prior_token_ids, output_usages = future.result()
+            future.result()
         except Exception as error:
-            for client in clients:
-                self._complete_with_error(client.request_id, f"GLM AR error: {error}")
-            return
-
-        expected_outputs = sum(
-            max(1, int(client.req.num_outputs_per_prompt or 1)) for client in clients
-        )
-        if len(prior_token_ids) != expected_outputs:
-            for client in clients:
+            for request in requests:
                 self._complete_with_error(
-                    client.request_id,
-                    "GLM AR output count mismatch: "
-                    f"got {len(prior_token_ids)}, expected {expected_outputs}",
-                )
-            return
-        if len(output_usages) != expected_outputs:
-            for client in clients:
-                self._complete_with_error(
-                    client.request_id,
-                    "GLM AR usage count mismatch: "
-                    f"got {len(output_usages)}, expected {expected_outputs}",
+                    request.client_request_id, f"GLM AR error: {error}"
                 )
             return
 
         group_id = f"glm-distributed::{time.monotonic_ns()}"
-        output_start = 0
-        for client_index, client in enumerate(clients):
-            output_count = max(1, int(client.req.num_outputs_per_prompt or 1))
-            output_end = output_start + output_count
-            if self._tracker.get(client.request_id) is None:
-                output_start = output_end
+        for request_index, request in enumerate(requests):
+            if self._tracker.get(request.client_request_id) is None:
                 continue
             try:
-                self._tracker.transition(client.request_id, RequestState.ENCODER_DONE)
                 self._tracker.transition(
-                    client.request_id, RequestState.DENOISING_WAITING
+                    request.client_request_id, RequestState.ENCODER_DONE
+                )
+                self._tracker.transition(
+                    request.client_request_id, RequestState.DENOISING_WAITING
                 )
             except ValueError:
                 pass
-            shard_req = client.req
-            shard_req.extra = dict(shard_req.extra or {})
-            shard_req.request_id = f"{group_id}::shard::{client_index}"
-            shard_req.prior_token_id = torch.cat(
-                prior_token_ids[output_start:output_end], dim=0
-            )
-            shard_req.prior_token_image_ids = None
-            shard_usages = output_usages[output_start:output_end]
-            shard_req.extra["usage_by_output"] = shard_usages
-            shard_req.usage = _merge_srt_usages(shard_usages)
-            shard_id = shard_req.request_id
-            shard = _GlmShardEntry(shard_id, shard_req, client)
-            state.shards[shard_id] = shard
-            state.shard_queue.append(shard)
-            output_start = output_end
+            denoiser_req = request.req
+            denoiser_req.request_id = f"{group_id}::request::{request_index}"
+            state.denoiser_requests[denoiser_req.request_id] = request
+            state.pending_denoiser_requests.append(request)
 
     def _dispatch_queued_glm_denoiser_requests(self) -> None:
         from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
@@ -655,26 +596,25 @@ class DiffusionServer:
 
         state = self._glm_distributed_state
         assert state is not None
-        while state.shard_queue:
-            shard = state.shard_queue[0]
+        while state.pending_denoiser_requests:
             available_slots = [
-                slots if state.worker_available[index] else 0
+                slots if state.denoiser_worker_available[index] else 0
                 for index, slots in enumerate(self._denoiser_free_slots)
             ]
             worker_idx = self._dispatcher.select_denoiser_with_capacity(available_slots)
             if worker_idx is None:
                 return
-            shard = state.shard_queue.popleft()
+            request = state.pending_denoiser_requests.popleft()
             self._denoiser_free_slots[worker_idx] -= 1
-            shard.worker_idx = worker_idx
-            tensor_fields, scalar_fields = extract_transfer_fields(shard.req)
-            scalar_fields["request_id"] = shard.request_id
+            request.worker_idx = worker_idx
+            tensor_fields, scalar_fields = extract_transfer_fields(request.req)
+            scalar_fields["request_id"] = request.req.request_id
             send_tensors(
                 self._denoiser_pushes[worker_idx], tensor_fields, scalar_fields
             )
             try:
                 self._tracker.transition(
-                    shard.client.request_id,
+                    request.client_request_id,
                     RequestState.DENOISING_RUNNING,
                     denoiser_instance=worker_idx,
                 )
@@ -683,7 +623,7 @@ class DiffusionServer:
             logger.info(
                 "GLM distributed mode dispatched request with %d output(s) "
                 "to denoiser[%d]",
-                shard.client.req.num_outputs_per_prompt,
+                request.req.num_outputs_per_prompt,
                 worker_idx,
             )
 
@@ -694,13 +634,14 @@ class DiffusionServer:
         assert state is not None
         event = recv_monitor_message(monitor, flags=zmq.NOBLOCK)["event"]
         if event == zmq.EVENT_DISCONNECTED:
-            state.worker_available[worker_idx] = False
+            state.denoiser_worker_available[worker_idx] = False
             logger.warning("GLM denoiser[%d] disconnected", worker_idx)
         elif event == zmq.EVENT_CONNECTED:
             registered = worker_idx in self._denoiser_peers
-            state.worker_available[worker_idx] = True
+            state.denoiser_worker_available[worker_idx] = True
             if not any(
-                shard.worker_idx == worker_idx for shard in state.shards.values()
+                request.worker_idx == worker_idx
+                for request in state.denoiser_requests.values()
             ):
                 self._denoiser_free_slots[worker_idx] = 1
             logger.info(
@@ -713,18 +654,19 @@ class DiffusionServer:
         state = self._glm_distributed_state
         assert state is not None
         tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
-        shard_id = scalar_fields.get("request_id")
-        shard = state.shards.pop(shard_id, None)
-        if shard is None:
-            logger.warning("Unknown GLM distributed shard result: %s", shard_id)
+        denoiser_request_id = scalar_fields.get("request_id")
+        request = state.denoiser_requests.pop(denoiser_request_id, None)
+        if request is None:
+            logger.warning(
+                "Unknown GLM distributed denoiser result: %s", denoiser_request_id
+            )
             return
-        if shard.worker_idx is not None:
-            self._denoiser_free_slots[shard.worker_idx] = 1
+        if request.worker_idx is not None:
+            self._denoiser_free_slots[request.worker_idx] = 1
 
         error = scalar_fields.get("error")
         output = tensor_fields.get("output")
-        client = shard.client
-        total = max(1, int(client.req.num_outputs_per_prompt or 1))
+        total = max(1, int(request.req.num_outputs_per_prompt or 1))
         output_size = len(output) if output is not None else None
         if output_size is not None and output_size != total:
             error = (
@@ -739,25 +681,23 @@ class DiffusionServer:
             usage=scalar_fields.get("usage"),
         )
         with self._lock:
-            identity = self._pending.pop(client.request_id, None)
+            identity = self._pending.pop(request.client_request_id, None)
         if identity is not None:
             self._frontend.send_multipart([identity, b"", pickle.dumps(result)])
         try:
-            self._tracker.transition(client.request_id, RequestState.DENOISING_DONE)
             self._tracker.transition(
-                client.request_id,
+                request.client_request_id, RequestState.DENOISING_DONE
+            )
+            self._tracker.transition(
+                request.client_request_id,
                 RequestState.FAILED if error else RequestState.DONE,
                 error=error,
             )
         except ValueError:
             pass
-        self._tracker.remove(client.request_id)
+        self._tracker.remove(request.client_request_id)
 
     def _handle_decoder_result_frames(self, frames: list) -> None:
-        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-            OutputBatch,
-        )
-
         request_id = self._extract_request_id(frames)
         if request_id is None:
             logger.warning("DiffusionServer: decoder result missing request_id")
@@ -884,10 +824,6 @@ class DiffusionServer:
             return None
 
     def _complete_with_error(self, request_id: str, error_msg: str) -> None:
-        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-            OutputBatch,
-        )
-
         logger.error("DiffusionServer: %s — %s", request_id, error_msg)
 
         try:
@@ -943,21 +879,23 @@ class DiffusionServer:
             )
             if self._glm_distributed_state is not None:
                 state = self._glm_distributed_state
-                state.ar_queue = deque(
-                    entry
-                    for entry in state.ar_queue
-                    if entry.request_id not in timed_set
+                state.pending_ar_requests = deque(
+                    request
+                    for request in state.pending_ar_requests
+                    if request.client_request_id not in timed_set
                 )
-                state.shard_queue = deque(
-                    shard
-                    for shard in state.shard_queue
-                    if shard.client.request_id not in timed_set
+                state.pending_denoiser_requests = deque(
+                    request
+                    for request in state.pending_denoiser_requests
+                    if request.client_request_id not in timed_set
                 )
-                for shard_id, shard in list(state.shards.items()):
-                    if shard.client.request_id in timed_set:
-                        state.shards.pop(shard_id, None)
-                        if shard.worker_idx is not None:
-                            self._denoiser_free_slots[shard.worker_idx] = 1
+                for denoiser_request_id, request in list(
+                    state.denoiser_requests.items()
+                ):
+                    if request.client_request_id in timed_set:
+                        state.denoiser_requests.pop(denoiser_request_id)
+                        if request.worker_idx is not None:
+                            self._denoiser_free_slots[request.worker_idx] = 1
 
     def _free_slot_for_record(self, record) -> None:
         if (
@@ -1048,7 +986,7 @@ class DiffusionServer:
         info["free_preallocated_slots"] = list(prealloc)
         peers[idx] = info
         if role == RoleType.DENOISER and self._glm_distributed_state is not None:
-            self._glm_distributed_state.worker_available[idx] = True
+            self._glm_distributed_state.denoiser_worker_available[idx] = True
 
         logger.info(
             "DiffusionServer transfer: registered %s[%d] work_endpoint=%s "
@@ -1408,10 +1346,6 @@ class DiffusionServer:
             )
 
     def _transfer_return_to_client_from_msg(self, request_id: str, msg: dict) -> None:
-        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-            OutputBatch,
-        )
-
         with self._lock:
             client_identity = self._pending.pop(request_id, None)
 
@@ -1460,10 +1394,14 @@ class DiffusionServer:
             state = self._glm_distributed_state
             stats.update(
                 {
-                    "glm_ar_queue_depth": len(state.ar_queue),
-                    "glm_ar_in_flight": state.ar_inflight is not None,
-                    "glm_denoiser_queue_depth": len(state.shard_queue),
-                    "glm_denoiser_worker_available": list(state.worker_available),
+                    "glm_ar_queue_depth": len(state.pending_ar_requests),
+                    "glm_ar_in_flight": state.active_ar_batch is not None,
+                    "glm_denoiser_queue_depth": len(
+                        state.pending_denoiser_requests
+                    ),
+                    "glm_denoiser_worker_available": list(
+                        state.denoiser_worker_available
+                    ),
                 }
             )
         return stats
