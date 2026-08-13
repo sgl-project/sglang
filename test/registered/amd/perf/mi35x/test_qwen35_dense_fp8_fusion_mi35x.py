@@ -1,10 +1,10 @@
 """MI35x PR-CI accuracy gate for the Qwen3.5 dense-FP8 fused down_proj path.
 
-Two parallel TP4 servers on the MXFP4-AttnFP8 checkpoint (8-GPU stage-c):
---enable-dense-fp8 (GPUs 0-3, shared_expert.down_proj -> online w8a8 FP8 with a
-fused SiluAndMul+quant kernel) vs bf16 baseline (GPUs 4-7). The fused path must
-hold GSM8K accuracy against the baseline. Default-off, so untested by a plain CI
-run; nightly single-server eval is in accuracy/mi35x/test_qwen35_dense_fp8_mi35x.py.
+Two parallel TP4 servers on the MXFP4 checkpoint (8-GPU stage-c): --enable-dense-fp8
+(GPUs 0-3, shared_expert.down_proj -> online w8a8 FP8 with a fused SiluAndMul+quant
+kernel) vs bf16 baseline (GPUs 4-7). The fused path must hold GSM8K accuracy against
+the baseline. Default-off, so untested by a plain CI run; nightly single-server eval
+is in accuracy/mi35x/test_qwen35_dense_fp8_mi35x.py.
 """
 
 import os
@@ -31,9 +31,11 @@ from sglang.utils import download_and_cache_file
 
 register_amd_ci(est_time=4800, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
-QWEN35_ATTNFP8_MODEL_PATH = os.environ.get(
-    "QWEN35_ATTNFP8_MODEL_PATH",
-    "amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2",
+# Promotion only reaches layers the checkpoint excludes: this one leaves
+# shared_expert.down_proj bf16, while AttnFP8-V2 quantizes it (nothing to promote).
+QWEN35_MXFP4_MODEL_PATH = os.environ.get(
+    "QWEN35_MXFP4_MODEL_PATH",
+    "amd/Qwen3.5-397B-A17B-MXFP4",
 )
 SERVER_LAUNCH_TIMEOUT = 4800
 GSM8K_NUM_QUESTIONS = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
@@ -123,7 +125,7 @@ class TestQwen35DenseFp8MI35x(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = QWEN35_ATTNFP8_MODEL_PATH
+        cls.model = QWEN35_MXFP4_MODEL_PATH
         cls.variants = get_dense_fp8_variants()
         # Pre-fetch once so the two parallel subprocesses don't race the cache write.
         cls.gsm8k_data_path = download_and_cache_file(GSM8K_DATA_URL)
@@ -176,10 +178,7 @@ class TestQwen35DenseFp8MI35x(CustomTestCase):
             kill_process_tree(process.pid)
 
     def test_qwen35_dense_fp8_accuracy(self):
-        summary = (
-            "### Qwen3.5 MXFP4-AttnFP8 --enable-dense-fp8 GSM8K "
-            "(MI35x, parallel TP4)\n\n"
-        )
+        summary = "### Qwen3.5 MXFP4 --enable-dense-fp8 GSM8K (MI35x, parallel TP4)\n\n"
         summary += (
             "| Variant | GPUs | Accuracy | Invalid | Latency (s) | Output tok/s | "
             "Threshold | Status |\n"
