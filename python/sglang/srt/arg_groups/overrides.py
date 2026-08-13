@@ -1057,7 +1057,15 @@ def _llama4_overrides(server_args: Any, hf_config: Any) -> dict:
 )
 def _gemma4_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides: Dict[str, Any] = {}
-    default_attention_backend = "trtllm_mha" if is_sm100_supported() else "triton"
+    # trtllm_mha is not deterministic-capable: with
+    # --enable-deterministic-inference it would make
+    # _deterministic_attention_backend raise as if the user had picked it
+    # explicitly. triton is the Gemma4-compatible backend that supports
+    # deterministic inference (radix cache included), so prefer it there.
+    if is_sm100_supported() and not server_args.enable_deterministic_inference:
+        default_attention_backend = "trtllm_mha"
+    else:
+        default_attention_backend = "triton"
     if server_args.is_attention_backend_not_set():
         logger.info(
             f"Use {default_attention_backend} as default attention backend for Gemma4"

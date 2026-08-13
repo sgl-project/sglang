@@ -2027,6 +2027,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 device="cuda",
                 attention_backend=None,
                 is_attention_backend_not_set=lambda: True,
+                enable_deterministic_inference=False,
                 # keep the (now-absorbed) quant/moe blocks inert so these
                 # assertions stay attention-only
                 moe_runner_backend="triton",
@@ -2045,6 +2046,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             self.assertEqual(
                 _gemma4_overrides(_args(), None), {"attention_backend": "trtllm_mha"}
+            )
+            # Deterministic inference: trtllm_mha would be rejected by
+            # _deterministic_attention_backend, so the Gemma4 default must
+            # switch to triton even on SM100.
+            self.assertEqual(
+                _gemma4_overrides(_args(enable_deterministic_inference=True), None),
+                {"attention_backend": "triton"},
             )
             self.assertEqual(
                 _minicpm_v4_6_overrides(_args(), None),
