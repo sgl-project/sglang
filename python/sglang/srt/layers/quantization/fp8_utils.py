@@ -448,6 +448,21 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
         return flashinfer_mxfp8_blockscaled_linear
     elif backend.is_triton():
         return triton_mxfp8_blockscaled_linear
+    elif backend.is_aiter():
+        if not _use_aiter:
+            raise RuntimeError(
+                "AITER MXFP8 GEMM requested via --fp8-gemm-backend=aiter, "
+                "but AITER is unavailable. Set SGLANG_USE_AITER=1 in the ROCm image."
+            )
+        if not (_is_hip and _is_gfx95_supported):
+            raise RuntimeError(
+                "AITER/FlyDSL dense MXFP8 currently requires ROCm gfx950."
+            )
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+            flydsl_mxfp8_blockscaled_linear,
+        )
+
+        return flydsl_mxfp8_blockscaled_linear
     elif _is_hip and _is_gfx95_supported:
         from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
             dot_scaled_mxfp8_blockscaled_linear,
@@ -605,6 +620,11 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
         backend = Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
 
     FP8_GEMM_RUNNER_BACKEND = backend
+    logger.info(
+        "FP8 GEMM backend requested=%s effective=%s",
+        server_args.fp8_gemm_runner_backend,
+        FP8_GEMM_RUNNER_BACKEND.value,
+    )
 
 
 def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:

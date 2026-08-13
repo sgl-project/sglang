@@ -31,7 +31,9 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (  # noqa: E402
     _mxfp8_dot_scaled_linear,
     _mxfp8_e4m3_quantize_torch,
     _mxfp8_e4m3_quantize_triton,
+    _shuffle_flydsl_activation_scale,
     dequant_mxfp8_to_bf16,
+    mxfp8_e4m3_quantize_flydsl,
 )
 
 DEVICE = "cuda"
@@ -57,6 +59,117 @@ def _relerr(a: torch.Tensor, b: torch.Tensor) -> float:
     return ((a - b).norm() / (b.norm() + 1e-8)).item()
 
 
+def test_mxfp8_aiter_backend_reaches_flydsl(monkeypatch):
+    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+        flydsl_mxfp8_blockscaled_linear,
+    )
+    from sglang.srt.layers.quantization import fp8_utils
+
+    monkeypatch.setattr(fp8_utils, "_use_aiter", True)
+    monkeypatch.setattr(fp8_utils, "_is_hip", True)
+    monkeypatch.setattr(fp8_utils, "_is_gfx95_supported", True)
+    monkeypatch.setattr(
+        fp8_utils,
+        "FP8_GEMM_RUNNER_BACKEND",
+        fp8_utils.Fp8GemmRunnerBackend.AITER,
+    )
+
+    assert (
+        fp8_utils.dispatch_w8a8_mxfp8_linear()
+        is flydsl_mxfp8_blockscaled_linear
+    )
+
+
+@torch.inference_mode()
+def test_mxfp8_flydsl_weight_derivation_is_idempotent(monkeypatch):
+    from sglang.kernels.ops.quantization import mxfp8_amd_gfx95
+    from sglang.srt.layers.quantization import fp8 as fp8_module
+    from sglang.srt.layers.quantization import fp8_utils
+
+    monkeypatch.setattr(fp8_module, "_use_aiter", True)
+    monkeypatch.setattr(fp8_module, "_is_hip", True)
+    monkeypatch.setattr(fp8_module, "_is_gfx95_supported", True)
+    monkeypatch.setattr(
+        fp8_utils,
+        "FP8_GEMM_RUNNER_BACKEND",
+        fp8_utils.Fp8GemmRunnerBackend.AITER,
+    )
+    monkeypatch.setattr(
+        mxfp8_amd_gfx95, "MXFP8_FLYDSL_WEIGHT_SHAPES", frozenset({(32, 256)})
+    )
+    monkeypatch.setattr(
+        mxfp8_amd_gfx95,
+        "get_flydsl_mxfp8_config",
+        lambda m, n, k: {"kernelName": "test", "splitK": 1},
+    )
+
+    layer = torch.nn.Module()
+    weight = torch.randn(
+        (32, 256), device=DEVICE, dtype=torch.bfloat16
+    ).to(torch.float8_e4m3fn)
+    scale = torch.randint(
+        120, 130, (32, 8), device=DEVICE, dtype=torch.uint8
+    )
+    layer.register_parameter("weight", torch.nn.Parameter(weight, requires_grad=False))
+    layer.register_parameter(
+        "weight_scale_inv", torch.nn.Parameter(scale, requires_grad=False)
+    )
+    canonical_weight = layer.weight.detach().clone()
+    canonical_scale = layer.weight_scale_inv.detach().clone()
+
+    method = fp8_module.Fp8LinearMethod.__new__(fp8_module.Fp8LinearMethod)
+    method.use_mxfp8 = True
+    method._process_mxfp8_linear_weight_scale(layer)
+    derived_weight_ptr = layer.weight_mxfp8_flydsl.data_ptr()
+    derived_scale_ptr = layer.weight_scale_inv_mxfp8_flydsl.data_ptr()
+    method._process_mxfp8_linear_weight_scale(layer)
+
+    assert torch.equal(layer.weight, canonical_weight)
+    assert torch.equal(layer.weight_scale_inv, canonical_scale)
+    assert layer.weight_mxfp8_flydsl.data_ptr() == derived_weight_ptr
+    assert layer.weight_scale_inv_mxfp8_flydsl.data_ptr() == derived_scale_ptr
+
+
+@torch.inference_mode()
+def test_mxfp8_flydsl_decode_buffers_are_pointer_stable():
+    from sglang.srt.layers.quantization import fp8 as fp8_module
+
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "weight",
+        torch.nn.Parameter(
+            torch.empty((32, 256), device=DEVICE, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        ),
+    )
+    method = fp8_module.Fp8LinearMethod.__new__(fp8_module.Fp8LinearMethod)
+
+    first = method._get_mxfp8_flydsl_runtime_buffers(
+        layer,
+        m=4,
+        n=32,
+        k=256,
+        output_dtype=torch.bfloat16,
+        split_k=2,
+    )
+    second = method._get_mxfp8_flydsl_runtime_buffers(
+        layer,
+        m=4,
+        n=32,
+        k=256,
+        output_dtype=torch.bfloat16,
+        split_k=2,
+    )
+
+    for name in (
+        "activation_scale_padded",
+        "activation_scale_shuffled",
+        "output_buffer",
+        "splitk_workspace",
+    ):
+        assert first[name].data_ptr() == second[name].data_ptr()
+
+
 # --------------------------------------------------------------------------- #
 # Fused MXFP8 activation quant (Triton vs torch reference)
 # --------------------------------------------------------------------------- #
@@ -76,6 +189,40 @@ def test_mxfp8_quant_triton_matches_torch(shape, dtype):
     deq_t = dequant_mxfp8_to_bf16(xq_t, s_t)
     deq_k = dequant_mxfp8_to_bf16(xq_k, s_k)
     assert _relerr(deq_k, deq_t) < 1e-2
+
+
+@pytest.mark.parametrize("m,k", [(4, 6144), (16, 3072), (64, 2048)])
+@torch.inference_mode()
+def test_mxfp8_flydsl_activation_scale_layout(m, k):
+    from aiter.ops.shuffle import shuffle_scale_a16w4
+
+    canonical = torch.randint(
+        0, 255, (m, k // 32), dtype=torch.uint8, device=DEVICE
+    )
+    padded_shape = ((m + 31) // 32 * 32, k // 32)
+    padded = torch.empty(padded_shape, dtype=torch.uint8, device=DEVICE)
+    shuffled = torch.empty_like(padded)
+    got = _shuffle_flydsl_activation_scale(canonical, padded, shuffled)
+    expected = shuffle_scale_a16w4(padded, 1, False)
+    assert torch.equal(got, expected)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("m,k", [(4, 6144), (16, 3072), (64, 2048)])
+@torch.inference_mode()
+def test_mxfp8_flydsl_direct_quant_is_canonical_exact(m, k):
+    from aiter.ops.shuffle import shuffle_scale_a16w4
+
+    torch.manual_seed(722)
+    x = torch.randn((m, k), device=DEVICE, dtype=torch.bfloat16)
+    canonical_q, canonical_scale = _mxfp8_e4m3_quantize_triton(x)
+    direct_q, direct_scale = mxfp8_e4m3_quantize_flydsl(x)
+
+    padded = torch.zeros_like(direct_scale)
+    padded[:m].copy_(canonical_scale)
+    expected_scale = shuffle_scale_a16w4(padded, 1, False)
+    assert torch.equal(direct_q.view(torch.uint8), canonical_q.view(torch.uint8))
+    assert torch.equal(direct_scale, expected_scale)
 
 
 @pytest.mark.parametrize("m,inter", [(8, 512), (65, 2048)])

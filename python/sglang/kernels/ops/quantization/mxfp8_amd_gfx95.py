@@ -6,14 +6,14 @@
     block scales directly, no dequant-to-BF16), lowering to the CDNA4 native MX
     matrix-core ops; ``K % 128 != 0`` falls back to dequant + ``F.linear``.
 
-Replaces the FlyDSL ``v_mfma_scale_f32_32x32x64`` dense path with a single
-Triton ``dot_scaled`` GEMM: no load-time weight reformat (fp8 + E8M0 are
-consumed as-is) and the activation is MXFP8-quantized in one fused pass.
+The canonical Triton path consumes checkpoint tensors as-is. Exact MiniMax-M3
+TP4 signatures may additionally use load-time AITER/FlyDSL preshuffled weights;
+unknown signatures and unsupported runtime topologies stay on Triton.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -25,6 +25,43 @@ MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
 MXFP8_SCALE_DTYPE = torch.uint8
 MXFP8_BLOCK_SIZE = 32
 MXFP8_E4M3_MAX = 448.0  # max representable magnitude of float8_e4m3fn
+
+# Per-rank TP4 weight shapes covered by the paired AITER tune table. Runtime
+# dispatch still requires an exact (M, N, K, architecture, CU-count) match.
+MXFP8_FLYDSL_WEIGHT_SHAPES = frozenset(
+    {
+        (2304, 6144),  # QKV
+        (2560, 6144),  # fused QKV + sparse index
+        (6144, 2048),  # attention output
+        (6144, 6144),  # dense gate/up
+        (6144, 3072),  # dense down
+        (1536, 6144),  # shared gate/up
+        (6144, 768),  # shared down
+    }
+)
+MXFP8_FLYDSL_M_VALUES = (
+    1,
+    2,
+    4,
+    8,
+    12,
+    16,
+    24,
+    32,
+    40,
+    48,
+    56,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    8320,
+    16384,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -104,6 +141,66 @@ def _mxfp8_quant_kernel(
     tl.store(s_ptr + offs_m * ssm + pid_b * ssk, sb.to(tl.uint8), mask=m_mask)
 
 
+@triton.jit
+def _mxfp8_quant_flydsl_scale_kernel(
+    x_ptr,
+    xq_ptr,
+    scale_shuffled_ptr,
+    M,
+    K,
+    stride_xm,
+    stride_xk,
+    stride_qm,
+    stride_qk,
+    SCALE_K1: tl.constexpr,
+    PADDED_M: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """Canonical MXFP8 quant with direct FlyDSL A16W4 scale stores."""
+    pid_m = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = pid_b * 32 + tl.arange(0, 32)
+    row_valid = rows < M
+
+    x = tl.load(
+        x_ptr + rows[:, None] * stride_xm + cols[None, :] * stride_xk,
+        mask=row_valid[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1.0e-30)
+    scale_biased = tl.ceil(tl.log2(amax / 448.0)) + 127.0
+    scale_biased = tl.minimum(tl.maximum(scale_biased, 0.0), 254.0)
+    descale = tl.exp2(scale_biased - 127.0)
+    xq = tl.clamp(x / descale[:, None], -448.0, 448.0).to(
+        xq_ptr.dtype.element_ty
+    )
+    tl.store(
+        xq_ptr + rows[:, None] * stride_qm + cols[None, :] * stride_qk,
+        xq,
+        mask=row_valid[:, None],
+    )
+
+    # shuffle_scale_a16w4(src, 1, False):
+    # [N1,NPack=2,NLane=16,K1,KPack=2,KLane=4]
+    # -> [N1,K1,KLane,NLane,KPack,NPack].
+    row_n1 = rows // 32
+    row_in_tile = rows % 32
+    n_pack = row_in_tile // 16
+    n_lane = row_in_tile % 16
+    k1 = pid_b // 8
+    k_in_tile = pid_b % 8
+    k_pack = k_in_tile // 4
+    k_lane = k_in_tile % 4
+    dst = row_n1 * (SCALE_K1 * 4 * 16 * 2 * 2)
+    dst += k1 * (4 * 16 * 2 * 2)
+    dst += k_lane * (16 * 2 * 2)
+    dst += n_lane * (2 * 2)
+    dst += k_pack * 2 + n_pack
+    scale_out = tl.where(row_valid, scale_biased, 0.0).to(tl.uint8)
+    tl.store(scale_shuffled_ptr + dst, scale_out, mask=rows < PADDED_M)
+
+
 def _mxfp8_e4m3_quantize_triton(
     x: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -133,6 +230,55 @@ def _mxfp8_e4m3_quantize_triton(
     return xq, scales
 
 
+def mxfp8_e4m3_quantize_flydsl(
+    x: torch.Tensor,
+    scale_shuffled: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize canonically while emitting FlyDSL-ready E8M0 scales."""
+    if x.ndim != 2:
+        raise ValueError("FlyDSL-layout MXFP8 quant requires a 2D input")
+    m, k = x.shape
+    if not x.is_cuda or k % 256 != 0:
+        raise ValueError("FlyDSL-layout MXFP8 quant requires CUDA and K % 256 == 0")
+
+    x = x.contiguous()
+    padded_m = triton.cdiv(m, 32) * 32
+    scale_shape = (padded_m, k // MXFP8_BLOCK_SIZE)
+    if scale_shuffled is None:
+        scale_shuffled = torch.empty(
+            scale_shape, dtype=MXFP8_SCALE_DTYPE, device=x.device
+        )
+    elif (
+        scale_shuffled.shape != scale_shape
+        or scale_shuffled.dtype != MXFP8_SCALE_DTYPE
+        or scale_shuffled.device != x.device
+        or not scale_shuffled.is_contiguous()
+    ):
+        raise ValueError(
+            "scale_shuffled must be contiguous uint8 on x.device with "
+            f"shape {scale_shape}"
+        )
+
+    xq = torch.empty((m, k), dtype=MXFP8_VALUE_DTYPE, device=x.device)
+    block_m = 64
+    grid = (triton.cdiv(padded_m, block_m), k // MXFP8_BLOCK_SIZE)
+    _mxfp8_quant_flydsl_scale_kernel[grid](
+        x,
+        xq,
+        scale_shuffled,
+        m,
+        k,
+        x.stride(0),
+        x.stride(1),
+        xq.stride(0),
+        xq.stride(1),
+        SCALE_K1=(k // MXFP8_BLOCK_SIZE) // 8,
+        PADDED_M=padded_m,
+        BLOCK_M=block_m,
+    )
+    return xq, scale_shuffled
+
+
 def mxfp8_e4m3_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-token MXFP8 quant -> (fp8 values, [.., K//32] uint8 UE8M0 scales).
 
@@ -142,6 +288,68 @@ def mxfp8_e4m3_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     if x.ndim == 2 and x.shape[-1] % MXFP8_BLOCK_SIZE == 0 and x.is_cuda:
         return _mxfp8_e4m3_quantize_triton(x.contiguous())
     return _mxfp8_e4m3_quantize_torch(x)
+
+
+def get_flydsl_mxfp8_config(m: int, n: int, k: int) -> Optional[Dict]:
+    """Return the paired AITER tune for one exact accepted signature."""
+    if (int(n), int(k)) not in MXFP8_FLYDSL_WEIGHT_SHAPES:
+        return None
+    try:
+        from aiter.ops.flydsl import get_mxscale_preshuffle_config
+    except ImportError as error:
+        raise RuntimeError(
+            "AITER/FlyDSL dense MXFP8 requires the paired AITER "
+            "v0.1.19.post2 release-port branch."
+        ) from error
+
+    return get_mxscale_preshuffle_config(
+        int(m), int(n), int(k), a_dtype="fp8", b_dtype="fp8"
+    )
+
+
+def _shuffle_flydsl_activation_scale(
+    canonical: torch.Tensor,
+    padded: torch.Tensor,
+    shuffled: torch.Tensor,
+) -> torch.Tensor:
+    """Pad canonical [M,K/32] E8M0 scales and write the FlyDSL layout."""
+    if (
+        canonical.ndim != 2
+        or canonical.dtype != MXFP8_SCALE_DTYPE
+        or not canonical.is_contiguous()
+    ):
+        raise ValueError("canonical scale must be contiguous 2D uint8")
+
+    m, scale_k = canonical.shape
+    padded_m = (m + 31) // 32 * 32
+    expected_shape = (padded_m, scale_k)
+    if (
+        padded.shape != expected_shape
+        or shuffled.shape != expected_shape
+        or padded.dtype != MXFP8_SCALE_DTYPE
+        or shuffled.dtype != MXFP8_SCALE_DTYPE
+        or padded.device != canonical.device
+        or shuffled.device != canonical.device
+        or not padded.is_contiguous()
+        or not shuffled.is_contiguous()
+    ):
+        raise ValueError(
+            "FlyDSL activation-scale buffers must be contiguous uint8 on the "
+            f"input device with shape {expected_shape}"
+        )
+    if scale_k % 8 != 0:
+        raise ValueError(
+            f"FlyDSL MXFP8 scale K ({scale_k}) must be divisible by 8"
+        )
+
+    padded.zero_()
+    padded[:m].copy_(canonical)
+    n1 = padded_m // 32
+    k1 = scale_k // 8
+    source = padded.view(1, n1, 2, 16, k1, 2, 4)
+    destination = shuffled.view(1, n1, k1, 4, 16, 2, 2)
+    destination.copy_(source.permute(0, 1, 4, 6, 3, 5, 2))
+    return shuffled
 
 
 def dequant_mxfp8_to_bf16(x: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -331,3 +539,124 @@ def dot_scaled_mxfp8_blockscaled_linear(
     if bias is not None:
         out = out + bias
     return out.to(output_dtype).view(*output_shape)
+
+
+def flydsl_mxfp8_blockscaled_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
+    *,
+    config: Optional[Dict] = None,
+    activation_scale_padded: Optional[torch.Tensor] = None,
+    activation_scale_shuffled: Optional[torch.Tensor] = None,
+    output_buffer: Optional[torch.Tensor] = None,
+    splitk_workspace: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run one exact tuned AITER/FlyDSL dense MXFP8 signature.
+
+    ``weight`` and ``weight_scale`` are load-time preshuffled copies. Canonical
+    tensors remain owned by the caller for Triton fallback.
+    """
+    input_2d = input.view(-1, input.shape[-1]).contiguous()
+    m, k = input_2d.shape
+    n, weight_k = weight.shape
+    if k != weight_k:
+        raise ValueError(f"input K ({k}) does not match weight K ({weight_k})")
+    if weight.dtype != MXFP8_VALUE_DTYPE:
+        raise ValueError("FlyDSL MXFP8 weight must be float8_e4m3fn")
+    if weight_scale.dtype != MXFP8_SCALE_DTYPE:
+        raise ValueError("FlyDSL MXFP8 weight scale must be uint8 E8M0")
+
+    if output_dtype is None:
+        output_dtype = (
+            input_2d.dtype
+            if input_2d.dtype in (torch.float16, torch.bfloat16)
+            else torch.bfloat16
+        )
+
+    padded_shape = ((m + 31) // 32 * 32, k // MXFP8_BLOCK_SIZE)
+    if activation_scale_shuffled is None:
+        activation_scale_shuffled = torch.empty(
+            padded_shape, dtype=MXFP8_SCALE_DTYPE, device=input.device
+        )
+
+    if input_scale is None:
+        x_q, activation_scale_shuffled = mxfp8_e4m3_quantize_flydsl(
+            input_2d, activation_scale_shuffled
+        )
+    else:
+        if input_2d.dtype != MXFP8_VALUE_DTYPE:
+            raise ValueError("pre-quantized FlyDSL input must be FP8 E4M3")
+        if (
+            input_scale.dtype != MXFP8_SCALE_DTYPE
+            or input_scale.shape != (m, k // MXFP8_BLOCK_SIZE)
+        ):
+            raise ValueError("input_scale must be uint8 E8M0 with shape [M,K/32]")
+        x_q = input_2d
+        if activation_scale_padded is None:
+            activation_scale_padded = torch.empty(
+                padded_shape, dtype=MXFP8_SCALE_DTYPE, device=input.device
+            )
+        _shuffle_flydsl_activation_scale(
+            input_scale, activation_scale_padded, activation_scale_shuffled
+        )
+
+    selected_config = (
+        config if config is not None else get_flydsl_mxfp8_config(m, n, k)
+    )
+    if selected_config is None:
+        raise RuntimeError(f"no accepted FlyDSL MXFP8 config for {(m, n, k)}")
+
+    if output_buffer is None:
+        output_buffer = torch.empty(
+            (m, n), dtype=output_dtype, device=input.device
+        )
+    elif (
+        output_buffer.shape != (m, n)
+        or output_buffer.dtype != output_dtype
+        or output_buffer.device != input.device
+        or not output_buffer.is_contiguous()
+    ):
+        raise ValueError(
+            f"output_buffer must be contiguous on {input.device} with "
+            f"shape {(m, n)} and dtype {output_dtype}"
+        )
+
+    split_k = int(selected_config.get("splitK", 1))
+    if splitk_workspace is not None and (
+        splitk_workspace.shape != (split_k, m, n)
+        or splitk_workspace.dtype != torch.float32
+        or splitk_workspace.device != input.device
+        or not splitk_workspace.is_contiguous()
+    ):
+        raise ValueError(
+            "splitk_workspace must be contiguous float32 on the input device "
+            f"with shape {(split_k, m, n)}"
+        )
+
+    try:
+        from aiter.ops.flydsl import gemm_mxscale_preshuffle
+    except ImportError as error:
+        raise RuntimeError(
+            "AITER/FlyDSL dense MXFP8 requires the paired AITER "
+            "v0.1.19.post2 release-port branch."
+        ) from error
+
+    gemm_mxscale_preshuffle(
+        x_q,
+        weight,
+        activation_scale_shuffled,
+        weight_scale,
+        output_buffer,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        config=selected_config,
+        require_tuned=True,
+        splitk_workspace=splitk_workspace,
+    )
+    if bias is not None:
+        output_buffer.add_(bias)
+    return output_buffer.view(*input.shape[:-1], n)
