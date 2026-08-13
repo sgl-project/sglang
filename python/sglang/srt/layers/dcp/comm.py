@@ -446,7 +446,38 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
     _FI_A2A_STATE = {
         "workspace": workspace,
         "cp_rank": cp_rank,
+        "send_buffers": {},
     }
+
+
+def _fi_a2a_send_buffers(
+    batch: int,
+    h_per_rank: int,
+    cp_size: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+):
+    """Persistent send tensors for the FlashInfer exchange, sliced to ``batch``.
+
+    The exchange does not write its inputs, so ``softmax_stats`` slots past the
+    LSE stay zero after the one-time allocation and only slot 0 is refreshed per
+    call. Buffers are grown on demand and never shrink, which also keeps their
+    addresses stable for graph capture.
+    """
+    key = (h_per_rank, cp_size, head_dim, dtype)
+    cache = _FI_A2A_STATE["send_buffers"]
+    entry = cache.get(key)
+    if entry is None or entry[0].shape[0] < batch:
+        partial_o = torch.empty(
+            batch, h_per_rank, cp_size, head_dim, dtype=dtype, device=device
+        )
+        softmax_stats = torch.zeros(
+            batch, h_per_rank, cp_size, 2, dtype=torch.float32, device=device
+        )
+        entry = (partial_o, softmax_stats)
+        cache[key] = entry
+    return entry[0][:batch], entry[1][:batch]
 
 
 def dcp_a2a_lse_reduce(
@@ -491,7 +522,15 @@ def dcp_a2a_lse_reduce(
         )
         recv_combined = torch.empty_like(send_combined)
 
-    dcp_pack_a2a_send(cp_attn_out, cp_attn_lse, send_combined)
+    # One buffer, two views: payload rows and the trailing fp32 LSE lane. Keeps
+    # the exchange to a single collective.
+    send_words = send_combined.view(torch.float32)
+    dcp_pack_a2a_send(
+        cp_attn_out,
+        cp_attn_lse,
+        send_combined[:, :, :, :D],
+        send_words[:, :, :, D // lpd],
+    )
 
     # Transport as raw bytes (uint8): the output may be fp8 (fp8 KV cache),
     # which pynccl's dtype enum can't send; byte a2a is exact for equal chunks.
@@ -533,16 +572,19 @@ def _dcp_fi_a2a_lse_reduce(
     assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
     H_per_rank = H // N
 
-    # FlashInfer sends partial_o[..., peer, :] to `peer`; head h -> peer h//H_per_rank,
-    # so the peer axis is the outer head split: [B,N,H_pr,D] -> [B,H_pr,N,D].
-    partial_o = cp_attn_out.view(B, N, H_per_rank, D).permute(0, 2, 1, 3).contiguous()
-    # softmax_stats: fp32 [B, H_per_rank, N, S=2] (FI requires S>=2 & even);
-    # carry the LSE in lane 0, lane 1 is ignored by the combine.
-    lse_view = cp_attn_lse.view(B, N, H_per_rank).permute(0, 2, 1)  # [B,H_pr,N]
-    softmax_stats = torch.zeros(
-        B, H_per_rank, N, 2, dtype=torch.float32, device=cp_attn_out.device
+    # FlashInfer wants the peer axis inside the heads: partial_o
+    # [B, H_pr, cp_size, D] and softmax_stats [B, H_pr, cp_size, S>=2] with the
+    # LSE in lane 0. That is only a stride permutation of what the pack kernel
+    # already writes, so pack straight into it instead of permuting first.
+    partial_o, softmax_stats = _fi_a2a_send_buffers(
+        B, H_per_rank, N, D, cp_attn_out.dtype, cp_attn_out.device
     )
-    softmax_stats[..., 0] = lse_view
+    dcp_pack_a2a_send(
+        cp_attn_out,
+        cp_attn_lse,
+        partial_o.permute(2, 0, 1, 3),
+        softmax_stats[..., 0].permute(2, 0, 1),
+    )
 
     o_out, stats_out = decode_cp_a2a_alltoall(
         partial_o,
@@ -552,9 +594,10 @@ def _dcp_fi_a2a_lse_reduce(
         N,
     )
 
-    # o_out[b,hpr,src] = rank src's partial for local head hpr -> combine layout.
-    recv_output = o_out.permute(2, 0, 1, 3).contiguous()  # [N, B, H_per_rank, D]
-    recv_lse = stats_out[..., 0].permute(2, 0, 1).contiguous()  # [N, B, H_per_rank]
+    # The combine kernel takes strides, so the returned tensors are read in
+    # place: no contiguous() on either side.
+    recv_output = o_out.permute(2, 0, 1, 3)
+    recv_lse = stats_out[..., 0].permute(2, 0, 1)
 
     combined, _ = dcp_lse_combine_triton(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
