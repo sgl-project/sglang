@@ -61,7 +61,7 @@ def _cached_decode_mean_std(
     return mean, std
 
 
-def _reverse_normalize_latents_(
+def _reverse_normalize_latents(
     latents: torch.Tensor,
     *,
     mean_values,
@@ -89,7 +89,12 @@ def _reverse_normalize_latents_(
         )
     view_shape = [1] * latents.ndim
     view_shape[1] = int(mean.shape[0])
-    return latents.mul_(std.view(*view_shape)).add_(mean.view(*view_shape))
+    # 故意不用原地：batch.latents / batch.audio_latents 是去噪阶段在 InferenceMode
+    # 内分配的 inference tensor，而 --vae-cpu-offload 会让本 stage 跑在
+    # torch.inference_mode(False) 下（PipelineExecutor._stage_needs_version_counters），
+    # 此时原地写 inference tensor 直接抛错。保持 mul 再 add 的两步舍入顺序，
+    # 不用 addcmul，避免引入 FMA 带来的数值差异。
+    return latents * std.view(*view_shape) + mean.view(*view_shape)
 
 
 def _crop_to_target_canvas(batch: Req, frames: torch.Tensor) -> torch.Tensor:
@@ -276,7 +281,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
             if audio_vae.training:
                 audio_vae.eval()
             audio_arch_config = server_args.pipeline_config.audio_vae_config.arch_config
-            audio_decode_latent = _reverse_normalize_latents_(
+            audio_decode_latent = _reverse_normalize_latents(
                 audio_latent,
                 mean_values=audio_arch_config.latents_mean,
                 std_values=audio_arch_config.latents_std,
@@ -332,7 +337,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
             if selected_video_vae.training:
                 selected_video_vae.eval()
             visual_arch_config = server_args.pipeline_config.vae_config.arch_config
-            visual_decode_latent = _reverse_normalize_latents_(
+            visual_decode_latent = _reverse_normalize_latents(
                 visual_latent,
                 mean_values=visual_arch_config.latents_mean,
                 std_values=visual_arch_config.latents_std,
