@@ -18,6 +18,12 @@ from ..common.utils import (
 )
 
 
+def _prune_decode_configs(configs, named_args, **kwargs):
+    """Drop autotune configs whose token tile is smaller than a sparse block."""
+    block_size = named_args["block_size"]
+    return [config for config in configs if config.kwargs["BLOCK_SIZE_N"] >= block_size]
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_H": lambda args: max(
@@ -41,6 +47,7 @@ from ..common.utils import (
         "block_size",
         "SCORE_TYPE",
     ],
+    prune_configs_by={"early_config_prune": _prune_decode_configs},
 )
 @triton.jit
 def _decode_score_kernel(
@@ -228,6 +235,7 @@ def _decode_score_kernel(
         "HAS_SINK",
         "SCORE_TYPE",
     ],
+    prune_configs_by={"early_config_prune": _prune_decode_configs},
 )
 @triton.jit
 def _decode_score_attn_kernel(
