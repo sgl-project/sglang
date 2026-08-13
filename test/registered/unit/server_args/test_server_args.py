@@ -262,19 +262,17 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
-    def test_default_transport_is_cuda_ipc_for_multimodal_model(self, _mock_is_cuda):
+    def test_default_transport_is_cpu_for_multimodal_model(self, _mock_is_cuda):
         server_args = ServerArgs(model_path="dummy")
         self._set_model_type(server_args, is_multimodal=True)
 
         with patch.dict(os.environ, {}, clear=False):
             envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
-            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+            with self.assertNoLogs(server_args_module.logger, level="INFO"):
                 server_args._handle_multimodal_feature_transport()
 
-            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
-            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-
-        self.assertIn("auto-resolved to cuda_ipc", "\n".join(logs.output))
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @patch("sglang.srt.server_args.os.path.exists", return_value=True)
     @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True)
@@ -362,7 +360,7 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
-    def test_default_transport_is_cuda_ipc_for_language_only_model(self, _mock_is_cuda):
+    def test_default_transport_is_cpu_for_language_only_model(self, _mock_is_cuda):
         server_args = ServerArgs(model_path="dummy", language_only=True)
         self._set_model_type(server_args, is_multimodal=True)
 
@@ -370,8 +368,8 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
             server_args._handle_multimodal_feature_transport()
 
-            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
-            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @patch("sglang.srt.server_args.is_cuda", return_value=False)
     def test_cuda_ipc_rejects_non_nvidia_platforms(self, _mock_is_cuda):
