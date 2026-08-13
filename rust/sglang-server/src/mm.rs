@@ -136,13 +136,16 @@ fn parse_caller_hash(entry: &str) -> Option<u64> {
 
 /// One parked result: the buffers the drain-time Python adapter needs (the
 /// expanded `input_ids` travel separately, via `TmEvent::MmEncoded`). The qwen
-/// shape (`sglang_mm::qwen_vl::pack_result`); generalizes to a
+/// shape (`sglang_mm::qwen_vl::pack_output`); generalizes to a
 /// named-tensor handoff once a family needs a different one.
 pub struct MmEncodedEntry {
     pub features: FeatureStore,
+    /// Per item `[t, h, w]` patch grid.
     pub grids: Vec<[u32; 3]>,
     pub hashes: Vec<u64>,
+    /// Per item inclusive token range in the expanded prompt.
     pub offsets: Vec<(u32, u32)>,
+    /// Flattened row-major `[3, input_len]` M-RoPE positions.
     pub mrope: Vec<i64>,
     pub mrope_delta: i64,
 }
@@ -222,7 +225,7 @@ fn process(
         })?;
         tokenizer.encode(text).map_err(|error| error.to_string())
     })?;
-    let mut packed = sglang_mm::qwen_vl::pack_result(output)?;
+    let mut packed = sglang_mm::qwen_vl::pack_output(output)?;
     apply_caller_hashes(&mut packed.hashes, &caller_hashes);
     let features = if ctx.feature_shm {
         park_features_in_shm(&packed.features, &packed.grids)

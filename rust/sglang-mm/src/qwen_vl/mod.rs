@@ -346,18 +346,22 @@ pub fn mrope_image_only(
 /// [`Output`](crate::driver::Output). Shared by `sglang-server`'s MM worker
 /// and the parity binding so the mapping can't drift; replaced by a generic
 /// named-tensor handoff once a second family needs a different shape.
-pub struct QwenEncodedResult {
+pub struct QwenPackedOutput {
     pub input_ids: Vec<i32>,
-    /// All items' `pixel_values`, concatenated in prompt order.
+    /// All items' `pixel_values`, concatenated in prompt order; flattened
+    /// `[Σ t·h·w, 3·temporal_patch_size·patch_size²]`.
     pub features: Vec<f32>,
+    /// Per item `[t, h, w]` patch grid.
     pub grids: Vec<[u32; 3]>,
     pub hashes: Vec<u64>,
+    /// Per item inclusive token range in `input_ids`.
     pub offsets: Vec<(u32, u32)>,
+    /// Flattened row-major `[3, input_len]` M-RoPE positions.
     pub mrope: Vec<i64>,
     pub mrope_delta: i64,
 }
 
-pub fn pack_result(output: crate::driver::Output) -> Result<QwenEncodedResult, String> {
+pub fn pack_output(output: crate::driver::Output) -> Result<QwenPackedOutput, String> {
     use crate::pipeline::PositionOutput;
 
     let PositionOutput::MRope { positions, delta } = output.positions else {
@@ -382,7 +386,7 @@ pub fn pack_result(output: crate::driver::Output) -> Result<QwenEncodedResult, S
         grids.push([grid[0] as u32, grid[1] as u32, grid[2] as u32]);
         hashes.push(item.hash);
     }
-    Ok(QwenEncodedResult {
+    Ok(QwenPackedOutput {
         input_ids: output.input_ids,
         features,
         grids,
@@ -510,7 +514,7 @@ mod python {
                 let output = crate::driver::process(family.as_ref(), input, |_| {
                     Err("native parity API requires input_ids".into())
                 })?;
-                pack_result(output)
+                pack_output(output)
             })
             .map_err(PyValueError::new_err)?;
         Ok((

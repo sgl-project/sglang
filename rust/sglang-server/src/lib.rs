@@ -38,11 +38,15 @@ use crate::runtime::{Runtime, RuntimeConfig};
 /// broadcasts across TP ranks and Python wraps each in a `ShmPointerMMData`.
 #[pyclass(frozen, get_all)]
 struct MmEncodedResult {
+    /// Flattened; the drain reshapes to `(-1, feature_dim)`.
     features: Option<Py<numpy::PyArray1<f32>>>,
     shm_names: Option<Vec<String>>,
+    /// Per item `(t, h, w)` patch grid.
     grids: Vec<(u32, u32, u32)>,
     hashes: Vec<u64>,
+    /// Per item inclusive token range in the expanded prompt.
     offsets: Vec<(u32, u32)>,
+    /// Flattened `[3, input_len]`; the drain reshapes to `(3, -1)`.
     mrope: Py<numpy::PyArray1<i64>>,
     mrope_delta: i64,
 }
