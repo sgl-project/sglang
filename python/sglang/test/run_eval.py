@@ -136,6 +136,13 @@ def _run_sgl_eval(eval_name, args) -> dict:
         cmd += ["--model", args.model]
     if getattr(args, "num_examples", None) is not None:
         cmd += ["--num-examples", str(args.num_examples)]
+    if getattr(args, "top_p", None) is not None:
+        cmd += ["--top-p", str(args.top_p)]
+    # Unset by default in sgl-eval; only a sampling caller (temperature > 0) needs it.
+    if getattr(args, "seed", None) is not None:
+        cmd += ["--seed", str(args.seed)]
+    if getattr(args, "repeat", None) is not None:
+        cmd += ["--n-repeats", str(args.repeat)]
     # Bound generation length so long-reasoning models don't stall the eval.
     if getattr(args, "max_tokens", None) is not None:
         cmd += ["--max-tokens", str(args.max_tokens)]
@@ -242,10 +249,10 @@ def run_eval(args):
     )
 
     if args.eval_name == "mmlu":
-        from sglang.test.simple_eval_mmlu import MMLUEval
-
-        filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
-        eval_obj = MMLUEval(filename, args.num_examples, args.num_threads)
+        # Scored by sgl-eval (NeMo-Skills' mcq prompt + eval_mcq grader), so a
+        # caller's threshold has to be measured against it, not inherited.
+        # `simple_eval_mmlu` stays: the ascend eval imports its subject2category.
+        return _run_sgl_eval("mmlu", args)
     elif args.eval_name == "math":
         from sglang.test.simple_eval_math import MathEval
 
@@ -301,6 +308,10 @@ def run_eval(args):
             args.num_threads,
             response_answer_regex=getattr(args, "response_answer_regex", None),
         )
+    elif args.eval_name == "mmmu_pro_vision":
+        # sgl-eval owns this benchmark's dataset, prompt and grader; there is no
+        # simple_eval implementation to fall back to.
+        return _run_sgl_eval("mmmu_pro_vision", args)
     elif args.eval_name == "aime25":
         from sglang.test.simple_eval_aime25 import AIME25Eval
 
