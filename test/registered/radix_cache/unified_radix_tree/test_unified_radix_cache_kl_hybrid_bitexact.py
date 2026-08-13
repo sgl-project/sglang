@@ -8,9 +8,21 @@ reproduces every logprob exactly under deterministic inference, which turns the
 same comparison into an exact one -- any nonzero KL is a state-reuse bug. It also
 fits on one GPU, so these run per-commit rather than on a 4-GPU stage.
 
-Each class below reproduces a specific merged regression when its fix is
-reverted; the measured pre-fix divergence is recorded in the class docstring so a
-later threshold change has to argue with a number.
+Reverting either #34184 or #29792 turns this file red, so a later threshold
+change has to argue with a number. Which case fires is architecture-dependent
+though, because prefill and decode take different fa4 kernels on SM90 and SM100.
+Measured avg_kl_div, 0.0 everywhere in the fixed state:
+
+                                      SM100 (B200)        SM90 (H200)
+  #34184  test_logprobs_match             5.58e-07              0.0
+          test_prefill_cache_hit          6.22e-06         4.40e-06
+          test_decode_cache_hit                0.0              0.0
+          multiturn branching                  0.0         2.01e-07
+  #29792  multiturn branching     9.43e-06/1.16e-05         5.14e-04
+
+`test_prefill_cache_hit` is the only case that fires on both, so read the rest as
+extra coverage rather than as the guard for one fix. CI runs `1-gpu-large`, which
+is SM90.
 
 These classes do not use UnifiedRadixTreeTestMixin: it bundles gsm8k and mmlu,
 which an undertrained checkpoint cannot gate on, and each class here runs the
@@ -109,10 +121,10 @@ class TestUnifiedHybridBitExact(CustomTestCase):
     prefix the cache restored wrong.
 
     Guards #34184 (stale track rows corrupting conv checkpoints under the prefill
-    graph). Reverting that fix here measures avg_kl_div 5.58e-07 on
-    test_logprobs_match and 6.22e-06 on test_prefill_cache_hit, against 0.0 with
-    it in place. test_decode_cache_hit is 0.0 either way -- it guards decode-region
-    state reuse in general, not that regression.
+    graph) through test_prefill_cache_hit, which is the case that fires on both
+    architectures; see the table at the top for what the other two measure.
+    test_decode_cache_hit stays 0.0 even with the fix reverted, so it covers
+    decode-region state reuse in general rather than that regression.
     """
 
     @classmethod
@@ -167,9 +179,9 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
     branches so hits land at many prefix lengths rather than one aligned one.
 
     Guards #29792 (decode track save picking its slot from the producer-side
-    pointer). Without that fix this measures avg_kl_div 9.43e-06 and 1.16e-05 over
-    two rounds, with 3 of 9 samples dirty and the rest exactly 0; with it in place
-    both rounds are 0.0.
+    pointer) on both architectures. The signal is sparse rather than uniform:
+    3 of 9 samples dirty and the rest exactly 0. Reverting #34184 also lands here
+    on SM90, so a red run means "state reuse broke", not "#29792 broke".
 
     Runs the multi-turn branching harness because the single-turn helpers above
     cannot produce a non-aligned hit length, which this regression needs.
