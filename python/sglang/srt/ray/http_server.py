@@ -51,6 +51,7 @@ def launch_server(
         ray.init(
             address="auto",
             runtime_env=getattr(server_args, "ray_runtime_env", None),
+            namespace=getattr(server_args, "ray_namespace", None),
         )
     server_args.override(
         "ray.http_server.placement_group",
