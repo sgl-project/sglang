@@ -211,6 +211,10 @@ class ReqState:
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
+    # Set once the request reaches the scheduler. From then on the scheduler owns
+    # its lifetime, so a teardown here must abort it rather than silently drop it.
+    dispatched: bool = False
+
     # For streaming output
     last_output_offset: int = 0
 
@@ -1583,6 +1587,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
 
+    def _mark_dispatched(self, rid: str) -> None:
+        state = self.rid_to_state.get(rid)
+        if state is not None:
+            state.dispatched = True
+
     def _send_one_request(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
@@ -1599,6 +1608,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj.wrap_pickle_fields()
             self._dispatch_to_scheduler(tokenized_obj)
             dispatched = True
+            self._mark_dispatched(tokenized_obj.rid)
             tokenized_obj.time_stats = time_stats
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
         finally:
@@ -1631,6 +1641,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             self._dispatch_to_scheduler(batch_req)
             dispatched = True
+            for tokenized_obj in tokenized_objs:
+                self._mark_dispatched(tokenized_obj.rid)
             for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
                 tokenized_obj.time_stats = time_stat
             set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
@@ -1977,17 +1989,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self,
+        rid: str = "",
+        abort_all: bool = False,
+        expect_obj: Optional[Union[GenerateReqInput, EmbeddingReqInput]] = None,
+    ):
+        """Abort a request on the scheduler.
+
+        ``expect_obj`` pins the abort to one specific request. A rid only becomes
+        reusable after its state is gone, so callers that abort after a delay must
+        pass it: by then the rid may belong to a newer request that must not die.
+        """
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
-        if (
-            not abort_all
-            and self.server_args.tokenizer_worker_num == 1
-            and rid not in self.rid_to_state
-        ):
-            return
+        if not abort_all:
+            state = self.rid_to_state.get(rid)
+            if expect_obj is not None:
+                # Delayed aborts run as a background task of the response that
+                # created them, so they always execute in the process that owns
+                # the state -- a local miss means the request is gone, whatever
+                # tokenizer_worker_num says.
+                if state is None or state.obj is not expect_obj:
+                    return
+            elif self.server_args.tokenizer_worker_num == 1 and state is None:
+                # /abort_request may land on a different tokenizer worker than the
+                # one serving the request, so only trust a local miss when there
+                # is exactly one.
+                return
         req = AbortReq(rid=rid, abort_all=abort_all)
         self._dispatch_to_scheduler(req)
         if self.enable_metrics:
@@ -2162,11 +2193,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
+            # obj[i] is cached, so these are the very objects stored on the states.
             if obj.is_single:
-                self.abort_request(obj.rid)
+                self.abort_request(obj.rid, expect_obj=obj)
             else:
-                for rid in obj.rid:
-                    self.abort_request(rid)
+                for i, rid in enumerate(obj.rid):
+                    self.abort_request(rid, expect_obj=obj[i])
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
@@ -3418,15 +3450,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _discard_pending_req_states(self, obj):
         """Drop rid_to_state entries created by _init_req_state for *obj*.
 
-        Safe to call after a partial/failed dispatch: only entries still present
-        are removed, and the scheduler-response path looks up state with
-        ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
+        Only entries that never reached the scheduler are dropped. A dispatched
+        request is still running there, and removing its state would strand it:
+        the delayed abort from ``create_abort_task`` looks the rid up in
+        ``rid_to_state`` and would skip the request that most needs stopping,
+        leaving the scheduler generating for a client that is already gone.
+        Those entries are removed later by the scheduler-response path
+        (``_handle_batch_output``) or by the abort echo (``_handle_abort_req``).
         """
         if not hasattr(obj, "is_single") or obj.is_single:
             rids = [obj.rid]
         else:
             rids = obj.rid
         for rid in rids:
+            state = self.rid_to_state.get(rid)
+            if state is not None and state.dispatched:
+                continue
             self.rid_to_state.pop(rid, None)
 
     def _should_dispatch_to_encoder(

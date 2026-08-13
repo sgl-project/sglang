@@ -14,7 +14,7 @@ Covers:
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
 import msgspec
 
@@ -157,6 +157,35 @@ def _make_abort_req(rid: str, abort_message: str = "Aborted") -> AbortReq:
         finished_reason={"type": "abort", "message": abort_message},
         abort_message=abort_message,
     )
+
+
+def _make_batch_obj(rids):
+    """Batch request whose obj[i] is stable, mirroring GenerateReqInput's cache.
+
+    The plain helper below hands out a fresh Mock per __getitem__ call, which would
+    make identity checks fail for reasons the production code never sees.
+    """
+    obj = MagicMock(spec=GenerateReqInput)
+    obj.rid = list(rids)
+    obj.is_single = False
+    subs = {}
+    for i, rid in enumerate(rids):
+        sub = Mock(spec=GenerateReqInput)
+        sub.rid = rid
+        sub.is_single = True
+        subs[i] = sub
+    obj.__getitem__.side_effect = subs.__getitem__
+    return obj
+
+
+def _run_background(background_tasks):
+    """Run a BackgroundTasks bundle without waiting out its real sleep."""
+
+    async def main():
+        with patch("asyncio.sleep", new=AsyncMock()):
+            await background_tasks()
+
+    asyncio.run(main())
 
 
 def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
@@ -603,6 +632,232 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
             asyncio.run(drive())
 
         self.assertFalse(tm.rid_to_state)
+
+
+class TestDiscardKeepsDispatchedStates(CustomTestCase):
+    """A dispatched request must survive teardown so its abort can still fire.
+
+    `generate_request` discards pending states on any BaseException, and a client
+    disconnect raises CancelledError *after* the request reached the scheduler.
+    Dropping the state there strands the request: the delayed `create_abort_task`
+    looks the rid up in rid_to_state, finds nothing, and never tells the scheduler
+    to stop -- so the GPU keeps decoding for a client that already left.
+    """
+
+    def test_undispatched_state_is_discarded(self):
+        tm = _make_tokenizer_manager()
+        obj = Mock(spec=GenerateReqInput)
+        obj.rid = "never-sent"
+        obj.is_single = True
+        tm.rid_to_state["never-sent"] = _make_req_state("never-sent")
+
+        tm._discard_pending_req_states(obj)
+
+        self.assertNotIn("never-sent", tm.rid_to_state)
+
+    def test_dispatched_state_is_kept(self):
+        tm = _make_tokenizer_manager()
+        obj = Mock(spec=GenerateReqInput)
+        obj.rid = "in-flight"
+        obj.is_single = True
+        state = _make_req_state("in-flight")
+        state.dispatched = True
+        tm.rid_to_state["in-flight"] = state
+
+        tm._discard_pending_req_states(obj)
+
+        self.assertIn("in-flight", tm.rid_to_state)
+
+    def test_batch_discards_only_undispatched(self):
+        tm = _make_tokenizer_manager()
+        obj = Mock(spec=GenerateReqInput)
+        obj.rid = ["sent", "unsent"]
+        obj.is_single = False
+        sent = _make_req_state("sent")
+        sent.dispatched = True
+        tm.rid_to_state["sent"] = sent
+        tm.rid_to_state["unsent"] = _make_req_state("unsent")
+
+        tm._discard_pending_req_states(obj)
+
+        self.assertIn("sent", tm.rid_to_state)
+        self.assertNotIn("unsent", tm.rid_to_state)
+
+    def test_kept_state_lets_the_delayed_abort_reach_the_scheduler(self):
+        """End state of the disconnect path: abort_request must now dispatch."""
+        tm = _make_tokenizer_manager()
+        tm.server_args.tokenizer_worker_num = 1
+        tm.tokenizer_ipc_name = None
+        tm._dispatch_to_scheduler = Mock()
+        obj = Mock(spec=GenerateReqInput)
+        obj.rid = "disconnected"
+        obj.is_single = True
+        state = _make_req_state("disconnected")
+        state.dispatched = True
+        tm.rid_to_state["disconnected"] = state
+
+        tm._discard_pending_req_states(obj)
+        tm.abort_request(rid="disconnected")
+
+        tm._dispatch_to_scheduler.assert_called_once()
+        sent = tm._dispatch_to_scheduler.call_args[0][0]
+        self.assertIsInstance(sent, AbortReq)
+        self.assertEqual(sent.rid, "disconnected")
+
+    def test_completed_request_does_not_trigger_a_late_abort(self):
+        """A finished request left no state, so the delayed abort stays a no-op.
+
+        This only covers the rid being *gone*. The harder case -- the rid having
+        been handed to a different request in the meantime -- is covered by
+        TestDelayedAbortTargetsOneRequest below.
+        """
+        tm = _make_tokenizer_manager()
+        tm.server_args.tokenizer_worker_num = 1
+        tm.tokenizer_ipc_name = None
+        tm._dispatch_to_scheduler = Mock()
+        self.assertNotIn("finished-rid", tm.rid_to_state)
+
+        tm.abort_request(rid="finished-rid")
+
+        tm._dispatch_to_scheduler.assert_not_called()
+
+
+class TestDelayedAbortTargetsOneRequest(CustomTestCase):
+    """The delayed abort must not kill a newer request that reused the rid.
+
+    `_init_req_state` rejects a duplicate rid only while the previous state is
+    alive, so a rid becomes reusable the moment its request finishes. Between that
+    moment and the 2s `create_abort_task` firing there is a window where the rid
+    belongs to somebody else; matching on the rid alone would abort that innocent
+    request. `expect_obj` pins each delayed abort to the request that scheduled it.
+    """
+
+    @staticmethod
+    def _make_tm():
+        tm = _make_tokenizer_manager()
+        tm.server_args.tokenizer_worker_num = 1
+        tm.tokenizer_ipc_name = None
+        tm._dispatch_to_scheduler = Mock()
+        return tm
+
+    @staticmethod
+    def _make_obj(rid, is_single=True):
+        obj = Mock(spec=GenerateReqInput)
+        obj.rid = rid
+        obj.is_single = is_single
+        return obj
+
+    @staticmethod
+    def _place_state(tm, rid, obj):
+        """Register a dispatched state owned by *obj*, as _init_req_state would."""
+        state = _make_req_state(rid)
+        state.obj = obj
+        state.dispatched = True
+        tm.rid_to_state[rid] = state
+        return state
+
+    def test_reused_rid_is_not_aborted_by_the_previous_request(self):
+        """Request A finished, B took its rid, then A's delayed abort fired."""
+        tm = self._make_tm()
+        rid = "shared-rid"
+        obj_a = self._make_obj(rid)
+        obj_b = self._make_obj(rid)
+        self._place_state(tm, rid, obj_b)  # A's state is long gone; B owns the rid
+
+        tm.abort_request(rid, expect_obj=obj_a)
+
+        tm._dispatch_to_scheduler.assert_not_called()
+        self.assertIs(tm.rid_to_state[rid].obj, obj_b, "B must be left running")
+
+    def test_delayed_abort_still_fires_for_its_own_request(self):
+        """The disconnect path must keep working: same object, so abort proceeds."""
+        tm = self._make_tm()
+        rid = "disconnected"
+        obj = self._make_obj(rid)
+        self._place_state(tm, rid, obj)
+
+        tm.abort_request(rid, expect_obj=obj)
+
+        tm._dispatch_to_scheduler.assert_called_once()
+        self.assertEqual(tm._dispatch_to_scheduler.call_args[0][0].rid, rid)
+
+    def test_explicit_abort_endpoint_is_unaffected(self):
+        """/abort_request passes no expectation and must abort whoever holds the rid."""
+        tm = self._make_tm()
+        rid = "shared-rid"
+        self._place_state(tm, rid, self._make_obj(rid))
+
+        tm.abort_request(rid)
+
+        tm._dispatch_to_scheduler.assert_called_once()
+
+    def test_reused_rid_is_protected_with_multiple_tokenizer_workers(self):
+        """The identity check must not be limited to tokenizer_worker_num == 1.
+
+        Multi-tokenizer mode runs N Granian worker processes, each with its own
+        rid_to_state. A delayed abort is a background task of the response that
+        scheduled it, so it always runs in the process that owns the state --
+        the lookup is just as trustworthy there as with a single worker.
+        """
+        tm = self._make_tm()
+        tm.server_args.tokenizer_worker_num = 2
+        rid = "shared-rid"
+        obj_a = self._make_obj(rid)
+        obj_b = self._make_obj(rid)
+        self._place_state(tm, rid, obj_b)
+
+        tm.abort_request(rid, expect_obj=obj_a)
+
+        tm._dispatch_to_scheduler.assert_not_called()
+        self.assertIs(tm.rid_to_state[rid].obj, obj_b, "B must be left running")
+
+    def test_multi_worker_explicit_abort_still_dispatches_on_local_miss(self):
+        """The reverse: /abort_request may land on a worker that never saw the rid.
+
+        With several tokenizer workers a local miss proves nothing, so the abort
+        must still go out -- otherwise the endpoint silently stops working.
+        """
+        tm = self._make_tm()
+        tm.server_args.tokenizer_worker_num = 2
+        self.assertNotIn("elsewhere", tm.rid_to_state)
+
+        tm.abort_request("elsewhere")
+
+        tm._dispatch_to_scheduler.assert_called_once()
+
+    def test_create_abort_task_pins_the_single_request(self):
+        tm = self._make_tm()
+        obj = self._make_obj("solo")
+        tm.abort_request = Mock()
+
+        _run_background(tm.create_abort_task(obj))
+
+        tm.abort_request.assert_called_once_with("solo", expect_obj=obj)
+
+    def test_create_abort_task_pins_each_batch_entry(self):
+        tm = self._make_tm()
+        obj = _make_batch_obj(["r0", "r1"])
+        tm.abort_request = Mock()
+
+        _run_background(tm.create_abort_task(obj))
+
+        self.assertEqual(
+            tm.abort_request.call_args_list,
+            [call("r0", expect_obj=obj[0]), call("r1", expect_obj=obj[1])],
+        )
+
+    def test_sub_object_identity_is_stable(self):
+        """Guards the invariant the batch path relies on: obj[i] is cached.
+
+        If upstream ever stops caching sub-objects, `state.obj is expect_obj` would
+        never match for batches and every batched disconnect would silently stop
+        being aborted -- the exact bug this file exists to prevent.
+        """
+        obj = GenerateReqInput(text=["a", "b"], rid=["r0", "r1"])
+        obj.normalize_batch_and_arguments()
+
+        self.assertIs(obj[0], obj[0])
+        self.assertIsNot(obj[0], obj[1])
 
 
 if __name__ == "__main__":
