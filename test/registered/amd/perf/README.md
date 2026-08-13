@@ -74,8 +74,14 @@ Reporting, baseline not recorded yet:
 | Benchmark | Hardware | Job |
 |---|---|---|
 | GPT-OSS 20b + 120b (MXFP4) | MI35x | `nightly-perf-8-gpu-mi35x-gpt-oss-rocm720` |
-| GPT-OSS 20b + 120b (bf16) | MI30x | `nightly-perf-8-gpu-gpt-oss-rocm720` |
+| GPT-OSS 20b + 120b (bf16) | MI30x | `nightly-accuracy-8-gpu-rocm720`, perf step |
 | Kimi-K3 | MI35x | `nightly-perf-8-gpu-mi35x-kimi-k3-rocm720` |
+
+The MI30x benchmark rides on the accuracy job instead of taking its own: an
+MI30x job spends around 49 minutes pulling the image and installing
+dependencies before it runs anything — 59% of all MI30x GPU-hours in this
+workflow — which is more than the benchmark itself costs. On MI35x the same
+setup takes 6 minutes, so a standalone job is cheap there.
 
 Reporting only, no gate: DeepSeek-V3.1, DeepSeek-V3.2 (basic + MTP),
 DeepSeek-R1-MXFP4 (plain, KV-FP8, all-reduce fusion), GLM-5.1, GLM-5-MXFP4,

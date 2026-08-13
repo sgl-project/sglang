@@ -44,7 +44,6 @@ on:
           # 8-GPU GPT-OSS (MI30x mixes Grok1-FP8; MI35x mixes Qwen3-Coder-Next)
           - nightly-accuracy-8-gpu-rocm720
           - nightly-accuracy-8-gpu-mi35x-rocm720
-          - nightly-perf-8-gpu-gpt-oss-rocm720
           - nightly-perf-8-gpu-mi35x-gpt-oss-rocm720
           # 8-GPU Grok1-INT4 (MI30x + MI35x)
           - nightly-8-gpu-grok1-int4-rocm720
@@ -504,6 +503,21 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
+      # Rides on this job rather than its own: MI30x spends ~49 min per job
+      # pulling the image and installing dependencies, which is more than the
+      # benchmark itself costs, and the accuracy step above already serves the
+      # same two models.
+      - name: Performance Test ROCm 7.2 (8-GPU GPT-OSS)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 120
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-gpt-oss --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
       - name: Accuracy Test ROCm 7.2 (8-GPU Grok1-FP8)
         timeout-minutes: 60
         run: |
@@ -545,40 +559,6 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
-  nightly-perf-8-gpu-gpt-oss-rocm720:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-perf-8-gpu-gpt-oss-rocm720,'))
-    runs-on: linux-mi300-8gpu-sglang
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Setup docker (ROCm 7.2)
-        run: |
-          touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-          ENABLE_CACHE_HOST: "1"
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
-
-      - name: Performance Test ROCm 7.2 (8-GPU GPT-OSS)
-        timeout-minutes: 150
-        run: |
-          > github_summary.md  # Clear summary file
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-gpt-oss --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -2212,7 +2192,6 @@ jobs:
       # 8-GPU GPT-OSS (MI30x mixes Grok1-FP8; MI35x mixes Qwen3-Coder-Next)
       - nightly-accuracy-8-gpu-rocm720
       - nightly-accuracy-8-gpu-mi35x-rocm720
-      - nightly-perf-8-gpu-gpt-oss-rocm720
       - nightly-perf-8-gpu-mi35x-gpt-oss-rocm720
       # 8-GPU Grok1-INT4 (MI30x + MI35x)
       - nightly-8-gpu-grok1-int4-rocm720
