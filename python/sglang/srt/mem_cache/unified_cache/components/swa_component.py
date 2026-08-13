@@ -200,6 +200,12 @@ class SWAComponent(TreeComponent):
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
+        if getattr(self.cache, "aoh_radix_anchor_only", False):
+            # AoH shares just the permanent anchor. Unlike a contiguous SWA
+            # prefix, it can be shorter than the normal sliding window.
+            ct = self.component_type
+            return lambda node: node.component_data[ct].value is not None
+
         sliding_window_size = self.sliding_window_size
         ct = self.component_type
         state = {"len": float("inf")}
@@ -739,6 +745,12 @@ class SWAComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        if getattr(self.cache, "aoh_radix_anchor_only", False):
+            # UnifiedRadixCache only receives [0:sink) for AoH. The request's
+            # dynamic middle eviction frontier must not tombstone that anchor.
+            insert_params.swa_evicted_seqlen = 0
+            return None
+
         # Unfinished requests can already have an SWA-evicted prefix; preserve
         # that boundary so insertion creates a tombstone instead of live SWA KV.
         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
@@ -747,6 +759,10 @@ class SWAComponent(TreeComponent):
     def free_out_of_window_slots(
         self, req: Req, pre_len: int, insert_params: InsertParams
     ) -> None:
+        if getattr(self.cache, "aoh_radix_anchor_only", False):
+            insert_params.swa_evicted_seqlen = 0
+            return
+
         if self.sliding_window_size is not None:
             free_swa_out_of_window_slots(
                 req,

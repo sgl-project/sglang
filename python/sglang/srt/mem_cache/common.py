@@ -95,6 +95,32 @@ def free_swa_out_of_window_slots(
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
+def free_aoh_out_of_window_slots(
+    req: Req,
+    pre_len: int,
+    *,
+    sink_size: int,
+    recent_size: int,
+    page_size: int,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+) -> None:
+    """Release the middle of an AoH stream while keeping anchors and the tail."""
+    if req.kv is None:
+        return
+    assert sink_size % page_size == 0 and recent_size % page_size == 0
+
+    anchor_end = min(sink_size, pre_len)
+    tail_start = max(anchor_end, pre_len - recent_size)
+    free_start = max(req.kv.swa_evicted_seqlen, anchor_end)
+    if tail_start <= free_start:
+        return
+
+    free_slots = req_to_token_pool.req_to_token[req.req_pool_idx, free_start:tail_start]
+    token_to_kv_pool_allocator.free_swa(free_slots)
+    req.kv.swa_evicted_seqlen = tail_start
+
+
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
         return

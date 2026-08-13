@@ -100,6 +100,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
+    free_aoh_out_of_window_slots,
     free_swa_out_of_window_slots,
     release_kv_cache,
 )
@@ -3356,6 +3357,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _evict_swa(self, req: Req, pre_len: int):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
+        if getattr(self.tree_cache, "is_aoh", False):
+            free_aoh_out_of_window_slots(
+                req,
+                pre_len,
+                sink_size=self.tree_cache.aoh_sink_size,
+                recent_size=self.tree_cache.aoh_recent_size,
+                page_size=self.tree_cache.page_size,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            )
+            return
         free_swa_out_of_window_slots(
             req,
             pre_len,

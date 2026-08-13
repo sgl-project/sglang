@@ -146,6 +146,10 @@ class RadixAttention(nn.Module):
         self.pos_encoding_mode = pos_encoding_mode
         self.logit_capping_method = logit_capping_method
         self.xai_temperature_len = -1
+        # Set by ModelRunner when --aoh-config is active. Keep the default on
+        # every model so attention backends can branch without model-specific
+        # imports.
+        self.aoh_mode: Optional[str] = None
 
     def forward(
         self,

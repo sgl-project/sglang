@@ -70,6 +70,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.model_executor.aoh import get_aoh_kv_group
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -926,6 +927,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             layer_id=layer_id,
             prefix=f"{prefix}.attn",
             quant_config=quant_config,
+        )
+        # AoH classifies global KV groups offline. With Qwen3.6 GQA and TP>=2,
+        # each rank owns one replicated KV group, so the runtime can route the
+        # entire local attention module without reordering Q heads.
+        self.attn.aoh_total_kv_heads = self.total_num_kv_heads
+        self.attn.aoh_kv_group = get_aoh_kv_group(
+            total_kv_heads=self.total_num_kv_heads,
+            kv_tp_size=self.kv_tp_size,
+            kv_tp_rank=self.kv_tp_rank,
+            local_kv_heads=self.num_kv_heads,
         )
 
         # Dense MLP for non-MoE variant

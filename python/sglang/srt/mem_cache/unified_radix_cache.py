@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     UnifiedTreeCore,
     UnifiedTreeNode,
 )
+from sglang.srt.model_executor.aoh import get_aoh_cacheable_prefix_len
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
     StorageMetricsCollector,
@@ -646,11 +647,29 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
+    def _aoh_cacheable_prefix_len(self, sequence_len: int) -> int:
+        """Limit AoH radix reuse to the permanent, content-stable anchor."""
+        if not getattr(self, "aoh_radix_anchor_only", False):
+            return sequence_len
+        return get_aoh_cacheable_prefix_len(sequence_len, self.aoh_sink_size)
+
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
+
+        original_kv_len = kv_len_to_handle
+        cacheable_kv_len = self._aoh_cacheable_prefix_len(kv_len_to_handle)
+        release_private_kv = cacheable_kv_len < original_kv_len
+        private_kv_indices = (
+            self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, cacheable_kv_len:original_kv_len
+            ]
+            if release_private_kv
+            else None
+        )
+        kv_len_to_handle = cacheable_kv_len
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -728,6 +747,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
 
+        if private_kv_indices is not None:
+            # The allocator releases full KV and its remaining SWA mapping. The
+            # AoH middle may already have had SWA released; free_swa treats the
+            # cleared mapping as a no-op.
+            self.token_to_kv_pool_allocator.free_segment(
+                private_kv_indices, start_pos=cacheable_kv_len
+            )
+
         if self.enable_session_radix_cache and result is not None:
             from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
@@ -740,17 +767,20 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
-        token_ids = req.get_fill_ids()
+        full_token_ids = req.get_fill_ids()
+        token_ids = full_token_ids[
+            : self._aoh_cacheable_prefix_len(len(full_token_ids))
+        ]
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(token_ids)
+                req.req_pool_idx, : len(full_token_ids)
             ]
             req.prefix_indices = kv_indices
             return
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, : len(full_token_ids)
         ]
 
         # components prepare insert data + return effective cache_len

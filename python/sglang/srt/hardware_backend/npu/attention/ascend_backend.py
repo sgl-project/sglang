@@ -242,6 +242,31 @@ class AscendAttnMaskBuilder:
         mask = (indices < start_indices) | (indices >= seq_lens)
         return mask.unsqueeze(1).to(self.device, non_blocking=True)
 
+    def get_aoh_mask(
+        self, seq_lens: torch.Tensor, s2: int, sink_size: int, recent_size: int
+    ) -> torch.Tensor:
+        """Mask the evicted middle while retaining [0:sink) and the recent tail."""
+        if seq_lens.dim() == 1:
+            seq_lens = seq_lens.unsqueeze(1)
+        indices = torch.arange(s2, device=seq_lens.device).unsqueeze(0)
+        tail_start = torch.clamp(seq_lens - recent_size, min=sink_size)
+        keep = (indices < sink_size) | ((indices >= tail_start) & (indices < seq_lens))
+        return (~keep).unsqueeze(1).to(self.device, non_blocking=True)
+
+    def get_aoh_prefill_mask(
+        self, total_kv_len: int, query_len: int, sink_size: int, recent_size: int
+    ) -> torch.Tensor:
+        key_positions = torch.arange(total_kv_len, device=self.device)
+        query_positions = torch.arange(
+            total_kv_len - query_len, total_kv_len, device=self.device
+        ).unsqueeze(1)
+        tail_start = torch.clamp(query_positions - recent_size + 1, min=sink_size)
+        keep = (key_positions.unsqueeze(0) < sink_size) | (
+            (key_positions.unsqueeze(0) >= tail_start)
+            & (key_positions.unsqueeze(0) <= query_positions)
+        )
+        return ~keep
+
 
 def _cp_allgather_and_save_kv_npu(
     forward_batch, layer, k, v, cp_size, token_to_kv_pool, swa_loc=None
@@ -349,6 +374,11 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
         self.is_hybrid_swa = model_runner.is_hybrid_swa
+        self.is_aoh = model_runner.is_aoh
+        self.aoh_sink_size = model_runner.server_args.aoh_sink_size
+        self.aoh_recent_size = model_runner.server_args.aoh_recent_size
+        if self.is_aoh and not self.use_fia:
+            raise ValueError("AoH on Ascend requires ASCEND_USE_FIA=1.")
         if self.is_hybrid_swa:
             self.full_to_swa_index_mapping = (
                 model_runner.token_to_kv_pool.full_to_swa_index_mapping
@@ -1240,7 +1270,9 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     block_tables = self.forward_metadata.block_tables
                 if self.use_fia:
-                    if self._can_use_tnd(layer):
+                    if self._can_use_tnd(layer) and not (
+                        self.is_aoh and layer.aoh_mode == "streaming"
+                    ):
                         num_token_padding = q.shape[0]
                         if num_token_padding > forward_batch.num_token_non_padded_cpu:
                             q, k, v = [
@@ -1314,6 +1346,19 @@ class AscendAttnBackend(AttentionBackend):
                             if q_len == 0:
                                 continue
                             total_kv_len = seq_lens_cpu[seq_idx]
+                            is_aoh_streaming = (
+                                self.is_aoh and layer.aoh_mode == "streaming"
+                            )
+                            attn_mask = (
+                                self.ascend_attn_mask_builder.get_aoh_prefill_mask(
+                                    total_kv_len,
+                                    q_len,
+                                    self.aoh_sink_size,
+                                    self.aoh_recent_size,
+                                )
+                                if is_aoh_streaming
+                                else self.fia_mask
+                            )
                             result, _ = torch_npu.npu_fused_infer_attention_score_v2(
                                 query=q[None, q_len_offset : q_len_offset + q_len],
                                 key=k_cache.view(
@@ -1333,10 +1378,14 @@ class AscendAttnBackend(AttentionBackend):
                                 block_size=self.page_size,
                                 actual_seq_qlen=[q_len],
                                 actual_seq_kvlen=[total_kv_len],
-                                atten_mask=self.fia_mask.unsqueeze(0),
+                                atten_mask=attn_mask.unsqueeze(0),
                                 sparse_mode=4,
                                 softmax_scale=layer.scaling,
-                                pre_tokens=layer.sliding_window_size,
+                                pre_tokens=(
+                                    FULL_ATTENTION_WINDOW
+                                    if is_aoh_streaming
+                                    else layer.sliding_window_size
+                                ),
                                 next_tokens=0,
                             )
                             attn_out[q_len_offset : q_len_offset + q_len] = result[0]
@@ -2558,11 +2607,18 @@ class AscendAttnBackend(AttentionBackend):
                             self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                         )
                     block_size = self.page_size
+                    max_model_len = block_tables.shape[-1] * block_size
 
                     if sinks is not None:
                         mask = self.fia_mask
+                    elif self.is_aoh and layer.aoh_mode == "streaming":
+                        mask = self.ascend_attn_mask_builder.get_aoh_mask(
+                            self.forward_metadata.seq_lens,
+                            max_model_len,
+                            self.aoh_sink_size,
+                            self.aoh_recent_size,
+                        )
                     else:
-                        max_model_len = block_tables.shape[-1] * block_size
                         mask = self.ascend_attn_mask_builder.get_swa_mask(
                             self.forward_metadata.seq_lens,
                             max_model_len,
@@ -2592,7 +2648,11 @@ class AscendAttnBackend(AttentionBackend):
                         block_table=block_tables,
                         actual_seq_qlen=[1] * len(self.forward_metadata.seq_lens),
                         actual_seq_kvlen=actual_seq_len_kv,
-                        pre_tokens=layer.sliding_window_size,
+                        pre_tokens=(
+                            FULL_ATTENTION_WINDOW
+                            if self.is_aoh and layer.aoh_mode == "streaming"
+                            else layer.sliding_window_size
+                        ),
                         next_tokens=0,
                         learnable_sink=sinks,
                     )

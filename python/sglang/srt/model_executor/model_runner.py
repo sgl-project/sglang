@@ -79,6 +79,7 @@ from sglang.srt.layers.cp.utils import (
     is_cp_v2_active,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -91,6 +92,7 @@ from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.model_executor.aoh import AoHConfig
 from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
@@ -174,6 +176,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_global_dwdp_manager,
     get_lora,
+    get_memory,
     get_model,
     get_parallel,
     get_schedule,
@@ -338,6 +341,9 @@ class ModelRunner:
         self.mtp_draft_device_pools = ()
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
+        self.is_aoh = False
+        self.aoh_streaming_layer_ids: list[int] = []
+        self.aoh_retrieval_layer_ids: list[int] = []
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.enable_elastic_ep = server_args.elastic_ep_backend is not None
@@ -594,6 +600,9 @@ class ModelRunner:
             spec_aux_config=self.spec_aux_config,
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_swa_compress=self.is_hybrid_swa_compress,
+            is_aoh=self.is_aoh,
+            aoh_streaming_layer_ids=self.aoh_streaming_layer_ids,
+            aoh_retrieval_layer_ids=self.aoh_retrieval_layer_ids,
             use_mla_backend=self.use_mla_backend,
             layer_info=self.layer_info,
             forward_stream=self.forward_stream,
@@ -656,10 +665,134 @@ class ModelRunner:
             end_layer=self.layer_info.end_layer,
             is_hybrid_swa=self.is_hybrid_swa,
         )
+        self.configure_aoh()
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+
+    def configure_aoh(self) -> None:
+        """Apply an offline AoH sidecar to Qwen3.6's local GQA attention layers."""
+        if self.server_args.aoh_config is None:
+            return
+        if self.is_draft_worker:
+            raise ValueError("AoH does not support speculative draft workers.")
+        if self.ps.pp_size != 1:
+            raise ValueError("AoH v1 supports pp-size=1 only.")
+        if get_parallel().attn_dcp_size != 1:
+            raise ValueError("AoH v1 supports attention DCP=1 only.")
+        if get_parallel().attn_tp_size < 2:
+            raise ValueError(
+                "AoH v1 requires TP>=2 so each rank owns one Qwen3.6 KV group."
+            )
+        if not self.spec_algorithm.is_none():
+            raise ValueError("AoH v1 does not support speculative decoding.")
+        if self.server_args.disaggregation_mode != "null":
+            raise ValueError("AoH v1 does not support PD disaggregation.")
+        if self.server_args.enable_hierarchical_cache:
+            raise ValueError("AoH v1 does not support hierarchical cache.")
+        if self.server_args.enable_session_radix_cache:
+            raise ValueError("AoH v1 does not support session radix cache.")
+        if self.server_args.enable_streaming_session:
+            raise ValueError("AoH v1 does not support streaming sessions.")
+        if self.server_args.radix_cache_backend is not None:
+            raise ValueError(
+                "AoH v1 only supports the built-in UnifiedRadixCache; "
+                "omit --radix-cache-backend."
+            )
+        if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
+            raise ValueError(
+                "AoH v1 does not support SGLANG_EXPERIMENTAL_CPP_RADIX_TREE."
+            )
+        if get_memory().enable_unified_memory:
+            raise ValueError("AoH v1 does not support --enable-unified-memory.")
+        if self.server_args.max_running_requests is None:
+            raise ValueError("AoH v1 requires an explicit --max-running-requests.")
+        if self.server_args.chunked_prefill_size in (None, -1):
+            raise ValueError(
+                "AoH v1 requires chunked prefill; set --chunked-prefill-size."
+            )
+        if self.server_args.aoh_sink_size <= 0 or self.server_args.aoh_recent_size <= 0:
+            raise ValueError("AoH sink and recent sizes must both be positive.")
+        if self.server_args.aoh_sink_size > self.model_config.context_len:
+            raise ValueError("AoH sink size cannot exceed the model context length.")
+        if (
+            self.server_args.aoh_sink_size % self.page_size
+            or self.server_args.aoh_recent_size % self.page_size
+        ):
+            raise ValueError(
+                "AoH sink and recent sizes must be multiples of --page-size."
+            )
+        if self.server_args.chunked_prefill_size < self.page_size:
+            raise ValueError("AoH chunked prefill size must be at least one KV page.")
+
+        model_type = getattr(self.model_config.hf_text_config, "model_type", "")
+        if not model_type.startswith("qwen3_5"):
+            raise ValueError(
+                "AoH v1 currently supports Qwen3.6 (qwen3_5) models only; "
+                f"got model_type={model_type!r}."
+            )
+
+        sidecar = AoHConfig.load(self.server_args.aoh_config)
+        attention_layers = [
+            module
+            for module in self.model.modules()
+            if isinstance(module, RadixAttention) and hasattr(module, "aoh_kv_group")
+        ]
+        if not attention_layers:
+            raise ValueError(
+                "AoH v1 requires Qwen3.6 full-attention RadixAttention layers."
+            )
+
+        self.aoh_streaming_layer_ids = []
+        self.aoh_retrieval_layer_ids = []
+        for layer in attention_layers:
+            if layer.tp_k_head_num != 1 or layer.aoh_total_kv_heads != 2:
+                raise ValueError(
+                    "AoH v1 expects one local KV head from Qwen3.6's two-group GQA; "
+                    f"layer {layer.layer_id} has local={layer.tp_k_head_num}, "
+                    f"global={layer.aoh_total_kv_heads}."
+                )
+            mode = sidecar.mode_for(layer.layer_id, layer.aoh_kv_group)
+            layer.aoh_mode = mode
+            if mode == "streaming":
+                layer.sliding_window_size = (
+                    self.server_args.aoh_sink_size + self.server_args.aoh_recent_size
+                )
+                self.aoh_streaming_layer_ids.append(layer.layer_id)
+            else:
+                layer.sliding_window_size = -1
+                self.aoh_retrieval_layer_ids.append(layer.layer_id)
+
+        configured_layer_ids = {layer.layer_id for layer in attention_layers}
+        unexpected_layer_ids = set(sidecar.layer_modes).difference(configured_layer_ids)
+        if unexpected_layer_ids:
+            raise ValueError(
+                "AoH config contains non-attention layers for this model: "
+                f"{sorted(unexpected_layer_ids)}."
+            )
+        if not self.aoh_streaming_layer_ids or not self.aoh_retrieval_layer_ids:
+            raise ValueError(
+                "AoH v1 requires at least one streaming and one retrieval layer per rank."
+            )
+
+        # AoH reuses the hybrid-SWA scheduler and allocator, but replaces the
+        # contiguous-window eviction rule with an anchor-and-recent rule.
+        self.is_aoh = True
+        self.is_hybrid_swa = True
+        self.sliding_window_size = (
+            self.server_args.aoh_sink_size + self.server_args.aoh_recent_size
+        )
+        logger.info(
+            "AoH enabled: rank=%s streaming_layers=%s retrieval_layers=%s sink=%s recent=%s radix_cache=%s cuda_graph=%s",
+            self.ps.tp_rank,
+            self.aoh_streaming_layer_ids,
+            self.aoh_retrieval_layer_ids,
+            self.server_args.aoh_sink_size,
+            self.server_args.aoh_recent_size,
+            not self.server_args.disable_radix_cache,
+            not self.server_args.disable_cuda_graph,
+        )
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
