@@ -4,9 +4,10 @@ from transformers import (
     Cache,
     DynamicCache,
 )
-from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
+from transformers.utils.generic import is_flash_attention_requested
+from transformers.vision_utils import get_vision_cu_seqlens, get_vision_position_ids
 
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLConfig
 from sglang.multimodal_gen.runtime.distributed import (
@@ -208,7 +209,11 @@ class Qwen3VLTextAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.head_dim = (
+            int(config.head_dim)
+            if getattr(config, "head_dim", None) is not None
+            else config.hidden_size // config.num_attention_heads
+        )
         self.total_num_heads = config.num_attention_heads
         self.total_num_key_value_heads = config.num_key_value_heads
         tp_size = _tp_world_size() if use_tensor_parallel else 1
@@ -582,14 +587,6 @@ class Qwen3VLTextModel(nn.Module):
         else:
             text_position_ids = position_ids[0]
 
-        attention_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=text_position_ids,
-        )
-
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
@@ -651,7 +648,8 @@ class Qwen3VLTextModel(nn.Module):
     ):
         visual_pos_masks = visual_pos_masks.to(hidden_states.device)
         visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
-        local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds
+        local_this = hidden_states[visual_pos_masks, :]
+        local_this.add_(visual_embeds)
         hidden_states[visual_pos_masks, :] = local_this
         return hidden_states
 
@@ -664,10 +662,13 @@ class Qwen3VLModel(nn.Module):
     config: Qwen3VLConfig
     _no_split_modules = ["Qwen3VLTextDecoderLayer", "Qwen3VLVisionBlock"]
 
-    def __init__(self, config):
+    def __init__(self, config, *, use_tensor_parallel: bool = False):
         super().__init__()
         self.visual = Qwen3VLVisionModel._from_config(config.vision_config)
-        self.language_model = Qwen3VLTextModel(config.text_config)
+        self.language_model = Qwen3VLTextModel(
+            config.text_config,
+            use_tensor_parallel=use_tensor_parallel,
+        )
         self.rope_deltas = None  # cache rope_deltas here
         self.config = config
 
@@ -868,6 +869,25 @@ class Qwen3VLModel(nn.Module):
         # Same implementation as for images
         return self.get_image_features(pixel_values_videos, video_grid_thw)
 
+    def _get_flat_visual_features(
+        self,
+        pixel_values: torch.FloatTensor,
+        grid_thw: Optional[torch.LongTensor],
+    ):
+        pixel_values = pixel_values.type(self.visual.dtype)
+        vision_kwargs = {}
+        if grid_thw is not None and grid_thw.device.type == "cpu":
+            if not is_flash_attention_requested(self.visual.config):
+                vision_kwargs = {
+                    "position_ids": get_vision_position_ids(
+                        grid_thw, self.visual.spatial_merge_size
+                    ).to(pixel_values.device),
+                    "cu_seqlens": get_vision_cu_seqlens(grid_thw),
+                }
+            grid_thw = grid_thw.to(pixel_values.device)
+        visual_out = self.visual(pixel_values, grid_thw=grid_thw, **vision_kwargs)
+        return visual_out.pooler_output, visual_out.deepstack_features
+
     def get_image_features(
         self,
         pixel_values: torch.FloatTensor,
@@ -882,10 +902,9 @@ class Qwen3VLModel(nn.Module):
             image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
                 The temporal, height and width of feature shape of each image in LLM.
         """
-        pixel_values = pixel_values.type(self.visual.dtype)
-        visual_out = self.visual(pixel_values, grid_thw=image_grid_thw)
-        image_embeds = visual_out.pooler_output
-        deepstack_image_embeds = visual_out.deepstack_features
+        image_embeds, deepstack_image_embeds = self._get_flat_visual_features(
+            pixel_values, image_grid_thw
+        )
         split_sizes = (
             image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
         ).tolist()
@@ -996,35 +1015,40 @@ class Qwen3VLModel(nn.Module):
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
-        if inputs_embeds is None:
+        inputs_embeds_owned = inputs_embeds is None
+        if inputs_embeds_owned:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
         image_mask = None
         video_mask = None
 
         if pixel_values is not None:
-            image_embeds, deepstack_image_embeds = self.get_image_features(  # long
+            image_embeds, deepstack_image_embeds = self._get_flat_visual_features(
                 pixel_values, image_grid_thw
             )
-            image_embeds = torch.cat(image_embeds, dim=0).to(
-                inputs_embeds.device, inputs_embeds.dtype
-            )
+            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            if inputs_embeds_owned:
+                inputs_embeds.masked_scatter_(image_mask, image_embeds)
+            else:
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+                inputs_embeds_owned = True
 
         if pixel_values_videos is not None:
-            video_embeds, deepstack_video_embeds = self.get_video_features(
+            video_embeds, deepstack_video_embeds = self._get_flat_visual_features(
                 pixel_values_videos, video_grid_thw
             )
-            video_embeds = torch.cat(video_embeds, dim=0).to(
-                inputs_embeds.device, inputs_embeds.dtype
-            )
+            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
             )
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+            if inputs_embeds_owned:
+                inputs_embeds.masked_scatter_(video_mask, video_embeds)
+            else:
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+                inputs_embeds_owned = True
 
         visual_pos_masks = None
         deepstack_visual_embeds = None
@@ -1040,8 +1064,8 @@ class Qwen3VLModel(nn.Module):
                 deepstack_image_embeds, deepstack_video_embeds
             ):
                 embed_joint = img_embed.new_zeros(
-                    visual_pos_masks.sum(), img_embed.shape[-1]
-                ).to(img_embed.device)
+                    img_embed.shape[0] + vid_embed.shape[0], img_embed.shape[-1]
+                )
                 embed_joint[image_mask_joint, :] = img_embed
                 embed_joint[video_mask_joint, :] = vid_embed
                 deepstack_visual_embeds.append(embed_joint)
