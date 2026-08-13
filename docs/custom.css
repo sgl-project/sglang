@@ -347,6 +347,9 @@ html.dark table tbody tr:nth-child(even) td,
   min-height: 38px;
   padding: 7px 10px;
   overflow: hidden;
+  /* Rows in the same grid track stretch to the tallest sibling; center the
+     label stack so a single-line option does not ride the top of its cell. */
+  align-content: center;
   border: 0;
   border-radius: 8px;
   background: transparent;
