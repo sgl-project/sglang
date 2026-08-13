@@ -518,7 +518,7 @@ def generate_metrics_json(metrics_data_file, test_case, status):
     tc_name = test_case.rsplit("/", 1)[-1].rsplit(".", 1)[0]
 
     test_type = "unknown"
-    # Directory structure: .../tests/output/{branch_label}-{create_date}-{run_id}-{run_attempt}/{workflow_name}/{test_type}/{tc_name}-{timestamp}
+    # Directory structure: .../tests/output/{branch_label}-{create_date}-{run_id}-{run_attempt}/{workflow_name}/{test_type}/{tc_name}
     parts = metrics_data_file.split("/")
     for i, part in enumerate(parts):
         if part == "output" and i + 3 < len(parts):
@@ -557,7 +557,6 @@ def run_npu_e2e_test_case(
     env="debug",
     trouble_shotting=False,
     transformers_version="",
-    timestamp="",
 ):
     """The method for running a npu e2e test case.
     Args:
@@ -573,8 +572,6 @@ def run_npu_e2e_test_case(
         sglang_is_in_ci (bool): whether running in CI environment.
         install_sglang_from_source (bool): whether installing sglang from source or use docker image directly.
         env (str): the environment to run the test on.  Choose one in ["debug", "ci"]
-        timestamp (str): the task creation timestamp (HHMMSS, Beijing time) used to build
-            the pod log directory in CI, keeping it consistent with the persistence directory.
     """
     random_str = get_unique_random_string(16, True)
 
@@ -618,7 +615,6 @@ def run_npu_e2e_test_case(
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
                 "run_label": run_label,
-                "timestamp": timestamp,
             }
             create_kube_yaml(
                 kube_yaml_template=KUBE_YAML_TEMPLATE.get(kube_job_type),
@@ -642,7 +638,6 @@ def run_npu_e2e_test_case(
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
                 "run_label": run_label,
-                "timestamp": timestamp,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_MIX_GREEN if env == "green" else kube_job_type
@@ -671,7 +666,6 @@ def run_npu_e2e_test_case(
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
                 "run_label": run_label,
-                "timestamp": timestamp,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_SEPARATION_GREEN if env == "green" else kube_job_type
@@ -862,14 +856,6 @@ if __name__ == "__main__":
         help="The transformers version number for running sglang. Use default version in image if keep empty.",
     )
 
-    parser.add_argument(
-        "--timestamp",
-        type=str,
-        required=False,
-        default="",
-        help="The task creation timestamp (HHMMSS, Beijing time), used to build the pod log directory in CI.",
-    )
-
     args = parser.parse_args()
 
     docker_image_url = args.image
@@ -886,7 +872,6 @@ if __name__ == "__main__":
     env = args.env
     trouble_shotting = args.trouble_shotting
     transformers_version = args.transformers_version
-    timestamp = args.timestamp
 
     kube_name_space = args.kube_name_space
     kube_job_type = args.kube_job_type
@@ -916,5 +901,4 @@ if __name__ == "__main__":
         env=env,
         trouble_shotting=trouble_shotting,
         transformers_version=transformers_version,
-        timestamp=timestamp,
     )

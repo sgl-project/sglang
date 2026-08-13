@@ -364,7 +364,7 @@ def run_bench_serving(
     top_p=None,
     env=None,
 ):
-    metrics_path = os.getenv("SGLANG_TEST_RESULTS_OUTPUT")
+    metrics_path = os.getenv("METRICS_DATA_FILE")
     result_file = (
         "./bench_log.txt"
         if not metrics_path
@@ -596,7 +596,7 @@ def run_aisbench(
     else:
         logger.info(f"Use exist dataset: {dataset_path}")
 
-    metrics_path = os.getenv("SGLANG_TEST_RESULTS_OUTPUT")
+    metrics_path = os.getenv("METRICS_DATA_FILE")
     result_path = "./aisbench_result" if not metrics_path else metrics_path
     logger.info(f"The metrics result file: {result_path}")
 
@@ -930,21 +930,19 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     def _setup_per_case_output(cls):
         """Set up per-case output directories and env vars.
 
-        When the workflow sets SGLANG_TEST_RESULTS_OUTPUT to a suite-level directory
+        When the workflow sets METRICS_DATA_FILE to a suite-level directory
         (e.g. .../output/{branch_label}-{create_date}-{run_id}-{run_attempt}/
-        {workflow_name}/{test_type}/{suite}-{timestamp}), each case in the suite
+        {workflow_name}/{test_type}/{suite}), each case in the suite
         writes to its own subdirectory under it, so results stay in the
         structured layout and are keyed by the case id. Falls back to the
         legacy per-case layout when the env var is not set.
         """
         cls.tc_name = cls._get_tc_name()
-        suite_output = os.environ.get("SGLANG_TEST_RESULTS_OUTPUT")
+        suite_output = os.environ.get("METRICS_DATA_FILE")
         if suite_output:
-            # Keep the structured suite prefix; append the case id.
+            # Append the case id under the suite output prefix.
             cls.metrics_data_file = os.path.join(suite_output, cls.tc_name)
-            # Mirror the suite prefix into the plog location so per-case plog
-            # stays under .../logs/plog/{branch_label}-{create_date}-{run_id}-{run_attempt}/{workflow_name}/{tc_name}/{hostname}
-            # (drop the {test_type}/{suite}-{timestamp} tail kept in output).
+            # Mirror the output prefix to the plog location (drop the test_type/suite tail).
             suite_plog = suite_output.replace("/output/", "/logs/plog/", 1)
             cls.plog_base = os.path.dirname(os.path.dirname(suite_plog))
         else:
@@ -955,7 +953,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
             cls.plog_base = f"/root/.cache/tests/logs/plog"
         os.makedirs(cls.metrics_data_file, exist_ok=True)
         # Override env vars so evalscope/dump_metric write to per-case paths.
-        os.environ["SGLANG_TEST_RESULTS_OUTPUT"] = cls.metrics_data_file
+        os.environ["METRICS_DATA_FILE"] = cls.metrics_data_file
         os.environ["SGLANG_TEST_METRICS_OUTPUT"] = os.path.join(
             cls.metrics_data_file, "metrics"
         )
@@ -1008,9 +1006,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
             logger.info("Saved per-case metrics to %s", out_path)
         except Exception as e:
             logger.warning("Failed to write metrics.json: %s", e)
-        # The JSONL files are intermediate raw records; remove them after the
-        # aggregated metrics.json has been written so the per-case directory
-        # only keeps the final result.
+        # Remove the intermediate JSONL records, keeping only the final metrics.json.
         for jsonl_path in glob.glob(pattern):
             try:
                 os.remove(jsonl_path)

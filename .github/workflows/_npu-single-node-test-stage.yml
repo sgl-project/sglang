@@ -41,7 +41,7 @@ on:
         required: false
         type: string
         default: '{}'
-        description: 'JSON run metadata {branch_label, workflow_name, create_date, timestamp}, recorded once at workflow start'
+        description: 'JSON run metadata {branch_label, workflow_name, create_date}, recorded once at workflow start'
       skip_pr_test_health_check:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         type: string
@@ -242,26 +242,24 @@ jobs:
           run_id=${{ github.run_id }}
           run_attempt=${{ github.run_attempt }}
 
-          # Parse run metadata (branch_label / workflow_name / create_date / timestamp)
+          # Parse run metadata (branch_label / workflow_name / create_date)
           # from run_start_metadata JSON input using GitHub fromJson expression, same as partitions input.
           branch_label=$(echo "${{ fromJson(inputs.run_start_metadata).branch_label }}" | tr '/:' '--')
           workflow_name=$(echo "${{ fromJson(inputs.run_start_metadata).workflow_name }}" | tr ' ' '_' | tr -d '()')
           create_date="${{ fromJson(inputs.run_start_metadata).create_date }}"
           if [ -z "${create_date}" ]; then create_date=$(date -u -d '+8 hours' +%Y%m%d); fi
-          timestamp="${{ fromJson(inputs.run_start_metadata).timestamp }}"
-          if [ -z "${timestamp}" ]; then timestamp=$(date -u -d '+8 hours' +%H%M%S); fi
           
           # Print persistence‑directory‑prefix variables
-          echo "Persistence prefix: run_id=${run_id} run_attempt=${run_attempt} branch_label=${branch_label} workflow_name=${workflow_name} create_date=${create_date} timestamp=${timestamp}"
+          echo "Persistence prefix: run_id=${run_id} run_attempt=${run_attempt} branch_label=${branch_label} workflow_name=${workflow_name} create_date=${create_date}"
           
           if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
-            test_data_output_path=/root/.cache/tests/output/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}-${timestamp}
+            test_data_output_path=/root/.cache/tests/output/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}
             mkdir -p ${test_data_output_path}
 
             # Set and print the output path for test‑case results and metrics persistence.
-            export SGLANG_TEST_RESULTS_OUTPUT=${test_data_output_path}
+            export METRICS_DATA_FILE=${test_data_output_path}
             export SGLANG_TEST_METRICS_OUTPUT=${test_data_output_path}/metrics
-            echo "SGLANG_TEST_RESULTS_OUTPUT=${SGLANG_TEST_RESULTS_OUTPUT}"
+            echo "METRICS_DATA_FILE=${METRICS_DATA_FILE}"
             echo "SGLANG_TEST_METRICS_OUTPUT=${SGLANG_TEST_METRICS_OUTPUT}"
           fi
 

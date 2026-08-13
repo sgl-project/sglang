@@ -108,15 +108,18 @@ jobs:
           else
             echo "skip_install_flag=${{ inputs.skip_install_flag }}" >> $GITHUB_OUTPUT
           fi
-          # Run-origin label: PR head label first, else ref name; sanitized into a safe path segment.
+          # If the nightly pipeline is triggered by a PR, this variable takes the source branch label of the PR; 
+          # otherwise, it uses the branch or tag name of the current ref.
           BRANCH_LABEL="$HEAD_LABEL"
           if [ -z "${BRANCH_LABEL}" ]; then
             BRANCH_LABEL="${{ github.ref_name }}"
           fi
           BRANCH_LABEL="$(echo "${BRANCH_LABEL}" | tr -cd 'a-zA-Z0-9._/:' | tr '/:' '--')"
-          # Package run metadata (branch/workflow/date/time) as a single JSON for reuse by all test
-          # jobs; date/time use UTC+8 recorded once at run start, shared even across midnight.
-          echo "run_start_metadata=$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_date':sys.argv[3],'timestamp':sys.argv[4]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "$(date -u -d '+8 hours' +%Y%m%d)" "$(date -u -d '+8 hours' +%H%M%S)")" >> $GITHUB_OUTPUT
+          # Package run metadata (branch/workflow/date) as a single JSON for reuse by all test
+          # jobs; date is UTC+8 recorded once at run start, shared even across midnight.
+          RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_date':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "$(date -u -d '+8 hours' +%Y%m%d)")"
+          # Write to GITHUB_OUTPUT and print to the log in one command.
+          echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
   
   nightly-mix-single-node-a2-tests:
     name: single-node-mix-a2
@@ -392,7 +395,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           has_metrics=false
-          # Each suite job uploads its SGLANG_TEST_RESULTS_OUTPUT directory, which
+          # Each suite job uploads its METRICS_DATA_FILE directory, which
           # contains per-case subdirectories with their own metrics.json.
           # Recursively find every metrics.json and render one table row per
           # test case.

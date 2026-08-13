@@ -13,10 +13,7 @@ from sglang.test.ci.ci_register import (
     auto_partition,
     collect_tests,
 )
-from sglang.test.ci.ci_utils import (
-    derive_timeout_per_file,
-    run_unittest_files,
-)
+from sglang.test.ci.ci_utils import run_unittest_files
 
 HW_MAPPING = {
     "cpu": HWBackend.CPU,
@@ -342,18 +339,6 @@ def run_a_suite(args):
     all_tests = collect_tests(files, sanity_check=sanity_check)
     validate_all_suites(all_tests)
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
-
-    if args.timeout_from_est_time:
-        # Per-file timeout is derived from each case's est_time, but floored at
-        # the flat --timeout-per-file so fast cases keep the 2h budget while
-        # slow cases (e.g. qwen3_6_27b_1p_gpqa with est_time=7200) keep their
-        # own larger headroom (derive_timeout_per_file -> 3h). Must run before
-        # auto_partition so the LPT balancing sees the effective est times.
-        timeout_floor = float(args.timeout_per_file)
-        for t in ci_tests:
-            if derive_timeout_per_file(t.est_time) < timeout_floor:
-                # est * 1.5 >= floor guarantees derive_timeout_per_file >= floor.
-                t.est_time = max(t.est_time, timeout_floor / 1.5)
 
     if auto_partition_size:
         live_est = load_live_est(args.partition_model_file, suite, repo_root)

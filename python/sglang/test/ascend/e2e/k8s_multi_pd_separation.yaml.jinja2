@@ -56,14 +56,12 @@ spec:
             value: "{{ kube_config_map }}"
           - name: HF_ENDPOINT
             value: "https://hf-mirror.com"
-          - name: SGLANG_TEST_RESULTS_OUTPUT
+          - name: METRICS_DATA_FILE
             value: "{{ metrics_data_file }}"
           - name: SGLANG_IS_IN_CI
             value: "{{ sglang_is_in_ci }}"
           - name: RUN_LABEL
             value: "{{ run_label }}"
-          - name: TIMESTAMP
-            value: "{{ timestamp }}"
           - name: TROUBLE_SHOTTING
             value: "{{ trouble_shotting }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
@@ -174,14 +172,12 @@ spec:
             value: "{{ kube_config_map }}"
           - name: HF_ENDPOINT
             value: "https://hf-mirror.com"
-          - name: SGLANG_TEST_RESULTS_OUTPUT
+          - name: METRICS_DATA_FILE
             value: "{{ metrics_data_file }}"
           - name: SGLANG_IS_IN_CI
             value: "{{ sglang_is_in_ci }}"
           - name: RUN_LABEL
             value: "{{ run_label }}"
-          - name: TIMESTAMP
-            value: "{{ timestamp }}"
           - name: TROUBLE_SHOTTING
             value: "{{ trouble_shotting }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
@@ -284,12 +280,10 @@ spec:
                 fieldPath: status.hostIP
           - name: INSTALL_SGLANG_FROM_SOURCE
             value: "{{ install_sglang_from_source }}"
-          - name: SGLANG_TEST_RESULTS_OUTPUT
+          - name: METRICS_DATA_FILE
             value: "{{ metrics_data_file }}"
           - name: RUN_LABEL
             value: "{{ run_label }}"
-          - name: TIMESTAMP
-            value: "{{ timestamp }}"
           - name: KUBECONFIG
             value: "{{ kube_config }}"
           - name: NAMESPACE
