@@ -383,6 +383,87 @@ def _lse_pack_dim(output_dtype: torch.dtype) -> int:
 
 
 @triton.jit
+def _dcp_pack_a2a_send_kernel(
+    out_ptr,
+    lse_ptr,
+    send_ptr,
+    out_stride_B,
+    out_stride_H,
+    lse_stride_B,
+    lse_stride_H,
+    send_stride_N,
+    send_stride_B,
+    send_stride_H,
+    H_PER_RANK: tl.constexpr,
+    WORDS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Scatter one (batch, head) partial into its peer's a2a send slot."""
+    b = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
+
+    src = out_ptr + b * out_stride_B + h * out_stride_H
+    dst = (
+        send_ptr
+        + (h // H_PER_RANK) * send_stride_N
+        + b * send_stride_B
+        + (h % H_PER_RANK) * send_stride_H
+    )
+
+    for start in tl.range(0, WORDS, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = offs < WORDS
+        tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
+
+    tl.store(dst + WORDS, tl.load(lse_ptr + b * lse_stride_B + h * lse_stride_H))
+
+
+def dcp_pack_a2a_send(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    send_combined: torch.Tensor,
+) -> None:
+    """Pack ``[B, H, D]`` partials + ``[B, H]`` LSE into the a2a send buffer.
+
+    ``send_combined`` is ``[N, B_max, H // N, D + lse_pack_dim]``; rows beyond
+    ``B`` are left untouched.
+    """
+    B, H, D = cp_attn_out.shape
+    N, B_max, H_per_rank, row_width = send_combined.shape
+    lpd = _lse_pack_dim(send_combined.dtype)
+
+    if cp_attn_lse.dtype != torch.float32:
+        raise ValueError(f"cp_attn_lse must be float32, got {cp_attn_lse.dtype}")
+    if D % lpd:
+        raise ValueError(f"head dim {D} must be a multiple of the LSE pack dim {lpd}")
+    if row_width != D + lpd or H_per_rank * N != H or B > B_max:
+        raise ValueError(
+            f"send buffer {tuple(send_combined.shape)} does not match "
+            f"out {tuple(cp_attn_out.shape)}"
+        )
+
+    out_words = cp_attn_out.view(torch.float32)
+    send_words = send_combined.view(torch.float32)
+    words = D // lpd
+
+    _dcp_pack_a2a_send_kernel[(B, H)](
+        out_words,
+        cp_attn_lse,
+        send_words,
+        out_words.stride(0),
+        out_words.stride(1),
+        cp_attn_lse.stride(0),
+        cp_attn_lse.stride(1),
+        send_words.stride(0),
+        send_words.stride(1),
+        send_words.stride(2),
+        H_PER_RANK=H_per_rank,
+        WORDS=words,
+        BLOCK=min(1024, triton.next_power_of_2(words)),
+    )
+
+
+@triton.jit
 def _dcp_lse_combine_kernel(
     recv_output_ptr,
     recv_lse_ptr,

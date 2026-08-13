@@ -19,6 +19,7 @@ from typing import List, Optional
 from pydantic import BaseModel, Field, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionMessageContentImageURL,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -124,6 +125,17 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(request.temperature, None)  # default
         self.assertFalse(request.stream)  # default
         self.assertEqual(request.tool_choice, "none")  # default when no tools
+
+    def test_image_content_hash_validation(self):
+        digest = "sha256:" + "AB" * 32
+        image = ChatCompletionMessageContentImageURL(
+            url="https://example.com/image.jpg", content_hash=digest
+        )
+        self.assertEqual(image.content_hash, digest.lower())
+        with self.assertRaises(ValidationError):
+            ChatCompletionMessageContentImageURL(
+                url="https://example.com/image.jpg", content_hash="not-a-hash"
+            )
 
     def test_sampling_param_build(self):
         req = ChatCompletionRequest(
