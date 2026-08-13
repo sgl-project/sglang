@@ -111,7 +111,22 @@ fn process(
     Ok(packed.input_ids)
 }
 
-/// One MM worker, spawned via `Runtime::spawn_mm_pool` (which owns the
+/// Boot-time wiring of the MM path, held privately by the `Runtime` for the
+/// late pool spawn (`Runtime::start_mm_workers`, once Python has resolved
+/// the spec).
+pub struct MmWiring {
+    /// Requests parked in `Encoding`, drained by the worker pool. Stays empty
+    /// for non-multimodal models — nothing routes to it.
+    pub mm_rx: flume::Receiver<MmRequest>,
+    /// Back-channel for the workers' `MmEncoded` / `MmFailed` into the
+    /// to-scheduler loop.
+    pub tm_tx: flume::Sender<TmEvent>,
+    /// The loaded tokenizer, shared with the tokenizer pool (`None` under
+    /// `skip_tokenizer_init`).
+    pub tokenizer: Option<Arc<dyn TextTokenizer>>,
+}
+
+/// One MM worker, spawned via `Runtime::start_mm_workers` (which owns the
 /// pinning policy for this pool — see its docs).
 pub struct MmWorker {
     rx: flume::Receiver<MmRequest>,
