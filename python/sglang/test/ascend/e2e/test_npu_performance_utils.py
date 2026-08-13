@@ -364,7 +364,7 @@ def run_bench_serving(
     top_p=None,
     env=None,
 ):
-    metrics_path = os.getenv("METRICS_DATA_FILE")
+    metrics_path = os.getenv("SGLANG_TEST_RESULTS_OUTPUT")
     result_file = (
         "./bench_log.txt"
         if not metrics_path
@@ -596,7 +596,7 @@ def run_aisbench(
     else:
         logger.info(f"Use exist dataset: {dataset_path}")
 
-    metrics_path = os.getenv("METRICS_DATA_FILE")
+    metrics_path = os.getenv("SGLANG_TEST_RESULTS_OUTPUT")
     result_path = "./aisbench_result" if not metrics_path else metrics_path
     logger.info(f"The metrics result file: {result_path}")
 
@@ -930,7 +930,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     def _setup_per_case_output(cls):
         """Set up per-case output directories and env vars.
 
-        When the workflow sets METRICS_DATA_FILE to a suite-level directory
+        When the workflow sets SGLANG_TEST_RESULTS_OUTPUT to a suite-level directory
         (e.g. .../output/{branch_label}-{create_date}-{run_id}-{run_attempt}/
         {workflow_name}/{test_type}/{suite}-{timestamp}), each case in the suite
         writes to its own subdirectory under it, so results stay in the
@@ -938,7 +938,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
         legacy per-case layout when the env var is not set.
         """
         cls.tc_name = cls._get_tc_name()
-        suite_output = os.environ.get("METRICS_DATA_FILE")
+        suite_output = os.environ.get("SGLANG_TEST_RESULTS_OUTPUT")
         if suite_output:
             # Keep the structured suite prefix; append the case id.
             cls.metrics_data_file = os.path.join(suite_output, cls.tc_name)
@@ -955,7 +955,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
             cls.plog_base = f"/root/.cache/tests/logs/plog"
         os.makedirs(cls.metrics_data_file, exist_ok=True)
         # Override env vars so evalscope/dump_metric write to per-case paths.
-        os.environ["METRICS_DATA_FILE"] = cls.metrics_data_file
+        os.environ["SGLANG_TEST_RESULTS_OUTPUT"] = cls.metrics_data_file
         os.environ["SGLANG_TEST_METRICS_OUTPUT"] = os.path.join(
             cls.metrics_data_file, "metrics"
         )

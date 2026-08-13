@@ -137,11 +137,11 @@ else
 fi
 echo "Finished test case ${test_case}"
 
-if [ -n "${METRICS_DATA_FILE}" ]; then
-    mkdir -p "${METRICS_DATA_FILE}"
+if [ -n "${SGLANG_TEST_RESULTS_OUTPUT}" ]; then
+    mkdir -p "${SGLANG_TEST_RESULTS_OUTPUT}"
     # Archive the test log into the output directory for result collection
-    cp "${log_path}/${tc_name}.log" "${METRICS_DATA_FILE}/test_output.log"
-    echo "Metrics log saved to ${METRICS_DATA_FILE}/test_output.log"
+    cp "${log_path}/${tc_name}.log" "${SGLANG_TEST_RESULTS_OUTPUT}/test_output.log"
+    echo "Metrics log saved to ${SGLANG_TEST_RESULTS_OUTPUT}/test_output.log"
 fi
 
 source_plog_path="/root/ascend/log/debug/plog"

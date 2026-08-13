@@ -37,26 +37,11 @@ on:
         type: string
         default: ""
         description: "The transformers version number for running sglang. Use default version in image if keep empty."
-      branch_label:
+      run_start_metadata:
         required: false
         type: string
-        default: ''
-        description: 'Branch label (e.g., "pllimax:pr_branch_plli_for_check_in_2" for PR, or ref_name otherwise)'
-      workflow_name:
-        required: false
-        type: string
-        default: ''
-        description: 'Name of the orchestrating workflow (e.g., "PR Test (NPU)")'
-      create_date:
-        required: false
-        type: string
-        default: ''
-        description: 'Run creation date (YYYYMMDD, Beijing time), recorded once at workflow start'
-      timestamp:
-        required: false
-        type: string
-        default: ''
-        description: 'Run creation timestamp (HHMMSS, Beijing time), recorded once at workflow start'
+        default: '{}'
+        description: 'JSON run metadata {branch_label, workflow_name, create_date, timestamp}, recorded once at workflow start'
       skip_pr_test_health_check:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         type: string
@@ -65,18 +50,10 @@ on:
         description: 'Run the test suite with --nightly (collects nightly-registered tests) and --continue-on-error'
         type: boolean
         default: false
-      auto_partition_size:
-        description: 'Split the suite into N partitions; each partition job runs a subset via run_suite.py --auto-partition-size'
+      partitions:
+        description: 'Partition config to parallelize a suite across jobs, e.g. {"size":3,"arr":[0,1,2]}. Each element of arr is a partition id; the template expands one matrix job per element. size is passed to run_suite.py --auto-partition-size.'
         type: string
-        default: ''
-      auto_partition_id:
-        description: 'Which partition (0-based) this job runs when auto_partition_size is set'
-        type: string
-        default: ''
-      partition_label:
-        description: 'Short suffix (e.g. p0/p1) appended to the run/output directory and metrics artifact name to distinguish parallel partition jobs of the same suite'
-        type: string
-        default: ''
+        default: '{"size":1,"arr":[0]}'
       github-token:
         description: 'GitHub token for API calls'
         type: string
@@ -86,12 +63,16 @@ env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
 
 concurrency:
-  group: ascend-nightly-e2e-singlenode-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_suite }}-${{ inputs.auto_partition_id }}
+  group: ascend-nightly-e2e-singlenode-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_suite }}
   cancel-in-progress: true
 
 jobs:
   e2e:
     name: ${{ inputs.test_suite }}
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: ${{ fromJson(inputs.partitions).arr }}
     runs-on: ${{ inputs.runner }}
     container:
       image: ${{ inputs.image }}
@@ -233,9 +214,9 @@ jobs:
           GDN_ATTN_BACKEND_TRITON: 1
         shell: bash
         run: |
-          # Ensure the pipeline exit code reflects run_suite.py, not the final
-          # tee in the pipe, so test failures are reported to the job status.
+          # Set this parameter to ensure test failures are correctly reflected in the job status.
           set -o pipefail
+
           sglang_source_path=$(pwd)
           echo "Source code path: ${sglang_source_path}"
           ln -sf ${sglang_source_path} /root/sglang
@@ -244,42 +225,44 @@ jobs:
           test_suite="${{ inputs.test_suite }}"
           echo "Test mode: suite (${test_suite})"
           tc_name="${test_suite}"
-          # Parallel partition jobs of the same suite get distinct run/output
-          # directory suffixes so their artifacts do not collide.
-          if [ -n "${{ inputs.partition_label }}" ]; then
-            tc_name="${test_suite}-${{ inputs.partition_label }}"
+
+          # The ID is used to locate the current job instance, 
+          # size determines whether parallel execution is enabled.
+          PARTITION_ID=${{ matrix.partition }}
+          PARTITION_SIZE=${{ fromJson(inputs.partitions).size }}
+          # Append directory suffixes when there are parallel partition jobs 
+          # within the test suite to prevent collision of result artifact directories.
+          if [ "${PARTITION_SIZE}" -gt 1 ]; then
+            tc_name="${test_suite}-p${PARTITION_ID}"
           fi
 
-          # run_id / branch_label / workflow_name form the persistence directory prefix.
-          # run_attempt distinguishes re-runs of the same workflow run (1, 2, 3, ...).
+          # Provided automatically by the GitHub server. 
+          # run_id is the unique identifier for the workflow run,
+          # attempt represents the re‑run attempt count of the job.
           run_id=${{ github.run_id }}
           run_attempt=${{ github.run_attempt }}
-          branch_label=$(echo "${{ inputs.branch_label }}" | tr '/:' '--')
-          workflow_name=$(echo "${{ inputs.workflow_name }}" | tr ' ' '_' | tr -d '()')
-          # Run creation date/time are recorded ONCE at workflow start and passed in, so a
-          # task spanning midnight still uses the run creation date. Fall back to now for
-          # direct/local invocations that do not pass them.
-          current_date=$(date -u -d '+8 hours' +%Y%m%d)
-          create_date="${{ inputs.create_date }}"
-          if [ -z "${create_date}" ]; then create_date=${current_date}; fi
-          timestamp="${{ inputs.timestamp }}"
+
+          # Parse run metadata (branch_label / workflow_name / create_date / timestamp)
+          # from run_start_metadata JSON input using GitHub fromJson expression, same as partitions input.
+          branch_label=$(echo "${{ fromJson(inputs.run_start_metadata).branch_label }}" | tr '/:' '--')
+          workflow_name=$(echo "${{ fromJson(inputs.run_start_metadata).workflow_name }}" | tr ' ' '_' | tr -d '()')
+          create_date="${{ fromJson(inputs.run_start_metadata).create_date }}"
+          if [ -z "${create_date}" ]; then create_date=$(date -u -d '+8 hours' +%Y%m%d); fi
+          timestamp="${{ fromJson(inputs.run_start_metadata).timestamp }}"
           if [ -z "${timestamp}" ]; then timestamp=$(date -u -d '+8 hours' +%H%M%S); fi
-          # Print the persistence directory prefix vars so failures can be traced
-          # back to the exact run / branch / workflow / creation time in logs.
+          
+          # Print persistence‑directory‑prefix variables
           echo "Persistence prefix: run_id=${run_id} run_attempt=${run_attempt} branch_label=${branch_label} workflow_name=${workflow_name} create_date=${create_date} timestamp=${timestamp}"
-          # Persist results to: .../output/{branch_label}-{create_date}-{run_id}-{run_attempt}/{workflow_name}/{test_type}/{tc_name}-{timestamp}
-          # Only nightly persists structured results; PR keeps the original per-run flow.
+          
           if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
             test_data_output_path=/root/.cache/tests/output/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}-${timestamp}
             mkdir -p ${test_data_output_path}
-            export METRICS_DATA_FILE=${test_data_output_path}
-            # Redirect the test framework's JSONL metrics dump into the new structured directory
+
+            # Set and print the output path for test‑case results and metrics persistence.
+            export SGLANG_TEST_RESULTS_OUTPUT=${test_data_output_path}
             export SGLANG_TEST_METRICS_OUTPUT=${test_data_output_path}/metrics
-            echo "Metrics file path: ${METRICS_DATA_FILE}"
+            echo "SGLANG_TEST_RESULTS_OUTPUT=${SGLANG_TEST_RESULTS_OUTPUT}"
             echo "SGLANG_TEST_METRICS_OUTPUT=${SGLANG_TEST_METRICS_OUTPUT}"
-            # Persist to job env early so the "Upload metrics" step still has the
-            # path if the test fails or this step times out mid-run.
-            echo "METRICS_DATA_FILE=${METRICS_DATA_FILE}" >> $GITHUB_ENV
           fi
 
           export TRANSFORMERS_VERSION_FOR_SGLANG="${{ inputs.transformers_version }}"
@@ -335,19 +318,20 @@ jobs:
           echo "Running test: ${tc_name}"
           test_exit_code=0
           cd test
-          # nightly mode: collect nightly-registered tests (--nightly) and keep running
-          # remaining cases even if one fails (--continue-on-error)
+
+          # Append `--nightly` and `--continue-on-error` arguments when the job belongs to the nightly pipeline.
+          # --nightly: Collect test cases registered for nightly runs.
+          # --continue-on-error: Keep running remaining cases even if one fails.
           NIGHTLY_FLAG="$([ "${{ inputs.is_nightly_pipeline_job }}" = "true" ] && echo "--nightly --continue-on-error")"
-          # When the suite is split across parallel jobs, run only this job's
-          # partition of cases (run_suite.py balances by est_time).
-          PARTITION_ARGS=""
-          if [ -n "${{ inputs.auto_partition_size }}" ]; then
-            PARTITION_ARGS="--auto-partition-id ${{ inputs.auto_partition_id }} --auto-partition-size ${{ inputs.auto_partition_size }}"
-          fi
-          # Nightly derives each case's timeout from its est_time (run_suite.py
-          # floors it at --timeout-per-file), so slow cases get their own
-          # headroom while PR keeps the flat per-file budget.
+
+          # Append configuration arguments when the test suite is split into multiple parallel jobs.
+          PARTITION_ARGS="$([ "${PARTITION_SIZE}" -gt 1 ] && echo "--auto-partition-id ${PARTITION_ID} --auto-partition-size ${PARTITION_SIZE}")"
+
+          # Append `--timeout-from-est‑time` when the job belongs to the nightly pipeline.
+          # per‑case timeout is derived from each case's est_time.
           TIMEOUT_FLAG="$([ "${{ inputs.is_nightly_pipeline_job }}" = "true" ] && echo "--timeout-from-est-time")"
+
+          # Run NPU test suite with run_suite.py.
           ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
 
           echo "Finished test: ${tc_name}"
@@ -360,16 +344,8 @@ jobs:
             status_icon="❌"
           fi
 
-          echo "test_status=${test_status}" >> $GITHUB_ENV
-          echo "tc_name=${tc_name}" >> $GITHUB_ENV
-          # Persist path prefix vars for later steps (e.g. plog backup)
-          echo "branch_label=${branch_label}" >> $GITHUB_ENV
-          echo "workflow_name=${workflow_name}" >> $GITHUB_ENV
-          echo "create_date=${create_date}" >> $GITHUB_ENV
-          echo "run_id=${run_id}" >> $GITHUB_ENV
-          echo "run_attempt=${run_attempt}" >> $GITHUB_ENV
+          echo "tc_name=${tc_name}"
           export test_status tc_name
-
           echo "## ${tc_name}  ${status_icon} ${test_status}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           metric_count=$(grep -c '\[METRIC\]' /tmp/test_output.log 2>/dev/null || echo 0)
@@ -386,23 +362,4 @@ jobs:
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Save the suite-level merged log. Per-case metrics.json files are
-          # written by each test base class (test_npu_accuracy/performance_utils)
-          # into {METRICS_DATA_FILE}/{tc_name}/metrics.json, so no suite-level
-          # merged metrics.json is generated here.
-          if [ -n "${METRICS_DATA_FILE}" ]; then
-            mkdir -p "${METRICS_DATA_FILE}"
-            cp /tmp/test_output.log "${METRICS_DATA_FILE}/test_output.log"
-            echo "Merged log saved to ${METRICS_DATA_FILE}/test_output.log"
-          fi
-
           exit ${test_exit_code}
-
-      - name: Upload metrics
-        if: always() && inputs.is_nightly_pipeline_job == true && env.METRICS_DATA_FILE != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: metrics-${{ env.tc_name }}
-          path: ${{ env.METRICS_DATA_FILE }}
-          if-no-files-found: ignore
-          retention-days: 7

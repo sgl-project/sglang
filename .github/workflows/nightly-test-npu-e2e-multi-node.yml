@@ -59,26 +59,11 @@ on:
         type: string
         default: ""
         description: "The transformers version number for running sglang. Use default version in image if keep empty."
-      branch_label:
+      run_start_metadata:
         required: false
         type: string
-        default: ''
-        description: 'Branch label (e.g., "pllimax:pr_branch_plli_for_check_in_2" for PR, or ref_name otherwise)'
-      workflow_name:
-        required: false
-        type: string
-        default: ''
-        description: 'Name of the orchestrating workflow (e.g., "Nightly Test (NPU)")'
-      create_date:
-        required: false
-        type: string
-        default: ''
-        description: 'Run creation date (YYYYMMDD, Beijing time), recorded once at workflow start'
-      timestamp:
-        required: false
-        type: string
-        default: ''
-        description: 'Run creation timestamp (HHMMSS, Beijing time), recorded once at workflow start'
+        default: '{}'
+        description: 'JSON run metadata {branch_label, workflow_name, create_date, timestamp}, recorded once at workflow start'
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
@@ -161,14 +146,18 @@ jobs:
           # run_attempt distinguishes re-runs of the same workflow run (1, 2, 3, ...).
           run_id=${{ github.run_id }}
           run_attempt=${{ github.run_attempt }}
-          branch_label=$(echo "${{ inputs.branch_label }}" | tr '/:' '--')
-          workflow_name=$(echo "${{ inputs.workflow_name }}" | tr ' ' '_' | tr -d '()')
+          # Parse run metadata (branch_label / workflow_name / create_date / timestamp)
+          # from the single run_start_metadata JSON input via GitHub's fromJson expression.
+          # Sanitize filesystem segments and fall back to "now" for direct/local
+          # invocations that omit them.
+          branch_label=$(echo "${{ fromJson(inputs.run_start_metadata).branch_label }}" | tr '/:' '--')
+          workflow_name=$(echo "${{ fromJson(inputs.run_start_metadata).workflow_name }}" | tr ' ' '_' | tr -d '()')
           # Run creation date/time are recorded ONCE at workflow start and passed in, so a
           # task spanning midnight still uses the run creation date. Fall back to now for
           # direct/local invocations that do not pass them.
-          create_date="${{ inputs.create_date }}"
+          create_date="${{ fromJson(inputs.run_start_metadata).create_date }}"
           if [ -z "${create_date}" ]; then create_date=$(date -u -d '+8 hours' +%Y%m%d); fi
-          timestamp="${{ inputs.timestamp }}"
+          timestamp="${{ fromJson(inputs.run_start_metadata).timestamp }}"
           if [ -z "${timestamp}" ]; then timestamp=$(date -u -d '+8 hours' +%H%M%S); fi
           metrics_data_path=/root/.cache/tests/output/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}-${timestamp}
           mkdir -p ${metrics_data_path}
