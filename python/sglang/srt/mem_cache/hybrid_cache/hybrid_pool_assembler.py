@@ -923,15 +923,6 @@ def _build_mha_mla_host_pool(
     )
 
 
-def _unwrap_hybrid_linear_draft_pool(pool: Any) -> Any:
-    """Return the full-attention KV backing pool used by a hybrid draft."""
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-    if isinstance(pool, HybridLinearKVPool):
-        return pool.full_kv_pool
-    return pool
-
-
 def build_full_draft_pools(
     *,
     draft_kv_pool: Any,
@@ -941,7 +932,7 @@ def build_full_draft_pools(
     """Build draft KV/DSA sidecars whose indices follow target full KV."""
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
-    pool = _unwrap_hybrid_linear_draft_pool(draft_kv_pool)
+    pool = draft_kv_pool
     if pool.layer_num == 0:
         return [], []
 
