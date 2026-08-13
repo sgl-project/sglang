@@ -195,10 +195,10 @@ class TestProcessWeightsAfterLoadingZeroScale(unittest.TestCase):
         # as zero instead of failing loudly.
         layer = SimpleNamespace(
             w13_weight_scale_inv=torch.nn.Parameter(
-                torch.zeros(2, 2, 4, dtype=torch.uint8)
+                torch.zeros(2, 2, 4, dtype=torch.uint8), requires_grad=False
             ),
             w2_weight_scale_inv=torch.nn.Parameter(
-                torch.zeros(2, 2, 4, dtype=torch.uint8)
+                torch.zeros(2, 2, 4, dtype=torch.uint8), requires_grad=False
             ),
         )
         with self.assertRaises(RuntimeError):
@@ -207,10 +207,10 @@ class TestProcessWeightsAfterLoadingZeroScale(unittest.TestCase):
     def test_raises_when_w2_scales_never_loaded(self):
         layer = SimpleNamespace(
             w13_weight_scale_inv=torch.nn.Parameter(
-                torch.ones(2, 2, 4, dtype=torch.uint8)
+                torch.ones(2, 2, 4, dtype=torch.uint8), requires_grad=False
             ),
             w2_weight_scale_inv=torch.nn.Parameter(
-                torch.zeros(2, 2, 4, dtype=torch.uint8)
+                torch.zeros(2, 2, 4, dtype=torch.uint8), requires_grad=False
             ),
         )
         with self.assertRaises(RuntimeError):
