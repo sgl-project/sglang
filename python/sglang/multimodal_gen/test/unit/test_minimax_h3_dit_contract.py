@@ -6,6 +6,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from sglang.kernels.ops.diffusion.minimax_h3_rmsnorm_adaln import (
+    mark_minimax_h3_indexed_rmsnorm_adaln_site,
+    mount_minimax_h3_indexed_rmsnorm_adaln,
+    unmount_minimax_h3_indexed_rmsnorm_adaln,
+)
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTArchConfig,
     MiniMaxH3DiTConfig,
@@ -28,6 +33,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3DiTBlock,
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
+    _indexed_rmsnorm_adaln,
     _modulate_gate,
     _reorder_grouped_qkv_to_qkv,
 )
@@ -163,8 +169,8 @@ def test_cache_dit_preservation_only_makes_first_gate_out_of_place():
 
     with (
         patch(
-            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_scale_shift",
-            side_effect=lambda value, *_args, **_kwargs: value,
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._indexed_rmsnorm_adaln",
+            side_effect=lambda _block, _norm, value, *_args, **_kwargs: value,
         ),
         patch(
             "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_gate",
@@ -176,6 +182,117 @@ def test_cache_dit_preservation_only_makes_first_gate_out_of_place():
         # holds by reference, so only it goes out-of-place. The second works on
         # a block-local buffer and keeps the fused in-place kernel.
         assert run(preserve=True) == [False, True]
+
+
+def test_indexed_rmsnorm_adaln_is_quality_gated_and_routes_when_mounted():
+    block = torch.nn.Module()
+    mark_minimax_h3_indexed_rmsnorm_adaln_site(block)
+    norm = torch.nn.RMSNorm(4, eps=1e-5)
+    x = torch.randn(3, 4)
+    shift = torch.randn(2, 4)
+    scale = torch.randn(2, 4)
+    indices = torch.tensor([0, 1, 0], dtype=torch.long)
+
+    # Marking a site must leave the lossless/reference path enabled by default.
+    expected = norm(x)
+    expected = expected * (1 + scale.index_select(0, indices))
+    expected = expected + shift.index_select(0, indices)
+    actual = _indexed_rmsnorm_adaln(
+        block,
+        norm,
+        x,
+        shift,
+        scale,
+        indices,
+        dtype=torch.float32,
+    )
+    assert torch.equal(actual, expected)
+
+    fused_output = torch.full_like(x, 7)
+    assert mount_minimax_h3_indexed_rmsnorm_adaln(block)
+    try:
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.minimax_h3.can_use_fused_indexed_rmsnorm_adaln",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.minimax_h3.fused_indexed_rmsnorm_adaln",
+                return_value=fused_output,
+            ) as fused,
+        ):
+            actual = _indexed_rmsnorm_adaln(
+                block,
+                norm,
+                x,
+                shift,
+                scale,
+                indices,
+                dtype=torch.float32,
+            )
+        assert actual is fused_output
+        fused.assert_called_once_with(
+            x, norm.weight, shift, scale, indices, float(norm.eps)
+        )
+    finally:
+        unmount_minimax_h3_indexed_rmsnorm_adaln(block)
+
+
+def test_indexed_rmsnorm_adaln_runtime_failure_falls_back_once():
+    block = torch.nn.Module()
+    mark_minimax_h3_indexed_rmsnorm_adaln_site(block)
+    assert mount_minimax_h3_indexed_rmsnorm_adaln(block)
+    norm = torch.nn.RMSNorm(4, eps=1e-5)
+    x = torch.randn(3, 4)
+    shift = torch.randn(2, 4)
+    scale = torch.randn(2, 4)
+    indices = torch.tensor([0, 1, 0], dtype=torch.long)
+    expected = norm(x)
+    expected = expected * (1 + scale.index_select(0, indices))
+    expected = expected + shift.index_select(0, indices)
+
+    try:
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.minimax_h3._H3_RMSNORM_ADALN_FAILED_KEYS",
+                set(),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.minimax_h3.can_use_fused_indexed_rmsnorm_adaln",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.minimax_h3.fused_indexed_rmsnorm_adaln",
+                side_effect=RuntimeError("kernel unavailable"),
+            ) as fused,
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.minimax_h3.logger.warning_once"
+            ) as warning,
+        ):
+            first = _indexed_rmsnorm_adaln(
+                block,
+                norm,
+                x,
+                shift,
+                scale,
+                indices,
+                dtype=torch.float32,
+            )
+            second = _indexed_rmsnorm_adaln(
+                block,
+                norm,
+                x,
+                shift,
+                scale,
+                indices,
+                dtype=torch.float32,
+            )
+        assert torch.equal(first, expected)
+        assert torch.equal(second, expected)
+        fused.assert_called_once()
+        warning.assert_called_once()
+    finally:
+        unmount_minimax_h3_indexed_rmsnorm_adaln(block)
 
 
 def test_cache_dit_input_preservation_toggles_every_block():

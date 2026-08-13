@@ -6,9 +6,9 @@ Run directly on an NVIDIA or AMD server::
     python3 test/registered/kernels/benchmark/diffusion/\
         bench_minimax_h3_indexed_rmsnorm_adaln.py
 
-The ``split`` provider is the operation currently used by H3: PyTorch
-``RMSNorm`` followed by SGLang's in-place indexed BF16 modulation kernel.  The
-``fused`` provider is the Triton prototype under evaluation.
+The ``split`` provider is H3's ``quality="lossless"`` operation: PyTorch
+``RMSNorm`` followed by SGLang's in-place indexed BF16 modulation kernel. The
+``fused`` provider is the Triton path mounted for ``quality="high"`` requests.
 """
 
 from dataclasses import dataclass
@@ -70,9 +70,7 @@ LINE_NAMES = ["H3 RMSNorm + indexed adaLN", "Triton fused"]
 STYLES = [("red", "-"), ("blue", "--")]
 
 
-def _make_indices(
-    case: CaseSpec, generator: torch.Generator
-) -> torch.Tensor:
+def _make_indices(case: CaseSpec, generator: torch.Generator) -> torch.Tensor:
     if case.index_pattern == "random":
         return torch.randint(
             case.adaln_rows,
@@ -191,7 +189,7 @@ def benchmark(case_name: str, provider: str) -> Tuple[float, float, float]:
 
 
 if __name__ == "__main__":
-    print("Validating MiniMax H3 indexed RMSNorm + adaLN prototype...")
+    print("Validating MiniMax H3 indexed RMSNorm + adaLN fused kernel...")
     for case_name in CASE_NAMES:
         validate(CASE_BY_NAME[case_name])
     print("Running MiniMax H3 indexed RMSNorm + adaLN benchmark...")
