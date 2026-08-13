@@ -263,8 +263,18 @@ class EagerRunner(BaseRunner):
         if cp_v2_active:
             prepare_cp_forward(forward_batch)
 
-        if forward_batch.needs_forward_metadata_init() or cp_v2_active:
-            if model_runner.dcp_size > 1 and hasattr(
+        # Target verify can arrive with ``forward_metadata_ready`` set by an
+        # upstream/speculative planning step.  That mark does not initialize
+        # the final target hybrid backend, and unlike a graph replay eager has
+        # no static metadata load to fill the gap.  Re-plan target verify from
+        # the final batch every time; eager metadata is intentionally derived
+        # directly from the live ``spec_info`` tensors.
+        if (
+            forward_batch.needs_forward_metadata_init()
+            or cp_v2_active
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            if model_runner.ps.attn_dcp_size > 1 and hasattr(
                 model_runner.model, "prepare_context_parallel_metadata_for_dcp"
             ):
                 # prepare kv cache buffer for dcp to gather kv cache
@@ -371,15 +381,34 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
-        hidden_states = cp_gather_after_forward(
-            hidden_states, forward_batch, torch.cuda.current_stream()
-        )
+        stream = torch.cuda.current_stream()
+        hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
+        # DSpark aux tensors ride the same CP token split; gather them the same way.
+        if aux_hidden_states is not None:
+            if isinstance(aux_hidden_states, torch.Tensor):
+                aux_hidden_states = cp_gather_after_forward(
+                    aux_hidden_states, forward_batch, stream
+                )
+            else:
+                aux_hidden_states = [
+                    cp_gather_after_forward(aux, forward_batch, stream)
+                    for aux in aux_hidden_states
+                ]
+        logits_kwargs = {}
+        # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_before_norm = hidden_states
+            # Mirror DeepseekV4ForCausalLM.forward: drop pre_hc_head when
+            # DSpark aux capture is on, else it overrides the packed aux.
+            if aux_hidden_states is None:
+                logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
         return model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
             model.lm_head,
             forward_batch,
             aux_hidden_states,
+            **logits_kwargs,
         )
 
     def _execute_idle(

@@ -20,6 +20,12 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    MM_FEATURE_CACHE_SIZE,
+    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+    MmItemMemoryPool,
+    get_mm_feature_pool_size_per_worker,
+)
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     envs,
@@ -30,13 +36,6 @@ from sglang.srt.utils import (
     load_image,
     load_video,
     logger,
-)
-from sglang.srt.utils.cuda_ipc_transport_utils import (
-    MM_FEATURE_CACHE_SIZE,
-    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-    CudaIpcTensorTransportProxy,
-    MmItemMemoryPool,
-    get_mm_feature_pool_size_per_worker,
 )
 
 _is_cpu = is_cpu()
@@ -200,14 +199,19 @@ class BaseMultimodalProcessor(ABC):
         )
         self.mm_feature_transport = (
             configured_mm_feature_transport
-            if configured_mm_feature_transport in ("cpu", "cuda_ipc")
+            if configured_mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm")
             else "cpu"
         )
         self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
         self.use_ipc_pool_handle_cache = (
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
-        self.disable_fast_image_processor = server_args.disable_fast_image_processor
+        self.image_processor_backend = getattr(
+            server_args, "image_processor_backend", "auto"
+        )
+        if getattr(server_args, "disable_fast_image_processor", False):
+            self.image_processor_backend = "pil"
+        self.disable_fast_image_processor = self.image_processor_backend == "pil"
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
 
         mm_process_config = self.server_args.mm_process_config
@@ -289,8 +293,11 @@ class BaseMultimodalProcessor(ABC):
                 self.mm_processor_worker_num,
                 "auto" if requested_mm_processor_worker_num == 0 else "explicit",
             )
+        cpu_worker_start_method = (
+            "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
+        )
         self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
-            mp_context=mp.get_context("fork"),
+            mp_context=mp.get_context(cpu_worker_start_method),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
         )
 
@@ -361,7 +368,12 @@ class BaseMultimodalProcessor(ABC):
                 per_worker_pool_size,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
                 self.server_args.base_gpu_id,
+                self.server_args.tp_size,
             )
+
+    @property
+    def keep_mm_features_on_device(self) -> bool:
+        return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm")
 
     def compute_mrope_positions(self, input_ids, mm_items):
         """Compute M-RoPE positions from expanded input_ids and multimodal items.
@@ -588,7 +600,10 @@ class BaseMultimodalProcessor(ABC):
         )
         # Deferred: the hash is computed on the GPU tensor first, and
         # _precompute_hashes_before_cpu_transfer moves it down afterwards.
-        if not self.use_cuda_ipc and not self.precompute_hash_before_cpu_transfer:
+        if (
+            not self.keep_mm_features_on_device
+            and not self.precompute_hash_before_cpu_transfer
+        ):
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if feature_name in result and isinstance(
@@ -1358,24 +1373,11 @@ class BaseMultimodalProcessor(ABC):
         if not tensor.is_cuda:
             return tensor
 
-        sync_flag, available_slice, byte_offset = (
-            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(tensor)
+        proxy = self.cudaipc_mmfeature_pool.wrap_tensor(
+            tensor,
+            use_pool_handle_cache=self.use_ipc_pool_handle_cache,
         )
-        if isinstance(available_slice, torch.Tensor):
-            available_slice.copy_(tensor.view(torch.int8).view(-1), non_blocking=True)
-            return CudaIpcTensorTransportProxy(
-                data=available_slice,
-                info_data=tensor,
-                sync_buffer_meta=sync_flag,
-                pool_ipc_handle=(
-                    self.cudaipc_mmfeature_pool._pool_ipc_handle
-                    if self.use_ipc_pool_handle_cache
-                    else None
-                ),
-                pool_byte_offset=byte_offset,
-                pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
-            )
-        return tensor.cpu()
+        return proxy if proxy is not None else tensor.cpu()
 
     @staticmethod
     def _move_feature_to_cpu(value):
@@ -1395,7 +1397,7 @@ class BaseMultimodalProcessor(ABC):
 
         for item in mm_items:
             item.set_pad_value()
-            if not self.use_cuda_ipc:
+            if not self.keep_mm_features_on_device:
                 item.feature = self._move_feature_to_cpu(item.feature)
                 item.precomputed_embeddings = self._move_feature_to_cpu(
                     item.precomputed_embeddings

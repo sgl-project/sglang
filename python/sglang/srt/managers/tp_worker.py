@@ -310,6 +310,7 @@ class TpModelWorker(BaseTpWorker):
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
         context_length: Optional[int] = None,
+        draft_attention_backend: Optional[str] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -325,6 +326,8 @@ class TpModelWorker(BaseTpWorker):
         # Draft worker: target's effective context length; the draft runs at
         # absolute target positions. None keeps server_args.context_length.
         self.context_length = context_length
+        # Draft worker: the attention backend the algorithm resolved for it.
+        self.draft_attention_backend = draft_attention_backend
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
@@ -406,8 +409,7 @@ class TpModelWorker(BaseTpWorker):
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens
-            * self.model_runner.dcp_size
+            self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
             - 1,
         )
         assert max_req_len > 0, "Memory pool size is too small"
@@ -459,6 +461,7 @@ class TpModelWorker(BaseTpWorker):
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
+            draft_attention_backend=self.draft_attention_backend,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
         )
 
@@ -479,6 +482,7 @@ class TpModelWorker(BaseTpWorker):
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     memory_pool_config=self.memory_pool_config,
+                    draft_attention_backend=self.draft_attention_backend,
                     draft_model_idx=i,
                 )
             )
@@ -508,8 +512,7 @@ class TpModelWorker(BaseTpWorker):
     def get_worker_info(self):
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens
-            * self.model_runner.dcp_size
+            self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
             - 1,
         )
         return (

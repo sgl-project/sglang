@@ -35,3 +35,4 @@ class StableDiffusion3TransformerConfig(DiTConfig):
     arch_config: StableDiffusion3TransformerArchConfig = field(
         default_factory=StableDiffusion3TransformerArchConfig
     )
+    prefix: str = "SD3"
