@@ -60,16 +60,16 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
-_ASCEND_HICACHE_MAMBA_IO_ENV = "SGLANG_ASCEND_HICACHE_MAMBA_IO"
-_ASCEND_HICACHE_MAMBA_IO_MODES = {"sync", "async"}
+_NPU_HICACHE_MAMBA_IO_ENV = "SGLANG_NPU_HICACHE_MAMBA_IO"
+_NPU_HICACHE_MAMBA_IO_MODES = {"sync", "async"}
 
 
-def _ascend_hicache_mamba_io_mode() -> str:
-    mode = os.getenv(_ASCEND_HICACHE_MAMBA_IO_ENV, "sync").strip().lower()
-    if mode not in _ASCEND_HICACHE_MAMBA_IO_MODES:
+def _npu_hicache_mamba_io_mode() -> str:
+    mode = os.getenv(_NPU_HICACHE_MAMBA_IO_ENV, "sync").strip().lower()
+    if mode not in _NPU_HICACHE_MAMBA_IO_MODES:
         raise ValueError(
-            f"{_ASCEND_HICACHE_MAMBA_IO_ENV} must be one of "
-            f"{sorted(_ASCEND_HICACHE_MAMBA_IO_MODES)}, got {mode!r}."
+            f"{_NPU_HICACHE_MAMBA_IO_ENV} must be one of "
+            f"{sorted(_NPU_HICACHE_MAMBA_IO_MODES)}, got {mode!r}."
         )
     return mode
 
@@ -178,19 +178,16 @@ class MambaPoolHost(HostKVCache):
         ]
 
         self.init_kv_buffer()
-        self._configure_ascend_mamba_io()
+        self._configure_npu_mamba_io()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
 
-    def _configure_ascend_mamba_io(self) -> None:
-        if not _is_npu:
-            return
-
-        mode = _ascend_hicache_mamba_io_mode()
+    def _configure_npu_mamba_io(self) -> None:
+        mode = _npu_hicache_mamba_io_mode()
         if mode == "sync":
             logger.info(
-                "Ascend HiCache Mamba state transfer mode: sync torch fallback."
+                "NPU HiCache Mamba state transfer mode: sync torch fallback."
             )
             return
 
@@ -206,12 +203,12 @@ class MambaPoolHost(HostKVCache):
             not hasattr(torch.ops.npu, op_name) for op_name in required_torch_ops
         ):
             raise RuntimeError(
-                "Ascend HiCache Mamba async state transfer requires "
+                "NPU HiCache Mamba async state transfer requires "
                 "the per-layer PF->LF and all-layer LF->PF direct operators "
                 "from sgl-kernel-npu."
             )
 
-        logger.info("Ascend HiCache Mamba state transfer mode: native async.")
+        logger.info("NPU HiCache Mamba state transfer mode: native async.")
 
     def init_kv_buffer(self):
         _host_alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
@@ -434,7 +431,7 @@ class MambaPoolHost(HostKVCache):
                 page_size=1,
             )
         elif io_backend == "kernel_ascend":
-            if _ascend_hicache_mamba_io_mode() == "async":
+            if _npu_hicache_mamba_io_mode() == "async":
                 transfer_state_per_layer_direct_pf_lf(
                     src=src,
                     dst=dst,
@@ -496,7 +493,7 @@ class MambaPoolHost(HostKVCache):
                 page_size=1,
             )
         elif io_backend == "kernel_ascend":
-            if _ascend_hicache_mamba_io_mode() == "async":
+            if _npu_hicache_mamba_io_mode() == "async":
                 transfer_state_all_layer_direct_lf_pf(
                     device_states=[src_layers],
                     host_states=[dst],

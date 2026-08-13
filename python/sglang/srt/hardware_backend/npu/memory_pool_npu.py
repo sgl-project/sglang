@@ -105,7 +105,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             # while other backends remain unchanged.
             # FIA exposes the KV cache as per-layer Python views so graph
             # capture does not retain the full multi-layer tensor. HiCache's
-            # Ascend exchange operator still requires the original contiguous
+            # NPU exchange operator still requires the original contiguous
             # [layer, page, token, head, dim] allocation.
             self._hicache_k_buffer = torch.zeros(
                 (
@@ -152,7 +152,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 ]
 
     def get_hicache_transfer_buffers(self):
-        """Return contiguous all-layer KV tensors for Ascend HiCache IO."""
+        """Return contiguous all-layer KV tensors for NPU HiCache IO."""
         return self._hicache_k_buffer, self._hicache_v_buffer
 
     def _init_kv_copy_and_warmup(self):
