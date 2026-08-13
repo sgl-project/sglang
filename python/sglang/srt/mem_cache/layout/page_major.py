@@ -108,6 +108,77 @@ def build_page_major_mha_views(
     return k_buffer, v_buffer
 
 
+def build_dense_mha_views(
+    raw: torch.Tensor,
+    *,
+    layer_num: int,
+    head_num: int,
+    head_dim: int,
+    v_head_dim: int,
+    store_dtype: torch.dtype,
+    page_size: int,
+    num_pages: int,
+    anchor_bytes: int = 0,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """Per-layer DENSE K/V views over ``raw`` for uniform-row MHA.
+
+    The page envelope ``[L0_K*ps | L0_V*ps | L1_K*ps | ...]`` is a uniform
+    array of ``2*layer_num`` row-blocks when K and V rows are equally wide, so
+    it is a valid dense paged pool under
+
+        dense(t) = (t // ps) * (ps * 2 * layer_num) + t % ps
+
+    with layer ``l``'s K at block ``2l`` and its V at block ``2l+1``. Each view
+    is then a contiguous ``(num_pages * 2 * layer_num * ps, head_num,
+    head_dim)`` tensor — the stock per-layer shape — so one block table serves
+    every layer and the stock scatter serves the writes.
+
+    Views overlap by ``ps`` rows per block, which is safe because a dense id
+    always resolves inside its own block; the last view runs
+    ``(2*layer_num - 1) * ps`` rows past the envelope, so ``raw`` needs the
+    tail pad (``UnifiedKVPool.view_tail_pad_bytes``).
+    """
+    assert head_dim == v_head_dim, (
+        f"build_dense_mha_views requires uniform rows (head_dim == v_head_dim); "
+        f"got head_dim={head_dim}, v_head_dim={v_head_dim}. Asymmetric-KV "
+        "models keep the strided page-major layout (Triton-only)."
+    )
+    itemsize = store_dtype.itemsize
+    row_elems = head_num * head_dim
+    row_bytes = row_elems * itemsize
+    blocks = 2 * layer_num
+    page_bytes = page_size * blocks * row_bytes
+    n_dense = num_pages * blocks * page_size
+    assert anchor_bytes % itemsize == 0
+    last_view_end = (
+        anchor_bytes + (blocks - 1) * page_size * row_bytes + n_dense * row_bytes
+    )
+    assert last_view_end <= raw.numel() * raw.itemsize, (
+        f"build_dense_mha_views: block {blocks - 1}'s view ends at byte "
+        f"{last_view_end} but the raw buffer holds only "
+        f"{raw.numel() * raw.itemsize} bytes; allocate the tail pad "
+        f"(one page envelope = {page_bytes} B) via view_tail_pad_bytes"
+    )
+
+    as_dtype_view = raw.view(store_dtype)
+    k_buffer: List[torch.Tensor] = []
+    v_buffer: List[torch.Tensor] = []
+    for layer in range(layer_num):
+        k_base_bytes = anchor_bytes + (2 * layer) * page_size * row_bytes
+        v_base_bytes = k_base_bytes + page_size * row_bytes
+        for base_bytes, out in ((k_base_bytes, k_buffer), (v_base_bytes, v_buffer)):
+            assert base_bytes % itemsize == 0
+            out.append(
+                torch.as_strided(
+                    as_dtype_view,
+                    size=(n_dense, head_num, head_dim),
+                    stride=(row_elems, head_dim, 1),
+                    storage_offset=base_bytes // itemsize,
+                )
+            )
+    return k_buffer, v_buffer
+
+
 def mla_entry_bytes(*, layer_num: int, kv_cache_dim: int, itemsize: int) -> int:
     """Bytes occupied by one MLA slot across all layers (single latent row, no V)."""
     return layer_num * kv_cache_dim * itemsize

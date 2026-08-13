@@ -140,6 +140,19 @@ class MHASubPoolSpec(SubPoolSpec):
             + page_size * self.k_row_bytes()
         )
 
+    def is_uniform_row(self) -> bool:
+        """Equal K/V row width — the precondition for dense per-layer views."""
+        return self.k_row_bytes() == self.v_row_bytes()
+
+    def dense_blocks_per_page(self) -> int:
+        """Row-blocks per page in the dense id space (one K + one V per layer);
+        also this sub-pool's `kernel_page_multiplier` when dense."""
+        assert self.is_uniform_row(), (
+            f"sub-pool {self.name!r}: the dense id space requires uniform rows; "
+            f"got k_row_bytes={self.k_row_bytes()} != v_row_bytes={self.v_row_bytes()}"
+        )
+        return 2 * self.layer_num
+
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
 
@@ -638,7 +651,6 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         max_slots = unified_buffer.max_slots(sub_pool_name)
         self._num_pages = max_slots // page_size
         self._page_bytes = page_size * spec.entry_bytes()
-        # Dense row count per view; also the OOB bound for dense locs.
         self._dense_size = self._num_pages * spec.layer_num * page_size
 
         super().__init__(
