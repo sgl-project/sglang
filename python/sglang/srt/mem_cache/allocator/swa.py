@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
@@ -365,6 +367,30 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[mapping_indices] = 0
 
+    def free_segment(
+        self,
+        free_index: torch.Tensor,
+        *,
+        start_pos: int,
+        swa_alive_from: Optional[int] = None,
+    ):
+        """Segment form of free(): the full side releases the whole slice, the
+        SWA side only the part still mapped. Without ``swa_alive_from`` the SWA
+        side falls back to free_swa(), whose device filter tolerates dead
+        entries at the cost of a sync."""
+        if free_index.numel() == 0:
+            return
+
+        self.full_attn_allocator.free_segment(free_index, start_pos=start_pos)
+        if swa_alive_from is None:
+            self.free_swa(free_index)
+            return
+
+        alive = max(start_pos, swa_alive_from)
+        self.free_swa_segment(
+            free_index[alive - start_pos :], start_pos=alive, swa_alive_from=alive
+        )
+
     def free_swa_segment(
         self, free_index: torch.Tensor, *, start_pos: int, swa_alive_from: int
     ):
@@ -428,9 +454,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().free_group_begin()
         self.swa_free_group = []
         self.swa_segment_group = []
+        # free_segment goes straight to the inner allocator, so it needs its own
+        # group to stay deferred for the same window.
+        self.full_attn_allocator.free_group_begin()
 
     def free_group_end(self):
         super().free_group_end()
+        self.full_attn_allocator.free_group_end()
         if self.swa_free_group:
             swa_free_group = self.swa_free_group
             self.swa_free_group = []

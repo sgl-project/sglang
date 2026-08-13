@@ -16,7 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -124,10 +124,22 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free(self, free_index: torch.Tensor):
         raise NotImplementedError()
 
-    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+    def free_segment(
+        self,
+        free_index: torch.Tensor,
+        *,
+        start_pos: int,
+        swa_alive_from: Optional[int] = None,
+    ):
         """Free ``kv_row[start_pos : start_pos + n]`` of one request (or a
         page-aligned copy); subclasses may use ``start_pos`` to skip the
-        data-dependent dedup. Default: plain free()."""
+        data-dependent dedup.
+
+        ``swa_alive_from`` is for hybrid SWA allocators: the row position from
+        which this request's SWA mapping is still live. ``None`` means the
+        caller cannot state it, which keeps the SWA side on the legacy filter.
+
+        Default: plain free()."""
         self.free(free_index)
 
     def free_page_reps(self, *page_reps: torch.Tensor):
