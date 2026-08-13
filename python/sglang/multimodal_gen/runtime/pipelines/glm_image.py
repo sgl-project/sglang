@@ -15,7 +15,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class GlmImageDenoiserDecodingStage(DecodingStage):
-    """Reuse standard VAE decoding, but assign it to DENOISER instead of DECODER."""
+    """Run VAE decoding on the denoiser because this topology has no decoder worker."""
 
     @property
     def role_affinity(self) -> RoleType:
@@ -23,7 +23,7 @@ class GlmImageDenoiserDecodingStage(DecodingStage):
 
 
 class GlmImageDenoiserPreparationStage(GlmImageBeforeDenoisingStage):
-    """Reuse GLM preparation, but assign it to DENOISER instead of ENCODER."""
+    """Run DiT preparation on the denoiser because AR runs in the server head."""
 
     @property
     def role_affinity(self) -> RoleType:

@@ -8,7 +8,6 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from copy import deepcopy
 from dataclasses import dataclass
 
 import torch
@@ -55,6 +54,7 @@ class _GlmShardEntry:
     request_id: str
     req: object
     client: _GlmClientEntry
+    worker_idx: int | None = None
 
 
 @dataclass
@@ -161,20 +161,14 @@ class DiffusionServer:
         self._glm_ar_queue: deque[_GlmClientEntry] = deque()
         self._glm_shard_queue: deque[_GlmShardEntry] = deque()
         self._glm_shards: dict[str, _GlmShardEntry] = {}
-        self._glm_shard_workers: dict[str, int] = {}
         self._glm_worker_available = [
             not glm_distributed_mode_enabled
         ] * self._num_denoisers
         self._glm_ar_executor: ThreadPoolExecutor | None = None
-        self._glm_ar_future: Future | None = None
-        self._glm_ar_clients: list[_GlmClientEntry] = []
+        self._glm_ar_inflight: tuple[Future, list[_GlmClientEntry]] | None = None
         self._glm_ar_stage = None
-        self._glm_batch_max_size = 1
-        self._glm_batch_delay_s = 0.0
 
         if glm_distributed_mode_enabled:
-            if server_args is None:
-                raise ValueError("server_args is required for GLM distributed mode")
             from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
                 GlmImageAR,
             )
@@ -185,12 +179,6 @@ class DiffusionServer:
             self._glm_ar_stage = GlmImageAR(
                 processor=processor, vision_language_encoder=None
             )
-            self._glm_batch_max_size = (
-                max(1, server_args.batching_max_size)
-                if server_args.batching_mode == "dynamic"
-                else 1
-            )
-            self._glm_batch_delay_s = server_args.batching_delay_ms / 1000.0
             self._glm_ar_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="glm-ar-fanout"
             )
@@ -489,14 +477,19 @@ class DiffusionServer:
         )
 
     def _drain_glm_ar_queue(self) -> None:
-        if self._glm_ar_future is not None or not self._glm_ar_queue:
+        if self._glm_ar_inflight is not None or not self._glm_ar_queue:
             return
 
+        batch_max_size = (
+            max(1, self._server_args.batching_max_size)
+            if self._server_args.batching_mode == "dynamic"
+            else 1
+        )
         base = self._glm_ar_queue[0]
         indices = [0]
         output_slots = max(1, int(base.req.num_outputs_per_prompt or 1))
         for index in range(1, len(self._glm_ar_queue)):
-            if output_slots >= self._glm_batch_max_size:
+            if output_slots >= batch_max_size:
                 break
             candidate = self._glm_ar_queue[index]
             if (base.req.height, base.req.width) == (
@@ -506,20 +499,20 @@ class DiffusionServer:
                 candidate_outputs = max(
                     1, int(candidate.req.num_outputs_per_prompt or 1)
                 )
-                if output_slots + candidate_outputs > self._glm_batch_max_size:
+                if output_slots + candidate_outputs > batch_max_size:
                     continue
                 indices.append(index)
                 output_slots += candidate_outputs
 
         waited = time.monotonic() - base.enqueue_time
-        if output_slots < self._glm_batch_max_size and waited < self._glm_batch_delay_s:
+        batch_delay_s = self._server_args.batching_delay_ms / 1000.0
+        if output_slots < batch_max_size and waited < batch_delay_s:
             return
 
         clients = [self._glm_ar_queue[index] for index in indices]
         for index in reversed(indices):
             del self._glm_ar_queue[index]
 
-        self._glm_ar_clients = clients
         for client in clients:
             try:
                 self._tracker.transition(
@@ -527,8 +520,9 @@ class DiffusionServer:
                 )
             except ValueError:
                 pass
-        self._glm_ar_future = self._glm_ar_executor.submit(
-            self._execute_glm_ar_batch, clients
+        self._glm_ar_inflight = (
+            self._glm_ar_executor.submit(self._execute_glm_ar_batch, clients),
+            clients,
         )
         logger.info(
             "GLM AR fan-out dispatched batch size=%d requests, %d outputs",
@@ -565,12 +559,11 @@ class DiffusionServer:
             _merge_srt_usages,
         )
 
-        future = self._glm_ar_future
-        if future is None or not future.done():
+        inflight = self._glm_ar_inflight
+        if inflight is None or not inflight[0].done():
             return
-        clients = self._glm_ar_clients
-        self._glm_ar_future = None
-        self._glm_ar_clients = []
+        future, clients = inflight
+        self._glm_ar_inflight = None
         try:
             prior_token_ids, output_usages = future.result()
         except Exception as error:
@@ -613,7 +606,7 @@ class DiffusionServer:
                 )
             except ValueError:
                 pass
-            shard_req = deepcopy(client.req)
+            shard_req = client.req
             shard_req.extra = dict(shard_req.extra or {})
             shard_req.request_id = f"{group_id}::shard::{client_index}"
             shard_req.prior_token_id = torch.cat(
@@ -645,7 +638,7 @@ class DiffusionServer:
                 return
             shard = self._glm_shard_queue.popleft()
             self._denoiser_free_slots[worker_idx] -= 1
-            self._glm_shard_workers[shard.request_id] = worker_idx
+            shard.worker_idx = worker_idx
             tensor_fields, scalar_fields = extract_transfer_fields(shard.req)
             scalar_fields["request_id"] = shard.request_id
             send_tensors(
@@ -673,7 +666,9 @@ class DiffusionServer:
         elif event == zmq.EVENT_CONNECTED:
             registered = worker_idx in self._denoiser_peers
             self._glm_worker_available[worker_idx] = True
-            if worker_idx not in self._glm_shard_workers.values():
+            if not any(
+                shard.worker_idx == worker_idx for shard in self._glm_shards.values()
+            ):
                 self._denoiser_free_slots[worker_idx] = 1
             logger.info(
                 "GLM denoiser[%d] connected (registered=%s)",
@@ -685,12 +680,11 @@ class DiffusionServer:
         tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
         shard_id = scalar_fields.get("request_id")
         shard = self._glm_shards.pop(shard_id, None)
-        worker_idx = self._glm_shard_workers.pop(shard_id, None)
-        if worker_idx is not None:
-            self._denoiser_free_slots[worker_idx] = 1
         if shard is None:
             logger.warning("Unknown GLM fan-out shard result: %s", shard_id)
             return
+        if shard.worker_idx is not None:
+            self._denoiser_free_slots[shard.worker_idx] = 1
 
         error = scalar_fields.get("error")
         output = tensor_fields.get("output")
@@ -925,10 +919,9 @@ class DiffusionServer:
                 )
                 for shard_id, shard in list(self._glm_shards.items()):
                     if shard.client.request_id in timed_set:
-                        worker_idx = self._glm_shard_workers.pop(shard_id, None)
                         self._glm_shards.pop(shard_id, None)
-                        if worker_idx is not None:
-                            self._denoiser_free_slots[worker_idx] = 1
+                        if shard.worker_idx is not None:
+                            self._denoiser_free_slots[shard.worker_idx] = 1
 
     def _free_slot_for_record(self, record) -> None:
         if (
@@ -1431,7 +1424,7 @@ class DiffusionServer:
             stats.update(
                 {
                     "glm_ar_queue_depth": len(self._glm_ar_queue),
-                    "glm_ar_in_flight": self._glm_ar_future is not None,
+                    "glm_ar_in_flight": self._glm_ar_inflight is not None,
                     "glm_shard_queue_depth": len(self._glm_shard_queue),
                     "glm_worker_available": list(self._glm_worker_available),
                 }
