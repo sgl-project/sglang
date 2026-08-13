@@ -22,7 +22,9 @@ NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
 register_cuda_ci(est_time=7200, stage="nightly", runner_config="2-gpu-large")
 
 MODEL_THRESHOLDS = {
-    # Conservative thresholds on 100 MMMU samples, especially for latency thresholds
+    # Conservative thresholds on 100 MMMU samples. Latency baselines account for
+    # the 1024-token CoT budget introduced in #27327; older values measured only
+    # 30 output tokens and are not comparable.
     ModelLaunchSettings("deepseek-ai/deepseek-vl2-small"): ModelEvalMetrics(
         0.320, 56.1
     ),
@@ -33,14 +35,15 @@ MODEL_THRESHOLDS = {
     ModelLaunchSettings("Efficient-Large-Model/NVILA-Lite-2B-hf"): ModelEvalMetrics(
         0.270, 23.8
     ),
-    ModelLaunchSettings("google/gemma-4-E4B-it"): ModelEvalMetrics(0.26, 15.0),
+    ModelLaunchSettings("google/gemma-4-E4B-it"): ModelEvalMetrics(0.26, 24.0),
     ModelLaunchSettings(
         "google/gemma-4-26B-A4B-it", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.27, 22.3),
+    ): ModelEvalMetrics(0.27, 32.0),
     ModelLaunchSettings(
         "google/gemma-4-31B-it", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.28, 25.5),
-    ModelLaunchSettings("mistral-community/pixtral-12b"): ModelEvalMetrics(0.360, 16.6),
+    ): ModelEvalMetrics(0.28, 42.0),
+    # This 100-sample score has ranged from 0.33 to 0.37 since #27327.
+    ModelLaunchSettings("mistral-community/pixtral-12b"): ModelEvalMetrics(0.320, 28.0),
     ModelLaunchSettings("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(
         0.330, 23.5
     ),
@@ -55,12 +58,12 @@ MODEL_THRESHOLDS = {
     ): ModelEvalMetrics(0.29, 37.0),
     ModelLaunchSettings(
         "unsloth/Mistral-Small-3.1-24B-Instruct-2503"
-    ): ModelEvalMetrics(0.30, 16.7),
+    ): ModelEvalMetrics(0.30, 43.0),
     ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 40.0),
     ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.280, 30.4),
     ModelLaunchSettings(
         "zai-org/GLM-4.5V-FP8", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.26, 34.0),
+    ): ModelEvalMetrics(0.26, 140.0),
 }
 
 
