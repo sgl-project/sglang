@@ -46,6 +46,10 @@ on:
         description: "Volcengine fork only: verify an existing private debug image by immutable digest (repo@sha256:...), without rebuilding it."
         required: false
         default: ""
+      private_debug_image_formats:
+        description: "Volcengine fork only: CSV of image formats for the debug base build (oci, zstd, nydus). Applies only when private_debug_base_only is set."
+        required: false
+        default: "oci,zstd,nydus"
   schedule:
     - cron: "0 0 * * *"
 
@@ -355,6 +359,7 @@ jobs:
       cuda_version: 13.0.1
       cuda_suffix: cu130
       publish_default_cuda_alias: false
+      image_formats: ${{ inputs.private_debug_image_formats || 'oci,zstd,nydus' }}
       image_tag_override: ${{ format('debug-{0}-{1}-{2}', inputs.tag || 'servingkit', github.run_id, github.run_attempt) }}
       use_environment: prod
       extra_build_args: >-

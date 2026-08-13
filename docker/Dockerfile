@@ -52,7 +52,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     && apt install -y --no-install-recommends python3.12-full python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
-    && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 \
+    && retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 \
         -o get-pip.py https://bootstrap.pypa.io/get-pip.py \
     && python3 get-pip.py --break-system-packages \
     && rm get-pip.py \
@@ -140,8 +141,12 @@ RUN if [ -n "${PIP_DEFAULT_INDEX}" ]; then \
 fi
 
 # GDRCopy installation
+# Wrap the tarball download in a whole-command retry loop: the internal egress
+# proxy is intermittently unstable and can stay down longer than curl's own
+# --retry window, so an outer loop with sleep survives multi-minute outages.
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
-    && curl --retry 3 --retry-delay 2 -fsSL -o v${GDRCOPY_VERSION}.tar.gz \
+    && retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry curl --retry 5 --retry-all-errors --retry-delay 2 -fsSL -o v${GDRCOPY_VERSION}.tar.gz \
         https://${GITHUB_ARTIFACTORY}/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz \
     && tar -xzf v${GDRCOPY_VERSION}.tar.gz && rm v${GDRCOPY_VERSION}.tar.gz \
     && cd gdrcopy-${GDRCOPY_VERSION}/packages \
@@ -193,7 +198,8 @@ WORKDIR /sgl-workspace
 # Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
 # Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+RUN retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry curl --proto '=https' --tlsv1.2 --fail --show-error --location \
         --retry 5 --retry-all-errors --retry-delay 2 \
         -o /tmp/rustup-init.sh https://sh.rustup.rs \
     && sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
@@ -202,7 +208,8 @@ RUN curl --proto '=https' --tlsv1.2 --fail --show-error --location \
 
 # Install sgl-kernel (from pre-built wheel)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --upgrade pip setuptools wheel html5lib six \
+    retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && case "$CUDA_VERSION" in \
         12.6.1) CUINDEX=126 ;; \
         12.8.1) CUINDEX=128 ;; \
@@ -211,14 +218,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
-        python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+        retry python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
-        python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+        retry python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
         # --no-deps prevents pip from pulling torch from default PyPI
-        python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps \
+        retry python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps \
     ; \
     else \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
@@ -238,7 +245,8 @@ COPY proto                 /tmp/sglang_deps/proto
 # Generate constraints.txt to prevent reinstalling these deps in later stages
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cargo/registry \
-    case "$CUDA_VERSION" in \
+    retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && case "$CUDA_VERSION" in \
         12.6.1) CUINDEX=126 ;; \
         12.8.1) CUINDEX=128 ;; \
         12.9.1) CUINDEX=129 ;; \
@@ -256,13 +264,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' pyproject.toml && \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
        fi \
-    && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
+    && retry python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
-           python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+           retry python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
                torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --force-reinstall; \
-           python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
+           retry python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
@@ -313,7 +321,8 @@ RUN set -eux; \
       sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
       cd .. ; \
     else \
-        curl --retry 3 --retry-delay 2 -fsSL -o ${DEEPEP_COMMIT}.zip \
+        retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; }; \
+        retry curl --retry 5 --retry-all-errors --retry-delay 2 -fsSL -o ${DEEPEP_COMMIT}.zip \
             https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip && \
         unzip -q ${DEEPEP_COMMIT}.zip && rm ${DEEPEP_COMMIT}.zip && mv DeepEP-${DEEPEP_COMMIT} DeepEP && cd DeepEP && \
         sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
@@ -360,9 +369,11 @@ WORKDIR /build
 # setup.py derives the version from `git rev-parse`, so keep the .git dir
 # (a source zip archive would not build).
 RUN --mount=type=cache,target=/root/.cache/pip \
-    mkdir -p /wheels && \
+    retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && clone_fresh() { dir="$1"; shift; rm -rf "$dir" && git clone "$@" "$dir" ; } \
+    && mkdir -p /wheels && \
     if [ "$(uname -m)" = "x86_64" ]; then \
-        git clone https://github.com/Tencent/hpc-ops.git && \
+        retry clone_fresh hpc-ops https://github.com/Tencent/hpc-ops.git && \
         cd hpc-ops && \
         git checkout ${HPC_OPS_COMMIT} && \
         python3 setup.py bdist_wheel -d /wheels; \
@@ -387,12 +398,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && mkdir -p /flashinfer_jit_output \
+    # Retry external-index pip installs: the internal egress proxy is briefly
+    # unstable (proxy-connection-failed / 504) but recovers within a minute, so
+    # a whole-command retry with sleep is more robust than pip's inner --retries.
+    && retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
     # flashinfer-cubin is CUDA-version-agnostic, unlike jit-cache, so its index-url has no cu${CUINDEX} suffix
-    && python3 -m pip install flashinfer-cubin==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl \
+    && retry python3 -m pip install flashinfer-cubin==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl \
     && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_cubin /flashinfer_jit_output/ \
     && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_cubin-*.dist-info /flashinfer_jit_output/ \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
-        python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} \
+        retry python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} \
         && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache /flashinfer_jit_output/ \
         && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache-*.dist-info /flashinfer_jit_output/ ; \
     fi
@@ -413,15 +428,20 @@ RUN --mount=type=cache,target=/var/cache/apt,id=devtools-apt \
     && rm -rf /var/lib/apt/lists/*
 
 # Download CLI tools (each in its own layer for parallel downloads)
-RUN curl --retry 3 --retry-delay 2 -LSso /tools/diff-so-fancy \
+# Each download is wrapped in an outer retry loop because the internal egress
+# proxy can stay down longer than curl's own --retry window.
+RUN retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry curl --retry 5 --retry-all-errors --retry-delay 2 -LSso /tools/diff-so-fancy \
         https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
     && chmod +x /tools/diff-so-fancy
 
-RUN curl --retry 3 --retry-delay 2 -LSso /tools/clang-format \
+RUN retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry curl --retry 5 --retry-all-errors --retry-delay 2 -LSso /tools/clang-format \
         https://${GITHUB_ARTIFACTORY}/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
     && chmod +x /tools/clang-format
 
-RUN curl --retry 3 --retry-delay 2 -fsSL -o /tmp/clangd.zip \
+RUN retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry curl --retry 5 --retry-all-errors --retry-delay 2 -fsSL -o /tmp/clangd.zip \
         https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip \
     && unzip -q /tmp/clangd.zip -d /tmp \
     && cp /tmp/clangd_18.1.3/bin/* /tools/ \
@@ -431,28 +451,39 @@ RUN curl --retry 3 --retry-delay 2 -fsSL -o /tmp/clangd.zip \
 RUN CMAKE_VERSION=3.31.1 \
     && ARCH=$(uname -m) \
     && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
-    && curl --retry 3 --retry-delay 2 -fsSL -o "/tmp/${CMAKE_INSTALLER}.tar.gz" \
+    && retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry curl --retry 5 --retry-all-errors --retry-delay 2 -fsSL -o "/tmp/${CMAKE_INSTALLER}.tar.gz" \
         "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
     && tar -xzf "/tmp/${CMAKE_INSTALLER}.tar.gz" -C /tmp \
     && cp -r "/tmp/${CMAKE_INSTALLER}/bin/"* /tools/ \
     && mkdir -p /tools/share && cp -r "/tmp/${CMAKE_INSTALLER}/share/"* /tools/share/ \
     && rm -rf "/tmp/${CMAKE_INSTALLER}" "/tmp/${CMAKE_INSTALLER}.tar.gz"
 
-RUN curl --proto '=https' --tlsv1.2 --fail --show-error --location \
-        --retry 5 --retry-all-errors --retry-delay 2 \
-        -o /tmp/just-install.sh https://just.systems/install.sh \
-    && sed -i "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" /tmp/just-install.sh \
-    && bash /tmp/just-install.sh --tag 1.42.4 --to /tools \
-    && rm /tmp/just-install.sh \
-    && test -x /tools/just
+RUN retry() { for i in 1 2 3 4 5 6 7 8; do "$@" && return 0; echo "attempt $i failed; sleeping 20s"; sleep 20; done; return 1; } \
+    && install_just() { \
+        curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+            --retry 5 --retry-all-errors --retry-delay 2 \
+            -o /tmp/just-install.sh https://just.systems/install.sh \
+        && sed -i "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" /tmp/just-install.sh \
+        && bash /tmp/just-install.sh --tag 1.42.4 --to /tools \
+        && rm -f /tmp/just-install.sh \
+        && test -x /tools/just ; \
+    } \
+    && retry install_just
 
 # Install oh-my-zsh and plugins
-RUN curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 \
-        -o /tmp/oh-my-zsh-install.sh https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh \
-    && sh /tmp/oh-my-zsh-install.sh "" --unattended \
-    && rm /tmp/oh-my-zsh-install.sh \
-    && git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
-    && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+RUN retry() { for i in 1 2 3 4 5 6 7 8; do "$@" && return 0; echo "attempt $i failed; sleeping 20s"; sleep 20; done; return 1; } \
+    && install_omz() { \
+        rm -rf /root/.oh-my-zsh \
+        && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 \
+            -o /tmp/oh-my-zsh-install.sh https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh \
+        && sh /tmp/oh-my-zsh-install.sh "" --unattended \
+        && rm -f /tmp/oh-my-zsh-install.sh ; \
+    } \
+    && clone_fresh() { dir="$1"; shift; rm -rf "$dir" && git clone --depth 1 "$@" "$dir" ; } \
+    && retry install_omz \
+    && retry clone_fresh ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions https://github.com/zsh-users/zsh-autosuggestions \
+    && retry clone_fresh ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting https://github.com/zsh-users/zsh-syntax-highlighting.git
 
 ########################################################
 # PARALLEL STAGE 5: Gateway Builder (starts from base)
@@ -473,7 +504,8 @@ COPY sgl-model-gateway /build/sgl-model-gateway
 
 # Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
 RUN --mount=type=cache,target=/root/.cache/pip \
-    curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+    retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry curl --proto '=https' --tlsv1.2 --fail --show-error --location \
         --retry 5 --retry-all-errors --retry-delay 2 \
         -o /tmp/rustup-init.sh https://sh.rustup.rs \
     && sh /tmp/rustup-init.sh -y \
@@ -634,16 +666,19 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 
 # Install Mooncake
 RUN --mount=type=cache,target=/root/.cache/pip \
-    CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
+    retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
     if [ "$CUDA_MAJOR" -ge 13 ]; then \
-        python3 -m pip install mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}; \
+        retry python3 -m pip install mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}; \
     else \
-        python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
+        retry python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
     fi
 
 # Install MSCCL++ Python dependencies and package (builds extension via CMake through pip)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    git clone --depth=1 --branch ${MSCCLPP_VERSION} https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp.git /tmp/mscclpp \
+    retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && clone_fresh() { dir="$1"; shift; rm -rf "$dir" && git clone "$@" "$dir" ; } \
+    && retry clone_fresh /tmp/mscclpp --depth=1 --branch ${MSCCLPP_VERSION} https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp.git \
     && case "${CUDA_VERSION}" in \
            12.*) \
                CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
@@ -661,7 +696,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Install essential Python packages (use constraints to prevent conflicts)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install -c /sgl-workspace/constraints.txt \
+    retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry python3 -m pip install -c /sgl-workspace/constraints.txt \
     datamodel_code_generator \
     pre-commit \
     pytest \
@@ -681,7 +717,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
 # Install the EIC SDK used by the EIC HiCache backend.
-RUN python3 -m pip install --force-reinstall \
+RUN retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry python3 -m pip install --force-reinstall \
     https://eic-sdk-release.tos-cn-beijing.volces.com/python/eic-1.5.2-py3-none-any.whl \
     --no-cache-dir
 
@@ -689,12 +726,14 @@ RUN python3 -m pip install --force-reinstall \
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
 # it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
 # to avoid shipping wrong-CUDA libs on cu13 images.
-RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-    python3 -m pip install nixl nixl-cu12 --no-deps ; \
-    python3 -m pip install cuda-python==12.9 ; \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+    retry python3 -m pip install nixl nixl-cu12 --no-deps ; \
+    retry python3 -m pip install cuda-python==12.9 ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-    python3 -m pip install nixl nixl-cu13 --no-deps ; \
-    python3 -m pip install cuda-python==13.2.0 ; \
+    retry python3 -m pip install nixl nixl-cu13 --no-deps ; \
+    retry python3 -m pip install cuda-python==13.2.0 ; \
 fi
 
 # Add yank script
@@ -716,7 +755,8 @@ COPY docker/configs/.zshrc /root/.zshrc
 # libsqlite3-0:    CVE-2025-{6965,7709}
 # libtasn1-6:      CVE-2025-13151
 # dpkg:            CVE-2025-6297
-RUN python3 -m pip install --upgrade "urllib3>=2.6.3" "pillow>=12.1.1"
+RUN retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry python3 -m pip install --upgrade "urllib3>=2.6.3" "pillow>=12.1.1"
 RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     apt-get update && apt-get install -y --only-upgrade \
     binutils binutils-common binutils-x86-64-linux-gnu libbinutils \

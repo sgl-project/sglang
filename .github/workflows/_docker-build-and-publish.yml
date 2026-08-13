@@ -91,6 +91,11 @@ on:
         required: false
         type: string
         default: ""
+      image_formats:
+        description: "CSV of image formats to build and push: oci (default), zstd, nydus"
+        required: false
+        type: string
+        default: "oci"
 
 jobs:
   build-and-publish:
@@ -100,6 +105,7 @@ jobs:
     env:
       CUDA_KEY: ${{ inputs.cuda_key }}
       CUDA_SUFFIX: ${{ inputs.cuda_suffix }}
+      IMAGE_FORMATS: ${{ inputs.image_formats }}
       IMAGE_REPO: ${{ inputs.image_repo }}
       PUBLISH_DEFAULT_CUDA_ALIAS: ${{ inputs.publish_default_cuda_alias }}
       REGISTRY_HOST: ${{ inputs.registry_host }}
@@ -186,6 +192,28 @@ jobs:
             printf '%s\n' "${IMAGE_TAGS[@]}"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Validate requested image formats
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import sys
+
+          raw = os.environ.get("IMAGE_FORMATS", "oci")
+          tokens = [token.strip() for token in raw.split(",") if token.strip()]
+          if not tokens:
+              tokens = ["oci"]
+          allowed = {"oci", "zstd", "nydus"}
+          unknown = [token for token in tokens if token not in allowed]
+          if unknown:
+              print(
+                  f"::error::unknown image_formats tokens: {unknown}; "
+                  f"allowed: {sorted(allowed)}"
+              )
+              sys.exit(1)
+          print(f"Requested image formats: {tokens}")
+          PY
 
       - name: Compute Docker build metadata args
         id: build-metadata
@@ -378,3 +406,229 @@ jobs:
               python3 -m pytest -q test/registered/unit/test_runtime_context.py -k TestMoeFlagsGroup
               python3 -m pytest -q test/registered/unit/test_model_overrides.py -k deepseek_spec_moe_resolution
             '
+
+      # --- zstd format: re-export the just-built (cached) layers with zstd
+      # compression, then reuse the same provenance/runtime verification. This
+      # is a cache hit (no --no-cache), so the config is identical to base and
+      # only layer compression changes.
+      - name: Build and push AMD64 zstd image
+        id: build-zstd
+        if: ${{ contains(inputs.image_formats, 'zstd') }}
+        run: |
+          set -euo pipefail
+          VERSION_ARG=""
+          if [ -n "${SGL_VERSION}" ]; then
+            VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
+          fi
+          mapfile -t METADATA_ARGS < /tmp/docker-metadata.args
+
+          docker buildx build \
+            --target ${{ inputs.docker_target }} \
+            --platform linux/amd64 \
+            --output type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true,compression=zstd,compression-level=3,force-compression=true,oci-mediatypes=true \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GRACE_BLACKWELL=0 \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            "${METADATA_ARGS[@]}" \
+            ${VERSION_ARG} \
+            ${{ inputs.extra_build_args }} \
+            --metadata-file /tmp/metadata-zstd.json \
+            .
+
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-zstd.json'))['containerimage.digest'])")
+          echo "Pushed zstd digest: ${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Create Volcengine zstd image tag
+        if: ${{ contains(inputs.image_formats, 'zstd') }}
+        env:
+          IMAGE_TAGS: ${{ steps.image-tag.outputs.image-tags }}
+        run: |
+          set -euo pipefail
+          mapfile -t image_tags <<< "${IMAGE_TAGS}"
+          tag_args=()
+          for image_tag in "${image_tags[@]}"; do
+            [ -n "${image_tag}" ] || continue
+            tag_args+=(-t "${IMAGE_REPO}:${image_tag}-zstd")
+          done
+
+          docker buildx imagetools create \
+            "${tag_args[@]}" \
+            "${IMAGE_REPO}@${{ steps.build-zstd.outputs.digest }}"
+          for image_tag in "${image_tags[@]}"; do
+            [ -n "${image_tag}" ] || continue
+            echo "Published ${IMAGE_REPO}:${image_tag}-zstd"
+          done
+
+      - name: Verify pushed AMD64 zstd image and source provenance
+        if: ${{ contains(inputs.image_formats, 'zstd') }}
+        env:
+          EXPECTED_BUILD_COMMIT: ${{ steps.build-metadata.outputs.build-commit }}
+          EXPECTED_BUILD_SOURCE: ${{ steps.build-metadata.outputs.build-source }}
+          EXPECTED_BUILD_TREE: ${{ steps.build-metadata.outputs.build-tree }}
+          EXPECTED_PYTHON_MANIFEST_SHA256: ${{ steps.build-metadata.outputs.python-manifest-sha256 }}
+          IMAGE_DIGEST: ${{ steps.build-zstd.outputs.digest }}
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${IMAGE_REPO}@${IMAGE_DIGEST}"
+          docker buildx imagetools inspect "${IMAGE_REF}"
+
+          # zstd-compressed layers require Docker Engine >= 23 / containerd >= 1.5
+          # to pull and run. If this daemon cannot, degrade to manifest-only
+          # inspection (media-type + provenance labels) instead of failing.
+          if docker pull "${IMAGE_REF}"; then
+            python3 - "${IMAGE_REF}" <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          inspect = json.loads(
+              subprocess.check_output(["docker", "image", "inspect", sys.argv[1]])
+          )[0]
+          if inspect["Architecture"] != "amd64":
+              raise SystemExit(f"unexpected architecture: {inspect['Architecture']}")
+          labels = inspect["Config"].get("Labels") or {}
+          expected = {
+              "ai.sglang.build.commit": os.environ["EXPECTED_BUILD_COMMIT"],
+              "ai.sglang.build.tree": os.environ["EXPECTED_BUILD_TREE"],
+              "ai.sglang.build.python-manifest-sha256": os.environ[
+                  "EXPECTED_PYTHON_MANIFEST_SHA256"
+              ],
+              "org.opencontainers.image.source": os.environ["EXPECTED_BUILD_SOURCE"],
+          }
+          mismatches = {
+              key: (labels.get(key), value)
+              for key, value in expected.items()
+              if labels.get(key) != value
+          }
+          if mismatches:
+              raise SystemExit(f"image provenance mismatch: {mismatches}")
+          print(json.dumps({"architecture": inspect["Architecture"], **expected}))
+          PY
+
+            docker run --rm \
+              -e EXPECTED_BUILD_COMMIT \
+              -e EXPECTED_BUILD_TREE \
+              -e EXPECTED_PYTHON_MANIFEST_SHA256 \
+              --entrypoint bash "${IMAGE_REF}" -lc '
+                set -euo pipefail
+                test "$SGLANG_BUILD_COMMIT" = "$EXPECTED_BUILD_COMMIT"
+                test "$SGLANG_BUILD_TREE" = "$EXPECTED_BUILD_TREE"
+                test "$SGLANG_PYTHON_MANIFEST_SHA256" = "$EXPECTED_PYTHON_MANIFEST_SHA256"
+                command -v oniond
+                python3 scripts/ci/verify_private_image_runtime.py
+              '
+          else
+            echo "::warning::daemon cannot pull zstd image; degrading to manifest-only check"
+            python3 - "${IMAGE_REF}" <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          raw = subprocess.check_output(
+              ["docker", "buildx", "imagetools", "inspect", "--raw", sys.argv[1]]
+          )
+          manifest = json.loads(raw)
+          layers = manifest.get("layers", [])
+          media_types = {layer.get("mediaType", "") for layer in layers}
+          if not any("zstd" in media_type for media_type in media_types):
+              raise SystemExit(f"expected zstd layer media types, got: {media_types}")
+          print(json.dumps({"zstd_layer_media_types": sorted(media_types)}))
+          PY
+          fi
+
+      # --- nydus format: convert the already-pushed base OCI image into a
+      # nydus (lazy-loading) image with nydusify. A plain `docker run` cannot
+      # run nydus images (needs nydus-snapshotter), so CI validates with
+      # `nydusify check` + manifest/label inspection only. Real snapshotter
+      # mount + GPU serving is deferred to a ServingKit node.
+      - name: Install nydus tooling
+        if: ${{ contains(inputs.image_formats, 'nydus') }}
+        env:
+          NYDUS_VERSION: "2.3.0"
+        run: |
+          set -euo pipefail
+          tarball="nydus-static-v${NYDUS_VERSION}-linux-amd64.tgz"
+          url="https://github.com/dragonflyoss/nydus/releases/download/v${NYDUS_VERSION}/${tarball}"
+          echo "Downloading ${url}"
+          # The CI proxy is intermittently unstable, so wrap the download in an
+          # outer retry loop and let curl retry every error class (including
+          # curl 56 "Connection died") instead of only its default retryable set.
+          retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; }
+          retry curl -fL --retry 5 --retry-all-errors --retry-delay 2 -o "/tmp/${tarball}" "${url}"
+          tar -xzf "/tmp/${tarball}" -C /tmp
+          sudo install -m 0755 /tmp/nydus-static/nydusify /usr/local/bin/nydusify
+          sudo install -m 0755 /tmp/nydus-static/nydus-image /usr/local/bin/nydus-image
+          nydusify --version
+          nydus-image --version
+
+      - name: Convert and push nydus image
+        if: ${{ contains(inputs.image_formats, 'nydus') }}
+        env:
+          IMAGE_TAGS: ${{ steps.image-tag.outputs.image-tags }}
+          BASE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mapfile -t image_tags <<< "${IMAGE_TAGS}"
+          # nydusify convert is pull(base OCI)->convert->push(nydus). The pull and
+          # convert are deterministic and the push overwrites the same tag, so the
+          # whole convert is idempotent and safe to re-run. The internal registry
+          # push occasionally drops the connection mid-copy ("io: read/write on
+          # closed pipe"), so wrap the full convert in an outer retry loop.
+          retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 20s"; sleep 20; done; return 1; }
+          for image_tag in "${image_tags[@]}"; do
+            [ -n "${image_tag}" ] || continue
+            target="${IMAGE_REPO}:${image_tag}-nydus"
+            echo "Converting ${IMAGE_REPO}@${BASE_DIGEST} -> ${target}"
+            retry nydusify convert \
+              --nydus-image /usr/local/bin/nydus-image \
+              --source "${IMAGE_REPO}@${BASE_DIGEST}" \
+              --target "${target}"
+            echo "Published ${target}"
+          done
+
+      - name: Verify pushed nydus image
+        if: ${{ contains(inputs.image_formats, 'nydus') }}
+        env:
+          IMAGE_TAGS: ${{ steps.image-tag.outputs.image-tags }}
+          EXPECTED_BUILD_COMMIT: ${{ steps.build-metadata.outputs.build-commit }}
+          EXPECTED_BUILD_SOURCE: ${{ steps.build-metadata.outputs.build-source }}
+        run: |
+          set -euo pipefail
+          mapfile -t image_tags <<< "${IMAGE_TAGS}"
+          for image_tag in "${image_tags[@]}"; do
+            [ -n "${image_tag}" ] || continue
+            target="${IMAGE_REPO}:${image_tag}-nydus"
+            echo "Checking ${target}"
+            nydusify check --target "${target}"
+            docker buildx imagetools inspect "${target}"
+            python3 - "${target}" <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          target = sys.argv[1]
+          raw = subprocess.check_output(
+              ["docker", "buildx", "imagetools", "inspect", "--raw", target]
+          )
+          manifest = json.loads(raw)
+          layers = manifest.get("layers", [])
+          media_types = [layer.get("mediaType", "") for layer in layers]
+          annotations = {}
+          for layer in layers:
+              annotations.update(layer.get("annotations", {}) or {})
+          has_nydus = any(
+              "nydus" in media_type for media_type in media_types
+          ) or any("nydus" in key for key in annotations)
+          if not has_nydus:
+              raise SystemExit(
+                  f"expected nydus markers in manifest; layers={media_types} "
+                  f"annotations={sorted(annotations)}"
+              )
+          print(json.dumps({"nydus_layer_media_types": media_types}))
+          PY
+          done

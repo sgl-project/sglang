@@ -9,6 +9,49 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+TAG_SUFFIX_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z_.-]*")
+
+
+def validate_suffix(flag: str, value: str) -> None:
+    if value and not TAG_SUFFIX_RE.fullmatch(value):
+        raise SystemExit(f"--{flag} must be a Docker tag-safe suffix")
+
+
+def build_tag(
+    mode: str,
+    version: str,
+    timestamp: str,
+    tag_value: str = "",
+    variant_suffix: str = "",
+    cuda_suffix: str = "",
+    format_suffix: str = "",
+) -> str:
+    """Compose the final image tag.
+
+    Suffix order is fixed as ``variant`` -> ``cuda`` -> ``format`` so that the
+    image format marker (e.g. ``zstd`` / ``nydus``) always trails the CUDA
+    marker: ``v<ver>.byted.<val>.<ts>[-<variant>][-cu130][-zstd]``.
+    """
+    if mode == "manual":
+        tag = f"v{version}.iaas.dev.{timestamp}"
+    elif mode == "nightly":
+        tag = f"v{version}.iaas.nightly.{timestamp}"
+    else:
+        if not tag_value:
+            raise SystemExit("--tag-value is required when --mode=version")
+        tag = f"v{version}.byted.{tag_value}.{timestamp}"
+
+    if variant_suffix:
+        tag = f"{tag}-{variant_suffix}"
+
+    if cuda_suffix:
+        tag = f"{tag}-{cuda_suffix}"
+
+    if format_suffix:
+        tag = f"{tag}-{format_suffix}"
+
+    return tag
+
 
 def get_sglang_version() -> str:
     repo_root = Path(__file__).resolve().parents[2]
@@ -51,30 +94,29 @@ def main() -> None:
         default="",
         help="Optional build variant suffix appended before the CUDA suffix.",
     )
+    parser.add_argument(
+        "--format-suffix",
+        default="",
+        help="Optional image format suffix (e.g. zstd, nydus) appended after "
+        "the CUDA suffix.",
+    )
     args = parser.parse_args()
 
-    if args.variant_suffix and not re.fullmatch(
-        r"[0-9A-Za-z][0-9A-Za-z_.-]*", args.variant_suffix
-    ):
-        raise SystemExit("--variant-suffix must be a Docker tag-safe suffix")
+    validate_suffix("variant-suffix", args.variant_suffix)
+    validate_suffix("format-suffix", args.format_suffix)
 
     version = get_sglang_version()
     timestamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d%H%M")
 
-    if args.mode == "manual":
-        tag = f"v{version}.iaas.dev.{timestamp}"
-    elif args.mode == "nightly":
-        tag = f"v{version}.iaas.nightly.{timestamp}"
-    else:
-        if not args.tag_value:
-            raise SystemExit("--tag-value is required when --mode=version")
-        tag = f"v{version}.byted.{args.tag_value}.{timestamp}"
-
-    if args.variant_suffix:
-        tag = f"{tag}-{args.variant_suffix}"
-
-    if args.cuda_suffix:
-        tag = f"{tag}-{args.cuda_suffix}"
+    tag = build_tag(
+        mode=args.mode,
+        version=version,
+        timestamp=timestamp,
+        tag_value=args.tag_value,
+        variant_suffix=args.variant_suffix,
+        cuda_suffix=args.cuda_suffix,
+        format_suffix=args.format_suffix,
+    )
 
     print(tag)
 
