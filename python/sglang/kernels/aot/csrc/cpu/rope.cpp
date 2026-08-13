@@ -265,51 +265,8 @@ void rotary_embedding_kernel_impl(
 
 }  // namespace
 
-// query: [num_tokens, num_heads, head_dim]
-// key:   [num_tokens, num_heads, head_dim]
-// cos:   [num_tokens, head_dim]
-// sin:   [num_tokens, head_dim]
-// Gemma 4's vision tower rotates ndim = 2 head_dim chunks independently, so
-// this is apply_rotary_pos_emb_cpu run once per chunk, in place.
-void apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin) {
-  CHECK_DIM(3, query);
-  const auto input_dtype = query.scalar_type();
-  int64_t num_tokens = query.size(0);
-  int64_t num_heads = query.size(1);
-  int64_t head_size = query.size(2);
-
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
-  CHECK_INPUT_SHAPE_DTYPE<true>(key, {num_tokens, num_heads, head_size}, input_dtype);
-  CHECK_INPUT_SHAPE_DTYPE<false>(cos, {num_tokens, head_size}, cos.scalar_type());
-  CHECK_INPUT_SHAPE_DTYPE<false>(sin, {num_tokens, head_size}, sin.scalar_type());
-  CHECK_EQ(cos.scalar_type(), sin.scalar_type());
-
-  constexpr int64_t ndim = 2;
-  TORCH_CHECK(
-      head_size % (2 * ndim) == 0, "head_size must be divisible by ", 2 * ndim, " for ndim = ", ndim, " rotary chunks");
-  const int64_t chunk_size = head_size / ndim;
-
-  const RopeParams p{query, key, head_size, chunk_size};
-  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(input_dtype, cos.scalar_type(), [&] {
-    scalar_t* q_ptr = query.data_ptr<scalar_t>();
-    scalar_t* k_ptr = key.data_ptr<scalar_t>();
-    const param_t* cos_ptr = cos.data_ptr<param_t>();
-    const param_t* sin_ptr = sin.data_ptr<param_t>();
-    for (int64_t d = 0; d < ndim; ++d) {
-      const int64_t offset = d * chunk_size;
-      auto cache_pos = [cos_ptr, sin_ptr, head_size, offset](int64_t token) -> SplitCosSinRow<param_t> {
-        return {cos_ptr + token * head_size + offset, sin_ptr + token * head_size + offset};
-      };
-      rotary_embedding_kernel_impl<scalar_t, RotaryMode::NeoxFull, true>(
-          q_ptr + offset, k_ptr + offset, q_ptr + offset, k_ptr + offset, p, cache_pos);
-    }
-  });
-}
-
-// 2D : [num_tokens, num_heads*head_size] inplace
-// 3D : [num_tokens, num_heads, head_size] outplace
-// 4D : [batch_size, seq_len, num_heads, head_size] inplace
-std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
+// 2D/3D/4D inputs are handled in-place; the Python wrapper clones 3D inputs.
+void rotary_embedding_cpu(
     at::Tensor& positions,
     at::Tensor& query,
     at::Tensor& key,
@@ -352,39 +309,28 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     CHECK_EQ(query.size(1), key.size(1));
   }
 
-  at::Tensor query_out = (input_dim != 3) ? query : at::empty(query.sizes(), query.options());
-  at::Tensor key_out = (input_dim != 3) ? key : at::empty(key.sizes(), key.options());
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "rotary_embedding_cpu", [&] {
-    AT_DISPATCH_BOOL(input_dim != 3, inplace, [&] {
-      const scalar_t* cache_base = cos_sin_cache.data_ptr<scalar_t>();
-      const int64_t* pos_ptr = positions.data_ptr<int64_t>();
-      auto cache_pos = [cache_base, pos_ptr, rotary_dim](int64_t token) -> const scalar_t* {
-        return cache_base + pos_ptr[token] * rotary_dim;
-      };
+    const scalar_t* cache_base = cos_sin_cache.data_ptr<scalar_t>();
+    const int64_t* pos_ptr = positions.data_ptr<int64_t>();
+    auto cache_pos = [cache_base, pos_ptr, rotary_dim](int64_t token) -> const scalar_t* {
+      return cache_base + pos_ptr[token] * rotary_dim;
+    };
 
-      scalar_t* q_ptr = query.data_ptr<scalar_t>();
-      scalar_t* k_ptr = key.data_ptr<scalar_t>();
-      scalar_t* q_out_ptr = query_out.data_ptr<scalar_t>();
-      scalar_t* k_out_ptr = key_out.data_ptr<scalar_t>();
-
-      if (is_neox) {
-        rotary_embedding_kernel_impl<scalar_t, RotaryMode::Neox, inplace>(
-            q_out_ptr, k_out_ptr, q_ptr, k_ptr, p, cache_pos);
-      } else {
-        rotary_embedding_kernel_impl<scalar_t, RotaryMode::Interleaved, inplace>(
-            q_out_ptr, k_out_ptr, q_ptr, k_ptr, p, cache_pos);
-      }
-    });
+    scalar_t* q_ptr = query.data_ptr<scalar_t>();
+    scalar_t* k_ptr = key.data_ptr<scalar_t>();
+    if (is_neox) {
+      rotary_embedding_kernel_impl<scalar_t, RotaryMode::Neox, true>(q_ptr, k_ptr, q_ptr, k_ptr, p, cache_pos);
+    } else {
+      rotary_embedding_kernel_impl<scalar_t, RotaryMode::Interleaved, true>(q_ptr, k_ptr, q_ptr, k_ptr, p, cache_pos);
+    }
   });
-  return std::make_tuple(query_out, key_out);
 }
 
 // query: [num_tokens, num_heads, head_size]
 // key: [num_tokens, num_heads, head_size]
 // cos: [num_tokens, head_size]
 // sin: [num_tokens, head_size]
-std::tuple<at::Tensor, at::Tensor>
-apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin) {
+void apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin) {
   CHECK_DIM(3, query);
   const auto input_dtype = query.scalar_type();
   int64_t num_tokens = query.size(0);
@@ -409,7 +355,6 @@ apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at
     };
     rotary_embedding_kernel_impl<scalar_t, RotaryMode::NeoxFull, true>(q_ptr, k_ptr, q_ptr, k_ptr, p, cache_pos);
   });
-  return std::make_tuple(query, key);
 }
 
 // positions: [num_tokens] (text only) or [3, num_tokens] (T/H/W positions with multimodal inputs)

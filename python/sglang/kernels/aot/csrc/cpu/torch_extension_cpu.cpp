@@ -304,7 +304,7 @@ at::Tensor flash_attn_varlen_func(
     bool causal);
 
 // linear attention
-std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
+at::Tensor chunk_gated_delta_rule_cpu(
     const at::Tensor& query,
     const at::Tensor& key,
     const at::Tensor& value,
@@ -522,15 +522,14 @@ void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data);
 void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op);
 
 // rope
-std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
+void rotary_embedding_cpu(
     at::Tensor& positions,
     at::Tensor& query,
     at::Tensor& key,
     int64_t head_size,
     at::Tensor& cos_sin_cache,
     bool is_neox);
-std::tuple<at::Tensor, at::Tensor>
-apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
+void apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
 
 // multidimensional rope
 void apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
@@ -821,8 +820,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // linear attn
   m.def(
       "chunk_gated_delta_rule_cpu(Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, "
-      "Tensor initial_state, bool output_final_state, Tensor cu_seqlens, bool head_first, "
-      "bool use_qk_l2norm_in_kernel, Tensor initial_state_indices, float eps=1e-6) -> (Tensor, Tensor)");
+      "Tensor(a!) initial_state, bool output_final_state, Tensor cu_seqlens, bool head_first, "
+      "bool use_qk_l2norm_in_kernel, Tensor initial_state_indices, float eps=1e-6) -> Tensor");
   m.impl("chunk_gated_delta_rule_cpu", torch::kCPU, &chunk_gated_delta_rule_cpu);
 
   // weight prepack
@@ -926,7 +925,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("causal_conv1d_weight_pack", torch::kCPU, &causal_conv1d_weight_pack);
 
   m.def(
-      "causal_conv1d_fwd_cpu(Tensor x, Tensor weight, Tensor? bias, Tensor? conv_states, Tensor? query_start_loc,"
+      "causal_conv1d_fwd_cpu(Tensor x, Tensor weight, Tensor? bias, Tensor(a!)? conv_states, Tensor? query_start_loc,"
       "Tensor? cache_indices, Tensor? has_initial_state, bool silu_activation, int pad_slot_id, bool is_vnni) -> "
       "Tensor");
   m.impl("causal_conv1d_fwd_cpu", torch::kCPU, &causal_conv1d_fwd_cpu);
@@ -956,10 +955,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // rope
   m.def(
-      "rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
-      "bool is_neox) -> (Tensor, Tensor)");
+      "rotary_embedding_cpu(Tensor positions, Tensor(a!) query, Tensor(b!) key, int head_size, Tensor cos_sin_cache, "
+      "bool is_neox) -> ()");
   m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
-  m.def("apply_rotary_pos_emb_cpu(Tensor query, Tensor key, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
+  m.def("apply_rotary_pos_emb_cpu(Tensor(a!) query, Tensor(b!) key, Tensor cos, Tensor sin) -> ()");
   m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
 
   // multidimensional rope
