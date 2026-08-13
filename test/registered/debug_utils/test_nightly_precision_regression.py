@@ -68,6 +68,7 @@ NIGHTLY_PRECISION_SERVER_TIMEOUT = 3600
 # Pin fusion ON: captured inputs.1 must be TP-partial (the comparator's tp:partial
 # contract), and SM90 auto-enable was dropped in #23402.
 PRECISION_FUSION_BACKEND = "trtllm"
+TP_LAYOUT_POLICY = "per-tensor-v1"
 
 
 def _sanitize_model_name(model: str) -> str:
@@ -155,6 +156,7 @@ def _capture_signature(dump_cfg: dict[str, Any], tp_size: int) -> str:
             tp_size,
             dump_cfg["dumper_filter"],
             dump_cfg["fusion_backend"],
+            TP_LAYOUT_POLICY,
         )
     )
     return hashlib.sha1(raw.encode()).hexdigest()[:12]
@@ -542,6 +544,7 @@ def _maybe_hf_push(
             "capture_layers": dump_cfg.get("capture_layers"),
             "capture_signature": dump_cfg.get("capture_signature"),
             "fusion_backend": dump_cfg.get("fusion_backend"),
+            "tp_layout_policy": TP_LAYOUT_POLICY,
             "num_tensor_files": len(pt_files),
             "pass_label": pass_label,
             "source": "test_nightly_precision_regression.py",

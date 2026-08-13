@@ -93,7 +93,7 @@ If the comparator returns exit code 0 but compared **zero layers** (baseline/tar
 
 ### Capture signature
 
-A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP size, and dumper filter) is computed per run. The HF store uses this signature during fetch to ensure only baselines with an identical capture shape are considered. If the signature changes (e.g. you add layers to the capture set or change TP), the framework establishes a fresh baseline instead of erroring on incompatible tensors.
+A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP size, dumper filter, fusion backend, and TP layout policy) is computed per run. The HF store uses this signature during fetch to ensure only baselines with an identical capture and comparison contract are considered. If the signature changes (e.g. you add layers to the capture set or change TP), the framework establishes a fresh baseline instead of erroring on incompatible tensors.
 
 ---
 
