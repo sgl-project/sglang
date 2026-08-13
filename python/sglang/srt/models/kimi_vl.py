@@ -169,17 +169,18 @@ class KimiVLForConditionalGeneration(nn.Module):
             )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = (
-            torch.cat([item.feature for item in items], dim=0)
-            .type(self.vision_tower.dtype)
-            .to(self.vision_tower.device)
-        )
+        pixel_values = torch.cat([item.feature for item in items], dim=0)
 
+        # Already-embedded features need no tower, so test before touching one.
         if (
             pixel_values.dim() == 2
             and pixel_values.shape[-1] == self.config.text_config.hidden_size
         ):
             return pixel_values
+
+        pixel_values = pixel_values.type(self.vision_tower.dtype).to(
+            self.vision_tower.device
+        )
 
         image_grid_hws = torch.cat([item.image_grid_hws for item in items], dim=0)
         image_grid_hws_list = image_grid_hws.tolist()
@@ -218,6 +219,7 @@ class KimiVLForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
+            multimodal_model=self,
             data_embedding_funcs={
                 Modality.IMAGE: self.get_image_feature,
             },

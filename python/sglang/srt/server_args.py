@@ -3151,6 +3151,11 @@ class ServerArgs:
         "One or more EncoderBootstrapServer URLs to register this encoder with on startup, for dynamic encoder discovery. Example: --encoder-register-urls http://prefill0:8997 http://prefill1:8997. Used with --encoder-only servers.",
         NS("disagg"),
     ] = dataclasses.field(default_factory=list)
+    enable_encoder_bootstrap: A[
+        bool,
+        "Join an encoder fleet: run the EncoderBootstrapServer and the multimodal receivers so encoders can register at runtime. Implied by --encoder-urls; needed only when every encoder registers dynamically.",
+        NS("disagg"),
+    ] = False
     enable_adaptive_dispatch_to_encoder: A[
         bool,
         "When enabled, adaptively dispatch: multi-image requests go to encoder in language_only epd mode, single-image requests are processed locally.",
@@ -7563,7 +7568,13 @@ class ServerArgs:
             )
 
         if self.language_only:
-            architectures = self.get_model_config().hf_config.architectures or []
+            model_config = self.get_model_config()
+            architectures = model_config.hf_config.architectures or []
+            if not model_config.is_multimodal:
+                raise ValueError(
+                    f"--language-only serves the language half of a multimodal "
+                    f"model, but {architectures} is text-only. Drop the flag."
+                )
             if any(a in TOWER_SKIPPING_ARCHITECTURES for a in architectures):
                 # No tower means no local encode to fall back on: multimodal
                 # inputs must arrive already embedded, or be rejected.
@@ -7581,11 +7592,20 @@ class ServerArgs:
                     architectures,
                 )
 
-        if self.language_only and len(self.encoder_urls) == 0:
+        if self.enable_encoder_bootstrap and not self.language_only:
+            raise ValueError(
+                "--enable-encoder-bootstrap is the language side of encoder "
+                "disaggregation and requires --language-only."
+            )
+        # Naming an encoder is itself the opt-in; the explicit flag exists for
+        # fleets where every encoder registers at runtime and there is no seed.
+        if self.language_only and self.encoder_urls:
+            self.enable_encoder_bootstrap = True
+        if self.language_only and not self.enable_encoder_bootstrap:
             logger.info(
-                "--language-only is set without --encoder-urls. Encoders are "
-                "expected to register dynamically via the "
-                "EncoderBootstrapServer."
+                "--language-only without --encoder-urls or "
+                "--enable-encoder-bootstrap: serving the language half alone, "
+                "multimodal requests will be rejected."
             )
 
         # Validate IB devices when mooncake backend is used

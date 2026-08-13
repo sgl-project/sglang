@@ -159,16 +159,19 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 logger = logging.getLogger(__name__)
 
 
+class NoLocalVisionTowerError(ValueError):
+    """A ValueError so the /generate streaming handler can still emit an error frame."""
+
+    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+
+
 def _require_local_vision_tower(model_config) -> None:
     """Reject rather than fall back to a tower --language-only never built."""
     if getattr(model_config.hf_config, "has_local_vision_tower", True):
         return
-    raise fastapi.HTTPException(
-        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-        detail=(
-            "This server has no local vision tower (--language-only). "
-            "Multimodal inputs must be embedded by an encoder replica."
-        ),
+    raise NoLocalVisionTowerError(
+        "This server has no local vision tower (--language-only). "
+        "Multimodal inputs must be embedded by an encoder replica."
     )
 
 
@@ -673,7 +676,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Encoder Disaggregation
         self.encoder_bootstrap_server = None
-        if self.server_args.language_only:
+        self.mm_receiver = None
+        if self.server_args.enable_encoder_bootstrap:
             from sglang.srt.disaggregation.encode_receiver import (
                 EncoderBootstrapServer,
             )
@@ -798,7 +802,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         self._init_req_state(obj, request)
         try:
-            if self.server_args.language_only:
+            if self.server_args.enable_encoder_bootstrap:
                 self._handle_epd_disaggregation_encode_request(obj)
 
             # Log the request
@@ -1063,10 +1067,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             if (
-                not self.server_args.language_only
+                not self.server_args.enable_encoder_bootstrap
                 or self.server_args.encoder_transfer_backend == "zmq_to_tokenizer"
             ):
-                if self.server_args.language_only:
+                if self.server_args.enable_encoder_bootstrap:
                     mm_inputs = await self.mm_receiver.recv_mm_data(
                         request_obj=obj,
                         mm_processor=self.mm_processor,
@@ -1077,8 +1081,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         self.server_args, obj, mm_inputs
                     )
                 if mm_inputs is None:
-                    if self.server_args.language_only:
-                        _require_local_vision_tower(self.model_config)
+                    _require_local_vision_tower(self.model_config)
+                    if self.server_args.enable_encoder_bootstrap:
                         logger.warning(
                             "Encoder embedding not available, "
                             "falling back to local mm processing"
@@ -1091,13 +1095,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         max_req_input_len=self.max_req_input_len,
                     )
             elif (
-                self.server_args.language_only
+                self.server_args.enable_encoder_bootstrap
                 and self.server_args.encoder_transfer_backend
                 in ["zmq_to_scheduler", "mooncake"]
                 and not obj.need_wait_for_mm_inputs
             ):
-                # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
-                # to encoder (e.g., only one image), process locally like non-language_only mode
+                # In an encoder fleet with zmq_to_scheduler/mooncake, a request we
+                # did not dispatch (e.g. only one image) is processed locally --
+                # unless this replica dropped its tower, which the guard catches.
                 _require_local_vision_tower(self.model_config)
                 mm_inputs = await self.mm_processor.process_mm_data_async(
                     image_data=obj.image_data,

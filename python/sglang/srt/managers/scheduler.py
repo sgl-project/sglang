@@ -1412,10 +1412,14 @@ class Scheduler(
             )
 
         # Init mm receiver for EPD disaggregation mode
-        if get_disagg().language_only and get_disagg().encoder_transfer_backend in [
-            "zmq_to_scheduler",
-            "mooncake",
-        ]:
+        if (
+            get_disagg().enable_encoder_bootstrap
+            and get_disagg().encoder_transfer_backend
+            in [
+                "zmq_to_scheduler",
+                "mooncake",
+            ]
+        ):
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 dtype=self.model_config.dtype,

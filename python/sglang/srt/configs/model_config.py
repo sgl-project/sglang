@@ -29,7 +29,7 @@ from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import TOWER_SKIPPING_ARCHITECTURES, ServerArgs
 from sglang.srt.utils import is_hip, is_sm100_supported, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
@@ -538,7 +538,14 @@ class ModelConfig:
         # Two different questions: language_model_only is the checkpoint saying it
         # never processes images (it drives the forward pipeline), while a tower
         # can be absent *here* and an EPD replica still consume remote features.
-        self.hf_config.has_local_vision_tower = not (language_only or self.is_lm_only)
+        # Only the architectures that implement the skip actually drop it, so ask
+        # them -- claiming otherwise makes callers reject requests a tower could
+        # still serve.
+        drops_tower = language_only and any(
+            arch in TOWER_SKIPPING_ARCHITECTURES
+            for arch in (getattr(self.hf_config, "architectures", None) or [])
+        )
+        self.hf_config.has_local_vision_tower = not (drops_tower or self.is_lm_only)
 
         # matryoshka embeddings
         self.matryoshka_dimensions = getattr(

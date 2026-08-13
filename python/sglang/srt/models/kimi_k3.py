@@ -3298,6 +3298,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
+            multimodal_model=self,
             data_embedding_funcs={
                 Modality.IMAGE: self.get_image_feature,
             },

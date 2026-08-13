@@ -25,6 +25,7 @@ from sglang.srt.disaggregation.encode_server import MMEncoder, _get_mm_grid_dim
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.managers.tokenizer_manager import (
     _reject_missing_dispatched_encoder_embedding,
+    _require_local_vision_tower,
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.multimodal.encoder_preprocessing import (
@@ -86,7 +87,9 @@ def test_epd_language_only_rejects_missing_dispatched_embedding():
     assert getattr(exc_info.value, "status_code", None) == 503
 
 
-def test_epd_allows_local_processing_when_request_was_not_dispatched():
+def test_dispatch_check_ignores_requests_that_were_never_dispatched():
+    # This helper only polices dispatched requests; whether the undispatched one
+    # may then run locally is _require_local_vision_tower's call, tested below.
     server_args = SimpleNamespace(
         language_only=True,
         encoder_transfer_backend="zmq_to_tokenizer",
@@ -94,6 +97,22 @@ def test_epd_allows_local_processing_when_request_was_not_dispatched():
     request = SimpleNamespace(need_wait_for_mm_inputs=False)
 
     _reject_missing_dispatched_encoder_embedding(server_args, request, None)
+
+
+def test_local_processing_rejected_only_when_the_tower_was_dropped():
+    dropped = SimpleNamespace(hf_config=SimpleNamespace(has_local_vision_tower=False))
+    with pytest.raises(ValueError) as exc_info:
+        _require_local_vision_tower(dropped)
+    # A ValueError so /generate's streaming handler still emits an error frame,
+    # carrying 503 so a router retries elsewhere instead of blaming the client.
+    assert getattr(exc_info.value, "status_code", None) == 503
+
+    # An architecture that keeps its tower under --language-only still falls back.
+    _require_local_vision_tower(
+        SimpleNamespace(hf_config=SimpleNamespace(has_local_vision_tower=True))
+    )
+    # Non-multimodal configs never carry the attribute at all.
+    _require_local_vision_tower(SimpleNamespace(hf_config=SimpleNamespace()))
 
 
 def _encoder(model_type="kimi_k3"):
