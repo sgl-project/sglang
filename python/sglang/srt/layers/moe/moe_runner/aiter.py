@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 
+from sglang.kernels.ops.moe.moe_sorting_small import apply_aiter_small_moe_sort_patch
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -148,14 +149,7 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
 class AiterRunnerCore(MoeRunnerCore):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        from sglang.srt.environ import envs
-
-        if envs.SGLANG_OPT_AITER_SMALL_MOE_SORT.get():
-            from sglang.kernels.ops.moe.moe_sorting_small import (
-                apply_aiter_small_moe_sort_patch,
-            )
-
-            apply_aiter_small_moe_sort_patch()
+        apply_aiter_small_moe_sort_patch()
 
     def run(
         self,

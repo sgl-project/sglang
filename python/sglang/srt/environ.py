@@ -713,10 +713,6 @@ class Envs:
     # the constant-weight shared-expert slots directly instead of running the
     # separate fused_append_shared_experts kernel afterwards.
     SGLANG_OPT_GATE_APPEND_SHARED = EnvBool(False)
-    # Patch aiter so decode-sized MoE sorting (+ the stage1 mxfp8 activation
-    # quant) runs as one sglang Triton launch instead of the opus sorting and
-    # separate quant kernels. See kernels/ops/moe/moe_sorting_small.py.
-    SGLANG_OPT_AITER_SMALL_MOE_SORT = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 

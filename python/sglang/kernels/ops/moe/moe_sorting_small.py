@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Single-launch MoE sorting (+ optional stage1 mxfp8 activation quant) for
 decode-sized batches on the aiter MoE runner, applied to a stock aiter install
-via runtime patches (SGLANG_OPT_AITER_SMALL_MOE_SORT=1).
+via runtime patches.
 
 aiter's opus sorting kernel is built for thousands of tokens; at M<=8 it costs
 ~7us/layer of launch/ramp overhead per launch, and the separate
