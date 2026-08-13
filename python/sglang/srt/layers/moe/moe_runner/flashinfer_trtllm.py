@@ -52,19 +52,6 @@ _TRTLLM_MOE_PDL_MAX_TOKENS = envs.SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS.get()
 
 
 def trtllm_moe_enable_pdl(num_tokens: int) -> bool:
-    """Whether to run the trtllm-gen MoE with programmatic dependent launch.
-
-    PDL on these kernels can leave the consumer's grid-dependency wait
-    unreleased when another stream overlaps the launch, stranding the whole TP
-    group at its next collective (see 6a1d1f4422, landed in #31681). The
-    consumer is the finalize kernel, launched with one block per token, so the
-    pressure it puts on the producer GEMM grows with the token count -- and
-    large calls gain nothing from PDL to begin with.
-
-    Every trtllm-gen MoE call site should route its PDL decision through here
-    rather than passing a literal or leaving the argument off, which lets
-    FlashInfer default it to on with no ceiling.
-    """
     return num_tokens <= _TRTLLM_MOE_PDL_MAX_TOKENS
 
 
@@ -94,17 +81,14 @@ def finalize_flashinfer_trtllm_deferred_output(
     from sglang.kernels.jit.utils import is_arch_support_pdl
     from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
 
-    # Same producer (the trtllm-gen GEMM2) as the in-op finalize this replaces,
-    # so it takes the same token ceiling on top of the arch check.
-    num_tokens = deferred_output.expert_weights.shape[0]
-
     return moe_finalize_fuse_shared(
         deferred_output.gemm2_out,
         deferred_output.expanded_idx_to_permuted_idx,
         deferred_output.expert_weights,
         shared_output,
         deferred_output.top_k,
-        enable_pdl=is_arch_support_pdl() and trtllm_moe_enable_pdl(num_tokens),
+        enable_pdl=is_arch_support_pdl()
+        and trtllm_moe_enable_pdl(deferred_output.expert_weights.shape[0]),
     )
 
 
