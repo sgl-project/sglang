@@ -23,7 +23,9 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import rank0_log
 
-if not is_cpu():
+_is_cpu = is_cpu()
+
+if not _is_cpu:
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
@@ -56,7 +58,7 @@ elif is_npu():
     fused_gdn_gating = fused_gdn_gating_npu
     causal_conv1d_fn = causal_conv1d_fn_npu
     causal_conv1d_update = causal_conv1d_update_npu
-elif is_cpu():
+elif _is_cpu:
     from sgl_kernel.mamba import causal_conv1d_fn_cpu, causal_conv1d_update_cpu
 
     causal_conv1d_fn = causal_conv1d_fn_cpu
@@ -339,7 +341,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
-        if not is_cpu() and not is_npu():
+        if not _is_cpu and not is_npu():
             assert (
                 self.conv_states_shape[-1] < FLA_CHUNK_SIZE
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
@@ -514,7 +516,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # int64 indexing, like packed_decode / causal_conv1d_update already do.
         needs_state_gather = (
             (not is_target_verify)
-            and (not is_cpu())
+            and (not _is_cpu)
             and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
         )
         if needs_state_gather:

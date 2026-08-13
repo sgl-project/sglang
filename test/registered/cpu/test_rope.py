@@ -81,7 +81,7 @@ class TestROPE(CustomTestCase):
                     positions=positions,
                 )
                 # fused rope kernel
-                q_sgl, k_sgl = torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
+                torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
                     positions,
                     q_clone,
                     k_clone,
@@ -92,8 +92,8 @@ class TestROPE(CustomTestCase):
                     is_neox_style,
                 )
                 atol = rtol = precision[q_ref.dtype]
-                torch.testing.assert_close(q_ref, q_sgl, atol=atol, rtol=rtol)
-                torch.testing.assert_close(k_ref, k_sgl, atol=atol, rtol=rtol)
+                torch.testing.assert_close(q_ref, q_clone, atol=atol, rtol=rtol)
+                torch.testing.assert_close(k_ref, k_clone, atol=atol, rtol=rtol)
 
     def test_deepseek_v2_rope(self):
         num_head = 16
@@ -149,7 +149,7 @@ class TestROPE(CustomTestCase):
                 )
 
                 # fused rope kernel
-                q_pe_clone, k_pe_clone = torch.ops.sgl_kernel.rotary_embedding_cpu(
+                torch.ops.sgl_kernel.rotary_embedding_cpu(
                     positions,
                     q_pe_clone,
                     k_pe_clone,
@@ -209,7 +209,7 @@ class TestROPE(CustomTestCase):
             query_ref_out, key_ref_out = rope_ref.forward_native(
                 pos_ids, query_ref, key_ref
             )
-            query_cpu_out, key_cpu_out = torch.ops.sgl_kernel.rotary_embedding_cpu(
+            torch.ops.sgl_kernel.rotary_embedding_cpu(
                 pos_ids,
                 query_cpu,
                 key_cpu,
@@ -217,10 +217,8 @@ class TestROPE(CustomTestCase):
                 rope_ref.cos_sin_cache.to(query.dtype),
                 rope_ref.is_neox_style,
             )
-            torch.testing.assert_close(
-                query_ref_out, query_cpu_out, atol=1e-2, rtol=1e-2
-            )
-            torch.testing.assert_close(key_ref_out, key_cpu_out, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(query_ref_out, query_cpu, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(key_ref_out, key_cpu, atol=1e-2, rtol=1e-2)
 
         test_config = [
             (64, 64, 32, 8000, True, torch.bfloat16, "cpu", 32, 32, 1, 1),
@@ -278,8 +276,9 @@ class TestROPE(CustomTestCase):
             q_out_eager, k_out_eager = apply_rotary_pos_emb_native_eager(
                 query, key, cos, sin
             )
-            q_out_sgl, k_out_sgl = torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu(
-                query, key, cos, sin
+            q_out_sgl, k_out_sgl = query.clone(), key.clone()
+            torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu(
+                q_out_sgl, k_out_sgl, cos, sin
             )
             torch.testing.assert_close(q_out_ref, q_out_eager)
             torch.testing.assert_close(k_out_ref, k_out_eager)

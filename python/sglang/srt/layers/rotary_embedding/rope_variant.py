@@ -14,6 +14,7 @@ from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.utils import (
     apply_rotary_pos_emb_native,
+    rotary_embedding_cpu,
     rotate_gptj,
     rotate_neox,
 )
@@ -527,7 +528,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
-            return torch.ops.sgl_kernel.rotary_embedding_cpu(
+            return rotary_embedding_cpu(
                 positions, query, key, self.head_size, self.cos_sin_cache, False
             )
         else:

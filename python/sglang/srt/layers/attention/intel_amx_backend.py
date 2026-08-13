@@ -138,7 +138,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             max_extend_len = self.num_draft_tokens
             self.extend_metadata = self._build_extend_metadata(forward_batch)
         else:
-            max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+            # Pass -1 to let C++ kernel compute max_len_extend dynamically on C++ side.
+            # Avoids calling Python .item() which triggers torch.compile recompile guards.
+            max_extend_len = -1
             self.extend_metadata = self._build_extend_metadata(forward_batch)
         self.forward_metadata = (attn_logits, max_extend_len)
 
@@ -174,7 +176,8 @@ class IntelAMXAttnBackend(AttentionBackend):
             dtype=torch.float32,
             device=self.device,
         )
-        max_extend_len = None
+        # Pass -1 to let C++ kernel compute max_len_extend dynamically on C++ side.
+        max_extend_len = -1
         self.forward_metadata = (attn_logits, max_extend_len)
         self.extend_metadata = None
 
