@@ -62,6 +62,8 @@ def _resolve_transformer_hook_compat(case: Any) -> TransformerHookCompat:
             normalize_reference_timestep=True,
             omit_reference_guidance=True,
         )
+    if "sana-video" in model_path or "sana_video" in model_path:
+        return TransformerHookCompat(omit_reference_guidance=True)
     if "sana" in model_path:
         return TransformerHookCompat(
             omit_reference_guidance=True,
@@ -362,10 +364,14 @@ def _build_transformer_hook_inputs(
         inputs["pooled_projections"] = rng.randn(
             (1, pooled_channels), device, torch.bfloat16
         )
-    if (
+    supports_text_attention_mask = (
         "encoder_attention_mask" in param_names
         or "encoder_hidden_states_mask" in param_names
-    ):
+    )
+    uses_ring_parallel = (case.server_args.ring_degree or 1) > 1
+    if supports_text_attention_mask and not uses_ring_parallel:
+        # This synthetic mask is all True and has no semantic effect. Omit it
+        # for ring-parallel cases, whose masked attention path is unsupported.
         attention_mask = torch.ones(
             1, DEFAULT_TEXT_SEQ_LEN, device=device, dtype=torch.bool
         )

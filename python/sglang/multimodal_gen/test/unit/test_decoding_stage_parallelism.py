@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -19,6 +20,19 @@ class FakeVAE(nn.Module):
 
 
 class TestDecodingStageParallelism(unittest.TestCase):
+    def test_component_use_honors_decode_precision_override(self):
+        stage = DecodingStage(FakeVAE())
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                vae_precision="fp32",
+                vae_decode_precision="bf16",
+            )
+        )
+
+        [component_use] = stage.component_uses(server_args)
+
+        self.assertEqual(component_use.target_dtype, torch.bfloat16)
+
     def test_cfg_parallel_uses_replicated_decode_when_decode_group_has_multiple_ranks(
         self,
     ):

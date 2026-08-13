@@ -7,6 +7,10 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+    EvictLayer,
+    TreeComponent,
+)
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     _TREE_CORE_REGISTRY,
     create_tree_core,
@@ -14,10 +18,6 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     registered_tree_core_backends,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
-    EvictLayer,
-    TreeComponent,
-)
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -63,6 +63,15 @@ class _StubFullComponent(TreeComponent):
         return None
 
     def _evict_device_end(self) -> None:
+        pass
+
+    def _dec_session_coverage(self, session_id, leaf) -> None:
+        pass
+
+    def _advance_session_coverage(self, session_id, leaf, old_ancestor) -> None:
+        pass
+
+    def _recede_session_coverage(self, session_id, leaf, fallback) -> None:
         pass
 
 
