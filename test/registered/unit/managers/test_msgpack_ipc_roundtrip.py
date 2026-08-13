@@ -24,8 +24,6 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetWeightsByNameReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
-    LoadReporterRefreshIpcReq,
-    LoadReporterRefreshReason,
     ParallelismInfo,
     RpcReqInput,
     SetInternalStateReq,
@@ -134,11 +132,6 @@ REGISTRY_TYPE_INSTANCES = {
     "DumperControlReqInput": DumperControlReqInput(method="start", body={"k": "v"}),
     "DumperControlReqOutput": DumperControlReqOutput(
         success=True, response=[{"worker": 0, "ok": True}]
-    ),
-    "load-reporter-refresh": LoadReporterRefreshIpcReq(
-        worker_id="w1",
-        reason=LoadReporterRefreshReason.COMPLETION,
-        event_count=7,
     ),
 }
 

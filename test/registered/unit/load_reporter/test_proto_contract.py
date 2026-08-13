@@ -1,12 +1,4 @@
-"""
-Descriptor-level contract test for the canonical LoadMonitorService proto.
-
-Asserts wire-contract invariants WITHOUT starting a server:
-  - Full service name
-  - Monitor method is bidirectional streaming
-  - RouterFrame / WorkerFrame oneof fields and their field numbers
-  - Preserved LoadReport field numbers (must never change)
-"""
+"""Descriptor-level contract test for the canonical LoadMonitorService proto."""
 
 import ast
 import re

@@ -1,9 +1,4 @@
-"""Unit tests for LoadReporterRuntime inbound Router session management.
-
-Tests exercise runtime.register_session, session lifecycle, sampler
-activation, and time-controlled lease expiry using monkeypatching.
-No grpc.aio server is needed; sessions are driven directly.
-"""
+"""Unit tests for the LoadReporterRuntime push-channel fire loop."""
 
 from __future__ import annotations
 
@@ -36,12 +31,12 @@ def make_server_args(dp_size: int = 1) -> types.SimpleNamespace:
     return args
 
 
-def make_load_snapshot(num_running_reqs: int):
+def make_load_snapshot(num_running_reqs: int = 1, dp_rank: int = 0):
     from sglang.srt.managers.load_snapshot import LoadSnapshot
 
     return LoadSnapshot(
         timestamp=time.time(),
-        dp_rank=0,
+        dp_rank=dp_rank,
         num_running_reqs=num_running_reqs,
         max_running_requests=8,
         max_total_num_tokens=1024,
@@ -49,7 +44,7 @@ def make_load_snapshot(num_running_reqs: int):
 
 
 class FakeSnapshotSource:
-    """Minimal LoadSnapshotSource for testing."""
+    """Return one valid rank-0 snapshot per pull and count calls."""
 
     def __init__(self, dp_size: int = 1) -> None:
         self._dp_size = dp_size
@@ -57,7 +52,7 @@ class FakeSnapshotSource:
 
     async def get_loads(self) -> list:
         self.get_loads_calls += 1
-        return []
+        return [make_load_snapshot(1)]
 
     def expected_dp_ranks(self) -> frozenset:
         return frozenset(range(self._dp_size))
@@ -95,39 +90,70 @@ class ControlledSnapshotSource:
 
 
 class MutableSnapshotSource:
-    """Return the current running-request count on every sample."""
+    """Return one valid snapshot per expected rank, tracked by the rank set."""
 
     def __init__(self) -> None:
         self.num_running_reqs = 1
         self.get_loads_calls = 0
+        self._dp_size = 1
+        self._rank_updates: list = []
 
     async def get_loads(self) -> list:
         self.get_loads_calls += 1
-        return [make_load_snapshot(self.num_running_reqs)]
+        return [
+            make_load_snapshot(self.num_running_reqs, dp_rank=rank)
+            for rank in range(self._dp_size)
+        ]
 
     def expected_dp_ranks(self) -> frozenset:
-        return frozenset({0})
+        return frozenset(range(self._dp_size))
+
+    def update_expected_dp_ranks(self, ranks) -> bool:
+        self._rank_updates.append(frozenset(ranks))
+        new = frozenset(ranks)
+        changed = new != frozenset(range(self._dp_size))
+        self._dp_size = len(list(ranks))
+        return changed
 
 
-class BlockingAfterInitialSnapshotSource:
-    """Complete the initial sample, then hold the next one in flight."""
+class ScriptedSnapshotSource:
+    """Return one scripted result (or raise it) per get_loads call; last step repeats."""
 
-    def __init__(self) -> None:
+    def __init__(self, script: list, dp_size: int = 1) -> None:
+        self._script = list(script)
         self.get_loads_calls = 0
-        self.blocked_sample_started = asyncio.Event()
-        self.release = asyncio.Event()
+        self._dp_size = dp_size
 
     async def get_loads(self) -> list:
         self.get_loads_calls += 1
-        if self.get_loads_calls == 1:
-            return [make_load_snapshot(1)]
-
-        self.blocked_sample_started.set()
-        await self.release.wait()
-        return [make_load_snapshot(9)]
+        step = self._script[min(self.get_loads_calls, len(self._script)) - 1]
+        if isinstance(step, BaseException):
+            raise step
+        return step
 
     def expected_dp_ranks(self) -> frozenset:
-        return frozenset({0})
+        return frozenset(range(self._dp_size))
+
+
+class DelayedScriptedSnapshotSource:
+    """Return one scripted result (or raise it) after a fixed delay per call."""
+
+    def __init__(self, script: list, delay: float, dp_size: int = 1) -> None:
+        self._script = list(script)
+        self._delay = delay
+        self.get_loads_calls = 0
+        self._dp_size = dp_size
+
+    async def get_loads(self) -> list:
+        self.get_loads_calls += 1
+        await asyncio.sleep(self._delay)
+        step = self._script[min(self.get_loads_calls, len(self._script)) - 1]
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+    def expected_dp_ranks(self) -> frozenset:
+        return frozenset(range(self._dp_size))
 
 
 async def drain_queue(q: asyncio.Queue, count: int, timeout: float = 2.0) -> list:
@@ -148,46 +174,8 @@ async def drain_queue(q: asyncio.Queue, count: int, timeout: float = 2.0) -> lis
     return items
 
 
-class TestSnapshotSources:
-    @pytest.mark.asyncio
-    async def test_manager_source_can_read_without_entering_manager_event_loop(self):
-        from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
-
-        expected_loads = [object()]
-
-        class Reader:
-            def read_all(self):
-                return expected_loads
-
-        class Manager:
-            async def get_loads(self, include):
-                raise AssertionError("background reporter entered manager event loop")
-
-        reader = Reader()
-        source = ManagerLoadSnapshotSource(Manager(), {0}, snapshot_reader=reader)
-
-        assert await source.get_loads() is expected_loads
-
-    def test_manager_source_tracks_elastic_worker_count(self):
-        from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
-
-        class Manager:
-            elastic_worker_count = 1
-
-        manager = Manager()
-        source = ManagerLoadSnapshotSource(manager, {0})
-
-        assert source.expected_dp_ranks() == frozenset({0})
-
-        manager.elastic_worker_count = 3
-        assert source.expected_dp_ranks() == frozenset({0, 1, 2})
-
-        manager.elastic_worker_count = 2
-        assert source.expected_dp_ranks() == frozenset({0, 1})
-
-
 # ---------------------------------------------------------------------------
-# Tests
+# Registration
 # ---------------------------------------------------------------------------
 
 
@@ -236,16 +224,17 @@ class TestRegisterSession:
 
         rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
         try:
-            ack, session = rt.register_session("r1", 500, 3000)
-            # The session enqueues the first report immediately.
+            _, session = rt.register_session("r1", 500, 3000)
+            # The next fire delivers the initial report immediately.
             reports = await drain_queue(session.queue, 1)
             assert len(reports) == 1, "Expected 1 initial report"
+            assert reports[0].ranks
         finally:
             session.stop()
             await rt.close()
 
     @pytest.mark.asyncio
-    async def test_initial_report_waits_for_first_completed_snapshot(self):
+    async def test_initial_report_waits_for_pull(self):
         from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
@@ -268,13 +257,214 @@ class TestRegisterSession:
             source.release.set()
             await rt.close()
 
+
+# ---------------------------------------------------------------------------
+# Fire loop behavior
+# ---------------------------------------------------------------------------
+
+
+class TestFireLoop:
     @pytest.mark.asyncio
-    async def test_initial_report_is_bounded_when_first_sample_hangs(self, monkeypatch):
+    async def test_coalesced_registration_shares_one_initial_pull(self):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        source = FakeSnapshotSource()
+        rt = LoadReporterRuntime(source, make_server_args())
+        try:
+            _, s1 = rt.register_session("r1", 5000, 30000)
+            _, s2 = rt.register_session("r2", 5000, 30000)
+            r1 = await asyncio.wait_for(s1.queue.get(), timeout=0.3)
+            r2 = await asyncio.wait_for(s2.queue.get(), timeout=0.3)
+            assert r1.ranks and r2.ranks
+            assert r1.sequence_id == r2.sequence_id  # one report, broadcast
+            assert source.get_loads_calls == 1
+        finally:
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_shared_fire_broadcasts_one_report_to_aligned_sessions(self):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        source = FakeSnapshotSource()
+        rt = LoadReporterRuntime(source, make_server_args())
+        try:
+            _, s1 = rt.register_session("r1", 100, 30000)
+            _, s2 = rt.register_session("r2", 100, 30000)
+            for _ in range(2):
+                r1 = await asyncio.wait_for(s1.queue.get(), timeout=0.5)
+                r2 = await asyncio.wait_for(s2.queue.get(), timeout=0.5)
+            # The periodic broadcast shares one report across aligned sessions.
+            assert r1.sequence_id == r2.sequence_id
+            assert source.get_loads_calls == 2  # initial fire + one periodic fire
+        finally:
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_long_interval_session_receives_only_its_own_deadlines(self):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        source = FakeSnapshotSource()
+        rt = LoadReporterRuntime(source, make_server_args())
+        try:
+            _, fast = rt.register_session("fast", 40, 30000)
+            _, slow = rt.register_session("slow", 300, 30000)
+            await asyncio.wait_for(fast.queue.get(), timeout=0.3)
+            await asyncio.wait_for(slow.queue.get(), timeout=0.3)
+            # slow has no further report due before ~300ms.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(slow.queue.get(), timeout=0.15)
+            slow_report = await asyncio.wait_for(slow.queue.get(), timeout=0.3)
+            assert slow_report.ranks
+        finally:
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_no_pull_between_initial_report_and_periodic_deadline(self):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        source = FakeSnapshotSource()
+        rt = LoadReporterRuntime(source, make_server_args())
+        try:
+            _, session = rt.register_session("r1", 5000, 30000)
+            await asyncio.wait_for(session.queue.get(), timeout=0.3)
+            calls_after_initial = source.get_loads_calls
+            await asyncio.sleep(0.2)
+            assert source.get_loads_calls == calls_after_initial
+        finally:
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_no_background_pull_without_sessions(self):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        source = FakeSnapshotSource()
+        rt = LoadReporterRuntime(source, make_server_args())
+        try:
+            await asyncio.sleep(0.15)
+            assert source.get_loads_calls == 0
+        finally:
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_periodic_cadence_anchored_at_registration(self):
+        """R4: the cadence anchor is registration, not first-report completion (2nd fire at ~500ms, not ~700ms)."""
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        source = ControlledSnapshotSource()
+        rt = LoadReporterRuntime(source, make_server_args())
+        try:
+            registered_at = time.monotonic()
+            rt.register_session("r1", 500, 30000)
+
+            # Hold the first pull for 200ms (< interval), then let it finish.
+            await asyncio.wait_for(source.started.wait(), timeout=1.0)
+            source.started.clear()
+            await asyncio.sleep(0.2)
+            source.release.set()
+
+            await asyncio.wait_for(source.started.wait(), timeout=1.0)
+            elapsed = time.monotonic() - registered_at
+            assert (
+                0.42 <= elapsed < 0.62
+            ), f"fire 2 started {elapsed:.3f}s after registration"
+        finally:
+            source.release.set()
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_reports_flow_periodically(self):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
+        try:
+            _, session = rt.register_session("r1", 30, 3000)
+            # Drain the immediate report plus at least 2 periodic ones.
+            reports = await drain_queue(session.queue, 3, timeout=2.0)
+            assert len(reports) >= 2, f"Expected >=2 reports, got {len(reports)}"
+        finally:
+            session.stop()
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_failed_fire_does_not_reuse_last_good_ranks(self):
+        from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        source = ScriptedSnapshotSource(
+            [[make_load_snapshot(1)], RuntimeError("read failed")]
+        )
+        rt = LoadReporterRuntime(source, make_server_args())
+        try:
+            _, session = rt.register_session("r1", 80, 3000)
+            healthy = await asyncio.wait_for(session.queue.get(), timeout=0.3)
+            failed = await asyncio.wait_for(session.queue.get(), timeout=0.3)
+            assert healthy.ranks
+            assert failed.status == pb.REPORT_STATUS_UNREACHABLE
+            assert not failed.ranks
+            assert failed.last_error == "read failed"
+            assert (
+                source.get_loads_calls == 2
+            )  # one pull per fire, no retry on read error
+        finally:
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_rank_set_mismatch_retries_once_then_succeeds(self):
+        from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        source = ScriptedSnapshotSource(
+            [
+                [make_load_snapshot(1)],  # missing rank 1 -> retryable mismatch
+                [make_load_snapshot(1), make_load_snapshot(1, dp_rank=1)],
+            ],
+            dp_size=2,
+        )
+        rt = LoadReporterRuntime(source, make_server_args(dp_size=2))
+        try:
+            _, session = rt.register_session("r1", 5000, 30000)
+            report = await asyncio.wait_for(session.queue.get(), timeout=0.3)
+            assert report.status == pb.REPORT_STATUS_HEALTHY
+            assert [r.dp_rank for r in report.ranks] == [0, 1]
+            assert source.get_loads_calls == 2  # initial attempt + one retry
+        finally:
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_rank_set_retry_uses_remaining_budget(self, monkeypatch):
+        """R3: the rank-set retry shares the fire's timeout budget (pre-fix, each attempt got the full 0.2s)."""
         import sglang.srt.load_reporter.runtime as runtime_module
         from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
-        monkeypatch.setattr(runtime_module, "INITIAL_SAMPLE_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(runtime_module, "SNAPSHOT_PULL_TIMEOUT_SECONDS", 0.2)
+        source = DelayedScriptedSnapshotSource(
+            script=[
+                [make_load_snapshot(1)],  # missing rank 1 -> retryable mismatch
+                [make_load_snapshot(1), make_load_snapshot(1, dp_rank=1)],
+            ],
+            delay=0.12,
+            dp_size=2,
+        )
+        rt = LoadReporterRuntime(source, make_server_args(dp_size=2))
+        started_at = time.monotonic()
+        try:
+            _, session = rt.register_session("r1", 5000, 30000)
+            report = await asyncio.wait_for(session.queue.get(), timeout=0.5)
+
+            assert report.status == pb.REPORT_STATUS_UNREACHABLE
+            assert source.get_loads_calls == 2  # retry ran with the remainder
+            assert time.monotonic() - started_at < 0.35  # not 2x the budget
+        finally:
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_initial_pull_hanging_is_bounded(self, monkeypatch):
+        import sglang.srt.load_reporter.runtime as runtime_module
+        from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        monkeypatch.setattr(runtime_module, "SNAPSHOT_PULL_TIMEOUT_SECONDS", 0.05)
         source = ControlledSnapshotSource()
         rt = LoadReporterRuntime(source, make_server_args())
         started_at = time.monotonic()
@@ -289,19 +479,10 @@ class TestRegisterSession:
             source.release.set()
             await rt.close()
 
-    @pytest.mark.asyncio
-    async def test_periodic_reports(self):
-        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
-        rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
-        try:
-            ack, session = rt.register_session("r1", 30, 3000)
-            # drain the immediate report + wait for at least 2 periodic ones
-            reports = await drain_queue(session.queue, 3, timeout=2.0)
-            assert len(reports) >= 2, f"Expected >=2 reports, got {len(reports)}"
-        finally:
-            session.stop()
-            await rt.close()
+# ---------------------------------------------------------------------------
+# Config updates
+# ---------------------------------------------------------------------------
 
 
 class TestUpdateConfig:
@@ -342,25 +523,6 @@ class TestUpdateConfig:
             await rt.close()
 
     @pytest.mark.asyncio
-    async def test_report_interval_update_reschedules_sampler(self):
-        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
-
-        source = FakeSnapshotSource()
-        rt = LoadReporterRuntime(source, make_server_args())
-        try:
-            _, session = rt.register_session("r1", 1000, 3000)
-            await asyncio.sleep(0.1)
-            calls_before = source.get_loads_calls
-
-            session.update_config(report_interval_ms=30)
-            await asyncio.sleep(0.15)
-
-            assert source.get_loads_calls - calls_before >= 2
-        finally:
-            session.stop()
-            await rt.close()
-
-    @pytest.mark.asyncio
     async def test_update_config_rejects_all_fields_atomically(self):
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
@@ -388,7 +550,7 @@ class TestUpdateConfig:
         rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
         try:
             # Short initial lease of 50ms.
-            ack, session = rt.register_session("r1", 10, 50)
+            _, session = rt.register_session("r1", 10, 50)
             # Extend the lease to 5000ms before the original 50ms expires.
             await asyncio.sleep(0.02)
             session.update_config(lease_ttl_ms=5000)
@@ -404,7 +566,51 @@ class TestUpdateConfig:
             await rt.close()
 
 
+# ---------------------------------------------------------------------------
+# Lease handling
+# ---------------------------------------------------------------------------
+
+
 class TestLeaseExpiry:
+    @pytest.mark.asyncio
+    async def test_expiring_session_does_not_shrink_shared_pull_timeout(self):
+        """R1: a short lease must not bound a shared fire's pull (pre-fix, an expiring session shrank the timeout)."""
+        from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        source = ControlledSnapshotSource()
+        rt = LoadReporterRuntime(source, make_server_args())
+        try:
+            _, expiring = rt.register_session("expiring", 60, 80)
+            _, healthy = rt.register_session("healthy", 60, 3000)
+
+            # Fire 1: release the initial pull immediately.
+            await asyncio.wait_for(source.started.wait(), timeout=1.0)
+            source.started.clear()
+            source.release.set()
+            first = await asyncio.wait_for(healthy.queue.get(), timeout=1.0)
+            assert first.status == pb.REPORT_STATUS_HEALTHY
+            source.release.clear()  # arm the gate before fire 2's pull awaits it
+
+            # Fire 2: hold the pull past the expiring session's 80ms lease.
+            await asyncio.wait_for(source.started.wait(), timeout=1.0)
+            source.started.clear()
+            await asyncio.sleep(0.05)
+            source.release.set()
+
+            # The healthy session shares the deadline and must still get the report, not a lease-shortened timeout.
+            second = await asyncio.wait_for(healthy.queue.get(), timeout=1.0)
+            assert second.status == pb.REPORT_STATUS_HEALTHY
+
+            # The expiring session is reaped once its lease ends.
+            sentinel = await asyncio.wait_for(expiring.queue.get(), timeout=1.0)
+            if sentinel is not None:
+                sentinel = await asyncio.wait_for(expiring.queue.get(), timeout=1.0)
+            assert sentinel is None
+        finally:
+            source.release.set()
+            await rt.close()
+
     @pytest.mark.asyncio
     async def test_keepalive_does_not_publish_before_report_deadline(self):
         """Lease renewals must not accelerate the periodic report cadence."""
@@ -439,7 +645,7 @@ class TestLeaseExpiry:
         rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
         try:
             # Very short lease: session should expire quickly.
-            ack, session = rt.register_session("r1", 5000, 20)
+            _, session = rt.register_session("r1", 5000, 20)
             # Wait for None sentinel in queue (lease expires)
             try:
                 sentinel = await asyncio.wait_for(session.queue.get(), timeout=1.5)
@@ -453,6 +659,11 @@ class TestLeaseExpiry:
             await rt.close()
 
 
+# ---------------------------------------------------------------------------
+# Router replacement
+# ---------------------------------------------------------------------------
+
+
 class TestSameRouterIdReplacement:
     @pytest.mark.asyncio
     async def test_same_router_id_replaces_session(self):
@@ -460,9 +671,9 @@ class TestSameRouterIdReplacement:
 
         rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
         try:
-            ack1, session1 = rt.register_session("r1", 500, 3000)
+            _, session1 = rt.register_session("r1", 500, 3000)
             # Re-register same router_id — replaces session1.
-            ack2, session2 = rt.register_session("r1", 200, 3000)
+            _, session2 = rt.register_session("r1", 200, 3000)
             # session1 should receive None sentinel (stopped).
             sentinel = await asyncio.wait_for(session1.queue.get(), timeout=1.0)
             # consume any initial report first, then None
@@ -475,135 +686,33 @@ class TestSameRouterIdReplacement:
 
     @pytest.mark.asyncio
     async def test_replacement_does_not_corrupt_session_table(self):
-        """C1 regression: old session's on_close must not delete the new session.
-
-        Bug mechanism: _on_session_closed was generation-blind — it did
-        self._sessions.pop(router_id) unconditionally, so when the old session's
-        cleanup ran asynchronously it silently removed the new session from the
-        table, deactivated the sampler, and leaked the new session's task.
-
-        This test reproduces the exact asynchronous interleaving and asserts the
-        behavioral invariants that would have failed on the buggy code:
-        - sampler stays active after replacement (session2 is in the table)
-        - session2 emits a fresh report (write loop is still running)
-        """
+        """C1: a generation-blind on_close deleted the replacement session; the fire loop must keep serving it."""
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
         source = FakeSnapshotSource()
         rt = LoadReporterRuntime(source, make_server_args())
         try:
-            ack1, session1 = rt.register_session("r1", 30, 3000)
-            ack2, session2 = rt.register_session("r1", 30, 3000)
+            _, session1 = rt.register_session("r1", 30, 3000)
+            _, session2 = rt.register_session("r1", 30, 3000)
 
-            # Let old session's _run() finally block execute (needs event loop yield).
-            # Drain session1 until we see the None sentinel.
-            sentinel = None
-            for _ in range(10):
-                await asyncio.sleep(0.01)
-                while not session1.queue.empty():
-                    item = session1.queue.get_nowait()
-                    if item is None:
-                        sentinel = item
-                        break
-                if sentinel is None and session1._done.is_set():
-                    sentinel = None  # done event set; on_close has fired
-                    break
+            sentinel = await asyncio.wait_for(session1.queue.get(), timeout=1.0)
+            if sentinel is not None:
+                sentinel = await asyncio.wait_for(session1.queue.get(), timeout=1.0)
+            assert sentinel is None
 
-            # Allow a bit more time for on_close to execute.
-            await asyncio.sleep(0.05)
-
-            # Sampler must still be active: session2 is in the table.
-            calls_before = source.get_loads_calls
-            await asyncio.sleep(0.15)
-            calls_after = source.get_loads_calls
-            assert calls_after > calls_before, (
-                "Sampler must stay active after same-router-id replacement; "
-                "generation-blind on_close would have deactivated it"
-            )
-
-            # session2 must still emit reports.
+            # The replacement session must still emit reports.
             reports = await drain_queue(session2.queue, 1, timeout=0.5)
             assert len(reports) >= 1, (
                 "session2 must still emit reports after replacement; "
-                "generation-blind on_close would have leaked its task"
+                "a generation-blind on_close would have removed it"
             )
         finally:
             await rt.close()
 
 
-class GatedReRegistrationSource:
-    """Return a snapshot immediately until gated, then block one sample.
-
-    Lets a test drive: (1) a first session's initial sample completing, then
-    (2) a later session registering while the *next* sample is held in flight.
-    """
-
-    def __init__(self) -> None:
-        self.gate = False
-        self.num_running = 1
-        self.gated_started = asyncio.Event()
-        self.release = asyncio.Event()
-
-    async def get_loads(self) -> list:
-        if self.gate:
-            self.gated_started.set()
-            await self.release.wait()
-        return [make_load_snapshot(self.num_running)]
-
-    def expected_dp_ranks(self) -> frozenset:
-        return frozenset({0})
-
-
-class TestReRegistrationFreshness:
-    @pytest.mark.asyncio
-    async def test_new_registration_waits_for_post_registration_sample(
-        self, monkeypatch
-    ):
-        """I5: a session registering after the sampler went idle must wait for a
-        fresh sample, not reuse a globally-latched completion from an earlier
-        session's sample.
-        """
-        import sglang.srt.load_reporter.runtime as runtime_module
-        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
-
-        # Long initial-sample timeout so the test asserts the generation barrier,
-        # not a timeout fallback.
-        monkeypatch.setattr(runtime_module, "INITIAL_SAMPLE_TIMEOUT_SECONDS", 10.0)
-
-        source = GatedReRegistrationSource()
-        rt = LoadReporterRuntime(source, make_server_args())
-        try:
-            # Router A registers; its initial sample (num_running=1) completes.
-            _, session_a = rt.register_session("router-a", 10_000, 30_000)
-            first = await asyncio.wait_for(session_a.queue.get(), timeout=1.0)
-            assert first is not None
-            assert first.ranks[0].num_running_reqs == 1
-
-            # Router A closes; with no active sessions the sampler deactivates.
-            session_a.stop()
-            sentinel = await asyncio.wait_for(session_a.queue.get(), timeout=1.0)
-            assert sentinel is None
-            await asyncio.sleep(0.05)  # let on_close deactivate the sampler
-
-            # The next sample will block in flight and would report num_running=5.
-            source.gate = True
-            source.num_running = 5
-
-            # Router B registers and reactivates the sampler.  A stale global
-            # one-shot event would let it emit the old num_running=1 immediately;
-            # the generation barrier must make it wait for the fresh sample.
-            _, session_b = rt.register_session("router-b", 10_000, 30_000)
-            await asyncio.wait_for(source.gated_started.wait(), timeout=1.0)
-            with pytest.raises(asyncio.TimeoutError):
-                await asyncio.wait_for(session_b.queue.get(), timeout=0.1)
-
-            # Once the fresh sample lands, Router B emits it.
-            source.release.set()
-            report = await asyncio.wait_for(session_b.queue.get(), timeout=1.0)
-            assert report.ranks[0].num_running_reqs == 5
-        finally:
-            source.release.set()
-            await rt.close()
+# ---------------------------------------------------------------------------
+# Multiple routers
+# ---------------------------------------------------------------------------
 
 
 class TestMultiRouter:
@@ -613,8 +722,8 @@ class TestMultiRouter:
 
         rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
         try:
-            ack1, session1 = rt.register_session("r1", 30, 3000)
-            ack2, session2 = rt.register_session("r2", 30, 3000)
+            _, session1 = rt.register_session("r1", 30, 3000)
+            _, session2 = rt.register_session("r2", 30, 3000)
             # Both sessions receive reports independently.
             reports1 = await drain_queue(session1.queue, 1)
             reports2 = await drain_queue(session2.queue, 1)
@@ -624,186 +733,105 @@ class TestMultiRouter:
             await rt.close()
 
     @pytest.mark.asyncio
-    async def test_min_interval_sampling(self):
-        """Sampler must use the shortest session interval (behavioral)."""
+    async def test_fire_cadence_tracks_shortest_interval(self):
+        """The fire loop must wake at the shortest session interval."""
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
         source = FakeSnapshotSource()
         rt = LoadReporterRuntime(source, make_server_args())
         try:
-            # s1 wants 1000ms, s2 wants 30ms: sampler should run ~at 30ms cadence.
-            ack1, s1 = rt.register_session("r1", 1000, 5000)
-            ack2, s2 = rt.register_session("r2", 30, 5000)
+            # s1 wants 1000ms, s2 wants 30ms: fires should run ~at 30ms cadence.
+            _, s1 = rt.register_session("r1", 1000, 5000)
+            _, s2 = rt.register_session("r2", 30, 5000)
             before = source.get_loads_calls
             await asyncio.sleep(0.2)
             after = source.get_loads_calls
-            # At 30ms interval over 200ms we expect at least 4 samples; at
-            # 1000ms interval we'd expect at most 1.  Assert a clear majority.
+            # At 30ms over 200ms expect >=4 fires; at 1000ms expect <=1; assert a majority.
             assert (
                 after - before >= 3
-            ), f"Expected >=3 samples at 30ms min interval, got {after - before}"
+            ), f"Expected >=3 fires at 30ms min interval, got {after - before}"
         finally:
             s1.stop()
             s2.stop()
             await rt.close()
 
 
-class TestSamplerActivation:
+# ---------------------------------------------------------------------------
+# Topology changes
+# ---------------------------------------------------------------------------
+
+
+class TestTopologyChangeEvents:
     @pytest.mark.asyncio
-    async def test_sampler_activates_on_first_session(self):
-        """Sampler must sample after a session is registered (behavioral)."""
-        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
-
-        source = FakeSnapshotSource()
-        rt = LoadReporterRuntime(source, make_server_args())
-        try:
-            before = source.get_loads_calls
-            ack, session = rt.register_session("r1", 500, 3000)
-            await asyncio.sleep(0.15)
-            after = source.get_loads_calls
-            assert (
-                after > before
-            ), "Sampler should start sampling when first session is registered"
-        finally:
-            session.stop()
-            await rt.close()
-
-    @pytest.mark.asyncio
-    async def test_sampler_deactivates_on_last_close(self):
-        """Sampler must stop sampling after the last session closes (behavioral)."""
-        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
-
-        source = FakeSnapshotSource()
-        rt = LoadReporterRuntime(source, make_server_args())
-        try:
-            ack, session = rt.register_session("r1", 500, 3000)
-            session.stop()
-            # Allow on_close to fire and deactivate the sampler.
-            await asyncio.sleep(0.1)
-            # Capture call count after deactivation.
-            snapshot = source.get_loads_calls
-            await asyncio.sleep(0.15)
-            after = source.get_loads_calls
-            assert (
-                after == snapshot
-            ), "Sampler should stop sampling after last session closes"
-        finally:
-            await rt.close()
-
-
-class TestShutdown:
-    @pytest.mark.asyncio
-    async def test_timeout_cancels_hanging_sampler_and_sessions(self, monkeypatch):
-        import sglang.srt.load_reporter.runtime as runtime_module
-        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
-
-        monkeypatch.setattr(runtime_module, "SHUTDOWN_TIMEOUT_SECONDS", 0.05)
-        source = HangingSnapshotSource()
-        rt = LoadReporterRuntime(source, make_server_args())
-        _, session = rt.register_session("r1", 1000, 3000)
-        await asyncio.wait_for(source.started.wait(), timeout=0.5)
-
-        sampler_task = rt._sampler._task
-        assert sampler_task is not None
-        try:
-            await asyncio.wait_for(rt.close(), timeout=0.5)
-
-            assert sampler_task.done()
-            assert session._task.done()
-            await asyncio.wait_for(rt.close(), timeout=0.1)
-        finally:
-            tasks = [sampler_task, session._task]
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-
-class TestDecoratorEvents:
-    @pytest.mark.asyncio
-    async def test_request_end_refreshes_coalesce_without_early_report(self):
-        """Refresh hints update state, but only the deadline publishes it."""
+    async def test_update_expected_dp_ranks_does_not_pull(self):
+        """A topology change only updates the expected set; it never pulls."""
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
         source = MutableSnapshotSource()
         rt = LoadReporterRuntime(source, make_server_args())
         try:
-            _, session = rt.register_session("r1", 400, 3000)
-            initial_report = await asyncio.wait_for(session.queue.get(), timeout=0.5)
-            assert initial_report.ranks[0].num_running_reqs == 1
-
-            source.num_running_reqs = 7
-            for _ in range(10):
-                rt.notify_refresh()
-
-            deadline = time.monotonic() + 0.2
-            while source.get_loads_calls < 2 and time.monotonic() < deadline:
-                await asyncio.sleep(0.005)
-            assert source.get_loads_calls == 2
-
-            with pytest.raises(asyncio.TimeoutError):
-                await asyncio.wait_for(session.queue.get(), timeout=0.1)
-
-            report = await asyncio.wait_for(session.queue.get(), timeout=0.4)
-            assert report.ranks[0].num_running_reqs == 7
+            _, session = rt.register_session("r1", 5000, 30000)
+            await asyncio.wait_for(session.queue.get(), timeout=0.5)
+            before = source.get_loads_calls
+            assert rt.update_expected_dp_ranks(range(2)) is True
+            await asyncio.sleep(0.15)
+            assert (
+                source.get_loads_calls == before
+            ), "topology change must not trigger a snapshot pull"
+            assert len(source._rank_updates) == 1
         finally:
+            session.stop()
             await rt.close()
 
     @pytest.mark.asyncio
-    async def test_inflight_sample_does_not_delay_deadline_report(self):
-        """A deadline reads the latest completed snapshot without awaiting I/O."""
+    async def test_next_fire_observes_new_rank_set(self):
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
-        source = BlockingAfterInitialSnapshotSource()
+        source = MutableSnapshotSource()
         rt = LoadReporterRuntime(source, make_server_args())
         try:
-            _, session = rt.register_session("r1", 150, 3000)
-            initial_report = await asyncio.wait_for(session.queue.get(), timeout=0.5)
-            assert initial_report.ranks[0].num_running_reqs == 1
+            _, session = rt.register_session("r1", 30, 30000)
+            initial = await asyncio.wait_for(session.queue.get(), timeout=0.5)
+            assert [rank.dp_rank for rank in initial.ranks] == [0]
 
-            rt.notify_refresh()
-            await asyncio.wait_for(source.blocked_sample_started.wait(), timeout=0.2)
+            assert rt.update_expected_dp_ranks(range(2)) is True
 
             report = await asyncio.wait_for(session.queue.get(), timeout=0.3)
-            assert not source.release.is_set()
-            assert report.ranks[0].num_running_reqs == 1
-        finally:
-            source.release.set()
-            await rt.close()
-
-    @pytest.mark.asyncio
-    async def test_notify_refresh_wakes_sampler(self):
-        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
-
-        source = FakeSnapshotSource()
-        rt = LoadReporterRuntime(source, make_server_args())
-        try:
-            ack, session = rt.register_session("r1", 5000, 30000)
-            before = source.get_loads_calls
-            rt.notify_refresh()
-            await asyncio.sleep(0.1)
-            after = source.get_loads_calls
-            assert after > before, "notify_refresh should trigger a sample"
+            assert [rank.dp_rank for rank in report.ranks] == [0, 1]
         finally:
             session.stop()
             await rt.close()
 
+
+# ---------------------------------------------------------------------------
+# Shutdown
+# ---------------------------------------------------------------------------
+
+
+class TestShutdown:
     @pytest.mark.asyncio
-    async def test_notify_source_changed_wakes_sampler(self):
+    async def test_close_cancels_in_flight_pull_promptly(self):
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
-        source = FakeSnapshotSource()
+        source = HangingSnapshotSource()
         rt = LoadReporterRuntime(source, make_server_args())
-        try:
-            ack, session = rt.register_session("r1", 5000, 30000)
-            before = source.get_loads_calls
-            rt.notify_source_changed()
-            await asyncio.sleep(0.1)
-            after = source.get_loads_calls
-            assert after > before
-        finally:
-            session.stop()
-            await rt.close()
+        _, session = rt.register_session("r1", 5000, 30000)
+        await asyncio.wait_for(source.started.wait(), timeout=0.5)
+
+        # Must not wait for the pull timeout: the fire task is cancelled.
+        await asyncio.wait_for(rt.close(), timeout=0.5)
+        # Stopped sessions receive the None sentinel.
+        sentinel = await asyncio.wait_for(session.queue.get(), timeout=0.5)
+        assert sentinel is None
+        # close() stays idempotent.
+        await asyncio.wait_for(rt.close(), timeout=0.1)
+
+    @pytest.mark.asyncio
+    async def test_close_without_sessions(self):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
+        await asyncio.wait_for(rt.close(), timeout=0.5)
 
 
 if __name__ == "__main__":

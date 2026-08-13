@@ -1,13 +1,4 @@
-"""E2E: multi-tokenizer load reporter ownership boundary.
-
-With ``--tokenizer-worker-num > 1`` only the sole ``MultiTokenizerRouter`` binds
-``--load-reporter-port``; the N HTTP workers forward coalesced refresh hints to
-that single runtime over IPC.  A real ``grpc.aio`` fake Router dials in and must
-see one working stream, and requests spread across workers must converge into
-ranked reports on the same sampler.
-
-Requires a GPU + model + the load-reporter grpc/protobuf extra (CUDA CI).
-"""
+"""E2E: multi-tokenizer ownership — only the sole MultiTokenizerRouter binds --load-reporter-port."""
 
 from __future__ import annotations
 
@@ -101,6 +92,18 @@ class FakeRouterClient:
         with self._lock:
             return tuple(self._reports)
 
+    def report_count(self) -> int:
+        with self._lock:
+            return len(self._reports)
+
+    def wait_for_reports(self, n: int, timeout: float = 12.0) -> bool:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if self.report_count() >= n:
+                return True
+            time.sleep(0.05)
+        return self.report_count() >= n
+
     def wait_for_ranked_report(self, timeout: float = 12.0) -> bool:
         end = time.monotonic() + timeout
         while time.monotonic() < end:
@@ -143,10 +146,8 @@ class TestLoadReporterMultiOwner(CustomTestCase):
             kill_process_tree(process.pid)
             cls.process = None
 
-    def test_sole_owner_listens_and_workers_share_sampler(self) -> None:
-        # A single reporter listener exists (the router). If any HTTP worker had
-        # also bound the port, launch would have failed; a working stream here
-        # proves the sole-owner boundary via the actual listener result.
+    def test_sole_owner_periodic_reports_continue_through_inference(self) -> None:
+        # If any HTTP worker had also bound the port, launch would have failed; a working stream proves sole ownership.
         router = FakeRouterClient("127.0.0.1", self.reporter_port, interval_ms=250)
         router.start()
         try:
@@ -154,8 +155,11 @@ class TestLoadReporterMultiOwner(CustomTestCase):
                 router.wait_for_register(),
                 "router-owned reporter listener never accepted the stream",
             )
-            # Spread several requests; they round-robin across the 2 workers,
-            # whose coalesced refresh hints reach the one router sampler.
+            self.assertTrue(
+                router.wait_for_reports(2),
+                "router-owned fire loop produced fewer than 2 reports",
+            )
+            # Spread requests across the 2 HTTP workers; activity is independent of the router-owned fire loop.
             for i in range(6):
                 resp = requests.post(
                     f"{self.base_url}/generate",
@@ -166,9 +170,14 @@ class TestLoadReporterMultiOwner(CustomTestCase):
                     timeout=30,
                 )
                 self.assertEqual(resp.status_code, 200, resp.text)
+            reports_after_inference = router.report_count()
+            self.assertTrue(
+                router.wait_for_reports(reports_after_inference + 1),
+                "periodic reporting stopped after multi-worker inference",
+            )
             self.assertTrue(
                 router.wait_for_ranked_report(),
-                "no ranked report converged from the shared router sampler",
+                "shared fire loop produced no ranked report",
             )
         finally:
             router.stop()

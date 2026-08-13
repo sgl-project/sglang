@@ -1,19 +1,4 @@
-"""E2E: standalone SMG RPC (``--smg-grpc-mode``) load reporter.
-
-Standalone SMG RPC bypasses FastAPI: SGLang imports ``smg-grpc-servicer`` and,
-in the ``on_request_manager_ready`` callback, starts the SAME reporter runtime
-+ ``grpc.aio`` service on ``--load-reporter-port`` and applies the SAME
-``enable_load_monitor("request_lifecycle")`` decorator to the current
-``GrpcRequestManager.generate_request`` bound method. A real ``grpc.aio`` fake
-Router dials into the reporter port (distinct from the SMG inference port), and
-the external SMG inference stub drives a real generation request. The next
-deadline report must contain a snapshot collected by the request-end wake,
-rather than one collected by ordinary interval sampling at that deadline.
-
-Requires a GPU + model + ``smg-grpc-servicer==0.8.0`` + the load-reporter extra
-(CUDA CI pins 0.8.0 in the test extra); it cannot run on a CPU-only host
-without those packages.
-"""
+"""E2E: standalone SMG RPC — the ready callback starts the reporter runtime with a manager-backed source."""
 
 from __future__ import annotations
 
@@ -163,8 +148,7 @@ class TestLoadReporterStandaloneGrpc(CustomTestCase):
                 "0.5",
             ]
         )
-        # Wait for the reporter listener (started in the ready callback, before
-        # the gRPC server accepts requests) to come up.
+        # Wait for the reporter listener, started in the ready callback before the gRPC server accepts requests.
         deadline = time.monotonic() + DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
         cls.reporter_up = False
         while time.monotonic() < deadline:
@@ -182,7 +166,8 @@ class TestLoadReporterStandaloneGrpc(CustomTestCase):
             kill_process_tree(process.pid)
             cls.process = None
 
-    def test_real_inference_refreshes_next_deadline_report(self) -> None:
+    def test_inference_and_reporting_coexist(self) -> None:
+        """Inference and periodic reporting run independently — requests never trigger a snapshot pull."""
         self.assertTrue(
             self.reporter_up, "standalone reporter port never started listening"
         )
@@ -190,7 +175,7 @@ class TestLoadReporterStandaloneGrpc(CustomTestCase):
         self.assertNotEqual(self.reporter_port, self.smg_port)
         self.assertNotEqual(self.reporter_port, self.sidecar_port)
 
-        report_interval_ms = 10_000
+        report_interval_ms = 500
         router = FakeRouterClient(
             self.host,
             self.reporter_port,
@@ -205,10 +190,10 @@ class TestLoadReporterStandaloneGrpc(CustomTestCase):
             )
             self.assertTrue(
                 router.wait_for_reports(1, timeout=8.0),
-                "no initial report after register under a long interval",
+                "no initial report after register",
             )
 
-            inference_started_ms = int(time.time() * 1000)
+            # Run a real inference request — must succeed without affecting the reporter stream.
             channel = grpc.insecure_channel(f"{self.host}:{self.smg_port}")
             try:
                 stub = sglang_scheduler_pb2_grpc.SglangSchedulerStub(channel)
@@ -228,17 +213,18 @@ class TestLoadReporterStandaloneGrpc(CustomTestCase):
             finally:
                 channel.close()
             self.assertTrue(responses and responses[-1].HasField("complete"))
-            inference_finished_ms = int(time.time() * 1000)
 
+            # Periodic reports must continue arriving after inference.
+            reports_after_inference = router.report_count()
             self.assertTrue(
-                router.wait_for_reports(2, timeout=report_interval_ms / 1000 + 3),
+                router.wait_for_reports(
+                    reports_after_inference + 1,
+                    timeout=report_interval_ms / 1000 + 3,
+                ),
                 "no deadline report after real standalone inference",
             )
-            report = router.reports_snapshot()[1]
+            report = router.reports_snapshot()[-1]
             self.assertTrue(report.ranks, "post-inference report has no rank snapshot")
-            snapshot_time_ms = max(rank.snapshot_time_unix_ms for rank in report.ranks)
-            self.assertGreaterEqual(snapshot_time_ms, inference_started_ms)
-            self.assertLessEqual(snapshot_time_ms, inference_finished_ms + 2_000)
         finally:
             router.stop()
 

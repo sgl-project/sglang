@@ -1,8 +1,4 @@
-"""Unit tests for load reporter fields in ServerArgs.
-
-Covers default value, CLI parsing, range validation, and interaction with
-the post-init _handle_load_reporter_config check.
-"""
+"""Unit tests for load reporter fields in ServerArgs."""
 
 from __future__ import annotations
 

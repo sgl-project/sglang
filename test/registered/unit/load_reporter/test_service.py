@@ -1,10 +1,4 @@
-"""Integration tests for LoadMonitorService using a real grpc.aio in-process server.
-
-The Worker is the gRPC server; the fake Router is the gRPC client.
-Tests cover: normal handshake, periodic reporting (no decorator events),
-illegal first frame, client cancel, server shutdown, same-router_id
-stream replacement, and the fixed-port-occupied failure path.
-"""
+"""Integration tests for LoadMonitorService using a real grpc.aio in-process server."""
 
 from __future__ import annotations
 
@@ -155,8 +149,8 @@ class TestNormalHandshake:
 
 class TestContinuousReporting:
     @pytest.mark.asyncio
-    async def test_reports_flow_without_decorator_events(self):
-        """Reports must flow on interval even with NO decorator events."""
+    async def test_reports_flow_without_request_activity(self):
+        """Reports must flow on interval without inference request activity."""
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
         rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
@@ -421,8 +415,7 @@ class TestFixedPortOccupied:
             rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
             server = grpc.aio.server()
             add_service_to_server(rt, server)
-            # grpc.aio raises RuntimeError on bind failure (never silently
-            # falls back to a random port — that's the invariant we protect).
+            # grpc.aio raises on bind failure and never silently falls back to a random port (the invariant).
             with pytest.raises(RuntimeError):
                 server.add_insecure_port(f"127.0.0.1:{occupied_port}")
             await server.stop(grace=0)

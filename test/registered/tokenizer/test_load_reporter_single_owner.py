@@ -1,13 +1,4 @@
-"""E2E: single-tokenizer HTTP Worker load reporter (router dials in).
-
-Transport inversion vs. the old HTTP-registration design: the external Router
-is now a gRPC CLIENT that dials INTO the Worker's fixed ``--load-reporter-port``
-and drives the bidi ``Monitor`` stream.  This suite uses a real ``grpc.aio``
-fake Router (no HTTP POST) against a real single-tokenizer server.
-
-Requires a GPU + model + the load-reporter grpc/protobuf extra, so it is
-registered as a CUDA CI test and cannot run on a CPU-only host.
-"""
+"""E2E: single-tokenizer HTTP Worker — the Router is a gRPC client dialing into its --load-reporter-port."""
 
 from __future__ import annotations
 
@@ -38,12 +29,7 @@ register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-small")
 
 
 class FakeRouterClient:
-    """Real grpc.aio client that dials INTO the Worker reporter port.
-
-    Runs its own event loop on a background thread. Sends a register frame
-    first, then periodic keep-alive frames, and records every WorkerFrame it
-    reads.
-    """
+    """Real grpc.aio client dialing INTO the Worker reporter port; runs its own loop on a background thread."""
 
     def __init__(
         self,
@@ -140,7 +126,7 @@ class FakeRouterClient:
 
 
 class TestLoadReporterSingleOwner(CustomTestCase):
-    """Single-tokenizer HTTP Worker: register, continuous reports, request-end."""
+    """Single-tokenizer HTTP Worker: register and periodic reporting."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -181,30 +167,30 @@ class TestLoadReporterSingleOwner(CustomTestCase):
         finally:
             router.stop()
 
-    def test_request_end_drives_report_convergence(self) -> None:
+    def test_inference_and_periodic_reporting_coexist(self) -> None:
         router = FakeRouterClient("127.0.0.1", self.reporter_port, interval_ms=250)
         router.start()
         try:
             self.assertTrue(router.wait_for_register())
-            router.wait_for_reports(1)
-            # Drive dispatch + completion through the decorator seam.
+            self.assertTrue(router.wait_for_reports(1), "no initial report received")
             resp = requests.post(
                 f"{self.base_url}/generate",
                 json={
-                    "text": "single-owner reporter convergence",
+                    "text": "single-owner periodic reporter",
                     "sampling_params": {"max_new_tokens": 8, "temperature": 0},
                 },
                 timeout=30,
             )
             self.assertEqual(resp.status_code, 200, resp.text)
-            # A ranked snapshot must eventually converge (hints coalesce; we do
-            # not require one report per request-end).
-            end = time.monotonic() + 10.0
-            ranked = False
-            while time.monotonic() < end and not ranked:
-                ranked = any(r.ranks for r in router.reports_snapshot())
-                time.sleep(0.1)
-            self.assertTrue(ranked, "no ranked report converged after a request")
+            reports_after_inference = router.report_count()
+            self.assertTrue(
+                router.wait_for_reports(reports_after_inference + 1, timeout=10.0),
+                "periodic reporting stopped after inference",
+            )
+            self.assertTrue(
+                any(report.ranks for report in router.reports_snapshot()),
+                "periodic reports never observed a scheduler snapshot",
+            )
         finally:
             router.stop()
 
@@ -235,8 +221,7 @@ class TestLoadReporterSingleOwner(CustomTestCase):
 
 
 class TestLoadReporterNativeGrpcReuse(CustomTestCase):
-    """Native gRPC (--grpc-port) reuses the HTTP/TokenizerManager lifecycle:
-    exactly one reporter listener on --load-reporter-port, not a second one."""
+    """Native gRPC reuses the HTTP lifecycle: exactly one reporter listener on --load-reporter-port."""
 
     @classmethod
     def setUpClass(cls) -> None:
