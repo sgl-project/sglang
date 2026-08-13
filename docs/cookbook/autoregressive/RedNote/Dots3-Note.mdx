@@ -92,7 +92,7 @@ The dots3.note checkpoint is **not yet publicly released**. The recipes on this 
 
 **Context length.** `--context-length 524288` is the model's window. Like other SGLang models, it bounds the longest accepted request; it does not size the KV pool.
 
-**Language-only mode.** Add `--language-only` to skip constructing the vision and audio towers entirely — the freed memory goes to the language model. This is also the language role of an encoder/LLM-disaggregated (EPD) deployment; see [EPD](#3-4-encoderllm-disaggregation-epd) below.
+**Language-only mode.** Add `--language-only` to skip constructing the vision and audio towers entirely — the freed memory goes to the language model. This is also the language role of an encoder/LLM-disaggregated (EPD) deployment; see [EPD](#epd-disaggregation) below.
 
 ## 3. Advanced Usage
 
