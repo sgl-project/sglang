@@ -2497,6 +2497,43 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     (1.0 / layer.g1_alphas).to(torch.float32),
                 )
 
+        if layer.moe_runner_config.is_gated and self.enable_flashinfer_cutlass_moe:
+            swiglu_alpha = layer.moe_runner_config.gemm1_alpha
+            swiglu_limit = (
+                layer.moe_runner_config.gemm1_clamp_limit
+                or layer.moe_runner_config.swiglu_limit
+            )
+            if swiglu_alpha is not None and swiglu_limit is None:
+                raise ValueError("gemm1_alpha requires gemm1_clamp_limit")
+            # Real-domain values (cutlass dequantizes before the activation); beta=1.0 only for the GPT-OSS-style +1 shift (gemm1_alpha set), else 0.0 for clamp-limit-only models.
+            if swiglu_alpha is not None or swiglu_limit is not None:
+                copy_or_rebind_param(
+                    layer,
+                    "swiglu_alpha",
+                    torch.full_like(
+                        layer.g1_alphas,
+                        swiglu_alpha if swiglu_alpha is not None else 1.0,
+                        dtype=torch.float32,
+                    ),
+                )
+                copy_or_rebind_param(
+                    layer,
+                    "swiglu_beta",
+                    torch.full_like(
+                        layer.g1_alphas,
+                        1.0 if swiglu_alpha is not None else 0.0,
+                        dtype=torch.float32,
+                    ),
+                )
+                if swiglu_limit is not None:
+                    copy_or_rebind_param(
+                        layer,
+                        "swiglu_limit",
+                        torch.full_like(
+                            layer.g1_alphas, swiglu_limit, dtype=torch.float32
+                        ),
+                    )
+
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         layer.dispatcher.set_quant_config(
             {
@@ -2869,6 +2906,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 moe_tp_size=layer.moe_tp_size,
                 moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=False,
+                swiglu_alpha=getattr(layer, "swiglu_alpha", None),
+                swiglu_beta=getattr(layer, "swiglu_beta", None),
+                swiglu_limit=getattr(layer, "swiglu_limit", None),
             )
             return self.runner.run(dispatch_output, quant_info)
 
