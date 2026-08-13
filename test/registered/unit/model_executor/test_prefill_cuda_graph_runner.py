@@ -61,6 +61,54 @@ class _FakeKVIndexKernel:
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
+    def test_low_free_memory_still_captures_prefill_graph(self):
+        eager_runner = object()
+        prefill_runner = object()
+        model_runner = SimpleNamespace(
+            device="cuda",
+            gpu_id=0,
+            is_draft_worker=False,
+            spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
+            server_args=SimpleNamespace(
+                enable_lora=False,
+                cuda_graph_config=SimpleNamespace(
+                    prefill=SimpleNamespace(bs=[1], backend=Backend.BREAKABLE)
+                ),
+            ),
+            model=SimpleNamespace(),
+            model_config=SimpleNamespace(context_len=8192, num_hidden_layers=1),
+            req_to_token_pool=SimpleNamespace(size=1),
+        )
+        language_model = SimpleNamespace(layers=[object()])
+
+        with (
+            patch.object(graph_setup, "check_cuda_graph_backend", return_value=False),
+            patch.object(
+                graph_setup, "resolve_language_model", return_value=language_model
+            ),
+            patch.object(
+                graph_setup,
+                "compute_attention_and_moe_layers",
+                return_value=([object()], [], [], [], []),
+            ),
+            patch.object(
+                graph_setup,
+                "get_available_gpu_memory",
+                side_effect=[3.99, 3.5],
+            ),
+            patch.object(
+                graph_setup,
+                "PrefillCudaGraphRunner",
+                return_value=prefill_runner,
+            ),
+        ):
+            capture = capture_prefill_graph(
+                model_runner=model_runner,
+                eager_runner=eager_runner,
+            )
+
+        self.assertIs(capture.runner, prefill_runner)
+
     def test_eagle_target_tc_piecewise_skips_last_mode_capture(self):
         eager_runner = object()
         model_runner = SimpleNamespace(
@@ -77,24 +125,25 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             "check_cuda_graph_backend",
             return_value=False,
         ):
-            runner = capture_prefill_graph(
+            capture = capture_prefill_graph(
                 model_runner=model_runner,
                 eager_runner=eager_runner,
             )
 
-        self.assertIs(runner, eager_runner)
+        self.assertIs(capture.runner, eager_runner)
 
     def test_prefix_chunk_capacity_is_aggregate_and_can_be_overridden(self):
         model_runner = SimpleNamespace(
             server_args=SimpleNamespace(
                 chunked_prefill_size=16,
-                context_length=None,
                 cuda_graph_config=SimpleNamespace(
                     prefill=SimpleNamespace(
                         full_prefill_prefix_chunk_tokens=None, max_bs=8
                     )
                 ),
             ),
+            # Wider than the token table, so the table is the binding limit.
+            model_config=SimpleNamespace(context_len=4096),
             req_to_token_pool=SimpleNamespace(
                 req_to_token=torch.empty((1, 32), dtype=torch.int32)
             ),
@@ -136,6 +185,17 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(
             PrefillCudaGraphRunner._resolve_prefix_chunk_shape(model_runner, 4),
             (1, 4),
+        )
+
+        # A context shorter than the token table binds instead: a draft runner
+        # capped at the target's context, or a short --context-length.
+        model_runner.model_config.context_len = 8
+        model_runner.server_args.cuda_graph_config.prefill.full_prefill_prefix_chunk_tokens = (
+            256
+        )
+        self.assertEqual(
+            PrefillCudaGraphRunner._resolve_prefix_chunk_shape(model_runner, 4),
+            (8, 32),
         )
 
         model_runner.server_args.cuda_graph_config.prefill.full_prefill_prefix_chunk_tokens = (
