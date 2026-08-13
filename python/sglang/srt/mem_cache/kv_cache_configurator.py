@@ -114,6 +114,26 @@ def _should_enable_lazy_compaction() -> bool:
     return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
 
 
+def mm_runtime_reservation_gb(
+    *, is_multimodal: bool, mm_feature_transport: Optional[str]
+) -> float:
+    """Multimodal GPU memory allocated only after the KV pool is sized
+    (mm embedding cache + GPU feature-transport pools); reserve it out of
+    the KV budget so it doesn't have to fit in the runtime slack."""
+    if not is_multimodal:
+        return 0.0
+    reserved_mb = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
+    if mm_feature_transport in ("cuda_ipc", "cuda_vmm"):
+        reserved_mb += envs.SGLANG_MM_FEATURE_CACHE_MB.get()
+    if reserved_mb > 0:
+        logger.info(
+            "Reserving %.2f GB of the KV budget for post-sizing multimodal "
+            "allocations (feature-transport pools + embedding cache).",
+            reserved_mb / 1024,
+        )
+    return reserved_mb / 1024
+
+
 # base ratio of mamba pool size to max_running_requests. Under
 # SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK the decode-time skip frees one resident slot
 # per running request, so the base drops by 1 (overlap 5->4, lazy 4->3). no_buffer
@@ -1767,7 +1787,11 @@ class KVCacheConfigurator:
                 )
                 / 1024,
             )
-        rest_memory = available_gpu_memory - slack_gb
+        mm_reservation_gb = mm_runtime_reservation_gb(
+            is_multimodal=self.model_config.is_multimodal,
+            mm_feature_transport=self.server_args.mm_feature_transport,
+        )
+        rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 

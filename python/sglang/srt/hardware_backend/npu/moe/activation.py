@@ -115,6 +115,39 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         return hidden_states, None
 
 
+class NPUSitu(BaseActivation):
+    """SiTU activation and optional INT8 requantization for grouped rows."""
+
+    def __init__(
+        self,
+        *,
+        need_quant: bool,
+        beta: float = 4.0,
+        linear_beta: Optional[float] = 25.0,
+    ):
+        from sgl_kernel_npu.activation.situ import situ
+
+        self.situ = situ
+        self.need_quant = need_quant
+        self.beta = float(beta)
+        self.linear_beta = None if linear_beta is None else float(linear_beta)
+
+    def _apply_activation(
+        self,
+        hidden_states: torch.Tensor,
+        group_list: torch.Tensor,
+        group_list_type: int,
+    ):
+        return self.situ(
+            hidden_states,
+            group_list,
+            group_list_type,
+            need_quant=self.need_quant,
+            beta=self.beta,
+            linear_beta=self.linear_beta,
+        )
+
+
 class NPUGeluAndMul(BaseActivation):
     def __init__(self):
         self._gelu = GeluAndMul()

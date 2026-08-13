@@ -348,6 +348,9 @@ class Envs:
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
     SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
+    SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
+    SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
+    SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
@@ -670,6 +673,13 @@ class Envs:
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
+    # Keep K3 shared experts and dense MLPs sharded over attention TP.
+    SGLANG_K3_SHARED_EXPERTS_ATTN_TP = EnvBool(False)
+    SGLANG_K3_DENSE_MLP_ATTN_TP = EnvBool(False)
+    # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
+    SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
+    )
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
@@ -708,9 +718,6 @@ class Envs:
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
-    # Unpacked cubin pool for the JIT-built trtllm-gen fused MoE (cubins + flat
-    # ABI headers + overlay/). Unset means the path is unavailable, not empty.
-    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
@@ -1046,7 +1053,7 @@ class Envs:
 
     # Numa
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
-    SGLANG_AUTO_NUMA_BIND = EnvBool(False)
+    SGLANG_AUTO_NUMA_BIND = EnvBool(True)
     SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
 
     # Metrics
@@ -1313,12 +1320,6 @@ class Envs:
 
     # ====================================================================
     # Kimi-K3
-
-    # TRT-LLM-gen fused MoE (SiTU) via sglang JIT: path to an unpacked SiTU
-    # cubin pool (cubins + flat ABI headers + overlay/; distributed as a
-    # single downloadable archive). Needs the public flashinfer package
-    # installed for the unmodified JIT sources. Unset = feature off.
-    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
 
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
     # small messages and in-place NVLS 2shot on symmetric-memory tensors for
