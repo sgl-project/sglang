@@ -109,6 +109,7 @@ A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP 
 | `SGLANG_PRECISION_HF_REPO` | _(required)_ | HuggingFace dataset repo for cross-runner baseline storage |
 | `SGLANG_PRECISION_HF_REVISION` | `main` | Branch/revision of the HF dataset |
 | `SGLANG_PRECISION_HF_TOKEN` | _(required in CI)_ | HuggingFace token with write access to the dataset. Kept off `HF_TOKEN`, which already carries the runner's gated-model read token |
+| `SGLANG_PRECISION_HF_READ_ONLY` | `0` | Set to `1` to fetch and compare without updating the shared baseline store |
 
 ---
 
@@ -136,6 +137,8 @@ Key CI configuration:
 ```
 
 `SGLANG_PRECISION_HF_TOKEN` rather than `HF_TOKEN`: the latter already carries the runner's gated-model read token, and overwriting it would turn every gated model on the job into a 401.
+
+Standalone `/rerun-test` runs set `SGLANG_PRECISION_HF_READ_ONLY=1` and receive no baseline-store write token. They fetch the same repository baseline as nightly without changing shared state.
 
 ### Required GitHub secrets/variables
 

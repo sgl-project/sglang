@@ -68,9 +68,9 @@ env:
   HF_HUB_ETAG_TIMEOUT: 300
   SGLANG_JIT_KERNEL_RUN_FULL_TESTS: ${{ inputs.full_jit_kernel_tests && '1' || '0' }}
   IS_H200: ${{ inputs.runs_on == '8-gpu-h200' && '1' || '0' }}
-  # SGLANG_PRECISION_* stays out: that test pushes to the shared baseline on
-  # every run, so a rerun holding the write token could become everyone's next
-  # comparison baseline. Without the repo var it fails fast instead.
+  SGLANG_PRECISION_HF_REPO: ${{ vars.SGLANG_PRECISION_HF_REPO }}
+  SGLANG_PRECISION_HF_REVISION: ${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}
+  SGLANG_PRECISION_HF_READ_ONLY: "1"
 
 permissions:
   actions: write

@@ -40,6 +40,7 @@ def _store_token() -> Optional[str]:
 class HfStoreConfig:
     repo: str
     revision: str = "main"
+    read_only: bool = False
 
     @classmethod
     def from_env(cls) -> HfStoreConfig:
@@ -51,7 +52,8 @@ class HfStoreConfig:
                 "and SGLANG_PRECISION_HF_TOKEN."
             )
         revision = os.environ.get("SGLANG_PRECISION_HF_REVISION", "main")
-        return cls(repo=repo, revision=revision)
+        read_only = os.environ.get("SGLANG_PRECISION_HF_READ_ONLY", "0") == "1"
+        return cls(repo=repo, revision=revision, read_only=read_only)
 
 
 def _sanitize_model_name(model: str) -> str:
@@ -228,6 +230,9 @@ def push_run(
     comparator_report: Optional[Path] = None,
     force: bool = False,
 ) -> str:
+    if config.read_only:
+        raise PermissionError("precision baseline store is read-only")
+
     # Dedup: same model+date+sha → skip tensor upload but still refresh meta
     # + comparator_report + append a new manifest row, so pass-1 baseline and
     # pass-2 stats both land. force=True re-uploads tensors too.

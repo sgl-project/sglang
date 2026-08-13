@@ -62,6 +62,18 @@ class TestHfStoreConfig(CustomTestCase):
             cfg = hfs.HfStoreConfig.from_env()
         self.assertEqual(cfg.revision, "dev")
 
+    def test_from_env_reads_read_only_mode(self):
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_PRECISION_HF_REPO": "my/repo",
+                "SGLANG_PRECISION_HF_READ_ONLY": "1",
+            },
+            clear=False,
+        ):
+            cfg = hfs.HfStoreConfig.from_env()
+        self.assertTrue(cfg.read_only)
+
     def test_from_env_raises_when_missing(self):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(RuntimeError):
@@ -347,6 +359,19 @@ class TestPushRun(CustomTestCase):
     """push_run deletes its temp manifest file in a finally block, so tests
     that inspect the manifest content must capture it via a side_effect on
     the mock upload_file *before* push_run cleans up."""
+
+    def test_read_only_store_rejects_push_before_api_access(self):
+        config = hfs.HfStoreConfig(repo="test/repo", read_only=True)
+        with tempfile.TemporaryDirectory() as td, patch.object(hfs, "HfApi") as api:
+            with self.assertRaisesRegex(PermissionError, "read-only"):
+                hfs.push_run(
+                    config=config,
+                    model="org/model",
+                    sglang_commit="abc1234",
+                    today_tensors_dir=Path(td),
+                    meta={},
+                )
+        api.assert_not_called()
 
     @staticmethod
     def _make_push_mocks(mock_manifest, mock_api_cls):

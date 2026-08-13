@@ -11,6 +11,7 @@ Env knobs:
                                   baseline storage; see precision_baseline_store
   SGLANG_PRECISION_HF_TOKEN       write token for that repo (not HF_TOKEN, which
                                   carries the runner's gated-model read token)
+  SGLANG_PRECISION_HF_READ_ONLY=1 fetch and compare without updating the store
 """
 
 from __future__ import annotations
@@ -514,6 +515,10 @@ def _maybe_hf_push(
     comparator_report: Optional[Path] = None,
     comparator_stats: Optional[dict[str, Any]] = None,
 ) -> None:
+    if hf_cfg.read_only:
+        print(f"[hf-store] read-only; not pushing {model}", flush=True)
+        return
+
     # Under CI a push failure raises rather than warns, so a misconfigured
     # store can't quietly mask the regression-detection guarantee.
     pt_files = list(tensors_dir.glob("*.pt"))
