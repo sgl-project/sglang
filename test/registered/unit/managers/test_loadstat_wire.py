@@ -274,6 +274,22 @@ class TestLoadPublisherGating(CustomTestCase):
         pub.publish_load_stat(provider, force=True)
         provider.assert_not_called()
 
+    def test_caller_supplied_snapshot_bypasses_the_provider(self):
+        # The scheduler hands in the snapshot it already computed for the
+        # DP-balancing sink; the provider is the fallback for cycles where
+        # that sink was throttled — it must not run when a snapshot is given.
+        pub, _ = self._build()
+        provider = MagicMock()
+        snap = SimpleNamespace(
+            num_running_reqs=1,
+            num_waiting_reqs=2,
+            num_used_tokens=3,
+            max_total_num_tokens=4,
+        )
+        pub.publish_load_stat(provider, force=True, snapshot=snap)
+        provider.assert_not_called()
+        self.assertEqual(pub._socket.send_multipart.call_count, 1)
+
     def test_publish_frames_are_topic_seq_payload(self):
         # Three frames, matching the KV-event socket's layout so one
         # subscriber loop handles both.

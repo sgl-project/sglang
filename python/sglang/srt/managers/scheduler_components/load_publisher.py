@@ -230,7 +230,10 @@ class SchedulerLoadPublisher:
         return self._socket is not None
 
     def publish_load_stat(
-        self, load_provider: Callable[[], LoadSnapshot], force: bool = False
+        self,
+        load_provider: Callable[[], LoadSnapshot],
+        force: bool = False,
+        snapshot: Optional[LoadSnapshot] = None,
     ) -> None:
         """Publish a load snapshot, throttled to [`LOAD_PUBLISH_INTERVAL`]
         calls unless `force`; an unchanged stat is re-sent at most once per
@@ -240,9 +243,11 @@ class SchedulerLoadPublisher:
         `load_provider` returns a live [`LoadSnapshot`] read directly from
         scheduler state (`SchedulerLoadInquirer.get_loads`) — used instead of
         metrics stats, whose values are only populated under
-        `--enable-metrics`. Invoked only after the counter throttle passes
-        (on the hot forced paths the scheduler hands in a snapshot it
-        already computed for the DP-balancing sink, so this is cheap).
+        `--enable-metrics`. Invoked only after the counter throttle passes,
+        and not at all when the caller passes `snapshot` — a [`LoadSnapshot`]
+        it already computed for another sink this same cycle (the
+        DP-balancing writer), so the queues are never walked twice and a
+        disabled publisher costs the caller nothing but this call.
 
         Best-effort: a failure here must never crash the scheduler loop —
         routers fall back to their own in-flight counter. Failures re-warn
@@ -256,7 +261,7 @@ class SchedulerLoadPublisher:
             return
 
         try:
-            load = load_provider()
+            load = snapshot if snapshot is not None else load_provider()
             counts = (
                 load.num_running_reqs,
                 load.num_waiting_reqs,

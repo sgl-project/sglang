@@ -3941,12 +3941,9 @@ class Scheduler(
         # publisher just computed instead of walking the queues a second
         # time, and dedups unchanged gauges internally.
         self.load_publisher.publish_load_stat(
-            (
-                (lambda: snapshot)
-                if snapshot is not None
-                else self.load_inquirer.get_loads
-            ),
+            self.load_inquirer.get_loads,
             force=batch.forward_mode.is_extend(),
+            snapshot=snapshot,
         )
 
         if batch.forward_mode.is_decode():
@@ -4104,12 +4101,7 @@ class Scheduler(
         # a spinning idle loop costs one send per heartbeat. The snapshot
         # is shared with the write above.
         self.load_publisher.publish_load_stat(
-            (
-                (lambda: snapshot)
-                if snapshot is not None
-                else self.load_inquirer.get_loads
-            ),
-            force=True,
+            self.load_inquirer.get_loads, force=True, snapshot=snapshot
         )
 
         # sleep until next event
