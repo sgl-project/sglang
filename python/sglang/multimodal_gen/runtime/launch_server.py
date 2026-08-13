@@ -616,9 +616,7 @@ def launch_disagg_server(server_args: ServerArgs):
     )
 
     denoiser_options = (
-        {"denoiser_capacity_per_worker": 1}
-        if glm_distributed_mode_enabled
-        else {}
+        {"denoiser_capacity_per_worker": 1} if glm_distributed_mode_enabled else {}
     )
     diffusion_server = DiffusionServer(
         frontend_endpoint=frontend_endpoint,

@@ -74,9 +74,7 @@ class _GlmDistributedModeState:
     pending_denoiser_requests: deque[_GlmDistributedRequest] = field(
         default_factory=deque
     )
-    denoiser_requests: dict[str, _GlmDistributedRequest] = field(
-        default_factory=dict
-    )
+    denoiser_requests: dict[str, _GlmDistributedRequest] = field(default_factory=dict)
     active_ar_batch: tuple[Future, list[_GlmDistributedRequest]] | None = None
 
 
@@ -170,9 +168,7 @@ class DiffusionServer:
 
         # FreeBufferSlots per instance
         self._encoder_free_slots = [encoder_capacity] * self._num_encoders
-        self._denoiser_free_slots = [
-            denoiser_capacity_per_worker
-        ] * self._num_denoisers
+        self._denoiser_free_slots = [denoiser_capacity_per_worker] * self._num_denoisers
         self._decoder_free_slots = [decoder_capacity] * self._num_decoders
 
         # TTA queues per role type
@@ -193,9 +189,7 @@ class DiffusionServer:
             )
             self._glm_distributed_state = _GlmDistributedModeState(
                 server_args=server_args,
-                ar_stage=GlmImageAR(
-                    processor=processor, vision_language_encoder=None
-                ),
+                ar_stage=GlmImageAR(processor=processor, vision_language_encoder=None),
                 executor=ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="glm-distributed-ar"
                 ),
@@ -1411,9 +1405,7 @@ class DiffusionServer:
                 {
                     "glm_ar_queue_depth": len(state.pending_ar_requests),
                     "glm_ar_in_flight": state.active_ar_batch is not None,
-                    "glm_denoiser_queue_depth": len(
-                        state.pending_denoiser_requests
-                    ),
+                    "glm_denoiser_queue_depth": len(state.pending_denoiser_requests),
                     "glm_denoiser_worker_available": list(
                         state.denoiser_worker_available
                     ),
