@@ -9,6 +9,7 @@ Both use the split-dim pattern: D_V processed in NUM_GROUPS chunks of 128
 for native CDNA4 fp8 MFMA tile alignment.
 """
 
+import contextlib
 import functools
 
 import torch
@@ -17,10 +18,56 @@ import triton.language as tl
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
+_ASYNC_COPY_OFF_ARCHES = frozenset({"gfx950"})
 _IS_FNUZ = is_fp8_fnuz()
 _FP8_MAX = 240.0 if _IS_FNUZ else 448.0
 _LOG2E = 1.4426950408889634
 _G = tl.constexpr(128)
+
+
+@functools.lru_cache(maxsize=None)
+def _async_copy_is_harmful_on_device(device: int) -> bool:
+    properties = torch.cuda.get_device_properties(device)
+    arch = getattr(properties, "gcnArchName", "") or ""
+    return arch.split(":", 1)[0] in _ASYNC_COPY_OFF_ARCHES
+
+
+def _async_copy_is_harmful() -> bool:
+    try:
+        from triton import knobs
+    except ImportError:
+        return False
+
+    amd_knobs = getattr(knobs, "amd", None)
+    if not hasattr(amd_knobs, "use_async_copy"):
+        return False
+
+    # An explicit TRITON_HIP_USE_ASYNC_COPY setting takes precedence.
+    if amd_knobs.use_async_copy is not None:
+        return False
+    if not torch.cuda.is_available():
+        return False
+
+    return _async_copy_is_harmful_on_device(torch.cuda.current_device())
+
+
+@contextlib.contextmanager
+def _no_async_copy():
+    """Compile enclosed DSA launches without direct-to-LDS async copies.
+
+    Triton compiles lazily and per specialization, so the scope must cover every
+    launch. The knob is part of Triton's disk cache key; kernels compiled
+    elsewhere retain the backend default.
+    """
+    if not _async_copy_is_harmful():
+        yield
+        return
+
+    from triton import knobs
+
+    with knobs.amd.scope():
+        knobs.amd.use_async_copy = False
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +131,7 @@ def _prune_configs(configs, named_args, **kwargs):
 _SPLIT_DIM_CONFIGS = [
     triton.Config({"BLOCK_N": bn}, num_warps=w, num_stages=ns)
     for bn in (32, 64)
-    for w in (2, 4)
+    for w in (1, 2, 4)
     for ns in (1, 2)
 ]
 
@@ -234,6 +281,7 @@ def _sparse_mla_fwd_split_dim_kernel(
         )
 
 
+@_no_async_copy()
 def _triton_sparse_mla_fwd_single(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
