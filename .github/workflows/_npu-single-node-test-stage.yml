@@ -317,6 +317,14 @@ jobs:
 
           echo "Running test: ${tc_name}"
           test_exit_code=0
+
+          # --- DIAGNOSTIC: surface the exact failure point (temporary) ---
+          echo "--- DEBUG pwd: $(pwd)"
+          echo "--- DEBUG ls -la:"; ls -la
+          echo "--- DEBUG test/ exists?"; ls -ld test 2>&1 || echo "--- DEBUG: test/ NOT FOUND in $(pwd)"
+          echo "--- DEBUG PYTHON_FOR_SGLANG=${PYTHON_FOR_SGLANG} ($(command -v ${PYTHON_FOR_SGLANG} 2>&1))"
+          # --- END DIAGNOSTIC ---
+
           cd test
 
           # Append `--nightly` and `--continue-on-error` arguments when the job belongs to the nightly pipeline.
