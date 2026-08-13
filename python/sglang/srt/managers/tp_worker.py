@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
+    ForwardMode,
     PPProxyTensors,
 )
 from sglang.srt.model_executor.graph_memory_usage import (
@@ -656,6 +657,88 @@ class TpModelWorker(BaseTpWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
+
+    def forward_batch_generation_split_prefill_init(
+        self,
+        batch: ScheduleBatch,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+    ) -> ForwardBatch:
+        """Initialize a ForwardBatch for layer-pipelined split prefill."""
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.model_runner,
+            capture_hidden_mode=capture_hidden_mode,
+            return_hidden_states_before_norm=False,
+        )
+        forward_batch.forward_mode = ForwardMode.SPLIT_PREFILL
+        forward_batch.split_index = 0
+        return forward_batch
+
+    def forward_batch_generation_split_prefill(
+        self,
+        forward_batch: ForwardBatch,
+        forward_count: int = 1,
+    ) -> tuple:
+        """Run one split-prefill layer group and return its ready event."""
+        out = self.model_runner.forward(
+            forward_batch,
+            reinit_attn_backend=(forward_batch.split_index == 0),
+            split_forward_count=forward_count,
+        )
+        event = torch.cuda.Event()
+        event.record()
+        return out.logits_output, event
+
+    def forward_batch_generation_split_prefill_finalize(
+        self,
+        batch: ScheduleBatch,
+        logits_output,
+        forward_batch: ForwardBatch,
+        defer_sample: bool = False,
+        on_publish=None,
+    ) -> GenerationBatchResult:
+        """Finalize layer-pipelined split prefill and sample next tokens."""
+        if batch.return_logprob:
+            extend_input_len_per_req = [
+                req.extend_range.length if req.extend_range is not None else 0
+                for req in batch.reqs
+            ]
+            extend_logprob_start_len_per_req = batch.extend_logprob_start_lens
+        else:
+            extend_input_len_per_req = None
+            extend_logprob_start_len_per_req = None
+
+        result = GenerationBatchResult(
+            logits_output=logits_output,
+            extend_input_len_per_req=extend_input_len_per_req,
+            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+            can_run_cuda_graph=False,
+        )
+        if not forward_batch.is_prefill_only:
+
+            def sample_batch():
+                result.next_token_ids = self.model_runner.sample(
+                    logits_output, forward_batch
+                )
+                return result
+
+            if defer_sample and forward_batch.sampling_info.grammars is not None:
+                result.delay_sample_func = sample_batch
+            else:
+                sample_batch()
+        else:
+            result.next_token_ids = torch.zeros(
+                len(forward_batch.seq_lens),
+                dtype=torch.long,
+                device=forward_batch.input_ids.device,
+            )
+            if (
+                forward_batch.return_logprob
+                and logits_output.next_token_logits is not None
+            ):
+                self.model_runner.compute_logprobs_only(logits_output, forward_batch)
+
+        return result
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
         if batch.split_index == 0:

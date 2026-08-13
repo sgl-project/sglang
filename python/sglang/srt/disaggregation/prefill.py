@@ -742,7 +742,12 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor.add_sampling_mask_return_values(
                         i, req, logits_output
                     )
-                if not req.pending_bootstrap:
+                if not req.pending_bootstrap and not (
+                    self.layer_pipelined_kv_transfer
+                    and self.layer_pipelined_kv_transfer.finalize_pipelined_transfer(
+                        req
+                    )
+                ):
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 

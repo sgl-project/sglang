@@ -421,6 +421,13 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
+    # Layer-pipelined KV transfer: overlap transfer with prefill compute.
+    SGLANG_ENABLE_PIPELINED_KV_TRANSFER = EnvBool(False)
+    SGLANG_PIPELINE_GROUP_SIZE = EnvInt(0)
+    SGLANG_PIPELINE_MIN_TOKENS = EnvInt(3072)
+    SGLANG_PIPELINE_SAT_MULTIPLIER = EnvFloat(3.0)
+    SGLANG_PIPELINE_MAX_ITERS = EnvInt(10)
+    SGLANG_PIPELINE_MIN_ITERS = EnvInt(4)
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.

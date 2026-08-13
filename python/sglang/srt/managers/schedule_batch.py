@@ -1120,6 +1120,10 @@ class Req(ReqDllmMixin):
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
+        # State owned by the layer-pipelined prefill transfer adapter.
+        self.ready_for_pipelined_transfer_finalize = False
+        self.non_pipelined_state_indices: Optional[List] = None
+
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
 

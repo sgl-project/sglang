@@ -1298,11 +1298,19 @@ class ModelRunner:
         forward path needs — the cuda-graph path does the equivalent inside the
         runner's capture/replay, so this is skipped there.
         """
-        # For MLP sync
-        if forward_batch.global_num_tokens_cpu is not None:
-            forward_batch.prepare_mlp_sync_batch(self)
-        else:
-            forward_batch.prepare_attn_tp_scatter_input(self)
+        # Split prefill reuses one ForwardBatch across layer groups. DP padding and
+        # attn-TP token-count normalization mutate that batch and must run only once.
+        is_split_prefill_continuation = (
+            forward_batch.forward_mode.is_split_prefill()
+            and forward_batch.split_index > 0
+        )
+
+        if not is_split_prefill_continuation:
+            # For MLP sync
+            if forward_batch.global_num_tokens_cpu is not None:
+                forward_batch.prepare_mlp_sync_batch(self)
+            else:
+                forward_batch.prepare_attn_tp_scatter_input(self)
 
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         # The skip is scoped to DSACPLayerCommunicator-style CP (DSA, MLA): those
@@ -1311,7 +1319,8 @@ class ModelRunner:
         # (Qwen3/Qwen2 MoE) keeps the attn_tp-replicated layout and wants the
         # adjustment to run — see docs/design/prefill-cp-mla.md §Phase 5.
         if (
-            forward_batch.num_token_non_padded is not None
+            not is_split_prefill_continuation
+            and forward_batch.num_token_non_padded is not None
             and forward_batch.global_num_tokens_gpu is not None
             and require_gathered_buffer(self.server_args)
             and not is_dsa_enable_prefill_cp()
@@ -1615,9 +1624,14 @@ class ModelRunner:
                     forward_batch, pp_proxy_tensors=pp_proxy_tensors
                 )
 
+            should_postprocess_mlp_sync = (
+                not forward_batch.forward_mode.is_split_prefill()
+                or forward_batch.split_index == self.model_config.num_hidden_layers
+            )
             if (
                 forward_batch.global_num_tokens_cpu is not None
                 and self.pp_group.is_last_rank
+                and should_postprocess_mlp_sync
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
 

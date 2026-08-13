@@ -73,6 +73,9 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.pipelined_kv_transfer import (
+    LayerPipelinedKVTransferAdapter,
+)
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -598,6 +601,7 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+        self.maybe_init_layer_pipelined_kv_transfer()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1407,6 +1411,26 @@ class Scheduler(
                 tp_group=self.tp_group,
                 scheduler=self,
             )
+
+    def maybe_init_layer_pipelined_kv_transfer(self) -> None:
+        self.layer_pipelined_kv_transfer = None
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return
+
+        self.layer_pipelined_kv_transfer = LayerPipelinedKVTransferAdapter(
+            server_args=self.server_args,
+            ps=self.ps,
+            model_config=self.model_config,
+            tp_worker=self.tp_worker,
+            model_worker=self.model_worker,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            kv_manager=self.disagg_prefill_bootstrap_queue.kv_manager,
+            metadata_buffers=self.disagg_metadata_buffers,
+            transfer_backend=self.transfer_backend,
+            sliding_window_size=self.sliding_window_size,
+            enable_staging=self.enable_staging,
+        )
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
@@ -3553,6 +3577,12 @@ class Scheduler(
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req)
 
+        layer_pipelined_plan = (
+            self.layer_pipelined_kv_transfer.plan_batch(batch)
+            if self.is_generation and self.layer_pipelined_kv_transfer is not None
+            else None
+        )
+
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
@@ -3591,9 +3621,17 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
-                        )
+                        if layer_pipelined_plan is not None:
+                            batch_result = self.layer_pipelined_kv_transfer.run_batch(
+                                batch,
+                                layer_pipelined_plan,
+                                defer_sample=True,
+                                on_publish=fwd_kwargs.get("on_publish"),
+                            )
+                        else:
+                            batch_result = self.model_worker.forward_batch_generation(
+                                batch, **fwd_kwargs
+                            )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -3660,7 +3698,12 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    if layer_pipelined_plan is not None:
+                        batch_result = self.layer_pipelined_kv_transfer.run_batch(
+                            batch, layer_pipelined_plan
+                        )
+                    else:
+                        batch_result = self.model_worker.forward_batch_generation(batch)
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3684,9 +3727,14 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch, **kwargs
-                )
+                if layer_pipelined_plan is not None:
+                    batch_result = self.layer_pipelined_kv_transfer.run_batch(
+                        batch, layer_pipelined_plan
+                    )
+                else:
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **kwargs
+                    )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
