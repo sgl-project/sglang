@@ -240,9 +240,7 @@ class SWAComponent(TreeComponent):
         aligned_seqlen = (
             result.full_kv_hit_length // self.tree_core.page_size
         ) * self.tree_core.page_size
-        branching_seqlen = (
-            aligned_seqlen if aligned_seqlen > swa_boundary_len else None
-        )
+        branching_seqlen = aligned_seqlen if aligned_seqlen > swa_boundary_len else None
 
         n_swa = 0
         swa_host_hit = 0

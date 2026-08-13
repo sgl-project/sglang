@@ -3776,9 +3776,7 @@ class UnifiedRadixCacheSuite:
         rematch = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
         )
-        self.assertEqual(
-            len(rematch.device_indices), result.swa_branching_seqlen
-        )
+        self.assertEqual(len(rematch.device_indices), result.swa_branching_seqlen)
         self.assertIsNone(rematch.swa_branching_seqlen)
 
     def test_swa_branching_seqlen_uses_host_full_hit(self):
