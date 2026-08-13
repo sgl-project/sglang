@@ -186,7 +186,6 @@ jobs:
     with:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
       run_all_tests: true
-      branch_label: ${{ needs.cut-release-branch.outputs.branch_name }}
     secrets: inherit
 
   run-pr-tests-xeon:

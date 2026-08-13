@@ -79,8 +79,8 @@ jobs:
       - name: Set image config
         id: set-vars
         env:
-          # Pass untrusted PR metadata via env vars so it is never interpolated
-          # into the shell script (prevents script injection from fork branch names)
+          # Pass untrusted PR metadata through environment variables to avoid shell‑script interpolation,
+          # mitigating script injection risks from fork branch names.
           HEAD_LABEL: ${{ github.event.pull_request.head.label }}
         run: |
           if [ -z "${{ inputs.ref }}" ]; then
@@ -108,28 +108,20 @@ jobs:
           else
             echo "skip_install_flag=${{ inputs.skip_install_flag }}" >> $GITHUB_OUTPUT
           fi
-          # branch_label identifies the run origin; PR head label > ref name.
-          # Only keep safe characters for use as a filesystem path segment.
+          # Run-origin label: PR head label first, else ref name; sanitized into a safe path segment.
           BRANCH_LABEL="$HEAD_LABEL"
           if [ -z "${BRANCH_LABEL}" ]; then
             BRANCH_LABEL="${{ github.ref_name }}"
           fi
           BRANCH_LABEL="$(echo "${BRANCH_LABEL}" | tr -cd 'a-zA-Z0-9._/:' | tr '/:' '--')"
-          # Combine the four run-metadata fields (branch_label / workflow_name /
-          # create_date / timestamp) into one JSON for the reusable test templates
-          # (which now accept a single run_start_metadata input). create_date/timestamp are
-          # recorded ONCE at workflow start and shared by all jobs of this run, so a
-          # task spanning midnight still uses the run creation date.
+          # Package run metadata (branch/workflow/date/time) as a single JSON for reuse by all test
+          # jobs; date/time use UTC+8 recorded once at run start, shared even across midnight.
           echo "run_start_metadata=$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_date':sys.argv[3],'timestamp':sys.argv[4]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "$(date -u -d '+8 hours' +%Y%m%d)" "$(date -u -d '+8 hours' +%H%M%S)")" >> $GITHUB_OUTPUT
   
   nightly-mix-single-node-a2-tests:
     name: single-node-mix-a2
     if: ${{ !cancelled() }}
     needs: [set-image-config]
-    # Single suite job (no perf/accuracy split) that runs all a2-registered
-    # cases via run_suite.py --nightly --continue-on-error. test_type is set to
-    # 'perf' only for output-directory grouping; each test case reports its own
-    # real type in its per-case metrics.json.
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a2-4
@@ -190,8 +182,7 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  # The acc-2 suite is split across 3 parallel partition jobs via the single
-  # `partitions` input; the template expands one matrix job per partition id.
+  # The acc-2 suite is split across 3 parallel partition jobs via the single `partitions` input.
   nightly-acc-2-npu-a3:
     name: nightly-acc-2-npu-a3
     if: ${{ !cancelled() }}
@@ -325,6 +316,7 @@ jobs:
       prefill_decode_deployment: 'mix'
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+  
   check-all-jobs:
     if: ${{ !cancelled() }}
     needs:
