@@ -225,9 +225,7 @@ if _use_aiter:
     pass
 
 if _is_cuda:
-    from sglang.kernels.ops.gemm.dsv3_router_gemm import (
-        dsv3_router_gemm as dsv3_router_gemm,
-    )
+    from sglang.kernels.ops.gemm.tiny_gemm import can_use_tiny_gemm, tiny_gemm_bf16
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
@@ -456,6 +454,20 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
+def _tiny_router_gemm_max_tokens(
+    *, num_experts: int, hidden_size: int, weight_dtype: torch.dtype
+) -> int:
+    """Rows up to which the tiny GEMM beats cuBLAS for the router, 0 when the
+    shape or the device rules it out. Doubles as the kernel's compile-time
+    max_m, so keep it as tight as the measurements allow.
+    """
+    if not _is_cuda or _device_sm < 90 or weight_dtype != torch.bfloat16:
+        return -1
+    if not can_use_tiny_gemm(num_experts, hidden_size, max_m=16):
+        return -1
+    return 16
+
+
 class MoEGate(nn.Module):
     def __init__(
         self,
@@ -494,6 +506,11 @@ class MoEGate(nn.Module):
         self.use_dsa = is_deepseek_dsa(config)
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
+        self.tiny_router_gemm_max_tokens = _tiny_router_gemm_max_tokens(
+            num_experts=config.n_routed_experts,
+            hidden_size=config.hidden_size,
+            weight_dtype=self.weight.dtype,
+        )
 
     def forward(
         self,
@@ -526,17 +543,12 @@ class MoEGate(nn.Module):
                 return linear_bf16_fp32(hidden_states, self.weight)
             return F.linear(hidden_states, self.weight, None)
         else:
-            # NOTE(b8zhong): this threshold has been empirically verified
-            max_router_gemm_tokens = 4 if _device_sm in (100, 103) else 16
-            if (
-                _is_cuda
-                and hidden_states.shape[0] <= max_router_gemm_tokens
-                and hidden_states.shape[1] % 1024 == 0
-                and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
-                and _device_sm >= 90
-            ):
-                logits = dsv3_router_gemm(
-                    hidden_states, self.weight, out_dtype=torch.float32
+            if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
+                logits = tiny_gemm_bf16(
+                    hidden_states,
+                    self.weight,
+                    out_dtype=torch.float32,
+                    max_m=self.tiny_router_gemm_max_tokens,
                 )
 
             elif _use_aiter:
