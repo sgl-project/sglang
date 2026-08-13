@@ -1690,7 +1690,9 @@ class Scheduler(
             return None
 
         raw_mm_inputs = recv_req.mm_inputs
-        items = getattr(raw_mm_inputs, "mm_items", None)
+        if raw_mm_inputs is None:
+            return None
+        items = raw_mm_inputs.mm_items
         if not items:
             return None
 
@@ -2480,8 +2482,8 @@ class Scheduler(
     @staticmethod
     def _release_aborted_mm_inputs(req: Req) -> None:
         """Release request-owned MM resources once the scheduler drops it."""
-        mm_inputs = getattr(req, "multimodal_inputs", None)
-        if mm_inputs is not None and getattr(req, "session", None) is None:
+        mm_inputs = req.multimodal_inputs
+        if mm_inputs is not None and req.session is None:
             mm_inputs.release_features()
             req.multimodal_inputs = None
 

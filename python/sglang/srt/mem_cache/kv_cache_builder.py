@@ -5,7 +5,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -35,7 +35,10 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
-from sglang.srt.model_loader.utils import get_resolved_model_impl
+from sglang.srt.model_loader.utils import (
+    get_model_architecture,
+    get_resolved_model_impl,
+)
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -51,23 +54,27 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
-_KIMI_K3_MM_EMBEDDING_CACHE_SIZE_MB = 4096
+@runtime_checkable
+class MultimodalEmbeddingCacheConfigProvider(Protocol):
+    """Model-class contract for a non-reserving embedding-cache default."""
+
+    auto_mm_embedding_cache_size_mb: int
 
 
 def resolve_mm_embedding_cache_size_mb(model_config: ModelConfig) -> int:
     """Resolve the per-rank GPU embedding-cache cap.
 
-    Repeated-image Kimi-K3 workloads need more than the historical 100 MiB
-    default to avoid LRU thrashing.  The cache remains lazy: this value is a
-    cap, not a fixed HBM allocation.  An explicit environment value always
-    wins, including zero for deterministic or cache-off runs.
+    Models may declare a larger default than the historical 100 MiB to avoid
+    LRU thrashing. The cache remains lazy: this value is a cap, not a fixed HBM
+    allocation. An explicit environment value always wins, including zero for
+    deterministic or cache-off runs.
     """
     if envs.SGLANG_VLM_CACHE_SIZE_MB.is_set():
         return envs.SGLANG_VLM_CACHE_SIZE_MB.get()
 
-    architectures = getattr(model_config.hf_config, "architectures", None) or ()
-    if "KimiK3ForConditionalGeneration" in architectures:
-        return _KIMI_K3_MM_EMBEDDING_CACHE_SIZE_MB
+    model_class, _ = get_model_architecture(model_config)
+    if isinstance(model_class, MultimodalEmbeddingCacheConfigProvider):
+        return model_class.auto_mm_embedding_cache_size_mb
     return envs.SGLANG_VLM_CACHE_SIZE_MB.get()
 
 

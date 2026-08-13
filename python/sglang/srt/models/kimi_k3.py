@@ -3088,6 +3088,7 @@ class KimiK3LinearForCausalLM(nn.Module):
 
 
 class KimiK3ForConditionalGeneration(nn.Module):
+    auto_mm_embedding_cache_size_mb = 4096
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 
     supports_cuda_vmm_feature_transport = True

@@ -323,6 +323,7 @@ def _build_mm_aux_data(mm_inputs, model_type=None):
     aux = {
         attr: _normalize_aux_value(mm_inputs.get(attr))
         for attr in video_meta_attrs_for(model_type)
+        if mm_inputs.get(attr) is not None
     }
     return aux
 

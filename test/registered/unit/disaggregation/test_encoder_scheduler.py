@@ -72,6 +72,7 @@ def test_scheduler_coalesces_concurrent_submissions():
     class FakeEncoder:
         def __init__(self):
             self.encode_dispatch_lock = asyncio.Lock()
+            self.mm_global_cache = None
             self.batches = []
 
         async def batch_encode(self, requests, _modality):

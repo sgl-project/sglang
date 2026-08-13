@@ -314,7 +314,7 @@ class TokenizerControlMixin:
     async def _flush_encoder_mm_caches(self: TokenizerManager) -> Optional[str]:
         import aiohttp
 
-        urls = list(dict.fromkeys(getattr(self.mm_receiver, "encode_urls", [])))
+        urls = list(dict.fromkeys(self.mm_receiver.encode_urls))
         if not urls:
             return None
         timeout = aiohttp.ClientTimeout(total=10.0)

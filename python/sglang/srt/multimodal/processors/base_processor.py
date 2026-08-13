@@ -191,6 +191,7 @@ class MultimodalSpecialTokens:
 
 class BaseMultimodalProcessor(ABC):
     models = []
+    _preprocess_metrics_callback = None
     gpu_image_decode = True  # Enable GPU decoding by default
     prefer_tokenized_input = False
     precompute_hash_before_cpu_transfer = False
