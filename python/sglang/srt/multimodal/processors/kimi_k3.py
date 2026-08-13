@@ -290,6 +290,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     precompute_hash_before_cpu_transfer = True
     auto_mm_processor_worker_num = 2
     auto_mm_io_worker_num = 16
+    auto_mm_preprocess_cache_size_mb = 256
     supports_mm_processor_concurrency = True
     preserve_processor_input_ids = True
 
