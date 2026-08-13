@@ -300,6 +300,8 @@ jobs:
 
       - name: Build and push AMD64 image
         id: build
+        env:
+          IMAGE_TAGS: ${{ steps.image-tag.outputs.image-tags }}
         run: |
           set -euo pipefail
           VERSION_ARG=""
@@ -307,6 +309,21 @@ jobs:
             VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
           fi
           mapfile -t METADATA_ARGS < /tmp/docker-metadata.args
+
+          # When a zstd re-export will follow, export a full (mode=max) registry
+          # build cache so the zstd step can re-use these freshly built layers
+          # instead of recompiling from scratch. The heavy intermediate stages
+          # (torch_deps/framework/deepep) reach the final image via COPY --from,
+          # so mode=max is required to cache them; mode=min/inline would not.
+          # The cache ref is keyed to the resolved primary tag (unique per
+          # variant+cuda+run) to avoid collisions across concurrent matrix jobs.
+          CACHE_ARGS=()
+          if printf '%s' "${IMAGE_FORMATS}" | tr ',' '\n' | grep -qx "zstd"; then
+            PRIMARY_TAG=$(printf '%s\n' "${IMAGE_TAGS}" | grep -v '^[[:space:]]*$' | head -1 | tr -d '[:space:]')
+            CACHE_REF="${IMAGE_REPO}:buildcache-${PRIMARY_TAG}"
+            echo "cache-ref=${CACHE_REF}" >> "$GITHUB_OUTPUT"
+            CACHE_ARGS+=(--cache-to "type=registry,ref=${CACHE_REF},mode=max,image-manifest=true,oci-mediatypes=true")
+          fi
 
           docker buildx build \
             --target ${{ inputs.docker_target }} \
@@ -320,6 +337,7 @@ jobs:
             "${METADATA_ARGS[@]}" \
             ${VERSION_ARG} \
             ${{ inputs.extra_build_args }} \
+            "${CACHE_ARGS[@]}" \
             --metadata-file /tmp/metadata.json \
             --no-cache \
             .
@@ -407,10 +425,13 @@ jobs:
               python3 -m pytest -q test/registered/unit/test_model_overrides.py -k deepseek_spec_moe_resolution
             '
 
-      # --- zstd format: re-export the just-built (cached) layers with zstd
-      # compression, then reuse the same provenance/runtime verification. This
-      # is a cache hit (no --no-cache), so the config is identical to base and
-      # only layer compression changes.
+      # --- zstd format: re-export the just-built layers with zstd compression,
+      # then reuse the same provenance/runtime verification. It pulls the
+      # mode=max registry build cache written by the base step (--cache-from),
+      # so all intermediate stages are cache hits and only layer compression is
+      # redone. The config stays identical to base; only layer compression
+      # changes. (Without --cache-from the local BuildKit cache can be evicted
+      # between steps by the large image + verify pull, forcing a full rebuild.)
       - name: Build and push AMD64 zstd image
         id: build-zstd
         if: ${{ contains(inputs.image_formats, 'zstd') }}
@@ -421,6 +442,11 @@ jobs:
             VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
           fi
           mapfile -t METADATA_ARGS < /tmp/docker-metadata.args
+
+          CACHE_FROM_ARGS=()
+          if [ -n "${{ steps.build.outputs.cache-ref }}" ]; then
+            CACHE_FROM_ARGS+=(--cache-from "type=registry,ref=${{ steps.build.outputs.cache-ref }}")
+          fi
 
           docker buildx build \
             --target ${{ inputs.docker_target }} \
@@ -434,6 +460,7 @@ jobs:
             "${METADATA_ARGS[@]}" \
             ${VERSION_ARG} \
             ${{ inputs.extra_build_args }} \
+            "${CACHE_FROM_ARGS[@]}" \
             --metadata-file /tmp/metadata-zstd.json \
             .
 
