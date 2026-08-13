@@ -154,14 +154,15 @@ async fn generate(
     let stream = body.stream;
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form → the response is a JSON array.
-    let (mut payloads, is_batch) = match body.into_requests() {
-        Ok(v) => v,
-        // The error carries its own status (a bad batch is `Validation` → 400).
-        Err(e) => {
-            let code = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::BAD_REQUEST);
-            return pre_submit_error(code, &e.to_string(), stream);
-        }
-    };
+    let (mut payloads, is_batch) =
+        match body.into_requests(state.server_args.preferred_sampling_params.as_ref()) {
+            Ok(v) => v,
+            // The error carries its own status (a bad batch is `Validation` → 400).
+            Err(e) => {
+                let code = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::BAD_REQUEST);
+                return pre_submit_error(code, &e.to_string(), stream);
+            }
+        };
     // Media I/O (URL downloads, file reads) happens here, on the API runtime
     // — never on the MM worker pool (see `prefetch`).
     if let Err(e) = super::prefetch::prefetch_all(&mut payloads).await {

@@ -32,6 +32,7 @@ use std::fmt;
 use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use super::OneOrMany;
 use crate::error::Error;
@@ -219,20 +220,51 @@ pub struct SamplingParams {
     pub is_normalized: bool,
 }
 
+/// Request-side sampling fields before serde applies [`SamplingParams`] defaults.
+/// Keeping this raw map is what lets `--preferred-sampling-params` distinguish an
+/// omitted key from a present key whose value is `null`.
+pub(crate) type SamplingParamsMap = JsonMap<String, JsonValue>;
+
+/// Apply the same shallow merge as Python's `TokenizerManager`:
+/// `{**preferred, **request}`. Request keys win even when their value is `null`;
+/// nested values such as `custom_params` are replaced wholesale.
+pub(crate) fn merge_sampling_params(
+    preferred: Option<&JsonValue>,
+    request: SamplingParamsMap,
+) -> Result<SamplingParams, Error> {
+    let mut merged = match preferred {
+        None => SamplingParamsMap::new(),
+        Some(JsonValue::Object(map)) => map.clone(),
+        Some(_) => {
+            return Err(bad("preferred_sampling_params must be a JSON object".into()));
+        }
+    };
+    merged.extend(request);
+    serde_json::from_value(JsonValue::Object(merged))
+        .map_err(|error| bad(format!("invalid sampling parameters: {error}")))
+}
+
+/// Structural startup validation for the operator-provided defaults. Runtime
+/// checks that need a tokenizer or model vocabulary remain in `normalize`.
+pub(crate) fn validate_preferred_sampling_params(
+    preferred: Option<&JsonValue>,
+) -> Result<(), String> {
+    merge_sampling_params(preferred, SamplingParamsMap::new())
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 /// The `/generate` body's `sampling_params`: one object (broadcast to every
 /// prompt) or a list of them (one per prompt), fanned out by `GenerateBody::into_requests`.
 ///
-/// Hand-written `Deserialize` rather than `#[serde(untagged)]`: untagged buffers
-/// the input and, on failure, reports only "data did not match any variant" —
-/// losing the field-level message ("unknown field `temperature`, expected one of
-/// …") that makes a typo actionable. Object-vs-list is unambiguous here, so a
-/// single `deserialize_any` dispatch keeps the inner error verbatim.
+/// Hand-written `Deserialize` rather than `#[serde(untagged)]`: object-vs-list is
+/// unambiguous, and retaining raw maps preserves key presence until preferred
+/// defaults have been merged. Field/type validation happens exactly once when
+/// the merged map is deserialized into [`SamplingParams`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum SamplingParamsInput {
-    /// Boxed: `SamplingParams` is ~440 bytes, so an inline variant would make
-    /// every `GenerateBody` that big regardless of which form arrived.
-    One(Box<SamplingParams>),
-    Many(Vec<SamplingParams>),
+    One(Box<SamplingParamsMap>),
+    Many(Vec<SamplingParamsMap>),
 }
 
 impl<'de> Deserialize<'de> for SamplingParamsInput {
@@ -247,12 +279,13 @@ impl<'de> Deserialize<'de> for SamplingParamsInput {
             }
 
             fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-                SamplingParams::deserialize(MapAccessDeserializer::new(map))
+                SamplingParamsMap::deserialize(MapAccessDeserializer::new(map))
                     .map(|p| SamplingParamsInput::One(Box::new(p)))
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
-                Vec::deserialize(SeqAccessDeserializer::new(seq)).map(SamplingParamsInput::Many)
+                Vec::<SamplingParamsMap>::deserialize(SeqAccessDeserializer::new(seq))
+                    .map(SamplingParamsInput::Many)
             }
         }
 
@@ -867,6 +900,62 @@ mod tests {
         assert!(serde_json::from_str::<SamplingParams>(r#"{"zzz_not_a_field": 1}"#).is_err());
         // ...while every declared field still parses.
         assert!(serde_json::from_str::<SamplingParams>(r#"{"temperature": 0.7}"#).is_ok());
+    }
+
+    #[test]
+    fn preferred_params_are_shallow_defaults() {
+        let preferred = serde_json::json!({
+            "temperature": 0.2,
+            "max_new_tokens": 64,
+            "custom_params": {"preferred": true, "shared": "preferred"},
+        });
+        let request = serde_json::from_value(serde_json::json!({
+            "temperature": 0.8,
+            "custom_params": {"request": true},
+        }))
+        .unwrap();
+
+        let sampling = merge_sampling_params(Some(&preferred), request).unwrap();
+        assert_eq!(sampling.temperature, 0.8);
+        assert_eq!(sampling.max_new_tokens, Some(64));
+        assert_eq!(
+            sampling.custom_params,
+            Some(serde_json::json!({"request": true}))
+        );
+    }
+
+    #[test]
+    fn explicit_null_overrides_preferred() {
+        let preferred = serde_json::json!({
+            "temperature": 0.2,
+            "max_new_tokens": 64,
+        });
+        let request = serde_json::from_value(serde_json::json!({
+            "temperature": null,
+            "max_new_tokens": null,
+        }))
+        .unwrap();
+
+        let sampling = merge_sampling_params(Some(&preferred), request).unwrap();
+        assert_eq!(sampling.temperature, 1.0);
+        assert_eq!(sampling.max_new_tokens, None);
+    }
+
+    #[test]
+    fn invalid_preferred_params_are_rejected() {
+        assert!(validate_preferred_sampling_params(Some(&serde_json::json!([]))).is_err());
+        assert!(
+            validate_preferred_sampling_params(Some(&serde_json::json!({
+                "zzz_not_a_field": 1
+            })))
+            .is_err()
+        );
+        assert!(
+            validate_preferred_sampling_params(Some(&serde_json::json!({
+                "temperature": "bad"
+            })))
+            .is_err()
+        );
     }
 
     /// A present-but-null non-optional field keeps the default (Python's

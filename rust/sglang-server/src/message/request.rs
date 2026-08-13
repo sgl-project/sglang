@@ -11,7 +11,10 @@ use itertools::izip;
 use serde::Deserialize;
 
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
-use super::{OneOrMany, OneOrManyItem, SamplingParams, SamplingParamsInput, TokenIds};
+use super::{
+    OneOrMany, OneOrManyItem, SamplingParams, SamplingParamsInput, SamplingParamsMap, TokenIds,
+    merge_sampling_params,
+};
 use crate::environ::env_u64;
 use crate::error::Error;
 use crate::ids::Rid;
@@ -132,7 +135,10 @@ impl GenerateBody {
     /// `GenerateReqInput.normalize_batch_and_arguments`; an invalid/inconsistent
     /// batch is [`Error::Validation`], which the handler surfaces with the
     /// variant's own status (400).
-    pub fn into_requests(self) -> Result<(Vec<GenerateRequest>, bool), Error> {
+    pub fn into_requests(
+        self,
+        preferred_sampling_params: Option<&serde_json::Value>,
+    ) -> Result<(Vec<GenerateRequest>, bool), Error> {
         let GenerateBody {
             rid,
             text,
@@ -224,8 +230,21 @@ impl GenerateBody {
         }
 
         // A list is per-item; a single object broadcasts to every item.
+        let broadcast = |sp: SamplingParams| -> Result<Vec<SamplingParams>, Error> {
+            if n > 1 {
+                let per_clone = serde_json::to_string(&sp)
+                    .map_or(0, |s| s.len())
+                    .saturating_mul(JSON_TO_HEAP_FACTOR);
+                check_broadcast_budget(per_clone, n, "sampling_params")?;
+            }
+            Ok(vec![sp; n])
+        };
         let sps: Vec<SamplingParams> = match sampling_params {
-            None => vec![SamplingParams::default(); n],
+            None if preferred_sampling_params.is_none() => vec![SamplingParams::default(); n],
+            None => broadcast(merge_sampling_params(
+                preferred_sampling_params,
+                SamplingParamsMap::new(),
+            )?)?,
             Some(SamplingParamsInput::Many(v)) => {
                 if v.len() != n {
                     return Err(Error::Validation(format!(
@@ -233,9 +252,12 @@ impl GenerateBody {
                         v.len()
                     )));
                 }
-                v
+                v.into_iter()
+                    .map(|request| merge_sampling_params(preferred_sampling_params, request))
+                    .collect::<Result<Vec<_>, _>>()?
             }
-            Some(SamplingParamsInput::One(sp)) => {
+            Some(SamplingParamsInput::One(request)) => {
+                let sp = merge_sampling_params(preferred_sampling_params, *request)?;
                 // Broadcasting deep-clones the client's params once per prompt,
                 // heap and all — `stop`, `logit_bias` and `custom_params` (arbitrary
                 // JSON) are still unnormalized client data here. The blow-up is
@@ -247,17 +269,7 @@ impl GenerateBody {
                 // it means serializing the client's whole `custom_params` to a
                 // throwaway `String` on every single request. The callee's own
                 // `n > 1` guard cannot prevent that — the cost is in the argument.
-                if n > 1 {
-                    // Serialized bytes are NOT the clone cost: measured, 63.7 MiB of
-                    // JSON became ~1008 MiB of live heap once parsed into `Value`
-                    // nodes, `String`s and map entries. Scale by that measured factor
-                    // so the budget bounds memory rather than wire size.
-                    let per_clone = serde_json::to_string(&*sp)
-                        .map_or(0, |s| s.len())
-                        .saturating_mul(JSON_TO_HEAP_FACTOR);
-                    check_broadcast_budget(per_clone, n, "sampling_params")?;
-                }
-                vec![*sp; n]
+                broadcast(sp)?
             }
         };
 
@@ -815,7 +827,16 @@ mod tests {
     fn requests(body: &str) -> Result<(Vec<GenerateRequest>, bool), Error> {
         serde_json::from_str::<GenerateBody>(body)
             .unwrap()
-            .into_requests()
+            .into_requests(None)
+    }
+
+    fn requests_with_preferred(
+        body: &str,
+        preferred: &serde_json::Value,
+    ) -> Result<(Vec<GenerateRequest>, bool), Error> {
+        serde_json::from_str::<GenerateBody>(body)
+            .unwrap()
+            .into_requests(Some(preferred))
     }
 
     /// Scalar `text` → one item, not a batch (response stays a single object).
@@ -854,6 +875,36 @@ mod tests {
         )
         .unwrap();
         assert_ne!(ps[0].sampling_params, ps[1].sampling_params);
+    }
+
+    #[test]
+    fn preferred_sampling_params_apply_before_native_fanout() {
+        let preferred = serde_json::json!({
+            "temperature": 0.2,
+            "max_new_tokens": 64,
+            "ignore_eos": true,
+        });
+
+        let (ps, _) = requests_with_preferred(r#"{"text": ["a", "b"]}"#, &preferred).unwrap();
+        assert_eq!(ps.len(), 2);
+        assert!(ps.iter().all(|p| p.sampling_params.temperature == 0.2));
+        assert!(
+            ps.iter()
+                .all(|p| p.sampling_params.max_new_tokens == Some(64))
+        );
+
+        let (ps, _) = requests_with_preferred(
+            r#"{"text": ["a", "b"], "sampling_params": [
+                {"temperature": 0.8},
+                {"max_new_tokens": null}
+            ]}"#,
+            &preferred,
+        )
+        .unwrap();
+        assert_eq!(ps[0].sampling_params.temperature, 0.8);
+        assert_eq!(ps[0].sampling_params.max_new_tokens, Some(64));
+        assert_eq!(ps[1].sampling_params.temperature, 0.2);
+        assert_eq!(ps[1].sampling_params.max_new_tokens, None);
     }
 
     /// A per-item `sampling_params` list whose length ≠ batch size is a 400.
