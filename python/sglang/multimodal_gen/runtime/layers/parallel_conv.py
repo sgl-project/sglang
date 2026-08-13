@@ -168,12 +168,25 @@ def split_height_for_parallel_decode(
 
 
 def _maybe_contiguous_for_sp_gather(x: torch.Tensor) -> torch.Tensor:
-    # NCCL requires contiguous buffers, and the gather concatenates along height,
-    # so channels-last / permuted views (e.g. from platform conv fast paths) must
-    # be materialized in standard layout first.
-    if x.is_contiguous():
-        return x
-    return x.contiguous()
+    if (
+        x.dim() == 5
+        and hasattr(torch, "channels_last_3d")
+        and x.is_contiguous(memory_format=torch.channels_last_3d)
+        and not x.is_contiguous()
+    ):
+        return x.contiguous()
+    if (
+        x.dim() == 4
+        and x.is_contiguous(memory_format=torch.channels_last)
+        and not x.is_contiguous()
+    ):
+        return x.contiguous()
+    # Permuted views (e.g. the platform Conv2D fast path's NTCHW -> NCTHW
+    # permute) are neither contiguous nor channels-last; NCCL still needs a
+    # contiguous buffer for the height gather.
+    if not x.is_contiguous():
+        return x.contiguous()
+    return x
 
 
 def gather_and_trim_height(x: torch.Tensor, expected_height: int | None):
