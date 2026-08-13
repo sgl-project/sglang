@@ -81,6 +81,15 @@ Its core features include:
 ## Benchmark and Performance
 Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/), [GB200 rack-scale parallelism](https://lmsys.org/blog/2025-09-25-gb200-part-2/), [GB300 long context](https://lmsys.org/blog/2026-02-19-gb300-longctx/).
 
+## SGLang Ecosystem
+The SGLang runtime anchors a family of open-source projects:
+
+- [**SGLang-Omni**](https://github.com/sgl-project/sglang-omni): High-performance serving for TTS, ASR, speech, and omni models with OpenAI-compatible APIs (Qwen3-Omni, Qwen3-TTS, Higgs Audio, MOSS-TTS, Fish Speech, MiniMax Music, and more).
+- [**SGLang-Jax**](https://github.com/sgl-project/sglang-jax): JAX backend for native serving on Google TPUs.
+- [**SpecForge**](https://github.com/sgl-project/SpecForge): Train speculative decoding models and port them smoothly to SGLang serving.
+- [**genai-bench**](https://github.com/sgl-project/genai-bench): Token-level performance benchmarking for LLM serving systems.
+- [**mini-sglang**](https://github.com/sgl-project/mini-sglang): A compact implementation of SGLang that demystifies modern LLM serving.
+
 ## Adoption and Sponsorship
 SGLang has been deployed at large scale, generating trillions of tokens in production each day. It is trusted and adopted by a wide range of leading enterprises and institutions, including xAI, NVIDIA, AMD, Intel, LinkedIn, Cursor, Oracle Cloud, Google Cloud, Microsoft Azure, AWS, Atlas Cloud, Voltage Park, Nebius, DataCrunch, Novita, RunPod, InnoMatrix, Modal, MIT, UCLA, the University of Washington, Stanford, UC Berkeley, Tsinghua University, Baseten, Baidu, AntGroup, Alibaba, Tencent, and other major technology organizations.
 As an open-source LLM inference engine, SGLang has become the de facto industry standard, with deployments running on over 400,000 GPUs worldwide.
