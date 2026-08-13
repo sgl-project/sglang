@@ -166,7 +166,7 @@ and devices 2-15 for 14 independent batch-1 Cache-DiT denoisers.
 ```bash
 # Run 14 terminal denoisers
 DISAGG_SERVER="tcp://127.0.0.1:19655"
-MODEL_PATH="zai-org/GLM-Image/"
+MODEL_PATH="zai-org/GLM-Image"
 BASE_MASTER_PORT=29005
 
 export SGLANG_CACHE_DIT_FN=2
@@ -222,7 +222,7 @@ omitted for this topology.
 
 ```bash
 sglang serve \
-  --model-path zai-org/GLM-Image/ \
+  --model-path zai-org/GLM-Image \
   --disagg-role server \
   --srt-encoder-url http://127.0.0.1:30020 \
   --srt-encoder-timeout 300 \
