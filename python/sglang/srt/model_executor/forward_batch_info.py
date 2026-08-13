@@ -408,6 +408,79 @@ class NgramEmbeddingInfo:
         )
 
 
+def apply_unified_kv_loc_rebind(fb, model_runner) -> None:
+    """Unified memory pool: translate the forward batch's WRITE loc to
+    KERNEL-FACING ids, exactly once, at ForwardBatch preparation.
+
+    The one rule of the physical-loc contract: ScheduleBatch-side tensors stay
+    VIRTUAL always (the radix / accept / inflight machinery reads them); each
+    ForwardBatch is translated exactly once at its construction. `init_new`
+    calls this for every standard construction; a hand-built live forward
+    (e.g. the DFLASH draft-block batch) calls it explicitly.
+
+    REBIND, never mutate: the translate returns a FRESH tensor, so the
+    ScheduleBatch's aliased tensor is untouched — scheduler-thread readers
+    (on_forward_launched, accept bookkeeping) require virtual ids.
+
+    ORDER-CRITICAL for hybrid SWA: one virtual id maps to TWO kernel-facing
+    ids (full and swa). The swa rail must be derived from the still-VIRTUAL
+    loc BEFORE the full-side rebind replaces it.
+
+    No-op on non-unified pools, whose `out_cache_loc` is already physical.
+    """
+    # Local import: sglang.srt.mem_cache imports back into this module
+    # (deep_gemm_wrapper -> ForwardMode), so a top-level import would cycle.
+    from sglang.srt.mem_cache.multi_ended_allocator import (
+        UnifiedMambaTokenToKVPoolAllocator,
+        UnifiedSWATokenToKVPoolAllocator,
+    )
+
+    allocator = model_runner.token_to_kv_pool_allocator
+    if (
+        not isinstance(
+            allocator,
+            (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWATokenToKVPoolAllocator),
+        )
+        or fb.out_cache_loc is None
+    ):
+        return
+    if isinstance(allocator, UnifiedSWATokenToKVPoolAllocator):
+        # From the STILL-VIRTUAL loc — see ORDER-CRITICAL above. Read off the
+        # allocator we already hold: it and its `UnifiedSWAKVPool` are built as
+        # a pair and expose the same translation, so the pool adds a second
+        # dependency for nothing.
+        fb.swa_out_cache_loc = allocator.translate_loc_from_full_to_swa(
+            fb.out_cache_loc
+        )
+    # Dense-first, exactly the preference the attention backends use for their
+    # kernel-facing translate handle: dense view ids under dense views, and
+    # the plain physical ids under strided views (where the dense translate
+    # collapses onto it at page-multiplier 1). Using the same preference here
+    # is what makes every downstream consumer — backend metadata, cuda-graph
+    # refill, pool doors — a pure passthrough.
+    fb.out_cache_loc = allocator.translate_kv_loc_dense(fb.out_cache_loc)
+    fb.out_cache_loc_is_physical = True
+    fb._unified_kv_loc_translate = allocator.translate_kv_loc_dense
+
+
+def resolve_swa_write_loc(fb, token_to_kv_pool) -> torch.Tensor:
+    """The SWA-side write loc for a batch storing into a hybrid-SWA pool.
+
+    The single place the unified and static SWA pools diverge on this
+    question. Unified: the rail was derived from the still-virtual ids at
+    ForwardBatch preparation, and re-running the virtual->swa map on the
+    now-kernel-facing `out_cache_loc` would be silently wrong. Static: the loc
+    is physical-full and the static full->swa map applies.
+    """
+    if fb.out_cache_loc_is_physical:
+        assert fb.swa_out_cache_loc is not None, (
+            "unified hybrid-SWA: forward_batch.swa_out_cache_loc missing — the "
+            "ForwardBatch was built without apply_unified_kv_loc_rebind"
+        )
+        return fb.swa_out_cache_loc
+    return token_to_kv_pool.translate_loc_from_full_to_swa(fb.out_cache_loc)
+
+
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
@@ -423,7 +496,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     req_pool_indices: torch.Tensor
     # The sequence length
     seq_lens: torch.Tensor
-    # The indices of output tokens in the token_to_kv_pool
+    # The indices of output tokens in the token_to_kv_pool. Under the unified
+    # memory pool this field is REBOUND at ForwardBatch preparation to a FRESH
+    # kernel-facing tensor (see apply_unified_kv_loc_rebind): the ScheduleBatch's
+    # tensor stays VIRTUAL (radix / accept / inflight machinery reads it), while
+    # every forward-side consumer — attention backends, model-side pool writes —
+    # sees kernel-facing ids and never translates again.
     out_cache_loc: torch.Tensor
     # The sum of all sequence lengths
     seq_lens_sum: int
@@ -438,6 +516,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
     # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
+
+    # === Unified memory pool: kernel-facing write-loc contract ===
+    # (all three set by apply_unified_kv_loc_rebind; None/False elsewhere)
+    #
+    # SWA-rail write locs for a unified hybrid-SWA pool: the SAME virtual ids
+    # as out_cache_loc, mapped through the swa-side v2p BEFORE the full-side
+    # rebind — one virtual id has TWO kernel-facing ids. int32, the shared
+    # read-index kernel convention.
+    swa_out_cache_loc: Optional[torch.Tensor] = None
+    # True once out_cache_loc holds kernel-facing ids. Backends assert it, so
+    # a hand-built ForwardBatch that skipped the rebind fails loudly instead
+    # of writing virtual ids as if physical.
+    out_cache_loc_is_physical: bool = False
+    # The allocator's translate, stashed for read-rail producers so that
+    # req_to_token-derived READ indices can be translated where they are
+    # built. None on non-unified pools.
+    _unified_kv_loc_translate: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    # Saved swa rail across a draft-input forward, alongside
+    # output_cache_loc_backup.
+    swa_output_cache_loc_backup: Optional[torch.Tensor] = None
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
