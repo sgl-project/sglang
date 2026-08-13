@@ -57,7 +57,6 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.allocator.base import register_req_to_token
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
@@ -282,9 +281,6 @@ class ReqToTokenPool:
             )
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
-
-        # The allocators consult this on every deferred free.
-        register_req_to_token(self.req_to_token)
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
