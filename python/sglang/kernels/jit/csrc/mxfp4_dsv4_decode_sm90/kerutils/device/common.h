@@ -3,30 +3,20 @@ Common data types and macros that are used across the kerutils library.
 */
 #pragma once
 
+#include <cute/config.hpp>  // For CUTE_DEVICE
+#include <cutlass/arch/barrier.h>
+#include <cutlass/bfloat16.h>
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
-
-#include <cutlass/bfloat16.h>
-#include <cutlass/arch/barrier.h>
-#include <cute/config.hpp>  // For CUTE_DEVICE
 
 namespace kerutils {
 
 // Cache hints
-enum class CacheHint {
-    EVICT_FIRST,
-    EVICT_NORMAL,
-    EVICT_LAST,
-    EVICT_UNCHANGED,
-    NO_ALLOCATE
-};
+enum class CacheHint { EVICT_FIRST, EVICT_NORMAL, EVICT_LAST, EVICT_UNCHANGED, NO_ALLOCATE };
 
 // Prefetch size
-enum class PrefetchSize {
-    B64,
-    B128,
-    B256
-};
+enum class PrefetchSize { B64, B128, B256 };
 
 using nvbf16 = __nv_bfloat16;
 using nvbf16x2 = __nv_bfloat162;
@@ -37,7 +27,7 @@ using nve4m3x4 = __nv_fp8x4_e4m3;
 using bf16 = cutlass::bfloat16_t;
 using transac_bar_t = cutlass::arch::ClusterTransactionBarrier;
 
-}
+}  // namespace kerutils
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
 #define KERUTILS_ENABLE_SM80

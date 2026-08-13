@@ -3,16 +3,15 @@
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
 #include <cutlass/barrier.h>
-#include <math_constants.h>
-
 #include <cutlass/cluster_launch.hpp>
-#include "kerutils/kerutils.cuh"
 
-#include "dequant.h"
 #include "components/helpers.h"
 #include "config.h"
+#include "dequant.h"
 #include "flashmla_utils.h"
+#include "kerutils/kerutils.cuh"
 #include "splitkv_mla.h"
+#include <math_constants.h>
 using namespace cute;
 
 namespace sm90::decode::sparse_mxfp4_dsv4 {
@@ -86,12 +85,9 @@ __forceinline__ __device__ void scale_softmax(
   if (idx_in_warpgroup % 4 == 0) *(float2*)(sScale + 2 * (idx_in_warpgroup / 4)) = *(float2*)(scale_for_olds);
 }
 
-
 template <int NUM_HEADS>
 template <typename TMAParams>
-__device__ void KernelTemplate<NUM_HEADS>::devfunc(
-    const SparseAttnDecodeParams& params,
-    const TMAParams& tma_params) {
+__device__ void KernelTemplate<NUM_HEADS>::devfunc(const SparseAttnDecodeParams& params, const TMAParams& tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
   const int head_block_idx = NUM_M_BLOCKS == 1 ? 0 : blockIdx.x;
   const int s_q_idx = blockIdx.y;
@@ -585,13 +581,11 @@ __device__ void KernelTemplate<NUM_HEADS>::devfunc(
           if (token_is_valid) {
             const int block_index =
                 page_block_size > 0
-                    ? static_cast<int>(
-                          static_cast<uint32_t>(safe_token_index) / static_cast<uint32_t>(page_block_size))
+                    ? static_cast<int>(static_cast<uint32_t>(safe_token_index) / static_cast<uint32_t>(page_block_size))
                     : 0;
             const int rel_idx_in_block =
                 page_block_size > 0
-                    ? static_cast<int>(
-                          static_cast<uint32_t>(safe_token_index) % static_cast<uint32_t>(page_block_size))
+                    ? static_cast<int>(static_cast<uint32_t>(safe_token_index) % static_cast<uint32_t>(page_block_size))
                     : 0;
             gK_base = k_ptr + block_index * k_block_stride + rel_idx_in_block * k_row_stride;
           }
@@ -623,8 +617,7 @@ __device__ void KernelTemplate<NUM_HEADS>::devfunc(
             uint8_t block_scale_bits = 0;
             if (token_is_valid) {
               packed = nvfp4::load_packed_e2m1x16(gK_base + logical_dim / 2);
-              block_scale_bits =
-                  mxfp4::load_scale_bits(gK_base + PACKED_NOPE_BYTES + logical_dim / SCALE_BLOCK_SIZE);
+              block_scale_bits = mxfp4::load_scale_bits(gK_base + PACKED_NOPE_BYTES + logical_dim / SCALE_BLOCK_SIZE);
             }
             const float effective_scale = token_is_valid ? mxfp4::e8m0_bits_to_float(block_scale_bits) : 0.0f;
             const nvfp4::bf16x16 dequant = nvfp4::dequant_e2m1x16(packed, effective_scale);
@@ -704,11 +697,9 @@ __device__ void KernelTemplate<NUM_HEADS>::devfunc(
 template <typename Kernel, typename TMAParams>
 __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, Kernel::CLUSTER_SIZE)
     flash_fwd_splitkv_mla_mxfp4_dsv4_scaled_sparse_kernel(
-        __grid_constant__ const SparseAttnDecodeParams params,
-        __grid_constant__ const TMAParams tma_params) {
+        __grid_constant__ const SparseAttnDecodeParams params, __grid_constant__ const TMAParams tma_params) {
   Kernel::devfunc(params, tma_params);
 }
-
 
 template <int NUM_HEADS>
 void KernelTemplate<NUM_HEADS>::run(const SparseAttnDecodeParams& params) {
@@ -804,7 +795,6 @@ void KernelTemplate<NUM_HEADS>::run(const SparseAttnDecodeParams& params) {
   cutlass::launch_kernel_on_cluster(launch_params, (void*)mla_kernel, params, tma_params);
   KU_CHECK_KERNEL_LAUNCH();
 }
-
 
 template <int NUM_HEADS>
 void run_flash_splitkv_mla_mxfp4_dsv4_sparse_kernel_impl(const SparseAttnDecodeParams& params) {

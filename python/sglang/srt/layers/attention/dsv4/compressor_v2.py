@@ -292,10 +292,7 @@ class CompressorBackendMixin:
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
 
         state_pool = compressor.get_state_pool(self)
-        if (
-            token_to_kv_pool.dsv4_kv_cache_store_mxfp4
-            and not compressor.is_in_indexer
-        ):
+        if token_to_kv_pool.dsv4_kv_cache_store_mxfp4 and not compressor.is_in_indexer:
             self._forward_mxfp4(
                 token_to_kv_pool=token_to_kv_pool,
                 kv_score_input=kv_score_input,

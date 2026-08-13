@@ -9,9 +9,9 @@ Timed with CUDA events over the full call (scheduler + main + combine).
 import math
 
 import torch
-
 from sgl_kernel.flash_mla import FlashMLASchedMeta as Fp8SchedMeta
 from sgl_kernel.flash_mla import flash_mla_with_kvcache as fp8_decode
+
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
@@ -28,7 +28,9 @@ from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
 
 _HEAD_DIM = 512
 _FP8_BYTES_PER_TOKEN = 584
@@ -38,7 +40,9 @@ def _pack_fp8(k_bf16: torch.Tensor) -> torch.Tensor:
     """BF16 [N, 512] -> FlashMLA fp8 row [N, 584] uint8."""
     pack = quant_to_nope_fp8_rope_bf16_pack_triton(k_bf16)
     n = k_bf16.shape[0]
-    row = torch.empty((n, _FP8_BYTES_PER_TOKEN), dtype=torch.uint8, device=k_bf16.device)
+    row = torch.empty(
+        (n, _FP8_BYTES_PER_TOKEN), dtype=torch.uint8, device=k_bf16.device
+    )
     row[:, :448] = pack.k_nope_fp8.view(torch.uint8)
     row[:, 448:576] = pack.k_rope_bf16.view(torch.uint8)
     row[:, 576:583] = pack.scale_k_nope_ue8m0
@@ -48,13 +52,18 @@ def _pack_fp8(k_bf16: torch.Tensor) -> torch.Tensor:
 def _make_caches(num_pages: int, page_size: int, gen):
     dev = torch.device("cuda")
     cap = num_pages * page_size
-    src = torch.randn((cap, _HEAD_DIM), dtype=torch.bfloat16, device=dev, generator=gen) / 10
+    src = (
+        torch.randn((cap, _HEAD_DIM), dtype=torch.bfloat16, device=dev, generator=gen)
+        / 10
+    )
     loc = torch.arange(cap, dtype=torch.int32, device=dev)
 
     mxfp4_raw = torch.zeros(
         (num_pages, page_size * MXFP4_BYTES_PER_TOKEN), dtype=torch.uint8, device=dev
     )
-    quantize_dsv4_mxfp4_k_cache_into(cache_k=src, kv_buffer=mxfp4_raw, loc=loc, page_size=page_size)
+    quantize_dsv4_mxfp4_k_cache_into(
+        cache_k=src, kv_buffer=mxfp4_raw, loc=loc, page_size=page_size
+    )
     mxfp4_4d = mxfp4_raw.view(num_pages, page_size, 1, MXFP4_BYTES_PER_TOKEN)
 
     fp8_row = _pack_fp8(src)
@@ -100,17 +109,32 @@ def _make_case(h_q: int, b: int, swa_pages: int, extra_cfg):
     f8_meta = Fp8SchedMeta()
     return dict(
         mxfp4=lambda: mxfp4_decode(
-            q=q, k_cache=mxfp4_swa, indices=swa_idx, topk_length=swa_len,
-            attn_sink=attn_sink, tile_scheduler_metadata=mx_meta,
-            softmax_scale=sm, extra_k_cache=ex_mx,
-            extra_indices_in_kvcache=ex_idx, extra_topk_length=ex_len,
+            q=q,
+            k_cache=mxfp4_swa,
+            indices=swa_idx,
+            topk_length=swa_len,
+            attn_sink=attn_sink,
+            tile_scheduler_metadata=mx_meta,
+            softmax_scale=sm,
+            extra_k_cache=ex_mx,
+            extra_indices_in_kvcache=ex_idx,
+            extra_topk_length=ex_len,
         ),
         fp8=lambda: fp8_decode(
-            q=q, k_cache=fp8_swa, head_dim_v=_HEAD_DIM, block_table=None,
-            cache_seqlens=None, tile_scheduler_metadata=f8_meta,
-            softmax_scale=sm, is_fp8_kvcache=True, indices=swa_idx,
-            topk_length=swa_len, attn_sink=attn_sink, extra_k_cache=ex_f8,
-            extra_indices_in_kvcache=ex_idx, extra_topk_length=ex_len,
+            q=q,
+            k_cache=fp8_swa,
+            head_dim_v=_HEAD_DIM,
+            block_table=None,
+            cache_seqlens=None,
+            tile_scheduler_metadata=f8_meta,
+            softmax_scale=sm,
+            is_fp8_kvcache=True,
+            indices=swa_idx,
+            topk_length=swa_len,
+            attn_sink=attn_sink,
+            extra_k_cache=ex_f8,
+            extra_indices_in_kvcache=ex_idx,
+            extra_topk_length=ex_len,
         ),
     )
 

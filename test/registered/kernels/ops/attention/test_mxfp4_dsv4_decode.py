@@ -16,6 +16,7 @@ from typing import Callable, Optional
 import msgspec
 import pytest
 import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -560,9 +561,7 @@ def test_flashmla_dsv4_mxfp4_fresh_meta_per_capture() -> None:
     torch.testing.assert_close(
         graph2_out, out_ref, atol=_OUTPUT_ATOL, rtol=_OUTPUT_RTOL
     )
-    torch.testing.assert_close(
-        graph2_lse, lse_ref, atol=_LSE_ATOL, rtol=_LSE_RTOL
-    )
+    torch.testing.assert_close(graph2_lse, lse_ref, atol=_LSE_ATOL, rtol=_LSE_RTOL)
 
 
 @pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")

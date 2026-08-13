@@ -1,12 +1,11 @@
 #pragma once
 
+#include <cute/tensor.hpp>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/numeric_types.h>
 
-#include <cute/tensor.hpp>
-#include "kerutils/kerutils.cuh"
-
 #include "defines.h"
+#include "kerutils/kerutils.cuh"
 #include "params.h"
 
 using namespace cute;

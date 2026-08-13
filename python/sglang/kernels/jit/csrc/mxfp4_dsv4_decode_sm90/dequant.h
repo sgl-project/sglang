@@ -16,11 +16,9 @@
 
 #pragma once
 
-#include <cuda_bf16.h>
-
-#include <cstdint>
-
 #include "layout.h"
+#include <cstdint>
+#include <cuda_bf16.h>
 
 namespace sm90::nvfp4 {
 

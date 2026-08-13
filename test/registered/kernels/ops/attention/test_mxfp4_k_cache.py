@@ -10,7 +10,6 @@ Verifies:
 from __future__ import annotations
 
 import torch
-from sglang.test.ci.ci_register import register_cuda_ci
 
 from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import (
     MXFP4_BYTES_PER_TOKEN,
@@ -18,6 +17,7 @@ from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import (
     dequantize_dsv4_mxfp4_k_cache_paged,
     quantize_dsv4_mxfp4_k_cache_into,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -137,9 +137,9 @@ def test_oob_indices():
     dequantize_dsv4_mxfp4_k_cache_paged(pool, loc, page_size, out=out)
 
     oob = (loc < 0) | (loc >= num_rows)
-    assert (out[oob] == 0).all(), (
-        f"OOB rows should be zero, got {(out[oob] != 0).sum().item()} non-zero"
-    )
+    assert (
+        out[oob] == 0
+    ).all(), f"OOB rows should be zero, got {(out[oob] != 0).sum().item()} non-zero"
     # In-range rows still dequantize (nonzero signal).
     assert (out[~oob] != 0).any()
 

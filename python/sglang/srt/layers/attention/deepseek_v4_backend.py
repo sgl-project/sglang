@@ -1801,7 +1801,9 @@ class DeepseekV4AttnBackend(
         )
         from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import MXFP4_BYTES_PER_TOKEN
 
-        assert q.ndim == 3 and q.shape[2] == 512, f"expect [bs, heads, 512], got {q.shape}"
+        assert (
+            q.ndim == 3 and q.shape[2] == 512
+        ), f"expect [bs, heads, 512], got {q.shape}"
         bs, h_q, _ = q.shape
         assert h_q in (64, 128)
 

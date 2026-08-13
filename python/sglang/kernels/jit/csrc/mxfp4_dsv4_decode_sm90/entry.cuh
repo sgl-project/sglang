@@ -21,12 +21,11 @@
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/extra/c_env_api.h>
 
-#include <cuda_runtime.h>
-#include <math_constants.h>
-
+#include "combine.cuh"
 #include "config.h"
 #include "splitkv_mla.cuh"
-#include "combine.cuh"
+#include <cuda_runtime.h>
+#include <math_constants.h>
 
 namespace sm90::decode::sparse_mxfp4_dsv4 {
 
@@ -253,16 +252,13 @@ void mxfp4_dsv4_decode_dispatch(
     sched_params.b = b;
     sched_params.s_q = s_q;
     sched_params.block_size_n = sm90::decode::sparse_mxfp4_dsv4::kTopkBlockSize;
-    sched_params.fixed_overhead_num_blocks =
-        sm90::decode::sparse_mxfp4_dsv4::kFixedOverheadNumBlocks;
+    sched_params.fixed_overhead_num_blocks = sm90::decode::sparse_mxfp4_dsv4::kFixedOverheadNumBlocks;
     sched_params.topk = topk;
     sched_params.extra_topk = have_extra ? extra_topk : 0;
-    sched_params.topk_length =
-        is_empty(topk_length) ? nullptr : static_cast<int*>(topk_length.data_ptr());
+    sched_params.topk_length = is_empty(topk_length) ? nullptr : static_cast<int*>(topk_length.data_ptr());
     sched_params.extra_topk_length =
         is_empty(extra_topk_length) ? nullptr : static_cast<int*>(extra_topk_length.data_ptr());
-    sched_params.tile_scheduler_metadata_ptr =
-        reinterpret_cast<DecodingSchedMeta*>(tile_scheduler_metadata.data_ptr());
+    sched_params.tile_scheduler_metadata_ptr = reinterpret_cast<DecodingSchedMeta*>(tile_scheduler_metadata.data_ptr());
     sched_params.num_splits_ptr = static_cast<int*>(num_splits.data_ptr());
     sched_params.num_sm_parts = num_sm_parts;
     sched_params.stream = stream;
@@ -326,8 +322,7 @@ void mxfp4_dsv4_decode_dispatch(
   params.stride_o_accum_split = s_q * h_q * kHeadDimV;
   params.stride_o_accum_s_q = h_q * kHeadDimV;
   params.stride_o_accum_h_q = kHeadDimV;
-  params.tile_scheduler_metadata_ptr =
-      reinterpret_cast<DecodingSchedMeta*>(tile_scheduler_metadata.data_ptr());
+  params.tile_scheduler_metadata_ptr = reinterpret_cast<DecodingSchedMeta*>(tile_scheduler_metadata.data_ptr());
   params.num_splits_ptr = static_cast<int*>(num_splits.data_ptr());
   params.num_sm_parts = num_sm_parts;
 

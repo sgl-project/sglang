@@ -1,10 +1,9 @@
 #pragma once
 
-#include <cooperative_groups.h>
-
 #include <cute/tensor.hpp>
 
 #include "../config.h"
+#include <cooperative_groups.h>
 
 using namespace cute;
 

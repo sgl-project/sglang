@@ -300,7 +300,11 @@ def flash_mla_with_kvcache_dsv4_mxfp4(
         sched_meta.tile_scheduler_metadata,
         sched_meta.num_splits,
         extra_k_cache if extra_k_cache is not None else _empty_i32(device),
-        extra_indices_in_kvcache if extra_indices_in_kvcache is not None else _empty_i32(device),
+        (
+            extra_indices_in_kvcache
+            if extra_indices_in_kvcache is not None
+            else _empty_i32(device)
+        ),
         extra_topk_length if extra_topk_length is not None else _empty_i32(device),
         lse_accum,
         o_accum,

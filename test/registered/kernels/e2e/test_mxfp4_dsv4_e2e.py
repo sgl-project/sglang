@@ -11,7 +11,6 @@ Registry: extra-b 8-GPU CUDA (nightly-class runtime).
 """
 
 import os
-import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
@@ -90,7 +89,10 @@ class TestDeepseekV4Mxfp4(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### gsm8k (deepseek-v4-flash-mxfp4)\n"
-                f'{metrics["accuracy"]=:.3f}\n'
+                f"### gsm8k (deepseek-v4-flash-mxfp4)\n" f'{metrics["accuracy"]=:.3f}\n'
             )
         self.assertGreater(metrics["accuracy"], 0.9)
+
+
+if __name__ == "__main__":
+    unittest.main()
