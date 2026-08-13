@@ -11,14 +11,15 @@ fits on one GPU, so these run per-commit rather than on a 4-GPU stage.
 Reverting either #34184 or #29792 turns this file red, so a later threshold
 change has to argue with a number. Which case fires is architecture-dependent
 though, because prefill and decode take different fa4 kernels on SM90 and SM100.
-Measured avg_kl_div, 0.0 everywhere in the fixed state:
+Measured avg_kl_div:
 
-                                      SM100 (B200)        SM90 (H200)
-  #34184  test_logprobs_match             5.58e-07              0.0
-          test_prefill_cache_hit          6.22e-06         4.40e-06
-          test_decode_cache_hit                0.0              0.0
-          multiturn branching                  0.0         2.01e-07
-  #29792  multiturn branching     9.43e-06/1.16e-05         5.14e-04
+                                             fix reverted                 fix
+                                          SM100 (B200) SM90 (H200)   in place
+  #34184   test_logprobs_match                5.58e-07         0.0        0.0
+           test_prefill_cache_hit             6.22e-06    4.40e-06        0.0
+           test_decode_cache_hit                   0.0         0.0        0.0
+           multiturn branching                     0.0    2.01e-07        0.0
+  #29792   multiturn branching       9.43e-06/1.16e-05    5.14e-04        0.0
 
 `test_prefill_cache_hit` is the only case that fires on both, so read the rest as
 extra coverage rather than as the guard for one fix. CI runs `1-gpu-large`, which
