@@ -31,6 +31,7 @@ def _make_backend():
     backend.req_to_token = torch.empty(1, dtype=torch.int32)
     backend.disable_value_layer_ids = set()
     backend.fp8_attn_gemm = False
+    backend.is_npu = False
     backend._max_seqlen_q = 8
     backend._max_seqlen_k = 128
     backend.block_size_q = 64
@@ -121,7 +122,8 @@ def test_dp_padded_target_verify_requires_forward_batch_geometry():
     batch.num_token_non_padded_cpu = 3
 
     with patch(
-        "sglang.srt.layers.attention.minimax_sparse_backend.minimax_sparse_prefill",
+        "sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse."
+        "minimax_sparse_prefill",
         return_value=(None, torch.empty(4, 2)),
     ):
         with pytest.raises(
@@ -156,7 +158,8 @@ def test_ragged_target_verify_trims_dp_padding_before_sparse_kernel():
         return None, torch.ones(args[0].shape[0], 2)
 
     with patch(
-        "sglang.srt.layers.attention.minimax_sparse_backend.minimax_sparse_prefill",
+        "sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse."
+        "minimax_sparse_prefill",
         side_effect=fake_sparse_prefill,
     ):
         _, output = _run_forward(backend, batch)
@@ -188,7 +191,8 @@ def test_forward_batch_target_verify_geometry_trims_dp_padding():
         return None, torch.ones(args[0].shape[0], 2)
 
     with patch(
-        "sglang.srt.layers.attention.minimax_sparse_backend.minimax_sparse_prefill",
+        "sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse."
+        "minimax_sparse_prefill",
         side_effect=fake_sparse_prefill,
     ):
         _, output = _run_forward(backend, batch)
