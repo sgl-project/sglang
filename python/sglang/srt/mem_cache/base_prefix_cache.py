@@ -65,6 +65,10 @@ class InsertParams:
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
+    # Semantic prefix length represented by mamba_value: the value is H(S)
+    # after exactly tokens [0, S). Keep this separate from the Full-KV insert
+    # length so page alignment can never silently relabel a recurrent state.
+    mamba_state_seqlen: Optional[int] = None
 
     # SWA specific
     prev_prefix_len: int = 0

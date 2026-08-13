@@ -218,7 +218,19 @@ class MambaComponent(TreeComponent):
         result: InsertResult,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
-        assert params.mamba_value is not None
+        if params.mamba_value is None:
+            result.mamba_exist = True
+            return
+
+        assert (
+            params.mamba_state_seqlen is not None
+        ), "mamba_state_seqlen is required when inserting a Mamba checkpoint"
+        assert params.key is not None
+        radix_node_seqlen = len(params.key.page_aligned(self.cache.page_size))
+        assert params.mamba_state_seqlen == radix_node_seqlen, (
+            f"Mamba checkpoint H({params.mamba_state_seqlen}) cannot be attached "
+            f"to radix node at depth {radix_node_seqlen}"
+        )
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
@@ -515,6 +527,12 @@ class MambaComponent(TreeComponent):
         else:
             self.cache.req_to_token_pool.mamba_allocator.free(mamba_value)
 
+    def _can_attach_checkpoint(self, state_seqlen: int, token_ids_len: int) -> bool:
+        return (
+            0 <= state_seqlen <= token_ids_len
+            and state_seqlen % self.cache.page_size == 0
+        )
+
     def prepare_for_caching_req(
         self,
         req: Req,
@@ -525,7 +543,12 @@ class MambaComponent(TreeComponent):
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.mamba_last_track_seqlen
         else:
-            cache_len = token_ids_len
+            # Without a snapshot buffer, the request slot represents the live
+            # committed state, which may be ahead of token_ids_len when a cache
+            # policy deliberately shortens a finished key (for example
+            # strip-thinking). Use the state's actual semantic length and let
+            # the exact-boundary gate below reject an incompatible donation.
+            cache_len = req.kv_committed_len if is_finished else token_ids_len
             # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by the
             # slot's unflushed ring depth (`write_pos`), so on request finish cap
             # the donate to the last flush boundary (where temporal is current)
@@ -540,9 +563,29 @@ class MambaComponent(TreeComponent):
                     cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
                     write_pos_buf[req.mamba_pool_idx] = 0
 
+        if cache_len is None:
+            if not is_finished:
+                return 0
+            cache_len = 0
+
+        # A recurrent state H(S) is a point checkpoint and can only be attached
+        # to the radix node whose cumulative key depth is exactly S. DCP widens
+        # cache.page_size, so a checkpoint tracked on the pre-DCP grid may not
+        # be a legal tree boundary. Also reject states ahead of a shortened key
+        # (for example strip-thinking cache insertion). Do this before cloning,
+        # quantizing, or donating a slot so ownership remains with the request.
+        if not self._can_attach_checkpoint(cache_len, token_ids_len):
+            if is_finished:
+                return None
+            # cache_unfinished_req transfers inserted KV ownership to the tree
+            # only after rematching and locking the new node. A Full-only node
+            # cannot win Mamba consensus, so inserting one here would leave the
+            # request and an unlocked tree node sharing the same KV slots.
+            return 0
+
+        insert_params.mamba_state_seqlen = cache_len
+
         if is_finished:
-            if cache_len is None:
-                cache_len = 0
             if self.cache.enable_mamba_extra_buffer:
                 keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
                     req
@@ -558,8 +601,6 @@ class MambaComponent(TreeComponent):
                 insert_params.mamba_value = active_value
             return cache_len
         else:
-            if cache_len is None:
-                return 0
             # Donate the mamba index to the radix cache instead of copying.
             if self.int8_ckpt_pool is not None:
                 if self.cache.enable_mamba_extra_buffer:

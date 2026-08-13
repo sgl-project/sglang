@@ -1578,6 +1578,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 mamba_radix_cache_strategy="auto",
                 disable_overlap_schedule=False,
                 page_size=None,
+                dcp_size=1,
                 linear_attn_backend="triton",
             )
             defaults.update(kw)
@@ -1619,6 +1620,31 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertEqual(declared["mamba_radix_cache_strategy"], "no_buffer")
         self.assertIs(declared["disable_overlap_schedule"], True)
+        # DCP widens an otherwise unpaged tree, so auto must not select
+        # no_buffer even when overlap scheduling is disabled.
+        declared = _mamba_radix_cache_resolution(
+            _view(
+                "Qwen3NextForCausalLM",
+                disable_overlap_schedule=True,
+                page_size=1,
+                dcp_size=2,
+            )
+        )
+        self.assertEqual(declared["mamba_radix_cache_strategy"], "extra_buffer")
+
+        from sglang.srt.server_args import ServerArgs
+
+        with self.assertRaisesRegex(AssertionError, "no_buffer does not support DCP"):
+            ServerArgs._validate_mamba_no_buffer(
+                object(),
+                SimpleNamespace(
+                    page_size=1,
+                    dcp_size=2,
+                    disable_overlap_schedule=True,
+                    attention_backend="flashinfer",
+                ),
+                "Qwen3NextForCausalLM",
+            )
         # paging alone wants the extra buffer
         self.assertEqual(
             _mamba_radix_cache_resolution(

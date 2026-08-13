@@ -5717,6 +5717,9 @@ class ServerArgs:
     def _validate_mamba_no_buffer(self, view, model_arch: str):
         assert view.page_size in (1, None), "no_buffer only supports page_size=1."
         assert (
+            view.dcp_size == 1
+        ), "no_buffer does not support DCP; use extra_buffer or extra_buffer_lazy."
+        assert (
             view.disable_overlap_schedule
         ), "no_buffer do not support overlap schedule. Try to set disable_overlap_schedule=True."
         assert (

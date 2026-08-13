@@ -1543,7 +1543,11 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
     if view.mamba_radix_cache_strategy == "auto":
         wants_overlap = not view.disable_overlap_schedule
-        wants_paging = view.page_size is not None and view.page_size > 1
+        # DCP widens the effective radix page even when the configured page is
+        # one, so no_buffer's page_size == 1 invariant cannot hold.
+        wants_paging = (view.page_size is not None and view.page_size > 1) or (
+            getattr(view, "dcp_size", 1) > 1
+        )
         if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
             view, model_arch
         ):

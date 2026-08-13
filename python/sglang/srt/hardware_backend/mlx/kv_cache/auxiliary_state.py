@@ -336,14 +336,24 @@ class MlxAuxiliaryStateComponent(MambaComponent):
         is_finished: bool,
     ) -> int | None:
         cache_len = getattr(req, "mamba_last_track_seqlen", None)
+        if cache_len is None:
+            cache_len = (
+                getattr(req, "kv_committed_len", token_ids_len)
+                if is_finished
+                else token_ids_len
+            )
+        if not self._can_attach_checkpoint(cache_len, token_ids_len):
+            if is_finished:
+                return None
+            return 0
+
         auxiliary_value, uses_track_slot = self._tracked_value(req)
         setattr(insert_params, "mlx_auxiliary_state_uses_track_slot", uses_track_slot)
 
         if auxiliary_value is None:
             return 0 if is_finished else None
 
-        if cache_len is None:
-            cache_len = token_ids_len
+        insert_params.mamba_state_seqlen = cache_len
         if is_finished:
             insert_params.mamba_value = auxiliary_value
         else:

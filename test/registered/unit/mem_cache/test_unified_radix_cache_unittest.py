@@ -740,6 +740,7 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
+            params.mamba_state_seqlen = len(key)
         return cache.insert(params)
 
     def test_insert_and_match_basic(self):
@@ -853,6 +854,7 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
+            params.mamba_state_seqlen = len(key_2p)
         result = cache.insert(params)
         self.assertEqual(result.prefix_len, len(seq_1p))
         self.assertEqual(
@@ -872,6 +874,7 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
+            params.mamba_state_seqlen = len(key_3p)
         result = cache.insert(params)
         self.assertEqual(result.prefix_len, len(seq_2p))
         # alloc(3p), freed 0 (prev_prefix_len covers entire overlap), stored 1p new → net -3p
@@ -959,7 +962,10 @@ class UnifiedRadixCacheSuite:
         m = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", prompt_ids + output_ids)))
         )
-        self.assertEqual(len(m.device_indices), prompt_aligned)
+        self.assertEqual(m.full_kv_hit_length, prompt_aligned)
+        self.assertEqual(
+            len(m.device_indices), 0 if self.cfg.has_mamba else prompt_aligned
+        )
         # Only prompt-aligned pages remain owned by the tree.
         self.assertEqual(
             allocator.available_size(), avail_before + kv_len - prompt_aligned
@@ -1030,6 +1036,93 @@ class UnifiedRadixCacheSuite:
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
         )
         cache.sanity_check()
+
+    def test_mamba_misaligned_finished_req_inserts_full_only(self):
+        if self.cfg.components != (ComponentType.FULL, ComponentType.MAMBA):
+            self.skipTest("requires Full + Mamba")
+        if self.cfg.page_size != 4:
+            self.skipTest("uses a widened page_size=4 tree")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        tokens = self._make_seq(1, 2)
+        req = self._make_req(req_to_token_pool)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(tokens))
+        req.kv_committed_len = len(tokens)
+        req.last_node = cache.root_node.id
+        req.extra_key = None
+        req.mamba_last_track_seqlen = len(tokens) - 1
+        kv_indices = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+
+        cache.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
+        )
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(match.full_kv_hit_length, len(tokens))
+        self.assertEqual(len(match.device_indices), 0)
+        leaf = next(iter(cache.root_node.children.values()))
+        self.assertIsNotNone(leaf.component_data[ComponentType.FULL].value)
+        self.assertIsNone(leaf.component_data[ComponentType.MAMBA].value)
+        cache.sanity_check()
+
+    def test_mamba_misaligned_unfinished_req_keeps_request_ownership(self):
+        if self.cfg.components != (ComponentType.FULL, ComponentType.MAMBA):
+            self.skipTest("requires Full + Mamba")
+        if self.cfg.page_size != 4:
+            self.skipTest("uses a widened page_size=4 tree")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        tokens = self._make_seq(1, 2)
+        req = self._make_req(req_to_token_pool)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(tokens))
+        req.kv_committed_len = len(tokens)
+        req.last_node = cache.root_node.id
+        req.extra_key = None
+        req.mamba_last_track_seqlen = len(tokens) - 1
+        kv_indices = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+        track_slots_before = req.mamba_ping_pong_track_buffer.clone()
+        available_before = allocator.available_size()
+
+        cache.cache_unfinished_req(req)
+
+        self.assertEqual(cache.full_evictable_size(), 0)
+        self.assertEqual(allocator.available_size(), available_before)
+        self.assertEqual(len(req.prefix_indices), len(tokens))
+        self.assertEqual(req.cache_protected_len, 0)
+        torch.testing.assert_close(req.mamba_ping_pong_track_buffer, track_slots_before)
+        self.assertIsNone(req.mamba_last_track_seqlen)
+        cache.sanity_check()
+
+    def test_mamba_insert_rejects_wrong_semantic_length(self):
+        if self.cfg.components != (ComponentType.FULL, ComponentType.MAMBA):
+            self.skipTest("requires Full + Mamba")
+        if self.cfg.page_size != 4:
+            self.skipTest("uses a widened page_size=4 tree")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        tokens = self._make_seq(1, 2)
+        key = RadixKey(array("q", tokens))
+        value = self._alloc(allocator, len(tokens))
+        req = self._make_req(req_to_token_pool)
+        with self.assertRaisesRegex(
+            AssertionError, r"checkpoint H\(7\).*node at depth 8"
+        ):
+            cache.insert(
+                InsertParams(
+                    key=key,
+                    value=value,
+                    mamba_value=req.mamba_pool_idx.unsqueeze(0),
+                    mamba_state_seqlen=len(tokens) - 1,
+                )
+            )
 
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
@@ -1169,7 +1262,10 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(allocator.available_size(), avail_before + tail_extra)
         aligned = input_ids[: (len(input_ids) // ps) * ps]
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", aligned))))
-        self.assertEqual(len(m.device_indices), len(aligned))
+        self.assertEqual(m.full_kv_hit_length, len(aligned))
+        self.assertEqual(
+            len(m.device_indices), 0 if self.cfg.has_mamba else len(aligned)
+        )
         cache.sanity_check()
 
     def test_mamba_evict_only(self):
@@ -5129,6 +5225,7 @@ class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
                     key=RadixKey(array("q", tokens)),
                     value=value[: len(tokens)],
                     mamba_value=req.mamba_pool_idx.unsqueeze(0),
+                    mamba_state_seqlen=len(tokens),
                 )
             )
 
