@@ -815,8 +815,7 @@ class InputLogprobProcessor:
             fused_kernel, fused_max_k = row_logsumexp_topk, FUSED_TOPK_MAX_K
 
         use_distributed_logprobs = (
-            distributed_context is not None
-            and self.enable_fast_input_logprobs
+            distributed_context is not None and self.enable_fast_input_logprobs
         )
 
         for i in range(num_chunks):
@@ -955,16 +954,14 @@ class InputLogprobProcessor:
                             distributed_context.vocab_size,
                             distributed_context.tp_group,
                         )
-                        top_values = (
-                            top_values - row_max[:, None]
-                        ) - row_log_sum[:, None]
+                        top_values = (top_values - row_max[:, None]) - row_log_sum[
+                            :, None
+                        ]
                         split_len_topk = append_distributed_topk_chunk(
                             top_values,
                             top_indices,
                             top_k_nums,
-                            logits_metadata.extend_logprob_pruned_lens_cpu[
-                                chunk_slice
-                            ],
+                            logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice],
                             top_logprobs_val,
                             top_logprobs_idx,
                             split_len_topk,
@@ -996,9 +993,7 @@ class InputLogprobProcessor:
                             empty_values,
                             empty_indices,
                             top_k_nums,
-                            logits_metadata.extend_logprob_pruned_lens_cpu[
-                                chunk_slice
-                            ],
+                            logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice],
                             top_logprobs_val,
                             top_logprobs_idx,
                             split_len_topk,
