@@ -687,8 +687,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        core_attn_out = z = None
-
         if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_npu:
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
