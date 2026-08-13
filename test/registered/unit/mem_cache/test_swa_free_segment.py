@@ -226,6 +226,30 @@ class TestOverrideSignatures(unittest.TestCase):
         ):
             self.assertIn(expected, checked)
 
+    def test_free_override_implies_free_segment_override(self):
+        """SWATokenToKVPoolAllocator.free_segment drives full_attn_allocator and
+        free_swa directly instead of going through self.free(). A subclass that
+        redefines free() therefore has release semantics the parent's split does
+        not reproduce -- PureSWA aliases the two inner allocators (so the split
+        frees twice), UnifiedSWA clears both inverse histories (which the split
+        skips). Both shipped as silent corruption before this check existed."""
+        seen = set()
+        for cls in _subclasses(SWATokenToKVPoolAllocator):
+            if "free" not in cls.__dict__:
+                continue
+            seen.add(cls.__name__)
+            # assertTrue, not assertIn: the latter dumps the whole __dict__.
+            self.assertTrue(
+                "free_segment" in cls.__dict__,
+                f"{cls.__name__} overrides free() but not free_segment(); the "
+                f"parent's free_segment would bypass its release semantics",
+            )
+        for expected in (
+            "PureSWATokenToKVPoolAllocator",
+            "UnifiedSWATokenToKVPoolAllocator",
+        ):
+            self.assertIn(expected, seen)
+
 
 if __name__ == "__main__":
     unittest.main()
