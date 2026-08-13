@@ -110,9 +110,8 @@ class TestQwen35GdnInProjMergeMI35x(TestQwen35EvalMI35x):
     """Same eval with the GDN in_proj_qkvzba merge (PR #33068) enabled.
 
     The merge folds in_proj_ba into in_proj_qkvz as one GEMM, which needs all four
-    shards on one quantization scheme. This bf16 checkpoint has no quant config, so
-    they trivially agree and the merged path runs; the quantized MXFP4-AttnFP8
-    checkpoint excludes in_proj_a/b and falls back to separate projections.
+    checkpoint shards on one quantization scheme. This bf16 checkpoint has no quant
+    config, so they trivially agree and the merged path runs.
     """
 
     variant_label = " + fused in_proj_qkvzba"

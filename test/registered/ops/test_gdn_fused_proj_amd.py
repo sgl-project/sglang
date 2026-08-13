@@ -141,8 +141,7 @@ class TestGdnInProjMergeGate(CustomTestCase):
         self.assertIsInstance(method, UnquantizedLinearMethod)
 
     def test_ba_left_unquantized_is_rejected(self):
-        # What amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8 ships: in_proj_a and in_proj_b are
-        # excluded while qkvz is quantized, so that checkpoint keeps them separate.
+        # in_proj_a/b excluded while qkvz is quantized: mixed, so keep them separate.
         with self.assertRaises(ValueError):
             _quant_method(
                 {"*linear_attn*": _FP8},
