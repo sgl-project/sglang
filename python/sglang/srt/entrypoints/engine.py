@@ -369,6 +369,11 @@ class Engine(EngineScoreMixin, EngineBase):
         video_data: Optional[MultimodalDataInputFormat] = None,
         # See GenerateReqInput.mm_hashes / async_generate for the contract.
         mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
+        # SHA-256 identities for the original media contents. See
+        # GenerateReqInput.mm_content_hashes.
+        mm_content_hashes: Optional[
+            Union[List[Optional[str]], List[List[Optional[str]]]]
+        ] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -394,6 +399,8 @@ class Engine(EngineScoreMixin, EngineBase):
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        *,
+        cache_salt: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -411,6 +418,8 @@ class Engine(EngineScoreMixin, EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             mm_hashes=mm_hashes,
+            mm_content_hashes=mm_content_hashes,
+            cache_salt=cache_salt,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -475,6 +484,9 @@ class Engine(EngineScoreMixin, EngineBase):
         # that compute their own per-image hash for routing decisions and need
         # sglang's prefix-cache key to align. See GenerateReqInput.mm_hashes.
         mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
+        mm_content_hashes: Optional[
+            Union[List[Optional[str]], List[List[Optional[str]]]]
+        ] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -500,6 +512,8 @@ class Engine(EngineScoreMixin, EngineBase):
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        *,
+        cache_salt: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -517,6 +531,8 @@ class Engine(EngineScoreMixin, EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             mm_hashes=mm_hashes,
+            mm_content_hashes=mm_content_hashes,
+            cache_salt=cache_salt,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -1191,26 +1207,32 @@ class Engine(EngineScoreMixin, EngineBase):
             tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
             template_manager = None
 
-        # Wait for the model to finish loading
-        scheduler_init_result.wait_for_ready()
+        startup_complete = False
+        try:
+            # Wait for the model to finish loading
+            scheduler_init_result.wait_for_ready()
 
-        cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
+            cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
 
-        # Get back some info from scheduler to tokenizer_manager
-        tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[0][
-            "max_req_input_len"
-        ]
+            # Get back some info from scheduler to tokenizer_manager
+            tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
+                0
+            ]["max_req_input_len"]
 
-        # Set up subprocess liveness watchdog to detect crashes
-        # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
-        processes = list(scheduler_procs or [])
-        names = [f"scheduler_{i}" for i in range(len(processes))]
-        processes.extend(detoken_procs)
-        names.extend(detoken_names)
-        subprocess_watchdog = SubprocessWatchdog(
-            processes=processes, process_names=names
-        )
-        subprocess_watchdog.start()
+            # Set up subprocess liveness watchdog to detect crashes
+            # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
+            processes = list(scheduler_procs or [])
+            names = [f"scheduler_{i}" for i in range(len(processes))]
+            processes.extend(detoken_procs)
+            names.extend(detoken_names)
+            subprocess_watchdog = SubprocessWatchdog(
+                processes=processes, process_names=names
+            )
+            subprocess_watchdog.start()
+            startup_complete = True
+        finally:
+            if not startup_complete and isinstance(tokenizer_manager, TokenizerManager):
+                tokenizer_manager.cuda_vmm_feature_transport.shutdown()
 
         return (
             tokenizer_manager,
@@ -1225,26 +1247,33 @@ class Engine(EngineScoreMixin, EngineBase):
         """Shutdown the engine; block until the scheduler subprocess releases
         its GPU context so the caller can immediately reallocate on the same
         device."""
-        if (
-            self.tokenizer_manager is not None
-            and self.tokenizer_manager._subprocess_watchdog is not None
-        ):
-            self.tokenizer_manager._subprocess_watchdog.stop()
+        try:
+            if (
+                self.tokenizer_manager is not None
+                and self.tokenizer_manager._subprocess_watchdog is not None
+            ):
+                self.tokenizer_manager._subprocess_watchdog.stop()
 
-        send_to_rpc = getattr(self, "send_to_rpc", None)
-        if send_to_rpc is not None:
-            send_to_rpc.close(linger=0)
-            self.send_to_rpc = None
+            send_to_rpc = getattr(self, "send_to_rpc", None)
+            if send_to_rpc is not None:
+                send_to_rpc.close(linger=0)
+                self.send_to_rpc = None
 
-        # Gracefully stop weight cache daemons *before* the blanket
-        # kill_process_tree below, so their SIGTERM handlers can unlink the
-        # .sock/.ready files instead of being SIGKILLed and leaving stale state.
-        daemon_procs = getattr(self, "_weight_cache_daemon_procs", None)
-        if daemon_procs:
-            self._terminate_weight_cache_daemons(daemon_procs)
-            self._weight_cache_daemon_procs = []
+            # Gracefully stop weight cache daemons *before* the blanket
+            # kill_process_tree below, so their SIGTERM handlers can unlink the
+            # .sock/.ready files instead of being SIGKILLed and leaving stale state.
+            daemon_procs = getattr(self, "_weight_cache_daemon_procs", None)
+            if daemon_procs:
+                self._terminate_weight_cache_daemons(daemon_procs)
+                self._weight_cache_daemon_procs = []
 
-        kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
+            kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
+        finally:
+            if isinstance(self.tokenizer_manager, TokenizerManager):
+                mm_processor = getattr(self.tokenizer_manager, "mm_processor", None)
+                if mm_processor is not None:
+                    mm_processor.shutdown()
+                self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
 
     def __enter__(self):
         return self
@@ -1643,7 +1672,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.15.post1",
+                "0.6.17",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -1651,7 +1680,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.5",
+                "0.4.6.post1",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 

@@ -119,16 +119,25 @@ jobs:
           UV_SYSTEM_PYTHON: "1"
         run: |
           uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
+          source scripts/ci/utils/sgl_eval_ref.sh
+          uv pip install "$SGL_EVAL_SPEC" --index-strategy unsafe-best-match
 
       # Hosted runners are ephemeral, so models are re-fetched every run and the
       # Hub occasionally returns 429s. Persist the HF cache in GitHub's cache
       # storage (rolling key + restore-keys) so warm runs never hit the network.
-      - name: Cache HF hub
-        uses: actions/cache@v4
+      # Reads see this ref plus the default branch: only main refreshes the base.
+      - name: Restore HF hub cache
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.hf-cache
           key: hf-cpu-${{ matrix.partition }}-${{ github.run_id }}
           restore-keys: hf-cpu-${{ matrix.partition }}-
+
+      - name: Record restored HF cache size
+        id: hf_cache_before
+        run: |
+          size=$(du -sb "$HF_HOME" 2>/dev/null | cut -f1)
+          echo "bytes=${size:-0}" >> "$GITHUB_OUTPUT"
 
       # Pinned SHA so every shard splits against the same snapshot; without
       # the file run_suite falls back to the (drifting) in-source est_time.
@@ -147,3 +156,25 @@ jobs:
         run: |
           cd test/
           python3 run_suite.py --hw cpu --suite ${{ inputs.self_name }} --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} --partition-model-file /tmp/partition-model.json $CONTINUE_ON_ERROR_FLAG
+
+      # PRs save only what the base lacks; the implicit if: success() keeps a
+      # half-downloaded cache unpublished.
+      - name: Decide whether to save the HF cache
+        id: hf_cache_save
+        run: |
+          size=$(du -sb "$HF_HOME" 2>/dev/null | cut -f1)
+          after=${size:-0}
+          before='${{ steps.hf_cache_before.outputs.bytes }}'
+          if [ "$GITHUB_REF" = "refs/heads/main" ] || [ "$after" -gt "$before" ]; then
+            echo "save=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "save=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "hf cache bytes: before=$before after=$after"
+
+      - name: Save HF hub cache
+        if: steps.hf_cache_save.outputs.save == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.hf-cache
+          key: hf-cpu-${{ matrix.partition }}-${{ github.run_id }}
