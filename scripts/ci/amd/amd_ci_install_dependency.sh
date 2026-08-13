@@ -134,8 +134,6 @@ else
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
 fi
 
-# mmlu evals shell out to the sgl-eval CLI; the pinned commit is shared with
-# every other CI variant.
 # shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../utils/sgl_eval_ref.sh"
 install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "$SGL_EVAL_SPEC"

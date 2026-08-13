@@ -119,8 +119,6 @@ jobs:
           UV_SYSTEM_PYTHON: "1"
         run: |
           uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
-          # mmlu evals shell out to the sgl-eval CLI; the pinned commit is
-          # shared with every other CI variant.
           source scripts/ci/utils/sgl_eval_ref.sh
           uv pip install "$SGL_EVAL_SPEC" --index-strategy unsafe-best-match
 

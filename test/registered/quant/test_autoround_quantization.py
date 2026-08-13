@@ -29,8 +29,7 @@ register_cuda_ci(est_time=120, stage="extra-a", runner_config="1-gpu-large")
 MMLU_NUM_EXAMPLES = 256
 MMLU_NUM_THREADS = 32
 # The unquantized model scores 0.68-0.70 over 256 questions; int8 gives up a
-# point or two, then the 0.05 margin the other eval thresholds use. 32 questions
-# was too few to gate on -- one question moved the score by 3 points.
+# point or two, then the 0.05 margin the other eval thresholds use.
 MMLU_SCORE_THRESHOLD = 0.63
 
 
