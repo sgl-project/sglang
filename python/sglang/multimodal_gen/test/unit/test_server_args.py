@@ -998,6 +998,80 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.dit_layerwise_offload)
         self.assertEqual(args.layerwise_offload_components, ["dit"])
 
+    def test_explicit_layerwise_false_keeps_independent_auto_residency(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "performance_mode": "auto",
+                "dit_layerwise_offload": False,
+            },
+        )
+
+        self.assertFalse(args.dit_layerwise_offload)
+        self.assertFalse(args.dit_cpu_offload)
+
+    def test_explicit_dit_cpu_offload_is_preserved_by_auto_residency(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "performance_mode": "auto",
+                "dit_layerwise_offload": False,
+                "dit_cpu_offload": True,
+            },
+        )
+
+        self.assertFalse(args.dit_layerwise_offload)
+        self.assertTrue(args.dit_cpu_offload)
+
+    def test_explicit_layerwise_true_preserves_initial_dit_residency(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "performance_mode": "auto",
+                "dit_layerwise_offload": True,
+            },
+        )
+
+        self.assertTrue(args.dit_layerwise_offload)
+        self.assertTrue(args.dit_cpu_offload)
+
+    def test_explicit_vae_cpu_offload_is_preserved_by_auto_residency(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "performance_mode": "auto",
+                "dit_layerwise_offload": False,
+                "vae_cpu_offload": True,
+            },
+        )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.vae_cpu_offload)
+
+    def test_explicit_cpu_offload_components_are_preserved_by_auto_residency(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "performance_mode": "auto",
+                "cpu_offload_components": ["dit", "vae"],
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertTrue(args.vae_cpu_offload)
+
+    def test_explicit_dit_layerwise_component_preserves_initial_residency(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "performance_mode": "auto",
+                "layerwise_offload_components": ["dit"],
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertEqual(args.layerwise_offload_components, ["dit"])
+
     def test_pipeline_configs_declare_auto_tune_hints(self):
         qwen_deployment = QwenImagePipelineConfig().get_model_deployment_config()
         wan_deployment = WanT2V480PConfig().get_model_deployment_config()
@@ -1724,10 +1798,12 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
-        self.assertTrue(args.dit_cpu_offload)
+        # Explicit FSDP selection must not freeze unrelated, implicit DiT
+        # residency decisions on a high-memory GPU.
+        self.assertFalse(args.dit_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
-        # explicit use_fsdp_inference skips the residency pass, but the layerwise
-        # filter still drops vae (kept resident); encoders stay offloaded
+        # The layerwise filter still drops VAE (kept resident); encoders stay
+        # offloaded.
         self.assertEqual(
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder"],
