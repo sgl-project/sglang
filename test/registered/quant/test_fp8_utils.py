@@ -81,7 +81,7 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
                 input, qinput, weight, input_scale, weight_scale = self._make_inputs()
                 seen_scales = []
 
-                def fake_fp8_scaled_mm(
+                def fake_fp8_per_tensor_scaled_mm(
                     mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None
                 ):
                     seen_scales.append(scales_a)
@@ -98,7 +98,9 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
                 }
                 capabilities[capability] = True
                 with patch.multiple(fp8_utils, **capabilities), patch.object(
-                    fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm
+                    fp8_utils,
+                    "fp8_per_tensor_scaled_mm",
+                    side_effect=fake_fp8_per_tensor_scaled_mm,
                 ), patch.object(fp8_utils, "get_exec", return_value=exec_config):
                     fp8_utils.apply_fp8_linear(
                         input,
@@ -145,7 +147,9 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
         input, qinput, weight, input_scale, weight_scale = self._make_inputs()
         seen_scales = []
 
-        def fake_fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
+        def fake_fp8_per_tensor_scaled_mm(
+            mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None
+        ):
             seen_scales.append(scales_a)
             return torch.empty(
                 (mat_a.shape[0], mat_b.shape[1]), dtype=out_dtype, device=mat_a.device
@@ -156,7 +160,11 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
             _is_sm90_supported=False,
             _is_sm100_supported=False,
             _is_sm120_supported=False,
-        ), patch.object(fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm):
+        ), patch.object(
+            fp8_utils,
+            "fp8_per_tensor_scaled_mm",
+            side_effect=fake_fp8_per_tensor_scaled_mm,
+        ):
             fp8_utils.apply_fp8_linear(
                 input,
                 weight,
