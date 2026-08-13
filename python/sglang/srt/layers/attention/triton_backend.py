@@ -756,6 +756,19 @@ class TritonAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
             )
+            # Physical-loc contract tripwire (replay only — capture batches
+            # are runner-built with zero-filled static buffers and carry no
+            # flag): a live ForwardBatch that skipped the rebind would feed
+            # virtual ids into the captured store as if physical.
+            if (
+                self._translate_kv_loc is not None
+                and forward_batch.out_cache_loc is not None
+            ):
+                assert forward_batch.out_cache_loc_is_physical, (
+                    "unified pool: forward_batch.out_cache_loc is not physical "
+                    "— the ForwardBatch was built without "
+                    "apply_unified_kv_loc_rebind"
+                )
             # Metadata view is reused from capture; just refill the buffers.
             self._translate_cuda_graph_shared_pool_locs(forward_batch, bs)
             self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
@@ -1168,6 +1181,12 @@ class TritonAttnBackend(AttentionBackend):
             self._translate_kv_loc is not None
             and forward_batch.out_cache_loc is not None
         ):
+            # Physical-loc contract tripwire: a hand-built ForwardBatch that
+            # skipped the rebind would write virtual ids as if physical.
+            assert forward_batch.out_cache_loc_is_physical, (
+                "unified pool: forward_batch.out_cache_loc is not physical — "
+                "the ForwardBatch was built without apply_unified_kv_loc_rebind"
+            )
             out_cache_loc_full_physical = forward_batch.out_cache_loc
 
         self.forward_metadata = ForwardMetadata(

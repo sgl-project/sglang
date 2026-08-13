@@ -635,6 +635,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # (apply_unified_kv_loc_rebind, dense-first). Copy into the
             # capture-stable buffer — the captured write kernel reads THIS
             # buffer, so each replay must refill it.
+            assert forward_batch.out_cache_loc_is_physical, (
+                "unified pool: forward_batch.out_cache_loc is not kernel-facing "
+                "— the ForwardBatch was built without apply_unified_kv_loc_rebind"
+            )
             n = out_cache_loc.shape[0]
             dst = self.cuda_graph_out_cache_loc_dense[:n]
             dst.copy_(out_cache_loc)
