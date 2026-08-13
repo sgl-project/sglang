@@ -414,6 +414,7 @@ def _test_one_model(
         )
         today_exp_dir = today_dump_dir / EXP_NAME
         _assert_decode_captured(today_exp_dir, tp_size=model_setup.tp_size)
+        _assert_fused_tp_layout(today_exp_dir)
 
         has_baseline = baseline_exp_dir.exists() and any(baseline_exp_dir.glob("*.pt"))
 
@@ -681,6 +682,7 @@ def _run_comparator(
 
 _RANK_TAG_RE = re.compile(r"___rank=\d+___")
 _NAME_TAG_RE = re.compile(r"(?:^|___)name=(.*?)(?:___|$)")
+_LAYER_INPUT_RE = re.compile(r"^non_intrusive__model\.layers\.(\d+)\.inputs\.1$")
 
 
 def _detect_tp_layouts(dump_dir: Path) -> dict[str, str]:
@@ -713,6 +715,25 @@ def _detect_tp_layouts(dump_dir: Path) -> dict[str, str]:
     return layouts
 
 
+def _assert_fused_tp_layout(dump_dir: Path) -> None:
+    layouts = _detect_tp_layouts(dump_dir)
+    non_initial_layers = {
+        name: layout
+        for name, layout in layouts.items()
+        if (match := _LAYER_INPUT_RE.match(name)) and int(match.group(1)) > 0
+    }
+    if not non_initial_layers:
+        raise AssertionError("no non-initial transformer layer dumps found")
+    replicated = [
+        name for name, layout in non_initial_layers.items() if layout != "partial"
+    ]
+    if replicated:
+        raise AssertionError(
+            "flashinfer allreduce fusion did not produce TP-partial hidden states; "
+            f"replicated layers={replicated}. Refusing to compare or update baseline."
+        )
+
+
 class TestTpLayoutDetection(unittest.TestCase):
     def test_mixed_layouts(self):
         with tempfile.TemporaryDirectory() as td:
@@ -730,6 +751,18 @@ class TestTpLayoutDetection(unittest.TestCase):
                 _detect_tp_layouts(dump_dir),
                 {"partial": "partial", "replicated": "replicated"},
             )
+
+    def test_rejects_replicated_non_initial_layer(self):
+        with tempfile.TemporaryDirectory() as td:
+            dump_dir = Path(td)
+            name = "non_intrusive__model.layers.8.inputs.1"
+            for rank in (0, 1):
+                torch.save(
+                    {"value": torch.tensor([[1.0, 2.0]])},
+                    dump_dir / f"step=0___rank={rank}___name={name}.pt",
+                )
+            with self.assertRaisesRegex(AssertionError, "Refusing to compare"):
+                _assert_fused_tp_layout(dump_dir)
 
 
 def _update_baseline(model_baseline_dir: Path, today_exp_dir: Path):

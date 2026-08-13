@@ -56,6 +56,11 @@ on:
         required: false
         type: boolean
         default: false
+      refresh_precision_baseline:
+        description: "Force-refresh the nightly precision baseline. Restricted by the slash-command handler to the precision test on trusted in-repo PRs."
+        required: false
+        type: boolean
+        default: false
 
 # Mirrors _pr-test-stage.yml's env, so a rerun validates what CI actually ran.
 env:
@@ -70,7 +75,9 @@ env:
   IS_H200: ${{ inputs.runs_on == '8-gpu-h200' && '1' || '0' }}
   SGLANG_PRECISION_HF_REPO: ${{ vars.SGLANG_PRECISION_HF_REPO }}
   SGLANG_PRECISION_HF_REVISION: ${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}
-  SGLANG_PRECISION_HF_READ_ONLY: "1"
+  SGLANG_PRECISION_HF_READ_ONLY: ${{ inputs.refresh_precision_baseline && '0' || '1' }}
+  SGLANG_PRECISION_FORCE_UPDATE: ${{ inputs.refresh_precision_baseline && '1' || '0' }}
+  SGLANG_PRECISION_COMMIT: ${{ inputs.pr_head_sha || github.sha }}
 
 permissions:
   actions: write
@@ -134,7 +141,20 @@ jobs:
 
       - name: Run test
         timeout-minutes: 60
+        env:
+          TEST_COMMAND: ${{ inputs.test_command }}
+          SGLANG_PRECISION_HF_TOKEN: ${{ inputs.refresh_precision_baseline && inputs.mode == 'cuda' && inputs.runs_on == '8-gpu-h200' && inputs.test_command == 'registered/debug_utils/test_nightly_precision_regression.py' && inputs.pr_head_sha == '' && secrets.HF_TOKEN_PRECISION_STORE || '' }}
         run: |
+          if [[ "${{ inputs.refresh_precision_baseline }}" == "true" ]]; then
+            expected="registered/debug_utils/test_nightly_precision_regression.py"
+            if [[ "${{ inputs.mode }}" != "cuda" \
+               || "${{ inputs.runs_on }}" != "8-gpu-h200" \
+               || -n "${{ inputs.pr_head_sha }}" \
+               || "$TEST_COMMAND" != "$expected" ]]; then
+              echo "::error::Precision baseline refresh only accepts $expected on 8-gpu-h200"
+              exit 1
+            fi
+          fi
           if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
           fi
@@ -142,7 +162,7 @@ jobs:
           while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
             cmds+=("$cmd")
-          done <<< "${{ inputs.test_command }}"
+          done <<< "$TEST_COMMAND"
           total=${#cmds[@]}
           suite_start=$SECONDS
           for idx in "${!cmds[@]}"; do

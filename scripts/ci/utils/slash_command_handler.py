@@ -27,6 +27,8 @@ _ALLOWED_INSTALL_SCRIPT = re.compile(r"^scripts/ci/cuda/[\w.-]+\.sh$")
 
 # Configuration
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
+PRECISION_BASELINE_TEST = "registered/debug_utils/test_nightly_precision_regression.py"
+PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
 
 
 MAINTENANCE_ISSUE_NUMBER = 21065
@@ -921,7 +923,15 @@ def _resolve_test_spec(test_spec):
     return out
 
 
-def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker=""):
+def _dispatch_batch(
+    gh_repo,
+    pr,
+    batch,
+    token,
+    reply_comment_id="",
+    reply_marker="",
+    refresh_precision_baseline=False,
+):
     """
     Dispatch a single workflow run for a batch of resolved test specs that
     share the same dispatch shape (mode + runs_on + install_script +
@@ -969,6 +979,7 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
             "rdma_devices": rdma_devices,
             "reply_comment_id": str(reply_comment_id) if reply_comment_id else "",
             "reply_marker": reply_marker,
+            "refresh_precision_baseline": str(refresh_precision_baseline).lower(),
         }
         if is_fork:
             ref = "main"
@@ -1060,6 +1071,27 @@ def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name
     return True
 
 
+def _check_precision_baseline_refresh_permissions(gh_repo, pr, comment):
+    commenter = comment.user.login
+    is_fork = pr.head.repo is None or pr.head.repo.full_name != gh_repo.full_name
+    if is_fork:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            "⛔ Precision baseline refresh is only available on PR branches in "
+            "this repository. Fork PR code cannot receive the baseline write token."
+        )
+        return False
+
+    perm = gh_repo.get_collaborator_permission(commenter)
+    if perm not in ("admin", "maintain", "write"):
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            "⛔ Precision baseline refresh requires write permission on the repo."
+        )
+        return False
+    return True
+
+
 def handle_rerun_test(
     gh_repo,
     pr,
@@ -1069,6 +1101,7 @@ def handle_rerun_test(
     token,
     skip_permission_check=False,
     command_label=None,
+    refresh_precision_baseline=False,
 ):
     """
     Handles the /rerun-test command. Resolves all test specs, groups them by
@@ -1077,6 +1110,12 @@ def handle_rerun_test(
     """
     if not skip_permission_check and not _check_rerun_test_permissions(
         gh_repo, pr, comment, user_perms, "rerun-test"
+    ):
+        return False
+
+    if (
+        refresh_precision_baseline
+        and not _check_precision_baseline_refresh_permissions(gh_repo, pr, comment)
     ):
         return False
 
@@ -1160,6 +1199,20 @@ def handle_rerun_test(
             seen_commands.add(key)
             resolved.append(r)
 
+    if refresh_precision_baseline:
+        is_exact_precision_test = (
+            not resolve_failures
+            and len(resolved) == 1
+            and resolved[0]["test_command"] == PRECISION_BASELINE_TEST
+        )
+        if not is_exact_precision_test:
+            comment.create_reaction("confused")
+            pr.create_issue_comment(
+                "⛔ `--refresh-precision-baseline` must be used alone with "
+                f"`test/{PRECISION_BASELINE_TEST}`."
+            )
+            return False
+
     # Phase 2: Group by dispatch shape.
     groups = {}
     for r in resolved:
@@ -1192,6 +1245,7 @@ def handle_rerun_test(
                 token,
                 reply_comment_id=reply_comment.id,
                 reply_marker=marker,
+                refresh_precision_baseline=refresh_precision_baseline,
             )
         )
 
@@ -1418,7 +1472,11 @@ def main():
         )
 
     elif first_line.startswith("/rerun-test"):
-        test_specs = first_line.split()[1:]
+        rerun_args = first_line.split()[1:]
+        refresh_precision_baseline = PRECISION_BASELINE_REFRESH_FLAG in rerun_args
+        test_specs = [
+            arg for arg in rerun_args if arg != PRECISION_BASELINE_REFRESH_FLAG
+        ]
         handle_rerun_test(
             repo,
             pr,
@@ -1427,6 +1485,7 @@ def main():
             test_specs or None,
             token,
             command_label=first_line,
+            refresh_precision_baseline=refresh_precision_baseline,
         )
 
     else:
