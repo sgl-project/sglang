@@ -687,6 +687,30 @@ def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
     )
 
 
+def test_kimi_k3_normal_deferred_config_selects_gpu_backend():
+    processor = KimiK3GPUProcessorWrapper(
+        _HFProcessor(),
+        image_token="<|media_pad|>",
+        image_token_id=99,
+        patch_size=14,
+        merge_kernel_size=2,
+        in_patch_limit=16384,
+        patch_limit_on_one_side=256,
+        fixed_output_tokens=None,
+        image_mean=[0.5, 0.5, 0.5],
+        image_std=[0.5, 0.5, 0.5],
+        transparent_bg_config=None,
+    )
+
+    _, _, deferred_config = processor.prepare_deferred(
+        "<|media_pad|>",
+        [torch.zeros((3, 32, 32), dtype=torch.uint8)],
+        [99],
+    )
+
+    assert deferred_config["backend"] == "gpu"
+
+
 def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
     from sglang.srt.multimodal.kimi_k3_image_processing import (
         DEFERRED_PREPROCESSING_KEY,
@@ -718,6 +742,7 @@ def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
                     },
                 ],
                 {
+                    "backend": "gpu",
                     "image_mean": [0.5, 0.5, 0.5],
                     "image_std": [0.5, 0.5, 0.5],
                     "transparent_bg_config": None,
@@ -753,6 +778,10 @@ def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
     assert all(item.pad_value is not None for item in output.mm_items)
     assert all(
         DEFERRED_PREPROCESSING_KEY in item.model_specific_data
+        for item in output.mm_items
+    )
+    assert all(
+        item.model_specific_data[DEFERRED_PREPROCESSING_KEY]["backend"] == "gpu"
         for item in output.mm_items
     )
 
