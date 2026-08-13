@@ -2769,6 +2769,21 @@ class ServerArgs:
         "environment override when this argument is 0.",
         NS("mm"),
     ] = 0
+    mm_preprocess_cache_size_mb: A[
+        Optional[int],
+        "CPU memory budget for content-addressed multimodal preprocessing "
+        "artifacts. Unset selects a model-specific default (256 MiB for "
+        "Kimi-K3); 0 disables the cache. The budget is divided across "
+        "tokenizer workers and does not reserve GPU memory.",
+        NS("mm"),
+    ] = None
+    trust_mm_content_hashes: A[
+        bool,
+        "Trust caller-provided multimodal SHA-256 content hashes. This can "
+        "skip reading media on a hot metadata-cache hit; only enable it when "
+        "the caller guarantees that hashes identify immutable media bytes.",
+        NS("mm"),
+    ] = False
     limit_mm_data_per_request: A[
         Optional[Union[str, Dict[str, int]]],
         Arg(
@@ -4008,6 +4023,11 @@ class ServerArgs:
 
     def _handle_multimodal(self):
         """Validate mm_process_config structure before model loading."""
+        if (
+            self.mm_preprocess_cache_size_mb is not None
+            and self.mm_preprocess_cache_size_mb < 0
+        ):
+            raise ValueError("mm_preprocess_cache_size_mb must be non-negative")
         if self.mm_process_config is not None:
             if not isinstance(self.mm_process_config, dict):
                 raise TypeError(
