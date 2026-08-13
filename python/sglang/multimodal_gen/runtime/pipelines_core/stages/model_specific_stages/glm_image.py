@@ -538,7 +538,7 @@ class GlmImageAR(PipelineStage):
             usages.append(_extract_srt_usage(item.get("meta_info")))
         return prior_token_ids, usages
 
-    def populate_prior_tokens_for_requests(
+    def generate_and_assign_prior_tokens(
         self,
         batches: list[Req],
         server_args: ServerArgs,
@@ -612,7 +612,7 @@ class GlmImageAR(PipelineStage):
         if any(batch.height != height or batch.width != width for batch in batches[1:]):
             return super().run_grouped_requests(batches, server_args)
 
-        return self.populate_prior_tokens_for_requests(batches, server_args)
+        return self.generate_and_assign_prior_tokens(batches, server_args)
 
     def iter_sequential_requests(
         self, batch: Req, server_args: ServerArgs

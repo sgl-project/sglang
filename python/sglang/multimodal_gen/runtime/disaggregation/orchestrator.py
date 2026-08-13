@@ -541,7 +541,7 @@ class DiffusionServer:
                 pass
         state.active_ar_batch = (
             state.executor.submit(
-                state.ar_stage.populate_prior_tokens_for_requests,
+                state.ar_stage.generate_and_assign_prior_tokens,
                 [request.req for request in requests],
                 state.server_args,
                 device=torch.device("cpu"),
