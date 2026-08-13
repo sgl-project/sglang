@@ -502,9 +502,8 @@ def flash_prefill_with_topk_index(
         o = torch.empty(
             total_q, num_heads, v_head_dim, dtype=sparse_out_dtype(q), device=q.device
         )
-    score = torch.full(
+    score = torch.empty(
         (num_heads, total_q, max_seqblock_k),
-        float("-inf"),
         dtype=torch.float32,
         device=q.device,
     )
