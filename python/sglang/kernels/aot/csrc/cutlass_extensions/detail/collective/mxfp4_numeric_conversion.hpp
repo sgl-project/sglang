@@ -109,8 +109,12 @@ struct NumericArrayConverter<cutlass::float_e4m3_t, cutlass::float_e2m1_t, N, Ro
           "  prmt.b32 %0, pos_f8s, neg_f8s, %6;\n"
           "}\n"
           : "=r"(r[ii])
-          : "n"(POS_E4M3s_REG1), "n"(POS_E4M3s_REG2), "n"(NEG_E4M3s_REG1), "n"(NEG_E4M3s_REG2),
-            "r"(lut_idx), "r"(final_prmt_idx));
+          : "n"(POS_E4M3s_REG1),
+            "n"(POS_E4M3s_REG2),
+            "n"(NEG_E4M3s_REG1),
+            "n"(NEG_E4M3s_REG2),
+            "r"(lut_idx),
+            "r"(final_prmt_idx));
     }
     return reinterpret_cast<PackedResultType&>(r);
   }
@@ -121,11 +125,10 @@ struct NumericArrayConverter<cutlass::float_e4m3_t, cutlass::float_e2m1_t, N, Ro
   CUTLASS_DEVICE
   static result_type convert(source_type const& source) {
     result_type result;
-    using ConverterType =
-        NumericArrayConverter<typename result_type::Element, typename source_type::Element, N, Round>;
-    detail::VectorizedConverter::convert<
-        ConverterType, result_type_packed_8, source_type_packed_8, result_type_packed_4, source_type_packed_4>(
-        result, source);
+    using ConverterType = NumericArrayConverter<typename result_type::Element, typename source_type::Element, N, Round>;
+    detail::VectorizedConverter::
+        convert<ConverterType, result_type_packed_8, source_type_packed_8, result_type_packed_4, source_type_packed_4>(
+            result, source);
     return result;
   }
 

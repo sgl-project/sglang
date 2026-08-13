@@ -303,9 +303,8 @@ struct CollectiveMmaArrayMixedInput<
   // (no scale) we fall back to the tile-K size so no chunking is introduced.
   static constexpr int MxScalePackedNum =
       cutlass::detail::is_Array_v<ElementScale> ? static_cast<int>(NonVoidElementScale::kElements) : 1;
-  static constexpr int MxGroupSize =
-      ModeHasScales ? (static_cast<int>(cute::size<2>(TileShape{})) / MxScalePackedNum)
-                    : static_cast<int>(cute::size<2>(TileShape{}));
+  static constexpr int MxGroupSize = ModeHasScales ? (static_cast<int>(cute::size<2>(TileShape{})) / MxScalePackedNum)
+                                                   : static_cast<int>(cute::size<2>(TileShape{}));
 
   // --- MXFP4A8: per-token + per-block (mxfp8) ACTIVATION block-scale support ---
   // The RS mixed-input mainloop already applies a per-K-block WEIGHT scale
@@ -609,8 +608,8 @@ struct CollectiveMmaArrayMixedInput<
       if constexpr (EnableActBlockScale) {
         NonVoidElementScale const* ptr_AS = reinterpret_cast<NonVoidElementScale const*>(args.ptr_AS);
         StrideScale dAS{};
-        Tensor tensor_act_scale = make_tensor(
-            detail::get_logical_ptr(ptr_AS), make_layout(make_shape(init_N, fake_scale_k, mock_L), dAS));
+        Tensor tensor_act_scale =
+            make_tensor(detail::get_logical_ptr(ptr_AS), make_layout(make_shape(init_N, fake_scale_k, mock_L), dAS));
         tma_load_act_scale = make_tma_copy<TmaElementScale>(
             GmemTiledCopyScale{},
             tensor_act_scale,
@@ -769,11 +768,11 @@ struct CollectiveMmaArrayMixedInput<
   static constexpr uint32_t TmaTransactionBytesNK = Utils::compute_tma_transaction_bytes_nk();
   static constexpr uint32_t TmaTransactionBytesExtra = Utils::compute_tma_transaction_bytes_extra();
   // MXFP4A8: extra bytes for the activation block-scale TMA (one stage). 0 for int4a8.
-  static constexpr uint32_t TmaTransactionBytesActScale = EnableActBlockScale
-      ? cutlass::bits_to_bytes(
-            size<0>(SmemLayoutActScale{}) * size<1>(SmemLayoutActScale{}) *
-            static_cast<uint32_t>(cute::sizeof_bits_v<NonVoidElementScale>))
-      : 0;
+  static constexpr uint32_t TmaTransactionBytesActScale =
+      EnableActBlockScale ? cutlass::bits_to_bytes(
+                                size<0>(SmemLayoutActScale{}) * size<1>(SmemLayoutActScale{}) *
+                                static_cast<uint32_t>(cute::sizeof_bits_v<NonVoidElementScale>))
+                          : 0;
   static constexpr uint32_t TmaTransactionBytes =
       TmaTransactionBytesMK + TmaTransactionBytesNK + TmaTransactionBytesExtra + TmaTransactionBytesActScale;
 
@@ -972,8 +971,8 @@ struct CollectiveMmaArrayMixedInput<
             Tensor gAS_nkl = get<3>(load_inputs);
             auto block_tma_as = mainloop_params.tma_load_act_scale.get_slice(cluster_local_block_id.x);
             Tensor gAS = gAS_nkl(_, _, n_coord, _, l_coord);  // (BLK_N,BLK_K,k)
-            Tensor tASgAS = block_tma_as.partition_S(gAS);     // (TMA,TMA_N,TMA_K,k)
-            Tensor tASsAS = block_tma_as.partition_D(sAS);     // (TMA,TMA_N,TMA_K,PIPE)
+            Tensor tASgAS = block_tma_as.partition_S(gAS);    // (TMA,TMA_N,TMA_K,k)
+            Tensor tASsAS = block_tma_as.partition_D(sAS);    // (TMA,TMA_N,TMA_K,PIPE)
             if (cute::elect_one_sync()) {
               copy(
                   mainloop_params.tma_load_act_scale.with(get<3>(input_tensormaps), *tma_barrier, mcast_mask_s),
@@ -1163,8 +1162,7 @@ struct CollectiveMmaArrayMixedInput<
     // partition_C broadcast layout, which mislocated the smem read.
     auto tCcAS = [&]() {
       if constexpr (EnableActBlockScale) {
-        return thr_mma_c.partition_C(
-            make_identity_tensor(make_shape(size<0>(TileShape{}), size<1>(TileShape{}))));
+        return thr_mma_c.partition_C(make_identity_tensor(make_shape(size<0>(TileShape{}), size<1>(TileShape{}))));
       } else {
         return 0;
       }
@@ -1185,8 +1183,8 @@ struct CollectiveMmaArrayMixedInput<
         // the raw-read diagnostic. For each accumulator fragment element, the
         // partitioned identity tensor `tCcAS(i)` yields its (wch, token) tile
         // coordinate; we read the kElements packed chunk-scales for that token.
-        auto const* raw = reinterpret_cast<typename NonVoidElementScale::Element const*>(
-            shared_tensors.smem_act_scale.begin());
+        auto const* raw =
+            reinterpret_cast<typename NonVoidElementScale::Element const*>(shared_tensors.smem_act_scale.begin());
         const int stage_off = stage * static_cast<int>(cute::size<0>(SmemLayoutActScale{})) *
                               static_cast<int>(NonVoidElementScale::kElements);
         CUTLASS_PRAGMA_UNROLL
@@ -1380,8 +1378,7 @@ struct CollectiveMmaArrayMixedInput<
                       if constexpr (EnableActBlockScale) {
                         gscale *= static_cast<float>(tCrAS(accum_coord)[chunk_id_]);
                       }
-                      accum(accum_coord) =
-                          fma(intermediate_array[chunk_id_](accum_coord), gscale, accum(accum_coord));
+                      accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), gscale, accum(accum_coord));
                     }
                   }
                 }
@@ -1545,8 +1542,7 @@ struct CollectiveMmaArrayMixedInput<
         copy(recast<uint128_t>(pS_tensormap), recast<uint128_t>(sS_tensormap));
       }
       if constexpr (EnableActBlockScale) {
-        Tensor pAS_tensormap =
-            make_tensor(mainloop_params.tma_load_act_scale.get_tma_descriptor(), Int<1>{}, Int<1>{});
+        Tensor pAS_tensormap = make_tensor(mainloop_params.tma_load_act_scale.get_tma_descriptor(), Int<1>{}, Int<1>{});
         Tensor sAS_tensormap =
             make_tensor(make_smem_ptr(&shared_tensormaps.smem_tensormap_act_scale), Int<1>{}, Int<1>{});
         if (cute::elect_one_sync()) {

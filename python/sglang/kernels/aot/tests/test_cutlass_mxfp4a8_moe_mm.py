@@ -18,6 +18,7 @@ import sys
 
 import torch
 from sgl_kernel import cutlass_mxfp4a8_moe_mm
+
 from sglang.srt.layers.mxfp4a8_utils import build_grouped_act_block_scale
 
 # E2M1 magnitude table indexed by the 3-bit magnitude index (exp<<1 | mant).
@@ -113,7 +114,7 @@ def run_case(pack_fn, label, num_experts, m, k, n, device, seed=0):
 
     # E8M0 power-of-2 scale, block=32 along K -> [E,N,K//CHUNK]
     exps = torch.randint(-4, 3, (num_experts, n, k // CHUNK), device=device)
-    w_scale = (2.0 ** exps.to(torch.float32))  # exact powers of two
+    w_scale = 2.0 ** exps.to(torch.float32)  # exact powers of two
 
     b_packed = pack_fn(codes).view(num_experts, n, k // 2).contiguous()
     b_scale = interleave_scales(w_scale.to(torch.bfloat16)).contiguous()
@@ -129,10 +130,19 @@ def run_case(pack_fn, label, num_experts, m, k, n, device, seed=0):
 
     c = torch.empty((m, n), dtype=torch.bfloat16, device=device)
     cutlass_mxfp4a8_moe_mm(
-        c, a_q, b_packed, a_scale, b_scale,
-        expert_offsets[:-1], problem_sizes,
-        a_strides, b_strides, c_strides, s_strides,
-        CHUNK, 8,
+        c,
+        a_q,
+        b_packed,
+        a_scale,
+        b_scale,
+        expert_offsets[:-1],
+        problem_sizes,
+        a_strides,
+        b_strides,
+        c_strides,
+        s_strides,
+        CHUNK,
+        8,
     )
     c = c.to(dtype)
 
@@ -254,16 +264,29 @@ def run_case_mxfp8_act(pack_fn, label, num_experts, m, k, n, device, seed=0):
 
     c = torch.empty((m, n), dtype=torch.bfloat16, device=device)
     cutlass_mxfp4a8_moe_mm(
-        c, a_fp8, b_packed, a_scale_one, b_scale,
-        expert_offsets[:-1], problem_sizes,
-        a_strides, b_strides, c_strides, s_strides,
-        CHUNK, 8,
-        as_packed, as_strides, CHUNK,
+        c,
+        a_fp8,
+        b_packed,
+        a_scale_one,
+        b_scale,
+        expert_offsets[:-1],
+        problem_sizes,
+        a_strides,
+        b_strides,
+        c_strides,
+        s_strides,
+        CHUNK,
+        8,
+        as_packed,
+        as_strides,
+        CHUNK,
     )
     c = c.to(dtype)
 
     sel = torch.zeros((m,), dtype=torch.long, device=device)
-    c_ref = ref_grouped_gemm_mxfp8_act(a_fp8, a_blk_scale, w_values, w_scale, num_experts, sel)
+    c_ref = ref_grouped_gemm_mxfp8_act(
+        a_fp8, a_blk_scale, w_values, w_scale, num_experts, sel
+    )
 
     max_abs = torch.max(torch.abs(c.float() - c_ref.float())).item()
     mean_abs = torch.mean(torch.abs(c.float() - c_ref.float())).item()
@@ -307,16 +330,29 @@ def run_case_act_identity(label, num_experts, m, k, n, device, seed=0):
 
     c = torch.empty((m, n), dtype=torch.bfloat16, device=device)
     cutlass_mxfp4a8_moe_mm(
-        c, a_fp8, b_packed, a_scale_one, b_scale,
-        expert_offsets[:-1], problem_sizes,
-        a_strides, b_strides, c_strides, s_strides,
-        CHUNK, 8,
-        as_packed, as_strides, CHUNK,
+        c,
+        a_fp8,
+        b_packed,
+        a_scale_one,
+        b_scale,
+        expert_offsets[:-1],
+        problem_sizes,
+        a_strides,
+        b_strides,
+        c_strides,
+        s_strides,
+        CHUNK,
+        8,
+        as_packed,
+        as_strides,
+        CHUNK,
     )
     c = c.to(dtype)
 
     sel = torch.zeros((m,), dtype=torch.long, device=device)
-    c_ref = ref_grouped_gemm_mxfp8_act(a_fp8, a_blk_scale, w_values, w_scale, num_experts, sel)
+    c_ref = ref_grouped_gemm_mxfp8_act(
+        a_fp8, a_blk_scale, w_values, w_scale, num_experts, sel
+    )
 
     max_abs = torch.max(torch.abs(c.float() - c_ref.float())).item()
     mean_abs = torch.mean(torch.abs(c.float() - c_ref.float())).item()
@@ -357,12 +393,13 @@ def run_case_mxfp8_act_multi(label, counts, k, n, device, seed=0, capture_safe=F
         starts.append(starts[-1] + int(c))
     sel = torch.zeros((m_total,), dtype=torch.long, device=device)
     for e in range(num_experts):
-        sel[starts[e]:starts[e + 1]] = e
+        sel[starts[e] : starts[e + 1]] = e
 
     expert_offsets = torch.tensor(starts, dtype=torch.int32, device=device)
     problem_sizes = torch.tensor(
         [[n, int(counts[e]), k] for e in range(num_experts)],
-        dtype=torch.int32, device=device,
+        dtype=torch.int32,
+        device=device,
     )
     a_strides = torch.full((num_experts, 3), k, device=device, dtype=torch.int64)
     c_strides = torch.full((num_experts, 3), n, device=device, dtype=torch.int64)
@@ -378,7 +415,7 @@ def run_case_mxfp8_act_multi(label, counts, k, n, device, seed=0, capture_safe=F
         as_blocks = []
         m_pads = []
         for e in range(num_experts):
-            se = a_blk_scale[starts[e]:starts[e + 1]]  # [M_e, sk]
+            se = a_blk_scale[starts[e] : starts[e + 1]]  # [M_e, sk]
             flat, m_pad = interleave_act_scale_padded(se)  # [sk/4 * M_pad*4], M_pad
             as_blocks.append(flat)
             m_pads.append(m_pad)
@@ -389,21 +426,35 @@ def run_case_mxfp8_act_multi(label, counts, k, n, device, seed=0, capture_safe=F
         # act-scale pointer by the exclusive cumsum of padded strides.
         as_strides = torch.tensor(
             [[int(m_pads[e])] * 2 for e in range(num_experts)],
-            dtype=torch.int64, device=device,
+            dtype=torch.int64,
+            device=device,
         )
     a_scale_one = torch.ones(1, dtype=torch.float32, device=device)
 
     c = torch.empty((m_total, n), dtype=torch.bfloat16, device=device)
     cutlass_mxfp4a8_moe_mm(
-        c, a_fp8, b_packed, a_scale_one, b_scale,
-        expert_offsets[:-1], problem_sizes,
-        a_strides, b_strides, c_strides, s_strides,
-        CHUNK, 1,
-        as_packed, as_strides, CHUNK,
+        c,
+        a_fp8,
+        b_packed,
+        a_scale_one,
+        b_scale,
+        expert_offsets[:-1],
+        problem_sizes,
+        a_strides,
+        b_strides,
+        c_strides,
+        s_strides,
+        CHUNK,
+        1,
+        as_packed,
+        as_strides,
+        CHUNK,
     )
     c = c.to(dtype)
 
-    c_ref = ref_grouped_gemm_mxfp8_act(a_fp8, a_blk_scale, w_values, w_scale, num_experts, sel)
+    c_ref = ref_grouped_gemm_mxfp8_act(
+        a_fp8, a_blk_scale, w_values, w_scale, num_experts, sel
+    )
 
     max_abs = torch.max(torch.abs(c.float() - c_ref.float())).item()
     mean_abs = torch.mean(torch.abs(c.float() - c_ref.float())).item()
@@ -432,18 +483,22 @@ def main():
         sys.exit(1)
     device = "cuda"
     print("=== DIAGNOSTIC: activation scale = ones (should be identity) ===")
-    for (m, k, n) in [(4, 256, 512), (8, 512, 1024), (128, 512, 1024)]:
+    for m, k, n in [(4, 256, 512), (8, 512, 1024), (128, 512, 1024)]:
         run_case_act_identity("act_ones", 1, m, k, n, device)
     print("=== mxfp8 per-token + per-block activation (FULL path, single expert) ===")
-    for (m, k, n) in [(4, 256, 512), (8, 512, 1024), (16, 1024, 2048), (128, 512, 1024)]:
+    for m, k, n in [(4, 256, 512), (8, 512, 1024), (16, 1024, 2048), (128, 512, 1024)]:
         run_case_mxfp8_act(pack_nibbles_natural, "mxfp8_act", 1, m, k, n, device)
     print("=== mxfp8 activation MULTI-EXPERT (uneven token counts) ===")
     run_case_mxfp8_act_multi("mxfp8_multi", [4, 4, 4, 4], 512, 1024, device)
     run_case_mxfp8_act_multi("mxfp8_multi", [3, 5, 4, 8], 512, 1024, device)
     run_case_mxfp8_act_multi("mxfp8_multi", [16, 8, 32, 8], 1024, 2048, device)
     print("=== mxfp8 activation MULTI-EXPERT (graph-safe fixed-stride layout) ===")
-    run_case_mxfp8_act_multi("mxfp8_graph", [3, 5, 4, 8], 512, 1024, device, capture_safe=True)
-    run_case_mxfp8_act_multi("mxfp8_graph", [16, 8, 32, 8], 1024, 2048, device, capture_safe=True)
+    run_case_mxfp8_act_multi(
+        "mxfp8_graph", [3, 5, 4, 8], 512, 1024, device, capture_safe=True
+    )
+    run_case_mxfp8_act_multi(
+        "mxfp8_graph", [16, 8, 32, 8], 1024, 2048, device, capture_safe=True
+    )
     print("=== mxfp8 activation MULTI-EXPERT (UNIFORM counts: isolate N-value bug) ===")
     for c in ([2, 2], [3, 3], [4, 4], [8, 8], [16, 16], [32, 32]):
         run_case_mxfp8_act_multi("mxfp8_unif", c, 512, 1024, device)

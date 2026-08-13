@@ -294,8 +294,7 @@ void cutlass_w4a8_group_gemm_caller(
   // MXFP4A8: feed the activation block-scale into the mainloop's optional path.
   // These members default to nullptr, so the int4a8 path is unaffected.
   if (use_act_block_scale) {
-    arguments.mainloop.ptr_AS =
-        static_cast<const typename Gemm::ElementScalePacked**>(as_scales_ptrs.data_ptr());
+    arguments.mainloop.ptr_AS = static_cast<const typename Gemm::ElementScalePacked**>(as_scales_ptrs.data_ptr());
     arguments.mainloop.dAS = static_cast<typename Gemm::StrideS*>(as_strides->data_ptr());
   }
 
@@ -319,11 +318,7 @@ void cutlass_w4a8_group_gemm_caller(
   if (status != cutlass::Status::kSuccess) {
     cudaError_t ce = cudaGetLastError();
     TORCH_CHECK(
-        false,
-        "GEMM execution failed: status=",
-        cutlassGetStatusString(status),
-        " cuda=",
-        cudaGetErrorString(ce));
+        false, "GEMM execution failed: status=", cutlassGetStatusString(status), " cuda=", cudaGetErrorString(ce));
   }
 }
 

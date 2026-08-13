@@ -226,8 +226,7 @@ class Mxfp4CutlassMoEMethod:
             self.expert_offsets,
             self.problem_sizes1,
             self.problem_sizes2,
-            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor
-            or 1.0,
+            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor or 1.0,
             swiglu_limit=self.moe_runner_config.swiglu_limit,
         )
         return StandardCombineInput(hidden_states=output)

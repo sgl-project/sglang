@@ -22,6 +22,7 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
 logger = logging.getLogger(__name__)
@@ -279,7 +280,7 @@ def _fused_silu_mul_mxfp8_quant_kernel(
     xq_ptr,
     sc_ptr,
     N,
-    twoN,
+    TOW_N,
     nblk,
     HAS_LIM: tl.constexpr,
     LIM,
@@ -302,8 +303,8 @@ def _fused_silu_mul_mxfp8_quant_kernel(
     row = tl.program_id(0)
     blk = tl.program_id(1)
     col = blk * BLK + tl.arange(0, BLK)
-    g = tl.load(c1_ptr + row * twoN + col).to(tl.float32)
-    u = tl.load(c1_ptr + row * twoN + N + col).to(tl.float32)
+    g = tl.load(c1_ptr + row * TOW_N + col).to(tl.float32)
+    u = tl.load(c1_ptr + row * TOW_N + N + col).to(tl.float32)
     if HAS_LIM:
         g = tl.minimum(g, LIM)
         u = tl.minimum(tl.maximum(u, -LIM), LIM)
@@ -373,7 +374,7 @@ def _fused_silu_mul_quant_scatter_kernel(
     mpad_ptr,
     estart_ptr,
     N,
-    twoN,
+    TOW_N,
     HAS_LIM: tl.constexpr,
     LIM,
     FP8_MAX: tl.constexpr,
@@ -394,8 +395,8 @@ def _fused_silu_mul_quant_scatter_kernel(
     mpad = tl.load(mpad_ptr + e)
     estart = tl.load(estart_ptr + e)
     col = blk * BLK + tl.arange(0, BLK)
-    g = tl.load(c1_ptr + row * twoN + col).to(tl.float32)
-    u = tl.load(c1_ptr + row * twoN + N + col).to(tl.float32)
+    g = tl.load(c1_ptr + row * TOW_N + col).to(tl.float32)
+    u = tl.load(c1_ptr + row * TOW_N + N + col).to(tl.float32)
     if HAS_LIM:
         g = tl.minimum(g, LIM)
         u = tl.minimum(tl.maximum(u, -LIM), LIM)
@@ -558,7 +559,11 @@ def _build_grouped_act_block_scale_compact(
             pad = torch.zeros(m_pad - m_e, nblk, dtype=se.dtype, device=device)
             se = torch.cat([se, pad], dim=0)
         # A-wide interleave over K-blocks: [M_pad, nblk] -> [nblk/A, M_pad*A]
-        si = se.reshape(m_pad, nblk // A, A).permute(1, 0, 2).reshape(nblk // A, m_pad * A)
+        si = (
+            se.reshape(m_pad, nblk // A, A)
+            .permute(1, 0, 2)
+            .reshape(nblk // A, m_pad * A)
+        )
         blocks.append(si.reshape(-1).contiguous())
         m_pads.append(m_pad)
 
@@ -797,7 +802,9 @@ def _build_grouped_act_block_scale_capture_safe(
     issue for odd per-expert token counts and makes the whole builder
     CUDA-graph-recordable.
     """
-    assert torch.is_tensor(expert_offsets), "capture-safe path requires tensor expert_offsets"
+    assert torch.is_tensor(
+        expert_offsets
+    ), "capture-safe path requires tensor expert_offsets"
     device = scale.device
     nblk = scale.shape[1]
     A = MXFP4_PACKED_SCALES
