@@ -19,14 +19,21 @@ tagged subset of the snapshot rather than the full `LoadSnapshot`, so the
 router-facing wire contract stays fixed while the internal snapshot keeps
 growing fields.
 
-The transport (`ZmqEventPublisher`), config parsing, and rank/port
-derivation are borrowed from `sglang.srt.disaggregation.kv_events`; the
-load wire format and publishing cadence live here. The port itself comes
-from `derive_load_port_base` — the same function `/server_info` advertises
-with — which packs the load range after the KV-event range, bumping past
-the replay ROUTER range when the two overlap (with the conventional
-replay = kv + 1 they always do). Operators must leave the derived range
-free on the host: a worker's ZMQ footprint spans
+Wire framing — three frames, matching the KV-event socket's layout so one
+subscriber loop handles both: ``[topic b"load", big-endian i64 seq,
+msgpack LoadStat]``. The transport is a plain synchronous PUB socket owned
+here: a PUB send is an enqueue to ZMQ's IO thread, so unlike the KV-event
+path there is no background thread or replay buffer — a gauge needs
+neither, and a small send HWM sheds backlog toward a stalled subscriber
+instead of queueing stale readings.
+
+The port comes from `resolve_load_pub_range` in
+`sglang.srt.disaggregation.kv_events` — the same function `/server_info`
+advertises with — which packs the load range after the KV-event range,
+bumping past the replay ROUTER range when the two overlap (with the
+conventional replay = kv + 1 they always do); `--load-publish-endpoint`
+moves the range outright. Operators must leave the resolved range free on
+the host: with the default packing a worker's ZMQ footprint spans
 `[kv_base, load_base + dp_size)` — `2 * dp_size` ports without a replay
 endpoint, `2 * dp_size + 1` with the conventional adjacent one — so
 co-hosted workers need their KV port bases spaced at least that far
@@ -46,18 +53,20 @@ from __future__ import annotations
 
 import logging
 import time
+from itertools import count
 from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
+import zmq
 
 from sglang.srt.disaggregation.kv_events import (
     LOAD_TOPIC,
     KVEventsConfig,
-    ZmqEventPublisher,
-    derive_load_port_base,
     is_kv_publisher_rank,
+    resolve_load_pub_range,
     select_kv_publisher_dp_rank,
 )
+from sglang.srt.utils.network import NetworkAddress, is_zmq_endpoint_ipv6
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -79,10 +88,19 @@ LOAD_PUBLISH_INTERVAL = 5
 # event-loop iteration, which busy-spins when --sleep-on-idle is off).
 LOAD_PUBLISH_HEARTBEAT_S = 1.0
 
-# Re-warn about publish failures every this many consecutive failures, so a
-# permanent failure (e.g. a renamed field) keeps a live breadcrumb instead of
-# going silent after the first warning, without flooding the log.
-LOAD_PUBLISH_FAIL_WARN_EVERY = 60
+# After the first report, re-warn about publish failures at most this often.
+# Wall-clock rather than a count: a permanently broken socket fails once per
+# publish attempt and attempts are driven by the scheduler loop, so a
+# count-based bound would still emit at a rate proportional to that loop.
+FAIL_WARN_PERIOD_S = 60.0
+
+# Send high-water mark. Small on purpose: load is a gauge, so once a
+# subscriber's pipe is full, shedding sends (PUB drops the newest message)
+# loses readings that the next heartbeat supersedes anyway — better than
+# queueing a backlog of stale ones for it to drain later.
+LOAD_PUB_HWM = 8
+
+_encoder = msgspec.msgpack.Encoder()
 
 
 class LoadStat(
@@ -97,10 +115,10 @@ class LoadStat(
     Wire shape (tag + array_like): ``["LoadStat", num_running_reqs,
     num_waiting_reqs, num_tokens, max_total_num_tokens, attn_dp_rank]`` —
     the router decoder reads the four counts and ignores the rest. The
-    trailing field is always emitted (null when unset); array_like structs
-    do not trim it. `attn_dp_rank` exists so the snapshot can be published
-    directly through `ZmqEventPublisher.publish` (which stamps it); the
-    router keys load by the subscriber's socket rank, not this field.
+    trailing field is always emitted (array_like structs do not trim it;
+    the publisher stamps its rank, and a decoder must also tolerate null
+    there). The router keys load by the subscriber's socket rank, not this
+    field — it is informational.
     """
 
     num_running_reqs: int
@@ -112,17 +130,33 @@ class LoadStat(
     attn_dp_rank: Optional[int] = None
 
 
+def _open_pub_socket(endpoint: str) -> zmq.Socket:
+    """Bind the load PUB socket. Module-level so tests can stub the one side
+    effect while exercising the real gating and port derivation."""
+    sock = zmq.Context.instance().socket(zmq.PUB)
+    try:
+        sock.set_hwm(LOAD_PUB_HWM)
+        sock.setsockopt(zmq.LINGER, 0)
+        if is_zmq_endpoint_ipv6(endpoint):
+            sock.setsockopt(zmq.IPV6, 1)
+        sock.bind(endpoint)
+    except Exception:
+        # Release the handle on the shared context rather than leaking it.
+        sock.close()
+        raise
+    return sock
+
+
 class SchedulerLoadPublisher:
     """Owns one scheduler's dedicated load PUB socket and the throttled,
     best-effort `publish_load_stat` path.
 
     Enabled on the same condition as KV-event publishing
-    (`is_kv_publisher_rank`), on the port range `derive_load_port_base`
-    packs after the KV-event range; within the range, the per-rank offset
-    follows `select_kv_publisher_dp_rank`, exactly like the KV-event
-    publisher, so pure-DP replicas don't collide on one port. Stays a
-    no-op (`publisher is None`) when disabled or when no load port is
-    derivable from the KV config.
+    (`is_kv_publisher_rank`), on the port range `resolve_load_pub_range`
+    derives; within the range, the per-rank offset follows
+    `select_kv_publisher_dp_rank`, exactly like the KV-event publisher, so
+    pure-DP replicas don't collide on one port. Stays a no-op
+    (`_socket is None`) when disabled or when no load range is resolvable.
     """
 
     def __init__(
@@ -131,19 +165,22 @@ class SchedulerLoadPublisher:
         kv_events_config: Optional[str],
         ps: ParallelState,
         dp_size: int,
+        load_publish_endpoint: Optional[str] = None,
     ) -> None:
-        # `publisher is None` means "no PUB socket is bound"; every early
+        # `_socket is None` means "no PUB socket is bound"; every early
         # return below leaves it None so `publish_load_stat` skips the
         # snapshot computation entirely.
-        self.publisher: Optional[ZmqEventPublisher] = None
+        self._socket: Optional[zmq.Socket] = None
+        self._rank = 0
+        self._seq = count()
         self._publish_counter = 0
         # The four counts of the last stat actually sent, and when — drives
         # the changed-immediately / unchanged-on-heartbeat dedup.
         self._last_counts: Optional[tuple] = None
         self._last_publish_ts = 0.0
-        # Consecutive publish failures, reset on success (drives the
-        # periodic warn).
+        # Consecutive publish failures and when they were last reported.
         self._fail_count = 0
+        self._last_fail_warn_ts = float("-inf")
         if not is_kv_publisher_rank(kv_events_config, ps):
             return
         try:
@@ -155,47 +192,42 @@ class SchedulerLoadPublisher:
         if cfg.publisher == "null" or not cfg.endpoint:
             return
         # Shared with describe_kv_events_publisher, which advertises the
-        # same derivation (or omits the key) on /server_info — so a router
-        # never subscribes to a port this constructor declined. (A runtime
+        # same resolution (or omits the key) on /server_info — so a router
+        # never subscribes to a range this constructor declined. (A runtime
         # bind failure below is the one case where the advertisement can
         # outlive the socket; the router then sees silence and falls back.)
-        load_base = derive_load_port_base(cfg.endpoint, cfg.replay_endpoint, dp_size)
-        if load_base is None:
-            logger.info(
-                "load-publisher disabled: no load port range is derivable "
-                "from --kv-events-config endpoint %r (needs a tcp:// "
-                "endpoint with an integer port whose load range fits in "
-                "the u16 port space)",
-                cfg.endpoint,
-            )
+        resolved, reason = resolve_load_pub_range(
+            kv_endpoint=cfg.endpoint,
+            replay_endpoint=cfg.replay_endpoint,
+            dp_size=dp_size,
+            load_publish_endpoint=load_publish_endpoint,
+        )
+        if resolved is None:
+            if reason:
+                logger.warning("load-publisher disabled: %s", reason)
             return
-        load_endpoint = f"{cfg.endpoint[:cfg.endpoint.rfind(':')]}:{load_base}"
-        # Dedicated load socket: own port, replay disabled, unbuffered (load
-        # is a gauge, not a replayable delta). Best-effort like everything
-        # else here: an unforeseen bind failure must not take down scheduler
-        # startup over a routing hint.
+        host, base = resolved
+        self._rank = select_kv_publisher_dp_rank(
+            ps.attn_dp_size, ps.attn_dp_rank, ps.dp_rank
+        )
+        endpoint = NetworkAddress(host, base + self._rank).to_tcp()
+        # Best-effort: an unforeseen bind failure must not take down
+        # scheduler startup over a routing hint.
         try:
-            self.publisher = ZmqEventPublisher(
-                select_kv_publisher_dp_rank(
-                    ps.attn_dp_size, ps.attn_dp_rank, ps.dp_rank
-                ),
-                endpoint=load_endpoint,
-                replay_endpoint=None,
-                buffer_steps=0,
-                topic=LOAD_TOPIC,
-            )
+            self._socket = _open_pub_socket(endpoint)
         except Exception:
             logger.warning(
-                "load-publisher disabled: failed to bind the load socket at %r",
-                load_endpoint,
+                "load-publisher disabled: failed to bind the load socket at "
+                "%r; /server_info advertises this range but nothing is "
+                "listening on it",
+                endpoint,
                 exc_info=True,
             )
-            self.publisher = None
 
     @property
     def enable(self) -> bool:
         """True when a real load PUB socket is bound."""
-        return self.publisher is not None
+        return self._socket is not None
 
     def publish_load_stat(
         self, load_provider: Callable[[], LoadSnapshot], force: bool = False
@@ -214,9 +246,9 @@ class SchedulerLoadPublisher:
 
         Best-effort: a failure here must never crash the scheduler loop —
         routers fall back to their own in-flight counter. Failures re-warn
-        every [`LOAD_PUBLISH_FAIL_WARN_EVERY`] consecutive failures.
+        at most once per [`FAIL_WARN_PERIOD_S`].
         """
-        if self.publisher is None:
+        if self._socket is None:
             return
 
         self._publish_counter += 1
@@ -238,25 +270,45 @@ class SchedulerLoadPublisher:
             ):
                 return
             self._publish_counter = 0
-            self.publisher.publish(
+            payload = _encoder.encode(
                 LoadStat(
                     num_running_reqs=counts[0],
                     num_waiting_reqs=counts[1],
                     num_tokens=counts[2],
                     max_total_num_tokens=counts[3],
+                    attn_dp_rank=self._rank,
                 )
             )
+            seq = next(self._seq).to_bytes(8, "big")
+            try:
+                self._socket.send_multipart(
+                    (LOAD_TOPIC.encode(), seq, payload), zmq.NOBLOCK
+                )
+            except zmq.Again:
+                # A stalled subscriber pipe: the gauge is superseded by the
+                # next send, so dropping beats blocking the scheduler loop.
+                pass
             # Recorded only after a successful hand-off so a failed publish
             # retries instead of being deduped away.
             self._last_counts = counts
             self._last_publish_ts = now
             self._fail_count = 0
         except Exception:
-            if self._fail_count % LOAD_PUBLISH_FAIL_WARN_EVERY == 0:
+            self._fail_count += 1
+            now = time.monotonic()
+            if (
+                self._fail_count == 1
+                or now - self._last_fail_warn_ts >= FAIL_WARN_PERIOD_S
+            ):
+                self._last_fail_warn_ts = now
                 logger.warning(
                     "load-publisher: publish_load_stat failed (%d consecutive); "
                     "load-aware routers fall back to their in-flight load signal",
-                    self._fail_count + 1,
+                    self._fail_count,
                     exc_info=True,
                 )
-            self._fail_count += 1
+
+    def close(self) -> None:
+        if self._socket is not None:
+            self._socket.close()
+            self._socket = None

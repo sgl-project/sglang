@@ -130,6 +130,41 @@ class TestServerInfoKvEventsField(CustomTestCase):
         self.assertEqual(info["kv_events"]["load_endpoint_port_base"], 5560)
         self.assertEqual(info["kv_events"]["load_topic"], "load")
 
+    def test_explicit_load_publish_endpoint_moves_the_advertised_base(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
+            load_publish_endpoint="tcp://*:7000",
+            page_size=64,
+            dp_size=2,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertEqual(info["kv_events"]["load_endpoint_port_base"], 7000)
+        self.assertEqual(info["kv_events"]["load_topic"], "load")
+
+    def test_load_keys_omitted_for_connect_style_kv_endpoint(self):
+        # A concrete host is connected to rather than bound: the KV-events
+        # descriptor is still valid (KV events work connect-style), but no
+        # load range can be bound there, so the load keys must be omitted
+        # rather than advertising a port nothing listens on.
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://10.0.0.5:5557"}'
+            ),
+            page_size=64,
+            dp_size=1,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIsNotNone(info["kv_events"])
+        self.assertEqual(info["kv_events"]["endpoint_host"], "10.0.0.5")
+        self.assertNotIn("load_endpoint_port_base", info["kv_events"])
+        self.assertNotIn("load_topic", info["kv_events"])
+
     def test_load_keys_omitted_when_no_load_range_fits(self):
         # kv base 65535 leaves no u16 room for a load range: the kv_events
         # descriptor must still be served, with only the load keys omitted,

@@ -33,6 +33,8 @@ import msgspec
 import zmq
 from pydantic import BaseModel
 
+from sglang.srt.utils.network import NetworkAddress
+
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 
@@ -83,57 +85,128 @@ def is_kv_publisher_rank(kv_events_config: Optional[str], ps: "ParallelState") -
 # (the load socket carries only load, so subscribe-all works too).
 LOAD_TOPIC = "load"
 
+# Hosts a PUB socket binds rather than connects to. Decided on the parsed
+# host, not a substring match: "::" appears inside every IPv6 address, so a
+# substring test would call the concrete remote host in
+# "tcp://[2001:db8::5]:5557" bindable — advertised, then failing to bind on
+# any machine where that address is not local.
+_BIND_WILDCARD_HOSTS = frozenset({"*", "0.0.0.0", "::"})
+
 
 def parse_tcp_port(endpoint: Optional[str]) -> Optional[int]:
-    """Port of a tcp:// endpoint, or None when there is no integer port."""
+    """Legal port of a tcp:// endpoint regardless of host, or None.
+
+    Host-agnostic on purpose: this answers "which ports does something else
+    occupy" — the KV replay ROUTER binds whatever host spelling it was given,
+    so gating on bind-style would arm the collision checks for only the
+    wildcard spelling of the endpoint they exist to avoid.
+    """
     if not endpoint or not endpoint.startswith("tcp://"):
         return None
-    _, _, tail = endpoint.rpartition(":")
     try:
-        return int(tail)
+        port = NetworkAddress.parse(endpoint[len("tcp://") :]).port
     except ValueError:
         return None
+    return port if 0 < port <= 65535 else None
 
 
-def derive_load_port_base(
-    endpoint: Optional[str], replay_endpoint: Optional[str], dp_size: int
-) -> Optional[int]:
-    """Base port of the load-publisher range derived from a KV-events
-    config, or None when no legal range exists.
+def parse_bindable_tcp(endpoint: Optional[str]) -> Optional[tuple]:
+    """``(host, port)`` if this is a tcp:// endpoint a PUB socket can BIND,
+    else None.
 
-    The load range is `dp_size` ports packed right after the KV-event range
-    `[kv_port, kv_port + dp_size)`; a tcp replay ROUTER range
-    `[replay_port, replay_port + dp_size)` is bumped past only when it
-    overlaps that candidate (under the inherited convention replay = kv + 1
-    it always does; a non-adjacent replay leaves the packing unchanged).
-    Returns None when the endpoint carries no legal tcp port (ipc://,
-    inproc://, missing/non-integer port, or a port outside 1..65535) or the
-    range would exceed the u16 port space.
-
-    This is the single source of truth for the load port: called by both
-    `SchedulerLoadPublisher` (which binds the range) and
-    `ServerArgs.describe_kv_events_publisher` (which advertises it on
-    /server_info), so the bind and the advertisement cannot drift.
+    A concrete host is not bindable by this module's convention: ZMQ
+    publishers here *connect* to concrete hosts (the central-collector
+    topology), and a load PUB that connects to its own advertised range
+    reaches nobody while reporting no error.
     """
-    kv_base = parse_tcp_port(endpoint)
-    if kv_base is None or not (0 < kv_base <= 65535) or dp_size < 1:
+    if not endpoint or not endpoint.startswith("tcp://"):
         return None
-    load_base = kv_base + dp_size
-    replay_base = parse_tcp_port(replay_endpoint)
-    if replay_base is not None and not (0 < replay_base <= 65535):
-        # A replay port no ROUTER socket can legally bind constrains nothing.
-        replay_base = None
-    if (
-        replay_base is not None
-        and load_base < replay_base + dp_size
-        and replay_base < load_base + dp_size
-    ):
-        # Overlap implies kv < replay < kv + 2 * dp_size, so packing after
-        # the replay range also clears the KV range.
-        load_base = replay_base + dp_size
-    if load_base + dp_size - 1 > 65535:
+    try:
+        addr = NetworkAddress.parse(endpoint[len("tcp://") :])
+    except ValueError:
         return None
-    return load_base
+    if addr.host not in _BIND_WILDCARD_HOSTS or not (0 < addr.port <= 65535):
+        return None
+    return addr.host, addr.port
+
+
+def resolve_load_pub_range(
+    *,
+    kv_endpoint: Optional[str],
+    replay_endpoint: Optional[str],
+    dp_size: int,
+    load_publish_endpoint: Optional[str] = None,
+) -> tuple:
+    """``((host, base), reason)`` for the router-facing load PUB range —
+    exactly one of the two is None.
+
+    Rank ``r`` binds ``base + r`` and ``/server_info`` advertises ``base``;
+    consumers read the advertised key rather than re-deriving. This is the
+    single source of truth for both the bind (`SchedulerLoadPublisher`) and
+    the advertisement (`ServerArgs.describe_kv_events_publisher`), so the
+    two cannot drift.
+
+    ``--load-publish-endpoint`` sets the range outright; otherwise it packs
+    right after the KV-event range ``[kv_port, kv_port + dp_size)``, bumping
+    past the replay ROUTER range when the two would overlap (with the
+    conventional replay = kv + 1 they always do; a non-adjacent replay
+    leaves the packing unchanged).
+
+    ``reason`` is a string when an operator would want to know why load
+    publishing is off (explicit endpoint unusable, range collision, u16
+    overflow) and None when declining is unremarkable: no KV config to
+    derive from, or a connect-style KV endpoint — the derived address would
+    be *connected to* rather than bound, publishing into a void, so load
+    publishing there needs --load-publish-endpoint. Callers log the reason
+    once at construction; /server_info calls this per request and must not
+    turn a static misconfiguration into request-rate log volume.
+
+    Every rejection exists because binding anyway would be worse than not
+    publishing: an unadvertised range is a port claimed for nothing, and a
+    range overlapping the KV publisher's own sockets would take a port whose
+    later, unguarded bind kills scheduler startup.
+    """
+    if dp_size < 1:
+        return None, None
+    # Half-open port ranges the KV-event publisher itself claims, per rank.
+    reserved = [
+        (port, port + dp_size)
+        for port in (parse_tcp_port(kv_endpoint), parse_tcp_port(replay_endpoint))
+        if port is not None
+    ]
+    if load_publish_endpoint:
+        resolved = parse_bindable_tcp(load_publish_endpoint)
+        if resolved is None:
+            return None, (
+                f"--load-publish-endpoint={load_publish_endpoint!r} is not a "
+                f"bindable tcp:// address (a concrete host would be connected "
+                f"to, not bound)"
+            )
+        host, base = resolved
+        for lo, hi in reserved:
+            if base < hi and lo < base + dp_size:
+                return None, (
+                    f"--load-publish-endpoint range [{base}, {base + dp_size}) "
+                    f"overlaps the kv-events range [{lo}, {hi})"
+                )
+    else:
+        resolved = parse_bindable_tcp(kv_endpoint)
+        if resolved is None:
+            return None, None
+        host, kv_base = resolved
+        base = kv_base + dp_size
+        replay_base = parse_tcp_port(replay_endpoint)
+        if (
+            replay_base is not None
+            and base < replay_base + dp_size
+            and replay_base < base + dp_size
+        ):
+            # Overlap implies kv < replay < kv + 2 * dp_size, so packing
+            # after the replay range also clears the KV range.
+            base = replay_base + dp_size
+    if base + dp_size - 1 > 65535:
+        return None, f"load port range from {base} would run past the u16 ceiling"
+    return (host, base), None
 
 
 class EventBatch(

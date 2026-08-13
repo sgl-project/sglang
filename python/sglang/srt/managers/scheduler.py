@@ -2114,6 +2114,7 @@ class Scheduler(
             kv_events_config=get_observability().kv_events_config,
             ps=self.ps,
             dp_size=self.server_args.dp_size,
+            load_publish_endpoint=get_observability().load_publish_endpoint,
         )
 
     def init_load_inquirer(self) -> None:

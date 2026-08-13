@@ -1603,7 +1603,12 @@ class ServerArgs:
     ] = False
     kv_events_config: A[
         Optional[str],
-        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
+        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Note that a bindable (wildcard-host) TCP endpoint here also reserves a load-publishing range packed after the KV-event (and, when overlapping, replay) range, unless --load-publish-endpoint moves it.",
+        NS("observability"),
+    ] = None
+    load_publish_endpoint: A[
+        Optional[str],
+        "Bind address for the runtime-load PUB socket that load-aware routers subscribe to, e.g. tcp://*:6000; rank r binds port+r and /server_info advertises the base under the kv_events block. Must be a wildcard-host TCP address (a concrete host would be connected to, not bound). Defaults to the dp_size ports packed after the --kv-events-config range; set it explicitly to move the range off a port conflict. Routers discover the base through /server_info, so load publishing requires --kv-events-config to describe a publisher either way.",
         NS("observability"),
     ] = None
     enable_forward_pass_metrics: A[
@@ -9484,17 +9489,23 @@ class ServerArgs:
                                                   # prompts at this size
                 "dp_size": <dp_size>,             # number of SUB sockets
                                                   # to open
-                "load_endpoint_port_base": <derived>,
+                "load_endpoint_port_base": <resolved>,
                                                   # base TCP port of the
                                                   # dedicated load-snapshot
                                                   # range (load rank r =
                                                   # base + r). Normally kv
                                                   # base + dp_size, bumped
                                                   # past an overlapping
-                                                  # replay range — consumers
-                                                  # MUST read this key, not
-                                                  # re-derive it; omitted if
-                                                  # no legal range exists
+                                                  # replay range; moved
+                                                  # outright by
+                                                  # --load-publish-endpoint.
+                                                  # Consumers MUST read this
+                                                  # key, not re-derive it;
+                                                  # omitted when no bindable
+                                                  # range exists (e.g. a
+                                                  # concrete-host kv
+                                                  # endpoint, or u16
+                                                  # overflow)
                 "load_topic": "load",             # ZMQ topic prefix on the
                                                   # load-socket SUB filter;
                                                   # present iff
@@ -9513,7 +9524,7 @@ class ServerArgs:
           1..65535).
 
         Reuses KVEventsConfig.from_cli for JSON parsing and
-        derive_load_port_base for the load range, so the advertisement
+        resolve_load_pub_range for the load range, so the advertisement
         cannot drift from what SchedulerLoadPublisher binds; the inline
         rfind(":") endpoint split mirrors
         ZmqEventPublisher.offset_endpoint_port rather than adding a
@@ -9524,7 +9535,7 @@ class ServerArgs:
         from sglang.srt.disaggregation.kv_events import (
             LOAD_TOPIC,
             KVEventsConfig,
-            derive_load_port_base,
+            resolve_load_pub_range,
         )
 
         raw = self.kv_events_config
@@ -9564,16 +9575,21 @@ class ServerArgs:
         }
         # Dedicated port range for runtime load snapshots (load rank r binds
         # load_endpoint_port_base + r). Load-aware routers connect there to
-        # read the engine's true queue depth / KV occupancy. Derived by the
-        # same derive_load_port_base call SchedulerLoadPublisher binds with,
+        # read the engine's true queue depth / KV occupancy. Resolved by the
+        # same resolve_load_pub_range call SchedulerLoadPublisher binds with,
         # so the advertisement and the bound socket cannot drift. Absent =>
-        # the worker predates load publishing, or no legal range exists; the
-        # router then falls back to its own in-flight counter.
-        load_port_base = derive_load_port_base(
-            cfg.endpoint, cfg.replay_endpoint, self.dp_size
+        # the worker predates load publishing, or no bindable range exists;
+        # the router then falls back to its own in-flight counter. The
+        # decline reason (if any) is logged once at scheduler startup, not
+        # here — this runs per /server_info request.
+        resolved, _reason = resolve_load_pub_range(
+            kv_endpoint=cfg.endpoint,
+            replay_endpoint=cfg.replay_endpoint,
+            dp_size=self.dp_size,
+            load_publish_endpoint=self.load_publish_endpoint,
         )
-        if load_port_base is not None:
-            descriptor["load_endpoint_port_base"] = load_port_base
+        if resolved is not None:
+            descriptor["load_endpoint_port_base"] = resolved[1]
             descriptor["load_topic"] = LOAD_TOPIC
         return descriptor
 
