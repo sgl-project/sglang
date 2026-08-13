@@ -304,7 +304,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
                 torch.equal(host.v_buffer[host_indices, layer_id], expected_v[layer_id])
             )
 
-    def test_ascend_mha_transfer_uses_contiguous_hicache_backing(self):
+    def test_npu_mha_transfer_uses_contiguous_hicache_backing(self):
         host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
         host.layout = "page_first_direct"
         host.page_size = 2
@@ -522,7 +522,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             )
         )
 
-    def test_mamba_kernel_ascend_backup_then_load_roundtrip(self):
+    def test_mamba_kernel_npu_backup_then_load_roundtrip(self):
         num_layers = 2
         host_indices = torch.tensor([1, 3], dtype=torch.int64)
         device_indices = torch.tensor([2, 5], dtype=torch.int64)

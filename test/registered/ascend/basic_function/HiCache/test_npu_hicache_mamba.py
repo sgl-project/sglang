@@ -1,4 +1,4 @@
-"""Ascend NPU HiCache L3 coverage for hybrid Mamba models."""
+"""NPU HiCache L3 coverage for hybrid Mamba models."""
 
 import os
 import shutil
@@ -26,8 +26,8 @@ TEST_MODEL_MATRIX = {
 }
 
 
-class TestAscendMambaHiCache(CustomTestCase):
-    """Exercise Mamba state write-back and L3 load-back on Ascend."""
+class TestNPUMambaHiCache(CustomTestCase):
+    """Exercise Mamba state write-back and L3 load-back on NPU."""
 
     # A reusable Mamba checkpoint must be strictly inside the prompt. Ending the
     # prompt exactly at 1024 does not make that boundary reusable by a second

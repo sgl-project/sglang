@@ -8,28 +8,28 @@ import torch
 import sglang.srt.mem_cache.memory_pool_host as memory_pool_host
 from sglang.srt.mem_cache.memory_pool_host import (
     MambaPoolHost,
-    _ascend_hicache_mamba_io_mode,
+    _npu_hicache_mamba_io_mode,
 )
 
 
-class TestAscendMambaAsyncConfig(unittest.TestCase):
+class TestNPUMambaAsyncConfig(unittest.TestCase):
     def test_accepts_explicit_sync_and_async_modes(self):
         for mode in ("sync", "async"):
             with self.subTest(mode=mode), patch.dict(
-                os.environ, {"SGLANG_ASCEND_HICACHE_MAMBA_IO": mode}
+                os.environ, {"SGLANG_NPU_HICACHE_MAMBA_IO": mode}
             ):
-                self.assertEqual(_ascend_hicache_mamba_io_mode(), mode)
+                self.assertEqual(_npu_hicache_mamba_io_mode(), mode)
 
     def test_rejects_auto_mode(self):
         with patch.dict(
-            os.environ, {"SGLANG_ASCEND_HICACHE_MAMBA_IO": "auto"}
+            os.environ, {"SGLANG_NPU_HICACHE_MAMBA_IO": "auto"}
         ), self.assertRaisesRegex(ValueError, "must be one of"):
-            _ascend_hicache_mamba_io_mode()
+            _npu_hicache_mamba_io_mode()
 
     @patch.object(memory_pool_host, "_is_npu", True)
     @patch.object(
         memory_pool_host,
-        "_ascend_hicache_mamba_io_mode",
+        "_npu_hicache_mamba_io_mode",
         return_value="async",
     )
     @patch.object(
@@ -44,7 +44,7 @@ class TestAscendMambaAsyncConfig(unittest.TestCase):
         with self.assertRaisesRegex(
             RuntimeError, "per-layer PF->LF and all-layer LF->PF"
         ):
-            pool._configure_ascend_mamba_io()
+            pool._configure_npu_mamba_io()
 
     def test_async_h2d_is_dispatched_per_component_from_copy_helper(self):
         pool = MambaPoolHost.__new__(MambaPoolHost)
@@ -60,7 +60,7 @@ class TestAscendMambaAsyncConfig(unittest.TestCase):
             transfer_op,
         ), patch.object(
             memory_pool_host,
-            "_ascend_hicache_mamba_io_mode",
+            "_npu_hicache_mamba_io_mode",
             return_value="async",
         ):
             pool._copy_tensor_pf_lf(
@@ -95,7 +95,7 @@ class TestAscendMambaAsyncConfig(unittest.TestCase):
             transfer_op,
         ), patch.object(
             memory_pool_host,
-            "_ascend_hicache_mamba_io_mode",
+            "_npu_hicache_mamba_io_mode",
             return_value="async",
         ):
             pool._copy_tensor_all_layers_lf_pf(
@@ -124,7 +124,7 @@ class TestAscendMambaAsyncConfig(unittest.TestCase):
 
         with patch.object(
             memory_pool_host,
-            "_ascend_hicache_mamba_io_mode",
+            "_npu_hicache_mamba_io_mode",
             return_value="sync",
         ):
             pool._copy_tensor_pf_lf(
