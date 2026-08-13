@@ -1,19 +1,22 @@
+"""Moved out of test/registered/8-gpu-models/.
+
+Originally registered with `register_cuda_ci(...)` on the nightly 8-gpu-h200 and
+8-gpu-b200 suites. Moved here because nobody serves Llama 4 any more, and the CI
+HF account has no access to meta-llama/Llama-4-Scout-17B-16E-Instruct either, so
+it had been skipping for a while. Run with
+`python3 test/manual/8-gpu-models/test_llama4.py`.
+"""
+
 import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-# Runs on both H200 and B200: registered once per runner_config below
-register_cuda_ci(est_time=1800, stage="nightly", runner_config="8-gpu-h200")
-register_cuda_ci(est_time=1800, stage="nightly", runner_config="8-gpu-b200")
-
 LLAMA4_MODEL_PATH = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
 
 
-@unittest.skip("Blocked: Missing HF token permission for Llama 4 model")
 class TestLlama4(unittest.TestCase):
     """Unified test class for Llama-4-Scout performance and accuracy.
 

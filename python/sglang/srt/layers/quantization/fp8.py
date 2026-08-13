@@ -773,7 +773,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 .reshape_as(scale_u8)
                 .contiguous(),
             )
-        elif backend.is_flashinfer_cutlass():
+        elif backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
             from flashinfer import block_scale_interleave
 
             scale_u8 = layer.weight_scale_inv.data
@@ -974,7 +974,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.use_mxfp8:
             backend = self.mxfp8_dense_backend
             extra_kwargs = {}
-            if backend.is_flashinfer_cutlass():
+            if backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
                 weight_scale = layer.weight_scale_inv_swizzled
             elif backend.is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled
