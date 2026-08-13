@@ -23,8 +23,7 @@ if TYPE_CHECKING:
 MXFP4_BLOCK_SIZE = 32
 
 # Routed-expert activation quant scheme. The DSV4 checkpoint declares W4A8_MXFP
-# (FP4 weights, FP8-e4m3 activations), matching vllm-ascend's
-# AscendW4A8MXFPDynamicFusedMoEMethod, which is what this flag selects. The
+# (FP4 weights, FP8-e4m3 activations) The
 # W4A4_MXFP4 path below (FP4 activations) is kept because it parameterizes the
 # same GMM differently and is the fallback used while bringing up new weight
 # packings. Flipping the flag switches both the NZ weight pack and the GMM
@@ -132,10 +131,6 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
                 "not match w2_weight_scale_inv."
             )
 
-        # NZ-pack (ACL format 29) the FP4 weight. The fractal layout depends on
-        # the GMM's activation dtype, so the FP8 scheme must declare both the
-        # GMM x_dtype and that the stored weight is FP4 (mirroring vllm-ascend's
-        # AscendW4A8MXFPDynamicFusedMoEMethod); the FP4 scheme packs plain.
         nz_kwargs = (
             dict(
                 customize_dtype=torch.float8_e4m3fn,
@@ -186,12 +181,6 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
         topk_weights, topk_ids, _ = dispatch_output.topk_output
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = (topk_weights * _ROUTED_SCALING).to(hidden_states.dtype)
-
-        # Read the runner config off the layer, never off self: FusedMoE always
-        # sets layer.moe_runner_config in __init__, while self.moe_runner_config
-        # is only populated if create_moe_runner reached *this* method instance.
-        # A None self.moe_runner_config would silently degrade swiglu_limit to
-        # None, dropping the DSV4 gate/up clamp that vllm-ascend always applies.
         moe_runner_config = layer.moe_runner_config
 
         output = npu_fused_experts_w4a4_mxfp(
@@ -226,7 +215,7 @@ def _apply_swiglu_limit_npu(
 ) -> None:
     """Clamp the SwiGLU input in place before ``npu_swiglu`` (DeepSeek-V4).
 
-    Matches vllm-ascend: gate (first half) <= limit; up (second half) in
+     gate (first half) <= limit; up (second half) in
     [-limit, limit]. ``chunk`` returns views, so the in-place clamps mutate
     ``gate_up`` directly. No-op when ``swiglu_limit`` is unset or <= 0.
     """
@@ -496,12 +485,7 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
 
 
 def _pair_pack_mxfp_act_scale(scale: torch.Tensor) -> torch.Tensor:
-    """``[M, K/32] -> [M, K/64, 2]`` MX per-token scale layout for the A5 GMM.
-
-    Same reshape as vllm-ascend ``A5DeviceAdaptor.maybe_normalize_mxfp_scale_layout``,
-    which every MXFP per-token scale goes through before it reaches
-    ``npu_grouped_matmul``. Memory is unchanged; only the view differs.
-    """
+    """``[M, K/32] -> [M, K/64, 2]`` MX per-token scale layout for the A5 GMM."""
     if scale.ndim != 2:
         return scale
     if scale.shape[-1] % 2 != 0:
@@ -589,7 +573,7 @@ def _w4a8_mxfp_gmm(
 ) -> torch.Tensor:
     """FP4 weight x FP8-e4m3 activation (the checkpoint's W4A8_MXFP scheme).
 
-    Mirrors the vllm-ascend W4A8MXFP GMM call: FP8 ``x_dtype``, FP4
+    W4A8MXFP GMM call: FP8 ``x_dtype``, FP4
     ``weight_dtype``, and the weight block scales fed through ``antiquant_scale``
     with ``scale=None`` — the ``scale=`` + ``scale_dtype=`` form belongs to
     W4A4_MXFP4 and dequantizes differently.
