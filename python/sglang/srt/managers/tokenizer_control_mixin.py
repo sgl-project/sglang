@@ -297,9 +297,12 @@ class TokenizerControlMixin:
         self: TokenizerManager, timeout_s: Optional[float] = None
     ) -> FlushCacheReqOutput:
         self.auto_create_handle_loop()
-        return (
+        result = (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+        if result.success and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
+        return result
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
@@ -460,6 +463,8 @@ class TokenizerControlMixin:
                 results = await self.update_weights_from_distributed_communicator(obj)
 
         success, message = FanOutCommunicator.merge_results(results)
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -521,6 +526,8 @@ class TokenizerControlMixin:
                 results = await self.update_weights_from_tensor_communicator(obj)
 
         success, message = FanOutCommunicator.merge_results(results)
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -556,6 +563,8 @@ class TokenizerControlMixin:
             logger.error(error_msg)
             success, message = False, error_msg
 
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
