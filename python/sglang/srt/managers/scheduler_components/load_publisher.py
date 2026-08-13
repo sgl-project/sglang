@@ -15,12 +15,14 @@ Framing is the KV-event socket's, so one subscriber loop handles both:
 plain synchronous PUB socket (a send just enqueues to ZMQ's IO thread) —
 no background thread or replay buffer, which a gauge does not need.
 
-The port comes from `resolve_load_pub_range` (the same function
-`/server_info` advertises with, so the two cannot drift). A worker's ZMQ
-footprint is `2 * dp_size` ports after its KV base (`2 * dp_size + 1` with
-the conventional adjacent replay), so co-hosted workers must space their
-KV bases at least that far apart or one's load socket lands on another's
-KV-event port; `--load-publish-endpoint` moves the range off a conflict.
+Opt-in via `--load-publish-endpoint` (`auto` to pack after the KV range, or
+an explicit address); off by default so an upgrade never reserves a port a
+co-hosted neighbor's KV publisher binds. The port comes from
+`resolve_load_pub_range` (the same function `/server_info` advertises with,
+so the two cannot drift). With `auto`, a worker's ZMQ footprint is
+`2 * dp_size` ports after its KV base (`2 * dp_size + 1` with the
+conventional adjacent replay), so co-hosted workers must space their KV
+bases that far apart or move the range with an explicit address.
 """
 
 from __future__ import annotations

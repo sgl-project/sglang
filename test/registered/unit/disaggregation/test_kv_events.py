@@ -24,7 +24,7 @@ class TestResolveLoadPubRange(CustomTestCase):
     """The single source of truth both the bind and /server_info route through."""
 
     @staticmethod
-    def _base(kv, replay=None, dp_size=1, explicit=None):
+    def _base(kv, replay=None, dp_size=1, explicit="auto"):
         resolved, _ = resolve_load_pub_range(
             kv_endpoint=kv,
             replay_endpoint=replay,
@@ -33,11 +33,16 @@ class TestResolveLoadPubRange(CustomTestCase):
         )
         return None if resolved is None else resolved[1]
 
-    def test_packs_after_kv_range(self):
+    def test_off_by_default(self):
+        # Opt-in: unset or "off" reserves nothing, even with a valid config.
+        self.assertIsNone(self._base("tcp://*:5557", explicit=None))
+        self.assertIsNone(self._base("tcp://*:5557", explicit="off"))
+
+    def test_auto_packs_after_kv_range(self):
         self.assertEqual(self._base("tcp://*:5557"), 5558)
         self.assertEqual(self._base("tcp://*:5557", dp_size=2), 5559)
 
-    def test_skips_an_overlapping_replay_range(self):
+    def test_auto_skips_an_overlapping_replay_range(self):
         # Conventional replay = kv + 1 always overlaps the packed candidate.
         self.assertEqual(self._base("tcp://*:5557", "tcp://*:5558"), 5559)
         self.assertEqual(self._base("tcp://*:5557", "tcp://*:5558", dp_size=4), 5562)
@@ -45,7 +50,7 @@ class TestResolveLoadPubRange(CustomTestCase):
     def test_non_adjacent_replay_leaves_packing_unchanged(self):
         self.assertEqual(self._base("tcp://*:5557", "tcp://*:6000"), 5558)
 
-    def test_declines_connect_style_and_underivable_endpoints(self):
+    def test_auto_declines_connect_style_and_underivable_endpoints(self):
         for kv in (
             "tcp://10.0.0.5:5557",  # concrete host: connect-style
             "tcp://[2001:db8::5]:5557",  # concrete IPv6 ("::" is not a wildcard)
@@ -57,7 +62,7 @@ class TestResolveLoadPubRange(CustomTestCase):
             with self.subTest(kv=kv):
                 self.assertIsNone(self._base(kv))
 
-    def test_declines_on_u16_overflow(self):
+    def test_auto_declines_on_u16_overflow(self):
         self.assertIsNone(self._base("tcp://*:65535"))
 
     def test_explicit_endpoint_moves_and_validates_the_range(self):
@@ -67,23 +72,21 @@ class TestResolveLoadPubRange(CustomTestCase):
         self.assertIsNone(
             self._base("tcp://*:5557", dp_size=4, explicit="tcp://*:5558")
         )
-        # off is the operator's disable switch.
-        self.assertIsNone(self._base("tcp://*:5557", explicit="off"))
 
     def test_reason_is_set_only_for_actionable_declines(self):
-        # A plain missing/connect-style config is unremarkable (no reason);
-        # an explicit endpoint the operator asked for that can't bind is.
+        # Off by default is unremarkable (no reason); an opt-in the operator
+        # asked for that can't resolve is worth surfacing.
         _, quiet = resolve_load_pub_range(
             kv_endpoint="tcp://10.0.0.5:5557", replay_endpoint=None, dp_size=1
         )
         self.assertIsNone(quiet)
-        _, loud = resolve_load_pub_range(
-            kv_endpoint="ipc:///tmp/kv",
+        _, auto_loud = resolve_load_pub_range(
+            kv_endpoint="tcp://10.0.0.5:5557",  # connect-style: can't derive
             replay_endpoint=None,
             dp_size=1,
-            load_publish_endpoint="tcp://*:7000",
+            load_publish_endpoint="auto",
         )
-        self.assertIsNotNone(loud)
+        self.assertIsNotNone(auto_loud)
         # A missing config surfaces at startup — the message must not read
         # "absent for None".
         _, no_cfg = resolve_load_pub_range(

@@ -149,63 +149,37 @@ def resolve_load_pub_range(
     Single source of truth for both the bind (`SchedulerLoadPublisher`) and
     the advertisement (`describe_kv_events_publisher`), so they cannot drift.
 
-    ``--load-publish-endpoint`` sets the range outright (``off`` disables);
-    otherwise it packs after the KV-event range, bumping past an overlapping
-    replay ROUTER range (with the conventional replay = kv + 1, always).
+    Opt-in via ``--load-publish-endpoint``: unset (or ``off``) disables it, so
+    an upgrade never reserves a port a co-hosted neighbor's KV publisher would
+    bind. ``auto`` packs the range after the KV-event range, bumping past an
+    overlapping replay ROUTER range (with the conventional replay = kv + 1,
+    always); an explicit ``tcp://`` address sets it outright.
 
     ``reason`` is set when an operator would want to know why publishing is
-    off (unusable endpoint, collision, u16 overflow) and None when the
-    decline is unremarkable (no KV config, or a connect-style KV endpoint —
-    the derived socket would publish into a void). Callers log it once;
-    /server_info calls this per request, so it must not log here.
+    off (unusable endpoint, collision, u16 overflow) and None when the decline
+    is unremarkable (feature off). Callers log it once; /server_info calls
+    this per request, so it must not log here.
 
-    Known limit: `describe_kv_events_publisher` also suppresses the whole
-    block when `page_size` <= 0 — a precondition this cannot see — so that
-    one config still binds a range it never advertises.
+    Two inherited limits, both from the KV-event discovery structure: with
+    ``page_size`` <= 0 `describe_kv_events_publisher` suppresses the whole
+    block, so the range binds unadvertised; and with DP-attention across
+    ``nnodes`` > 1 the single advertised base is paired with one worker-URL
+    host, so ranks on other nodes are unreachable at that host.
     """
-    if dp_size < 1:
+    # Opt-in: off unless the operator sets `auto` (derive) or an address, so an
+    # upgrade never claims a port a co-hosted neighbor's KV publisher binds.
+    mode = (load_publish_endpoint or "").strip()
+    if dp_size < 1 or not mode or mode.lower() == "off":
         return None, None
-    if load_publish_endpoint and load_publish_endpoint.strip().lower() == "off":
-        return None, None
-    reserved = [  # per-rank ranges the KV-event publisher itself claims
-        (port, port + dp_size)
-        for port in (parse_tcp_port(kv_endpoint), parse_tcp_port(replay_endpoint))
-        if port is not None
-    ]
-    if load_publish_endpoint:
-        # Discovery needs the kv_events block, absent for a non-tcp KV
-        # endpoint — so an explicit range there would bind but never advertise.
-        if parse_tcp_port(kv_endpoint) is None:
-            absent = (
-                "without --kv-events-config"
-                if kv_endpoint is None
-                else f"for endpoint {kv_endpoint!r}"
-            )
-            return None, (
-                f"--load-publish-endpoint={load_publish_endpoint!r} needs a "
-                f"routable tcp:// --kv-events-config endpoint: routers "
-                f"discover the load range through /server_info's kv_events "
-                f"block, absent {absent}, so the socket would be bound but "
-                f"never advertised"
-            )
-        resolved = parse_bindable_tcp(load_publish_endpoint)
-        if resolved is None:
-            return None, (
-                f"--load-publish-endpoint={load_publish_endpoint!r} is not a "
-                f"bindable tcp:// address (a concrete host would be connected "
-                f"to, not bound)"
-            )
-        host, base = resolved
-        for lo, hi in reserved:
-            if base < hi and lo < base + dp_size:
-                return None, (
-                    f"--load-publish-endpoint range [{base}, {base + dp_size}) "
-                    f"overlaps the kv-events range [{lo}, {hi})"
-                )
-    else:
+
+    if mode.lower() == "auto":
         resolved = parse_bindable_tcp(kv_endpoint)
         if resolved is None:
-            return None, None
+            return None, (
+                f"--load-publish-endpoint=auto needs a bindable wildcard-host "
+                f"tcp:// --kv-events-config endpoint to pack after; got "
+                f"{kv_endpoint!r}"
+            )
         host, kv_base = resolved
         base = kv_base + dp_size
         replay_base = parse_tcp_port(replay_endpoint)
@@ -217,6 +191,35 @@ def resolve_load_pub_range(
             # Overlap implies kv < replay < kv + 2*dp_size, so packing after
             # the replay range also clears the KV range.
             base = replay_base + dp_size
+    else:
+        # Explicit address. Discovery still needs the kv_events block, absent
+        # for a non-tcp KV endpoint — so the range would bind but never
+        # advertise.
+        if parse_tcp_port(kv_endpoint) is None:
+            absent = (
+                "without --kv-events-config"
+                if kv_endpoint is None
+                else f"for endpoint {kv_endpoint!r}"
+            )
+            return None, (
+                f"--load-publish-endpoint={mode!r} needs a routable tcp:// "
+                f"--kv-events-config endpoint: routers discover the load range "
+                f"through /server_info's kv_events block, absent {absent}, so "
+                f"the socket would be bound but never advertised"
+            )
+        resolved = parse_bindable_tcp(mode)
+        if resolved is None:
+            return None, (
+                f"--load-publish-endpoint={mode!r} is not a bindable tcp:// "
+                f"address (a concrete host would be connected to, not bound)"
+            )
+        host, base = resolved
+        for port in (parse_tcp_port(kv_endpoint), parse_tcp_port(replay_endpoint)):
+            if port is not None and base < port + dp_size and port < base + dp_size:
+                return None, (
+                    f"--load-publish-endpoint range [{base}, {base + dp_size}) "
+                    f"overlaps the kv-events range [{port}, {port + dp_size})"
+                )
     if base + dp_size - 1 > 65535:
         return None, f"load port range from {base} would run past the u16 ceiling"
     return (host, base), None

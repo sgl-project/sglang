@@ -88,6 +88,7 @@ class TestServerInfoKvEventsField(CustomTestCase):
             kv_events_config=(
                 '{"publisher": "zmq", "endpoint": "tcp://*:5557", "topic": "kv"}'
             ),
+            load_publish_endpoint="auto",
             page_size=64,
             dp_size=2,
         )
@@ -121,6 +122,7 @@ class TestServerInfoKvEventsField(CustomTestCase):
                 '{"publisher": "zmq", "endpoint": "tcp://*:5557", '
                 '"replay_endpoint": "tcp://*:5558"}'
             ),
+            load_publish_endpoint="auto",
             page_size=64,
             dp_size=2,
         )
@@ -154,6 +156,7 @@ class TestServerInfoKvEventsField(CustomTestCase):
             kv_events_config=(
                 '{"publisher": "zmq", "endpoint": "tcp://10.0.0.5:5557"}'
             ),
+            load_publish_endpoint="auto",
             page_size=64,
             dp_size=1,
         )
@@ -172,6 +175,7 @@ class TestServerInfoKvEventsField(CustomTestCase):
         args = ServerArgs(
             model_path="dummy",
             kv_events_config='{"publisher": "zmq", "endpoint": "tcp://[::]:5557"}',
+            load_publish_endpoint="auto",
             page_size=64,
             dp_size=1,
         )
@@ -191,6 +195,7 @@ class TestServerInfoKvEventsField(CustomTestCase):
             kv_events_config=(
                 '{"publisher": "zmq", "endpoint": "tcp://[2001:db8::5]:5557"}'
             ),
+            load_publish_endpoint="auto",
             page_size=64,
             dp_size=1,
         )
@@ -222,6 +227,7 @@ class TestServerInfoKvEventsField(CustomTestCase):
         args = ServerArgs(
             model_path="dummy",
             kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:65535"}',
+            load_publish_endpoint="auto",
             page_size=64,
             dp_size=1,
         )
@@ -497,7 +503,7 @@ class TestLoadPublishEndpointValidation(CustomTestCase):
             args.check_load_publish_args()
 
     def test_off_and_valid_endpoint_pass(self):
-        for endpoint in ("off", "OFF", "tcp://*:6000"):
+        for endpoint in (None, "off", "OFF", "auto", "tcp://*:6000"):
             with self.subTest(endpoint=endpoint):
                 args = ServerArgs(
                     model_path="dummy",

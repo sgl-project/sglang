@@ -1603,12 +1603,12 @@ class ServerArgs:
     ] = False
     kv_events_config: A[
         Optional[str],
-        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Note that a bindable (wildcard-host) TCP endpoint here also reserves a load-publishing range packed after the KV-event (and, when overlapping, replay) range, unless --load-publish-endpoint moves it.",
+        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Runtime-load publishing for load-aware routers is a separate opt-in; see --load-publish-endpoint.",
         NS("observability"),
     ] = None
     load_publish_endpoint: A[
         Optional[str],
-        "Bind address for the runtime-load PUB socket that load-aware routers subscribe to, e.g. tcp://*:6000; rank r binds port+r and /server_info advertises the base under the kv_events block. Must be a wildcard-host TCP address (a concrete host would be connected to, not bound). Defaults to the dp_size ports packed after the --kv-events-config range; set it explicitly to move the range off a port conflict, or to the literal 'off' to disable load publishing while keeping KV events. Requires --kv-events-config to describe a publisher (routers discover the base through /server_info); startup fails if this is set without one, is not bindable, or overlaps the KV range.",
+        "Opt in to the runtime-load PUB socket that load-aware routers subscribe to. Off by default (unset or 'off'). Use 'auto' to reserve the dp_size ports packed after the --kv-events-config range, or a wildcard-host TCP address (e.g. tcp://*:6000) to place it explicitly; rank r binds port+r and /server_info advertises the base under the kv_events block. Requires --kv-events-config to describe a publisher (routers discover the base through /server_info); startup fails if this is set without one, is not bindable, or overlaps the KV range. Note: 'auto' reserves 2*dp_size ports from the KV base — space co-hosted engines accordingly.",
         NS("observability"),
     ] = None
     enable_forward_pass_metrics: A[
@@ -9525,8 +9525,10 @@ class ServerArgs:
                                                   # range (load rank r = base
                                                   # + r). Consumers MUST read
                                                   # this key, not re-derive
-                                                  # it; omitted when no
-                                                  # bindable range exists
+                                                  # it; present only when
+                                                  # --load-publish-endpoint
+                                                  # opted in and a range
+                                                  # resolved
                 "load_topic": "load",             # SUB filter for the load
                                                   # socket; present iff
                                                   # load_endpoint_port_base is

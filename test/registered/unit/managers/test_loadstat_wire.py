@@ -1,17 +1,18 @@
 """Wire contract and port/rank gating for the LoadStat load snapshot.
 
-Locks the msgpack array shape the router's `cache_aware_zmq` policy decodes:
+Locks the msgpack array shape the sgl-router `cache_aware_zmq` policy will
+decode positionally (that consumer lands with the router PR; it is not yet
+in this tree, so this pins only the Python side):
 
     ["LoadStat", num_running_reqs, num_waiting_reqs, num_tokens,
      max_total_num_tokens, attn_dp_rank]
 
 carried as the payload of a three-frame message ``[b"load", BE-i64 seq,
-payload]``. The consumer decodes the payload positionally, so a field
-reorder or rename is a silent cross-language break; this pins the encoding
-and the framing. TestLoadPublisherGating additionally pins which schedulers
-publish and on which port. CPU-only: the socket bind is stubbed at the
-`_open_pub_socket` seam, so the real gating and port resolution run without
-claiming TCP ports under parallel CI.
+payload]``. A field reorder or rename is a silent cross-language break, so
+`test_loadstat_golden_bytes` pins the exact encoding — assert the same hex
+on the Rust side when that PR lands to actually close the loop.
+TestLoadPublisherGating pins which schedulers publish and on which port.
+CPU-only: the socket bind is stubbed at the `_open_pub_socket` seam.
 """
 
 import unittest
@@ -32,30 +33,41 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestLoadStatWire(CustomTestCase):
-    def test_loadstat_msgpack_array_shape(self):
-        stat = LoadStat(
-            num_running_reqs=7,
-            num_waiting_reqs=3,
-            num_tokens=1024,
-            max_total_num_tokens=8192,
-            attn_dp_rank=2,
+    def test_loadstat_golden_bytes(self):
+        # Exact on-the-wire encoding. Assert the identical hex from the Rust
+        # decoder's test when the router PR lands — that is what actually pins
+        # a cross-language format; the decode-round-trip below only pins Python.
+        raw = msgspec.msgpack.Encoder().encode(
+            LoadStat(
+                num_running_reqs=7,
+                num_waiting_reqs=3,
+                num_tokens=1024,
+                max_total_num_tokens=8192,
+                attn_dp_rank=2,
+            )
         )
-        # Same encoder the publisher uses (msgspec.msgpack.Encoder).
-        raw = msgspec.msgpack.Encoder().encode(stat)
-        decoded = msgspec.msgpack.Decoder().decode(raw)
+        self.assertEqual(raw.hex(), "96a84c6f6164537461740703cd0400cd200002")
 
-        # tag=True + array_like → [tag, *fields] in declaration order. The Rust
-        # decoder reads the tag + first four counts and ignores any trailing
-        # fields (attn_dp_rank).
+    def test_loadstat_msgpack_array_shape(self):
+        raw = msgspec.msgpack.Encoder().encode(
+            LoadStat(
+                num_running_reqs=7,
+                num_waiting_reqs=3,
+                num_tokens=1024,
+                max_total_num_tokens=8192,
+                attn_dp_rank=2,
+            )
+        )
+        # tag=True + array_like → [tag, *fields] in declaration order; the
+        # router reads the tag + four counts and ignores the trailing field.
         self.assertEqual(
-            decoded,
+            msgspec.msgpack.Decoder().decode(raw),
             ["LoadStat", 7, 3, 1024, 8192, 2],
-            "LoadStat wire shape must match the Rust decoder's expectation",
         )
 
     def test_loadstat_tag_is_class_name(self):
-        # The Rust decoder matches the literal tag string "LoadStat"; guard
-        # against an accidental msgspec `tag=` override or class rename.
+        # The tag is the literal "LoadStat"; guard against an accidental
+        # msgspec `tag=` override or a class rename.
         raw = msgspec.msgpack.Encoder().encode(
             LoadStat(
                 num_running_reqs=0,
@@ -82,9 +94,12 @@ class TestLoadPublisherGating(CustomTestCase):
     connect-style one.
     """
 
-    def _build(self, *, config=ZMQ_ENDPOINT, dp_size=1, explicit=None, **ps_overrides):
+    def _build(
+        self, *, config=ZMQ_ENDPOINT, dp_size=1, explicit="auto", **ps_overrides
+    ):
         """Construct a publisher with the socket bind stubbed out, returning
-        (publisher, captured _open_pub_socket mock). dp_size lives on the ps,
+        (publisher, captured _open_pub_socket mock). Opts in via explicit="auto"
+        by default (the feature is off without it). dp_size lives on the ps,
         which the publisher reads (no separate param to disagree with it)."""
         with patch(
             "sglang.srt.managers.scheduler_components.load_publisher."
@@ -97,8 +112,16 @@ class TestLoadPublisherGating(CustomTestCase):
             )
         return pub, open_sock
 
+    def test_disabled_by_default(self):
+        # Off unless opted in: a bare --kv-events-config user (no
+        # --load-publish-endpoint) reserves no load port, so an upgrade can't
+        # collide with a co-hosted neighbor's KV bind.
+        pub, open_sock = self._build(explicit=None)
+        self.assertFalse(pub.enable)
+        open_sock.assert_not_called()
+
     def test_enabled_on_rank_zero(self):
-        pub, open_sock = self._build()
+        pub, open_sock = self._build()  # explicit="auto"
         self.assertTrue(pub.enable)
         open_sock.assert_called_once_with("tcp://*:5558")
 
@@ -410,6 +433,61 @@ class TestLoadPublisherGating(CustomTestCase):
             pub.publish_load_stat(self._provider(running=7), force=True)
             pub.publish_load_stat(self._provider(running=0), force=True)
             self.assertEqual(pub._socket.send_multipart.call_count, 2)
+
+
+class TestLoadStatIntegration(CustomTestCase):
+    """The one path every gating test stubs: a real socket bind + SUB
+    round-trip. Covers _open_pub_socket (bind, HWM/LINGER/IPV6 order) and the
+    three-frame wire end to end."""
+
+    def test_binds_and_delivers_three_decodable_frames(self):
+        import socket as _socket
+        import time as _time
+
+        import zmq
+
+        # Explicit ephemeral port so parallel CI can't collide.
+        with _socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+
+        pub = SchedulerLoadPublisher(
+            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
+            ps=ParallelState.trivial(),
+            load_publish_endpoint=f"tcp://*:{port}",
+        )
+        self.assertTrue(pub.enable)
+        self.addCleanup(pub.close)
+
+        sub = zmq.Context.instance().socket(zmq.SUB)
+        sub.connect(f"tcp://127.0.0.1:{port}")
+        sub.setsockopt_string(zmq.SUBSCRIBE, "load")  # exact advertised topic
+        self.addCleanup(sub.close)
+
+        snap = SimpleNamespace(
+            num_running_reqs=7,
+            num_waiting_reqs=3,
+            num_used_tokens=1024,
+            max_total_num_tokens=8192,
+        )
+        # PUB/SUB drops messages sent before the subscription propagates, so
+        # re-publish until one lands (heartbeat reset each pass).
+        frames = None
+        deadline = _time.time() + 5
+        while frames is None and _time.time() < deadline:
+            pub._last_publish_ts = 0.0
+            pub.publish_load_stat(lambda: snap, force=True)
+            if sub.poll(100):
+                frames = sub.recv_multipart()
+        self.assertIsNotNone(frames, "no load frame received within 5s")
+
+        topic, seq, payload = frames
+        self.assertEqual(topic, b"load")
+        self.assertEqual(len(seq), 8)
+        self.assertEqual(
+            msgspec.msgpack.Decoder().decode(payload),
+            ["LoadStat", 7, 3, 1024, 8192, 0],
+        )
 
 
 if __name__ == "__main__":
