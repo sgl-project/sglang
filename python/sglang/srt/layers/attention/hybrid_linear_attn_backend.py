@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
+    logical_forward_mode,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -88,6 +89,8 @@ class MambaAttnBackendBase(AttentionBackend):
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
 
+        logical_mode = logical_forward_mode(forward_batch)
+
         retrieve_next_token = None
         retrieve_next_sibling = None
         retrieve_parent_token = None
@@ -119,7 +122,7 @@ class MambaAttnBackendBase(AttentionBackend):
 
         replayssm_write_pos = None
         replayssm_force_flush = None
-        if forward_batch.forward_mode.is_decode_or_idle():
+        if logical_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
                 0, bs + 1, dtype=torch.int32, device=self.device
             )
@@ -180,7 +183,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     )
                     new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
                     write_pos_buf[uniq_slots] = new_vals
-        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+        elif logical_mode.is_extend(include_draft_extend_v2=True):
             if forward_batch.forward_mode.is_draft_extend_v2():
                 # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model;
                 # skip mamba metadata.

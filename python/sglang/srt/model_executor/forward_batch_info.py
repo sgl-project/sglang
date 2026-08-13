@@ -1391,16 +1391,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
                 # Fabricate a single dummy request covering num_tokens for an
-                # empty (idle) rank. Hybrid-SSM families always take this path;
-                # non-hybrid ranks reach it once MAX_LEN is forced for the
-                # prefill breakable CUDA graph (idle + prefill), which needs
-                # every DP rank to run the same captured shape. The `else`
-                # branch handles decode rows padded to a 1-token extend.
-                if hybrid_ssm or self.seq_lens.shape[0] == 0:
+                # empty (idle) rank. Hybrid-SSM families reach this as soon as
+                # any peer rank prefills (MAX_LEN is forced whenever a rank is
+                # idle); non-hybrid ranks reach it once MAX_LEN is forced for
+                # the prefill breakable CUDA graph (idle + prefill), which
+                # needs every DP rank to run the same captured shape. A rank
+                # that holds real decode rows keeps them and takes the `else`
+                # branch, which pads each row to a 1-token extend — hybrid-SSM
+                # included, where the mamba metadata reads through the relabel
+                # (see mamba2_metadata.logical_forward_mode).
+                if self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
-                    assert (
-                        self.seq_lens.shape[0] == 0
-                    ), "extend-idle conversion expects an empty rank"
                     self.extend_num_tokens = num_tokens
                     self.extend_seq_lens = torch.tensor(
                         [num_tokens], dtype=torch.int32, device=dev
