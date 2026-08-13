@@ -288,8 +288,7 @@ class ReqToTokenPool:
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
 
-        # The allocators consult this to skip taking ownership of already-owned
-        # deferred frees, so it is registered unconditionally.
+        # Unconditional: the allocators consult this on every deferred free.
         register_req_to_token(self.req_to_token)
         if envs.SGLANG_DEBUG_MEMORY_POOL.get():
             install_index_alias_hooks()

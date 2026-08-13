@@ -1,15 +1,8 @@
 """Ownership tracking for KV index tensors taken from a `req_to_token` row.
 
-A row of `req_to_token` is mutable: the radix caches overwrite it during rematch.
-A tensor viewing that storage which is *stored* somewhere outliving the current
-call (a request field, a tree node, a deferred free queue) can therefore change
-value before it is read.
-
-`aliases_req_to_token()` answers that question and is always available, so the
-allocators can skip taking ownership of inputs that are already owned (tree node
-values and their slices). `install_debug_hooks()` additionally turns the rule
-into an assertion on the stored-field paths, and is gated by
-`SGLANG_DEBUG_MEMORY_POOL`.
+The radix caches rewrite such a row during rematch, so a view of it that outlives
+the current call -- a request field, a tree node, a deferred free queue -- can
+change value before it is read.
 """
 
 from __future__ import annotations
@@ -24,19 +17,14 @@ _hooks_installed = False
 
 
 def register_req_to_token(req_to_token: torch.Tensor) -> None:
-    """Ranges are never unregistered: a stale one can only over-report aliasing,
-    which costs a redundant copy rather than losing ownership."""
+    # Never unregistered: a stale range only over-reports, costing a spare copy.
     start = req_to_token.data_ptr()
     end = start + req_to_token.numel() * req_to_token.element_size()
     _rows.append((start, end, req_to_token.device))
 
 
 def aliases_req_to_token(value: torch.Tensor) -> bool:
-    """Whether `value`'s data lives inside a req_to_token buffer.
-
-    An address-range test, not `_base`/storage identity: a slice of a tree node
-    value is a view, yet it owns its data as far as this rule is concerned.
-    """
+    # Address range, not `_base`: a slice of a tree node value is a view yet owned.
     if not _rows or value.numel() == 0:
         return False
     ptr = value.data_ptr()
@@ -66,12 +54,8 @@ def _guarded_attr(attr: str, what: str) -> property:
 
 
 def install_debug_hooks() -> None:
-    """Swap the guarded attributes to asserting properties.
-
-    Safe because this runs from `ReqToTokenPool.__init__`, before any `Req` or
-    `TreeNode` exists -- a data descriptor would shadow values already in
-    `__dict__`.
-    """
+    # Must run before any Req/TreeNode exists: a data descriptor added later would
+    # shadow values already in `__dict__`.
     global _hooks_installed
     if _hooks_installed:
         return
