@@ -544,6 +544,7 @@ class GlmImageAR(PipelineStage):
         server_args: ServerArgs,
         device: Optional[torch.device] = None,
     ) -> list[Req]:
+        """Generate one AR batch and assign its tokens and usage to each request."""
         height = batches[0].height
         width = batches[0].width
         start_time = time.time()

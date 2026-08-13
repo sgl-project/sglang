@@ -467,7 +467,7 @@ class SchedulerDisaggMixin:
 
         sa = self.server_args
 
-        if self._is_glm_distributed_denoiser():
+        if self._is_glm_distributed_mode():
             self._preallocated_slots = {}
             register_msg = TransferRegisterMsg(
                 role=self._disagg_role.value,
@@ -1340,11 +1340,11 @@ class SchedulerDisaggMixin:
         (:meth:`_disagg_non_rank0_event_loop`).
         """
         if self._disagg_role == RoleType.DENOISER:
-            if not self._is_glm_distributed_denoiser():
+            if not self._is_glm_distributed_mode():
                 _init_disagg_request_scheduler(self, req)
 
             with self._disagg_trace_dispatch(req):
-                if self._is_glm_distributed_denoiser():
+                if self._is_glm_distributed_mode():
                     req.save_output = False
                     req.return_file_paths_only = False
                     self.worker.execute_forward([req])
@@ -1503,7 +1503,8 @@ class SchedulerDisaggMixin:
             duration_s,
         )
 
-    def _is_glm_distributed_denoiser(self: Scheduler) -> bool:
+    def _is_glm_distributed_mode(self: Scheduler) -> bool:
+        """Return whether this scheduler is a GLM distributed denoiser."""
         return (
             self._disagg_role == RoleType.DENOISER
             and self.worker.pipeline.pipeline_name == "GlmImagePipeline"
@@ -1513,6 +1514,7 @@ class SchedulerDisaggMixin:
     def _execute_glm_distributed_denoiser_request(
         self: Scheduler, req: Req, request_id: str
     ) -> None:
+        """Run local preparation, DiT, and VAE, then return decoded pixels."""
         req.save_output = False
         start_time = time.monotonic()
         with self._disagg_trace_dispatch(req):

@@ -545,12 +545,12 @@ def launch_http_server_only(server_args):
     )
 
 
-def parse_url_string(url_str: str) -> list[str]:
+def parse_url_string(url_str: str | None) -> list[str]:
     """Parse a semicolon-separated URL string into a list.
 
     Example: "tcp://10.0.0.1:35000;tcp://10.0.0.2:35000" -> ["tcp://...", "tcp://..."]
     """
-    return [u.strip() for u in url_str.split(";") if u.strip()]
+    return [u.strip() for u in (url_str or "").split(";") if u.strip()]
 
 
 def launch_disagg_server(server_args: ServerArgs):
@@ -588,9 +588,9 @@ def launch_disagg_server(server_args: ServerArgs):
     host = server_args.host or "127.0.0.1"
     base_port = server_args.scheduler_port
 
-    encoder_work_endpoints = parse_url_string(server_args.encoder_urls or "")
+    encoder_work_endpoints = parse_url_string(server_args.encoder_urls)
     denoiser_work_endpoints = parse_url_string(server_args.denoiser_urls)
-    decoder_work_endpoints = parse_url_string(server_args.decoder_urls or "")
+    decoder_work_endpoints = parse_url_string(server_args.decoder_urls)
 
     encoder_result_ep = f"tcp://{host}:{base_port + 1}"
     denoiser_result_ep = f"tcp://{host}:{base_port + 2}"
@@ -615,6 +615,11 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder_result_ep,
     )
 
+    denoiser_options = (
+        {"denoiser_capacity_per_worker": 1}
+        if glm_distributed_mode_enabled
+        else {}
+    )
     diffusion_server = DiffusionServer(
         frontend_endpoint=frontend_endpoint,
         encoder_work_endpoints=encoder_work_endpoints,
@@ -625,9 +630,9 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
-        denoiser_capacity=1 if glm_distributed_mode_enabled else 2,
         server_args=server_args,
         glm_distributed_mode_enabled=glm_distributed_mode_enabled,
+        **denoiser_options,
     )
     diffusion_server.start()
 

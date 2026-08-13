@@ -54,6 +54,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class _GlmDistributedRequest:
+    """Track one client request as it moves from AR to a denoiser."""
+
     client_request_id: str
     req: Req
     enqueue_time: float
@@ -62,6 +64,8 @@ class _GlmDistributedRequest:
 
 @dataclass
 class _GlmDistributedModeState:
+    """State used only by the GLM external-AR distributed topology."""
+
     server_args: "ServerArgs"
     ar_stage: "GlmImageAR"
     executor: ThreadPoolExecutor
@@ -129,7 +133,7 @@ class DiffusionServer:
         dispatch_policy_name: str = "round_robin",
         timeout_s: float = 600.0,
         encoder_capacity: int = 4,
-        denoiser_capacity: int = 2,
+        denoiser_capacity_per_worker: int = 2,
         decoder_capacity: int = 4,
         p2p_mode: bool = True,
         server_args=None,
@@ -166,7 +170,9 @@ class DiffusionServer:
 
         # FreeBufferSlots per instance
         self._encoder_free_slots = [encoder_capacity] * self._num_encoders
-        self._denoiser_free_slots = [denoiser_capacity] * self._num_denoisers
+        self._denoiser_free_slots = [
+            denoiser_capacity_per_worker
+        ] * self._num_denoisers
         self._decoder_free_slots = [decoder_capacity] * self._num_decoders
 
         # TTA queues per role type
@@ -349,7 +355,7 @@ class DiffusionServer:
                 if self._glm_distributed_state is not None:
                     self._process_glm_ar_batch_result_if_ready()
                     self._dispatch_glm_ar_batch_if_ready()
-                    self._dispatch_queued_glm_denoiser_requests()
+                    self._dispatch_glm_denoiser_requests_if_ready()
                 else:
                     self._drain_all_queues()
 
@@ -494,6 +500,7 @@ class DiffusionServer:
         )
 
     def _dispatch_glm_ar_batch_if_ready(self) -> None:
+        """Dispatch one compatible batch to the external AR server."""
         state = self._glm_distributed_state
         assert state is not None
         if state.active_ar_batch is not None or not state.pending_ar_requests:
@@ -555,6 +562,7 @@ class DiffusionServer:
         )
 
     def _process_glm_ar_batch_result_if_ready(self) -> None:
+        """Move a completed AR batch into the denoiser dispatch queue."""
         state = self._glm_distributed_state
         assert state is not None
         active_batch = state.active_ar_batch
@@ -589,7 +597,12 @@ class DiffusionServer:
             state.denoiser_requests[denoiser_req.request_id] = request
             state.pending_denoiser_requests.append(request)
 
-    def _dispatch_queued_glm_denoiser_requests(self) -> None:
+    def _dispatch_glm_denoiser_requests_if_ready(self) -> None:
+        """Dispatch AR-complete requests to available denoisers.
+
+        Each GLM denoiser accepts one request at a time. Dispatch continues until
+        either the pending queue is empty or every connected worker is busy.
+        """
         from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
             extract_transfer_fields,
         )
@@ -630,6 +643,7 @@ class DiffusionServer:
     def _handle_glm_denoiser_monitor_event(
         self, worker_idx: int, monitor: zmq.Socket
     ) -> None:
+        """Update dispatch eligibility when a denoiser connects or disconnects."""
         state = self._glm_distributed_state
         assert state is not None
         event = recv_monitor_message(monitor, flags=zmq.NOBLOCK)["event"]
@@ -651,6 +665,7 @@ class DiffusionServer:
             )
 
     def _handle_glm_denoiser_result_frames(self, frames: list) -> None:
+        """Return decoded denoiser output to the originating HTTP request."""
         state = self._glm_distributed_state
         assert state is not None
         tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")

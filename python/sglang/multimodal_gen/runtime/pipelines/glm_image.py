@@ -44,7 +44,7 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        is_glm_distributed_denoiser = (
+        is_glm_distributed_mode = (
             self._disagg_role == RoleType.DENOISER
             and server_args.srt_encoder_url is not None
         )
@@ -58,7 +58,7 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
 
         before_denoising_stage_cls = (
             GlmImageDenoiserPreparationStage
-            if is_glm_distributed_denoiser
+            if is_glm_distributed_mode
             else GlmImageBeforeDenoisingStage
         )
         self.add_stage(
@@ -79,7 +79,7 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
             ),
         )
 
-        if is_glm_distributed_denoiser:
+        if is_glm_distributed_mode:
             self.add_stage(
                 GlmImageDenoiserDecodingStage(
                     vae=self.get_module("vae"), pipeline=self
