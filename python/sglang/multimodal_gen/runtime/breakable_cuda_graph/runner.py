@@ -344,6 +344,14 @@ class BaseBreakableCudaGraphRunner:
                 "[Diffusion BCG]   differing fields (serving vs captured): %s",
                 diffs[:8],
             )
+        logger.warning(
+            "[Diffusion BCG] hint: graphs replay only for the exact shapes "
+            "captured at warmup. A ``hidden_states`` difference above means "
+            "the request resolution was never captured (the auto-derived "
+            "warmup resolution is the model default, which can differ from "
+            "the resolutions you actually serve) -- declare every served "
+            "resolution explicitly, e.g. --warmup-resolutions 1024x1024."
+        )
 
     def replay(self, entry: _CaptureEntry, kwargs: dict[str, Any]) -> Any:
         live_leaves = _flatten_kwargs(kwargs)

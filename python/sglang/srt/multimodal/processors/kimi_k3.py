@@ -44,10 +44,10 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     _grid_thw_from_resize_config,
     navit_resize_config,
 )
-from sglang.srt.utils import is_cuda
-from sglang.srt.utils.cuda_ipc_transport_utils import (
+from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
+from sglang.srt.utils import is_cuda
 
 
 def _encode_k3_special_tokens(tokenizer, text: str) -> list[int]:
@@ -290,6 +290,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     precompute_hash_before_cpu_transfer = True
     auto_mm_processor_worker_num = 2
     auto_mm_io_worker_num = 16
+    auto_mm_preprocess_cache_size_mb = 256
     supports_mm_processor_concurrency = True
     preserve_processor_input_ids = True
 
