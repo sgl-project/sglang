@@ -7,7 +7,7 @@ on transformer modules in SGLang's modular pipeline architecture.
 """
 
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Protocol, cast
+from typing import List, Optional
 
 import torch
 import torch.distributed as dist
