@@ -15,11 +15,13 @@ import math
 
 import torch
 import torch.nn.functional as F
-from diffusers.models.embeddings import PixArtAlphaCombinedTimestepSizeEmbeddings
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.ltx_2_5_diffusion_decoder import (
     LTX25DiffusionDecoderConfig,
+)
+from sglang.multimodal_gen.runtime.models.dits.ltx_2 import (
+    LTX2PixArtAlphaCombinedTimestepSizeEmbeddings,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -578,8 +580,8 @@ class LTX2VideoDiffusionDecoder3d(nn.Module):
                 )
             )
 
-        self.t_embedder = PixArtAlphaCombinedTimestepSizeEmbeddings(
-            embedding_dim=arch.decoder_t_emb_dim, size_emb_dim=0
+        self.t_embedder = LTX2PixArtAlphaCombinedTimestepSizeEmbeddings(
+            embedding_dim=arch.decoder_t_emb_dim
         )
 
         stage5_channels = stage_channels[-1]
@@ -648,9 +650,6 @@ class LTX2VideoDiffusionDecoder3d(nn.Module):
         """One stage-5 step; returns a pixel-space prediction `(B, C, F, H, W)`."""
         t_emb = self.t_embedder(
             self.timestep_scale_multiplier * timestep,
-            resolution=None,
-            aspect_ratio=None,
-            batch_size=timestep.shape[0],
             hidden_dtype=latent_context.dtype,
         )
         modulation = self.shared_adaln(t_emb)
