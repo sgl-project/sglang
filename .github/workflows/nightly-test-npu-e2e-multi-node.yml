@@ -63,7 +63,7 @@ on:
         required: false
         type: string
         default: '{}'
-        description: 'JSON run metadata {branch_label, workflow_name, create_date}, recorded once at workflow start'
+        description: 'JSON run metadata {branch_label, workflow_name, create_time}, recorded once at workflow start'
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
@@ -149,17 +149,17 @@ jobs:
           run_id=${{ github.run_id }}
           run_attempt=${{ github.run_attempt }}
 
-          # Parse run metadata (branch_label / workflow_name / create_date)
+          # Parse run metadata (branch_label / workflow_name / create_time)
           # from run_start_metadata JSON input using GitHub fromJson expression, same as partitions input.
           branch_label=$(echo "${{ fromJson(inputs.run_start_metadata).branch_label }}" | tr '/:' '--')
           workflow_name=$(echo "${{ fromJson(inputs.run_start_metadata).workflow_name }}" | tr ' ' '_' | tr -d '()')
-          create_date="${{ fromJson(inputs.run_start_metadata).create_date }}"
-          if [ -z "${create_date}" ]; then create_date=$(date -u -d '+8 hours' +%Y%m%d); fi
+          create_time="${{ fromJson(inputs.run_start_metadata).create_time }}"
+          if [ -z "${create_time}" ]; then create_time=$(date -u -d '+8 hours' +%Y%m%d-%H%M); fi
 
           # Print persistence‑directory‑prefix variables
-          echo "Persistence prefix: run_id=${run_id} run_attempt=${run_attempt} branch_label=${branch_label} workflow_name=${workflow_name} create_date=${create_date}"
+          echo "Persistence prefix: run_id=${run_id} run_attempt=${run_attempt} branch_label=${branch_label} workflow_name=${workflow_name} create_time=${create_time}"
 
-          sglang_test_results_output_path=/root/.cache/tests/output/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}
+          sglang_test_results_output_path=/root/.cache/tests/output/${branch_label}-${create_time}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}
           mkdir -p ${sglang_test_results_output_path}
           echo "Metrics file path: ${sglang_test_results_output_path}"
 

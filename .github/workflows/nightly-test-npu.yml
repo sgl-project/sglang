@@ -115,9 +115,10 @@ jobs:
             BRANCH_LABEL="${{ github.ref_name }}"
           fi
           BRANCH_LABEL="$(echo "${BRANCH_LABEL}" | tr -cd 'a-zA-Z0-9._/:' | tr '/:' '--')"
-          # Package run metadata (branch/workflow/date) as a single JSON for reuse by all test
-          # jobs; date is UTC+8 recorded once at run start, shared even across midnight.
-          RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_date':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "$(date -u -d '+8 hours' +%Y%m%d)")"
+          # Package run metadata (branch/workflow/create_time) as a single JSON for reuse by all
+          # test jobs; create_time is UTC+8 date + time (minute precision) recorded once at run
+          # start, shared even across midnight.
+          RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_time':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "$(date -u -d '+8 hours' +%Y%m%d-%H%M)")"
           # Write to GITHUB_OUTPUT and print to the log in one command.
           echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
   
