@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
 
+from sglang.kernels.ops.diffusion.bitexact_gate import BitExactFusionGate
 from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
     can_use_fused_layernorm_modulate,
     fused_layernorm_modulate_raw,
@@ -22,10 +23,12 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_SANA_FUSED_LN_MOD_DISABLED = False
-# (shape/stride/dtype/eps) signatures whose fused output was torch.equal-
-# verified against the live eager chain.
-_SANA_FUSED_LN_MOD_OK_SIGS: set = set()
+_SANA_LN_MOD = BitExactFusionGate("Sana fused LN+modulate", per_signature=True)
+# Direct module-level state keeps BCG warmup launch overhead equal to the
+# pre-refactor path; the gate still owns first-sight verification transitions.
+_SANA_LN_MOD_SIGS = _SANA_LN_MOD.verified_sigs
+assert _SANA_LN_MOD_SIGS is not None
+_SANA_LN_MOD_DISABLED = False
 
 
 def _eager_ln_modulate(
@@ -61,9 +64,9 @@ def _sana_ln_modulate(
     layout); aten's LayerNorm contiguizes internally, and the fast path
     issues the same copy explicitly.
     """
-    global _SANA_FUSED_LN_MOD_DISABLED
+    global _SANA_LN_MOD_DISABLED
 
-    if _SANA_FUSED_LN_MOD_DISABLED or torch.compiler.is_compiling() or not x.is_cuda:
+    if _SANA_LN_MOD_DISABLED or torch.compiler.is_compiling() or not x.is_cuda:
         return _eager_ln_modulate(norm, x, scale, shift)
 
     capturing = torch.cuda.is_current_stream_capturing()
@@ -79,7 +82,7 @@ def _sana_ln_modulate(
         shift.stride(),
         norm.eps,
     )
-    if sig in _SANA_FUSED_LN_MOD_OK_SIGS:
+    if sig in _SANA_LN_MOD_SIGS:
         return fused_layernorm_modulate_raw(
             x.contiguous(), scale[:, 0], shift[:, 0], norm.eps
         )
@@ -101,19 +104,21 @@ def _sana_ln_modulate(
         try:
             out = fused_layernorm_modulate_raw(x_c, scale[:, 0], shift[:, 0], norm.eps)
         except Exception as exc:
-            logger.warning_once(f"Disabling Sana fused LN+modulate fast path: {exc}")
-            _SANA_FUSED_LN_MOD_DISABLED = True
+            _SANA_LN_MOD.on_exception(exc, logger=logger)
+            _SANA_LN_MOD_DISABLED = True
         else:
-            ref = _eager_ln_modulate(norm, x, scale, shift)
-            if torch.equal(out, ref):
-                _SANA_FUSED_LN_MOD_OK_SIGS.add(sig)
-                return out
-            logger.warning_once(
-                "Sana fused LN+modulate fast path is not bit-exact against "
-                "this platform's LayerNorm dispatch; falling back to eager"
+            result = _SANA_LN_MOD.accept_or_fallback(
+                out,
+                _eager_ln_modulate(norm, x, scale, shift),
+                sig=sig,
+                logger=logger,
+                mismatch_msg=(
+                    "Sana fused LN+modulate fast path is not bit-exact against "
+                    "this platform's LayerNorm dispatch; falling back to eager"
+                ),
             )
-            _SANA_FUSED_LN_MOD_DISABLED = True
-            return ref
+            _SANA_LN_MOD_DISABLED = _SANA_LN_MOD.disabled
+            return result
 
     return _eager_ln_modulate(norm, x, scale, shift)
 
@@ -401,7 +406,7 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     def __init__(self, config: SanaConfig, hf_config=None, **kwargs):
         super().__init__(config, hf_config=hf_config or {}, **kwargs)
 
-        arch = config.arch_config
+        arch = self.config
         self.out_channels = arch.out_channels
         self.patch_size = arch.patch_size
         self.inner_dim = arch.num_attention_heads * arch.attention_head_dim
