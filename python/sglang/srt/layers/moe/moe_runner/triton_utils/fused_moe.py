@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
+from sglang.kernels.ops.moe import moe_align_block_size
 from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     act_and_mul_triton,
     invoke_fused_moe_kernel,
@@ -43,7 +44,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
-from .moe_align_block_size import moe_align_block_size
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput

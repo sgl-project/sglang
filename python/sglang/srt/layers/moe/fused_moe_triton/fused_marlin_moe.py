@@ -190,7 +190,7 @@ def fused_marlin_moe(
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
-    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+    from sglang.kernels.ops.moe import moe_align_block_size
 
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     assert hidden_states.shape[1] == w1.shape[1] * 16, "Hidden size mismatch w1"

@@ -92,7 +92,7 @@ def moe_lora_merged_align(
     # The align kernel's block-1 fill writes sorted_token_ids with vectorized int4
     # stores; the last store can spill up to 3 int32 past the logical end. Pad the
     # standalone allocation to a multiple of VEC_SIZE (4) so the spill stays in
-    # bounds (matches _align_block_size_jit's _A4). block_size=16 is already a
+    # bounds (matches moe_align_block_size's VEC_SIZE rounding). block_size=16 is already a
     # multiple of 4 in production; this guards non-multiple-of-4 block sizes.
     sorted_alloc = (max_num_tokens_padded + 3) & ~3
     sorted_token_ids = torch.empty((sorted_alloc,), dtype=torch.int32, device=device)

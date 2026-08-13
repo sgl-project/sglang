@@ -24,13 +24,11 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import silu_and_mul
 
+    from sglang.kernels.ops.moe import moe_align_block_size
     from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
         moe_sum_reduce_triton,
     )
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
-    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
-        _align_block_size_jit as moe_align_block_size,
-    )
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
         get_scalar_type,
     )

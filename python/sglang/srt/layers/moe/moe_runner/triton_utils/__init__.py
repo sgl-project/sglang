@@ -6,9 +6,6 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config impor
     get_config_file_name,
     try_get_optimal_moe_config,
 )
-from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
-    moe_align_block_size,
-)
 
 _config: Optional[Dict[str, Any]] = None
 
@@ -31,6 +28,5 @@ __all__ = [
     "get_config",
     "fused_experts",
     "get_config_file_name",
-    "moe_align_block_size",
     "try_get_optimal_moe_config",
 ]

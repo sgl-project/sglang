@@ -148,6 +148,14 @@ inline constexpr auto kFullMask = 0xffffffffffffffffULL;
  * On Hopper (sm_90+), inserts a `griddepcontrol.wait` instruction to
  * synchronize with a preceding kernel in the same stream. On older
  * architectures or ROCm this is a no-op.
+ *
+ * \note This is the only thing that orders us against the producer. Per the PTX
+ * ISA, `.wait` makes the executing thread wait until every prerequisite grid in
+ * flight has COMPLETED and all of its memory operations are performed and made
+ * visible to this grid -- so it is what a `PDLTriggerSecondary` upstream does
+ * NOT give us. It acts per thread, so every thread that reads producer data has
+ * to execute it; put it ahead of the first such load. Stores into our own output
+ * buffers depend on nothing upstream and may be issued before it.
  */
 template <bool kUsePDL>
 SGL_DEVICE void PDLWaitPrimary() {
@@ -163,6 +171,22 @@ SGL_DEVICE void PDLWaitPrimary() {
  *
  * On Hopper (sm_90+), inserts a `griddepcontrol.launch_dependents`
  * instruction. On older architectures or ROCm this is a no-op.
+ *
+ * \note Scheduling only: this carries no memory ordering of its own. The
+ * dependent becomes eligible to launch once every CTA in this grid has issued
+ * the instruction or has exited, and it may then start before our writes are
+ * visible -- making them visible is the job of `PDLWaitPrimary` on the dependent
+ * side, which is why the programming guide requires the dependent to call it.
+ *
+ * Granularity is the CTA: the PTX ISA states that repeated invocations by
+ * threads of the same CTA have no side effect past the first, so one thread
+ * would do; we call it from all of them because it is free and needs no
+ * predication. Leaving it out altogether is safe and merely late, since the
+ * trigger is implied once every CTA exits.
+ *
+ * Placing it early therefore costs nothing and only buys the dependent a head
+ * start on the work that does not depend on us. Even that is opportunistic:
+ * concurrent execution is never guaranteed, so nothing may rely on it.
  */
 template <bool kUsePDL>
 SGL_DEVICE void PDLTriggerSecondary() {

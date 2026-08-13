@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
@@ -20,7 +20,7 @@ _CUDA = frozenset({CapabilityRequirement.CUDA})
 
 register_kernel(
     KernelSpec(
-        op="moe.moe_align_block_size",
+        op="moe.moe_align_block_size_out",
         backend=KernelBackend.AOT,
         target="sgl_kernel:moe_align_block_size",
         format_signature=FormatSignature(
@@ -32,9 +32,9 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
-        op="moe.moe_align_block_size",
+        op="moe.moe_align_block_size_out",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.moe.moe_align:moe_align_block_size",
+        target="sglang.kernels.ops.moe.moe_align:moe_align_block_size_out",
         capabilities=_CUDA,
         format_signature=FormatSignature(
             in_place=True,
@@ -59,39 +59,53 @@ register_kernel(
 
 def moe_align_block_size(
     topk_ids: torch.Tensor,
-    num_experts: int,
     block_size: int,
-    sorted_token_ids: torch.Tensor,
-    experts_ids: torch.Tensor,
-    num_tokens_post_pad: torch.Tensor,
-    cumsum_buffer: torch.Tensor,
-    pad_sorted_token_ids: bool = False,
+    num_experts: int,
     ignore_invalid_expert: bool = False,
-) -> None:
-    """Align and sort expert token ids into block-padded output buffers."""
-    kernel = get_kernel("moe.moe_align_block_size", KernelBackend.AOT)
-    if ignore_invalid_expert:
-        return kernel(
-            topk_ids,
-            num_experts,
-            block_size,
-            sorted_token_ids,
-            experts_ids,
-            num_tokens_post_pad,
-            cumsum_buffer,
-            pad_sorted_token_ids,
-            ignore_invalid_expert,
-        )
-    return kernel(
-        topk_ids,
-        num_experts,
-        block_size,
-        sorted_token_ids,
-        experts_ids,
-        num_tokens_post_pad,
-        cumsum_buffer,
-        pad_sorted_token_ids,
-    )
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Aligns the token distribution across experts to be compatible with block
+    size for matrix multiplication.
+
+    Parameters:
+    - topk_ids: A tensor of shape [total_tokens, top_k] representing the
+        top-k expert indices for each token.
+    - block_size: The block size used in block matrix multiplication.
+    - num_experts: The total number of experts.
+
+    Returns:
+    - sorted_token_ids: A tensor containing the sorted token indices according
+        to their allocated expert.
+    - expert_ids: A tensor indicating the assigned expert index for each block.
+    - num_tokens_post_padded: The total number of tokens after padding,
+        ensuring divisibility by block_size.
+
+    This function pads the number of tokens that each expert needs to process
+    so that it is divisible by block_size.
+    Padding ensures that during block matrix multiplication, the dimensions
+    align correctly.
+
+    Example:
+    Given topk_ids = [[2, 3, 4], [1, 2, 4], [1, 3, 4], [1, 2, 3]],
+    block_size = 4, and num_experts = 4:
+    - We initially have 12 tokens (after repeating 'top_k' times) and 4 experts,
+        with each expert needing to process 3 tokens.
+    - As block_size is 4, we pad 1 token for each expert.
+    - First, flatten topk_ids to [2, 3, 4, 1, 2, 4, 1, 3, 4, 1, 2, 3].
+    - Then append padding tokens [12, 12, 12, 12] for each block.
+    - After sorting by expert index, we obtain token_ids
+        [3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12].
+        Tokens 12 are non-existent (padding) and are ignored in
+        the subsequent matrix multiplication.
+    - The padding ensures that the total number of tokens is now divisible
+        by block_size for proper block matrix operations.
+    """
+    # Imported here, not in the module body: the dispatch module pulls in torch
+    # and resolves a backend at import, and importing a group package has to stay
+    # metadata-only (see `sglang.kernels.ops`).
+    from sglang.kernels.ops.moe.moe_align_dispatch import align_block_size
+
+    return align_block_size(topk_ids, block_size, num_experts, ignore_invalid_expert)
 
 
 def topk_softmax(
@@ -111,9 +125,6 @@ def topk_softmax(
         moe_softcapping,
         correction_bias,
     )
-
-
-__all__ = ["moe_align_block_size", "topk_softmax"]
 
 
 # Fused MoE-LoRA Triton kernels migrated into this group (from lora/triton_ops);
@@ -170,19 +181,4 @@ register_kernel(
     )
 )
 
-# Single-CTA align for tiny batches: covers the corner the AOT/JIT
-# moe_align_block_size small-batch path leaves out (num_experts > 64), and is
-# selected by the moe_runner call site on numel <= SMALL_NUMEL_LIMIT.
-register_kernel(
-    KernelSpec(
-        op="moe.moe_align_small_numel",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.moe.moe_align_small_numel:moe_align_small_numel",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            in_place=True,
-            description="align/sort expert token ids into block-padded buffers",
-        ),
-        description="MoE align-block-size, single-launch triton variant.",
-    )
-)
+__all__ = ["moe_align_block_size", "topk_softmax"]

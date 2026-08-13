@@ -9,7 +9,7 @@ Covers two regression bugs that surface only with `--lora-use-virtual-experts`
   them onto a real virtual-expert slot belonging to another adapter and
   triggered OOB loads in downstream LoRA kernels.
 
-- `_align_block_size_torch` / `_align_block_size_jit` (the `>= 1024`-expert
+- `align_block_size_torch` / the unified `moe_align_block_size` (the `>= 1024`-expert
   fallback paths) must route `-1` and `>= num_experts` IDs into a sentinel
   bucket so they don't OOB-index `padded_offsets[sorted_expert_ids]` (negative
   wrap, or past-end) and don't get assigned to a real expert in the
@@ -32,9 +32,11 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
+from sglang.kernels.ops.moe import moe_align_block_size
+
+# Reached directly: on CUDA the unified entry never picks this path.
+from sglang.kernels.ops.moe.moe_align_dispatch import align_block_size_torch
 from sglang.kernels.ops.moe.virtual_experts import (
-    _align_block_size_jit,
-    _align_block_size_torch,
     _fused_virtual_topk_ids,
     fused_sanitize_expert_ids,
 )
@@ -261,15 +263,15 @@ class TestAlignBlockSizeTorchSentinelBucket(_AlignBlockSizeSentinelBucketBase):
     """Test the pure-PyTorch torch.compile fallback path (AMD/ROCm compatible)."""
 
     def _align(self, topk_ids, block_size, num_experts):
-        return _align_block_size_torch(topk_ids, block_size, num_experts)
+        return align_block_size_torch(topk_ids, block_size, num_experts)
 
 
-class TestAlignBlockSizeJitSentinelBucket(_AlignBlockSizeSentinelBucketBase):
-    """Test the CUDA JIT kernel path (with fused_sanitize_expert_ids, as in
-    production)."""
+class TestAlignBlockSizeKernelSentinelBucket(_AlignBlockSizeSentinelBucketBase):
+    """Test the kernel path the production entry selects for these shapes (with
+    fused_sanitize_expert_ids, as in production)."""
 
     def _align(self, topk_ids, block_size, num_experts):
-        sorted_token_ids, expert_ids, num_tokens_post_padded = _align_block_size_jit(
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, block_size, num_experts
         )
         expert_ids = fused_sanitize_expert_ids(expert_ids, num_experts)
