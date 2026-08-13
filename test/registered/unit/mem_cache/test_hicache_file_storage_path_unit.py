@@ -72,7 +72,9 @@ class TestFileStoragePathRouting(CustomTestCase):
 
     def test_set_flag_is_routed(self):
         extra = _inject("/mnt/nvme/hicache")
-        self.assertEqual(HiCacheFile(_make_config(extra)).file_path, "/mnt/nvme/hicache")
+        self.assertEqual(
+            HiCacheFile(_make_config(extra)).file_path, "/mnt/nvme/hicache"
+        )
 
     def test_env_var_wins_over_flag(self):
         os.environ[_ENV] = "/env/hicache"
