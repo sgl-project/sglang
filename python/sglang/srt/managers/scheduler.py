@@ -4060,6 +4060,22 @@ class Scheduler(
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
+        # Publish load BEFORE the fully-idle gate below. A no-batch iteration
+        # that is not fully idle — waiting requests unschedulable under KV
+        # pressure, disagg requests parked in bootstrap/prealloc/transfer
+        # queues — is exactly when the gauge is changing (queues growing)
+        # with no process_batch_result running to publish it; gating this
+        # behind is_fully_idle froze /get_loads, DP balancing, and the
+        # router-facing LoadStat at their last busy values for the whole
+        # stall. For the router socket the busy->idle transition publishes
+        # immediately (the gauge changed) and an unchanged gauge is deduped
+        # to a slow heartbeat, so a spinning loop costs one send per
+        # heartbeat; the snapshot is shared between both sinks.
+        snapshot = self.publish_load_snapshot(force=True)
+        self.load_publisher.publish_load_stat(
+            self.load_inquirer.get_loads, force=True, snapshot=snapshot
+        )
+
         if not self.is_fully_idle():
             return
 
@@ -4090,19 +4106,6 @@ class Scheduler(
 
         # reset token ratio
         self.new_token_ratio_tracker.reset()
-
-        # Publish the idle state so /get_loads and DP balancing do not see stale load.
-        snapshot = self.publish_load_snapshot(force=True)
-        # Same for the router-facing load socket: without this, a load-aware
-        # router keeps the last busy LoadStat until its freshness window
-        # expires and routes as if this idle worker were still loaded. The
-        # busy->idle transition publishes immediately (the gauge changed);
-        # once idle the unchanged gauge is deduped to a slow heartbeat, so
-        # a spinning idle loop costs one send per heartbeat. The snapshot
-        # is shared with the write above.
-        self.load_publisher.publish_load_stat(
-            self.load_inquirer.get_loads, force=True, snapshot=snapshot
-        )
 
         # sleep until next event
         self.maybe_sleep_on_idle()

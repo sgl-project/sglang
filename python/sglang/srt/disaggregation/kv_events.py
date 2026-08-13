@@ -110,6 +110,27 @@ def parse_tcp_port(endpoint: Optional[str]) -> Optional[int]:
     return port if 0 < port <= 65535 else None
 
 
+def parse_advertisable_tcp(endpoint: Optional[str]) -> Optional[tuple[str, int]]:
+    """``(host, port)`` of a tcp:// endpoint fit for /server_info, else None.
+
+    Any host is allowed (KV events work connect-style); IPv6 hosts come back
+    re-bracketed so consumers can splice ``tcp://{host}:{port}`` directly.
+    Strict via NetworkAddress.parse — bare (unbracketed) IPv6 is ambiguous
+    and rejected — so the descriptor and the load-range resolver read the
+    same endpoint the same way.
+    """
+    if not endpoint or not endpoint.startswith("tcp://"):
+        return None
+    try:
+        addr = NetworkAddress.parse(endpoint[len("tcp://") :])
+    except ValueError:
+        return None
+    if not addr.host or not (0 < addr.port <= 65535):
+        return None
+    host = f"[{addr.host}]" if addr.is_ipv6 else addr.host
+    return host, addr.port
+
+
 def parse_bindable_tcp(endpoint: Optional[str]) -> Optional[tuple[str, int]]:
     """``(host, port)`` if this is a tcp:// endpoint a PUB socket can BIND,
     else None.
@@ -146,7 +167,8 @@ def resolve_load_pub_range(
     the advertisement (`ServerArgs.describe_kv_events_publisher`), so the
     two cannot drift.
 
-    ``--load-publish-endpoint`` sets the range outright; otherwise it packs
+    ``--load-publish-endpoint`` sets the range outright (or disables load
+    publishing entirely when set to the literal ``off``); otherwise it packs
     right after the KV-event range ``[kv_port, kv_port + dp_size)``, bumping
     past the replay ROUTER range when the two would overlap (with the
     conventional replay = kv + 1 they always do; a non-adjacent replay
@@ -179,6 +201,9 @@ def resolve_load_pub_range(
         for port in (parse_tcp_port(kv_endpoint), parse_tcp_port(replay_endpoint))
         if port is not None
     ]
+    if load_publish_endpoint and load_publish_endpoint.strip().lower() == "off":
+        # The operator's off switch: KV events without the extra port range.
+        return None, None
     if load_publish_endpoint:
         # Discovery rides on /server_info's kv_events block, which only
         # exists for a routable tcp:// KV endpoint — an explicit load range

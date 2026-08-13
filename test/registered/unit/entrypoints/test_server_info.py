@@ -165,6 +165,56 @@ class TestServerInfoKvEventsField(CustomTestCase):
         self.assertNotIn("load_endpoint_port_base", info["kv_events"])
         self.assertNotIn("load_topic", info["kv_events"])
 
+    def test_ipv6_wildcard_endpoint_advertises_bracketed_host_and_load_keys(self):
+        # "[::]" is a bind-all wildcard: the descriptor must keep the
+        # brackets (consumers splice tcp://{host}:{port}) and the load
+        # range resolves right after the KV range.
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://[::]:5557"}',
+            page_size=64,
+            dp_size=1,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertEqual(info["kv_events"]["endpoint_host"], "[::]")
+        self.assertEqual(info["kv_events"]["endpoint_port_base"], 5557)
+        self.assertEqual(info["kv_events"]["load_endpoint_port_base"], 5558)
+
+    def test_concrete_ipv6_endpoint_advertises_kv_but_not_load(self):
+        # A concrete IPv6 host works connect-style for KV events (advertised,
+        # brackets kept) but is not bindable for the load range — and "::"
+        # appearing inside the address must not be mistaken for a wildcard.
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://[2001:db8::5]:5557"}'
+            ),
+            page_size=64,
+            dp_size=1,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertEqual(info["kv_events"]["endpoint_host"], "[2001:db8::5]")
+        self.assertNotIn("load_endpoint_port_base", info["kv_events"])
+
+    def test_load_keys_omitted_when_explicitly_off(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
+            load_publish_endpoint="off",
+            page_size=64,
+            dp_size=1,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIsNotNone(info["kv_events"])
+        self.assertNotIn("load_endpoint_port_base", info["kv_events"])
+        self.assertNotIn("load_topic", info["kv_events"])
+
     def test_load_keys_omitted_when_no_load_range_fits(self):
         # kv base 65535 leaves no u16 room for a load range: the kv_events
         # descriptor must still be served, with only the load keys omitted,

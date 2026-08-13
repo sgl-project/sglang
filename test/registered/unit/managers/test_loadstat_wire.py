@@ -248,6 +248,42 @@ class TestLoadPublisherGating(CustomTestCase):
         self.assertFalse(pub.enable)
         open_sock.assert_not_called()
 
+    def test_explicit_off_disables_load_publishing(self):
+        # The operator's off switch: KV events without the extra port range.
+        # /server_info omits the load keys through the same resolver.
+        pub, open_sock = self._build(explicit="off")
+        self.assertFalse(pub.enable)
+        open_sock.assert_not_called()
+
+    def test_bind_failure_disables_without_raising(self):
+        # An occupied port must not take down scheduler startup over a
+        # routing hint; the publisher logs and stays a no-op.
+        import zmq
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.load_publisher."
+            "_open_pub_socket",
+            side_effect=zmq.ZMQError,
+        ):
+            pub = SchedulerLoadPublisher(
+                kv_events_config=ZMQ_ENDPOINT,
+                ps=ParallelState.trivial(),
+                dp_size=1,
+            )
+        self.assertFalse(pub.enable)
+        pub.publish_load_stat(MagicMock(), force=True)  # still a no-op
+
+    def test_close_is_idempotent_and_disables(self):
+        pub, _ = self._build()
+        socket = pub._socket
+        pub.close()
+        pub.close()
+        socket.close.assert_called_once()
+        self.assertFalse(pub.enable)
+        provider = MagicMock()
+        pub.publish_load_stat(provider, force=True)
+        provider.assert_not_called()
+
     def test_explicit_endpoint_needs_an_advertisable_kv_endpoint(self):
         # Discovery rides on /server_info's kv_events block, which is absent
         # for non-tcp (or port-less) KV endpoints — binding the explicit
@@ -336,9 +372,11 @@ class TestLoadPublisherGating(CustomTestCase):
             self.assertEqual(pub._socket.send_multipart.call_count, 2)
 
     def test_hwm_dropped_send_is_retried_not_deduped(self):
-        # zmq.Again means nobody got the reading: the dedup state must stay
-        # untouched so the next call retries it instead of suppressing an
-        # unchanged gauge until the heartbeat.
+        # Belt-and-braces guard: a real PUB send never raises Again (ZMQ
+        # sheds per-subscriber at HWM, silently), but if the socket type or
+        # contract ever changes, the dedup state must stay untouched so the
+        # next call retries the reading instead of suppressing an unchanged
+        # gauge until the heartbeat.
         import zmq
 
         pub, _ = self._build()

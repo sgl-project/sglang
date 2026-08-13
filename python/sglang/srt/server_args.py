@@ -1608,7 +1608,7 @@ class ServerArgs:
     ] = None
     load_publish_endpoint: A[
         Optional[str],
-        "Bind address for the runtime-load PUB socket that load-aware routers subscribe to, e.g. tcp://*:6000; rank r binds port+r and /server_info advertises the base under the kv_events block. Must be a wildcard-host TCP address (a concrete host would be connected to, not bound). Defaults to the dp_size ports packed after the --kv-events-config range; set it explicitly to move the range off a port conflict. Routers discover the base through /server_info, so load publishing requires --kv-events-config to describe a publisher either way.",
+        "Bind address for the runtime-load PUB socket that load-aware routers subscribe to, e.g. tcp://*:6000; rank r binds port+r and /server_info advertises the base under the kv_events block. Must be a wildcard-host TCP address (a concrete host would be connected to, not bound). Defaults to the dp_size ports packed after the --kv-events-config range; set it explicitly to move the range off a port conflict, or to the literal 'off' to disable load publishing while keeping KV events. Routers discover the base through /server_info, so load publishing requires --kv-events-config to describe a publisher either way.",
         NS("observability"),
     ] = None
     enable_forward_pass_metrics: A[
@@ -9521,21 +9521,30 @@ class ServerArgs:
           block_size would cause silent KV-cache misses by hashing
           prompts at the wrong granularity on the router side),
         * the endpoint is not a routable TCP address (inproc:// /
-          ipc://, missing port, non-integer port, or port outside
-          1..65535).
+          ipc://, missing port, non-integer port, port outside
+          1..65535, or a bare unbracketed IPv6 host, which is
+          ambiguous).
 
-        Reuses KVEventsConfig.from_cli for JSON parsing and
-        resolve_load_pub_range for the load range, so the advertisement
-        cannot drift from what SchedulerLoadPublisher binds; the inline
-        rfind(":") endpoint split mirrors
-        ZmqEventPublisher.offset_endpoint_port rather than adding a
-        new module-level helper.
+        NOTE for load-socket consumers: the load keys are only emitted
+        when a wildcard-host bind resolves, so whenever
+        load_endpoint_port_base is present, endpoint_host is a wildcard
+        ("*", "0.0.0.0", "::") — never a dialable address. Pair the load
+        port with the worker's own URL host (exactly as the KV SUB
+        endpoints require); splicing endpoint_host with the load port
+        yields tcp://*:PORT and connects to nothing.
+
+        Reuses KVEventsConfig.from_cli for JSON parsing,
+        parse_advertisable_tcp for the endpoint split, and
+        resolve_load_pub_range for the load range — the same helpers the
+        scheduler binds through, so the advertisement cannot drift from
+        the sockets.
         """
         # Lazy import so loading server_args doesn't pull in
         # disaggregation / msgspec / zmq at module top level.
         from sglang.srt.disaggregation.kv_events import (
             LOAD_TOPIC,
             KVEventsConfig,
+            parse_advertisable_tcp,
             resolve_load_pub_range,
         )
 
@@ -9552,19 +9561,10 @@ class ServerArgs:
             return None
         if cfg.publisher == "null" or not cfg.endpoint:
             return None
-        if not cfg.endpoint.startswith("tcp://"):
+        resolved_kv = parse_advertisable_tcp(cfg.endpoint)
+        if resolved_kv is None:
             return None
-        body = cfg.endpoint[len("tcp://") :]
-        last_colon = body.rfind(":")
-        if last_colon < 0:
-            return None
-        host = body[:last_colon]
-        try:
-            port = int(body[last_colon + 1 :])
-        except ValueError:
-            return None
-        if not host or not (0 < port < 65536):
-            return None
+        host, port = resolved_kv
 
         descriptor = {
             "publisher": cfg.publisher,

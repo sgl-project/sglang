@@ -96,9 +96,12 @@ LOAD_PUBLISH_HEARTBEAT_S = 1.0
 FAIL_WARN_PERIOD_S = 60.0
 
 # Send high-water mark. Small on purpose: load is a gauge, so once a
-# subscriber's pipe is full, shedding sends (PUB drops the newest message)
-# loses readings that the next heartbeat supersedes anyway — better than
-# queueing a backlog of stale ones for it to drain later.
+# subscriber's pipe is full, shedding sends (PUB drops per-subscriber inside
+# ZMQ, silently) loses readings that the next heartbeat supersedes anyway —
+# better than queueing a backlog of stale ones for it to drain later. ZMQ's
+# true newest-wins primitive (ZMQ_CONFLATE) is unavailable here: it keeps a
+# single *frame* and would corrupt the three-frame KV-compatible framing,
+# so a small bounded backlog is the closest achievable semantics.
 LOAD_PUB_HWM = 8
 
 _encoder = msgspec.msgpack.Encoder()
@@ -303,10 +306,13 @@ class SchedulerLoadPublisher:
                     (LOAD_TOPIC.encode(), seq, payload), zmq.NOBLOCK
                 )
             except zmq.Again:
-                # A stalled pipe: drop this reading (blocking the scheduler
-                # loop would be worse) and leave the dedup state untouched
-                # so the next call retries it instead of deduping away a
-                # send nobody got.
+                # Belt-and-braces: a PUB send never blocks — at HWM, ZMQ
+                # sheds per-subscriber silently, one layer down — so this
+                # branch is unreachable under PUB's documented contract.
+                # Kept in case the socket type or contract ever changes:
+                # leaving the dedup state untouched makes the next call
+                # retry the reading instead of deduping away a send nobody
+                # got.
                 return
             # Recorded only after a successful hand-off so a failed publish
             # retries instead of being deduped away.
