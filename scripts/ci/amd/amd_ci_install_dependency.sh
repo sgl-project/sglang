@@ -348,6 +348,14 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
         pip install -r requirements.txt
     "
 
+    # The re-clone above discards the image's patched torch_utils.py, and this
+    # rebuild path is exactly when it is needed most (validating a new AITER
+    # commit), so re-apply the same patch the Dockerfile applies.
+    if [[ "${IMAGE_HIP_VERSION}" == 7.2* ]]; then
+        docker exec ci_sglang python3 \
+            /sglang-checkout/scripts/ci/amd/patch_aiter_torch_stream.py
+    fi
+
     if [[ "${GPU_ARCH}" == "mi35x" ]]; then
         GPU_ARCH_LIST="gfx950"
     else

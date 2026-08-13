@@ -311,47 +311,6 @@ RUN git clone ${AITER_REPO} \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt
 
-# Hot patch: AITER stream handling on torch 2.11 (rocm720 and rocm724).
-# Dynamo reconstructs a stream as a base torch.Stream across a graph break, which
-# AITER's ctypes converter rejects because it only accepts the cuda subclass, so
-# every --enable-torch-compile run dies with "Unsupported type: torch.Stream".
-# Only the subclass carries the raw handle -- stream_id is a pool index, not a
-# pointer -- so rebuild the subclass from it instead of passing it through.
-# Self-skips once ROCm/aiter carries the fix (unfixed on main @ 4db400a9).
-RUN export GPU_ARCH="${GPU_ARCH}" \
-     && python3 - <<'PY'
-import os
-import pathlib
-
-if not os.environ.get("GPU_ARCH", "").endswith(("-rocm720", "-rocm724")):
-    raise SystemExit(0)
-
-OLD = """        elif isinstance(arg, torch.cuda.Stream):
-            c_args.append(ctypes.cast(arg.cuda_stream, ctypes.c_void_p))
-"""
-NEW = """        elif isinstance(arg, torch.Stream):
-            handle = getattr(arg, "cuda_stream", None)
-            if handle is None:
-                handle = torch.cuda.Stream(
-                    stream_id=arg.stream_id,
-                    device_index=arg.device_index,
-                    device_type=arg.device_type,
-                ).cuda_stream
-            c_args.append(ctypes.cast(handle, ctypes.c_void_p))
-"""
-
-path = pathlib.Path("/sgl-workspace/aiter/csrc/cpp_itfs/torch_utils.py")
-src = path.read_text()
-if OLD in src:
-    path.write_text(src.replace(OLD, NEW))
-    print("patched aiter torch_utils.py (base torch.Stream handle recovery)")
-else:
-    assert "isinstance(arg, torch.Stream)" in src, (
-        "FATAL: aiter torch_to_c_types no longer matches the stream patch"
-    )
-    print("aiter already accepts a base torch.Stream; no patch needed")
-PY
-
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
@@ -450,6 +409,17 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
        else \
          export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[${all_extras}]"; \
        fi
+
+# AITER stream handling on torch 2.11 (rocm720 and rocm724). Runs here rather
+# than next to the AITER clone because it shares its logic with the CI installer
+# via a script from the sglang checkout, which only exists from this point on.
+# AITER is installed editable, so patching its source after the install still
+# takes effect.
+RUN case "${GPU_ARCH}" in \
+      *-rocm720|*-rocm724) \
+        python3 /sgl-workspace/sglang/scripts/ci/amd/patch_aiter_torch_stream.py \
+        ;; \
+    esac
 
 RUN python -m pip cache purge
 
