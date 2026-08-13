@@ -70,6 +70,7 @@ class InsertParams:
     # SWA specific
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
+    swa_branching_seqlen: Optional[int] = None
 
     # General
     chunked: bool = False
@@ -84,6 +85,7 @@ class InsertResult:
     total_len: int = 0
     last_device_node: Any = None
     mamba_exist: bool = False
+    swa_branch_inserted: bool = False
     inserted_host_node: Any = None
     host_insert_dropped: bool = False
     # Controller-applied actions from the non-stepped channels (e.g. insert_host); the stepped insert emits via InsertStepResult.actions.

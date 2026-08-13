@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     IncLockRefResult,
@@ -378,6 +379,11 @@ class SWAComponent(TreeComponent):
         result: InsertResult,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
+        branching_seqlen = params.swa_branching_seqlen
+        if branching_seqlen is not None:
+            assert params.key is not None
+            result.swa_branch_inserted = len(params.key) >= branching_seqlen
+
         if not is_new_leaf:
             return
 
@@ -763,24 +769,44 @@ class SWAComponent(TreeComponent):
             branching_seqlen is not None
             and req.cache_protected_len < branching_seqlen <= token_ids_len
         ):
+            insert_params.swa_branching_seqlen = branching_seqlen
             return branching_seqlen
 
         return None
 
+    def _free_out_of_window_slots(self, req: Req, pre_len: int) -> None:
+        if self.sliding_window_size is None:
+            return
+        free_swa_out_of_window_slots(
+            req,
+            pre_len,
+            sliding_window_size=self.sliding_window_size,
+            page_size=self.cache.page_size,
+            req_to_token_pool=self.cache.req_to_token_pool,
+            token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
+            retain_floor=self.cache.swa_retain_floor(req),
+        )
+
     def free_out_of_window_slots(
         self, req: Req, pre_len: int, insert_params: InsertParams
     ) -> None:
-        if self.sliding_window_size is not None:
-            free_swa_out_of_window_slots(
-                req,
-                pre_len,
-                sliding_window_size=self.sliding_window_size,
-                page_size=self.cache.page_size,
-                req_to_token_pool=self.cache.req_to_token_pool,
-                token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
-                retain_floor=self.cache.swa_retain_floor(req),
-            )
+        self._free_out_of_window_slots(req, pre_len)
         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
+
+    def cleanup_after_caching_req(
+        self,
+        req: Req,
+        is_finished: bool,
+        insert_result: Optional[InsertResult] = None,
+        insert_params: Optional[InsertParams] = None,
+    ) -> None:
+        if (
+            not is_finished
+            and insert_result is not None
+            and insert_result.swa_branch_inserted
+            and envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
+        ):
+            self._free_out_of_window_slots(req, len(req.get_fill_ids()) - 1)
 
     # ---- HiCache Hooks ----
 

@@ -3757,7 +3757,15 @@ class UnifiedRadixCacheSuite:
                 MatchPrefixParams(key=RadixKey(array("q", tokens)))
             ).last_device_node
         )
-        leaf.component_data[ComponentType.SWA].value = None
+        device_frees = defaultdict(list)
+        cache.tree_core._evict_component_and_detach_lru(
+            leaf,
+            cache.components[ComponentType.SWA],
+            device_frees=device_frees,
+            host_frees=defaultdict(list),
+            target=EvictLayer.DEVICE,
+        )
+        cache._drain_device_frees(device_frees)
 
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
 
