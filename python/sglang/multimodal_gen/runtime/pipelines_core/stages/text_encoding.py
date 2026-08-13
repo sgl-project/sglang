@@ -515,29 +515,37 @@ class TextEncodingStage(ConditionEncodingStage):
     ):
         """group to data-parallel a batched text-encode over, or None
 
-        requires a replicated encoder (tp==1, dp==1, not folded): each rank
-        would otherwise redundantly encode the whole batch. Also requires a
-        TextEncoder, whose forward returns BaseEncoderOutput -- the gather needs
-        to know which fields carry the batch, and a raw transformers encoder
-        returns its own output type (e.g. Qwen2_5_VLCausalLMOutputWithPast).
+        dp splits the request batch across ranks and all-gathers the outputs,
+        so each rank must hold a full encoder replica it can run alone. The
+        DiT's TP/SP layout is irrelevant to that: encoders are only ever
+        sharded through folding, which is gated on its own below.
         """
-        policy = server_args.encoder_parallel
-        if (
-            policy not in ("auto", "dp")
-            # isinstance first: the loader can return a raw transformers
-            # encoder, which carries no such attribute
-            or not isinstance(text_encoder, TextEncoder)
-            or not text_encoder.supports_dp_encode
-            or (server_args.tp_size or 1) != 1
-            or (server_args.dp_size or 1) != 1
-            or encoder_config.parallel_folding_mode is not None
-        ):
+        if server_args.encoder_parallel not in ("auto", "dp"):
+            return None
+        # a folded encoder is sharded over its folding group, so a single rank
+        # cannot encode a batch slice by itself
+        if encoder_config.parallel_folding_mode is not None:
+            return None
+        # dp_size > 1 already splits requests across pipeline replicas one
+        # level up; re-splitting inside a replica would desync the scheduler's
+        # batch accounting
+        if (server_args.dp_size or 1) != 1:
+            return None
+        # the gather rebuilds a BaseEncoderOutput, which only a TextEncoder
+        # forward produces -- a raw transformers encoder returns its own output
+        # type (e.g. Qwen2_5_VLCausalLMOutputWithPast). isinstance first: the
+        # loader can return such an encoder, which carries no dp attribute.
+        if not isinstance(text_encoder, TextEncoder):
+            return None
+        if not text_encoder.supports_dp_encode:
             return None
         group = get_world_group()
         if group.world_size <= 1:
             return None
         # explicit dp trusts the operator on an unmeasured topology; auto does not
-        measured = policy == "dp" or group_has_measured_topology(group)
+        measured = server_args.encoder_parallel == "dp" or group_has_measured_topology(
+            group
+        )
         if not encoder_dp_worthwhile(encoder_config, batch_size, measured):
             return None
         self._log_dp_choice(batch_size, group.world_size)

@@ -1892,7 +1892,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "single-request latency) and data-parallels eligible native "
                 "text encoders at batch>1; `fold` always tensor-parallels the "
                 "encoder weights; `dp` never folds and splits the batch across "
-                "ranks (best batched throughput; requires TP=1 and DP=1); "
+                "ranks (best batched throughput; requires DP=1); "
                 "`replicate` disables both. The default is `auto`."
             ),
         )
@@ -3171,10 +3171,12 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
-        if self.encoder_parallel == "dp" and (
-            (self.tp_size or 1) != 1 or (self.dp_size or 1) != 1
-        ):
-            raise ValueError("encoder_parallel=dp requires tp_size=1 and dp_size=1")
+        # dp only needs each rank to hold a runnable encoder replica; the DiT's
+        # TP layout does not shard encoders (only folding does, and an explicit
+        # dp policy drops folding at load time). dp_size > 1 stays rejected:
+        # requests are already split across pipeline replicas one level up.
+        if self.encoder_parallel == "dp" and (self.dp_size or 1) != 1:
+            raise ValueError("encoder_parallel=dp requires dp_size=1")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
