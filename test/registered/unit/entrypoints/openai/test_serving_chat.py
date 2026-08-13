@@ -2977,6 +2977,72 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
         self.assertIsNone(tool_calls)
 
 
+class TestRequiredToolChoiceNonJsonOutput(unittest.TestCase):
+    """A detector that supplies a structural tag is constrained to its own
+    native format, never to the JSON array the ``is_required`` branch expects.
+    When such a model answers in prose -- or returns nothing at all once
+    reasoning is stripped -- the branch used to hand that text to
+    ``orjson.loads`` anyway, so every one of those turns burned an
+    ``ERROR``-level "Tool call parsing error" on a payload that could not have
+    been JSON. Reported as ~85 errors/day on Kimi-K3 in sgl-project/sglang#34604.
+    """
+
+    def setUp(self):
+        tm = _MockTokenizerManager()
+        tm.server_args.tool_call_parser = "kimi_k2"
+        self.chat = OpenAIServingChat(tm, _MockTemplateManager())
+        self.tools = [{"type": "function", "function": {"name": "get_weather"}}]
+
+    def _process(self, text: str):
+        with patch("sglang.srt.entrypoints.openai.serving_chat.logger") as logger_mock:
+            result = self.chat._process_tool_calls(
+                text=text,
+                tools=self.tools,
+                finish_reason={"type": "stop", "matched": None},
+                tool_choice="required",
+            )
+        return result, logger_mock
+
+    def test_prose_answer_is_returned_as_content_without_logging(self):
+        result, logger_mock = self._process("Sorry, I cannot call a tool here.")
+
+        self.assertIsNone(result.tool_calls)
+        self.assertEqual(result.remaining_text, "Sorry, I cannot call a tool here.")
+        self.assertEqual(result.finish_reason, {"type": "stop", "matched": None})
+        logger_mock.error.assert_not_called()
+
+    def test_empty_output_is_not_parsed_as_json(self):
+        """orjson rejects an empty buffer with "Input is a zero-length, empty
+        document" -- the third error class in the same report."""
+        result, logger_mock = self._process("")
+
+        self.assertIsNone(result.tool_calls)
+        self.assertEqual(result.finish_reason, {"type": "stop", "matched": None})
+        logger_mock.error.assert_not_called()
+
+    def test_malformed_json_payload_is_still_reported(self):
+        """The guard keys off the payload looking JSON-shaped, so a genuinely
+        truncated array must keep reaching the parser and keep logging --
+        otherwise a constraint violation would pass silently."""
+        result, logger_mock = self._process('[{"name": "get_weather"')
+
+        self.assertIsNone(result.tool_calls)
+        self.assertEqual(result.finish_reason, {"type": "stop", "matched": None})
+        logger_mock.error.assert_called_once()
+
+    def test_json_array_behind_leading_whitespace_still_parses(self):
+        """The guard keys off the payload, not off which constraint was used,
+        so a structural-tag detector that emits the array anyway keeps working
+        -- and orjson skips leading whitespace, so the guard must too."""
+        result, _ = self._process(
+            '\n  [{"name": "get_weather", "parameters": {"city": "Tokyo"}}]'
+        )
+
+        self.assertIsNotNone(result.tool_calls)
+        self.assertEqual(result.tool_calls[0].function.name, "get_weather")
+        self.assertEqual(result.finish_reason["type"], "tool_calls")
+
+
 class TestNormalizeToolContent(unittest.TestCase):
     """Unit tests for normalize_tool_content()."""
 

@@ -122,6 +122,12 @@ def parse_tool_call_arguments(arguments: str) -> Dict[str, Any]:
     return parsed_arguments
 
 
+def _looks_like_json_payload(text: str) -> bool:
+    """Whether ``text`` could be the start of a JSON object or array."""
+    stripped = text.lstrip()
+    return stripped.startswith("{") or stripped.startswith("[")
+
+
 def normalize_assistant_tool_call_arguments(
     message: Dict[str, Any], *, strict: bool = True
 ) -> None:
@@ -2031,8 +2037,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     logger.error(f"Tool call parsing error: {e}")
                     return ToolCallProcessingResult(None, text, finish_reason)
 
-        # json_schema constraint → JSON array output for required/named
-        if is_required:
+        # json_schema constraint → JSON array output for required/named.
+        #
+        # Only detectors that supply neither a structural tag nor native
+        # required-parsing are constrained that way; see
+        # FunctionCallParser.get_structure_constraint. Everything else was told
+        # to emit its own format and the parser above already had its shot at
+        # the text, so what reaches here is ordinary content — a refusal, or an
+        # empty turn once reasoning was stripped. Handing that to orjson.loads
+        # only ever produced a logged exception and the same text passthrough
+        # we fall through to below, so require something JSON-shaped first.
+        if is_required and _looks_like_json_payload(text):
             original_finish_type = finish_reason["type"]
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
