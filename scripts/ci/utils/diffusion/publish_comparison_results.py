@@ -26,13 +26,13 @@ from pathlib import Path
 if __package__:
     from ..publish_traces import (
         create_blobs,
-        make_github_request,
         create_commit,
         create_tree,
         get_branch_sha,
         get_tree_sha,
         is_permission_error,
         is_rate_limit_error,
+        make_github_request,
         update_branch_ref,
         verify_token_permissions,
     )
@@ -40,13 +40,13 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from publish_traces import (
         create_blobs,
-        make_github_request,
         create_commit,
         create_tree,
         get_branch_sha,
         get_tree_sha,
         is_permission_error,
         is_rate_limit_error,
+        make_github_request,
         update_branch_ref,
         verify_token_permissions,
     )
