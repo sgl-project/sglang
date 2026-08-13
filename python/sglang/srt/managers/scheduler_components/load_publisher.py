@@ -148,12 +148,9 @@ class SchedulerLoadPublisher:
             # Malformed config: the KV publisher would fail too; stay a no-op.
             return
         if cfg.publisher == "null" or not cfg.endpoint:
-            # KV publishing itself is off, so there is nothing to advertise
-            # through and nothing to bind alongside.
-            logger.info(
-                "load-publisher disabled: --kv-events-config publisher is "
-                "'null' or has no endpoint"
-            )
+            # KV publishing off. Silent: an opted-in server already failed in
+            # check_load_publish_args, so reaching here means load publishing
+            # wasn't requested (this runs before the resolver sees the mode).
             return
         # Same resolver /server_info advertises with, so a router never
         # subscribes to a range this declines — except a runtime bind failure
