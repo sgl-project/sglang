@@ -14,11 +14,8 @@ from sglang.auto_tune.utils import (
 from sglang.srt.layers.moe.fused_moe_triton import override_config
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
-    get_config_dtype_str,
-)
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_device, is_hip
 
 
 def benchmark_config(
@@ -37,6 +34,7 @@ def benchmark_config(
     block_shape: List[int] = None,
     num_iters: int = 100,
 ) -> float:
+    torch.set_default_device(get_device())
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
     if use_int8_w8a16 or use_int8_w8a8:
