@@ -276,17 +276,18 @@ def resolve_mm_spec(
     )
     if family is None:
         return None
-    ip = getattr(processor, "image_processor", None)
-    resample = family.image_processors.get(type(ip).__name__)
+    # Image processor only; video/audio is rejected at the message layer.
+    image_processor = getattr(processor, "image_processor", None)
+    resample = family.image_processors.get(type(image_processor).__name__)
     if resample is None:
         return None
     # The native pipeline always resizes, rescales by 1/255 and normalizes;
     # Rust's fused normalize constants assume that factor. Anything else
     # would silently produce different features.
     stages = ("do_resize", "do_rescale", "do_normalize")
-    if not all(getattr(ip, stage, True) for stage in stages):
+    if not all(getattr(image_processor, stage, True) for stage in stages):
         return None
-    if getattr(ip, "rescale_factor", None) != 1 / 255:
+    if getattr(image_processor, "rescale_factor", None) != 1 / 255:
         return None
 
     # `--mm-process-config {"image": {...}}`: only pixel-limit overrides are
@@ -295,25 +296,27 @@ def resolve_mm_spec(
     if not set(image_overrides) <= {"min_pixels", "max_pixels"}:
         return None
 
-    size = getattr(ip, "size", None) or {}
+    size = getattr(image_processor, "size", None) or {}
     min_pixels = image_overrides.get(
-        "min_pixels", getattr(ip, "min_pixels", None) or size.get("shortest_edge")
+        "min_pixels",
+        getattr(image_processor, "min_pixels", None) or size.get("shortest_edge"),
     )
     max_pixels = image_overrides.get(
-        "max_pixels", getattr(ip, "max_pixels", None) or size.get("longest_edge")
+        "max_pixels",
+        getattr(image_processor, "max_pixels", None) or size.get("longest_edge"),
     )
     try:
         spec = MmSpec(
             family=family.name,
             feature_shm=_use_feature_shm(server_args),
             image_token_id=hf_config.image_token_id,
-            patch_size=ip.patch_size,
-            merge_size=ip.merge_size,
-            temporal_patch_size=ip.temporal_patch_size,
+            patch_size=image_processor.patch_size,
+            merge_size=image_processor.merge_size,
+            temporal_patch_size=image_processor.temporal_patch_size,
             min_pixels=int(min_pixels),
             max_pixels=int(max_pixels),
-            image_mean=tuple(float(x) for x in ip.image_mean),
-            image_std=tuple(float(x) for x in ip.image_std),
+            image_mean=tuple(float(x) for x in image_processor.image_mean),
+            image_std=tuple(float(x) for x in image_processor.image_std),
             resample=resample,
             vision_start_token_id=getattr(hf_config, "vision_start_token_id", None),
             vision_end_token_id=getattr(hf_config, "vision_end_token_id", None),
@@ -390,8 +393,7 @@ class RustServer:
             server_args_json=cls._build_server_args(scheduler),
         )
 
-        # Multimodal models must have a native Rust pipeline — there is no Python
-        # fallback.
+        # Multimodal models must have a native Rust pipeline — no Python fallback.
         mm_spec = None
         if scheduler.model_config.is_multimodal:
             # New threads inherit the spawning thread's affinity, and this launch

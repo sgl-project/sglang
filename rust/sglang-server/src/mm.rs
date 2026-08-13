@@ -181,6 +181,20 @@ impl MmResultStore {
     }
 }
 
+/// Boot-time wiring of the MM path, held privately by the `Runtime` for the
+/// late pool spawn (`Runtime::start_mm_workers`, once Python has resolved
+/// the spec).
+pub struct MmWiring {
+    /// Requests parked in `Encoding`, drained by the worker pool. Stays empty
+    /// for non-multimodal models — nothing routes to it.
+    pub mm_rx: flume::Receiver<MmRequest>,
+    /// Back-channel for the workers' `MmEncoded` / `MmFailed` into tm-ingress.
+    pub tm_tx: flume::Sender<TmEvent>,
+    /// The loaded tokenizer, shared with the tokenizer pool (`None` under
+    /// `skip_tokenizer_init`).
+    pub tokenizer: Option<Arc<dyn TextTokenizer>>,
+}
+
 /// Shared state of the mm path, built once at `start_mm_workers`.
 pub struct MmContext {
     pub family: Box<dyn sglang_mm::pipeline::MmFamilyProcessor>,
