@@ -150,6 +150,7 @@ def fetch_latest_baseline(
         rows, model=model, capture_signature=capture_signature
     )
     if run_path is None:
+        shutil.rmtree(target_tensors_dir, ignore_errors=True)
         return None
 
     snapshot_root = _with_retries(
@@ -164,12 +165,15 @@ def fetch_latest_baseline(
     )
     src = Path(snapshot_root) / run_path / "tensors"
     if not src.exists():
+        shutil.rmtree(target_tensors_dir, ignore_errors=True)
         return None
 
-    target_tensors_dir.mkdir(parents=True, exist_ok=True)
-    for fp in src.iterdir():
-        if fp.is_file():
-            shutil.copy2(fp, target_tensors_dir / fp.name)
+    target_tensors_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=target_tensors_dir.parent) as staging_root:
+        staged_tensors = Path(staging_root) / "tensors"
+        shutil.copytree(src, staged_tensors)
+        shutil.rmtree(target_tensors_dir, ignore_errors=True)
+        staged_tensors.rename(target_tensors_dir)
     return run_path
 
 

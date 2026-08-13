@@ -486,8 +486,6 @@ def _test_one_model(
 def _maybe_hf_fetch(
     *, hf_cfg, model: str, baseline_exp_dir: Path, capture_signature: str
 ) -> None:
-    if baseline_exp_dir.exists() and any(baseline_exp_dir.glob("*.pt")):
-        return
     try:
         src = _hfs.fetch_latest_baseline(
             config=hf_cfg,

@@ -280,23 +280,32 @@ class TestFetchLatestBaseline(CustomTestCase):
             (tensors / "layer0.pt").write_bytes(b"\x00")
             mock_snapshot.return_value = snap_dir
 
-            with tempfile.TemporaryDirectory() as target:
+            with tempfile.TemporaryDirectory() as target_root:
+                target = Path(target_root) / "tensors"
+                target.mkdir()
+                (target / "stale.pt").write_bytes(b"\xff")
                 result = hfs.fetch_latest_baseline(
                     config=_make_config(),
                     model="org/m",
-                    target_tensors_dir=Path(target),
+                    target_tensors_dir=target,
                 )
+                self.assertEqual((target / "layer0.pt").read_bytes(), b"\x00")
+                self.assertFalse((target / "stale.pt").exists())
             self.assertEqual(result, "org__m/2025/01/01/run-abc")
 
     @patch.object(hfs, "_read_manifest")
     def test_returns_none_when_no_runs(self, mock_manifest):
         mock_manifest.return_value = ([], "")
-        with tempfile.TemporaryDirectory() as target:
+        with tempfile.TemporaryDirectory() as target_root:
+            target = Path(target_root) / "tensors"
+            target.mkdir()
+            (target / "stale.pt").write_bytes(b"\xff")
             result = hfs.fetch_latest_baseline(
                 config=_make_config(),
                 model="org/m",
-                target_tensors_dir=Path(target),
+                target_tensors_dir=target,
             )
+            self.assertFalse(target.exists())
         self.assertIsNone(result)
 
     @patch("sglang.test.precision_baseline_store.snapshot_download")
