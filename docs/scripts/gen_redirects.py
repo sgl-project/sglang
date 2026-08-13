@@ -102,7 +102,7 @@ EXPLICIT = {
     "/basic_usage/glm45": "/cookbook/autoregressive/GLM/GLM-4.5",
     "/basic_usage/glmv": "/cookbook/autoregressive/GLM/GLM-4.6V",
     "/basic_usage/gpt_oss": "/cookbook/autoregressive/OpenAI/GPT-OSS",
-    "/basic_usage/llama4": "/cookbook/autoregressive/Llama/Llama4",
+    "/basic_usage/llama4": "/cookbook/autoregressive/Meta/Llama4",
     "/basic_usage/minimax_m2": "/cookbook/autoregressive/MiniMax/MiniMax-M2",
     "/basic_usage/popular_model_usage": "/cookbook/autoregressive/intro",
     "/basic_usage/qwen3": "/cookbook/autoregressive/Qwen/Qwen3",
