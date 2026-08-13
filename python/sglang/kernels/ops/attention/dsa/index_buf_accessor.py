@@ -682,7 +682,8 @@ def _get_k_and_s_triton_kernel(
     # ===== Load K data =====
     # The address calculation logic for K: page_index * total number of elements in a single page + K offset of the token within the page.
     k_src_token_offset = token_offset_in_page * index_head_dim
-    k_src_base_offset = page_index * buf_numel_per_page + k_src_token_offset
+    page_byte_offset = page_index.to(tl.int64) * buf_numel_per_page
+    k_src_base_offset = page_byte_offset + k_src_token_offset
 
     k_load_addr = buf_ptr + k_src_base_offset[:, None] + k_offsets[None, :]
     k_dim_mask = k_offsets[None, :] < index_head_dim
@@ -699,7 +700,7 @@ def _get_k_and_s_triton_kernel(
     # ===== Load S data =====
     # The address calculation logic for S: page_index * total number of elements in a single page + starting offset of S within the page + offset of token within S in the page
     s_src_token_offset = s_offset_in_page + token_offset_in_page * 4
-    s_src_base_offset = page_index * buf_numel_per_page + s_src_token_offset
+    s_src_base_offset = page_byte_offset + s_src_token_offset
 
     s_offsets = tl.arange(0, 4)
     s_load_addr = buf_ptr + s_src_base_offset[:, None] + s_offsets[None, :]

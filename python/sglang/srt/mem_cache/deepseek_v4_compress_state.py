@@ -19,6 +19,34 @@ def _lcm(a: int, b: int) -> int:
     return a // gcd(a, b) * b
 
 
+def get_compress_state_layout(
+    *,
+    size: int,
+    ring_size: int,
+    overlap: bool,
+    head_dim: int,
+    ratio: int,
+    online: bool = False,
+    swa_page_size: int = 0,
+    online_mtp_max_draft_tokens: int = 0,
+) -> tuple[int, int, int]:
+    """Return ``(allocated_rows, logical_rows, last_dim)`` for a state pool."""
+    if online:
+        assert ring_size == 1, "online compress requires ring_size=1"
+        logical_size = size + ring_size + 1
+        allocated_size = logical_size * (1 + online_mtp_max_draft_tokens)
+        last_dim = 3 * head_dim
+    else:
+        allocated_size = size + ring_size + 1
+        pad_to = (
+            _lcm(ratio, swa_page_size) if (swa_page_size > 1 and _is_npu) else ratio
+        )
+        allocated_size = (allocated_size + pad_to - 1) // pad_to * pad_to
+        logical_size = allocated_size
+        last_dim = 2 * (1 + overlap) * head_dim
+    return allocated_size, logical_size, last_dim
+
+
 @dataclasses.dataclass
 class KVAndScore:
     kv_score: torch.Tensor
@@ -103,42 +131,42 @@ class CompressStatePool:
         self.online_mtp_state_slot_offset = 0
         self.online_mtp_max_draft_tokens = 0
 
+        self._size, self._logical_size, last_dim = get_compress_state_layout(
+            size=size,
+            ring_size=ring_size,
+            overlap=overlap,
+            head_dim=head_dim,
+            ratio=ratio,
+            online=online,
+            swa_page_size=swa_page_size,
+            online_mtp_max_draft_tokens=online_mtp_max_draft_tokens,
+        )
         if online:
-            assert ring_size == 1, "online compress requires ring_size=1"
-            self._logical_size = size + self.ring_size + 1
             if online_mtp_max_draft_tokens > 0:
                 # Bank 0 is the committed state. Banks 1..N cache per-draft
                 # prefix states for lazy commit after target verify.
                 self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
                 self.online_mtp_state_slot_offset = self._logical_size
-            self._size = self._logical_size * (1 + self.online_mtp_max_draft_tokens)
-            last_dim = 3 * head_dim
-        else:
-            self._size = size + self.ring_size + 1
-            # Pad to lcm(ratio, page_size) so the flat buffer reshapes cleanly into
-            # [block_num, page_size, last_dim] for the fused compressor op; page_size=1 falls back to ratio-only padding.
-            pad_to = (
-                _lcm(ratio, swa_page_size) if (swa_page_size > 1 and _is_npu) else ratio
-            )
-            self._size = (self._size + pad_to - 1) // pad_to * pad_to
-            self._logical_size = self._size
-            last_dim = 2 * (1 + overlap) * head_dim
 
         self.last_dim = last_dim
         self._alloc_kv_score_buffer(
             dtype=dtype, device=device, enable_memory_saver=enable_memory_saver
         )
-        if not online:
-            if _is_hip and ratio == 128:
-                # Request-scoped C128 state is addressed by req_pool_idx (or a
-                # per-request ring).  The pool is allocated with torch.empty(),
-                # so a cold server can otherwise read uninitialized partial
-                # states before a request slot has been written for the first
-                # time.  Initialize all C128 rows to the empty-state sentinel;
-                # C4 keeps the historical last-row sentinel behavior.
-                self.kv_score_buffer.clear()
-            else:
-                self.kv_score_buffer[-1].clear()
+        self._initialize_kv_score_buffer(online=online, ratio=ratio)
+
+    def _initialize_kv_score_buffer(self, *, online: bool, ratio: int) -> None:
+        if online:
+            return
+        if _is_hip and ratio == 128:
+            # Request-scoped C128 state is addressed by req_pool_idx (or a
+            # per-request ring).  The pool is allocated with torch.empty(),
+            # so a cold server can otherwise read uninitialized partial
+            # states before a request slot has been written for the first
+            # time.  Initialize all C128 rows to the empty-state sentinel;
+            # C4 keeps the historical last-row sentinel behavior.
+            self.kv_score_buffer.clear()
+        else:
+            self.kv_score_buffer[-1].clear()
 
     def _alloc_kv_score_buffer(
         self, *, dtype: torch.dtype, device: str, enable_memory_saver: bool

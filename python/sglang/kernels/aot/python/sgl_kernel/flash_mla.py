@@ -103,6 +103,18 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    shared_kv_row_cache: Optional[torch.Tensor] = None,
+    shared_kv_cache_tags: Optional[torch.Tensor] = None,
+    shared_kv_cache_stats: Optional[torch.Tensor] = None,
+    shared_kv_cache_epoch: int = 0,
+    shared_kv_cache_ways: int = 0,
+    shared_kv_cache_direct_slots: bool = True,
+    shared_kv_rank: int = 0,
+    shared_kv_size: int = 1,
+    shared_swa_page_size: int = 0,
+    shared_swa_pages_per_rank: int = 0,
+    shared_extra_page_size: int = 0,
+    shared_extra_pages_per_rank: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -147,6 +159,18 @@ def flash_mla_with_kvcache(
             extra_indices_in_kvcache=extra_indices_in_kvcache,
             topk_length=topk_length,
             extra_topk_length=extra_topk_length,
+            shared_kv_row_cache=shared_kv_row_cache,
+            shared_kv_cache_tags=shared_kv_cache_tags,
+            shared_kv_cache_stats=shared_kv_cache_stats,
+            shared_kv_cache_epoch=shared_kv_cache_epoch,
+            shared_kv_cache_ways=shared_kv_cache_ways,
+            shared_kv_cache_direct_slots=shared_kv_cache_direct_slots,
+            shared_kv_rank=shared_kv_rank,
+            shared_kv_size=shared_kv_size,
+            shared_swa_page_size=shared_swa_page_size,
+            shared_swa_pages_per_rank=shared_swa_pages_per_rank,
+            shared_extra_page_size=shared_extra_page_size,
+            shared_extra_pages_per_rank=shared_extra_pages_per_rank,
         )
 
     assert num_splits is not None
@@ -216,6 +240,18 @@ def _flash_mla_with_kvcache_sched_meta(
     extra_indices_in_kvcache: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor],
     extra_topk_length: Optional[torch.Tensor],
+    shared_kv_row_cache: Optional[torch.Tensor],
+    shared_kv_cache_tags: Optional[torch.Tensor],
+    shared_kv_cache_stats: Optional[torch.Tensor],
+    shared_kv_cache_epoch: int,
+    shared_kv_cache_ways: int,
+    shared_kv_cache_direct_slots: bool,
+    shared_kv_rank: int,
+    shared_kv_size: int,
+    shared_swa_page_size: int,
+    shared_swa_pages_per_rank: int,
+    shared_extra_page_size: int,
+    shared_extra_pages_per_rank: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert num_splits is None, "num_splits must be None with FlashMLASchedMeta"
 
@@ -279,6 +315,18 @@ def _flash_mla_with_kvcache_sched_meta(
                 extra_topk_length,
                 head_dim_v,
                 softmax_scale,
+                shared_kv_row_cache,
+                shared_kv_cache_tags,
+                shared_kv_cache_stats,
+                shared_kv_cache_epoch,
+                shared_kv_cache_ways,
+                shared_kv_cache_direct_slots,
+                shared_kv_rank,
+                shared_kv_size,
+                shared_swa_page_size,
+                shared_swa_pages_per_rank,
+                shared_extra_page_size,
+                shared_extra_pages_per_rank,
             )
         )
     else:

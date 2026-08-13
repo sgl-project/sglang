@@ -7,6 +7,30 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flashmla)
 
+# Apply the optional DSV4 MODEL1 Shared-KV row-cache specialization to the
+# exact pinned FlashMLA source. Calls with null cache pointers retain the
+# upstream SM90/SM100 direct-read implementations.
+find_program(SGLANG_PATCH_EXECUTABLE patch REQUIRED)
+set(SGLANG_FLASHMLA_DSV4_SHARED_PATCH
+    "${CMAKE_CURRENT_LIST_DIR}/flashmla_dsv4_shared_demand_cache.patch")
+execute_process(
+    COMMAND "${SGLANG_PATCH_EXECUTABLE}" -p1 --forward --batch --silent
+            -i "${SGLANG_FLASHMLA_DSV4_SHARED_PATCH}"
+    WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}"
+    RESULT_VARIABLE SGLANG_FLASHMLA_DSV4_SHARED_PATCH_RESULT
+)
+if(NOT SGLANG_FLASHMLA_DSV4_SHARED_PATCH_RESULT EQUAL 0)
+    execute_process(
+        COMMAND "${SGLANG_PATCH_EXECUTABLE}" -p1 --reverse --dry-run --batch
+                --silent -i "${SGLANG_FLASHMLA_DSV4_SHARED_PATCH}"
+        WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}"
+        RESULT_VARIABLE SGLANG_FLASHMLA_DSV4_SHARED_PATCH_REVERSE_RESULT
+    )
+    if(NOT SGLANG_FLASHMLA_DSV4_SHARED_PATCH_REVERSE_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to apply DSV4 Shared-KV FlashMLA demand-cache patch")
+    endif()
+endif()
+
 # flashmla submodule pin: NVIDIA/cutlass @ 147f5673d0c1c3dcf66f78d677fd647e4a020219
 FetchContent_Declare(
     repo-flashmla-cutlass

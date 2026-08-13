@@ -71,7 +71,10 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
 
 class TestDSV4NonPagedIndexer(CustomTestCase):
     def _is_eligible(self, **overrides):
-        backend = SimpleNamespace(hisparse_coordinator=None)
+        backend = SimpleNamespace(
+            hisparse_coordinator=None,
+            _can_use_nonpaged_indexer=lambda **_: True,
+        )
         c4_indexer = SimpleNamespace(use_fp4_indexer=overrides.get("fp4", False))
         forward_batch = SimpleNamespace(
             forward_mode=overrides.get("mode", ForwardMode.EXTEND),
@@ -163,7 +166,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             (65, 128, query_rows),
         )
         torch.testing.assert_close(plan.page_table, page_table[:1])
-        torch.testing.assert_close(plan.ke, c4_seq_lens)
+        torch.testing.assert_close(plan.ke, c4_seq_lens.to(torch.int32))
         torch.testing.assert_close(plan.gather_seq_lens, c4_seq_lens[-1:])
 
         metadata.nonpaged_plan = None
@@ -310,6 +313,236 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         torch.testing.assert_close(call.args[3], plan.ks)
         torch.testing.assert_close(call.args[4], plan.ke)
         self.assertEqual(call.kwargs, {"clean_logits": False, "max_seqlen_k": 128})
+
+    def test_shared_paged_fallback_stages_local_pages_and_reuses_plan(self):
+        logical_pages = torch.tensor([[3, 1], [7, -1]], dtype=torch.int32)
+        original_pages = logical_pages.clone()
+        physical_pages = torch.tensor([5, 9, 12], dtype=torch.int64)
+        compact_pages = torch.tensor([[1, 0], [2, -1]], dtype=torch.int32)
+        staged_layer_11 = torch.empty((3, 8448), dtype=torch.uint8)
+        staged_layer_13 = torch.empty((3, 8448), dtype=torch.uint8)
+        shared_access = MagicMock()
+        shared_access.prepare_indexer_pages.return_value = (
+            physical_pages,
+            compact_pages,
+        )
+        shared_access.stage_indexer_pages.side_effect = (
+            staged_layer_11,
+            staged_layer_13,
+        )
+        metadata = SimpleNamespace(use_prefill_cuda_graph=False)
+
+        first = C4IndexerBackendMixin._stage_shared_paged_indexer(
+            shared_access=shared_access,
+            indexer_metadata=metadata,
+            layer_id=11,
+            logical_page_table=logical_pages,
+        )
+        second = C4IndexerBackendMixin._stage_shared_paged_indexer(
+            shared_access=shared_access,
+            indexer_metadata=metadata,
+            layer_id=13,
+            logical_page_table=logical_pages,
+        )
+
+        self.assertEqual(first, (staged_layer_11, compact_pages))
+        self.assertEqual(second, (staged_layer_13, compact_pages))
+        shared_access.prepare_indexer_pages.assert_called_once_with(
+            logical_pages, fixed_shape=False
+        )
+        self.assertEqual(shared_access.stage_indexer_pages.call_count, 2)
+        torch.testing.assert_close(logical_pages, original_pages)
+
+    def test_shared_staging_plan_keeps_logical_gather_page_table(self):
+        query_rows = 4
+        logical_page_table = torch.tensor(
+            [[3, 1], [3, 1], [3, 1], [3, 1]], dtype=torch.int32
+        )
+        original_page_table = logical_page_table.clone()
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            _original_forward_mode=None,
+            tbo_parent_token_range=None,
+            batch_size=1,
+            seq_lens=torch.tensor([500_000]),
+            seq_lens_cpu=[500_000],
+            extend_seq_lens=torch.tensor([query_rows]),
+            extend_seq_lens_cpu=[query_rows],
+            extend_start_loc=torch.tensor([0]),
+            extend_num_tokens=query_rows,
+        )
+        metadata = SimpleNamespace(
+            use_prefill_cuda_graph=False,
+            c4_page_size=64,
+            nonpaged_plan=None,
+        )
+        c4_seq_lens = torch.tensor([124_997, 124_998, 124_999, 125_000])
+        backend = SimpleNamespace(
+            hisparse_coordinator=None,
+            _can_use_nonpaged_indexer=lambda **_: True,
+        )
+        c4_indexer = SimpleNamespace(use_fp4_indexer=False)
+
+        with (
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
+            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
+            patch(f"{_INDEXER}.is_in_tc_piecewise_cuda_graph", return_value=False),
+            patch(f"{_INDEXER}.is_in_breakable_cuda_graph", return_value=False),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+        ):
+            plan = C4IndexerBackendMixin._get_nonpaged_indexer_plan(
+                backend,
+                c4_indexer=c4_indexer,
+                forward_batch=batch,
+                indexer_metadata=metadata,
+                page_table=logical_page_table,
+                c4_seq_lens=c4_seq_lens,
+                query_rows=query_rows,
+                shared_staging=True,
+            )
+
+        self.assertIsNotNone(plan)
+        torch.testing.assert_close(plan.page_table, original_page_table[:1])
+        torch.testing.assert_close(logical_page_table, original_page_table)
+        torch.testing.assert_close(
+            plan.gather_seq_lens, torch.tensor([125_000], dtype=torch.int32)
+        )
+        torch.testing.assert_close(plan.ke, c4_seq_lens.to(torch.int32))
+        self.assertEqual(plan.seq_len_sum, 125_000)
+        self.assertEqual(plan.max_seq_len, 125_000)
+        self.assertEqual(plan.max_seqlen_k, 125_056)
+        self.assertIs(metadata.nonpaged_plan, plan)
+
+        cached = C4IndexerBackendMixin._get_nonpaged_indexer_plan(
+            backend,
+            c4_indexer=c4_indexer,
+            forward_batch=batch,
+            indexer_metadata=metadata,
+            page_table=logical_page_table,
+            c4_seq_lens=c4_seq_lens,
+            query_rows=query_rows,
+            shared_staging=True,
+        )
+        self.assertIs(cached, plan)
+
+    def test_shared_staging_rejects_inconsistent_extend_metadata(self):
+        query_rows = 4
+        page_table = torch.tensor([[3, 1]] * query_rows, dtype=torch.int32)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            _original_forward_mode=None,
+            tbo_parent_token_range=None,
+            batch_size=1,
+            seq_lens=torch.tensor([500_000]),
+            seq_lens_cpu=[500_000],
+            extend_seq_lens=torch.tensor([query_rows - 1]),
+            extend_seq_lens_cpu=[query_rows - 1],
+            extend_start_loc=torch.tensor([0]),
+            extend_num_tokens=query_rows - 1,
+        )
+        metadata = SimpleNamespace(
+            use_prefill_cuda_graph=False,
+            c4_page_size=64,
+            nonpaged_plan=None,
+        )
+        backend = SimpleNamespace(
+            hisparse_coordinator=None,
+            _can_use_nonpaged_indexer=lambda **_: True,
+        )
+
+        with (
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
+            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
+            patch(f"{_INDEXER}.is_in_tc_piecewise_cuda_graph", return_value=False),
+            patch(f"{_INDEXER}.is_in_breakable_cuda_graph", return_value=False),
+            patch(
+                f"{_INDEXER}.can_dsa_prefill_cp_round_robin_split",
+                return_value=False,
+            ),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+        ):
+            plan = C4IndexerBackendMixin._get_nonpaged_indexer_plan(
+                backend,
+                c4_indexer=SimpleNamespace(use_fp4_indexer=False),
+                forward_batch=batch,
+                indexer_metadata=metadata,
+                page_table=page_table,
+                c4_seq_lens=torch.tensor([124_997, 124_998, 124_999, 125_000]),
+                query_rows=query_rows,
+                shared_staging=True,
+            )
+
+        self.assertIsNone(plan)
+
+    def test_shared_staging_accepts_cp_round_robin_local_queries(self):
+        cp_size = 8
+        cp_rank = 3
+        global_query_rows = 8192
+        local_query_rows = global_query_rows // cp_size
+        final_seq_len = 131072
+        final_c4_len = final_seq_len // 4
+        page_table = torch.tensor([[3, 1]] * local_query_rows, dtype=torch.int32)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            _original_forward_mode=None,
+            tbo_parent_token_range=None,
+            batch_size=1,
+            seq_lens=torch.tensor([final_seq_len]),
+            seq_lens_cpu=[final_seq_len],
+            extend_seq_lens=torch.tensor([global_query_rows]),
+            extend_seq_lens_cpu=[global_query_rows],
+            extend_start_loc=torch.tensor([0]),
+            extend_num_tokens=global_query_rows,
+        )
+        metadata = SimpleNamespace(
+            use_prefill_cuda_graph=False,
+            c4_page_size=64,
+            nonpaged_plan=None,
+        )
+        c4_seq_lens = torch.arange(
+            final_c4_len - local_query_rows + 1,
+            final_c4_len + 1,
+            dtype=torch.int32,
+        )
+        backend = SimpleNamespace(
+            hisparse_coordinator=None,
+            _can_use_nonpaged_indexer=lambda **_: True,
+        )
+
+        with (
+            get_parallel().override(
+                attn_cp_size=cp_size,
+                attn_cp_rank=cp_rank,
+            ),
+            patch(
+                f"{_INDEXER}.can_dsa_prefill_cp_round_robin_split",
+                return_value=True,
+                create=True,
+            ),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+        ):
+            plan = C4IndexerBackendMixin._get_nonpaged_indexer_plan(
+                backend,
+                c4_indexer=SimpleNamespace(use_fp4_indexer=False),
+                forward_batch=batch,
+                indexer_metadata=metadata,
+                page_table=page_table,
+                c4_seq_lens=c4_seq_lens,
+                query_rows=local_query_rows,
+                shared_staging=True,
+            )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.query_rows, local_query_rows)
+        self.assertEqual(plan.seq_len_sum, final_c4_len)
+        self.assertEqual(plan.max_seq_len, final_c4_len)
+        torch.testing.assert_close(
+            plan.gather_seq_lens,
+            torch.tensor([final_c4_len], dtype=torch.int32),
+        )
+        torch.testing.assert_close(plan.ke, c4_seq_lens)
 
 
 if __name__ == "__main__":

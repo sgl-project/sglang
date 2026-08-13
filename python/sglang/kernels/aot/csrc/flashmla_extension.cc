@@ -33,7 +33,19 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
     const std::optional<at::Tensor>& extra_indices,
     const std::optional<at::Tensor>& extra_topk_length,
     int64_t d_v,
-    double sm_scale) {
+    double sm_scale,
+    const std::optional<at::Tensor>& shared_kv_row_cache,
+    const std::optional<at::Tensor>& shared_kv_cache_tags,
+    const std::optional<at::Tensor>& shared_kv_cache_stats,
+    int64_t shared_kv_cache_epoch,
+    int64_t shared_kv_cache_ways,
+    bool shared_kv_cache_direct_slots,
+    int64_t shared_kv_rank,
+    int64_t shared_kv_size,
+    int64_t shared_swa_page_size,
+    int64_t shared_swa_pages_per_rank,
+    int64_t shared_extra_page_size,
+    int64_t shared_extra_pages_per_rank) {
   return sparse_attn_decode_interface(
       q,
       kv,
@@ -46,7 +58,19 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       extra_indices,
       extra_topk_length,
       static_cast<int>(d_v),
-      static_cast<float>(sm_scale));
+      static_cast<float>(sm_scale),
+      shared_kv_row_cache,
+      shared_kv_cache_tags,
+      shared_kv_cache_stats,
+      shared_kv_cache_epoch,
+      shared_kv_cache_ways,
+      shared_kv_cache_direct_slots,
+      shared_kv_rank,
+      shared_kv_size,
+      shared_swa_page_size,
+      shared_swa_pages_per_rank,
+      shared_extra_page_size,
+      shared_extra_pages_per_rank);
 }
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_dense_decode_fwd(
@@ -102,7 +126,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "sparse_decode_fwd(Tensor q, Tensor kv, Tensor indices, Tensor? topk_length, Tensor? attn_sink, "
       "Tensor? tile_scheduler_metadata, Tensor? num_splits, Tensor? extra_kv, Tensor? extra_indices, "
-      "Tensor? extra_topk_length, int d_v, float sm_scale) -> (Tensor, Tensor, Tensor?, Tensor?)");
+      "Tensor? extra_topk_length, int d_v, float sm_scale, Tensor? shared_kv_row_cache=None, "
+      "Tensor? shared_kv_cache_tags=None, Tensor? shared_kv_cache_stats=None, int shared_kv_cache_epoch=0, "
+      "int shared_kv_cache_ways=0, bool shared_kv_cache_direct_slots=True, int shared_kv_rank=0, int shared_kv_size=1, "
+      "int shared_swa_page_size=0, int shared_swa_pages_per_rank=0, "
+      "int shared_extra_page_size=0, int shared_extra_pages_per_rank=0) "
+      "-> (Tensor, Tensor, Tensor?, Tensor?)");
   m.impl("sparse_decode_fwd", torch::kCUDA, &sgl_sparse_decode_fwd);
 
   m.def(

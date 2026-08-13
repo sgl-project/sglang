@@ -26,6 +26,9 @@ def dequantize_k_cache_paged(
     page_table_1_flattened: torch.Tensor,
     page_size: int,
     out: Optional[torch.Tensor] = None,
+    *,
+    shared_cp_size: int = 1,
+    shared_pages_per_rank: int = 0,
 ) -> torch.Tensor:
     """Dequantize the DeepSeek v4 paged KV cache for a list of token IDs.
 
@@ -36,12 +39,19 @@ def dequantize_k_cache_paged(
         out: optional (num_tokens, 1, DIM_NOPE + DIM_ROPE) bf16 destination.
             May be a slice of a larger workspace; the kernel uses out.stride(0)
             so contiguous-along-dim-0 slices work.
+        shared_cp_size: owner-page shard count. Values greater than one mean
+            ``page_table_1_flattened`` contains logical slot ids and the
+            physical rank-major page is resolved inside the Triton kernel.
+        shared_pages_per_rank: physical page stride of one owner segment.
 
     Returns:
         (num_tokens, 1, DIM_NOPE + DIM_ROPE) bfloat16.
     """
     assert quant_k_cache.is_contiguous()
     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
+    assert shared_cp_size >= 1
+    if shared_cp_size > 1:
+        assert shared_pages_per_rank > 0
 
     # The buffer's dtype is whatever the pool exposes (often bf16); the
     # underlying storage is uint8. Reinterpret to byte-space first.
@@ -81,6 +91,8 @@ def dequantize_k_cache_paged(
         NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
         PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
         S_OFFSET_BYTES=s_offset_bytes,
+        SHARED_CP_SIZE=shared_cp_size,
+        SHARED_PAGES_PER_RANK=shared_pages_per_rank,
     )
     return out
 
@@ -102,12 +114,20 @@ def _dequantize_k_cache_paged_kernel(
     NOPE_ROPE_BYTES: tl.constexpr,
     PADDED_SCALE_PER_TOKEN: tl.constexpr,
     S_OFFSET_BYTES: tl.constexpr,
+    SHARED_CP_SIZE: tl.constexpr,
+    SHARED_PAGES_PER_RANK: tl.constexpr,
 ):
     # One program per token: load page_table[token_id] once and emit all
     # NUM_SCALE_TILES nope tiles + rope tail via tl.static_range.
     token_id = tl.program_id(0)
     loc = tl.load(page_table_ptr + token_id).to(tl.int64)
-    page_idx = loc // PAGE_SIZE
+    logical_page = loc // PAGE_SIZE
+    if SHARED_CP_SIZE > 1:
+        owner = logical_page % SHARED_CP_SIZE
+        local_page = logical_page // SHARED_CP_SIZE
+        page_idx = owner * SHARED_PAGES_PER_RANK + local_page
+    else:
+        page_idx = logical_page
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
     token_data_base = page_byte_base + in_page * NOPE_ROPE_BYTES
