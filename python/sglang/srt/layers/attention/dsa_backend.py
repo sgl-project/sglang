@@ -61,6 +61,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
+    require_mla_kv_cache_scales,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
@@ -1920,6 +1921,16 @@ class DeepseekSparseAttnBackend(
                 is_prefill=True,
             )
 
+        if self.kv_cache_dtype == torch.float8_e4m3fn and not self.use_mha:
+            k_scale, _ = require_mla_kv_cache_scales(
+                layer, path=f"unsupported_dsa_{dsa_impl}_prefill"
+            )
+            if k_scale != 1.0:
+                raise RuntimeError(
+                    f"DSA {dsa_impl} prefill does not expose calibrated FP8 MLA "
+                    "read scales; use dsa_prefill_impl=trtllm"
+                )
+
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -2219,6 +2230,16 @@ class DeepseekSparseAttnBackend(
                 is_neox,
                 llama_4_scaling,
             )
+
+        if self.kv_cache_dtype == torch.float8_e4m3fn and not self.use_mha:
+            k_scale, _ = require_mla_kv_cache_scales(
+                layer, path=f"unsupported_dsa_{self.dsa_decode_impl}_decode"
+            )
+            if k_scale != 1.0:
+                raise RuntimeError(
+                    f"DSA {self.dsa_decode_impl} decode does not expose calibrated "
+                    "FP8 MLA read scales; use dsa_decode_impl=trtllm"
+                )
 
         if k is not None:
             assert v is not None
@@ -3149,6 +3170,9 @@ class DeepseekSparseAttnBackend(
                         forward_batch, rope_positions
                     )
 
+            k_scale, _ = require_mla_kv_cache_scales(
+                layer, path="dsa_trtllm_rope_write"
+            )
             q, k, k_rope = mla_quantize_and_rope_for_fp8(
                 q,
                 q_rope,
@@ -3159,6 +3183,7 @@ class DeepseekSparseAttnBackend(
                 is_neox,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
+                kv_descale=k_scale,
             )
             if save_kv_cache and dsa_use_prefill_cp(forward_batch):
                 if is_cp_v2_active(forward_batch):
@@ -3220,11 +3245,15 @@ class DeepseekSparseAttnBackend(
             )
 
         q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
+        if self.kv_cache_dtype == torch.float8_e4m3fn:
+            k_scale, _ = require_mla_kv_cache_scales(
+                layer, path="dsa_trtllm_bmm1"
+            )
+            _, v_scale = require_mla_kv_cache_scales(
+                layer, path="dsa_trtllm_bmm2"
+            )
+        else:
+            k_scale = v_scale = 1.0
         bmm1_scale = q_scale * k_scale * layer.scaling
 
         batch_size = page_table_1.shape[0]
@@ -3265,6 +3294,7 @@ class DeepseekSparseAttnBackend(
             max_seq_len=metadata.max_seq_len_k,
             sparse_mla_top_k=self.dsa_index_topk,
             bmm1_scale=bmm1_scale,
+            bmm2_scale=v_scale,
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,

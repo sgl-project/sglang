@@ -89,6 +89,82 @@ TRTLLM_BLOCK_CONSTRAINT = 128
 TRTLLM_MLA_MAX_BATCH_SIZE = 8192
 
 
+def require_mla_kv_cache_scales(
+    layer: RadixAttention, *, path: str
+) -> tuple[float, float]:
+    """Return coherent MLA cache descales or fail before a corrupt FP8 access.
+
+    MLA stores the compressed latent row once and consumes it as K-nope in
+    BMM1 and V in BMM2. The rotary K tail shares that storage row. Therefore a
+    single quantization scale must cover all three consumers.
+    """
+    k_scale = getattr(layer, "k_scale_float", None)
+    v_scale = getattr(layer, "v_scale_float", None)
+    if k_scale is None or v_scale is None:
+        raise RuntimeError(
+            f"FP8 MLA KV cache requires both k_scale and v_scale on layer "
+            f"{getattr(layer, 'layer_id', '?')} ({path})"
+        )
+    k_scale = float(k_scale)
+    v_scale = float(v_scale)
+    if (
+        not math.isfinite(k_scale)
+        or not math.isfinite(v_scale)
+        or k_scale <= 0.0
+        or v_scale <= 0.0
+    ):
+        raise RuntimeError(
+            f"FP8 MLA KV cache scales must be finite and positive, got "
+            f"k={k_scale!r}, v={v_scale!r} on layer "
+            f"{getattr(layer, 'layer_id', '?')} ({path})"
+        )
+    if not math.isclose(k_scale, v_scale, rel_tol=1e-7, abs_tol=0.0):
+        raise RuntimeError(
+            "MLA uses one compressed latent KV cache row, so k_scale and "
+            f"v_scale must match; got k={k_scale!r}, v={v_scale!r} on layer "
+            f"{getattr(layer, 'layer_id', '?')} ({path})"
+        )
+
+    return k_scale, v_scale
+
+
+def quantize_mla_kv_for_cache(
+    k: torch.Tensor,
+    k_rope: torch.Tensor,
+    layer: RadixAttention,
+    *,
+    path: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize the shared latent+rotary MLA cache with reciprocal scaling."""
+    k_scale, _ = require_mla_kv_cache_scales(layer, path=path)
+    if k.dtype == torch.float8_e4m3fn or k_rope.dtype == torch.float8_e4m3fn:
+        raise RuntimeError(
+            "quantize_mla_kv_for_cache expects unquantized tensors, got "
+            f"k={k.dtype}, k_rope={k_rope.dtype} ({path})"
+        )
+    scale = getattr(layer, "k_scale", None)
+    if not isinstance(scale, torch.Tensor) or scale.numel() != 1:
+        raise RuntimeError(
+            f"FP8 MLA KV cache requires a scalar k_scale tensor ({path})"
+        )
+
+    def quantize(value: torch.Tensor) -> torch.Tensor:
+        quantized, _ = scaled_fp8_quant(
+            value.reshape(-1, value.shape[-1]).contiguous(), scale
+        )
+        return quantized.reshape(value.shape)
+
+    k_fp8 = quantize(k)
+    k_rope_fp8 = quantize(k_rope)
+    if k_fp8.dtype != torch.float8_e4m3fn or k_rope_fp8.dtype != torch.float8_e4m3fn:
+        raise RuntimeError(
+            f"FP8 MLA KV cache quantization returned wrong dtype ({path})"
+        )
+    if k_scale != float(scale.item()):
+        raise RuntimeError(f"FP8 MLA KV cache tensor/float scale mismatch ({path})")
+    return k_fp8, k_rope_fp8
+
+
 def _multi_ctas_kv_counter_bytes(
     device: torch.device, num_q_heads: int, batch_size: int
 ) -> int:
@@ -119,29 +195,11 @@ def grow_multi_ctas_kv_counter_buffer_if_needed(
 def _quantize_fp8_qkv(q, k, v, layer):
     q = q.to(torch.float8_e4m3fn)
 
-    k_scale = getattr(layer, "k_scale_float", None)
-    if k_scale is None:
-        k_scale = 1.0
-    if k_scale != 1.0:
-        assert hasattr(layer, "k_scale"), "k_scale is not set"
-        k_2d, _ = scaled_fp8_quant(
-            k.reshape(-1, k.shape[-1]).contiguous(), layer.k_scale
-        )
-        k = k_2d.reshape(k.shape)
-    else:
-        k = k.to(torch.float8_e4m3fn)
-
-    v_scale = getattr(layer, "v_scale_float", None)
-    if v_scale is None:
-        v_scale = 1.0
-    if v_scale != 1.0:
-        assert hasattr(layer, "v_scale"), "v_scale is not set"
-        v_2d, _ = scaled_fp8_quant(
-            v.reshape(-1, v.shape[-1]).contiguous(), layer.v_scale
-        )
-        v = v_2d.reshape(v.shape)
-    else:
-        v = v.to(torch.float8_e4m3fn)
+    k_scale, v_scale = require_mla_kv_cache_scales(layer, path="regular_prefill")
+    k_2d, _ = scaled_fp8_quant(k.reshape(-1, k.shape[-1]).contiguous(), layer.k_scale)
+    k = k_2d.reshape(k.shape)
+    v_2d, _ = scaled_fp8_quant(v.reshape(-1, v.shape[-1]).contiguous(), layer.v_scale)
+    v = v_2d.reshape(v.shape)
 
     return q, k, v, k_scale, v_scale
 
@@ -810,11 +868,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         applies when the KV cache stores FP8."""
         q_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
-            k_scale = (
-                layer.k_scale_float
-                if getattr(layer, "k_scale_float", None) is not None
-                else 1.0
-            )
+            k_scale, _ = require_mla_kv_cache_scales(layer, path="decode_bmm1")
         else:
             if getattr(layer, "k_scale_float", None) is not None:
                 logger.warning_once(
@@ -825,6 +879,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             k_scale = 1.0
         return q_scale * k_scale * layer.scaling
+
+    def _compute_decode_bmm2_scale(self, layer: RadixAttention) -> float:
+        if self.data_type != torch.float8_e4m3fn:
+            return 1.0
+        _, v_scale = require_mla_kv_cache_scales(layer, path="decode_bmm2")
+        return v_scale
 
     def _dense_q_indptr(self, bs: int, draft_token_num: int) -> torch.Tensor:
         """Query indptr for a dense [bs, draft_token_num] verify batch."""
@@ -869,6 +929,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         #   For BF16/FP16 KV cache, k_scale must be 1.0 since values are unscaled.
         # - softmax_scale: Attention softmax scaling = 1/sqrt(head_dim), pre-computed as layer.scaling
         bmm1_scale = self._compute_decode_bmm1_scale(layer)
+        bmm2_scale = self._compute_decode_bmm2_scale(layer)
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
@@ -889,6 +950,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens=seq_lens_i32,
             max_seq_len=max_seq_len,
             bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             **extra_kwargs,
         )
@@ -1020,6 +1082,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ):
             return None
         parallel = get_parallel()
+        k_scale, _ = require_mla_kv_cache_scales(layer, path="fused_no_rope_write")
         return set_mla_kv_concat_q_fp8(
             kv_buffer=kv_2d,
             loc=loc,
@@ -1031,6 +1094,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # (identity when attn_dcp_size == 1).
             dcp_world_size=parallel.attn_dcp_size,
             dcp_rank=parallel.attn_dcp_rank,
+            quant_scale_kv=1.0 / k_scale,
         )
 
     def forward_decode(
@@ -1073,10 +1137,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                             k_rope=k_rope,
                         )
                 if fused_fp8_query is None:
+                    k_scale, _ = require_mla_kv_cache_scales(
+                        layer, path="decode_no_rope_write"
+                    )
                     q, k, k_rope = mla_quantize_without_rope_for_fp8(
-                        q, q_rope, k.squeeze(1), k_rope.squeeze(1)
+                        q,
+                        q_rope,
+                        k.squeeze(1),
+                        k_rope.squeeze(1),
+                        kv_descale=k_scale,
                     )
             else:
+                k_scale, _ = require_mla_kv_cache_scales(
+                    layer, path="decode_rope_write"
+                )
                 q, k, k_rope = mla_quantize_and_rope_for_fp8(
                     q,
                     q_rope,
@@ -1087,15 +1161,24 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     is_neox,
                     self.kv_lora_rank,
                     self.qk_rope_head_dim,
+                    kv_descale=k_scale,
                 )
             merge_query = False
 
         # Save KV cache if requested (the fused fp8 path already wrote it)
         query = fused_fp8_query
         if query is None and save_kv_cache:
-            assert (
-                k is not None and k_rope is not None
-            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            assert k is not None and k_rope is not None, (
+                "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            )
+            cache_k, cache_k_rope = k, k_rope
+            if self.data_type == torch.float8_e4m3fn:
+                if k.dtype == torch.float8_e4m3fn:
+                    require_mla_kv_cache_scales(layer, path="decode_fp8_cache_write")
+                else:
+                    cache_k, cache_k_rope = quantize_mla_kv_for_cache(
+                        k, k_rope, layer, path="decode_cache_write"
+                    )
             if self._decode_dense_loc is not None:
                 # cuda-graph path: dense write loc precomputed out-of-graph, so
                 # the in-graph write captures no translate allocation.
@@ -1105,14 +1188,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     query = self._set_kv_and_concat_q_fused(
                         layer=layer,
                         loc=self._decode_dense_loc,
-                        k=k,
-                        k_rope=k_rope,
+                        k=cache_k,
+                        k_rope=cache_k_rope,
                         q=q,
                         q_rope=q_rope,
                     )
                 if query is None:
                     self.token_to_kv_pool.set_mla_kv_buffer(
-                        layer, self._decode_dense_loc, k, k_rope, loc_is_dense=True
+                        layer,
+                        self._decode_dense_loc,
+                        cache_k,
+                        cache_k_rope,
+                        loc_is_dense=True,
                     )
             else:
                 # eager (or static pool): the pool's _full_translate handles it.
@@ -1126,14 +1213,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     query = self._set_kv_and_concat_q_fused(
                         layer=layer,
                         loc=forward_batch.out_cache_loc,
-                        k=k,
-                        k_rope=k_rope,
+                        k=cache_k,
+                        k_rope=cache_k_rope,
                         q=q,
                         q_rope=q_rope,
                     )
                 if query is None:
                     self.token_to_kv_pool.set_mla_kv_buffer(
-                        layer, forward_batch.out_cache_loc, k, k_rope
+                        layer,
+                        forward_batch.out_cache_loc,
+                        cache_k,
+                        cache_k_rope,
                     )
 
         # Prepare query tensor inline (already built when the fused save-KV
@@ -1223,6 +1313,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and self.forward_prefill_metadata is not None
             and self.forward_prefill_metadata.fallback_to_flashinfer_impl
         ):
+            if self.data_type == torch.float8_e4m3fn:
+                k_scale, _ = require_mla_kv_cache_scales(
+                    layer, path="unsupported_flashinfer_mla_prefill_fallback"
+                )
+                if k_scale != 1.0:
+                    raise RuntimeError(
+                        "FlashInfer MLA prefill fallback does not expose calibrated "
+                        "FP8 latent-cache scale handling; use TRT-LLM MLA prefill"
+                    )
             return super().forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
@@ -1234,10 +1333,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ) and forward_batch.forward_mode.is_target_verify():
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
+                k_scale, _ = require_mla_kv_cache_scales(
+                    layer, path="target_verify_no_rope_write"
+                )
                 q, k, k_rope = mla_quantize_without_rope_for_fp8(
-                    q, q_rope, k.squeeze(1), k_rope.squeeze(1)
+                    q,
+                    q_rope,
+                    k.squeeze(1),
+                    k_rope.squeeze(1),
+                    kv_descale=k_scale,
                 )
             else:
+                k_scale, _ = require_mla_kv_cache_scales(
+                    layer, path="target_verify_rope_write"
+                )
                 q, k, k_rope = mla_quantize_and_rope_for_fp8(
                     q,
                     q_rope,
@@ -1248,21 +1357,37 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     is_neox,
                     self.kv_lora_rank,
                     self.qk_rope_head_dim,
+                    kv_descale=k_scale,
                 )
             merge_query = False
 
         # Save KV cache if requested
         if save_kv_cache:
-            assert (
-                k is not None and k_rope is not None
-            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            assert k is not None and k_rope is not None, (
+                "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            )
+            cache_k, cache_k_rope = k, k_rope
+            if self.data_type == torch.float8_e4m3fn:
+                if k.dtype == torch.float8_e4m3fn:
+                    require_mla_kv_cache_scales(layer, path="extend_fp8_cache_write")
+                else:
+                    cache_k, cache_k_rope = quantize_mla_kv_for_cache(
+                        k, k_rope, layer, path="extend_cache_write"
+                    )
             if self._decode_dense_loc is not None:
                 self.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, self._decode_dense_loc, k, k_rope, loc_is_dense=True
+                    layer,
+                    self._decode_dense_loc,
+                    cache_k,
+                    cache_k_rope,
+                    loc_is_dense=True,
                 )
             else:
                 self.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, k_rope
+                    layer,
+                    forward_batch.out_cache_loc,
+                    cache_k,
+                    cache_k_rope,
                 )
 
         # TODO refactor to avoid code duplication
