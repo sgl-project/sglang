@@ -18,10 +18,6 @@ import PIL.Image
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
-    get_distilled_sigmas,
-    is_edge_checkpoint,
-)
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.communication_op import (

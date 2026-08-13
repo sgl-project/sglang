@@ -31,9 +31,11 @@ from sglang.srt.model_loader.loader import (
     ModelOptModelLoader,
     get_model_loader,
 )
-from sglang.srt.model_loader.weight_utils import get_quant_config
+from sglang.srt.model_loader.weight_utils import (
+    _modelopt_quant_section,
+    get_quant_config,
+)
 from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
-from sglang.srt.model_loader.weight_utils import _modelopt_quant_section
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
