@@ -50,11 +50,8 @@ jobs:
       - name: Run pre-commit checks
         run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
 
-      # Not a pre-commit hook: clippy already makes local rust commits slow, and
-      # this needs codegen + link on top of clippy's metadata-only pass. Not in
-      # the rust-ext build job either -- that job's cache entry is the built .so
-      # set, so gating it on a test would hash a non-build input into the
-      # artifact key. The Swatinem cache above carries the dependency codegen.
+      # Not in the rust-ext build job: its cache key covers the built .so files,
+      # and a test script is not a build input.
       - name: Run rust/ workspace tests
         run: bash scripts/ci/run_rust_workspace_tests.sh
 

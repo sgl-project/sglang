@@ -113,8 +113,8 @@ def find_bare_pytest_main(path: pathlib.Path) -> int | None:
     for node in ast.walk(tree):
         if not isinstance(node, ast.If) or not is_main_guard(node.test):
             continue
-        # Whole guard body at once: `code = pytest.main(...)` and the
-        # `sys.exit(code)` that propagates it are separate statements.
+        # Whole body at once: the call and the sys.exit() that propagates it
+        # are separate statements.
         nodes = [n for statement in node.body for n in runtime_nodes(statement)]
         parents = {
             id(child): parent

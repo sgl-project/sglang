@@ -28,9 +28,7 @@ _PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
 _KWARG_ONLY = ("stage", "runner_config")
 _ALL_PARAMS = _PARAM_ORDER + _KWARG_ONLY
 _UNSET = object()
-# The lone unregistered helper under test/registered/; the other shared helper
-# (unit/entrypoints/openai/utils.py) carries a `disabled=` registration. New
-# shared helpers belong in python/sglang/test/ instead of growing this set.
+# New shared helpers belong in python/sglang/test/, not in this set.
 _REGISTERED_NON_TEST_FILES = frozenset({"cpu/utils.py"})
 
 

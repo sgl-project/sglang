@@ -30,8 +30,7 @@ def main():
         check_parallel_adoption_ratchet,
         check_server_args_mutation_ratchet,
     )
-    # Every ratchet runs even after one fails: they guard independent
-    # invariants, and a raw traceback per run would hide the rest.
+    # They guard independent invariants, so one failure must not hide the rest.
     failures = []
     for check in checks:
         try:

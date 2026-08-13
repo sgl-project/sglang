@@ -44,8 +44,7 @@ def main() -> int:
         print("Bump both together, or every pool falls back to source builds.")
         return 1
 
-    # The lookup, the save, and the restore must hash the same inputs; adding a
-    # file to one key alone permanently misses the entries saved under the other.
+    # Adding a file to one key alone permanently misses the other's entries.
     sites = [(BUILD_WORKFLOW, inputs) for inputs in hashed_inputs(BUILD_WORKFLOW)]
     sites += [(DOWNLOAD_ACTION, inputs) for inputs in hashed_inputs(DOWNLOAD_ACTION)]
 
