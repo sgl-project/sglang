@@ -211,6 +211,15 @@ class TestReasoningTokenAccounting(CustomTestCase):
         self.assertEqual(req.reasoning_tokens, 0)
         self.assertFalse(req._is_reasoning_over)
 
+    def test_scalar_token_ids(self):
+        req, processor = self._make_reasoning_setup()
+
+        for token in (5, 6, 9, 7, 8, 10):
+            processor._maybe_update_reasoning_tokens(req, token)
+
+        self.assertEqual(req.reasoning_tokens, 5)
+        self.assertTrue(req._is_reasoning_over)
+
 
 if __name__ == "__main__":
     unittest.main()

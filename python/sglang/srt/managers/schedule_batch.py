@@ -145,6 +145,7 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 # This ensures pad_values don't overlap with valid text token IDs.
 MM_PAD_SHIFT_VALUE = 1_000_000
 
+# Prompt tail to scan for a prefilled thinking delimiter.
 PROMPT_THINK_SCAN_TOKENS = 256
 
 logger = logging.getLogger(__name__)
@@ -1835,7 +1836,6 @@ class Req(ReqDllmMixin):
         self._is_reasoning_started = self._prompt_opens_reasoning()
 
     def _prompt_opens_reasoning(self) -> bool:
-        """Whether the last thinking delimiter of the prompt tail leaves a block open."""
         is_open = False
         start_len = end_len = 0
         for token in self.origin_input_ids[-PROMPT_THINK_SCAN_TOKENS:]:
