@@ -515,12 +515,14 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-request-setting:last-child { border-bottom: 0; }
 .sgd-builder-request-setting .sgd-builder-context { padding: 16px 0; }
 
-.sgd-builder-output-rail { display: grid; gap: 12px; padding: 0 12px 16px; align-items: start; }
+/* stretch + the code area flexing below keep side-by-side cards the same
+   height, so their footers sit on one line instead of ragged bottoms. */
+.sgd-builder-output-rail { display: grid; gap: 12px; padding: 0 12px 16px; align-items: stretch; }
 .sgd-builder-output {
   --output-accent: var(--sgdb-serve);
-  display: grid;
+  display: flex;
   min-width: 0;
-  align-content: start;
+  flex-direction: column;
   overflow: hidden;
   border: 1px solid var(--sgdb-line);
   border-radius: 9px;
@@ -528,10 +530,12 @@ html.dark table tbody tr:nth-child(even) td,
   transition: border-color 160ms ease-out, transform 160ms ease-out;
 }
 .sgd-builder-output[data-output="request"] { --output-accent: var(--sgdb-request); }
-.sgd-builder-output[data-emphasized="true"] { border-color: color-mix(in oklch, var(--output-accent) 38%, var(--sgdb-line)); }
+.sgd-builder-output[data-emphasized="true"] { border-color: color-mix(in oklch, var(--output-accent) 24%, var(--sgdb-line)); }
 .sgd-builder-output > header { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; gap: 8px; align-items: center; min-height: 50px; padding: 8px 10px; border-bottom: 1px solid var(--sgdb-line); }
 .sgd-builder-output[data-emphasized="true"] > header { background: color-mix(in oklch, var(--output-accent) 4%, var(--sgdb-raised)); }
-.sgd-builder-output-index { display: grid; width: 20px; height: 20px; place-items: center; border: 0; border-radius: 50%; background: color-mix(in oklch, var(--output-accent) 13%, transparent); color: var(--output-accent); font-size: 10px; font-weight: 590; font-variant-numeric: tabular-nums; }
+/* Neutral step disc — the accents stay reserved for state (active tab, status),
+   so a static ordinal does not compete with them. */
+.sgd-builder-output-index { display: grid; width: 20px; height: 20px; place-items: center; border: 0; border-radius: 50%; background: var(--sgdb-well); color: var(--sgdb-muted); font-size: 10px; font-weight: 590; font-variant-numeric: tabular-nums; }
 .sgd-builder-output-title { display: flex; min-width: 0; gap: 7px; align-items: baseline; }
 .sgd-builder-output-title strong { font-size: 13px; font-weight: 590; }
 .sgd-builder-output-title span { color: var(--sgdb-muted); font-size: 10.5px; }
@@ -545,8 +549,12 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-node-fields { display: grid; grid-template-columns: minmax(0, 1fr) 84px; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--sgdb-line); }
 .sgd-builder-node-fields label { display: grid; min-width: 0; gap: 4px; color: var(--sgdb-muted); font-size: 10px; }
 .sgd-builder-node-fields input { width: 100%; min-width: 0; min-height: 34px; padding: 0 7px; border: 1px solid var(--sgdb-line); border-radius: 6px; background: var(--sgdb-surface); color: var(--sgdb-ink); font-size: 11px; }
-.sgd-builder-output > pre {
-  height: auto;
+/* Positioning context for the floating copy control; grid so the pre keeps
+   min-width:0 scrolling. flex:1 lets the code area absorb the height
+   difference between side-by-side cards. */
+.sgd-builder-code { position: relative; display: grid; min-width: 0; flex: 1 1 auto; }
+.sgd-builder-code > pre {
+  height: 100%;
   max-height: calc(13.95em + 24px);
   min-width: 0;
   margin: 0;
@@ -560,29 +568,56 @@ html.dark table tbody tr:nth-child(even) td,
   line-height: 1.55;
   white-space: pre;
 }
-.sgd-builder-output > pre.is-expanded { height: auto; max-height: 70vh; }
+.sgd-builder-code > pre::-webkit-scrollbar-corner { background: transparent; }
+.sgd-builder-code > pre.is-expanded { height: auto; max-height: 70vh; }
 .sgd-builder-output code { background: transparent; color: inherit; font: inherit; font-variant-ligatures: none; }
 .sgd-builder-output-error { padding: 8px 10px; border-top: 1px solid color-mix(in oklch, var(--sgdb-error) 35%, var(--sgdb-line)); background: color-mix(in oklch, var(--sgdb-error) 8%, transparent); color: var(--sgdb-error); font-size: 10.5px; line-height: 1.4; }
 .sgd-builder-output > footer { display: flex; min-height: 44px; padding: 5px 10px; align-items: center; justify-content: space-between; border-top: 1px solid var(--sgdb-line); }
 .sgd-builder-output > footer > div { display: flex; margin-left: auto; gap: 12px; align-items: center; }
-/* Tinted, borderless — the primary action reads through colour, not through a
-   raised box. Keeps it in the same visual weight class as the text actions
-   next to it. */
+/* Copy floats inside the code area (top-right), revealed on hover — the
+   standard code-block pattern. A frosted chip keeps the glyph legible over
+   scrolled code without drawing a box when idle. */
 .sgd-builder-copy {
-  min-height: 26px;
-  padding: 0 11px;
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  display: grid;
+  width: 28px;
+  height: 28px;
+  padding: 0;
   border: 0;
   border-radius: 7px;
-  background: color-mix(in oklch, var(--output-accent) 11%, transparent);
-  color: var(--output-accent);
+  background: color-mix(in oklch, var(--sgdb-raised) 82%, transparent);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 0 0 0.5px var(--sgdb-thumb-ring);
+  color: var(--sgdb-muted);
   cursor: pointer;
-  font-size: 11.5px;
-  font-weight: 590;
-  letter-spacing: -0.005em;
-  transition: background-color var(--sgdb-ease-dur) var(--sgdb-ease),
-    color var(--sgdb-ease-dur) var(--sgdb-ease);
+  opacity: 0;
+  place-items: center;
+  transition: opacity var(--sgdb-ease-dur) var(--sgdb-ease),
+    color var(--sgdb-ease-dur) var(--sgdb-ease),
+    background-color var(--sgdb-ease-dur) var(--sgdb-ease);
 }
-.sgd-builder-copy:disabled { cursor: not-allowed; opacity: 0.38; }
+.sgd-builder-code:hover > .sgd-builder-copy,
+.sgd-builder-copy:focus-visible,
+.sgd-builder-copy[data-copied="true"] { opacity: 1; }
+/* No hover on touch — the control must stay visible. */
+@media (hover: none) {
+  .sgd-builder-copy { opacity: 1; }
+}
+.sgd-builder-copy:disabled { cursor: not-allowed; color: color-mix(in oklch, var(--sgdb-muted) 45%, transparent); }
+/* Both glyphs share the cell; the swap is a settle-in scale rather than a
+   hard display switch. */
+.sgd-builder-copy svg {
+  grid-area: 1 / 1;
+  pointer-events: none;
+  transition: opacity 140ms var(--sgdb-ease), transform 220ms var(--sgdb-ease);
+}
+.sgd-builder-copy .sgd-builder-copy-check { opacity: 0; transform: scale(0.5); }
+.sgd-builder-copy[data-copied="true"] { color: var(--sgdb-ok); }
+.sgd-builder-copy[data-copied="true"] .sgd-builder-copy-glyph { opacity: 0; transform: scale(0.5); }
+.sgd-builder-copy[data-copied="true"] .sgd-builder-copy-check { opacity: 1; transform: scale(1); }
 
 /* Hover only changes tone. Lifting the card on hover (translateY) made the
    whole grid twitch as the pointer crossed it. */
@@ -596,7 +631,8 @@ html.dark table tbody tr:nth-child(even) td,
   .sgd-builder-setting-row:not(:disabled):hover { background: color-mix(in oklch, var(--sgdb-serve) 5%, transparent); }
   .sgd-builder-stepper button:not(:disabled):hover,
   .sgd-builder-request-stepper button:not(:disabled):hover { background: var(--sgdb-pick-hover); }
-  .sgd-builder-copy:not(:disabled):hover { background: color-mix(in oklch, var(--output-accent) 18%, transparent); }
+  .sgd-builder-copy:not(:disabled):hover { background: var(--sgdb-raised); color: var(--sgdb-ink); }
+  .sgd-builder-copy[data-copied="true"]:hover { color: var(--sgdb-ok); }
   .sgd-builder-text-action:not(:disabled):hover { color: var(--output-accent, var(--sgdb-brand)); }
 }
 

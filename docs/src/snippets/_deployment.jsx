@@ -1994,7 +1994,20 @@ export const Deployment = ({ config, benchmarks }) => {
               </label>
             </div>
           )}
-          <pre className={expanded ? "is-expanded" : ""}><code>{text}</code></pre>
+          <div className="sgd-builder-code">
+            <pre className={expanded ? "is-expanded" : ""}><code>{text}</code></pre>
+            <button
+              type="button"
+              className="sgd-builder-copy"
+              disabled={invalid}
+              aria-label={(serve ? copied : curlCopied) ? "Copied" : "Copy command"}
+              data-copied={(serve ? copied : curlCopied) ? "true" : undefined}
+              onClick={serve ? handleCopy : copyCurl}
+            >
+              <svg className="sgd-builder-copy-glyph" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2.5" /><path d="M15 5v-.25A2.75 2.75 0 0 0 12.25 2h-7.5A2.75 2.75 0 0 0 2 4.75v7.5A2.75 2.75 0 0 0 4.75 15H5" /></svg>
+              <svg className="sgd-builder-copy-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
+            </button>
+          </div>
           {invalid && <div className="sgd-builder-output-error">{errors[0]}</div>}
           <footer>
             {canExpand && (
@@ -2004,14 +2017,6 @@ export const Deployment = ({ config, benchmarks }) => {
             )}
             <div>
               <button type="button" className="sgd-builder-text-action" onClick={() => setModal("env")}>Variables</button>
-              <button
-                type="button"
-                className="sgd-builder-copy"
-                disabled={invalid}
-                onClick={serve ? handleCopy : copyCurl}
-              >
-                {(serve ? copied : curlCopied) ? "Copied" : "Copy"}
-              </button>
             </div>
           </footer>
         </section>
