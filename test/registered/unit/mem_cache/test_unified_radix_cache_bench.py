@@ -1,7 +1,7 @@
 """Large-scale benchmark + fuzz correctness tests for UnifiedRadixCache.
 
 Usage (standalone):
-    bench: python3 test/registered/unit/mem_cache/test_unified_radix_cache_bench.py --num-seqs 5000 --verify --components mamba legacy-mamba swa legacy-swa
+    bench: python3 test/registered/unit/mem_cache/test_unified_radix_cache_bench.py --bench --num-seqs 5000 --verify --components mamba legacy-mamba swa legacy-swa
     CI Test: python -m pytest test/registered/unit/mem_cache/test_unified_radix_cache_bench.py -v -s
 """
 
@@ -10,6 +10,7 @@ import gc
 import logging
 import random
 import statistics
+import sys
 import time
 import unittest
 from array import array
@@ -239,7 +240,7 @@ def create_bench_cache(
     _rid = [0]
 
     def make_req():
-        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
         from sglang.srt.sampling.sampling_params import SamplingParams
 
         req = Req(
@@ -250,6 +251,8 @@ def create_bench_cache(
         )
         _rid[0] += 1
         req_to_token_pool.alloc([req])
+        # fabricated reqs bypass alloc_for_extend, the normal creator of req.kv
+        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
         return req
 
     return tree, allocator, req_to_token_pool, make_req
@@ -821,7 +824,8 @@ _TREE_CONFIGS = {
     "legacy-swa": ((ComponentType.FULL, ComponentType.SWA), SWARadixCache),
 }
 
-if __name__ == "__main__":
+
+def _run_bench_cli():
     parser = argparse.ArgumentParser(description="UnifiedRadixCache benchmark")
     parser.add_argument("--num-seqs", type=int, default=5000)
     parser.add_argument("--chunk-len", type=int, default=256)
@@ -857,3 +861,12 @@ if __name__ == "__main__":
             tree_cls=tree_cls,
             page_size=args.page_size,
         )
+
+
+if __name__ == "__main__":
+    # CI runs `python3 file.py`; it must execute the TestBench_* classes
+    if "--bench" in sys.argv:
+        sys.argv.remove("--bench")
+        _run_bench_cli()
+    else:
+        unittest.main()
