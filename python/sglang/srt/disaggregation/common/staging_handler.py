@@ -94,6 +94,7 @@ class DecodeStagingHandler:
         # before unregister runs, but release_room still needs it.
         self._room_to_receiver: dict = {}
         self._wm_subscribers: dict = {}
+        self._wm_subscribers_lock = threading.Lock()
         # room -> chunk_idx -> [(page_start, num_pages, writer_id)] fan-in
         # arrivals; handler-owned so room teardown can purge them.
         self._writer_counts: dict = {}
@@ -103,8 +104,23 @@ class DecodeStagingHandler:
         if receiver is None or not receiver.bootstrap_infos:
             return
         key = tuple(str(bi) for bi in receiver.bootstrap_infos)
-        if key not in self._wm_subscribers:
+        # Receivers are request-scoped. Refresh an existing endpoint entry so
+        # watermark sends never retain a receiver from an earlier request.
+        with self._wm_subscribers_lock:
             self._wm_subscribers[key] = (receiver, session_id)
+
+    def unregister_wm_subscribers(self, bootstrap_info_groups) -> int:
+        """Remove watermark subscribers owned by a failed prefill node."""
+        keys = {
+            tuple(str(bootstrap_info) for bootstrap_info in bootstrap_infos)
+            for bootstrap_infos in bootstrap_info_groups
+            if bootstrap_infos
+        }
+        with self._wm_subscribers_lock:
+            removed = sum(key in self._wm_subscribers for key in keys)
+            for key in keys:
+                self._wm_subscribers.pop(key, None)
+        return removed
 
     def num_writers_for(self, receiver) -> int:
         """Compute all TP and PP writers expected for a staging chunk."""
@@ -447,7 +463,9 @@ class DecodeStagingHandler:
         wm_round, wm_tail = post_wm
         wm_round_b = str(wm_round).encode("ascii")
         wm_tail_b = str(wm_tail).encode("ascii")
-        for _key, (receiver, session_id) in list(self._wm_subscribers.items()):
+        with self._wm_subscribers_lock:
+            subscribers = list(self._wm_subscribers.values())
+        for receiver, session_id in subscribers:
             sid_b = session_id.encode("ascii")
             for bootstrap_info in receiver.bootstrap_infos:
                 try:

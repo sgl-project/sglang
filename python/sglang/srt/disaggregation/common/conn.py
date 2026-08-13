@@ -1025,6 +1025,9 @@ class CommonKVManager(BaseKVManager):
             keys_to_remove = [
                 k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
             ]
+            stale_bootstrap_info_groups = [
+                list(self.connection_pool[k]) for k in keys_to_remove
+            ]
             # Collect TCP endpoints from cached bootstrap_infos before deletion
             stale_endpoints = set()
             for k in keys_to_remove:
@@ -1042,6 +1045,10 @@ class CommonKVManager(BaseKVManager):
                 failed_bootstrap_addr, []
             )
             self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
+
+        staging_handler = getattr(self, "_staging_handler", None)
+        if staging_handler is not None:
+            staging_handler.unregister_wm_subscribers(stale_bootstrap_info_groups)
 
         for endpoint in stale_endpoints:
             CommonKVReceiver.disconnect_endpoint(endpoint)
