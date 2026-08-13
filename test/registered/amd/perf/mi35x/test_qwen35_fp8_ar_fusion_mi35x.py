@@ -41,6 +41,15 @@ QWEN35_FP8_MODEL_PATH = os.environ.get(
 )
 SERVER_LAUNCH_TIMEOUT = 4800
 GSM8K_NUM_QUESTIONS = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
+# Cap in-flight requests instead of firing all GSM8K_NUM_QUESTIONS at once.
+# Qwen3.5 is a hybrid model: the server caps max_running_requests at
+# max_mamba_cache_size (1013 for this config on MI35x). Submitting 1319
+# concurrent requests to each of the two servers this test runs side by side
+# pins the mamba state cache at 100% with requests still queued, and decode
+# stops making progress until the 1200s scheduler watchdog kills both servers.
+# The accuracy signal is identical at lower concurrency; this only bounds how
+# much work is admitted at once.
+GSM8K_PARALLEL = int(os.environ.get("GSM8K_PARALLEL", "256"))
 ACCURACY_THRESHOLD = 0.94
 
 # bench_sglang.py lives at the repo root (this file is 5 levels below), not under
@@ -149,7 +158,7 @@ class TestQwen35Fp8ArFusionMI35x(CustomTestCase):
             "--num-questions",
             str(GSM8K_NUM_QUESTIONS),
             "--parallel",
-            str(GSM8K_NUM_QUESTIONS),
+            str(GSM8K_PARALLEL),
             "--num-shots",
             "5",
             "--data-path",
