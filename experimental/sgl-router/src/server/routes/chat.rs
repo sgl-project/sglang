@@ -4,7 +4,8 @@
 use crate::config::{PolicyKind, SessionAffinityMode};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::admission::{
-    resolve_cache_candidates, resolve_decode, resolve_prefill, CandidateDomain, DecisionReason,
+    resolve_cache_candidates, resolve_decode, resolve_prefill, CandidateDomain, CandidateRange,
+    DecisionReason,
 };
 use crate::policies::buckets::BucketRequest;
 use crate::policies::decode::{build_decode_policy, DecodeSelectionContext};
@@ -441,8 +442,7 @@ pub async fn chat_completions(
     let cache_winner = (ctx.config.model.policy == PolicyKind::CacheAware)
         .then(|| {
             let snapshot = load_snapshot.as_ref()?;
-            let global_domain = CandidateDomain::global_prefill(&workers);
-            let global_range = global_domain.prefill_range()?;
+            let global_range = CandidateRange::global(&workers);
             let cache_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
                 .with_session_id(session_id)
                 .with_candidate_range_id(global_range.id)
@@ -504,8 +504,7 @@ pub async fn chat_completions(
     let global_affinity_probe = use_global_affinity_probe
         .then(|| {
             let snapshot = load_snapshot.as_ref()?;
-            let global_domain = CandidateDomain::global_prefill(&workers);
-            let global_range = global_domain.prefill_range()?;
+            let global_range = CandidateRange::global(&workers);
             let probe_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
                 .with_session_id(session_id)
                 .with_candidate_range_id(global_range.id)

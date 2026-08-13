@@ -294,3 +294,68 @@ fn decode_catch_all_still_rejects_input_beyond_runtime_context() {
         "an unknown output budget does not erase the known input context requirement"
     );
 }
+
+#[test]
+fn membership_index_preserves_exact_matching_and_fleet_order() {
+    let workers: Vec<_> = (0..10)
+        .map(|index| worker(&format!("w{index}"), WorkerMode::Prefill))
+        .collect();
+    let scan = bucket(
+        "scan",
+        BucketStage::Prefill,
+        10,
+        &["w3", "W3", " w2", "w1", "w1"],
+    );
+    let set = bucket(
+        "set",
+        BucketStage::Prefill,
+        20,
+        &[
+            "w9", "w3", "w1", "w1", "W3", " w2", "absent-0", "absent-1", "absent-2",
+        ],
+    );
+    let selector = BucketSelector::new(Some(BucketConfig {
+        buckets: vec![scan, set],
+        ttft_slo_policy: SloBucketPolicy::Disabled,
+        tps_slo_policy: SloBucketPolicy::Disabled,
+    }));
+    let request = BucketRequest {
+        input_tokens: 128,
+        expected_peak_sequence_tokens: None,
+        ttft_slo_ms: None,
+        tps_slo: None,
+    };
+
+    let domains = selector.prefill_domains(&workers, request);
+    let ids = |index: usize| {
+        domains[index]
+            .workers
+            .iter()
+            .map(|worker| worker.id.0.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(0), ["w1", "w3"]);
+    assert_eq!(ids(1), ["w1", "w3", "w9"]);
+
+    let candidate = CacheCandidate {
+        worker: Arc::clone(&workers[9]),
+        matched_prefix_tokens: 0,
+        uncached_tokens: 128,
+        candidate_range_id: "global".into(),
+        max_pending_prefill_tokens: None,
+    };
+    assert_eq!(
+        selector
+            .bind_prefill_cache_candidate(candidate, request)
+            .expect("w9 belongs to the hash-indexed bucket")
+            .candidate_range_id,
+        "set"
+    );
+    assert_eq!(
+        selector
+            .prefill_affinity_domain(&workers, &workers[9], request)
+            .expect("w9 has a bucket affinity")
+            .id,
+        "set"
+    );
+}
