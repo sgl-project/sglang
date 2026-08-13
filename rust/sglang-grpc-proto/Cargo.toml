@@ -1,0 +1,18 @@
+[package]
+name = "sglang-grpc-proto"
+description = "Generated Prost and Tonic bindings for the SGLang runtime API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+prost = { workspace = true }
+tonic = { workspace = true }
+
+[build-dependencies]
+protoc-bin-vendored = { workspace = true }
+tonic-build = { workspace = true }

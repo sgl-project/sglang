@@ -1,0 +1,77 @@
+name: Buf
+
+on:
+  pull_request:
+    paths:
+      - "proto/**"
+      - "buf.yaml"
+      - ".github/workflows/buf.yml"
+  push:
+    tags:
+      - "v*"
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Pull requests are isolated by number. Every publication source shares one
+# queue, and publication runs are never canceled while a push is in flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  proto:
+    if: >-
+      github.repository == 'sgl-project/sglang' &&
+      (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Build and validate schema
+        uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1.5.0
+        with:
+          version: "1.72.0"
+          input: proto
+          token: ${{ github.event_name != 'pull_request' && secrets.BUF_TOKEN || '' }}
+          lint: true
+          format: true
+          breaking: ${{ github.event_name == 'pull_request' }}
+          push: false
+          archive: false
+          pr_comment: false
+
+      - name: Verify release tag points to main
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::Release tags must point to commits on main"
+            exit 1
+          fi
+
+      - name: Publish nightly schema
+        if: >-
+          github.event_name == 'schedule' ||
+          (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+        shell: bash
+        run: >-
+          buf push
+          --label nightly
+          --source-control-url "${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+
+      - name: Publish release schema
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: >-
+          buf push
+          --label main
+          --label "${GITHUB_REF_NAME}"
+          --source-control-url "${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"

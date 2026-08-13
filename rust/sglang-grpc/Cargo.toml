@@ -24,21 +24,15 @@ crate-type = ["cdylib"]
 async-stream = { workspace = true }
 pyo3 = { workspace = true }
 serde_json = { workspace = true }
+sglang-grpc-proto = { path = "../sglang-grpc-proto" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
-prost = "0.13"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
-tonic = { version = "0.12", features = ["gzip", "transport"] }
-
-[build-dependencies]
-tonic-build = "0.12"
-# Fallback protoc for machines without a system install (see build.rs); keeps
-# `cargo clippy/check/build` and lint CI working without apt/brew protobuf.
-protoc-bin-vendored = "3"
 
 [features]
 default = ["pyo3/extension-module"]
