@@ -3,4 +3,6 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../../rust"
-timeout 300 cargo test --workspace
+# The tests themselves take ~1s; the ceiling covers a cold cargo cache, which
+# codegens the whole dependency graph first (clippy only leaves metadata).
+timeout 900 cargo test --workspace

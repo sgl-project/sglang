@@ -83,7 +83,6 @@ jobs:
             rust
             python/setup.py
             .github
-            scripts/ci/run_rust_workspace_tests.sh
             scripts/ci/utils
           sparse-checkout-cone-mode: false
 
@@ -94,16 +93,16 @@ jobs:
       - name: Ensure zstd so the saved entry is readable
         run: bash scripts/ci/utils/ensure_zstd.sh
 
-      # setup.py selects which crates get built; the workspace test script is
-      # part of the gate represented by a successful cache entry.
+      # setup.py counts because it selects which crates get built. pyproject.toml
+      # is left out - it churns on bumps that cannot affect these modules.
       - name: Restore built modules
         id: cache
         uses: actions/cache/restore@v4
         with:
           path: python/sglang/srt/*/_core*.so
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py', 'scripts/ci/run_rust_workspace_tests.sh') }}
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
 
-      # On a miss: an input changed or the matching entry was evicted.
+      # On a miss: different hash = rust/setup.py moved; no entries = evicted.
       - name: Report cache lookup
         env:
           GH_TOKEN: ${{ github.token }}
@@ -200,7 +199,6 @@ jobs:
           # Best-effort, like ci_cleanup_venv.sh: under set -e a failing EXIT trap
           # would fail the step, and nothing here is worth keeping for a postmortem.
           trap 'rm -rf "${venv_root}" || true' EXIT
-          workspace_tested=0
           for python_bin in "${{ steps.py310.outputs.python-path }}" "${{ steps.py312.outputs.python-path }}"; do
               minor="$("${python_bin}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
               export CARGO_TARGET_DIR="${cargo_target_root}/py${minor}"
@@ -210,19 +208,8 @@ jobs:
               source "${venv}/bin/activate"
               uv pip install "setuptools>=61.0" "setuptools-rust>=1.10" "setuptools-scm>=8.0" wheel
               (cd python && SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace)
-              # Run once while PyO3's interpreter and target fingerprints match.
-              if [ "${minor}" = "3.12" ]; then
-                  bash scripts/ci/run_rust_workspace_tests.sh
-                  workspace_tested=1
-              fi
               deactivate
           done
-          # A saved cache entry stands for "cargo test --workspace passed", so an
-          # interpreter bump that silently skips it must fail here instead.
-          if [ "${workspace_tested}" -ne 1 ]; then
-              echo "::error::no 3.12 interpreter in the build loop; cargo test --workspace never ran"
-              exit 1
-          fi
 
       - name: Verify modules and stage for upload
         env:
@@ -240,7 +227,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: python/sglang/srt/*/_core*.so
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py', 'scripts/ci/run_rust_workspace_tests.sh') }}
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
 
       - name: Upload extension modules
         uses: actions/upload-artifact@v4
