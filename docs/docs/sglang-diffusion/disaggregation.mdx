@@ -156,7 +156,7 @@ sglang serve --model-path ... --disagg-role server \
 ### GLM-Image AR-to-DiT fan-out
 
 GLM-Image can batch AR generation in the head and fan the resulting prior
-tokens out to terminal denoiser workers. Each terminal worker runs prompt/glyph
+tokens out to distributed denoiser workers. Each worker runs prompt/glyph
 preparation, DiT, and VAE decoding locally; no latent or embedding tensors are
 transferred.
 
@@ -164,7 +164,7 @@ The following 16-device deployment uses devices 0-1 for the external AR server
 and devices 2-15 for 14 independent batch-1 Cache-DiT denoisers.
 
 ```bash
-# Run 14 terminal denoisers
+# Run 14 distributed denoisers
 DISAGG_SERVER="tcp://127.0.0.1:19655"
 MODEL_PATH="zai-org/GLM-Image"
 BASE_MASTER_PORT=29005

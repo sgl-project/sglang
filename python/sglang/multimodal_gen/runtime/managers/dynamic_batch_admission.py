@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Compatibility and admission control for native diffusion batching.
+"""Admission control for native diffusion batching.
 
 Native diffusion batching is model, resolution, device, and implementation
 dependent. The scheduler treats `--batching-max-size` as the public ceiling;
@@ -9,7 +9,6 @@ combinations.
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 from dataclasses import dataclass
@@ -41,74 +40,6 @@ _BATCHING_RULE_KEYS = frozenset(
         "calibration",
     }
 )
-
-
-def _get_dynamic_batch_signature(
-    req: Req, *, exclude_num_outputs_per_prompt: bool
-) -> tuple[Any, ...] | None:
-    sampling_params = req.sampling_params
-    if sampling_params is None:
-        return None
-    try:
-        sampling_signature = json.dumps(
-            {
-                field.name: getattr(sampling_params, field.name, None)
-                for field in dataclasses.fields(sampling_params)
-                if not field.metadata.get("batch_sig_exclude", False)
-                and not (
-                    exclude_num_outputs_per_prompt
-                    and field.name == "num_outputs_per_prompt"
-                )
-            },
-            sort_keys=True,
-            default=repr,
-        )
-    except TypeError:
-        return None
-    profile = (
-        (True, req.profile_all_stages, req.num_profiled_timesteps)
-        if req.profile
-        else (False,)
-    )
-    diffusers_kwargs = json.dumps(
-        (req.extra or {}).get("diffusers_kwargs") or None,
-        sort_keys=True,
-        default=repr,
-    )
-    return sampling_signature, profile, diffusers_kwargs
-
-
-def are_requests_batch_compatible(
-    base_req: Req,
-    candidate_req: Req,
-    *,
-    exclude_num_outputs_per_prompt: bool = False,
-) -> bool:
-    def eligible(req: Req) -> bool:
-        return (
-            not req.is_warmup
-            and not req.realtime_session_id
-            and req.session is None
-            and isinstance(req.prompt, str)
-            and getattr(req, "image_path", None) is None
-        )
-
-    if (
-        not eligible(base_req)
-        or not eligible(candidate_req)
-        or base_req.return_file_paths_only != candidate_req.return_file_paths_only
-    ):
-        return False
-
-    base_signature = _get_dynamic_batch_signature(
-        base_req,
-        exclude_num_outputs_per_prompt=exclude_num_outputs_per_prompt,
-    )
-    candidate_signature = _get_dynamic_batch_signature(
-        candidate_req,
-        exclude_num_outputs_per_prompt=exclude_num_outputs_per_prompt,
-    )
-    return base_signature is not None and base_signature == candidate_signature
 
 
 @dataclass(frozen=True)

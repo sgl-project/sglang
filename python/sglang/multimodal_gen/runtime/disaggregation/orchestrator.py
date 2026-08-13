@@ -37,9 +37,6 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     encode_transfer_msg,
     is_transfer_message,
 )
-from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
-    are_requests_batch_compatible,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 
@@ -502,10 +499,9 @@ class DiffusionServer:
             if output_slots >= self._glm_batch_max_size:
                 break
             candidate = self._glm_ar_queue[index]
-            if are_requests_batch_compatible(
-                base.req,
-                candidate.req,
-                exclude_num_outputs_per_prompt=self._server_args.pipeline_config.supports_sequential_dit_inference(),
+            if (base.req.height, base.req.width) == (
+                candidate.req.height,
+                candidate.req.width,
             ):
                 candidate_outputs = max(
                     1, int(candidate.req.num_outputs_per_prompt or 1)
