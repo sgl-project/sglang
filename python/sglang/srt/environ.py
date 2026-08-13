@@ -819,7 +819,7 @@ class Envs:
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
 
     # Unified radix cache
-    SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(False)
+    SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
 
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
