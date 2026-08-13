@@ -23,7 +23,7 @@ class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
     consumed by the Rust worker pool (as the typed extension ``MmSpec``, see
     :meth:`RustServer._build_mm_spec`), the ``_multimodal`` parity API
     (:meth:`rust_json`) and the drain adapter
-    (:meth:`RustMmProcessor.build_output`)."""
+    (:meth:`RustMmProcessor.wrap_encoded`)."""
 
     family: str
     feature_shm: bool
@@ -119,7 +119,7 @@ class RustMmProcessor:
     TokenizerManager would build — not to process requests (the Rust worker pool
     does that, GIL-free) but as the source of truth
     :meth:`resolve_spec` resolves the pipeline parameters from. At drain
-    time :meth:`build_output` wraps the Rust-produced buffers into the
+    time :meth:`wrap_encoded` wraps the Rust-produced buffers into the
     scheduler's ``MultimodalProcessorOutput``.
 
     There is no Python fallback: a model without a Rust MM spec fails at launch,
@@ -247,7 +247,7 @@ class RustMmProcessor:
         )
 
     @staticmethod
-    def build_output(spec: RustMmSpec, encoded):
+    def wrap_encoded(spec: RustMmSpec, encoded):
         """Drain-time adapter: wrap the Rust-produced buffers of one
         ``MmEncodedResult`` into the scheduler's ``MultimodalProcessorOutput``.
         Wrapping only — load, resize, patchify, token expansion and M-RoPE all

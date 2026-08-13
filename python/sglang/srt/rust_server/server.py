@@ -211,7 +211,7 @@ class RustServer:
                 # multimodal model.
                 encoded = self.server.take_mm_result(obj.rid)
                 if encoded is not None:
-                    obj.mm_inputs = RustMmProcessor.build_output(self.mm_spec, encoded)
+                    obj.mm_inputs = RustMmProcessor.wrap_encoded(self.mm_spec, encoded)
             out.append(obj)
         return out
 

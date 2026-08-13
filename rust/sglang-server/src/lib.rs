@@ -29,7 +29,7 @@ use crate::utils::startup::{listen_addr, value_error};
 use crate::utils::{logging, runtime};
 
 /// One drained MM result (see [`Server::take_mm_result`]), consumed by
-/// `RustMmProcessor.build_output` to build the scheduler's
+/// `RustMmProcessor.wrap_encoded` to build the scheduler's
 /// `MultimodalProcessorOutput`.
 #[pyclass(frozen, get_all)]
 struct MmEncodedResult {
