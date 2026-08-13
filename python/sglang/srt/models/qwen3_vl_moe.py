@@ -31,6 +31,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeModel
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,10 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        # Use HF deepstack order only if rl_on_policy_target is set; 
+        # otherwise, retain original order for inference accuracy.
+        use_hf_deepstack_order = get_global_server_args().rl_on_policy_target is not None
+
         aux_hidden_states = []
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
@@ -104,25 +109,43 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                     hidden_states + residual if residual is not None else hidden_states
                 )
 
-            # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
-            # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
-            # To match HF behavior, deepstack must be added AFTER residual: (hidden_states + residual) + deepstack
-            # The order matters because addition with different tensors is not associative in practice.
-            # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
-            deepstack_embeds = self.get_deepstack_embeds(
-                layer_idx - 1, input_deepstack_embeds
-            )
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-                post_residual_addition=deepstack_embeds,
-            )
+            if use_hf_deepstack_order:
+                # HF-order path (RL on-policy / FSDP). SGLang applies residual at the START of the
+                # next layer, so to match HF's (hidden_states + residual) + deepstack, deepstack for
+                # the previous layer is added after residual via post_residual_addition.
+                deepstack_embeds = self.get_deepstack_embeds(
+                    layer_idx - 1, input_deepstack_embeds
+                )
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    post_residual_addition=deepstack_embeds,
+                )
+            else:
+                # Inference path: add deepstack directly to hidden_states at the end of the layer
+                # (original, grounding-correct order).
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                )
+                if (
+                    input_deepstack_embeds is not None
+                    and layer_idx in self.deepstack_embed_to_decoder_layer
+                ):
+                    sep = self.hidden_size * layer_idx
+                    hidden_states.add_(
+                        input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                    )
 
-        # Handle deepstack for the last processed layer if it exists.
-        last_deepstack = self.get_deepstack_embeds(
-            self.end_layer - 1, input_deepstack_embeds
+        # Handle deepstack for the last processed layer (HF-order path only).
+        last_deepstack = (
+            self.get_deepstack_embeds(self.end_layer - 1, input_deepstack_embeds)
+            if use_hf_deepstack_order
+            else None
         )
 
         if not self.pp_group.is_last_rank:
