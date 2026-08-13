@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.mem_cache.index_alias_guard import aliases_req_to_token
+from sglang.srt.mem_cache.index_ownership import aliases_req_to_token
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
