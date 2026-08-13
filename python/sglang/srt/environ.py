@@ -1277,6 +1277,9 @@ class Envs:
     # "cuda" = the hand-written SM90 WGMMA kernel (bitwise identical to the
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
+    # Fused indexer top-k (LiteTopk, SM100 only): prefill scoring + top-k in
+    # one pass, never materializing the [num_q, seq_len] logits. Opt-in.
+    SGLANG_ENABLE_DSA_LITETOPK = EnvBool(False)
     # ====================================================================
 
     # ====================================================================
