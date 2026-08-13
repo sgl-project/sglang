@@ -40,11 +40,18 @@ def _fake_mori_modules():
     }
 
 
-with patch.dict(sys.modules, _fake_mori_modules()):
+_fake_modules = _fake_mori_modules()
+sys.modules.update(_fake_modules)
+try:
     from sglang.srt.disaggregation.common.conn import CommonKVManager
+    from sglang.srt.disaggregation.mori import conn as mori_conn
     from sglang.srt.disaggregation.mori.conn import MoriKVManager
     from sglang.srt.disaggregation.utils import DisaggregationMode
     from sglang.test.ci.ci_register import register_cpu_ci
+finally:
+    for name, module in _fake_modules.items():
+        if sys.modules.get(name) is module:
+            del sys.modules[name]
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -64,7 +71,7 @@ class TestMoriKVManager(unittest.TestCase):
             patch.object(
                 MoriKVManager, "_start_heartbeat_checker_thread"
             ) as start_heartbeat,
-            patch("sglang.srt.disaggregation.mori.conn.zmq.Context"),
+            patch.object(mori_conn.zmq, "Context"),
         ):
             lifecycle.attach_mock(start_decode, "decode")
             lifecycle.attach_mock(start_heartbeat, "heartbeat")
