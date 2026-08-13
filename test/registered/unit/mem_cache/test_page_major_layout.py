@@ -96,6 +96,25 @@ class TestPageMajorMHAViews(unittest.TestCase):
         self.assertEqual(tuple(k[0].shape), (3, 1, 2, 6))
         self.assertEqual(tuple(v[0].shape), (3, 1, 2, 4))
 
+    def test_short_buffer_fails_at_construction(self):
+        """A buffer one page short must fail loudly instead of building a view
+        whose last page envelope runs past the end of the buffer."""
+        entry = mha_entry_bytes(
+            layer_num=2, head_num=2, head_dim=4, v_head_dim=4, itemsize=_DT.itemsize
+        )
+        raw = torch.zeros(2 * entry, dtype=torch.uint8, device=_DEV)
+        with self.assertRaises(AssertionError):
+            build_page_major_mha_views(
+                raw,
+                layer_num=2,
+                head_num=2,
+                head_dim=4,
+                v_head_dim=4,
+                store_dtype=_DT,
+                page_size=1,
+                num_pages=3,
+            )
+
 
 class TestPageMajorMove(unittest.TestCase):
     def test_move_ps1(self):

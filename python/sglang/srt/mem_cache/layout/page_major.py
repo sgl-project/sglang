@@ -70,6 +70,12 @@ def build_page_major_mha_views(
     assert k_row_bytes % itemsize == 0
     assert v_row_bytes % itemsize == 0
     assert page_bytes % itemsize == 0
+    envelope_end = anchor_bytes + num_pages * page_bytes
+    assert envelope_end <= raw.numel() * raw.itemsize, (
+        f"build_page_major_mha_views: {num_pages} page envelopes end at byte "
+        f"{envelope_end} but the raw buffer holds only "
+        f"{raw.numel() * raw.itemsize} bytes"
+    )
 
     as_dtype_view = raw.view(store_dtype)
     stride_page = page_bytes // itemsize
