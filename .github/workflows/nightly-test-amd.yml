@@ -1,4 +1,4 @@
-name: Nightly Test (AMD)
+name: Nightly Test (AMD ROCm 7.0)
 
 on:
   schedule:
