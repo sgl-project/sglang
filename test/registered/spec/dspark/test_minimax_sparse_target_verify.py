@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -204,3 +205,7 @@ def test_forward_batch_target_verify_geometry_trims_dp_padding():
     assert captured["verify_lens_cpu"] == [2, 0]
     assert output.shape == (4, 2)
     assert output[2:].tolist() == [[0.0, 0.0], [0.0, 0.0]]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
