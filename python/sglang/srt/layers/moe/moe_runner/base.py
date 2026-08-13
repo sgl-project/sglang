@@ -26,11 +26,16 @@ if TYPE_CHECKING:
     )
 
 
-def moe_output_buffer_ctx(buf: torch.Tensor):
-    """Provide the MoE output buffer for the current forward scope."""
+def moe_output_buffer_ctx(
+    buf: torch.Tensor, residual: Optional[torch.Tensor] = None
+):
+    """Provide MoE output and residual buffers for the current forward scope."""
     from sglang.srt.runtime_context import get_forward
 
-    return get_forward().scoped(moe_output_buffer=buf)
+    return get_forward().scoped(
+        moe_output_buffer=buf,
+        moe_residual_buffer=residual,
+    )
 
 
 @dataclass

@@ -11,7 +11,10 @@ from sglang.srt.layers.moe.moe_runner.aiter import (
     AiterRunnerCore,
     AiterRunnerInput,
 )
-from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.base import (
+    MoeRunnerConfig,
+    moe_output_buffer_ctx,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-c-test-cpu")
@@ -146,6 +149,124 @@ def test_aiter_runner_maps_minimax_gated_silu_to_clamped_swiglu(monkeypatch):
     assert captured["swiglu_limit"] == 7.0
     # EP1 has no expert mask and must use the raw 128-expert/top-k-4 lookup key.
     assert "has_fake_topk_slot" not in captured
+
+
+def test_aiter_runner_forwards_registered_output_and_residual(monkeypatch):
+    captured = {}
+
+    def fused_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["out"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+    output = torch.empty((1, 4), dtype=torch.bfloat16)
+    residual = torch.randn_like(output)
+
+    with moe_output_buffer_ctx(output, residual=residual):
+        result = runner.run(
+            _runner_input(),
+            _quant_info(),
+            running_state={},
+        )
+
+    assert captured["out"] is output
+    assert captured["residual"] is residual
+    assert result.hidden_states is output
+
+
+def test_minimax_moe_uses_registered_output_for_aiter_all_reduce(monkeypatch):
+    import sglang.srt.models.minimax_m3 as minimax_m3
+    from sglang.srt.runtime_context import get_forward
+
+    registered = torch.empty((1, 4), dtype=torch.bfloat16)
+
+    class FakeCommunicator:
+        disabled = False
+
+        def moe_out_registered_buffer(self, num_tokens, hidden_dim, dtype):
+            assert (num_tokens, hidden_dim, dtype) == (1, 4, torch.bfloat16)
+            return registered
+
+        def custom_fused_moe_out_all_reduce(self, value):
+            assert value is registered
+            return value + 1
+
+    class FakeExperts:
+        def __call__(self, hidden_states, topk_output):
+            output = get_forward().moe_output_buffer
+            residual = get_forward().moe_residual_buffer
+            assert output is registered
+            output.copy_(hidden_states)
+            output.add_(residual)
+            return output
+
+    monkeypatch.setattr(
+        minimax_m3,
+        "get_moe_runner_backend",
+        lambda: SimpleNamespace(is_aiter=lambda: True),
+    )
+    monkeypatch.setattr(
+        minimax_m3,
+        "get_server_args",
+        lambda: SimpleNamespace(enable_fused_moe_sum_all_reduce=True),
+    )
+    monkeypatch.setattr(
+        minimax_m3,
+        "get_tp_group",
+        lambda: SimpleNamespace(ca_comm=FakeCommunicator()),
+    )
+
+    moe = minimax_m3.MiniMaxM3MoE.__new__(minimax_m3.MiniMaxM3MoE)
+    torch.nn.Module.__init__(moe)
+    moe.tp_size = 4
+    moe.hidden_size = 4
+    moe.experts = FakeExperts()
+    hidden_states = torch.ones((1, 4), dtype=torch.bfloat16)
+    shared_output = torch.full_like(hidden_states, 2)
+
+    result = moe._try_fused_moe_registered_all_reduce(
+        hidden_states,
+        topk_output=object(),
+        shared_output=shared_output,
+        should_allreduce_fusion=False,
+        use_reduce_scatter=False,
+    )
+
+    assert torch.equal(result, torch.full_like(hidden_states, 4))
+
+
+def test_minimax_moe_rejects_unpaired_aiter_all_reduce(monkeypatch):
+    import sglang.srt.models.minimax_m3 as minimax_m3
+
+    monkeypatch.setattr(
+        minimax_m3,
+        "get_moe_runner_backend",
+        lambda: SimpleNamespace(is_aiter=lambda: True),
+    )
+    monkeypatch.setattr(
+        minimax_m3,
+        "get_server_args",
+        lambda: SimpleNamespace(enable_fused_moe_sum_all_reduce=True),
+    )
+    monkeypatch.setattr(
+        minimax_m3,
+        "get_tp_group",
+        lambda: SimpleNamespace(ca_comm=SimpleNamespace(disabled=False)),
+    )
+
+    moe = minimax_m3.MiniMaxM3MoE.__new__(minimax_m3.MiniMaxM3MoE)
+    torch.nn.Module.__init__(moe)
+    moe.tp_size = 4
+
+    with pytest.raises(RuntimeError, match="paired AITER.*missing"):
+        moe._try_fused_moe_registered_all_reduce(
+            torch.ones((1, 4), dtype=torch.bfloat16),
+            topk_output=object(),
+            shared_output=None,
+            should_allreduce_fusion=False,
+            use_reduce_scatter=False,
+        )
 
 
 def test_mxfp8_aiter_quant_info_uses_per_1x32(monkeypatch):

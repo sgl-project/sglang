@@ -857,10 +857,13 @@ class TestForwardFlags(_IsolatedServerArgs):
         from sglang.srt.runtime_context import get_forward
 
         reset_context()
-        sentinel = object()
-        with moe_output_buffer_ctx(sentinel):
-            self.assertIs(get_forward().moe_output_buffer, sentinel)
+        output = object()
+        residual = object()
+        with moe_output_buffer_ctx(output, residual=residual):
+            self.assertIs(get_forward().moe_output_buffer, output)
+            self.assertIs(get_forward().moe_residual_buffer, residual)
         self.assertIsNone(get_forward().moe_output_buffer)
+        self.assertIsNone(get_forward().moe_residual_buffer)
 
     def test_mlp_comm_forward_flags(self):
         """Decoder-published MLP collective flags: scoped restore + skip helpers."""

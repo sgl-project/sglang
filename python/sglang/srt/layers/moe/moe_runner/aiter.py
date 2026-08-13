@@ -18,6 +18,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.runtime_context import get_forward
 from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
 if TYPE_CHECKING:
@@ -218,6 +219,12 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["swiglu_limit"] = effective_swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
+        else:
+            forward_flags = get_forward()
+            if forward_flags.moe_output_buffer is not None:
+                extra["out"] = forward_flags.moe_output_buffer
+            if forward_flags.moe_residual_buffer is not None:
+                extra["residual"] = forward_flags.moe_residual_buffer
         if quant_info.expert_mask is not None:
             # Standard SGLang EP keeps exactly the routed top-k columns and
             # masks non-local experts separately; it does not append AITER's

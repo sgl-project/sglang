@@ -30,6 +30,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed import (
     get_pp_group,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.environ import envs
@@ -53,8 +54,9 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -284,6 +286,7 @@ class MiniMaxM3MoE(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
+        self.hidden_size = config.hidden_size
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
         self.num_fused_shared_experts = (
             0
@@ -387,6 +390,64 @@ class MiniMaxM3MoE(nn.Module):
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
             )
 
+    def _try_fused_moe_registered_all_reduce(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output,
+        shared_output: Optional[torch.Tensor],
+        should_allreduce_fusion: bool,
+        use_reduce_scatter: bool,
+    ) -> Optional[torch.Tensor]:
+        """Write AITER MoE output directly into custom-AR registered storage."""
+        if (
+            self.tp_size <= 1
+            or should_allreduce_fusion
+            or use_reduce_scatter
+            or not get_server_args().enable_fused_moe_sum_all_reduce
+            or not get_moe_runner_backend().is_aiter()
+        ):
+            return None
+
+        communicator = get_tp_group().ca_comm
+        required_apis = (
+            "moe_out_registered_buffer",
+            "custom_fused_moe_out_all_reduce",
+        )
+        missing_apis = [
+            name
+            for name in required_apis
+            if communicator is None or not callable(getattr(communicator, name, None))
+        ]
+        if missing_apis:
+            raise RuntimeError(
+                "enable_fused_moe_sum_all_reduce requires the paired AITER "
+                "custom-all-reduce communicator APIs; missing: "
+                + ", ".join(missing_apis)
+            )
+        if getattr(communicator, "disabled", True):
+            raise RuntimeError(
+                "enable_fused_moe_sum_all_reduce requires an enabled AITER "
+                "custom-all-reduce communicator"
+            )
+
+        registered = communicator.moe_out_registered_buffer(
+            hidden_states.shape[0], self.hidden_size, hidden_states.dtype
+        )
+        if registered is None:
+            return None
+
+        with moe_output_buffer_ctx(registered, residual=shared_output):
+            combined = self.experts(hidden_states, topk_output)
+        if combined.data_ptr() != registered.data_ptr():
+            raise RuntimeError(
+                "AITER fused_moe did not honor the registered output buffer"
+            )
+
+        reduced = communicator.custom_fused_moe_out_all_reduce(registered)
+        if reduced is not None:
+            return reduced
+        return tensor_model_parallel_all_reduce(combined)
+
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
@@ -400,6 +461,16 @@ class MiniMaxM3MoE(nn.Module):
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        fused_output = self._try_fused_moe_registered_all_reduce(
+            hidden_states,
+            topk_output,
+            shared_output,
+            should_allreduce_fusion,
+            use_reduce_scatter,
+        )
+        if fused_output is not None:
+            return fused_output
 
         final_hidden_states = self.experts(hidden_states, topk_output)
 
