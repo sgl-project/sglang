@@ -87,6 +87,16 @@ from sglang.srt.utils import (
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
 
+# The split path saves bandwidth only once the local query shard is large
+# enough to amortize its extra launch. Keep capability-specific entries so a
+# future Blackwell variant is not silently enabled with an unmeasured cutoff.
+_TRTLLM_SPLIT_ROPE_QUANTIZE_MIN_TOKENS_BY_CAPABILITY = {
+    # Keep the intended DP8 chunk size on B200 until its crossover is measured
+    # directly; B300 was benchmarked down to the 4K boundary below.
+    (10, 0): 8192,  # B200 / SM100
+    (10, 3): 4096,  # B300 / SM103
+}
+
 if is_cuda():
     import deep_gemm
 
@@ -405,9 +415,6 @@ class DeepseekSparseAttnBackend(
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-        self._trtllm_split_rope_quantize = (
-            envs.SGLANG_ENABLE_DSA_TRTLLM_SPLIT_ROPE_QUANTIZE.get()
-        )
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
@@ -3109,6 +3116,37 @@ class DeepseekSparseAttnBackend(
 
         return o
 
+    def _should_use_trtllm_split_rope_quantize(
+        self,
+        q: torch.Tensor,
+        q_rope: torch.Tensor,
+        forward_mode: ForwardMode,
+        is_prefill: bool,
+    ) -> bool:
+        min_tokens = _TRTLLM_SPLIT_ROPE_QUANTIZE_MIN_TOKENS_BY_CAPABILITY.get(
+            self.device_capability
+        )
+        return bool(
+            is_prefill
+            # MIXED takes the same forward-extend path as ordinary prefill.
+            # Keep speculative/dLLM/split-prefill modes on the default kernel
+            # until their launch shapes are benchmarked independently.
+            and forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and min_tokens is not None
+            and q.ndim == 3
+            and q_rope.ndim == 3
+            # This is the local row count after DP/CP sharding: it is the work
+            # size seen by both quantization kernels and therefore the relevant
+            # crossover, rather than the global prompt length.
+            and q.shape[0] >= min_tokens
+            and self.kv_lora_rank == 512
+            and self.qk_rope_head_dim == 64
+            and q.shape[1] == 64
+            and q.shape[-1] == self.kv_lora_rank
+            and q_rope.shape[:2] == q.shape[:2]
+            and q_rope.shape[-1] == self.qk_rope_head_dim
+        )
+
     def _forward_trtllm(
         self,
         q: torch.Tensor,
@@ -3155,19 +3193,11 @@ class DeepseekSparseAttnBackend(
 
             quantize_and_rope = (
                 mla_split_quantize_and_rope_for_fp8
-                if (
-                    self._trtllm_split_rope_quantize
-                    and is_prefill
-                    and forward_batch.forward_mode == ForwardMode.EXTEND
-                    and self.device_sm_major == 10
-                    and self.kv_lora_rank == 512
-                    and self.qk_rope_head_dim == 64
-                    # The split is correct for other head counts, but it only
-                    # outperformed the fused path at the measured 64-head
-                    # DP-attention shape on SM100.
-                    and q.shape[1] == 64
-                    and q.shape[-1] == self.kv_lora_rank
-                    and q_rope.shape[-1] == self.qk_rope_head_dim
+                if self._should_use_trtllm_split_rope_quantize(
+                    q,
+                    q_rope,
+                    forward_batch.forward_mode,
+                    is_prefill,
                 )
                 else mla_quantize_and_rope_for_fp8
             )

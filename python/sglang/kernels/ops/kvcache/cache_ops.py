@@ -323,69 +323,112 @@ def concat_and_cast_q_fp8_pad(q_fp8_pad, q_nope, q_rope, num_heads):
 
 
 @triton.jit
-def cast_q_nope_to_fp8_kernel(
+def cast_qk_nope_to_fp8_kernel(
     q_fp8_ptr,  # [num_tokens, H, NOPE+ROPE] fp8 (dst; nope prefix only)
     q_nope_ptr,  # [num_tokens, H, NOPE] bf16
+    k_fp8_ptr,  # [num_tokens, NOPE] fp8
+    k_nope_ptr,  # [num_tokens, NOPE] bf16
     q_fp8_s0,
     q_fp8_s1,
     q_nope_s0,
     q_nope_s1,
+    k_fp8_s0,
+    k_nope_s0,
     H: tl.constexpr,
     NOPE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_NOPE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
-    """Cast q-nope into an FP8 query prefix without touching its RoPE tail."""
+    """Cast Q/K no-RoPE components to FP8 in one program per token."""
     token = tl.program_id(0)
     head = tl.arange(0, BLOCK_H)
     col = tl.arange(0, BLOCK_NOPE)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     mask = (head[:, None] < H) & (col[None, :] < NOPE)
     value = tl.load(
-        q_nope_ptr
-        + token * q_nope_s0
-        + head[:, None] * q_nope_s1
-        + col[None, :],
+        q_nope_ptr + token * q_nope_s0 + head[:, None] * q_nope_s1 + col[None, :],
         mask=mask,
     )
     tl.store(
-        q_fp8_ptr
-        + token * q_fp8_s0
-        + head[:, None] * q_fp8_s1
-        + col[None, :],
+        q_fp8_ptr + token * q_fp8_s0 + head[:, None] * q_fp8_s1 + col[None, :],
         value,
         mask=mask,
     )
 
+    # The Q tile is 64x512 at the production shape. Reuse this CTA for the
+    # single 512-wide K row so the split path does not need a third launch.
+    k_mask = col < NOPE
+    k_value = tl.load(
+        k_nope_ptr + token * k_nope_s0 + col,
+        mask=k_mask,
+    )
+    tl.store(
+        k_fp8_ptr + token * k_fp8_s0 + col,
+        k_value,
+        mask=k_mask,
+    )
 
-def cast_q_nope_to_fp8(q_fp8: torch.Tensor, q_nope: torch.Tensor) -> None:
-    """Cast ``q_nope`` into ``q_fp8[..., :q_nope.shape[-1]]``.
+    # Keep the trigger after both output stores: the following RoPE kernel can
+    # in turn trigger a consumer that reads k_fp8.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
-    The destination may reserve a tail for a separate RoPE kernel. Both source
-    and destination may use arbitrary token/head strides, but their feature
-    dimensions must be contiguous.
+
+def cast_qk_nope_to_fp8(
+    q_fp8: torch.Tensor,
+    q_nope: torch.Tensor,
+    k_fp8: torch.Tensor,
+    k_nope: torch.Tensor,
+    *,
+    enable_pdl: bool = False,
+) -> None:
+    """Cast Q/K no-RoPE components into their FP8 destinations.
+
+    ``q_fp8`` may reserve a tail for a separate RoPE kernel. Sources and
+    destinations may use arbitrary outer strides, but their feature dimensions
+    must be contiguous.
     """
+    assert q_fp8.ndim == q_nope.ndim == 3
+    assert k_fp8.ndim == k_nope.ndim == 2
     num_tokens, num_heads, nope_dim = q_nope.shape
+    assert num_heads > 0 and nope_dim > 0
     assert q_fp8.shape[:2] == (num_tokens, num_heads)
     assert q_fp8.shape[-1] >= nope_dim
-    assert q_fp8.dtype == torch.float8_e4m3fn
+    assert k_nope.shape == (num_tokens, nope_dim)
+    assert k_fp8.shape == k_nope.shape
+    assert q_fp8.dtype == k_fp8.dtype == torch.float8_e4m3fn
+    assert q_nope.dtype == k_nope.dtype
     assert q_nope.dtype in (torch.float16, torch.bfloat16)
+    assert q_fp8.device == q_nope.device == k_fp8.device == k_nope.device
     assert q_fp8.stride(-1) == q_nope.stride(-1) == 1
+    assert k_fp8.stride(-1) == k_nope.stride(-1) == 1
     if num_tokens == 0:
         return
     block_h = triton.next_power_of_2(num_heads)
     block_nope = triton.next_power_of_2(nope_dim)
-    cast_q_nope_to_fp8_kernel[(num_tokens,)](
+    extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
+    cast_qk_nope_to_fp8_kernel[(num_tokens,)](
         q_fp8,
         q_nope,
+        k_fp8,
+        k_nope,
         q_fp8.stride(0),
         q_fp8.stride(1),
         q_nope.stride(0),
         q_nope.stride(1),
+        k_fp8.stride(0),
+        k_nope.stride(0),
         H=num_heads,
         NOPE=nope_dim,
         BLOCK_H=block_h,
         BLOCK_NOPE=block_nope,
+        ENABLE_PDL=enable_pdl,
         num_warps=8,
+        **extra_kwargs,
     )
 
 

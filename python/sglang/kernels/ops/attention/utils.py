@@ -16,7 +16,7 @@ from sglang.kernels.ops.attention.pad import (
     seqlens_expand_triton as seqlens_expand_triton,
 )
 from sglang.kernels.ops.kvcache.cache_ops import (
-    cast_q_nope_to_fp8 as cast_q_nope_to_fp8,
+    cast_qk_nope_to_fp8 as cast_qk_nope_to_fp8,
 )
 from sglang.kernels.ops.kvcache.cache_ops import (
     concat_and_cast_mha_k_kernel as concat_and_cast_mha_k_kernel,
@@ -198,9 +198,8 @@ def mla_split_quantize_and_rope_for_fp8(
 
     FlashInfer applies RoPE and writes the Q/K RoPE components directly to
     FP8, preserving the default path's FP32-to-FP8 rounding. A strided Triton
-    kernel writes only the q-nope prefix, while the much smaller k-nope uses a
-    regular converting copy. The returned tensors are byte-identical to
-    :func:`mla_quantize_and_rope_for_fp8`.
+    kernel writes the Q and K no-RoPE components in one launch. The returned
+    tensors are byte-identical to :func:`mla_quantize_and_rope_for_fp8`.
     """
     import flashinfer.rope
 
@@ -217,7 +216,14 @@ def mla_split_quantize_and_rope_for_fp8(
     k_rope_out = k_rope.new_empty(k_rope.shape, dtype=attn_dtype)
     k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
 
-    cast_q_nope_to_fp8(q_out, q_nope)
+    enable_pdl = is_arch_support_pdl()
+    cast_qk_nope_to_fp8(
+        q_out,
+        q_nope,
+        k_nope_out,
+        k_nope,
+        enable_pdl=enable_pdl,
+    )
     q_nope_empty = q_nope[..., :0]
     k_nope_empty = k_nope[..., :0]
     flashinfer.rope.rope_quantize_fp8(
@@ -235,9 +241,8 @@ def mla_split_quantize_and_rope_for_fp8(
         k_nope_out=k_nope_out[..., :0],
         quant_scale_q=1.0,
         quant_scale_kv=1.0,
-        enable_pdl=is_arch_support_pdl(),
+        enable_pdl=enable_pdl,
     )
-    k_nope_out.copy_(k_nope)
     return q_out, k_nope_out, k_rope_out
 
 
