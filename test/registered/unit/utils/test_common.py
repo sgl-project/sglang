@@ -1,3 +1,4 @@
+import os
 import unittest
 from array import array
 
@@ -7,6 +8,7 @@ from sglang.srt.utils.common import (
     flatten_arrays_to_int64_tensor,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
+    has_hf_quant_config,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -142,6 +144,47 @@ class TestGetDeviceSmNvidiaSmi(CustomTestCase):
             self.assertEqual(get_device_sm_nvidia_smi(), (0, 0))
         finally:
             subprocess.run = original
+
+
+class TestHasHfQuantConfig(CustomTestCase):
+    """`has_hf_quant_config` must answer local directories entirely from the
+    filesystem: `try_to_load_from_cache` validates its argument as a hub repo
+    id and raises HFValidationError on filesystem paths, so a local directory
+    without hf_quant_config.json used to crash instead of returning False
+    (hit by any local-dir speculative draft paired with a quantized target).
+    Runs on CPU.
+    """
+
+    def test_local_dir_with_config_returns_true(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as model_dir:
+            with open(os.path.join(model_dir, "hf_quant_config.json"), "w") as f:
+                json.dump({"quantization": {"quant_algo": "NVFP4"}}, f)
+            self.assertTrue(has_hf_quant_config(model_dir))
+
+    def test_local_dir_without_config_returns_false(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as model_dir:
+            self.assertFalse(has_hf_quant_config(model_dir))
+
+    def test_local_dir_never_reaches_hub_helpers(self):
+        import tempfile
+
+        import huggingface_hub
+
+        def boom(*args, **kwargs):
+            raise AssertionError("hub helper called for a local directory")
+
+        original = huggingface_hub.try_to_load_from_cache
+        huggingface_hub.try_to_load_from_cache = boom
+        try:
+            with tempfile.TemporaryDirectory() as model_dir:
+                self.assertFalse(has_hf_quant_config(model_dir))
+        finally:
+            huggingface_hub.try_to_load_from_cache = original
 
 
 if __name__ == "__main__":
