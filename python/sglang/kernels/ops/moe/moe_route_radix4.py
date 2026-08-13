@@ -30,6 +30,13 @@ _MAX_TOKENS = 1024
 logger = logging.getLogger(__name__)
 
 
+def _is_supported_cdna() -> bool:
+    if not is_hip_runtime() or not torch.cuda.is_available():
+        return False
+    gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+    return any(arch in gcn_arch for arch in ("gfx942", "gfx950"))
+
+
 @cache_once
 def _jit_route_radix4_module() -> Module:
     return load_jit(
@@ -45,7 +52,7 @@ def _jit_route_radix4_module() -> Module:
 @cache_once
 def available() -> bool:
     """CDNA only, and only if the kernel actually builds on this toolchain."""
-    if not is_hip_runtime():
+    if not _is_supported_cdna():
         return False
     try:
         _jit_route_radix4_module()
@@ -92,10 +99,15 @@ def route_radix4(
     """Returns (weights [M, topk] fp32, ids [M, topk] int32). Caller must have
     checked covered().
 
-    Matches aiter's contract: experts are ranked by sigmoid(score) + bias but the
-    emitted weight is the plain sigmoid, scaled by routed_scaling_factor and, when
-    renormalize is set, divided by the sum over the selected experts. Winners come
-    out unordered, which the MoE sorting stage downstream does not care about.
+    Experts are ranked by sigmoid(score) + bias but the emitted weight is the
+    plain sigmoid, scaled by routed_scaling_factor and, when renormalize is set,
+    divided by the sum over the selected experts. A NaN ranking value is floored
+    so it can never displace a finite expert, and experts that tie on the full
+    ranking value go to the lower expert id, same as the CUDA router. aiter
+    breaks those ties in its own wave64 traversal order, so on a tied row the two
+    can name different experts; both are a valid top-k and the weights agree.
+    Winners come out unordered, which the MoE sorting stage downstream does not
+    care about.
     """
     M = scores.shape[0]
     out_w = torch.empty((M, topk), dtype=torch.float32, device=scores.device)
