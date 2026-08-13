@@ -333,9 +333,12 @@ def get_replica_group() -> GroupCoordinator:
 
     Encoder-side collectives (batch data-parallel encode, replica-wide
     folding) must use this group rather than the world group, which spans
-    replicas when dp_size > 1."""
-    assert _REPLICA is not None, "replica group is not initialized"
-    return _REPLICA
+    replicas when dp_size > 1. A process that only initialized the world
+    group (component harnesses, single-process tools) has exactly one
+    replica by construction, so the world group doubles as it."""
+    if _REPLICA is not None:
+        return _REPLICA
+    return get_world_group()
 
 
 # xDiT
@@ -437,12 +440,18 @@ def initialize_model_parallel(
 
     global _REPLICA
     assert _REPLICA is None, "replica group is already initialized"
-    _REPLICA = init_parallel_group_coordinator(
-        group_ranks=rank_generator.get_ranks("tp-sp-pp-cfg"),
-        local_rank=get_world_group().local_rank,
-        backend=backend,
-        parallel_mode="replica",
-    )
+    if data_parallel_size == 1:
+        # one replica: the world group IS the replica group. Aliasing rather
+        # than building a duplicate coordinator keeps the common case free of
+        # an extra device communicator (and its GPU buffers).
+        _REPLICA = get_world_group()
+    else:
+        _REPLICA = init_parallel_group_coordinator(
+            group_ranks=rank_generator.get_ranks("tp-sp-pp-cfg"),
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="replica",
+        )
 
     global _CFG
     assert _CFG is None, "classifier_free_guidance group is already initialized"
@@ -954,7 +963,9 @@ def destroy_model_parallel() -> None:
     IPC_A2A.reset()
 
     for group in (_TP, _SP, _DP, _CFG, _PP, _REPLICA, _VAE_DECODE):
-        if group is not None:
+        # _REPLICA aliases the world group when dp_size == 1; the world group
+        # is destroyed by destroy_distributed_environment, not here
+        if group is not None and group is not _WORLD:
             group.destroy()
 
     # Ulysses and Ring groups are created separately from the SP coordinator,
