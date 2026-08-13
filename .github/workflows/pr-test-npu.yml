@@ -90,15 +90,27 @@ jobs:
           echo "CANN_image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
           echo "CANN_image_910b=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
 
-  base-a-test-1-npu-a2:
+  base-a-unit-test-1-npu-a2:
     needs: [check-changes, pr-gate, set-image-config]
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
-      self_name:  base-a-test-1-npu-a2
+      self_name:  base-a-unit-test-1-npu-a2
       runner_config: linux-aarch64-a2-1
       image: ${{ needs.set-image-config.outputs.CANN_image_910b }}
       npu_device_type: 910b
+      run_timeout_minutes: '15'
+    secrets: inherit
+
+  base-a-unit-test-1-npu-a3:
+    needs: [check-changes, pr-gate, set-image-config]
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    uses: ./.github/workflows/_npu-pr-test-stage.yml
+    with:
+      self_name: base-a-unit-test-1-npu-a3
+      runner_config: linux-aarch64-a3-2-
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+      npu_device_type: a3
       run_timeout_minutes: '15'
     secrets: inherit
 
@@ -387,7 +399,9 @@ jobs:
       [
         check-changes,
 
-        base-a-test-1-npu-a2,
+        base-a-unit-test-1-npu-a2,
+        base-a-unit-test-1-npu-a3,
+
         base-b-test-1-npu-a3,
         base-b-test-2-npu-a3,
         base-b-test-4-npu-a3,
