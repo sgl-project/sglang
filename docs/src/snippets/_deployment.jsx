@@ -1622,6 +1622,9 @@ export const Deployment = ({ config, benchmarks }) => {
     const verification = builderMeta.verification || {};
     const scopeIsVerified = (scope) => scopedDims(scope).every((dim) => {
       const option = (dim.options || []).find((entry) => entry.id === sel[dim.id]);
+      // A pick whose `soft` predicate is active is by definition outside the
+      // verified matrix — the scope badge must not keep reading Verified.
+      if (option && optionSoft(option, sel)) return false;
       const predicate = option?.verifiedWhen ?? dim.verifiedWhen;
       return typeof predicate === "function" ? !!predicate(sel) : predicate !== false;
     });
