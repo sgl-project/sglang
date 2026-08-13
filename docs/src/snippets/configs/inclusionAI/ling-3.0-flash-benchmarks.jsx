@@ -1,12 +1,9 @@
 // Ling-3.0-flash per-cell benchmark numbers, keyed by the same `match` tuple as
 // ling-3.0-flash.jsx cells. See _deployment.jsx for the speed/accuracy schema.
 //
-// Accuracy harness (one harness for the whole GSM8K column, per
-// config.benchmarkCommands.accuracy): sgl-eval run gsm8k, full 1319 questions,
-// --num-threads 32. Every filled entry below also recorded 100% stop /
-// 0% truncated / 0% error.
-//
-// Speed numbers are not measured yet — entries carry accuracy only.
+// Accuracy uses sgl-eval full GSM8K (1319 questions). Speed uses 80 exact-length
+// random requests (ISL 8192 / OSL 1024, --random-range-ratio 1, --flush-cache).
+// TTFT/TPOT are P50; tokens_per_sec_per_gpu is total (input + output) tok/s/GPU.
 //
 // Cells with no entry (H20-3e / H800 / H100, both quantizations) had no matching
 // allocation and were never gated.
@@ -39,6 +36,30 @@ export const benchmarks = [
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     sglang_version: "PR #33561 @ e57e030b",
     accuracy: { gsm8k_pct: 96.51 },
+  },
+  {
+    match: { hw: "h200", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "PR #33561 @ e1a24a18",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 205.96, tpot_ms: 3.68, tokens_per_sec_per_gpu: 1159 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 1891.74, tpot_ms: 8.16, tokens_per_sec_per_gpu: 7184 },
+    ],
+    accuracy: { gsm8k_pct: 95.30 },
+    notes: "Full GSM8K stop rate 100%; default decode CUDA Graph captured 32 shapes through batch 218.",
+  },
+  {
+    match: { hw: "h200", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "PR #33561 @ e1a24a18",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 305.23, tpot_ms: 6.05, tokens_per_sec_per_gpu: 709 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 2725.52, tpot_ms: 11.17, tokens_per_sec_per_gpu: 5215 },
+    ],
+    accuracy: { gsm8k_pct: 96.29 },
+    notes: "Full GSM8K stop rate 100%; default decode CUDA Graph captured 33 shapes through batch 227.",
   },
 
   // ====================================================================
@@ -76,6 +97,30 @@ export const benchmarks = [
     match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     sglang_version: "PR #33561 @ e57e030b",
     accuracy: { gsm8k_pct: 97.04 },
+  },
+  {
+    match: { hw: "b200", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "PR #33561 @ e1a24a18",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 641.41, tpot_ms: 8.72, tokens_per_sec_per_gpu: 482 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 6202.62, tpot_ms: 48.01, tokens_per_sec_per_gpu: 1344 },
+    ],
+    accuracy: { gsm8k_pct: 96.74 },
+    notes: "Full GSM8K stop rate 99.70%; default decode CUDA Graph captured 40 shapes through batch 305.",
+  },
+  {
+    match: { hw: "b200", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "PR #33561 @ e1a24a18",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 127.97, tpot_ms: 5.60, tokens_per_sec_per_gpu: 785 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 1117.16, tpot_ms: 7.98, tokens_per_sec_per_gpu: 7933 },
+    ],
+    accuracy: { gsm8k_pct: 96.29 },
+    notes: "Full GSM8K stop rate 99.62%; default decode CUDA Graph captured 40 shapes through batch 314.",
   },
 
   // ====================================================================

@@ -206,7 +206,12 @@ class BaseMultimodalProcessor(ABC):
         self.use_ipc_pool_handle_cache = (
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
-        self.disable_fast_image_processor = server_args.disable_fast_image_processor
+        self.image_processor_backend = getattr(
+            server_args, "image_processor_backend", "auto"
+        )
+        if getattr(server_args, "disable_fast_image_processor", False):
+            self.image_processor_backend = "pil"
+        self.disable_fast_image_processor = self.image_processor_backend == "pil"
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
 
         mm_process_config = self.server_args.mm_process_config
@@ -507,6 +512,22 @@ class BaseMultimodalProcessor(ABC):
             return "xpu"
         if not _is_npu:
             return f"cuda:{server_args.base_gpu_id}"
+        if processor.__class__.__name__ == "MiniMaxVLProcessor":
+            # MiniMax's image/video processors create 10-dim tensors during
+            # patch extraction, exceeding the Ascend 8-dim limit; patch them
+            # (same pattern as qwen-vl / GLM-4.6V) and run on NPU.
+            from sglang.srt.hardware_backend.npu.modules.minimax_m3_processor import (
+                npu_apply_minimax_m3_image_preprocess_patch,
+                npu_apply_minimax_m3_video_preprocess_patch,
+            )
+
+            npu_apply_minimax_m3_image_preprocess_patch(processor.image_processor)
+            if (
+                hasattr(processor, "video_processor")
+                and processor.video_processor is not None
+            ):
+                npu_apply_minimax_m3_video_preprocess_patch(processor.video_processor)
+            return "npu"
         if processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
             # For qwen-vl, the processor hits a reshape issue from the Ascend
             # dims restriction.

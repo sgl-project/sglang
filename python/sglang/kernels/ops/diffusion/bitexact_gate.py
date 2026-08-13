@@ -10,6 +10,54 @@ import torch
 
 T = TypeVar("T")
 EqualFn = Callable[[Any, Any], bool]
+DiagnosticHintFn = Callable[[], str | None]
+
+
+def flashinfer_rmsnorm_diagnostic_hint() -> str:
+    """Describe the live FlashInfer RMSNorm backend after an exactness miss.
+
+    Keep the imports and metadata lookups inside this function: callers pass it
+    as a callback, so none of this work runs on the verified steady-state path.
+    """
+    import importlib
+    import importlib.metadata
+    import os
+
+    try:
+        flashinfer_norm = importlib.import_module("flashinfer.norm")
+        use_cuda_norm = getattr(flashinfer_norm, "_USE_CUDA_NORM", None)
+    except Exception:
+        backend = "unavailable"
+    else:
+        if use_cuda_norm is True:
+            backend = "CUDA JIT"
+        elif use_cuda_norm is False:
+            backend = "CuTe DSL"
+        else:
+            backend = "legacy or unknown (no _USE_CUDA_NORM flag)"
+
+    versions = []
+    for package in (
+        "flashinfer-python",
+        "flashinfer-cubin",
+        "flashinfer-jit-cache",
+    ):
+        try:
+            package_version = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            package_version = "not installed"
+        except Exception:
+            package_version = "unknown"
+        versions.append(f"{package}={package_version}")
+
+    env_backend = os.environ.get("FLASHINFER_USE_CUDA_NORM", "<unset>")
+    return (
+        "RMSNorm exactness can change when FlashInfer selects a different "
+        f"reduction backend. Detected backend={backend}, "
+        f"FLASHINFER_USE_CUDA_NORM={env_backend}, {', '.join(versions)}. "
+        "Check that the FlashInfer packages are version-aligned and that the "
+        "expected RMSNorm backend is selected"
+    )
 
 
 class BitExactFusionGate:
@@ -91,6 +139,7 @@ class BitExactFusionGate:
         equal: EqualFn | None = None,
         logger: logging.Logger | None = None,
         mismatch_msg: str | None = None,
+        diagnostic_hint: DiagnosticHintFn | None = None,
     ) -> T:
         """Return ``out`` when bit-exact; otherwise disable and return ``ref``."""
         if self.is_verified(sig):
@@ -100,13 +149,23 @@ class BitExactFusionGate:
             self.mark_verified(sig)
             return out
         if logger is not None:
-            logger.warning_once(
-                mismatch_msg
-                or (
-                    f"{self.name} fast path is not bit-exact against this "
-                    "platform's reference dispatch; falling back to eager"
-                )
+            message = mismatch_msg or (
+                f"{self.name} fast path is not bit-exact against this "
+                "platform's reference dispatch; falling back to eager"
             )
+            details = (
+                "Correctness is preserved because the eager reference output "
+                "is used. A platform-specific reference kernel or reduction-order "
+                "change may have caused this fallback"
+            )
+            if diagnostic_hint is not None:
+                try:
+                    diagnostic_details = diagnostic_hint()
+                except Exception:
+                    diagnostic_details = None
+                if diagnostic_details:
+                    details = f"{details}. {diagnostic_details.rstrip('.')}"
+            logger.warning_once(f"{message.rstrip('.')}. {details}.")
         self.disable()
         return ref
 
