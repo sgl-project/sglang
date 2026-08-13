@@ -28,6 +28,30 @@ def _in_progress_response(request: ResponsesRequest) -> ResponsesResponse:
 
 
 class ResponsesRequestTestCase(CustomTestCase):
+    def test_deprecated_data_parallel_rank_migrates_to_routed_rank(self):
+        with self.assertWarns(DeprecationWarning):
+            request = ResponsesRequest(
+                model="x",
+                input="hi",
+                data_parallel_rank=3,
+                store=False,
+            )
+
+        self.assertEqual(request.routed_dp_rank, 3)
+        self.assertEqual(request.data_parallel_rank, 3)
+
+    def test_explicit_routed_rank_takes_precedence(self):
+        with self.assertWarns(DeprecationWarning):
+            request = ResponsesRequest(
+                model="x",
+                input="hi",
+                routed_dp_rank=5,
+                data_parallel_rank=3,
+                store=False,
+            )
+
+        self.assertEqual(request.routed_dp_rank, 5)
+
     def test_function_tool_accepted(self):
         request = ResponsesRequest(
             model="x",

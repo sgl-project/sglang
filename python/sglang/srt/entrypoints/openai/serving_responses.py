@@ -427,6 +427,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                         else {}
                     )
 
+                    # Preserve the external router's DP placement decision across
+                    # the Responses-to-GenerateReqInput conversion.
+                    effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
+                        raw_request, request.routed_dp_rank
+                    )
+
                     adapted_request = GenerateReqInput(
                         **prompt_kwargs,
                         **logprob_kwargs,
@@ -456,6 +462,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                         session_id=request.session_id,
                         extra_key=request.extra_key,
                         cache_salt=request.cache_salt,
+                        routed_dp_rank=effective_routed_dp_rank,
+                        disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
                         # background+stream streams on this connection, so don't detach.
                         background=request.background and not request.stream,
                         require_reasoning=require_reasoning,
@@ -2570,6 +2578,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 top_logprobs_num=adapted_request.top_logprobs_num,
                 return_text_in_logprobs=adapted_request.return_text_in_logprobs,
                 return_hidden_states=adapted_request.return_hidden_states,
+                routed_dp_rank=adapted_request.routed_dp_rank,
+                disagg_prefill_dp_rank=adapted_request.disagg_prefill_dp_rank,
                 background=adapted_request.background,
                 require_reasoning=adapted_request.require_reasoning,
             )

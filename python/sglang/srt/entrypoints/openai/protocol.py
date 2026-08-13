@@ -1550,6 +1550,13 @@ class ResponsesRequest(BaseModel):
         default=None, description="Cache salt for request caching"
     )
 
+    # For DP routing - external router assigns a specific DP worker.
+    routed_dp_rank: Optional[int] = None
+    # For PD disaggregation - hint telling decode which prefill DP worker has the KV cache.
+    disagg_prefill_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead. Kept for released gateway compatibility.
+    data_parallel_rank: Optional[int] = None
+
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
@@ -1610,6 +1617,11 @@ class ResponsesRequest(BaseModel):
             cls._normalize_input_item_for_validation(item) for item in input_value
         ]
         return values
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_dp_rank(cls, values):
+        return _migrate_deprecated_dp_rank(values)
 
     @staticmethod
     def _normalize_input_item_for_validation(item):
