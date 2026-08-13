@@ -704,6 +704,10 @@ class UnifiedRadixCache(BasePrefixCache):
             ).page_aligned(self.page_size)
             page_aligned_len = len(radix_key)
             values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
+            assert (
+                insert_params.mamba_value is None
+                or page_aligned_len == effective_cache_len
+            ), f"{page_aligned_len=}, {effective_cache_len=}, {req.mamba_last_track_seqlen=}"
 
             insert_params.key = radix_key
             insert_params.value = values
@@ -797,6 +801,9 @@ class UnifiedRadixCache(BasePrefixCache):
         ).page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
+        assert (
+            insert_params.mamba_value is None or page_aligned_len == effective_cache_len
+        ), f"{page_aligned_len=}, {effective_cache_len=}, {req.mamba_last_track_seqlen=}"
 
         insert_params.key = radix_key
         insert_params.value = values

@@ -218,7 +218,9 @@ class MambaComponent(TreeComponent):
         result: InsertResult,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
-        assert params.mamba_value is not None
+        if params.mamba_value is None:
+            result.mamba_exist = True
+            return
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
@@ -524,6 +526,10 @@ class MambaComponent(TreeComponent):
     ) -> Optional[int]:
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.mamba_last_track_seqlen
+            if cache_len is not None and cache_len % self.cache.page_size != 0:
+                if is_finished:
+                    return None
+                return cache_len - cache_len % self.cache.page_size
         else:
             cache_len = token_ids_len
             # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by the
