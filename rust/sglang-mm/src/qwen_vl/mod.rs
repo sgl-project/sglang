@@ -344,8 +344,9 @@ pub fn mrope_image_only(
 
 /// The qwen scheduler-drain shape, extracted from the generic driver
 /// [`Output`](crate::driver::Output). Shared by `sglang-server`'s MM worker
-/// and the parity binding so the mapping can't drift; replaced by a generic
-/// named-tensor handoff once a second family needs a different shape.
+/// and the parity binding so the mapping can't drift. TODO(mm-families):
+/// replace with a generic named-tensor handoff once a second family needs a
+/// different shape.
 pub struct QwenPackedOutput {
     pub input_ids: Vec<i32>,
     /// All items' `pixel_values`, concatenated in prompt order; flattened

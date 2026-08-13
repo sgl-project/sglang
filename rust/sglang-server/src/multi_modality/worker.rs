@@ -87,6 +87,9 @@ fn process(
         })?;
         tokenizer.encode(text).map_err(|error| error.to_string())
     })?;
+    // TODO(mm-families): the one family-specific call in this worker — dispatch
+    // on the spec's `family` (as `registry::build_pipeline` does) once a
+    // second family lands.
     let mut packed = sglang_mm::qwen_vl::pack_output(output)?;
     apply_caller_hashes(&mut packed.hashes, &caller_hashes);
     let features = if ctx.feature_shm {
