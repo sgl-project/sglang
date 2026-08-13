@@ -402,14 +402,7 @@ def _dcp_pack_a2a_send_kernel(
     WORDS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Scatter one (batch, head) partial into its peer's send slot.
-
-    Payload and LSE have independent destinations, so one kernel serves a
-    transport that wants them interleaved in a single buffer (pynccl
-    all_to_all_single, whose peer axis must be outermost) and one that wants
-    them in separate tensors with the peer axis inside (FlashInfer's
-    decode_cp_a2a_alltoall).
-    """
+    """Scatter one (batch, head) partial into its peer's send slot."""
     b = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1).to(tl.int64)
     peer = h // H_PER_RANK
@@ -445,12 +438,8 @@ def dcp_pack_a2a_send(
 ) -> None:
     """Scatter ``[B, H, D]`` partials + ``[B, H]`` LSE into a transport's send slots.
 
-    ``dst_o`` is ``[N, B_max, H // N, D]`` and ``dst_lse`` is ``[N, B_max, H // N]``
-    in *any* stride order, so a transport that wants the two interleaved in one
-    buffer and one that wants them separate are both just views. Rows beyond
-    ``B`` are left untouched.
-
-    Everything moves as fp32 words, so one kernel serves bf16/fp16/fp8 outputs.
+    ``dst_o`` is ``[N, B_max, H // N, D]`` and ``dst_lse`` ``[N, B_max, H // N]``,
+    in any stride order. Rows beyond ``B`` are left untouched.
     """
     B, H, D = cp_attn_out.shape
     N, B_max, H_per_rank = dst_lse.shape
@@ -466,7 +455,6 @@ def dcp_pack_a2a_send(
             f"match out {tuple(cp_attn_out.shape)}"
         )
 
-    # fp32-word views; the payload's last dim must be contiguous to reinterpret.
     out_words = cp_attn_out.view(torch.float32)
     dst_o_words = dst_o.view(torch.float32)
     words = D // lpd

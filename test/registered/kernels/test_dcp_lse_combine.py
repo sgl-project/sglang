@@ -507,8 +507,6 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
                 out = torch.randn(B, H, D, device=self.device, dtype=torch.bfloat16)
                 lse = torch.randn(B, H, device=self.device, dtype=torch.float32)
 
-                # FlashInfer's decode_cp_a2a_alltoall layout: payload and LSE in
-                # separate tensors with the peer axis inside the heads.
                 partial_o = torch.empty(
                     B, H_per_rank, N, D, dtype=torch.bfloat16, device=self.device
                 )

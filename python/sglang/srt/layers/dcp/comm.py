@@ -460,10 +460,8 @@ def _fi_a2a_send_buffers(
 ):
     """Persistent send tensors for the FlashInfer exchange, sliced to ``batch``.
 
-    The exchange does not write its inputs, so ``softmax_stats`` slots past the
-    LSE stay zero after the one-time allocation and only slot 0 is refreshed per
-    call. Buffers are grown on demand and never shrink, which also keeps their
-    addresses stable for graph capture.
+    The exchange does not write its inputs, so slots past the LSE stay zero
+    after the one-time allocation. Buffers grow on demand and never shrink.
     """
     key = (h_per_rank, cp_size, head_dim, dtype)
     cache = _FI_A2A_STATE["send_buffers"]
@@ -522,8 +520,6 @@ def dcp_a2a_lse_reduce(
         )
         recv_combined = torch.empty_like(send_combined)
 
-    # One buffer, two views: payload rows and the trailing fp32 LSE lane. Keeps
-    # the exchange to a single collective.
     send_words = send_combined.view(torch.float32)
     dcp_pack_a2a_send(
         cp_attn_out,
@@ -572,10 +568,6 @@ def _dcp_fi_a2a_lse_reduce(
     assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
     H_per_rank = H // N
 
-    # FlashInfer wants the peer axis inside the heads: partial_o
-    # [B, H_pr, cp_size, D] and softmax_stats [B, H_pr, cp_size, S>=2] with the
-    # LSE in lane 0. That is only a stride permutation of what the pack kernel
-    # already writes, so pack straight into it instead of permuting first.
     partial_o, softmax_stats = _fi_a2a_send_buffers(
         B, H_per_rank, N, D, cp_attn_out.dtype, cp_attn_out.device
     )
@@ -594,8 +586,6 @@ def _dcp_fi_a2a_lse_reduce(
         N,
     )
 
-    # The combine kernel takes strides, so the returned tensors are read in
-    # place: no contiguous() on either side.
     recv_output = o_out.permute(2, 0, 1, 3)
     recv_lse = stats_out[..., 0].permute(2, 0, 1)
 
