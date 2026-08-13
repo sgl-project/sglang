@@ -145,8 +145,8 @@ export const config = {
           id: "fsdp",
           label: "FSDP",
           flags: ["--performance-mode speed", "--use-fsdp-inference true"],
-          disabled: (s) => !["b200", "b300", "h200", "h100"].includes(s.hw) || s.nodes > 1,
-          disableReason: "FSDP is verified only on the listed single-node NVIDIA recipes.",
+          soft: (s) => !["b200", "b300", "h200", "h100"].includes(s.hw) || s.nodes > 1,
+          softReason: "Verified on single-node B200/B300/H200/H100. Other hardware and multi-node runs take the same flags but have not been through a verification round.",
           description: "Reduces resident DiT memory but adds parameter collectives on every block.",
         },
         {
@@ -159,8 +159,8 @@ export const config = {
             "--dit-layerwise-resident-layers 20",
             "--enable-torch-compile false",
           ],
-          disabled: (s) => s.hw !== "rtx5090",
-          disableReason: "The documented layerwise-offload operating point is verified on RTX 5090.",
+          soft: (s) => s.hw !== "rtx5090",
+          softReason: "Tuned and verified on RTX 5090. It runs on the datacenter GPUs too, where a resident recipe is simply faster.",
           recommendedWhen: (s) => s.hw === "rtx5090",
           description: "Capacity-first PCIe path. It is substantially slower than a resident datacenter recipe.",
         },
@@ -220,10 +220,10 @@ export const config = {
           id: "fp8",
           label: "Online FP8",
           flags: ["--quantization fp8"],
-          disabled: (s) => !["b200", "b300"].includes(s.hw)
+          soft: (s) => !["b200", "b300"].includes(s.hw)
             || !["auto", "resident"].includes(s.placement)
             || s.nodes !== 1,
-          disableReason: "Online FP8 is verified only for resident single-node B200/B300.",
+          softReason: "Verified for resident single-node B200/B300. Other hardware and placements take the same flag, but those recipes have not been verified yet.",
           description: "Approximate transformer weight quantization with the required H3 projections protected.",
         },
       ],
@@ -318,9 +318,11 @@ export const config = {
         {
           id: "high",
           label: "Audited high",
-          disabled: (s) => !(s.hw === "h200" && s.nodes === 1 && s.gpus_per_node === 4
-            && ["auto", "resident"].includes(s.placement) && s.execution === "eager"),
-          disableReason: "The high preset is audited only for the resident eager 4× H200 workload.",
+          disabled: (s) => s.execution !== "eager",
+          disableReason: "BCG supersedes Cache-DiT, so the preset would have no effect — switch Execution to Eager to use it.",
+          soft: (s) => !(s.hw === "h200" && s.nodes === 1 && s.gpus_per_node === 4
+            && ["auto", "resident"].includes(s.placement)),
+          softReason: "The 1.40× / SSIM 0.931 audit covers the resident eager 4× H200 workload; elsewhere the preset runs but its quality figures are unaudited.",
           description: "Measured 1.40× with SSIM 0.931 and PSNR 28.16 dB on the audited workload.",
         },
       ],
@@ -430,19 +432,23 @@ export const config = {
       const resolvedPlacement = s.placement === "auto"
         ? (automaticRecipe?.placement || (s.hw === "rtx5090" ? "offload" : "resident"))
         : s.placement;
+      const coverageWarnings = [];
       if (resolvedPlacement === "offload" && s.hw !== "rtx5090") {
-        errors.push("The H3 layerwise-offload recipe is verified only on RTX 5090.");
+        coverageWarnings.push("Layerwise offload is tuned and verified on RTX 5090; on this hardware it runs unverified and a resident recipe is faster.");
       }
       if (resolvedPlacement === "fsdp" && (s.nodes !== 1 || !["b200", "b300", "h200", "h100"].includes(s.hw))) {
-        errors.push("The documented H3 FSDP recipes require one NVIDIA datacenter node.");
+        coverageWarnings.push("FSDP outside the single-node NVIDIA recipes runs unverified.");
       }
       if (s.precision === "fp8" && (! ["b200", "b300"].includes(s.hw)
         || resolvedPlacement !== "resident" || s.nodes !== 1)) {
-        errors.push("Online FP8 is available only on resident single-node B200/B300.");
+        coverageWarnings.push("Online FP8 outside resident single-node B200/B300 runs unverified.");
       }
-      if (s.quality === "high" && !(s.hw === "h200" && s.nodes === 1
-        && s.gpus_per_node === 4 && resolvedPlacement === "resident" && s.execution === "eager")) {
-        errors.push("The audited high quality preset is restricted to resident eager 4× H200.");
+      const highAudited = s.hw === "h200" && s.nodes === 1
+        && s.gpus_per_node === 4 && resolvedPlacement === "resident";
+      if (s.quality === "high" && s.execution !== "eager") {
+        coverageWarnings.push("BCG supersedes Cache-DiT, so the high preset has no effect under this execution mode.");
+      } else if (s.quality === "high" && !highAudited) {
+        coverageWarnings.push("The high preset's 1.40× / SSIM 0.931 figures were audited on resident eager 4× H200; this workload is unaudited.");
       }
 
       const recipe = resource.verifiedRecipes.find((entry) => entry.hw === s.hw
@@ -463,7 +469,8 @@ export const config = {
         || (s.execution === "bcg" && ["b200", "h200"].includes(s.hw) && s.weights === "ref2va");
       const serveVerified = topologyVerified && encoderVerified && attentionVerified
         && precisionVerified && executionVerified;
-      const requestVerified = topologyVerified && (s.quality === "lossless" || s.quality === "high");
+      const requestVerified = topologyVerified && (s.quality === "lossless"
+        || (s.quality === "high" && highAudited && s.execution === "eager"));
 
       const topologyParts = [];
       if (topology.tp_size > 1) topologyParts.push(`TP ${topology.tp_size}`);
@@ -484,7 +491,7 @@ export const config = {
       if (topology.ring_degree > 1) flags.push(`--ring-degree ${topology.ring_degree}`);
       flags.push("--host {{HOST_IP}}", "--port {{PORT}}");
 
-      const warnings = [];
+      const warnings = [...coverageWarnings];
       if (!topologyVerified && errors.length === 0) {
         warnings.push("This topology satisfies H3's static constraints but has not completed an exact end-to-end verification run.");
       }
