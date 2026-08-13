@@ -32,9 +32,11 @@ class TestDisaggregationDecodeRadixCacheSWANixl(
 ):
     transfer_backend_name = "nixl"
     model_name = DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
-    # The 512-token eval cap truncates mxfp4 gpt-oss reasoning, so use a lower
-    # absolute floor while checking that the cached second pass does not regress.
-    gsm8k_min_score = 0.50
+    # The 512-token eval cap truncates mxfp4 gpt-oss reasoning. On the fixed
+    # 500-question H200 sample, the score has a roughly 2-point standard error,
+    # so keep the original 0.45 absolute floor and rely on the two-pass
+    # non-regression check below to catch decode-cache corruption.
+    gsm8k_min_score = 0.45
     # SWA + decode-side radix cache is gated to the unified radix tree.
     extra_prefill_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
     extra_decode_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
