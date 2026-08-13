@@ -271,10 +271,11 @@ class NativeMmHost:
         )
 
     @staticmethod
-    def build_native_mm(spec: NativeMmSpec, entry):
-        """Drain-time adapter: wrap the Rust-produced buffers of one ``MmHandoff``
-        into the scheduler's ``MultimodalProcessorOutput``. Wrapping only — load,
-        resize, patchify, token expansion and M-RoPE all ran in Rust.
+    def build_native_mm(spec: NativeMmSpec, encoded):
+        """Drain-time adapter: wrap the Rust-produced buffers of one
+        ``MmEncodedResult`` into the scheduler's ``MultimodalProcessorOutput``.
+        Wrapping only — load, resize, patchify, token expansion and M-RoPE all
+        ran in Rust.
 
         Runs on the scheduler loop, so it must stay copy-free *and* hash-free:
         ``take_mm``'s numpy arrays own the Rust buffers, ``torch.from_numpy`` just
@@ -291,13 +292,13 @@ class NativeMmHost:
             MultimodalProcessorOutput,
         )
 
-        shm_names = entry.shm_names
+        shm_names = encoded.shm_names
         if shm_names is None:
-            features = torch.from_numpy(entry.features.reshape(-1, spec.feature_dim))
+            features = torch.from_numpy(encoded.features.reshape(-1, spec.feature_dim))
         items = []
         row = 0
         for index, ((t, h, w), item_hash, offset) in enumerate(
-            zip(entry.grids, entry.hashes, entry.offsets)
+            zip(encoded.grids, encoded.hashes, encoded.offsets)
         ):
             n = t * h * w
             if shm_names is None:
@@ -338,8 +339,8 @@ class NativeMmHost:
             im_start_id=spec.vision_start_token_id,
             im_end_id=spec.vision_end_token_id,
             video_token_id=spec.video_token_id,
-            mrope_positions=torch.from_numpy(entry.mrope.reshape(3, -1)),
-            mrope_position_delta=torch.tensor([[entry.mrope_delta]], dtype=torch.long),
+            mrope_positions=torch.from_numpy(encoded.mrope.reshape(3, -1)),
+            mrope_position_delta=torch.tensor([[encoded.mrope_delta]], dtype=torch.long),
         )
 
 
@@ -514,12 +515,13 @@ class RustServer:
                 obj.input_ids = ids
                 pos += nbytes
             if self.mm_spec is not None and isinstance(obj, TokenizedGenerateReqInput):
-                # The buffers rode the Rust sidecar, parked before the ring push;
-                # wrapping them into tensors is the only Python step of the native
-                # path. `None` for a text-only request on a multimodal model.
-                native = self.server.take_mm(obj.rid)
-                if native is not None:
-                    obj.mm_inputs = NativeMmHost.build_native_mm(self.mm_spec, native)
+                # The buffers were parked in the Rust result store before the
+                # ring push; wrapping them into tensors is the only Python step
+                # of the native path. `None` for a text-only request on a
+                # multimodal model.
+                encoded = self.server.take_mm(obj.rid)
+                if encoded is not None:
+                    obj.mm_inputs = NativeMmHost.build_native_mm(self.mm_spec, encoded)
             out.append(obj)
         return out
 

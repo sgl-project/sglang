@@ -37,7 +37,7 @@ use crate::runtime::{Runtime, RuntimeConfig};
 /// (zero-copy into numpy), or one POSIX segment name per item when the scheduler
 /// broadcasts across TP ranks and Python wraps each in a `ShmPointerMMData`.
 #[pyclass(frozen, get_all)]
-struct MmHandoff {
+struct MmEncodedResult {
     features: Option<Py<numpy::PyArray1<f32>>>,
     shm_names: Option<Vec<String>>,
     grids: Vec<(u32, u32, u32)>,
@@ -221,10 +221,10 @@ impl Server {
     /// [`Server::take_mm`]; anything the pipeline cannot serve is rejected back to
     /// the client — there is no Python fallback.
     fn start_mm_workers(&self, spec_json: &str, workers: usize) -> PyResult<()> {
-        let ctx = mm::Context::new(
+        let ctx = mm::MmContext::new(
             spec_json,
             self.rt.tokenizer.clone(),
-            self.rt.mm_sidecar.clone(),
+            self.rt.mm_results.clone(),
         )
         .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
         self.rt.spawn_mm_pool(workers, std::sync::Arc::new(ctx));
@@ -239,10 +239,10 @@ impl Server {
     /// decode steps, so any per-byte work here — memcpy or hashing, tens of MB
     /// per image-heavy request — would stall every running request's ITL. Hence
     /// the worker-precomputed `hashes`.
-    fn take_mm(&self, py: Python<'_>, rid: &str) -> Option<MmHandoff> {
+    fn take_mm(&self, py: Python<'_>, rid: &str) -> Option<MmEncodedResult> {
         use numpy::IntoPyArray;
 
-        let res = self.rt.mm_sidecar.take(rid)?;
+        let res = self.rt.mm_results.take(rid)?;
         let (features, shm_names) = match res.features {
             mm::FeatureStore::Inline(v) => (Some(v.into_pyarray(py).unbind()), None),
             // The segments — and the duty to unlink — move to Python here;
@@ -252,7 +252,7 @@ impl Server {
                 Some(segments.into_iter().map(|s| s.into_name()).collect()),
             ),
         };
-        Some(MmHandoff {
+        Some(MmEncodedResult {
             features,
             shm_names,
             grids: res.grids.iter().map(|g| (g[0], g[1], g[2])).collect(),
@@ -309,6 +309,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .try_init();
     m.add_class::<Server>()?;
     m.add_class::<IngressBatch>()?;
-    m.add_class::<MmHandoff>()?;
+    m.add_class::<MmEncodedResult>()?;
     Ok(())
 }

@@ -80,9 +80,9 @@ class TestQwenE2eParity(CustomTestCase):
         ids, features, grids, hashes, offsets, mrope, delta = DRIVER(
             PROMPT_PER_IMAGE * len(sources), sources, spec.rust_json()
         )
-        # The shape of Rust's MmHandoff, inline transport (test_build_native_mm
-        # pins the shm shape).
-        handoff = SimpleNamespace(
+        # The shape of Rust's MmEncodedResult, inline transport
+        # (test_build_native_mm pins the shm shape).
+        encoded = SimpleNamespace(
             features=features,
             shm_names=None,
             grids=grids,
@@ -91,7 +91,7 @@ class TestQwenE2eParity(CustomTestCase):
             mrope=mrope,
             mrope_delta=delta,
         )
-        return snapshot(ids, NativeMmHost.build_native_mm(spec, handoff))
+        return snapshot(ids, NativeMmHost.build_native_mm(spec, encoded))
 
     def run_python(self, sources):
         """The reference path: the Python `mm_processor` the scheduler would use."""
