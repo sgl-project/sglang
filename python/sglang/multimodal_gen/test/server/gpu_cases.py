@@ -1182,6 +1182,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_dp_serving_2_gpu.py",
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
         "../single_test_file/test_usp_replicated_parity_2_gpu.py",
+        "../single_test_file/test_encoder_dp_under_tp_2_gpu.py",
     ],
 }
 
@@ -1226,6 +1227,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 180.0,
         # two SDPA parity checks on 128+6 rows
         "../single_test_file/test_usp_replicated_parity_2_gpu.py": 180.0,
+        # no model load; a toy elementwise encoder over a 5-row batch
+        "../single_test_file/test_encoder_dp_under_tp_2_gpu.py": 180.0,
     },
 }
 
