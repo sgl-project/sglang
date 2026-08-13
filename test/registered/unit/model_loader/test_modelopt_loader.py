@@ -18,11 +18,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
-from sglang.srt.layers.quantization.fp8 import (
-    Fp8Config,
-    Fp8LinearMethod,
-    Fp8MoEMethod,
-)
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -900,7 +896,6 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
                 ModelOptFp4Config.get_min_capability(),
             ),
             ("model.layers.0.mlp.shared_experts.down_proj", "MXFP8", 100),
-            ("model.layers.0.mlp.experts.0.down_proj", "MXFP8", 100),
         )
         for prefix, quant_algo, expected in cases:
             with self.subTest(prefix=prefix, quant_algo=quant_algo):
@@ -989,7 +984,7 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         self.assertIs(layer.weight_scale_inv_swizzled, derived_scale)
         torch.testing.assert_close(scale_param, reloaded_scale)
 
-    def test_mixed_precision_supports_mxfp8_routed_fused_moe(self):
+    def test_mixed_precision_rejects_mxfp8_routed_fused_moe(self):
         quant_config = self._mixed_config(
             "model.layers.0.mlp.experts.0.down_proj", "MXFP8"
         )
@@ -999,42 +994,7 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
 
         with (
             patch("sglang.srt.layers.moe.fused_moe_triton.FusedMoE", DummyFusedMoE),
-            patch(
-                "sglang.srt.layers.quantization.modelopt_quant.is_cuda",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.layers.quantization.modelopt_quant.is_sm100_supported",
-                return_value=True,
-            ),
-        ):
-            method = quant_config.get_quant_method(
-                DummyFusedMoE(),
-                "model.layers.0.mlp.experts",
-            )
-
-        self.assertIsInstance(method, Fp8MoEMethod)
-        self.assertTrue(method.use_mxfp8)
-
-    def test_mixed_precision_rejects_mxfp8_routed_fused_moe_without_sm100(self):
-        quant_config = self._mixed_config(
-            "model.layers.0.mlp.experts.0.down_proj", "MXFP8"
-        )
-
-        class DummyFusedMoE:
-            pass
-
-        with (
-            patch("sglang.srt.layers.moe.fused_moe_triton.FusedMoE", DummyFusedMoE),
-            patch(
-                "sglang.srt.layers.quantization.modelopt_quant.is_cuda",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.layers.quantization.modelopt_quant.is_sm100_supported",
-                return_value=False,
-            ),
-            self.assertRaisesRegex(ValueError, "require an NVIDIA SM100-class GPU"),
+            self.assertRaisesRegex(NotImplementedError, "MXFP8 routed FusedMoE"),
         ):
             quant_config.get_quant_method(
                 DummyFusedMoE(),
