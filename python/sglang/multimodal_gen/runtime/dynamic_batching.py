@@ -9,22 +9,24 @@ from typing import Any
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 
-def freeze_signature_value(value: Any):
+def _freeze_signature_value(value: Any):
     if isinstance(value, (str, int, float, bool, type(None))):
         return value
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, dict):
-        return {
-            str(key): freeze_signature_value(item)
+        return tuple(
+            (str(key), _freeze_signature_value(item))
             for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-        }
+        )
     if isinstance(value, (list, tuple)):
-        return tuple(freeze_signature_value(item) for item in value)
+        return tuple(_freeze_signature_value(item) for item in value)
     return repr(value)
 
 
-def build_dynamic_batch_signature(req: Req) -> tuple[Any, ...] | None:
+def _build_dynamic_batch_signature(
+    req: Req, *, exclude_num_outputs_per_prompt: bool
+) -> tuple[Any, ...] | None:
     sampling_params = req.sampling_params
     if sampling_params is None:
         return None
@@ -36,27 +38,34 @@ def build_dynamic_batch_signature(req: Req) -> tuple[Any, ...] | None:
     items = [
         (
             field.name,
-            freeze_signature_value(getattr(sampling_params, field.name, None)),
+            _freeze_signature_value(getattr(sampling_params, field.name, None)),
         )
         for field in sampling_fields
         if not field.metadata.get("batch_sig_exclude", False)
+        and not (
+            exclude_num_outputs_per_prompt and field.name == "num_outputs_per_prompt"
+        )
     ]
+
+    profile_signature = (
+        (True, req.profile_all_stages, req.num_profiled_timesteps)
+        if req.profile
+        else (False,)
+    )
+    items.append(("profiling", profile_signature))
+
     diffusers_kwargs = (req.extra or {}).get("diffusers_kwargs")
     if diffusers_kwargs:
-        items.append(("diffusers_kwargs", freeze_signature_value(diffusers_kwargs)))
+        items.append(("diffusers_kwargs", _freeze_signature_value(diffusers_kwargs)))
     return tuple(items)
 
 
-def get_dynamic_batch_signature(req: Req) -> tuple[Any, ...] | None:
-    cached = getattr(req, "_dynamic_batch_sig", None)
-    if cached is not None:
-        return cached
-    signature = build_dynamic_batch_signature(req)
-    req._dynamic_batch_sig = signature
-    return signature
-
-
-def can_dynamic_batch(base_req: Req, candidate_req: Req) -> bool:
+def are_requests_batch_compatible(
+    base_req: Req,
+    candidate_req: Req,
+    *,
+    exclude_num_outputs_per_prompt: bool = False,
+) -> bool:
     if base_req.is_warmup or candidate_req.is_warmup:
         return False
     if (
@@ -77,6 +86,12 @@ def can_dynamic_batch(base_req: Req, candidate_req: Req) -> bool:
         return False
     if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
         return False
-    base_signature = get_dynamic_batch_signature(base_req)
-    candidate_signature = get_dynamic_batch_signature(candidate_req)
+    base_signature = _build_dynamic_batch_signature(
+        base_req,
+        exclude_num_outputs_per_prompt=exclude_num_outputs_per_prompt,
+    )
+    candidate_signature = _build_dynamic_batch_signature(
+        candidate_req,
+        exclude_num_outputs_per_prompt=exclude_num_outputs_per_prompt,
+    )
     return base_signature is not None and base_signature == candidate_signature

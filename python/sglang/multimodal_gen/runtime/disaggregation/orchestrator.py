@@ -37,7 +37,9 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     encode_transfer_msg,
     is_transfer_message,
 )
-from sglang.multimodal_gen.runtime.dynamic_batching import can_dynamic_batch
+from sglang.multimodal_gen.runtime.dynamic_batching import (
+    are_requests_batch_compatible,
+)
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 
 logger = logging.getLogger(__name__)
@@ -46,7 +48,6 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _GlmClientEntry:
     request_id: str
-    client_identity: bytes
     req: object
     enqueue_time: float
 
@@ -55,7 +56,7 @@ class _GlmClientEntry:
 class _GlmShardEntry:
     request_id: str
     req: object
-    clients: list[_GlmClientEntry]
+    client: _GlmClientEntry
     batch_size: int
 
 
@@ -474,9 +475,7 @@ class DiffusionServer:
                 )
                 return
             now = time.monotonic()
-            self._glm_ar_queue.append(
-                _GlmClientEntry(request_id, client_identity, req, now)
-            )
+            self._glm_ar_queue.append(_GlmClientEntry(request_id, req, now))
             return
 
         self._encoder_tta.append(
@@ -502,7 +501,11 @@ class DiffusionServer:
             if output_slots >= self._glm_batch_max_size:
                 break
             candidate = self._glm_ar_queue[index]
-            if can_dynamic_batch(base.req, candidate.req):
+            if are_requests_batch_compatible(
+                base.req,
+                candidate.req,
+                exclude_num_outputs_per_prompt=self._server_args.pipeline_config.supports_sequential_dit_inference(),
+            ):
                 candidate_outputs = max(
                     1, int(candidate.req.num_outputs_per_prompt or 1)
                 )
@@ -627,14 +630,10 @@ class DiffusionServer:
             shard_req.extra["usage_by_output"] = shard_usages
             shard_req.usage = _merge_srt_usages(shard_usages)
             shard_id = shard_req.request_id
-            shard_clients = [client]
-            shard_req.extra["fanout_child_request_ids"] = [
-                client.request_id for client in shard_clients
-            ]
             shard = _GlmShardEntry(
                 shard_id,
                 shard_req,
-                shard_clients,
+                client,
                 1 if sequential_multi_output else output_count,
             )
             self._glm_shards[shard_id] = shard
@@ -668,18 +667,17 @@ class DiffusionServer:
             send_tensors(
                 self._denoiser_pushes[worker_idx], tensor_fields, scalar_fields
             )
-            for client_index, client in enumerate(shard.clients):
-                try:
-                    self._tracker.transition(
-                        client.request_id,
-                        RequestState.DENOISING_RUNNING,
-                        denoiser_instance=(worker_idx if client_index == 0 else None),
-                    )
-                except ValueError:
-                    pass
+            try:
+                self._tracker.transition(
+                    shard.client.request_id,
+                    RequestState.DENOISING_RUNNING,
+                    denoiser_instance=worker_idx,
+                )
+            except ValueError:
+                pass
             logger.info(
-                "GLM fan-out dispatched shard size=%d to denoiser[%d]",
-                len(shard.clients),
+                "GLM fan-out dispatched request with %d output(s) to denoiser[%d]",
+                shard.client.req.num_outputs_per_prompt,
                 worker_idx,
             )
 
@@ -698,16 +696,6 @@ class DiffusionServer:
                 worker_idx,
                 registered,
             )
-
-    @staticmethod
-    def _slice_output_value(value, start: int, end: int, total: int):
-        if value is None:
-            return None
-        if isinstance(value, (list, tuple)) and len(value) == total:
-            return value[start:end]
-        if hasattr(value, "shape") and len(value.shape) > 0 and value.shape[0] == total:
-            return value[start:end]
-        return value
 
     @staticmethod
     def _output_size(value) -> int | None:
@@ -738,7 +726,8 @@ class DiffusionServer:
         output = tensor_fields.get("output")
         audio = tensor_fields.get("audio")
         output_paths = scalar_fields.get("output_file_paths")
-        total = sum(client.req.num_outputs_per_prompt for client in shard.clients)
+        client = shard.client
+        total = max(1, int(client.req.num_outputs_per_prompt or 1))
         for name, value in (("output", output), ("output_file_paths", output_paths)):
             size = self._output_size(value)
             if size is not None and size != total:
@@ -749,36 +738,29 @@ class DiffusionServer:
                 audio = None
                 output_paths = None
                 break
-        start = 0
-        for client in shard.clients:
-            count = client.req.num_outputs_per_prompt
-            end = start + count
-            result = OutputBatch(
-                output=self._slice_output_value(output, start, end, total),
-                output_file_paths=self._slice_output_value(
-                    output_paths, start, end, total
-                ),
-                audio=self._slice_output_value(audio, start, end, total),
-                audio_sample_rate=scalar_fields.get("audio_sample_rate"),
+        result = OutputBatch(
+            output=output,
+            output_file_paths=output_paths,
+            audio=audio,
+            audio_sample_rate=scalar_fields.get("audio_sample_rate"),
+            error=error,
+            peak_memory_mb=scalar_fields.get("peak_memory_mb", 0.0),
+            usage=scalar_fields.get("usage"),
+        )
+        with self._lock:
+            identity = self._pending.pop(client.request_id, None)
+        if identity is not None:
+            self._frontend.send_multipart([identity, b"", pickle.dumps(result)])
+        try:
+            self._tracker.transition(client.request_id, RequestState.DENOISING_DONE)
+            self._tracker.transition(
+                client.request_id,
+                RequestState.FAILED if error else RequestState.DONE,
                 error=error,
-                peak_memory_mb=scalar_fields.get("peak_memory_mb", 0.0),
-                usage=scalar_fields.get("usage"),
             )
-            with self._lock:
-                identity = self._pending.pop(client.request_id, None)
-            if identity is not None:
-                self._frontend.send_multipart([identity, b"", pickle.dumps(result)])
-            try:
-                self._tracker.transition(client.request_id, RequestState.DENOISING_DONE)
-                self._tracker.transition(
-                    client.request_id,
-                    RequestState.FAILED if error else RequestState.DONE,
-                    error=error,
-                )
-            except ValueError:
-                pass
-            self._tracker.remove(client.request_id)
-            start = end
+        except ValueError:
+            pass
+        self._tracker.remove(client.request_id)
 
     def _handle_decoder_result_frames(self, frames: list) -> None:
         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
@@ -977,12 +959,10 @@ class DiffusionServer:
                 self._glm_shard_queue = deque(
                     shard
                     for shard in self._glm_shard_queue
-                    if not any(
-                        client.request_id in timed_set for client in shard.clients
-                    )
+                    if shard.client.request_id not in timed_set
                 )
                 for shard_id, shard in list(self._glm_shards.items()):
-                    if any(client.request_id in timed_set for client in shard.clients):
+                    if shard.client.request_id in timed_set:
                         worker_idx = self._glm_shard_workers.pop(shard_id, None)
                         self._glm_shards.pop(shard_id, None)
                         if worker_idx is not None:
