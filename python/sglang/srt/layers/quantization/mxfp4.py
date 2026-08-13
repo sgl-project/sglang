@@ -622,6 +622,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 torch.tensor([_limit] * E, dtype=torch.float32).cuda(),
                 requires_grad=False,
             )
+            layer._situ_routing_bias_bf16 = None
             sf_block_size = 32  # mxfp4 block size
 
             assert (
@@ -1252,9 +1253,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "cutlass_sm120",
             "trtllm_sm100",
         ):
-            # NOTE: MoeRunner.__init__ (runner.py) imports flashinfer_cutlass
-            # before its FusedOpPool lookup, which is what registers the fused
-            # func. Do not re-add an import here.
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             raise NotImplementedError(
@@ -1342,7 +1340,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-        routing_bias = getattr(layer, "_situ_routing_bias_bf16", None)
+        routing_bias = layer._situ_routing_bias_bf16
         topk_output = dispatch_output.topk_output
         if (
             self.moe_runner_config.activation == "situ"

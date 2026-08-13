@@ -993,14 +993,9 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             )
 
     if runner_config.activation == "situ":
-        from sglang.kernels.ops.moe import trtllm_gen_moe as situ_moe
-
-        if not situ_moe.available():
-            raise RuntimeError(
-                "activation='situ' with the flashinfer_mxfp4 runner needs the "
-                "SiTU cubin pool: set SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL (see "
-                "sglang/kernels/ops/moe/trtllm_gen_moe.py)."
-            )
+        from flashinfer import trtllm_fp4_block_scale_moe
+        from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+        from flashinfer.tllm_enums import ActivationType, RoutingMethodType
 
         if is_standard:
             if prepared_packed_topk is not None:
@@ -1011,25 +1006,34 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 )
 
             defer_finalize = _deferred_finalize_enabled.get()
-            result = situ_moe.trtllm_fp4_block_scale_routed_moe(
-                packed_topk_ids=packed_topk,
+            result = trtllm_fp4_block_scale_routed_moe(
+                topk_ids=packed_topk,
+                routing_bias=None,
                 hidden_states=x_quant,
                 hidden_states_scale=x_scale,
                 gemm1_weights=quant_info.w13_weight,
                 gemm1_weights_scale=quant_info.w13_weight_scale,
+                gemm1_bias=None,
                 gemm1_alpha=quant_info.gemm1_alpha,
                 gemm1_beta=quant_info.gemm1_clamp_limit,
+                gemm1_clamp_limit=None,
                 gemm2_weights=quant_info.w2_weight,
                 gemm2_weights_scale=quant_info.w2_weight_scale,
+                gemm2_bias=None,
                 output1_scale_scalar=None,
                 output1_scale_gate_scalar=None,
                 output2_scale_scalar=None,
                 num_experts=quant_info.global_num_experts,
                 top_k=packed_topk.shape[1],
+                n_group=None,
+                topk_group=None,
                 intermediate_size=quant_info.intermediate_size_per_partition,
-                activation_type=situ_moe.ACTIVATION_SITU,
                 local_expert_offset=quant_info.local_expert_offset,
                 local_num_experts=quant_info.local_num_experts,
+                routed_scaling_factor=None,
+                routing_method_type=RoutingMethodType.TopK.value,
+                activation_type=ActivationType.Situ.value,
+                tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
                 output=symm_output,
                 do_finalize=not defer_finalize,
             )
@@ -1041,19 +1045,24 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                     expanded_idx_to_permuted_idx=expanded_idx,
                     top_k=packed_topk.shape[1],
                 )
+            else:
+                result = result[0]
             return StandardCombineInput(hidden_states=result)
 
-        situ_moe.trtllm_fp4_block_scale_moe(
+        trtllm_fp4_block_scale_moe(
             routing_logits=router_logits.to(torch.bfloat16).contiguous(),
             routing_bias=quant_info.routing_bias,
             hidden_states=x_quant,
             hidden_states_scale=x_scale,
             gemm1_weights=quant_info.w13_weight,
             gemm1_weights_scale=quant_info.w13_weight_scale,
+            gemm1_bias=None,
             gemm1_alpha=quant_info.gemm1_alpha,
             gemm1_beta=quant_info.gemm1_clamp_limit,
+            gemm1_clamp_limit=None,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale,
+            gemm2_bias=None,
             output1_scale_scalar=None,
             output1_scale_gate_scalar=None,
             output2_scale_scalar=None,
@@ -1065,11 +1074,12 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             routed_scaling_factor=(
                 topk_output.topk_config.routed_scaling_factor or 1.0
             ),
-            routing_method_type=situ_moe.ROUTING_DEEPSEEK_V3,
-            activation_type=situ_moe.ACTIVATION_SITU,
+            routing_method_type=RoutingMethodType.DeepSeekV3.value,
+            activation_type=ActivationType.Situ.value,
             norm_topk_prob=topk_output.topk_config.renormalize,
             local_expert_offset=quant_info.local_expert_offset,
             local_num_experts=quant_info.local_num_experts,
+            tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
             output=symm_output,
         )
         return StandardCombineInput(hidden_states=symm_output)

@@ -304,7 +304,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
     key but call different kernels.
     """
     if isinstance(quant_info, FlashInferCutlassMxfp4MoeQuantInfo):
-        return _fused_experts_flashinfer_mxfp4_sm90_cutlass(
+        return _fused_experts_flashinfer_mxfp4_cutlass(
             dispatch_output, quant_info, runner_config
         )
 
@@ -324,7 +324,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
     )
 
 
-def _fused_experts_flashinfer_mxfp4_sm90_cutlass(
+def _fused_experts_flashinfer_mxfp4_cutlass(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferCutlassMxfp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
