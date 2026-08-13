@@ -609,12 +609,11 @@ class KimiK3MoE(nn.Module):
         # (TP8/EP8 MegaMoE + SP-MoE): +4~5% output tok/s and −5% ITL over
         # bs 1–32, GSM8K unchanged — so it is on whenever the shape allows,
         # no flag.
-        # EP a2a only: with plain-TP experts the fused front already lands both
-        # partial sums in one collective (_forward_fused), a strictly better
-        # overlap than two streams.
+        # In NPU attention-TP compatibility mode, the all-gather and
+        # reduce-scatter remain on the current stream while only the shared
+        # MLP runs on the side stream.
         self._sbo_shared_overlap = (
             self._ep_a2a
-            and not self._shared_experts_attn_tp_comm
             and self.shared_experts is not None
             and self.alt_stream is not None
         )
@@ -1008,6 +1007,7 @@ class KimiK3MoE(nn.Module):
         # the DP local buffer is the full reassembled per-replica batch.
         gathered_hidden_states = get_local_dp_buffer(group)
         attn_tp_all_gather_into_tensor(gathered_hidden_states, hidden_states)
+
         gathered_shared_output = self.shared_experts(gathered_hidden_states)
         shared_output = torch.empty_like(hidden_states)
         attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
@@ -1024,12 +1024,11 @@ class KimiK3MoE(nn.Module):
         # Shared experts on original hidden_states. Under SBO they go to the
         # side stream and are joined at the tail (see _sbo_shared_overlap).
         #
-        # Issued *after* the front, deliberately: alt_stream.wait_stream() makes
-        # the side stream wait for whatever the main stream has enqueued so far,
-        # so issuing here means the shared experts overlap the routed a2a rather
-        # than the front GEMMs. The shared branch is the shorter of the two and
-        # does not need a head start; running it against the front only takes
-        # bandwidth away from the critical path.
+        # CUDA issues this after the front so the shared experts overlap the
+        # routed a2a rather than the front GEMMs. NPU issues it before the front:
+        # this starts the attention-TP all-gather as soon as the post-attention
+        # RMSNorm output is available and lets the shared branch finish its
+        # lightweight DynamicQuant before the routed GroupedMatmul starts.
         shared_output = None
         shared_event = None
 
@@ -1038,12 +1037,38 @@ class KimiK3MoE(nn.Module):
             if self.shared_experts is None or hidden_states.shape[0] == 0:
                 return
             if self._sbo_shared_overlap:
-                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                current_stream = torch.cuda.current_stream()
+                # Keep HCCL collectives on the current stream. The alternate
+                # stream only executes the shared-expert MLP.
+                shared_input = hidden_states
+                if self._shared_experts_attn_tp_comm:
+                    group = get_parallel().attn_tp_group
+                    shared_input = get_local_dp_buffer(group)
+                    attn_tp_all_gather_into_tensor(shared_input, hidden_states)
+                shared_input.record_stream(self.alt_stream)
+                self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
-                    shared_output = self._forward_shared_experts(hidden_states)
+                    shared_output = self.shared_experts(shared_input)
                     shared_event = self.alt_stream.record_event()
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
+
+        def wait_and_finalize_shared_experts():
+            nonlocal shared_output
+            if shared_event is None:
+                return
+            # Join as late as possible, then keep the attention-TP collective
+            # on the current stream before the shared output is consumed.
+            torch.cuda.current_stream().wait_event(shared_event)
+            if self._shared_experts_attn_tp_comm:
+                gathered_shared_output = shared_output
+                shared_output = torch.empty_like(hidden_states)
+                attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
+
+        # Give the NPU shared-expert branch a head start. At this point
+        # hidden_states is the decoder layer's post-attention RMSNorm output.
+        if _is_npu and self._sbo_shared_overlap:
+            issue_shared()
 
         # Front: gate + TopK (+ latent down-proj when the merged front covers it).
         # The gate and the latent down-proj read the same hidden_states, so the
@@ -1061,12 +1086,12 @@ class KimiK3MoE(nn.Module):
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
-        issue_shared()
+        if not (_is_npu and self._sbo_shared_overlap):
+            issue_shared()
 
         if not self.use_latent_moe:
             expert_output = self.experts(hidden_states, topk_output)
-            if shared_event is not None:
-                torch.cuda.current_stream().wait_event(shared_event)
+            wait_and_finalize_shared_experts()
             if shared_output is not None:
                 expert_output = expert_output + shared_output
             if self.tp_size > 1:
@@ -1105,10 +1130,7 @@ class KimiK3MoE(nn.Module):
             latent = self._reduce_latent(expert_output)
             # up_proj is replicated, so the routed output is now fully reduced.
             out, _ = self.routed_expert_up_proj(latent)
-        if shared_event is not None:
-            # SBO join: as late as possible, so the side-stream shared experts
-            # get the whole routed a2a + latent tail to hide under.
-            torch.cuda.current_stream().wait_event(shared_event)
+        wait_and_finalize_shared_experts()
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
             # ones need the partial-sum reduction.
