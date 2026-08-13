@@ -2,7 +2,11 @@
 
 import unittest
 
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import _split_hicache_size
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    _split_hicache_size,
+    _unwrap_hybrid_linear_draft_pool,
+)
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -25,6 +29,17 @@ class TestSplitHicacheSize(CustomTestCase):
         )
         self.assertEqual(shares, (75.0, 25.0))  # proportional to device KV bytes
         self.assertEqual(sum(shares), 100)  # total budget preserved, not doubled
+
+    def test_unwraps_hybrid_linear_draft_to_full_kv_pool(self):
+        hybrid_pool = object.__new__(HybridLinearKVPool)
+        full_kv_pool = object()
+        hybrid_pool.full_kv_pool = full_kv_pool
+
+        self.assertIs(
+            _unwrap_hybrid_linear_draft_pool(hybrid_pool),
+            full_kv_pool,
+        )
+        self.assertIs(_unwrap_hybrid_linear_draft_pool(full_kv_pool), full_kv_pool)
 
     def test_splits_total_budget_by_device_bytes_three_pools(self):
         # scalar and (k, v) tuple return shapes both supported
