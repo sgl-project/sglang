@@ -228,6 +228,33 @@ class TestSWAEvictionBoundary(unittest.TestCase):
         self.assertLessEqual(req.kv.swa_evicted_seqlen, checkpoint - window)
         self.assertEqual(req.kv.swa_evicted_seqlen % page_size, 0)
 
+    def test_retain_floor_ignored_for_chunk_cache(self):
+        """Chunk cache builds no tree, so a retained checkpoint could never be
+        matched. Holding it would cost SWA slots for nothing."""
+        page_size, window = 8, 16
+        seq_len = 200
+        tree, allocator, pool = _build_swa_tree(
+            page_size=page_size, sliding_window_size=window
+        )
+        kv = _swa_alloc(allocator, seq_len)
+        pool.write((0, slice(0, seq_len)), kv)
+        req = _make_req(0, list(range(seq_len)), 0, tree)
+        batch = _make_batch(tree, allocator, pool)
+
+        free_swa_out_of_window_slots(
+            req,
+            seq_len - 1,
+            sliding_window_size=window,
+            page_size=page_size,
+            req_to_token_pool=batch.req_to_token_pool,
+            token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
+            is_chunk_cache=True,
+            retain_floor=16,
+        )
+
+        expected = (seq_len - 1 - window) // page_size * page_size
+        self.assertEqual(req.kv.swa_evicted_seqlen, expected)
+
     def test_retain_floor_none_matches_old_behaviour(self):
         """retain_floor=None must reproduce the pre-change frontier exactly, so a
         cache without a second state stream is unaffected."""

@@ -378,11 +378,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return False
 
     def swa_retain_floor(self, req) -> int | None:
-        # Caches that pair SWA with a second state stream (mamba/conv checkpoints)
-        # cannot free SWA to the window behind the tail: a match lands on a
-        # checkpoint, not on the tail, so the window that matters sits behind the
-        # last checkpoint. Those caches override this; everyone else has nothing
-        # deeper than the tail to protect.
+        # A match lands on a state checkpoint rather than on the tail, so a cache
+        # that pairs SWA with mamba/conv checkpoints has to keep the window behind
+        # the last checkpoint. Those caches override this. Everyone else has
+        # nothing deeper than the tail to protect.
         return None
 
     def swa_reprefill_tail_tokens(self) -> int:
