@@ -1786,6 +1786,7 @@ class ServerArgs:
             ),
             choices=DSV4_PREFILL_BACKEND_CHOICES,
         ),
+        NS("exec.kernel"),
     ] = "auto"
     dsa_decode_backend: A[
         Optional[str],

@@ -675,3 +675,7 @@ def test_q8kv8_sparse_prefill_real_kernel_repeated_launch_stable():
                 atol=1e-2,
                 rtol=1e-2,
             )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
