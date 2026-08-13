@@ -77,7 +77,12 @@ class SWAComponent(TreeComponent):
     component_type = ComponentType.SWA
 
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
-        return False
+        data = node.component_data[self.component_type]
+        return (
+            self.tree_core.has_swa_host_pool
+            and data.value is not None
+            and data.host_value is None
+        )
 
     def reset_session_state(self) -> None:
         super().reset_session_state()

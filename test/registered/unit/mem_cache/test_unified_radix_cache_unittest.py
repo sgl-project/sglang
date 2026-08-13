@@ -3812,11 +3812,29 @@ class UnifiedRadixCacheSuite:
             leaf, device_frees, host_frees, target=EvictLayer.HOST
         )
         cache._free_values(device_frees, host_frees)
+        full_host_pool = cache.cache_controller.mem_pool_host
+        swa_host_pool = cache.components[ComponentType.SWA]._swa_kv_pool_host
+        full_available_before = full_host_pool.available_size()
+        swa_available_before = swa_host_pool.available_size()
 
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
 
         self.assertEqual(result.full_kv_hit_length, len(tokens))
         self.assertEqual(result.swa_branching_seqlen, len(tokens))
+
+        self._insert(
+            cache,
+            allocator,
+            req_to_token_pool,
+            tokens[: result.swa_branching_seqlen],
+        )
+        cache.writing_check(write_back=True)
+        # Full was already backed up, so only the SWA window is allocated.
+        self.assertEqual(full_host_pool.available_size(), full_available_before)
+        self.assertEqual(
+            swa_host_pool.available_size(),
+            swa_available_before - len(leaf.key),
+        )
 
     def test_swa_branching_seqlen_caps_insert_after_forward(self):
         if (
