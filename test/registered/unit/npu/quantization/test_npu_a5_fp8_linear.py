@@ -65,6 +65,50 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         self.assertIs(matmul_call.kwargs["bias"], bias)
         self.assertEqual(matmul_call.kwargs["group_sizes"], (1, 1, 32))
 
+    def test_preserves_supported_input_dtype(self):
+        input_tensor = torch.randn(2, 128, dtype=torch.float16)
+        weight = torch.empty(128, 64, dtype=torch.float8_e4m3fn)
+        weight_scale = torch.empty(2, 64, 2, dtype=torch.uint8)
+        npu_ops = MagicMock()
+        npu_ops.npu_dynamic_mx_quant.return_value = (
+            torch.empty(2, 128, dtype=torch.float8_e4m3fn),
+            torch.empty(2, 2, 2, dtype=torch.uint8),
+        )
+        npu_ops.npu_quant_matmul.return_value = torch.empty(2, 64)
+
+        with patch.object(torch.ops, "npu", npu_ops, create=True):
+            npu_w8a8_block_fp8_linear(input_tensor, weight, [128, 128], weight_scale)
+
+        self.assertEqual(
+            npu_ops.npu_quant_matmul.call_args.kwargs["output_dtype"],
+            torch.float16,
+        )
+
+    def test_converts_bias_to_float32(self):
+        input_tensor = torch.randn(2, 128, dtype=torch.bfloat16)
+        weight = torch.empty(128, 64, dtype=torch.float8_e4m3fn)
+        weight_scale = torch.empty(2, 64, 2, dtype=torch.uint8)
+        bias = torch.randn(64, dtype=torch.bfloat16)
+        npu_ops = MagicMock()
+        npu_ops.npu_dynamic_mx_quant.return_value = (
+            torch.empty(2, 128, dtype=torch.float8_e4m3fn),
+            torch.empty(2, 2, 2, dtype=torch.uint8),
+        )
+        npu_ops.npu_quant_matmul.return_value = torch.empty(2, 64)
+
+        with patch.object(torch.ops, "npu", npu_ops, create=True):
+            npu_w8a8_block_fp8_linear(
+                input_tensor,
+                weight,
+                [128, 128],
+                weight_scale,
+                bias=bias,
+            )
+
+        quant_bias = npu_ops.npu_quant_matmul.call_args.kwargs["bias"]
+        self.assertEqual(quant_bias.dtype, torch.float32)
+        torch.testing.assert_close(quant_bias, bias.float())
+
 
 if __name__ == "__main__":
     unittest.main()
