@@ -8,6 +8,8 @@ license.workspace = true
 # Consumed by python/setup.py: registers this crate as a PyO3 extension module.
 [package.metadata.sglang]
 python-module = "sglang.srt.server._core"
+# Always build optimized, even for an editable install.
+debug = false
 
 [lib]
 name = "sglang_server"
@@ -22,6 +24,7 @@ futures = { workspace = true }
 pyo3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -31,10 +34,35 @@ uuid = { workspace = true }
 
 axum = { version = "0.8.9", features = ["json", "tokio"] }
 core_affinity = "0.8"
-# the dynamo-tokenizers is deps on hf-hub, should bump version together
-dynamo-tokenizers = "1.5.3"
+# the dynamo-tokenizers is deps on hf-hub, should bump version together.
+dynamo-tokenizers = "1.7.0"
+# Keep the HTTP adapter on Dynamo's public OpenAI types, renderer, and parsers.
+# `dynamo-llm` stays excluded because it pulls the full runtime just to reuse
+# small service helpers.
+dynamo-parsers = "7.0.1"
+dynamo-protocols = "5.1.0"
+dynamo-renderer = "5.0.0"
 flume = "0.12.0"
+# Safe POD slice casts (feature buffers viewed as bytes for the shm copy).
+bytemuck = "1"
+itertools = "0.14"
 hf-hub = { version = "0.4", default-features = false }
-regex-syntax = "0.8"
+# POSIX shm for the MM feature fan-out (`mm::ShmSegment`).
+libc = "0.2"
+# Same major as the workspace pyo3: the zero-copy MM drain (`take_mm`) moves
+# Rust vectors into numpy arrays.
+numpy = "0.29.0"
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
+# Pinned EXACTLY: this crate's accepted grammar defines the
+# "anything Rust admits, Python can compile" invariant in `message::sampling`.
+# A minor bump can widen it and silently reopen a scheduler-killing hole.
+regex-syntax = "=0.8.11"
+# The pure-Rust core of the MM pipeline. `default-features = false` drops the
+# pyo3 bindings so it links as a plain rlib; renamed so `use sglang_mm::…` reads
+# naturally while the crate keeps its own artifact name in the shared target/.
+sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
+
+[dev-dependencies]
+# `Router::oneshot` for handler-level router tests.
+tower = { version = "0.5", features = ["util"] }

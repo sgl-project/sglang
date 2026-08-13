@@ -768,7 +768,13 @@ def invoke_fused_moe_kernel(
             # activation block-wise fp8 quantization
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
-            if _is_cuda:
+            if A.dtype == torch.float8_e4m3fn:
+                # Pre-quantized activation (SGLANG_OPT_MOE_QUANT_ONCE): the
+                # caller already ran the per-token-group quant; A_scale holds
+                # the matching scales (row- or column-major, strides are
+                # passed to the kernel below).
+                assert A_scale is not None
+            elif _is_cuda:
                 A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
             else:
                 A, A_scale = per_token_group_quant_fp8(A, block_k)

@@ -6,11 +6,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
     align_tensor_to_module_dtype,
+    autocast_context,
     autocast_enabled,
     resolve_precision,
     temporary_module_dtype,
@@ -77,9 +77,9 @@ class LTX2AVDecodingStage(DecodingStage):
                 latents, server_args, vae=self.vae
             )
 
-            with torch.autocast(
-                device_type=current_platform.device_type,
+            with autocast_context(
                 dtype=vae_dtype,
+                disable_autocast=server_args.disable_autocast,
                 enabled=vae_autocast_enabled,
             ):
                 try:
@@ -167,9 +167,9 @@ class LTX2AVDecodingStage(DecodingStage):
                 should_cast_audio_vae = not audio_vae_autocast_enabled
                 with (
                     torch.no_grad(),
-                    torch.autocast(
-                        device_type=current_platform.device_type,
+                    autocast_context(
                         dtype=audio_vae_dtype,
+                        disable_autocast=server_args.disable_autocast,
                         enabled=audio_vae_autocast_enabled,
                     ),
                 ):

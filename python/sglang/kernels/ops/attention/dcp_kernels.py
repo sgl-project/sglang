@@ -77,6 +77,40 @@ def create_triton_kv_indices_for_dcp_triton(
 # all-gathered dcp_kv_buffer, plus the per-rank shard/compact kernel.
 # ---------------------------------------------------------------------------
 @triton.jit
+def create_mla_kv_page_table_for_dcp(
+    req_to_token_ptr,
+    req_pool_indices_ptr,
+    local_seq_lens_ptr,
+    block_kv_indices_ptr,
+    req_to_token_stride: tl.constexpr,
+    block_table_stride: tl.constexpr,
+    PHYSICAL_PAGE_SIZE: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    PAGES_PER_BLOCK: tl.constexpr,
+):
+    req = tl.program_id(0)
+    page_block = tl.program_id(1)
+    page_offsets = page_block * PAGES_PER_BLOCK + tl.arange(0, PAGES_PER_BLOCK)
+    local_len = tl.load(local_seq_lens_ptr + req)
+    local_pages = tl.cdiv(local_len, PHYSICAL_PAGE_SIZE)
+    mask = page_offsets < local_pages
+    global_positions = DCP_RANK + page_offsets * PHYSICAL_PAGE_SIZE * DCP_SIZE
+    req_pool_index = tl.load(req_pool_indices_ptr + req)
+    virtual_locs = tl.load(
+        req_to_token_ptr + req_pool_index * req_to_token_stride + global_positions,
+        mask=mask,
+        other=0,
+    )
+    physical_pages = virtual_locs // DCP_SIZE // PHYSICAL_PAGE_SIZE
+    tl.store(
+        block_kv_indices_ptr + req * block_table_stride + page_offsets,
+        physical_pages,
+        mask=mask,
+    )
+
+
+@triton.jit
 def create_dcp_kv_indices(
     kv_indptr,
     extend_lens_ptr,
@@ -168,6 +202,7 @@ def _correct_attn_cp_out_kernel(
     lse_idx,
     HEAD_DIM: tl.constexpr,
     N_ROUNDED: tl.constexpr,
+    IS_LSE_BASE_ON_E: tl.constexpr,
 ):
     """
     Apply the all-gathered lses to correct each local rank's attention
@@ -208,9 +243,9 @@ def _correct_attn_cp_out_kernel(
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == neg_inf, 0.0, lse_max)
     lse = lse - lse_max
-    lse_exp = tl.exp2(lse)
+    lse_exp = tl.exp(lse) if IS_LSE_BASE_ON_E else tl.exp2(lse)
     lse_acc = tl.sum(lse_exp, axis=0)
-    final_lse = tl.log2(lse_acc) + lse_max
+    final_lse = (tl.log(lse_acc) if IS_LSE_BASE_ON_E else tl.log2(lse_acc)) + lse_max
 
     # Compute correction factor
     lse_offset = lse_idx * lses_stride_N + b_i32 * lses_stride_B + h_i32 * lses_stride_H
@@ -221,7 +256,7 @@ def _correct_attn_cp_out_kernel(
         neg_inf,
         lse_diff,
     )
-    factor = tl.exp2(lse_diff)
+    factor = tl.exp(lse_diff) if IS_LSE_BASE_ON_E else tl.exp2(lse_diff)
 
     # Store final LSE
     tl.store(vlse_ptr + b_i32 * lses_stride_B + h_i32 * lses_stride_H, final_lse)
@@ -264,6 +299,7 @@ def correct_attn_out(
     cp_rank: int,
     ctx: Optional[CPTritonContext],
     new_output: torch.Tensor = None,
+    is_lse_base_on_e: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
 
@@ -327,7 +363,11 @@ def correct_attn_out(
         no_sD,
         cp_rank,
     )
-    const_args = {"HEAD_DIM": D, "N_ROUNDED": N}
+    const_args = {
+        "HEAD_DIM": D,
+        "N_ROUNDED": N,
+        "IS_LSE_BASE_ON_E": is_lse_base_on_e,
+    }
 
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
     return new_output, lse
@@ -340,6 +380,87 @@ def correct_attn_out(
 def _lse_pack_dim(output_dtype: torch.dtype) -> int:
     """Number of output-dtype elements needed to store one fp32 LSE value."""
     return torch.finfo(torch.float32).bits // torch.finfo(output_dtype).bits
+
+
+@triton.jit
+def _dcp_pack_a2a_send_kernel(
+    out_ptr,
+    lse_ptr,
+    send_ptr,
+    out_stride_B,
+    out_stride_H,
+    lse_stride_B,
+    lse_stride_H,
+    send_stride_N,
+    send_stride_B,
+    send_stride_H,
+    H_PER_RANK: tl.constexpr,
+    WORDS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Scatter one (batch, head) partial into its peer's a2a send slot."""
+    b = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
+
+    src = out_ptr + b * out_stride_B + h * out_stride_H
+    dst = (
+        send_ptr
+        + (h // H_PER_RANK) * send_stride_N
+        + b * send_stride_B
+        + (h % H_PER_RANK) * send_stride_H
+    )
+
+    for start in tl.range(0, WORDS, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = offs < WORDS
+        tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
+
+    tl.store(dst + WORDS, tl.load(lse_ptr + b * lse_stride_B + h * lse_stride_H))
+
+
+def dcp_pack_a2a_send(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    send_combined: torch.Tensor,
+) -> None:
+    """Pack ``[B, H, D]`` partials + ``[B, H]`` LSE into the a2a send buffer.
+
+    ``send_combined`` is ``[N, B_max, H // N, D + lse_pack_dim]``; rows beyond
+    ``B`` are left untouched.
+    """
+    B, H, D = cp_attn_out.shape
+    N, B_max, H_per_rank, row_width = send_combined.shape
+    lpd = _lse_pack_dim(send_combined.dtype)
+
+    if cp_attn_lse.dtype != torch.float32:
+        raise ValueError(f"cp_attn_lse must be float32, got {cp_attn_lse.dtype}")
+    if D % lpd:
+        raise ValueError(f"head dim {D} must be a multiple of the LSE pack dim {lpd}")
+    if row_width != D + lpd or H_per_rank * N != H or B > B_max:
+        raise ValueError(
+            f"send buffer {tuple(send_combined.shape)} does not match "
+            f"out {tuple(cp_attn_out.shape)}"
+        )
+
+    out_words = cp_attn_out.view(torch.float32)
+    send_words = send_combined.view(torch.float32)
+    words = D // lpd
+
+    _dcp_pack_a2a_send_kernel[(B, H)](
+        out_words,
+        cp_attn_lse,
+        send_words,
+        out_words.stride(0),
+        out_words.stride(1),
+        cp_attn_lse.stride(0),
+        cp_attn_lse.stride(1),
+        send_words.stride(0),
+        send_words.stride(1),
+        send_words.stride(2),
+        H_PER_RANK=H_per_rank,
+        WORDS=words,
+        BLOCK=min(1024, triton.next_power_of_2(words)),
+    )
 
 
 @triton.jit
