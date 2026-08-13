@@ -316,7 +316,8 @@ RMSNORM_KERNEL void rmsnorm_kernel(const RMSNormParams params) {
       }
     }
 
-    // the staged modes already issued it above
+    // issued after the input loads on purpose: an early async copy contends
+    // with them for the memory pipeline and measures slower
     load_weight();
   }
 

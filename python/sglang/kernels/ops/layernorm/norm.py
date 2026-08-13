@@ -49,7 +49,7 @@ def _div_ceil(a: int, b: int) -> int:
 
 class Schedule(NamedTuple):
     vec_size: int  # elements per vectorized access
-    num_threads: int  # vectorized accesses per thread
+    num_threads: int  # threads cooperating on one row
     copy_mode: int = 0  # 0=reg, 1=cp.async, 2=TMA
 
 
