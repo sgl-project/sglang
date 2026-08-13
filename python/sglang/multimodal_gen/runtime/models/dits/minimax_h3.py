@@ -22,6 +22,7 @@ from sglang.kernels.ops.diffusion.qknorm_rope import (
     fused_inplace_qknorm_rope,
 )
 from sglang.kernels.ops.diffusion.triton.indexed_modulation import (
+    indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
 )
@@ -238,8 +239,9 @@ def _modulate_gate(
     indices: torch.Tensor,
     *,
     dtype: torch.dtype,
+    allow_inplace: bool = True,
 ) -> torch.Tensor:
-    """Apply indexed gated residual, reusing disposable CUDA BF16 input."""
+    """Apply an indexed gated residual, optionally reusing the input buffer."""
     # Apply the per-index gated residual: x + gate[idx] * other.
     if (
         x.is_cuda
@@ -250,7 +252,9 @@ def _modulate_gate(
         and x.is_contiguous()
         and other.is_contiguous()
     ):
-        return indexed_gate_bf16_(x, gate, other, indices)
+        if allow_inplace:
+            return indexed_gate_bf16_(x, gate, other, indices)
+        return indexed_gate_bf16(x, gate, other, indices)
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
@@ -902,6 +906,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             expand_ratio=6,
             modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
         )
+        self.preserve_input_for_cache_dit = False
 
     def forward(
         self,
@@ -927,7 +932,9 @@ class MiniMaxH3DiTBlock(nn.Module):
         if adaln_params is None:
             adaln_params = self.adaln_proj(adaln_input)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
-
+        # Cache-DiT retains the inputs to its Fn and Mn block ranges. Only the
+        # first gated residual writes to that tensor; the second one operates on
+        # a block-local buffer.
         residual = x
         h = self.norm1(x)
         h = _modulate_scale_shift(
@@ -942,7 +949,14 @@ class MiniMaxH3DiTBlock(nn.Module):
             ulysses_active=ulysses_active,
             ring_active=ring_active,
         )
-        x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16_DTYPE)
+        x = _modulate_gate(
+            residual,
+            gate_msa,
+            h,
+            combined_indices,
+            dtype=_BF16_DTYPE,
+            allow_inplace=not self.preserve_input_for_cache_dit,
+        )
 
         residual = x
         h = self.norm2(x)
@@ -950,8 +964,14 @@ class MiniMaxH3DiTBlock(nn.Module):
             h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
         )
         h = self.mlp(h)
+        # `residual` is block-local here (see above), so this stays in-place
+        # even while Cache-DiT is attached.
         return _modulate_gate(
-            residual, gate_mlp, h, combined_indices, dtype=_BF16_DTYPE
+            residual,
+            gate_mlp,
+            h,
+            combined_indices,
+            dtype=_BF16_DTYPE,
         )
 
 
@@ -1024,6 +1044,8 @@ class MiniMaxH3FinalLayer(nn.Module):
 
 class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
+    # refine_prompt_embeds drives a forward pass outside __call__.
+    _fsdp_forward_methods = ("refine_prompt_embeds",)
     # parameters mix fp32 (patch projections, timestep embedder, and output
     # heads) with bf16 blocks; FSDP must gather in each parameter's own dtype
     _fsdp_mixed_dtype_params = True
@@ -1185,6 +1207,22 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         )
         self._resolved_attention_backend: AttentionBackendEnum | None = None
         self._mark_missing_params_required()
+
+    def set_cache_dit_input_preservation(self, enabled: bool) -> None:
+        """Stop the blocks from overwriting the input Cache-DiT holds by reference.
+
+        Cache-DiT snapshots the block-stack input to measure its residuals, so a
+        block that rewrites its own input in place makes that residual read as
+        zero. Only the first gated residual of a block writes the block input;
+        the second one operates on a buffer this block just allocated, so it is
+        left on the in-place fused path either way.
+
+        The caller owns the lifecycle. It has to be on before Cache-DiT mounts,
+        because mounting replaces `blocks` with a wrapper and the real blocks
+        stop being reachable by iterating it.
+        """
+        for block in self.blocks:
+            block.preserve_input_for_cache_dit = enabled
 
     def _resolve_attention_backend_once(self) -> None:
         if self._resolved_attention_backend is not None:
