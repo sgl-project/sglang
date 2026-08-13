@@ -35,7 +35,6 @@ import torch
 
 from sglang.srt.environ import EnvField, envs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_cuda
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -321,7 +320,7 @@ class TestResolutionIsReproducible(CustomTestCase):
                 # against `default_before`, so clearing it here does not skew
                 # that comparison.
                 envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
-                self._resolved(self._config_dir(config), **kwargs)
+                intermediate = self._resolved(self._config_dir(config), **kwargs)
                 after = self._resolved(model_path)
                 without_sticky = lambda snapshot: {
                     k: v
@@ -336,11 +335,13 @@ class TestResolutionIsReproducible(CustomTestCase):
                     # And the documented exception, asserted rather than
                     # assumed: the multimodal handler's env write does reach
                     # the next resolution. What it carries is the
-                    # intermediate's own device-dependent selection — cuda_ipc
-                    # on single-node CUDA, cpu on the CPU/ROCm runners (the
-                    # same `is_cuda()` gate the handler branches on).
-                    expected = "cuda_ipc" if is_cuda() else "cpu"
-                    self.assertEqual(after.mm_feature_transport, expected)
+                    # intermediate's own resolved selection. Do not duplicate
+                    # that selection policy here: it also depends on model,
+                    # topology, and deployment environment.
+                    self.assertEqual(
+                        after.mm_feature_transport,
+                        intermediate.mm_feature_transport,
+                    )
 
     def test_resolving_a_sibling_leaves_the_first_alone(self):
         for label, config, kwargs in _SHAPES:
