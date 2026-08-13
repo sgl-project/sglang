@@ -459,28 +459,16 @@ class RustServer:
         request objects. The scheduler's request receiver calls this instead of
         polling the zmq socket when `rust_server_mode` is set.
 
-        The transfer is **columnar**: `recv_requests` returns an `IngressBatch`
-        of scalar msgpack `headers` (with `input_ids` omitted) plus one
-        concatenated raw int64 `data` buffer and per-request `lengths`, so the
-        large `input_ids` lists never go through msgpack. Each header is `msgpack_decode`d (yielding
+        The ring carries one msgpack header per request (`msgpack_decode`d into
         the same `TokenizedGenerateReqInput` / control objects the zmq path
-        produces, so the IPC schema is tracked automatically) and its `input_ids`
-        slice is wrapped as the `array("q")` the scheduler expects. `recv_requests`
-        releases the GIL for the drain + concat, so this never holds the GIL
-        across a wait — same contract as `zmq.NOBLOCK`.
+        produces, so the IPC schema is tracked automatically). A generate
+        request's `input_ids` never ride the ring: they were parked in a
+        rid-keyed Rust store strictly before the push, and `take_input_ids`
+        pops them as a numpy array owning the Rust buffer.
         """
         limit = max_recv if max_recv > 0 else self._max_per_poll
-        batch = self.server.recv_requests(limit)
-        # Bind once: each attribute access converts the rust vec to a fresh list.
-        headers, data, lengths = batch.headers, batch.data, batch.lengths
-        if not headers:
-            return []
-
-        ids_view = memoryview(data)
         out = []
-        pos = 0  # byte offset into ids_buf
-        for header, n in zip(headers, lengths):
-            nbytes = n * 8
+        for header in self.server.recv_requests(limit):
             try:
                 obj = msgpack_decode_explained(header)
             except MsgpackDecodeError as e:
@@ -490,21 +478,22 @@ class RustServer:
                 )
                 if e.rid is not None:
                     self.server.push_error(e.rid, f"invalid request: {e.reason}")
-                pos += nbytes
+                    # Pop-and-drop so a dropped request can't leak parked ids.
+                    self.server.take_input_ids(e.rid)
                 continue
-            if n:  # generate request: attach its int64 ids slice as array("q")
+            if isinstance(obj, TokenizedGenerateReqInput):
                 ids = array("q")
-                ids.frombytes(ids_view[pos : pos + nbytes])
+                # cast("B"): frombytes wants a raw byte view of the int64 array.
+                ids.frombytes(memoryview(self.server.take_input_ids(obj.rid)).cast("B"))
                 obj.input_ids = ids
-                pos += nbytes
-            if self.mm_spec is not None and isinstance(obj, TokenizedGenerateReqInput):
-                # The buffers were parked in the Rust result store before the
-                # ring push; wrapping them into tensors is the only Python step
-                # of the native path. `None` for a text-only request on a
-                # multimodal model.
-                encoded = self.server.take_mm(obj.rid)
-                if encoded is not None:
-                    obj.mm_inputs = self.mm_spec.wrap_encoded(encoded)
+                if self.mm_spec is not None:
+                    # The buffers were parked in the Rust result store before
+                    # the ring push; wrapping them into tensors is the only
+                    # Python step of the native path. `None` for a text-only
+                    # request on a multimodal model.
+                    encoded = self.server.take_mm(obj.rid)
+                    if encoded is not None:
+                        obj.mm_inputs = self.mm_spec.wrap_encoded(encoded)
             out.append(obj)
         return out
 

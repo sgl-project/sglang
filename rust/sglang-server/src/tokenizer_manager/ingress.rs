@@ -19,15 +19,13 @@
 
 use std::collections::HashMap;
 
-use bytes::Bytes;
-
 use crate::error::Error;
 use crate::fsm::{Event, RequestState, ValidationOutcome};
 use crate::ids::Rid;
 
 use crate::message::{
-    AbortReq, ControlRequest, DetokMsg, EgressItem, GenerateRequest, IngressMsg, MmRequest,
-    Request, RequestKind,
+    AbortReq, ControlRequest, DetokMsg, EgressItem, GenerateRequest, MmRequest, Request,
+    RequestKind,
 };
 use crate::ring::IngressProducer;
 use crate::runtime::{Runnable, ServerArgs};
@@ -45,6 +43,9 @@ pub struct Ingress {
     ingress: IngressProducer,
     limits: Limits,
     mm: MmDispatch,
+    /// `push_to_ring` parks each generate request's ids here, keyed by rid,
+    /// for the scheduler drain to pop via `Server.take_input_ids`.
+    ids_store: crate::input_ids_store::InputIdsStore,
     /// Requests parked in `Encoding` while an MM worker processes their media;
     /// resumed by `MmEncoded` / `MmFailed`. Only this thread touches it, so no
     /// lock.
@@ -121,6 +122,7 @@ impl TryFrom<&ServerArgs> for Limits {
 }
 
 impl Ingress {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rx: flume::Receiver<TmEvent>,
         abort_rx: flume::Receiver<AbortSource>,
@@ -128,6 +130,7 @@ impl Ingress {
         ingress: IngressProducer,
         limits: Limits,
         mm: MmDispatch,
+        ids_store: crate::input_ids_store::InputIdsStore,
         shutdown: flume::Receiver<()>,
     ) -> Self {
         Self {
@@ -137,6 +140,7 @@ impl Ingress {
             ingress,
             limits,
             mm,
+            ids_store,
             pending_mm: HashMap::new(),
             shutdown,
         }
@@ -201,8 +205,9 @@ impl Ingress {
             tracing::error!(rid = %req.rid, error = %err, "ingress rejected request");
         }
         // A rejected request never reaches the scheduler drain, so purge any
-        // parked MM result (no-op for the common non-mm request).
+        // parked MM result or ids (no-ops in the common case).
         self.mm.results.purge(req.rid.as_str());
+        self.ids_store.purge(req.rid.as_str());
         let _ = req.state.apply(Event::Error(err.clone()));
         let _ = req.sink.try_send(EgressItem::Error(err)); // client may be gone
         if registered {
@@ -460,11 +465,7 @@ impl Ingress {
                 return;
             }
         };
-        // Control requests carry no tensor cell — empty `ids`.
-        if !self.ingress.try_push(IngressMsg {
-            header,
-            ids: Bytes::new(),
-        }) {
+        if !self.ingress.try_push(header) {
             self.fail(&mut req, Error::QueueFull, true); // registered
         }
     }
@@ -523,10 +524,7 @@ impl Ingress {
         // for, so report the miss rather than assuming the scheduler was told.
         match ControlRequest::AbortReq(AbortReq::new(rid.as_str().to_string(), false)).encode() {
             Ok(header) => {
-                if !self.ingress.try_push(IngressMsg {
-                    header,
-                    ids: Bytes::new(),
-                }) {
+                if !self.ingress.try_push(header) {
                     tracing::error!(
                         rid = %rid,
                         "abort dropped: ingress ring full; the scheduler keeps generating \
@@ -538,22 +536,26 @@ impl Ingress {
         }
     }
 
-    /// Serialize the tokenized request to its `TokenizedGenerateReqInput` wire and
-    /// push it onto the ingress ring for the scheduler. On backpressure, fail it.
+    /// Serialize the tokenized request to its `TokenizedGenerateReqInput` wire,
+    /// park its ids, and push the header onto the ingress ring for the
+    /// scheduler. On backpressure, fail it.
     fn push_to_ring(&self, mut req: Request) {
         // Only generate requests reach here (control uses `push_control_to_ring`).
-        // Validate + serialize while borrowing `g` immutably; the resulting `Bytes`
-        // own their data, so the borrow ends before any `fail(&mut req)`.
         let serialized = match &req.kind {
-            RequestKind::Generate(g) if g.already_tokenized() => g
-                .encode_header()
-                .map(|header| (header, g.encode_data_buf())),
+            RequestKind::Generate(g) if g.already_tokenized() => {
+                // Park strictly before the push (the drain must never see a
+                // header whose ids aren't parked); a failed push purges via
+                // `fail`.
+                self.ids_store
+                    .park(req.rid.as_str().to_owned(), g.input_ids_i64());
+                g.encode_header()
+            }
             RequestKind::Generate(_) => Err(Error::Tokenize("empty input_ids".into())),
             _ => Err(Error::Internal(
                 "non-generate request reached push_to_ring".into(),
             )),
         };
-        let (header, ids) = match serialized {
+        let header = match serialized {
             Ok(v) => v,
             Err(e) => {
                 self.fail(&mut req, e, true); // on the push path: registered
@@ -561,7 +563,7 @@ impl Ingress {
             }
         };
 
-        if !self.ingress.try_push(IngressMsg { header, ids }) {
+        if !self.ingress.try_push(header) {
             self.fail(&mut req, Error::QueueFull, true); // registered
         }
         // On success the scheduler owns the request (egress arrives by rid); we
@@ -798,6 +800,7 @@ mod tests {
             ingress_producer,
             limits,
             test_mm(mm_tx, true),
+            Default::default(),
             sd_rx,
         );
         (ingress, detok_rx, consumer, tm_tx, mm_rx)
@@ -843,6 +846,7 @@ mod tests {
                 ingress_producer,
                 test_limits(),
                 test_mm(flume::unbounded().0, true),
+                Default::default(),
                 sd_rx,
             );
 
@@ -853,7 +857,7 @@ mod tests {
                 "{source:?} must drop the detok entry",
             );
             assert_eq!(
-                consumer.drain(8).headers.len(),
+                consumer.drain(8).len(),
                 1,
                 "{source:?} must push an AbortReq so the scheduler stops",
             );
@@ -1116,7 +1120,7 @@ mod tests {
             "must deregister on reject",
         );
         assert!(
-            consumer.drain(16).headers.is_empty(),
+            consumer.drain(16).is_empty(),
             "must not reach the scheduler"
         );
     }
@@ -1152,7 +1156,7 @@ mod tests {
             "the decode job follows, ids intact",
         );
         assert!(
-            consumer.drain(16).headers.is_empty(),
+            consumer.drain(16).is_empty(),
             "must never reach the scheduler"
         );
         assert!(rx.try_recv().is_err(), "no egress until the shard answers");
@@ -1180,7 +1184,7 @@ mod tests {
         assert_eq!(err.http_status(), 400);
         assert!(err.to_string().contains("out of range"), "{err}");
         assert!(detok_rx.try_recv().is_err(), "shard never hears of it");
-        assert!(consumer.drain(16).headers.is_empty());
+        assert!(consumer.drain(16).is_empty());
     }
 
     /// A dropped ring push is survivable, and this pins WHY. The ring is bounded,
@@ -1214,6 +1218,7 @@ mod tests {
             producer,
             test_limits(),
             test_mm(flume::unbounded().0, true),
+            Default::default(),
             sd_rx,
         );
 
@@ -1498,14 +1503,11 @@ mod tests {
             },
         );
         ingress.on_abort(AbortSource::Guard("mm-gone".to_string().into()));
-        assert_eq!(consumer.drain(16).headers.len(), 1, "only the AbortReq");
+        assert_eq!(consumer.drain(16).len(), 1, "only the AbortReq");
 
         // The late result must be dropped, not queued, and the parked result purged.
         ingress.on_mm_encoded("mm-gone".to_string().into(), vec![5, 6]);
-        assert!(
-            consumer.drain(16).headers.is_empty(),
-            "cancelled, not queued"
-        );
+        assert!(consumer.drain(16).is_empty(), "cancelled, not queued");
         assert!(ingress.mm.results.take("mm-gone").is_none(), "entry purged");
     }
 
@@ -1526,16 +1528,15 @@ mod tests {
             sub.work.image_data.as_ref().and_then(|v| v.as_str()),
             Some("data:image/jpeg;base64,xxxx")
         );
-        assert!(consumer.drain(16).headers.is_empty(), "parked, not queued");
+        assert!(consumer.drain(16).is_empty(), "parked, not queued");
 
-        // The worker returns the final expanded ids → pushed to the ring.
+        // The worker returns the final expanded ids → header pushed, ids parked.
         ingress.on_mm_encoded("mm-1".to_string().into(), vec![5, 6, 7, 8]);
-        let batch = consumer.drain(16);
-        assert_eq!(batch.headers.len(), 1);
+        assert_eq!(consumer.drain(16).len(), 1);
         assert_eq!(
-            batch.lengths,
-            vec![4],
-            "expanded ids ride the columnar cell"
+            ingress.ids_store.take("mm-1"),
+            Some(vec![5, 6, 7, 8]),
+            "expanded ids must be parked for the drain"
         );
     }
 
@@ -1555,7 +1556,7 @@ mod tests {
                 if rid.as_str() == "mm-2"),
             "mm failure must deregister",
         );
-        assert!(consumer.drain(16).headers.is_empty(), "nothing queued");
+        assert!(consumer.drain(16).is_empty(), "nothing queued");
     }
 
     /// On a non-multimodal model (`Mm::enabled == false`), image_data is silently
@@ -1585,6 +1586,7 @@ mod tests {
             ingress_producer,
             test_limits(),
             test_mm(mm_tx, false),
+            Default::default(),
             sd_rx,
         );
 
@@ -1606,6 +1608,74 @@ mod tests {
         let (mut ingress, _detok_rx, consumer, _tm_tx, _mm_rx) = make_ingress();
         ingress.on_mm_encoded("ghost".to_string().into(), vec![1]);
         ingress.on_mm_failed("ghost".to_string().into(), "boom".into());
-        assert!(consumer.drain(16).headers.is_empty());
+        assert!(consumer.drain(16).is_empty());
+    }
+
+    /// An `Ingress` over a ring of `ring_cap` whose requests reach the push
+    /// path (detok lane kept open, unlike `make_ingress`'s returned receiver).
+    fn make_push_ingress(ring_cap: usize) -> (Ingress, IngressConsumer) {
+        let (tok_tx, _tok_rx) = flume::unbounded();
+        let (detok_tx, detok_rx) = flume::unbounded();
+        // Keep the detok lane open (tests end by dropping the ingress), so
+        // `register_detok` succeeds and requests reach the push path.
+        std::mem::forget(detok_rx);
+        let senders = Senders {
+            tm: flume::unbounded().0,
+            abort: flume::unbounded().0,
+            tok: tok_tx,
+            detok: vec![detok_tx],
+        };
+        let (producer, consumer) = ingress_ring(ring_cap);
+        let (sd_tx, sd_rx) = flume::unbounded::<()>();
+        std::mem::forget(sd_tx);
+        let ingress = Ingress::new(
+            flume::unbounded().1,
+            flume::unbounded().1,
+            senders,
+            producer,
+            test_limits(),
+            test_mm(flume::unbounded().0, false),
+            Default::default(),
+            sd_rx,
+        );
+        (ingress, consumer)
+    }
+
+    /// A pushed generate request = header on the ring + widened ids parked
+    /// under the rid — exactly what `Server.take_input_ids` pops.
+    #[test]
+    fn push_parks_ids_for_the_drain() {
+        let (mut ingress, consumer) = make_push_ingress(16);
+        ingress.drive(generate_req(61, SamplingParams::default()));
+
+        assert_eq!(consumer.drain(8).len(), 1, "request must reach the ring");
+        assert_eq!(
+            ingress.ids_store.take("61"),
+            Some(vec![1, 2, 3]),
+            "ids must be parked, widened to i64"
+        );
+        assert_eq!(
+            ingress.ids_store.take("61"),
+            None,
+            "take must pop, not copy"
+        );
+    }
+
+    /// Full ring: the reject must purge the just-parked entry, or every
+    /// request bounced by backpressure would leak its ids.
+    #[test]
+    fn ring_full_reject_purges_parked_ids() {
+        let (mut ingress, _consumer) = make_push_ingress(1);
+        ingress.drive(generate_req(71, SamplingParams::default())); // fills the ring
+        ingress.drive(generate_req(72, SamplingParams::default())); // QueueFull → fail
+        assert!(
+            ingress.ids_store.take("71").is_some(),
+            "accepted request stays parked"
+        );
+        assert_eq!(
+            ingress.ids_store.take("72"),
+            None,
+            "rejected request must be purged"
+        );
     }
 }

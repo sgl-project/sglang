@@ -30,8 +30,6 @@ pub use request::MmData;
 pub(crate) use sampling::{SamplingParams, SamplingParamsInput};
 pub(crate) use types::{OneOrMany, OneOrManyItem, TokenIds};
 
-use bytes::Bytes;
-
 use crate::fsm::RequestState;
 use crate::ids::Rid;
 
@@ -47,14 +45,6 @@ pub struct Request {
     pub sink: EgressSink,
     /// Discriminant + variant body (generate vs control).
     pub kind: RequestKind,
-}
-
-/// One ingress-ring entry, split columnar: the scalar `header` (msgpack, `input_ids`
-/// omitted) + the raw int64 `ids` cell, so the big tensor never goes through msgpack.
-#[derive(Debug)]
-pub struct IngressMsg {
-    pub header: Bytes,
-    pub ids: Bytes,
 }
 
 /// Messages to a Detokenizer shard. `Register` carries the per-request sink for
