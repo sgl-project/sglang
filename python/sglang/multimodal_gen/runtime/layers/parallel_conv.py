@@ -637,6 +637,9 @@ class SpatialParallelCausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
+        # Set only by the ROCm Conv3D->Conv2D fast path, to swap the inner
+        # conv without displacing the halo exchange and output trim.
+        self._halo_conv_forward = None
         self.rank = get_decode_parallel_rank()
         self.world_size = get_decode_parallel_world_size()
 
@@ -660,21 +663,20 @@ class SpatialParallelCausalConv3d(nn.Conv3d):
                 self.groups,
             )
 
+        # Bind ``super().forward`` lazily: doing it unconditionally costs two
+        # extra Dynamo frames per conv when the ROCm hook is what runs.
+        if current_platform.is_rocm() and self._halo_conv_forward is not None:
+            conv_forward = self._halo_conv_forward
+        else:
+            conv_forward = super().forward
+
         return _spatial_parallel_conv_forward(
             self,
             x,
-            self._halo_conv_forward,
+            conv_forward,
             height_pad_mode="zeros",
             match_conv3d_format=True,
         )
-
-    def _halo_conv_forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Convolve the halo-exchanged input.
-
-        Platform fast paths override this per instance instead of ``forward``,
-        so the halo exchange and output trim stay in place.
-        """
-        return nn.Conv3d.forward(self, x)
 
 
 class SpatialParallelConv3d(nn.Conv3d):
@@ -723,6 +725,9 @@ class SpatialParallelConv3d(nn.Conv3d):
         _set_conv_padding(self, (self.padding[0], 0, self.padding[2]))
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
+        # Set only by the ROCm Conv3D->Conv2D fast path, to swap the inner
+        # conv without displacing the halo exchange and output trim.
+        self._halo_conv_forward = None
         self.rank = get_decode_parallel_rank()
         self.world_size = get_decode_parallel_world_size()
 
@@ -733,21 +738,20 @@ class SpatialParallelConv3d(nn.Conv3d):
         if any(self._padding):
             x = _pad_with_mode(x, self._padding, self.padding_mode)
 
+        # Bind ``super().forward`` lazily: doing it unconditionally costs two
+        # extra Dynamo frames per conv when the ROCm hook is what runs.
+        if current_platform.is_rocm() and self._halo_conv_forward is not None:
+            conv_forward = self._halo_conv_forward
+        else:
+            conv_forward = super().forward
+
         return _spatial_parallel_conv_forward(
             self,
             x,
-            self._halo_conv_forward,
+            conv_forward,
             height_pad_mode=self.padding_mode,
             match_conv3d_format=True,
         )
-
-    def _halo_conv_forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Convolve the halo-exchanged input.
-
-        Platform fast paths override this per instance instead of ``forward``,
-        so the halo exchange and output trim stay in place.
-        """
-        return nn.Conv3d.forward(self, x)
 
     def _direct_forward(self, x):
         time_pad = self.padding[0]
