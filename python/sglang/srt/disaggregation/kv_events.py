@@ -175,10 +175,14 @@ def resolve_load_pub_range(
     if mode.lower() == "auto":
         resolved = parse_bindable_tcp(kv_endpoint)
         if resolved is None:
+            why = (
+                "--kv-events-config is not set"
+                if kv_endpoint is None
+                else f"{kv_endpoint!r} is not one"
+            )
             return None, (
                 f"--load-publish-endpoint=auto needs a bindable wildcard-host "
-                f"tcp:// --kv-events-config endpoint to pack after; got "
-                f"{kv_endpoint!r}"
+                f"tcp:// --kv-events-config endpoint to pack after; {why}"
             )
         host, kv_base = resolved
         base = kv_base + dp_size

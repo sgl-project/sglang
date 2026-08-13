@@ -446,17 +446,24 @@ class TestLoadStatIntegration(CustomTestCase):
 
         import zmq
 
-        # Explicit ephemeral port so parallel CI can't collide.
-        with _socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
-
-        pub = SchedulerLoadPublisher(
-            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
-            ps=ParallelState.trivial(),
-            load_publish_endpoint=f"tcp://*:{port}",
-        )
-        self.assertTrue(pub.enable)
+        # Probe a free port and retry: the probe-then-bind window is a TOCTOU
+        # race, and probing "" (all interfaces) matches the wildcard bind ZMQ
+        # does — loopback-free doesn't imply wildcard-free. The publisher
+        # swallows bind errors, so retry while it stays disabled.
+        pub = None
+        for _ in range(3):
+            with _socket.socket() as probe:
+                probe.bind(("", 0))
+                port = probe.getsockname()[1]
+            pub = SchedulerLoadPublisher(
+                kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
+                ps=ParallelState.trivial(),
+                load_publish_endpoint=f"tcp://*:{port}",
+            )
+            if pub.enable:
+                break
+            pub.close()
+        self.assertTrue(pub.enable, "load socket never bound a free port")
         self.addCleanup(pub.close)
 
         sub = zmq.Context.instance().socket(zmq.SUB)

@@ -240,6 +240,10 @@ class TestServerInfoKvEventsField(CustomTestCase):
         self.assertNotIn("load_topic", info["kv_events"])
 
     def test_kv_events_descriptor_carries_specific_host_and_topic(self):
+        # No --load-publish-endpoint: the KV descriptor is served but the load
+        # keys must be absent. The upgrade-safety argument rests on this
+        # staying silent by default, so pin it here (the exact-dict test opts
+        # in via 'auto').
         args = ServerArgs(
             model_path="dummy",
             kv_events_config=(
@@ -257,6 +261,8 @@ class TestServerInfoKvEventsField(CustomTestCase):
         self.assertEqual(info["kv_events"]["topic"], "kv")
         self.assertEqual(info["kv_events"]["block_size"], 128)
         self.assertEqual(info["kv_events"]["dp_size"], 1)
+        self.assertNotIn("load_endpoint_port_base", info["kv_events"])
+        self.assertNotIn("load_topic", info["kv_events"])
 
     # ----- disabled / unconfigured -------------------------------------
 
