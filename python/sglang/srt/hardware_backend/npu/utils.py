@@ -113,18 +113,25 @@ def init_npu_backend():
 def _is_nz_aligned(tensor: torch.Tensor) -> bool:
     """Check whether the last two dims satisfy FRACTAL_NZ alignment rules.
 
-    Ascend FRACTAL_NZ requires:
-      BF16 / FP16 : both dims divisible by 16
-      INT8         : k % 16 == 0  and  n % 32 == 0
+    A fractal tile is 16 rows by 32 bytes (the C0_32 in the op's error strings),
+    so the row rule is always k % 16 and the column rule is 32 // itemsize:
+
+      BF16 / FP16  : k % 16 == 0  and  n % 16 == 0
+      INT8 / FP8   : k % 16 == 0  and  n % 32 == 0
       INT4         : k % 16 == 0  and  n % 64 == 0
-      FP4          : both dims divisible by 64
+
+    Unlisted dtypes fall through to True: this is a cheap pre-filter for known
+    bad combinations, not an authority — the op itself is.
     """
     if tensor.dim() < 2:
         return False
     k, n = tensor.shape[-2], tensor.shape[-1]
     if tensor.dtype in (torch.bfloat16, torch.float16):
         return k % 16 == 0 and n % 16 == 0
-    if tensor.dtype == torch.int8:
+    if tensor.dtype in (torch.int8, torch.float8_e4m3fn):
+        # e4m3 is single-byte like int8, so it shares the column rule. Reached
+        # only by the MXFP8 MoE weights; the packed-FP4 callers pass
+        # customize_dtype and return before this check.
         return k % 16 == 0 and n % 32 == 0
     if tensor.dtype in (torch.uint8, torch.int32):
         # INT4 is typically packed into uint8/int32; be conservative

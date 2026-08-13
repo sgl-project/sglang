@@ -26,6 +26,12 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=120, stage="extra-a", runner_config="1-gpu-large")
 
+MMLU_NUM_EXAMPLES = 256
+MMLU_NUM_THREADS = 32
+# The unquantized model scores 0.68-0.70 over 256 questions; int8 gives up a
+# point or two, then the 0.05 margin the other eval thresholds use.
+MMLU_SCORE_THRESHOLD = 0.63
+
 
 class TestAutoRoundQuantization(CustomTestCase):
     @classmethod
@@ -52,12 +58,12 @@ class TestAutoRoundQuantization(CustomTestCase):
                 base_url=self.base_url,
                 model=self.model,
                 eval_name="mmlu",
-                num_examples=32,
-                num_threads=32,
+                num_examples=MMLU_NUM_EXAMPLES,
+                num_threads=MMLU_NUM_THREADS,
                 device="auto",
             )
             metrics = run_eval(args)
-            self.assertGreaterEqual(metrics["score"], 0.7)
+            self.assertGreaterEqual(metrics["score"], MMLU_SCORE_THRESHOLD)
         finally:
             kill_process_tree(process.pid)
             print(f"[INFO] Server for {self.model} stopped.")

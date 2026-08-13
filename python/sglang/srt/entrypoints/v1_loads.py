@@ -20,14 +20,35 @@ metrics for load balancing, monitoring, and capacity planning.
 
 import time
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
+from sglang.srt.utils import get_device_name
 from sglang.version import __version__
 
 router = APIRouter()
+
+
+@lru_cache(maxsize=1)
+def _accelerator_name() -> Optional[str]:
+    """Accelerator marketing name (e.g. "NVIDIA GB300"), None if unavailable."""
+    return get_device_name()
+
+
+@lru_cache(maxsize=1)
+def _num_accelerators_per_dp_rank(
+    tp_size: int,
+    pp_size: int,
+    dp_size: int,
+    enable_dp_attention: bool,
+) -> int:
+    num_accelerators = tp_size * pp_size
+    if enable_dp_attention:
+        num_accelerators //= dp_size
+    return num_accelerators
 
 
 def _get_tokenizer_manager():
@@ -87,7 +108,8 @@ async def get_loads(
         format: Response format - 'json' (default) or 'prometheus'
 
     Returns:
-        JSON response with timestamp, version, and per-DP-rank loads
+        JSON response with timestamp, version, accelerator metadata, and
+        per-DP-rank loads
     """
     include_list = [s.strip() for s in include.split(",")] if include else None
 
@@ -119,5 +141,12 @@ async def get_loads(
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": __version__,
+        "accelerator": _accelerator_name(),
+        "num_accelerators": _num_accelerators_per_dp_rank(
+            tokenizer_manager.server_args.tp_size,
+            tokenizer_manager.server_args.pp_size,
+            tokenizer_manager.server_args.dp_size,
+            tokenizer_manager.server_args.enable_dp_attention,
+        ),
         "loads": loads,
     }

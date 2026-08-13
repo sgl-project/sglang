@@ -20,6 +20,7 @@ from sglang.srt.utils.hf_transformers.common import (
     _is_deepseek_ocr_model,
     _override_v_head_dim_if_zero,
     _patch_text_config,
+    attach_additional_stop_token_ids,
     check_gguf_file,
     get_context_length,
     get_hf_text_config,
@@ -38,6 +39,72 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestGetProcessor(unittest.TestCase):
+    def test_does_not_forward_backend_to_auto_processor(self):
+        config = SimpleNamespace(model_type="test_vlm", auto_map={})
+        loaded_processor = MagicMock()
+        loaded_processor.image_processor.backend = "torchvision"
+        loaded_processor.tokenizer.chat_template = "template"
+        auto_config = MagicMock()
+        auto_config.from_pretrained.return_value = config
+        auto_processor = MagicMock()
+        auto_processor.from_pretrained.return_value = loaded_processor
+        auto_image_processor = MagicMock()
+
+        with patch.multiple(
+            processor_utils,
+            AutoConfig=auto_config,
+            AutoProcessor=auto_processor,
+            AutoImageProcessor=auto_image_processor,
+        ):
+            processor_utils.get_processor(
+                "test-model", image_processor_backend="torchvision"
+            )
+
+        call_kwargs = auto_processor.from_pretrained.call_args.kwargs
+        self.assertNotIn("backend", call_kwargs)
+        self.assertNotIn("use_fast", call_kwargs)
+        auto_image_processor.from_pretrained.assert_not_called()
+
+    def test_applies_pil_backend_only_to_image_processor(self):
+        config = SimpleNamespace(model_type="test_vlm", auto_map={})
+
+        for processor_kwargs in (
+            {"image_processor_backend": "pil"},
+            {"use_fast": False},
+        ):
+            with self.subTest(processor_kwargs=processor_kwargs):
+                loaded_processor = MagicMock()
+                loaded_processor.image_processor.backend = "torchvision"
+                loaded_processor.tokenizer.chat_template = "template"
+                pil_processor = MagicMock(backend="pil")
+                auto_config = MagicMock()
+                auto_config.from_pretrained.return_value = config
+                auto_processor = MagicMock()
+                auto_processor.from_pretrained.return_value = loaded_processor
+                auto_image_processor = MagicMock()
+                auto_image_processor.from_pretrained.return_value = pil_processor
+
+                with patch.multiple(
+                    processor_utils,
+                    AutoConfig=auto_config,
+                    AutoProcessor=auto_processor,
+                    AutoImageProcessor=auto_image_processor,
+                ):
+                    processor = processor_utils.get_processor(
+                        "test-model", **processor_kwargs
+                    )
+
+                call_kwargs = auto_processor.from_pretrained.call_args.kwargs
+                self.assertNotIn("backend", call_kwargs)
+                self.assertNotIn("use_fast", call_kwargs)
+                auto_image_processor.from_pretrained.assert_called_once_with(
+                    "test-model",
+                    trust_remote_code=False,
+                    revision=None,
+                    backend="pil",
+                )
+                self.assertIs(processor.image_processor, pil_processor)
+
     def test_resolves_model_name_before_loading_config(self):
         remote_model = "s3://bucket/model"
         local_model = "/cache/model"
@@ -449,6 +516,37 @@ class TestGetHfTextConfig(unittest.TestCase):
         get_hf_text_config(cfg)
         self.assertIn("type", cfg.rope_scaling)
         self.assertEqual(cfg.rope_scaling["type"], "llama3")
+
+
+# ---------------------------------------------------------------------------
+# attach_additional_stop_token_ids
+# ---------------------------------------------------------------------------
+
+
+class TestAttachAdditionalStopTokenIds(unittest.TestCase):
+    """Bug regression: the Inkling bundle ships eos metadata unset while its
+    turn-final marker <|content_model_end_sampling|> sits in added_tokens; the
+    old detector only recognized <|eom_id|>, so generation ran to max length
+    (documented by the Inkling GSM8K test)."""
+
+    @staticmethod
+    def _tokenizer(added):
+        return SimpleNamespace(get_added_vocab=lambda: added)
+
+    def test_inkling_end_sampling_registers_as_stop(self):
+        tok = self._tokenizer({"<|content_model_end_sampling|>": 200006})
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {200006})
+
+    def test_eom_id_still_registers_as_stop(self):
+        tok = self._tokenizer({"<|eom_id|>": 128008})
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {128008})
+
+    def test_no_known_marker_yields_none(self):
+        tok = self._tokenizer({"<|other|>": 7})
+        attach_additional_stop_token_ids(tok)
+        self.assertIsNone(tok.additional_stop_token_ids)
 
 
 # ---------------------------------------------------------------------------

@@ -138,6 +138,7 @@ class TritonRunnerCore(MoeRunnerCore):
             running_state["config"],
             running_state.get("down_config"),
             running_state.get("down_moe_use_tma", False),
+            running_state.get("up_moe_use_tma", False),
             b1=quant_info.b13,
             b2=quant_info.b2,
             use_fp8_w8a8=quant_info.use_fp8_w8a8,
@@ -217,6 +218,15 @@ def fused_experts_none_to_triton(
             fused_experts,
         )
 
+        # SGLANG_OPT_MOE_QUANT_ONCE: use the caller's pre-quantized activation
+        # (per-token-group-128 fp8 q + scales) instead of re-quantizing inside
+        # invoke_fused_moe_kernel.
+        pre_quant = dispatch_output.hidden_states_pre_quant
+        if pre_quant is not None:
+            a1_q, a1_scale = pre_quant
+        else:
+            a1_q, a1_scale = None, quant_info.a13_scale
+
         output = fused_experts(
             hidden_states=dispatch_output.hidden_states,
             w1=quant_info.w13_weight,
@@ -234,9 +244,10 @@ def fused_experts_none_to_triton(
             w2_scale=quant_info.w2_scale,
             w1_zp=quant_info.w13_zp,
             w2_zp=quant_info.w2_zp,
-            a1_scale=quant_info.a13_scale,
+            a1_scale=a1_scale,
             a2_scale=quant_info.a2_scale,
             block_shape=quant_info.block_shape,
+            a1_q=a1_q,
         )
 
     return StandardCombineInput(
@@ -270,6 +281,7 @@ def pre_permute_standard_to_triton(
         config,
         down_config,
         down_moe_use_tma,
+        up_moe_use_tma,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -289,6 +301,7 @@ def pre_permute_standard_to_triton(
     running_state["config"] = config
     running_state["down_config"] = down_config
     running_state["down_moe_use_tma"] = down_moe_use_tma
+    running_state["up_moe_use_tma"] = up_moe_use_tma
 
     return TritonRunnerInput(
         hidden_states=hidden_states,

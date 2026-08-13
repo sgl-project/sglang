@@ -3,7 +3,10 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.configs.model_config import get_hybrid_layer_ids
+from sglang.srt.configs.model_config import (
+    get_hybrid_layer_ids,
+    is_embedding_gemma,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -33,6 +36,20 @@ class TestHybridLayerIds(CustomTestCase):
                     get_hybrid_layer_ids([architecture], config),
                     ([0, 2], [1, 3]),
                 )
+
+
+class TestEmbeddingGemmaConfig(CustomTestCase):
+    def test_detects_bidirectional_gemma3_text_config(self):
+        config = SimpleNamespace(
+            model_type="gemma3_text", use_bidirectional_attention=True
+        )
+        self.assertTrue(is_embedding_gemma(config))
+
+    def test_does_not_misclassify_causal_gemma3(self):
+        config = SimpleNamespace(
+            model_type="gemma3_text", use_bidirectional_attention=False
+        )
+        self.assertFalse(is_embedding_gemma(config))
 
 
 if __name__ == "__main__":

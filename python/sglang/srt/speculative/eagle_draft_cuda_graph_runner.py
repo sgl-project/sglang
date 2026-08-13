@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -35,7 +34,7 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_flags, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
@@ -47,6 +46,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
+from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
@@ -120,7 +120,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.speculative_num_steps = (
-            model_runner.server_args.speculative_num_steps
+            get_spec().speculative_num_steps
             if speculative_num_steps is None
             else speculative_num_steps
         )
@@ -147,11 +147,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Bucket sizes
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
         # Static capture width.
-        self.num_tokens_per_req = resolve_num_tokens_per_req(
+        self.captured_req_width = resolve_num_tokens_per_req(
             phase="draft_decode", server_args=model_runner.server_args
         )
         self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_req
+        self.max_num_token = self.max_bs * self.captured_req_width
 
         # Attention backend init
         self.draft_attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
@@ -292,6 +292,17 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # can_run_graph
     # -----------------------------------------------------------------
     def can_run_graph(self, forward_batch: ForwardBatch):
+        # Uniform-width replay invariant: the batch's actual per-request width
+        # must match this runner's capture width; anything else falls back to
+        # eager. (Unset widths pass: not every path fills the field yet.)
+        spec_info = forward_batch.spec_info
+        if (
+            spec_info is not None
+            and spec_info.num_tokens_per_req > 0
+            and spec_info.num_tokens_per_req != self.captured_req_width
+        ):
+            return False
+
         if self.require_mlp_tp_gather:
             # Raw sync values are per-rank request counts on decode-family rounds.
             cuda_graph_bs = max(forward_batch.original_global_num_tokens_cpu)
@@ -299,7 +310,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             cuda_graph_bs = forward_batch.batch_size
 
         is_bs_supported = (
-            self.backend.can_run(forward_batch, cuda_graph_bs)
+            self.backend.can_run(forward_batch, self._make_graph_key(cuda_graph_bs))
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
@@ -321,7 +332,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     ):
         num_seqs = size  # EAGLE legacy name
         buffers = self.buffers
-        num_tokens = num_seqs * self.num_tokens_per_req
+        num_tokens = num_seqs * self.captured_req_width
 
         # Graph inputs
         req_pool_indices = buffers.req_pool_indices[:num_seqs]
@@ -468,12 +479,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 self,
                 run_once,
                 post_warmup_hook=post_warmup_hook,
-                skip_logits=False,
+                run_lm_head=True,
             )
             self.backend.capture_one(
                 shape_key,
                 run_once,
-                dummies=None,
+                capture_inputs=None,
                 post_warmup_hook=post_warmup_hook,
             )
 
@@ -492,13 +503,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         buffers = self.buffers
 
         raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_req
+        raw_num_token = raw_bs * self.captured_req_width
 
         # Pad to nearest captured shape
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
-                max_num_tokens // self.num_tokens_per_req
+                max_num_tokens // self.captured_req_width
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 else max_num_tokens
@@ -525,7 +536,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 buffers.dsa_seed_topk.zero_()
             buffers.req_pool_indices.zero_()
 
-        num_tokens = bs * self.num_tokens_per_req
+        num_tokens = bs * self.captured_req_width
 
         maybe_detect_nan(
             forward_batch.spec_info.topk_p,
@@ -600,9 +611,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
-            buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_req)
+            buffers.global_num_tokens_gpu.fill_(bs * self.captured_req_width)
             buffers.global_num_tokens_for_logprob_gpu.fill_(
-                bs * self.num_tokens_per_req
+                bs * self.captured_req_width
             )
 
         # Save the raw seq_lens_sum; it is restored after replay. While the graph
@@ -642,12 +653,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Replay via backend
         shape_key = self._make_graph_key(bs)
-        timer_ctx = (
-            self.model_runner.device_timer.wrap(metadata={"category": "eagle_draft"})
-            if self.model_runner.device_timer
-            else contextlib.nullcontext()
-        )
-        with timer_ctx:
+        with device_timer_ctx(self.model_runner.device_timer, "eagle_draft"):
             out = self._replay_graph(shape_key, forward_batch)
         if self.buffers.dsa_seed_topk is not None:
             forward_batch.spec_info.dsa_topk_indices = None

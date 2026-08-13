@@ -4,14 +4,11 @@ import argparse
 import asyncio
 import copy
 import doctest
+import importlib.util
 import inspect
 import json
 import logging
 import os
-
-# Registered tests run with the strict config-mutation guard: bare
-# server_args assignments after resolution raise (use ServerArgs.override).
-os.environ.setdefault("SGLANG_STRICT_CONFIG_MUTATION", "1")
 import random
 import re
 import shlex
@@ -22,7 +19,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from functools import partial, wraps
+from functools import wraps
 from io import BytesIO
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -49,7 +46,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.network import is_port_available
 from sglang.test.run_eval import run_eval
-from sglang.utils import get_exception_traceback, normalize_base_url
+from sglang.utils import normalize_base_url
 
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
@@ -182,6 +179,22 @@ def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Ima
             time.sleep(2**i)
 
 
+def build_vlm_image_prompt(processor, question: str) -> str:
+    # Take the image placeholder from the model's own HF chat template: a
+    # hand-written one silently degrades to a text-only prompt on any model
+    # whose placeholder differs.
+    return processor.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": question}],
+            }
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
 def is_in_ci():
     """Return whether it is in CI runner."""
     return get_bool_env_var("SGLANG_IS_IN_CI")
@@ -200,6 +213,23 @@ def is_blackwell_system():
 def is_h200_system():
     """Return whether it is running on an H200 system."""
     return envs.IS_H200.get()
+
+
+def is_rust_server_built():
+    """Return whether the embedded Rust server extension (``SGLANG_RUST_SERVER``)
+    is importable.
+
+    ``sglang/srt/server/`` is not in the source tree — it is produced by
+    ``setup.py build_rust --inplace``, so on a build without it ``find_spec``
+    raises ``ModuleNotFoundError`` for the missing *parent* package rather than
+    returning ``None`` for the missing leaf. Suites gate a rust-server subclass on
+    this at class-definition time, so letting that escape would fail the whole
+    module import instead of skipping the one class.
+    """
+    try:
+        return importlib.util.find_spec("sglang.srt.server._core") is not None
+    except ModuleNotFoundError:
+        return False
 
 
 def _use_cached_default_models(model_repo: str):
@@ -230,22 +260,8 @@ if is_blackwell_system():
 if is_h200_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
 
-
-def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
-    assert url is not None
-
-    data = {
-        "inputs": prompt,
-        "parameters": {
-            "temperature": temperature,
-            "max_new_tokens": max_tokens,
-            "stop_sequences": stop,
-        },
-    }
-    res = requests.post(url, json=data)
-    assert res.status_code == 200
-    pred = res.json()["generated_text"][0]
-    return pred
+if is_in_ci() and is_xpu():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1800
 
 
 def find_available_port(base_port: int):
@@ -257,174 +273,6 @@ def find_available_port(base_port: int):
             port += 42
         else:
             port -= 43
-
-
-def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None):
-    assert url is not None
-
-    data = {
-        "prompt": prompt,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stop": stop,
-        "n": n,
-    }
-    res = requests.post(url, json=data)
-    assert res.status_code == 200
-    if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
-    else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
-    return pred
-
-
-def call_generate_outlines(
-    prompt, temperature, max_tokens, stop=None, regex=None, n=1, url=None
-):
-    assert url is not None
-
-    data = {
-        "prompt": prompt,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stop": stop,
-        "regex": regex,
-        "n": n,
-    }
-    res = requests.post(url, json=data)
-    assert res.status_code == 200
-    if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
-    else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
-    return pred
-
-
-def call_generate_srt_raw(prompt, temperature, max_tokens, stop=None, url=None):
-    assert url is not None
-
-    data = {
-        "text": prompt,
-        "sampling_params": {
-            "temperature": temperature,
-            "max_new_tokens": max_tokens,
-            "stop": stop,
-        },
-    }
-    res = requests.post(url, json=data)
-    assert res.status_code == 200
-    obj = res.json()
-    pred = obj["text"]
-    return pred
-
-
-def call_generate_guidance(
-    prompt, temperature, max_tokens, stop=None, n=1, regex=None, model=None
-):
-    assert model is not None
-    from guidance import gen
-
-    rets = []
-    for _ in range(n):
-        out = (
-            model
-            + prompt
-            + gen(
-                name="answer",
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stop=stop,
-                regex=regex,
-            )
-        )
-        rets.append(out["answer"])
-    return rets if n > 1 else rets[0]
-
-
-def call_select_lightllm(context, choices, url=None):
-    assert url is not None
-
-    scores = []
-    for i in range(len(choices)):
-        data = {
-            "inputs": context + choices[i],
-            "parameters": {
-                "max_new_tokens": 1,
-            },
-        }
-        res = requests.post(url, json=data)
-        assert res.status_code == 200
-        scores.append(0)
-    return np.argmax(scores)
-
-
-def call_select_vllm(context, choices, url=None):
-    assert url is not None
-
-    scores = []
-    for i in range(len(choices)):
-        data = {
-            "prompt": context + choices[i],
-            "max_tokens": 1,
-            "prompt_logprobs": 1,
-        }
-        res = requests.post(url, json=data)
-        assert res.status_code == 200
-        scores.append(res.json().get("prompt_score", 0))
-    return np.argmax(scores)
-
-    """
-    Modify vllm/entrypoints/api_server.py
-
-    if final_output.prompt_logprobs is not None:
-        score = np.mean([prob[t_id] for t_id, prob in zip(final_output.prompt_token_ids[1:], final_output.prompt_logprobs[1:])])
-        ret["prompt_score"] = score
-    """
-
-
-def call_select_guidance(context, choices, model=None):
-    assert model is not None
-    from guidance import select
-
-    out = model + context + select(choices, name="answer")
-    return choices.index(out["answer"])
-
-
-def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
-    parser.add_argument("--parallel", type=int, default=64)
-    parser.add_argument("--host", type=str, default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=None)
-    parser.add_argument(
-        "--backend",
-        type=str,
-        required=True,
-        choices=[
-            "vllm",
-            "outlines",
-            "lightllm",
-            "gserver",
-            "guidance",
-            "srt-raw",
-            "llama.cpp",
-        ],
-    )
-    parser.add_argument("--n-ctx", type=int, default=4096)
-    parser.add_argument(
-        "--model-path", type=str, default="meta-llama/Llama-2-7b-chat-hf"
-    )
-    parser.add_argument("--result-file", type=str, default="result.jsonl")
-    args = parser.parse_args()
-
-    if args.port is None:
-        default_port = {
-            "vllm": 21000,
-            "outlines": 21000,
-            "lightllm": 22000,
-            "srt-raw": 30000,
-            "gserver": 9988,
-        }
-        args.port = default_port.get(args.backend, None)
-    return args
 
 
 def auto_config_device() -> str:
@@ -471,71 +319,6 @@ def select_sglang_backend(args: argparse.Namespace):
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
     return backend
-
-
-def _get_call_generate(args: argparse.Namespace):
-    base_url = normalize_base_url(args.host, args.port)
-    if args.backend == "lightllm":
-        return partial(call_generate_lightllm, url=f"{base_url}/generate")
-    elif args.backend == "vllm":
-        return partial(call_generate_vllm, url=f"{base_url}/generate")
-    elif args.backend == "srt-raw":
-        return partial(call_generate_srt_raw, url=f"{base_url}/generate")
-    elif args.backend == "outlines":
-        return partial(call_generate_outlines, url=f"{base_url}/generate")
-    elif args.backend == "guidance":
-        from guidance import models
-
-        model = models.LlamaCpp(args.model_path, n_gpu_layers=-1, n_ctx=args.n_ctx)
-        call_generate = partial(call_generate_guidance, model=model)
-        call_generate("Hello,", 1.0, 8, ".")
-        return call_generate
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
-
-
-def _get_call_select(args: argparse.Namespace):
-    base_url = normalize_base_url(args.host, args.port)
-    if args.backend == "lightllm":
-        return partial(call_select_lightllm, url=f"{base_url}/generate")
-    elif args.backend == "vllm":
-        return partial(call_select_vllm, url=f"{base_url}/generate")
-    elif args.backend == "guidance":
-        from guidance import models
-
-        model = models.LlamaCpp(args.model_path, n_gpu_layers=-1, n_ctx=args.n_ctx)
-        call_select = partial(call_select_guidance, model=model)
-
-        call_select("Hello,", ["world", "earth"])
-        return call_select
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
-
-
-def get_call_generate(args: argparse.Namespace):
-    call_generate = _get_call_generate(args)
-
-    def func(*args, **kwargs):
-        try:
-            return call_generate(*args, **kwargs)
-        except Exception:
-            print("Exception in call_generate:\n" + get_exception_traceback())
-            raise
-
-    return func
-
-
-def get_call_select(args: argparse.Namespace):
-    call_select = _get_call_select(args)
-
-    def func(*args, **kwargs):
-        try:
-            return call_select(*args, **kwargs)
-        except Exception:
-            print("Exception in call_select:\n" + get_exception_traceback())
-            raise
-
-    return func
 
 
 def _get_default_models():
@@ -768,6 +551,11 @@ def _subprocess_popen_with_outputs(
     env: Optional[dict],
     return_stdout_stderr: Optional[tuple],
 ) -> subprocess.Popen:
+    # Release allocator-cached GPU memory to the driver before spawning a
+    # server: cached blocks stay cudaMalloc'd and shrink the child's memory.
+    if torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+
     if not return_stdout_stderr:
         return subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
@@ -922,6 +710,11 @@ def popen_launch_server(
         merged.update(env)
         env = merged
 
+    # A dying predecessor can hold the derived port plan past
+    # kill_process_tree() while GPU teardown completes; give CI launches
+    # teardown-sized patience (see wait_port_available).
+    env.setdefault("SGLANG_WAIT_PORT_TIMEOUT", "120")
+
     # Store per-run marker path for potential invalidation
     per_run_marker_path = None
     try:
@@ -1034,6 +827,27 @@ def popen_launch_server(
     if "exited" in error_msg:
         raise Exception(error_msg + ". Check server logs for errors.")
     raise TimeoutError(error_msg)
+
+
+def terminate_and_kill_process_tree(
+    process,
+    terminate_timeout: float = 60,
+    **kill_kwargs,
+) -> None:
+    """Shut a launched server down gracefully, then SIGKILL whatever is left.
+
+    A bare ``kill_process_tree`` leaves the kernel to unwind the CUDA context
+    and unpin the host memory during process reclaim, which can hold GPU memory
+    for minutes on a busy host -- long enough to trip the per-class GPU-idle
+    gate in the next ``setUpClass``. SIGTERM first so the server releases those
+    resources in userspace.
+    """
+    process.terminate()
+    try:
+        process.wait(timeout=terminate_timeout)
+    except subprocess.TimeoutExpired:
+        pass
+    kill_process_tree(process.pid, **kill_kwargs)
 
 
 def popen_launch_pd_server(
@@ -2177,6 +1991,132 @@ def maybe_stub_sgl_kernel():
     sys.meta_path.insert(0, _SglKernelFinder())
 
 
+_GPU_IDLE_TIMEOUT_SECS = 30.0
+_GPU_IDLE_POLL_INTERVAL_SECS = 2.0
+_GPU_IDLE_USED_MEMORY_THRESHOLD = 2 << 30  # 2 GiB
+
+
+def _format_gib(num_bytes: Optional[int]) -> str:
+    if num_bytes is None:
+        return "N/A"
+    return f"{num_bytes / (1 << 30):.2f} GiB"
+
+
+def _visible_gpu_indices(pynvml) -> List[int]:
+    num_gpus = pynvml.nvmlDeviceGetCount()
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        return list(range(num_gpus))
+    entries = [entry.strip() for entry in visible.split(",") if entry.strip()]
+    if not all(entry.isdigit() for entry in entries):
+        # UUID-style entries; fall back to checking all GPUs.
+        return list(range(num_gpus))
+    return [int(entry) for entry in entries if int(entry) < num_gpus]
+
+
+def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
+    self_pid = os.getpid()
+    reports = []
+    for index in gpu_indices:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        used_bytes = pynvml.nvmlDeviceGetMemoryInfo(handle).used
+        if used_bytes < _GPU_IDLE_USED_MEMORY_THRESHOLD:
+            continue
+        try:
+            procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        except pynvml.NVMLError:
+            procs = None
+        if procs is not None:
+            # Discount our own usage: the caching allocator retains memory
+            # across test classes, and waiting on ourselves never succeeds.
+            self_used = sum(
+                proc.usedGpuMemory or 0 for proc in procs if proc.pid == self_pid
+            )
+            if used_bytes - self_used < _GPU_IDLE_USED_MEMORY_THRESHOLD:
+                continue
+            proc_info = ", ".join(
+                f"pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
+                for proc in procs
+                if proc.pid != self_pid
+            ) or (
+                f"no other compute processes;"
+                f" self pid={self_pid} holds {_format_gib(self_used)}"
+            )
+        else:
+            proc_info = ""
+        reports.append(
+            f"GPU {index} uses {_format_gib(used_bytes)}"
+            f" ({proc_info or 'no compute processes found'})"
+        )
+    return reports
+
+
+def _wait_for_gpu_idle_in_ci(
+    timeout: float = _GPU_IDLE_TIMEOUT_SECS,
+    poll_interval: float = _GPU_IDLE_POLL_INTERVAL_SECS,
+) -> None:
+    """Wait until visible GPUs release residual memory from earlier tests.
+
+    Killed server processes return GPU memory asynchronously; launching the
+    next server too early makes memory profiling over-commit the KV cache and
+    OOM. Abort with the offending processes if the memory is never returned.
+    """
+    if not is_in_ci():
+        return
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        # Non-NVIDIA runner (CPU/AMD) or NVML unavailable; nothing to check.
+        return
+    try:
+        gpu_indices = _visible_gpu_indices(pynvml)
+        deadline = time.monotonic() + timeout
+        while True:
+            busy_reports = _collect_busy_gpu_reports(pynvml, gpu_indices)
+            if not busy_reports:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"GPU(s) still not idle after waiting {timeout:.0f}s "
+                    f"before setUpClass: {'; '.join(busy_reports)}"
+                )
+            print(
+                f"[CI GPU Idle] Waiting for GPU to become idle: "
+                f"{'; '.join(busy_reports)}",
+                flush=True,
+            )
+            time.sleep(poll_interval)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
+def server_args_variant(server_args, **fields):
+    """A modified deep copy of a config, for a test double whose fixture
+    differs from the (possibly published, read-only) config it starts from.
+    The receiver is untouched; the copy keeps its read-only guard.
+
+    A name may also shadow a method with a fixture value (the runner kits set
+    ``use_mla_backend``, a method ModelRunner itself overwrites at init);
+    names that exist nowhere on the class fail loudly."""
+    variant = copy.deepcopy(server_args)
+    cls = type(variant)
+    unknown = {
+        name
+        for name in fields
+        if name not in cls.__dataclass_fields__ and not hasattr(cls, name)
+    }
+    if unknown:
+        raise ValueError(f"unknown ServerArgs field(s): {sorted(unknown)}")
+    for name, value in fields.items():
+        object.__setattr__(variant, name, value)
+    return variant
+
+
 class CustomTestCase(unittest.TestCase):
 
     def __init_subclass__(cls, **kwargs):
@@ -2193,6 +2133,7 @@ class CustomTestCase(unittest.TestCase):
 
         def safe_setUpClass(klass):
             try:
+                _wait_for_gpu_idle_in_ci()
                 orig_func(klass)
             except Exception:
                 # Best-effort cleanup; suppress teardown errors so the
@@ -2280,12 +2221,6 @@ class ModelLaunchSettings:
         for fixed_arg in fixed_args:
             if fixed_arg not in self.extra_args:
                 self.extra_args.append(fixed_arg)
-
-
-class ModelEvalMetrics:
-    def __init__(self, accuracy: float, eval_time: float):
-        self.accuracy = accuracy
-        self.eval_time = eval_time
 
 
 def extract_trace_link_from_bench_one_batch_server_output(output: str) -> str:
