@@ -383,9 +383,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.full_attn_allocator.free_segment(free_index, start_pos=start_pos)
 
-        # The SWA side needs a page-aligned start (a page's mapping is read at
-        # its first token); cache_protected_len comes from prefix matching and
-        # is not, so fall back rather than assert.
+        # Both fallbacks are load-bearing, not defensive. Radix caches free tree
+        # node values and have no per-request SWA frontier to state, so they
+        # pass None. And cache_protected_len is only asserted page-aligned
+        # inside free_swa_out_of_window_slots, which a request that finishes
+        # before its first window eviction never runs. The SWA side needs an
+        # aligned start because a page's mapping is read at its first token.
         alive = max(start_pos, swa_alive_from) if swa_alive_from is not None else None
         if alive is None or alive % self.page_size != 0:
             self.free_swa(free_index)

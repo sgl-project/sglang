@@ -20,7 +20,7 @@ Page-aligned memory pool.
 """
 
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -270,11 +270,18 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             self._debug_check_no_duplicate_pages()
 
-    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+    def free_segment(
+        self,
+        free_index: torch.Tensor,
+        *,
+        start_pos: int,
+        swa_alive_from: Optional[int] = None,
+    ):
         """Fixed-shape counterpart of free(): a page's tokens sit consecutively
         in the kv row, so page representatives are stride slices -- no
         torch.unique, whose data-dependent output shape forces a device sync.
-        Contract: see base; a page must be freed by only one call per group."""
+        Contract: see base; a page must be freed by only one call per group.
+        ``swa_alive_from`` is inert here -- there is no SWA side to keep alive."""
         if free_index.numel() == 0:
             return
 

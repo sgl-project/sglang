@@ -5,11 +5,13 @@ SWATokenToKVPoolAllocator.free_swa_segment for why the data-dependent ops are av
     python -m pytest test/registered/unit/mem_cache/test_swa_free_segment.py -v
 """
 
+import inspect
 import unittest
 from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -163,6 +165,45 @@ class TestOptOuts(unittest.TestCase):
             UnifiedSWATokenToKVPoolAllocator.free_swa_segment,
             SWATokenToKVPoolAllocator.free_swa_segment,
         )
+
+
+def _subclasses(cls):
+    for sub in cls.__subclasses__():
+        yield sub
+        yield from _subclasses(sub)
+
+
+class TestOverrideSignatures(unittest.TestCase):
+    def test_overrides_accept_every_base_kwarg(self):
+        """An override that drops a kwarg the base declares TypeErrors at its
+        first caller, and only on the config that reaches that subclass -- so
+        neither a CPU suite nor one model's e2e run catches it. Checks the whole
+        family at once rather than one signature at a time."""
+        checked = set()
+        for name in ("free_segment", "free_swa_segment", "free_page_reps"):
+            want = set(
+                inspect.signature(getattr(BaseTokenToKVPoolAllocator, name)).parameters
+            )
+            for cls in _subclasses(BaseTokenToKVPoolAllocator):
+                impl = cls.__dict__.get(name)
+                if impl is None:
+                    continue
+                checked.add(f"{cls.__name__}.{name}")
+                missing = want - set(inspect.signature(impl).parameters)
+                self.assertFalse(
+                    missing,
+                    f"{cls.__name__}.{name} drops {sorted(missing)}; a caller "
+                    f"passing them would TypeError",
+                )
+
+        # __subclasses__ only sees imported modules, so a vacuous pass is the
+        # real risk here.
+        for expected in (
+            "PagedTokenToKVPoolAllocator.free_segment",
+            "SWATokenToKVPoolAllocator.free_swa_segment",
+            "UnifiedSWATokenToKVPoolAllocator.free_swa_segment",
+        ):
+            self.assertIn(expected, checked)
 
 
 if __name__ == "__main__":
