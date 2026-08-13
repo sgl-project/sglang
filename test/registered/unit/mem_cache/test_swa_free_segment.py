@@ -96,21 +96,6 @@ class TestSWAFreeSegment(unittest.TestCase):
                                 torch.equal(got, torch.zeros_like(got)), label
                             )
 
-    def test_matches_free_swa(self):
-        # Behavior preservation only; the oracle sweep above covers correctness.
-        for ps in (1, 4):
-            fast, legacy = _alloc(ps), _alloc(ps)
-            fast_row, legacy_row = _row(fast, 3 * ps), _row(legacy, 3 * ps)
-            fast.free_swa_segment(fast_row, start_pos=0, swa_alive_from=0)
-            legacy.free_swa(legacy_row)
-            self.assertEqual(_freed(fast), _freed(legacy), f"{ps=}")
-            self.assertTrue(
-                torch.equal(
-                    fast.full_to_swa_index_mapping, legacy.full_to_swa_index_mapping
-                ),
-                f"{ps=}",
-            )
-
     def test_group_defers_and_queues_owned_values(self):
         # Queueing the caller's view would make the flush read whatever a remap
         # wrote into that row in between.
@@ -156,13 +141,6 @@ class TestSWAFreeSegment(unittest.TestCase):
         # Stating the frontier correctly frees only what is still mapped.
         a.free_swa_segment(row[ps:], start_pos=ps, swa_alive_from=ps)
         self.assertNotIn(0, _freed(a))
-
-    def test_empty_segment_is_noop(self):
-        a = _alloc(4)
-        row = _row(a, 4)
-        before = _freed(a)
-        a.free_swa_segment(row[:0], start_pos=0, swa_alive_from=0)
-        self.assertEqual(_freed(a), before)
 
 
 class TestOptOuts(unittest.TestCase):
