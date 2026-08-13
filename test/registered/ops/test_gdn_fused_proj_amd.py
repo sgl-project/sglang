@@ -99,7 +99,7 @@ class TestGdnFusedProjAmd(CustomTestCase):
 
         for merged in (False, True):
             for seq_len in (1, 4, 37, 256):
-                for num_heads_qk, num_heads_v in ((16, 32), (8, 32), (4, 16)):
+                for num_heads_qk, num_heads_v in ((16, 32), (8, 32), (4, 16), (4, 32)):
                     with self.subTest(
                         merged=merged,
                         seq_len=seq_len,
