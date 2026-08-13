@@ -65,9 +65,8 @@ class TestLoadStatWire(CustomTestCase):
             )
         )
         decoded = msgspec.msgpack.Decoder().decode(raw)
-        # omit_defaults does not trim trailing fields of an array_like struct,
-        # so attn_dp_rank is always emitted — the publisher stamps its rank,
-        # but a decoder must also tolerate a null there, not an absent element.
+        # LoadStat sets no omit_defaults, so the trailing field is always
+        # emitted (null when unset); a decoder must tolerate it.
         self.assertEqual(decoded, ["LoadStat", 0, 0, 0, 0, None])
 
 
@@ -374,36 +373,14 @@ class TestLoadPublisherGating(CustomTestCase):
         # Regression: the counter must reset when the throttle PASSES, not
         # when a send happens. Resetting only on the send path let one dedup
         # hit saturate the counter, running the O(queue) provider every step.
-        # Time advances past the compute floor each call, so the counter is
-        # what gates: a working counter fires the provider at counts 5 and 10.
+        # A working counter fires the provider at counts 5 and 10.
         pub, _ = self._build()
         provider = self._provider(running=1)
-        clock = [100.0]
         with patch(
             "sglang.srt.managers.scheduler_components.load_publisher.time"
         ) as fake_time:
-            fake_time.monotonic.side_effect = lambda: clock[0]
+            fake_time.monotonic.return_value = 100.0
             for _ in range(10):
-                clock[0] += 0.1
-                pub.publish_load_stat(provider)
-            self.assertEqual(provider.call_count, 2)
-
-    def test_provider_is_floored_on_the_stalled_spin_path(self):
-        # A no-batch stall spins on_idle without sleeping, calling non-forced
-        # at loop rate; the compute floor must bound the O(queue) provider
-        # regardless of how often the counter clears.
-        pub, _ = self._build()
-        provider = self._provider(running=1)
-        clock = [100.0]
-        with patch(
-            "sglang.srt.managers.scheduler_components.load_publisher.time"
-        ) as fake_time:
-            fake_time.monotonic.side_effect = lambda: clock[0]
-            for _ in range(100):  # time frozen: floor lets the provider run once
-                pub.publish_load_stat(provider)
-            self.assertEqual(provider.call_count, 1)
-            clock[0] += 0.06  # floor elapsed
-            for _ in range(5):  # next counter pass clears the floor too
                 pub.publish_load_stat(provider)
             self.assertEqual(provider.call_count, 2)
 

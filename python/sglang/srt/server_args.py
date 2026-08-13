@@ -1608,7 +1608,7 @@ class ServerArgs:
     ] = None
     load_publish_endpoint: A[
         Optional[str],
-        "Bind address for the runtime-load PUB socket that load-aware routers subscribe to, e.g. tcp://*:6000; rank r binds port+r and /server_info advertises the base under the kv_events block. Must be a wildcard-host TCP address (a concrete host would be connected to, not bound). Defaults to the dp_size ports packed after the --kv-events-config range; set it explicitly to move the range off a port conflict, or to the literal 'off' to disable load publishing while keeping KV events. Routers discover the base through /server_info, so load publishing requires --kv-events-config to describe a publisher either way.",
+        "Bind address for the runtime-load PUB socket that load-aware routers subscribe to, e.g. tcp://*:6000; rank r binds port+r and /server_info advertises the base under the kv_events block. Must be a wildcard-host TCP address (a concrete host would be connected to, not bound). Defaults to the dp_size ports packed after the --kv-events-config range; set it explicitly to move the range off a port conflict, or to the literal 'off' to disable load publishing while keeping KV events. Requires --kv-events-config to describe a publisher (routers discover the base through /server_info); startup fails if this is set without one, is not bindable, or overlaps the KV range.",
         NS("observability"),
     ] = None
     enable_forward_pass_metrics: A[
@@ -9174,22 +9174,36 @@ class ServerArgs:
                 "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
             )
 
-        # Fail fast at the entrypoint rather than in a scheduler subprocess log.
-        if self.load_publish_endpoint and self.load_publish_endpoint != "off":
-            if not self.kv_events_config:
-                raise ValueError(
-                    "--load-publish-endpoint requires --kv-events-config: routers"
-                    " discover the load range through /server_info's kv_events"
-                    " block, absent without a publisher."
-                )
-            from sglang.srt.disaggregation.kv_events import parse_bindable_tcp
+        self.check_load_publish_args()
 
-            if parse_bindable_tcp(self.load_publish_endpoint) is None:
-                raise ValueError(
-                    f"--load-publish-endpoint={self.load_publish_endpoint!r} must"
-                    " be a bindable wildcard-host tcp:// address (e.g."
-                    " tcp://*:6000), or 'off'."
-                )
+    def check_load_publish_args(self):
+        """Fail fast at the entrypoint on a --load-publish-endpoint the
+        scheduler would decline (unbindable, overlapping the KV range, u16
+        overflow, or no kv-events publisher to advertise through) rather than
+        only warning from a scheduler subprocess. Routes through the same
+        resolver the scheduler binds and /server_info advertises with."""
+        if not self.load_publish_endpoint:
+            return
+        from sglang.srt.disaggregation.kv_events import (
+            KVEventsConfig,
+            resolve_load_pub_range,
+        )
+
+        kv_endpoint = replay_endpoint = None
+        if self.kv_events_config:
+            try:
+                cfg = KVEventsConfig.from_cli(self.kv_events_config)
+                kv_endpoint, replay_endpoint = cfg.endpoint, cfg.replay_endpoint
+            except Exception:
+                pass  # malformed config fails on the KV publisher itself
+        _, reason = resolve_load_pub_range(
+            kv_endpoint=kv_endpoint,
+            replay_endpoint=replay_endpoint,
+            dp_size=self.dp_size,
+            load_publish_endpoint=self.load_publish_endpoint,
+        )
+        if reason:
+            raise ValueError(reason)
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"

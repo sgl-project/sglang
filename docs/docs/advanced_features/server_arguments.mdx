@@ -948,7 +948,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--load-publish-endpoint`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bind address for the runtime-load PUB socket that load-aware routers subscribe to, e.g. `tcp://*:6000`; rank r binds port+r and `/server_info` advertises the base under the `kv_events` block. Must be a wildcard-host TCP address. Defaults to the dp_size ports packed after the `--kv-events-config` range; set it explicitly to move the range off a port conflict, or to the literal `off` to disable load publishing while keeping KV events.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bind address for the runtime-load PUB socket that load-aware routers subscribe to, e.g. `tcp://*:6000`; rank r binds port+r and `/server_info` advertises the base under the `kv_events` block. Must be a wildcard-host TCP address. Defaults to the dp_size ports packed after the `--kv-events-config` range; set it explicitly to move the range off a port conflict, or to the literal `off` to disable load publishing while keeping KV events. Requires `--kv-events-config`; startup fails if set without one, not bindable, or overlapping the KV range.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>

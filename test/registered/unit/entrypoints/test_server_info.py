@@ -475,30 +475,38 @@ class TestLoadPublishEndpointValidation(CustomTestCase):
     def test_requires_kv_events_config(self):
         args = ServerArgs(model_path="dummy", load_publish_endpoint="tcp://*:6000")
         with self.assertRaisesRegex(ValueError, "kv-events"):
-            args.check_server_args()
+            args.check_load_publish_args()
 
     def test_rejects_non_bindable_endpoint(self):
         args = ServerArgs(
             model_path="dummy",
             kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
-            page_size=64,
             load_publish_endpoint="tcp://10.0.0.5:6000",
         )
         with self.assertRaisesRegex(ValueError, "bindable"):
-            args.check_server_args()
+            args.check_load_publish_args()
+
+    def test_rejects_endpoint_overlapping_the_kv_range(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
+            dp_size=4,
+            load_publish_endpoint="tcp://*:5558",
+        )
+        with self.assertRaisesRegex(ValueError, "overlaps"):
+            args.check_load_publish_args()
 
     def test_off_and_valid_endpoint_pass(self):
-        for endpoint in ("off", "tcp://*:6000"):
+        for endpoint in ("off", "OFF", "tcp://*:6000"):
             with self.subTest(endpoint=endpoint):
                 args = ServerArgs(
                     model_path="dummy",
                     kv_events_config=(
                         '{"publisher": "zmq", "endpoint": "tcp://*:5557"}'
                     ),
-                    page_size=64,
                     load_publish_endpoint=endpoint,
                 )
-                args.check_server_args()  # must not raise
+                args.check_load_publish_args()  # must not raise
 
 
 if __name__ == "__main__":

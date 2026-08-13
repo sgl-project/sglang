@@ -354,6 +354,11 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 STEP_MAX_US = 2_000_000
 
+# Min wall-clock between load publishes on the stalled no-batch path, which
+# spins on_idle without sleeping. Bounds the O(queue) get_loads for both the
+# DP-balancing writer and the router-facing socket.
+LOAD_STALL_REFRESH_S = 0.05
+
 
 def _accumulate_decode_moment(
     totals: list[float],
@@ -2114,6 +2119,7 @@ class Scheduler(
             ps=self.ps,
             load_publish_endpoint=get_observability().load_publish_endpoint,
         )
+        self._last_stall_publish_ts = float("-inf")
 
     def init_load_inquirer(self) -> None:
         self.total_prefill_uncached_tokens = 0
@@ -4053,17 +4059,21 @@ class Scheduler(
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
-        # Publish (throttled) before the fully-idle gate: a no-batch-but-not-
-        # idle stall (queues parked under KV pressure / disagg transfer) has
-        # no process_batch_result to publish the growing gauge, and gating
-        # here froze /get_loads, DP balancing, and the LoadStat for the
-        # stall. Non-forced so this spinning path rides the interval + compute
-        # floors; the fully-idle forced publish runs post-flush below.
+        # Publish before the fully-idle gate: a no-batch-but-not-idle stall
+        # (queues parked under KV pressure / disagg transfer) has no
+        # process_batch_result to publish the growing gauge, and gating here
+        # froze /get_loads, DP balancing, and the LoadStat for the stall. This
+        # path spins without sleeping, so a wall-clock floor bounds the
+        # O(queue) get_loads for both sinks; the fully-idle publish runs
+        # post-flush below.
         if not self.is_fully_idle():
-            snapshot = self.publish_load_snapshot(force=False)
-            self.load_publisher.publish_load_stat(
-                self.load_inquirer.get_loads, force=False, snapshot=snapshot
-            )
+            now = time.monotonic()
+            if now - self._last_stall_publish_ts >= LOAD_STALL_REFRESH_S:
+                self._last_stall_publish_ts = now
+                snapshot = self.publish_load_snapshot(force=True)
+                self.load_publisher.publish_load_stat(
+                    self.load_inquirer.get_loads, force=True, snapshot=snapshot
+                )
             return
 
         if self.enable_unified_memory:

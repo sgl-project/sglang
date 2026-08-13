@@ -52,11 +52,6 @@ logger = logging.getLogger(__name__)
 # Publish at most once per this many calls unless force=True.
 LOAD_PUBLISH_INTERVAL = 5
 
-# Floor on how often the O(queue) provider runs. Caps compute on the stalled
-# no-batch path (on_idle spins without sleeping and calls with force=False),
-# where the call throttle alone would still fire at loop rate / INTERVAL.
-LOAD_MIN_COMPUTE_INTERVAL_S = 0.05
-
 # An unchanged stat is re-sent at most this often; a changed one always goes
 # out immediately, so transitions are never delayed. Bounds the send rate on
 # the idle spin loop (on_idle force-publishes every iteration).
@@ -74,8 +69,8 @@ _encoder = msgspec.msgpack.Encoder()
 class LoadStat(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
-    # No omit_defaults: it would trim trailing fields, shortening a wire
-    # shape the router decodes positionally.
+    # No omit_defaults: it may trim trailing defaults, shortening a shape the
+    # router decodes positionally.
     gc=False,  # type: ignore[call-arg]
     tag=True,  # type: ignore[call-arg]
 ):
@@ -139,7 +134,6 @@ class SchedulerLoadPublisher:
         # Last sent counts + timestamp, driving the dedup/heartbeat.
         self._last_counts: Optional[tuple] = None
         self._last_publish_ts = 0.0
-        self._last_compute_ts = float("-inf")
         self._publish_failed = False
         if not is_kv_publisher_rank(kv_events_config, ps):
             return
@@ -202,8 +196,7 @@ class SchedulerLoadPublisher:
         (`SchedulerLoadInquirer.get_loads`), used over metrics stats which
         are only populated under `--enable-metrics`. Skipped when the caller
         passes `snapshot` (one it already computed for the DP-balancing sink
-        this cycle), and otherwise rate-limited to
-        [`LOAD_MIN_COMPUTE_INTERVAL_S`].
+        this cycle).
 
         Best-effort: never crashes the loop (routers fall back to their own
         counter).
@@ -221,19 +214,7 @@ class SchedulerLoadPublisher:
 
         now = time.monotonic()
         try:
-            if snapshot is not None:
-                load = snapshot
-            else:
-                # Floor the provider so a never-sleeping stall doesn't run it
-                # at loop rate. A changed gauge still gets out within the
-                # floor; only forced (fully-idle) calls bypass it.
-                if (
-                    not force
-                    and now - self._last_compute_ts < LOAD_MIN_COMPUTE_INTERVAL_S
-                ):
-                    return
-                self._last_compute_ts = now
-                load = load_provider()
+            load = snapshot if snapshot is not None else load_provider()
             counts = (
                 load.num_running_reqs,
                 load.num_waiting_reqs,
