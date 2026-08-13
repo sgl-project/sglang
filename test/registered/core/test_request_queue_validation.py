@@ -6,6 +6,10 @@ import unittest
 import requests
 from prometheus_client.parser import text_string_to_metric_families
 
+from sglang.srt.observability.metrics_collector import (
+    QUEUE_REJECTION_REASON_QUEUE_FULL,
+    QUEUE_REJECTION_REASONS,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -100,7 +104,7 @@ class TestMaxQueuedRequests(CustomTestCase):
         """
         self.assertEqual(
             set(self._rejections_by_reason()),
-            {"queue_full", "priority_preempted", "waiting_timeout"},
+            set(QUEUE_REJECTION_REASONS),
         )
 
     def test_queue_full_rejections_are_counted(self):
@@ -110,7 +114,9 @@ class TestMaxQueuedRequests(CustomTestCase):
         before the scheduler rejects, so this counter is the only server-side
         signal that the queue cap shed load.
         """
-        before = self._rejections_by_reason().get("queue_full", 0.0)
+        before = self._rejections_by_reason().get(
+            QUEUE_REJECTION_REASON_QUEUE_FULL, 0.0
+        )
 
         status_codes = asyncio.run(
             send_concurrent_generate_requests(self.base_url, num_requests=10)
@@ -118,7 +124,7 @@ class TestMaxQueuedRequests(CustomTestCase):
         num_rejected = status_codes.count(503)
         self.assertGreater(num_rejected, 0, "expected the queue cap to reject requests")
 
-        after = self._rejections_by_reason().get("queue_full", 0.0)
+        after = self._rejections_by_reason().get(QUEUE_REJECTION_REASON_QUEUE_FULL, 0.0)
         self.assertEqual(after - before, num_rejected)
 
     def test_max_running_requests_and_max_queued_request_validation(self):

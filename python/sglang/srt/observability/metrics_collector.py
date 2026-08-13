@@ -40,6 +40,15 @@ SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STAT
 
 logger = logging.getLogger(__name__)
 
+QUEUE_REJECTION_REASON_QUEUE_FULL = "queue_full"
+QUEUE_REJECTION_REASON_PRIORITY_PREEMPTED = "priority_preempted"
+QUEUE_REJECTION_REASON_WAITING_TIMEOUT = "waiting_timeout"
+QUEUE_REJECTION_REASONS = (
+    QUEUE_REJECTION_REASON_QUEUE_FULL,
+    QUEUE_REJECTION_REASON_PRIORITY_PREEMPTED,
+    QUEUE_REJECTION_REASON_WAITING_TIMEOUT,
+)
+
 
 @dataclass
 class QueueCount:
@@ -236,7 +245,6 @@ class SchedulerMetricsCollectorContext:
 
 
 class SchedulerMetricsCollector(_StatLoggerDIMixin):
-
     def __init__(
         self,
         labels: Dict[str, str],
@@ -496,7 +504,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Pre-seed every reason at 0. Without this the series is absent until the
         # first rejection, so rate() queries and alerts return no data instead of 0
         # exactly when the server is healthy.
-        for reason in ("queue_full", "priority_preempted", "waiting_timeout"):
+        for reason in QUEUE_REJECTION_REASONS:
             self.num_queue_rejected_requests_total.labels(**labels, reason=reason)
 
         # =================================================================

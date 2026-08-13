@@ -12,6 +12,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.srt.environ import envs
+from sglang.srt.observability.metrics_collector import (
+    QUEUE_REJECTION_REASON_WAITING_TIMEOUT,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -49,6 +52,7 @@ def _scheduler(waiting_queue):
     s = Scheduler.__new__(Scheduler)
     s.waiting_queue = waiting_queue
     s.enable_hicache_storage = False
+    s.ps = SimpleNamespace(pp_rank=0)
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
     # The waiting-timeout path reports dropped requests to the rejection counter,
     # so the reporter has to exist even though this file asserts nothing about it.
@@ -72,7 +76,7 @@ class TestWaitingTimeout(CustomTestCase):
         self.assertEqual(s.ipc_channels.send_to_tokenizer.send_output.call_count, 1)
         collector = s.metrics_reporter.metrics_collector
         collector.increment_queue_rejected_reqs.assert_called_once_with(
-            "waiting_timeout", 1
+            QUEUE_REJECTION_REASON_WAITING_TIMEOUT, 1
         )
 
     def test_non_reporting_rank_does_not_count_the_drop(self):
@@ -81,6 +85,19 @@ class TestWaitingTimeout(CustomTestCase):
         # must stay quiet or `sum by (reason)` counts one rejection tp_size times.
         s = _scheduler([_req("stale", wait_entry=time.perf_counter() - 10)])
         s.metrics_reporter.current_scheduler_metrics_enabled = False
+
+        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1.0):
+            s._abort_on_waiting_timeout()
+
+        self.assertEqual(s.waiting_queue, [], "the req must still be dropped")
+        collector = s.metrics_reporter.metrics_collector
+        collector.increment_queue_rejected_reqs.assert_not_called()
+
+    def test_nonzero_pp_rank_does_not_count_the_drop(self):
+        # Each PP stage can process the same logical request, so queue rejection
+        # counters are emitted only from pp_rank 0.
+        s = _scheduler([_req("stale", wait_entry=time.perf_counter() - 10)])
+        s.ps.pp_rank = 1
 
         with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1.0):
             s._abort_on_waiting_timeout()
