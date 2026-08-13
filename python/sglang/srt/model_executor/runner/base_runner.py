@@ -280,9 +280,8 @@ class BaseRunner(ABC):
 
     def _pre_initialize_fi_a2a_workspace(self):
         """Allocate the FlashInfer MNNVL all-to-all workspace and send buffers for
-        the fi_a2a DCP comm backend; must run before CG capture (the init syncs
-        the stream + barriers cross-rank, uncapturable, and buffers allocated
-        during capture come from the graph's private pool). Raises early on
+        the fi_a2a DCP comm backend; must run before CG capture (it syncs the
+        stream + barriers cross-rank, uncapturable) and raises early on
         non-MNNVL platforms.
         """
         ps = get_parallel()
@@ -293,15 +292,13 @@ class BaseRunner(ABC):
 
         mr = self.model_runner
         if mr.model_config.attention_arch != AttentionArch.MLA:
-            # The exchange is only reachable from the MLA decode path, so leave
-            # the send buffers unsized rather than guess at a non-MLA shape.
+            # The exchange is only reachable from the MLA decode path.
             init_fi_a2a_workspace(ps.dcp_group)
             return
 
         server_args = mr.server_args
-        # One reduce row per decode token. is_dcp_mla_decode_phase() also fires
-        # on TARGET_VERIFY, so scale by the draft width; batches past this (eager
-        # decode above the captured max) fall back to a transient allocation.
+        # One reduce row per decode token, and is_dcp_mla_decode_phase() also
+        # fires on TARGET_VERIFY, so scale by the draft width.
         max_reqs = (
             server_args.cuda_graph_config.decode.max_bs
             or server_args.max_running_requests

@@ -399,8 +399,7 @@ def _alloc_fi_a2a_send(
     partial_o = torch.empty(
         batch, h_per_rank, cp_size, head_dim, dtype=dtype, device=device
     )
-    # Entry 1 is never read by the exchange but is still transported, so define
-    # it once here rather than re-zeroing the tensor on every call.
+    # Slot 1 is transported but never read; zero it once instead of per call.
     softmax_stats = torch.zeros(
         batch, h_per_rank, cp_size, 2, dtype=torch.float32, device=device
     )
@@ -416,9 +415,13 @@ def init_fi_a2a_workspace(
     dtype: Optional[torch.dtype] = None,
 ) -> None:
     # Call once per process BEFORE CUDA-graph capture: the FlashInfer init syncs
-    # the stream and barriers cross-rank, neither of which is capturable. The
-    # send buffers are allocated here for the same reason -- allocating them on
-    # first use puts them in the capturing graph's private memory pool.
+    # the stream and barriers cross-rank, neither of which is capturable.
+    #
+    # Note(kpham-sgl): the send buffers are allocated here, not on first use.
+    # The DCP a2a runs once per MLA layer inside the decode graph, and nothing
+    # eager touches it first -- the FlashInfer autotune pass skips the exchange
+    # (_select_local_dcp_heads_for_autotune). So a lazy allocation lands during
+    # capture and comes from the graph's private pool.
     global _FI_A2A_STATE
     if _FI_A2A_STATE is not None:
         return
@@ -475,8 +478,7 @@ def init_fi_a2a_workspace(
     # REQUIRED barrier before the first alltoall: every rank must finish init,
     # else a rank writes a peer's FIFO before it is ready -> deadlock.
     dist.barrier(group=cp_group.device_group)
-    # dtype is None only when the caller could not derive the send shape (a
-    # non-MLA model); the exchange is MLA-only, so that config never gets here.
+    # dtype is None when the caller could not derive the shape (non-MLA).
     send_buffers = {}
     if dtype is not None:
         send_buffers[(h_per_rank, cp_size, head_dim, dtype)] = _alloc_fi_a2a_send(
@@ -507,9 +509,8 @@ def _fi_a2a_send_buffers(
 ):
     """Send tensors for the FlashInfer exchange, sliced to ``batch``.
 
-    Normally a slice of what init_fi_a2a_workspace() pre-allocated. Cached
-    entries are never replaced: captured CUDA graphs bake in their addresses,
-    so freeing one would strand the pointers baked into those graphs.
+    Note(kpham-sgl): cached entries are never replaced. Captured graphs bake in
+    these addresses, so freeing one to grow it would strand those pointers.
     """
     state = _FI_A2A_STATE
     cache = state["send_buffers"]
@@ -517,9 +518,7 @@ def _fi_a2a_send_buffers(
     entry = cache.get(key)
 
     if entry is None:
-        # The shape derived at init did not match what the model produced, so
-        # this allocation may land inside graph capture. Size it for max_batch
-        # so it is the only one for this shape.
+        # Sized for max_batch so this stays the only allocation for the shape.
         logger.warning(
             "fi_a2a send buffers were pre-sized for %s but the model produced "
             "%s; allocating now. Fix the derivation in "
@@ -541,8 +540,7 @@ def _fi_a2a_send_buffers(
     if entry[0].shape[0] >= batch:
         return entry[0][:batch], entry[1][:batch]
 
-    # Eager decode above the captured max. Hand back a transient pair instead of
-    # growing the cached one, which would free memory captured graphs point at.
+    # Eager decode above the captured max: transient, leave the cached one be.
     return _alloc_fi_a2a_send(
         batch=batch,
         h_per_rank=h_per_rank,
