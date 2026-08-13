@@ -205,6 +205,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         max_loras: int,
         compute_dtype: torch.dtype,
         moe_layer,
+        include_legacy_kernel_buffers: bool = True,
     ):
         """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
 
@@ -212,16 +213,34 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         to extract dimensions.  All FusedMoEWithLoRA layers share the same
         buffers since they execute sequentially during forward.
 
-        This is backend-agnostic because MoE LoRA always uses the same
-        fused Triton kernel (TritonRunnerCoreWithLoRA) regardless of which
-        dense LoRA backend is selected.
+        Two groups live here:
+
+        * batch metadata (``adapter_enabled``, ``token_lora_mapping``) is
+          engine-independent. ``_add_moe_lora_info`` writes into these exact
+          tensors under CUDA graphs, so their addresses must stay stable across
+          replays; every execution engine needs them and they depend only on
+          ``max_bs``/``max_loras``.
+        * kernel scratch for the legacy fused Triton MoE-LoRA path, which
+          needs layer geometry from ``moe_layer._quant_info``. Engines that
+          bring their own kernels pass
+          ``include_legacy_kernel_buffers=False``; that also keeps the
+          allocation out of the KV-cache budget.
         """
+        device = moe_layer.base_layer.w13_weight.device
+        self.moe_cg_buffers = {
+            "adapter_enabled": torch.zeros(max_loras, dtype=torch.int32, device=device),
+            "token_lora_mapping": torch.full(
+                (max_bs,), -1, dtype=torch.int32, device=device
+            ),
+        }
+        if not include_legacy_kernel_buffers:
+            return
+
         base = moe_layer.base_layer
         top_k = base.top_k
         qinfo = moe_layer._quant_info
         E, N, _ = qinfo.w13_weight.shape
         hidden_dim = qinfo.w2_weight.shape[1]
-        device = qinfo.w13_weight.device
         dtype = compute_dtype
         num_experts = base.num_experts
 
@@ -232,56 +251,54 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         ) * block_size_m
         max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
 
-        self.moe_cg_buffers = {
-            "intermediate_cache1": torch.empty(
-                (max_bs, top_k, N), device=device, dtype=dtype
-            ),
-            "intermediate_cache2": torch.empty(
-                (max_bs * top_k, N // 2), device=device, dtype=dtype
-            ),
-            "intermediate_cache3": torch.empty(
-                (max_bs, top_k, hidden_dim), device=device, dtype=dtype
-            ),
-            "out_hidden_states": torch.empty(
-                (max_bs, hidden_dim), device=device, dtype=dtype
-            ),
-            "sorted_token_ids_lora": torch.empty(
-                (max_loras * max_num_tokens_padded,),
-                device=device,
-                dtype=torch.int32,
-            ),
-            "expert_ids_lora": torch.empty(
-                (max_loras * max_num_m_blocks,),
-                device=device,
-                dtype=torch.int32,
-            ),
-            "num_tokens_post_padded_lora": torch.empty(
-                (max_loras,), device=device, dtype=torch.int32
-            ),
-            "adapter_enabled": torch.zeros(max_loras, dtype=torch.int32, device=device),
-            # int64 copy of weight_indices for index_fill_(), which requires
-            # LongTensor.  weight_indices itself must stay int32 because the
-            # CUDA moe_lora_align kernel casts it to int32_t*.
-            "weight_indices_long": torch.zeros(
-                max_bs, dtype=torch.int64, device=device
-            ),
-            "lora_ids": torch.arange(max_loras, dtype=torch.int32, device=device),
-            "cumsum_buffer": torch.zeros(
-                max_loras * (num_experts + 1),
-                dtype=torch.int32,
-                device=device,
-            ),
-            "token_mask": torch.empty(
-                (max_loras * max_bs * top_k,),
-                dtype=torch.int32,
-                device=device,
-            ),
-            "max_num_tokens_padded": max_num_tokens_padded,
-            "max_num_m_blocks": max_num_m_blocks,
-            "token_lora_mapping": torch.full(
-                (max_bs,), -1, dtype=torch.int32, device=device
-            ),
-        }
+        self.moe_cg_buffers.update(
+            {
+                "intermediate_cache1": torch.empty(
+                    (max_bs, top_k, N), device=device, dtype=dtype
+                ),
+                "intermediate_cache2": torch.empty(
+                    (max_bs * top_k, N // 2), device=device, dtype=dtype
+                ),
+                "intermediate_cache3": torch.empty(
+                    (max_bs, top_k, hidden_dim), device=device, dtype=dtype
+                ),
+                "out_hidden_states": torch.empty(
+                    (max_bs, hidden_dim), device=device, dtype=dtype
+                ),
+                "sorted_token_ids_lora": torch.empty(
+                    (max_loras * max_num_tokens_padded,),
+                    device=device,
+                    dtype=torch.int32,
+                ),
+                "expert_ids_lora": torch.empty(
+                    (max_loras * max_num_m_blocks,),
+                    device=device,
+                    dtype=torch.int32,
+                ),
+                "num_tokens_post_padded_lora": torch.empty(
+                    (max_loras,), device=device, dtype=torch.int32
+                ),
+                # int64 copy of weight_indices for index_fill_(), which requires
+                # LongTensor.  weight_indices itself must stay int32 because the
+                # CUDA moe_lora_align kernel casts it to int32_t*.
+                "weight_indices_long": torch.zeros(
+                    max_bs, dtype=torch.int64, device=device
+                ),
+                "lora_ids": torch.arange(max_loras, dtype=torch.int32, device=device),
+                "cumsum_buffer": torch.zeros(
+                    max_loras * (num_experts + 1),
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                "token_mask": torch.empty(
+                    (max_loras * max_bs * top_k,),
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                "max_num_tokens_padded": max_num_tokens_padded,
+                "max_num_m_blocks": max_num_m_blocks,
+            }
+        )
 
     def _add_moe_lora_info(
         self, forward_batch: ForwardBatch, batch_info: LoRABatchInfo

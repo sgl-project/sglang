@@ -671,6 +671,10 @@ class Envs:
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
+    # Base-GEMM provider for the sgl_lora MoE execution engine: "deepgemm"
+    # (default) or "cutedsl" (SM100-only; measured decode 1.16x / prefill
+    # ~1.00x vs deepgemm on GB300 -- promotion pending the step-2 gate).
+    SGLANG_LORA_MOE_BASE_PROVIDER = EnvStr("deepgemm")
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Keep K3 shared experts and dense MLPs sharded over attention TP.

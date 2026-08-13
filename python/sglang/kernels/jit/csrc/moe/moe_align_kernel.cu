@@ -339,9 +339,9 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
 // Launched with <<<2, 1024>>>: block 1 fills sorted_token_ids in parallel
 // with block 0 doing the alignment compute.
 //
-// With 1024 threads and EXPERTS_PER_THREAD=4, covers at most 4096 expert
-// indices. Since num_experts includes the +1 offset bucket, this supports
-// up to 4095 real experts.
+// With 1024 threads, each owning a contiguous window of EXPERTS_PER_THREAD
+// buckets, this covers 1024 * EPT expert indices. The host picks EPT from the
+// bucket count (2/4/8/16/32); EPT >= 16 needs the dynamic shared memory opt-in.
 template <typename scalar_t, int EXPERTS_PER_THREAD>
 __global__ void moe_align_block_size_kernel_v2(
     const scalar_t* __restrict__ topk_ids,
@@ -478,10 +478,13 @@ struct MoeAlignBlockSizeKernel {
     int64_t max_num_tokens_padded = sorted_token_ids.size(0);
 
     // num_experts from Python is actual_num_experts + 1 (for EP offset convention).
-    // The v2 kernel (>1024 experts) uses 1024 threads with EXPERTS_PER_THREAD up
-    // to 8, covering at most 8192 expert indices. This supports up to 8191 real
-    // experts, sufficient for LoRA virtual experts (num_moe_experts * max_loras).
-    RuntimeCheck(num_experts <= 8192, "moe_align_block_size: num_experts must be <= 8192, got ", num_experts);
+    // The v2 kernel (>1024 experts) uses 1024 threads, each owning a contiguous
+    // window of EXPERTS_PER_THREAD buckets, so it reaches 1024 * EPT indices.
+    // The ceiling is therefore the largest instantiated EPT, and the real limit
+    // beyond that is shared memory: (padded_num_experts + WARP_SIZE) * 4 bytes
+    // must fit the per-block maximum (48 KiB by default, up to 227 KiB with the
+    // opt-in below). EPT 32 needs 128 KiB at 32768 buckets, well inside that.
+    RuntimeCheck(num_experts <= 32768, "moe_align_block_size: num_experts must be <= 32768, got ", num_experts);
 
     const scalar_t* topk_ids_ptr = static_cast<const scalar_t*>(topk_ids.data_ptr());
     int32_t* sorted_token_ids_ptr = static_cast<int32_t*>(sorted_token_ids.data_ptr());
@@ -544,6 +547,14 @@ struct MoeAlignBlockSizeKernel {
       auto launch_v2 = [&](auto ept_tag) {
         constexpr int EPT = decltype(ept_tag)::value;
         auto v2_kernel = moe::moe_align_block_size_kernel_v2<scalar_t, EPT>;
+        // Past 48 KiB, dynamic shared memory must be opted into per function.
+        // LaunchKernel forwards the size but never sets this attribute.
+        if (shared_mem_size > 48 * 1024) {
+          cudaFuncSetAttribute(
+              reinterpret_cast<const void*>(v2_kernel),
+              cudaFuncAttributeMaxDynamicSharedMemorySize,
+              static_cast<int>(shared_mem_size));
+        }
         LaunchKernel(dim3(2), dim3(threads), stream, shared_mem_size)(
             v2_kernel,
             topk_ids_ptr,
@@ -563,8 +574,12 @@ struct MoeAlignBlockSizeKernel {
         launch_v2(std::integral_constant<int, 2>{});
       } else if (padded_num_experts <= 4096) {
         launch_v2(std::integral_constant<int, 4>{});
-      } else {
+      } else if (padded_num_experts <= 8192) {
         launch_v2(std::integral_constant<int, 8>{});
+      } else if (padded_num_experts <= 16384) {
+        launch_v2(std::integral_constant<int, 16>{});
+      } else {
+        launch_v2(std::integral_constant<int, 32>{});
       }
 
       const int block_threads = std::min(256, threads);

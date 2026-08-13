@@ -475,6 +475,31 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
             server_args._handle_mamba_backend()
 
 
+class TestSglLoraExecutionEngineArgs(unittest.TestCase):
+    def test_rejects_pdmux(self):
+        # The sgl_lora fused-align routing scratch is cached per
+        # (device, num_buckets); PDMux runs prefill and decode concurrently on
+        # separate streams, so the combination must fail at startup instead of
+        # silently corrupting routes.
+        server_args = ServerArgs(
+            model_path="dummy",
+            lora_execution_engine="sgl_lora",
+            enable_pdmux=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "PD-multiplexing"):
+            server_args.check_lora_server_args()
+
+    def test_pdmux_allowed_with_legacy_engine(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_pdmux=True,
+        )
+
+        server_args.check_lora_server_args()
+        self.assertEqual(server_args.lora_execution_engine, "legacy")
+
+
 class TestLoadBalanceMethod(unittest.TestCase):
     def _load_balance_args(self, **kwargs):
         server_args = ServerArgs(model_path="dummy", **kwargs)
