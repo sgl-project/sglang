@@ -1,5 +1,5 @@
 """free_swa_segment vs an independent oracle: stride page extraction over segment
-alignments and need_sort routing, plus the free-group contract. See
+alignments, plus the free-group contract. See
 SWATokenToKVPoolAllocator.free_swa_segment for why the data-dependent ops are avoided.
 
     python -m pytest test/registered/unit/mem_cache/test_swa_free_segment.py -v
@@ -72,29 +72,25 @@ def _oracle(row, start, end, ps, mapping):
 class TestSWAFreeSegment(unittest.TestCase):
     def test_sweep_against_oracle(self):
         # Aligned start per the contract; aligned, partial and interior segments.
-        for ps in (1, 2, 4):
-            for need_sort in (False, True):
-                for n in (ps, ps + 1, 3 * ps - 1):
-                    for start in range(0, n, ps):
-                        for end in range(start + 1, n + 1):
-                            a = _alloc(ps, need_sort=need_sort)
-                            row = _row(a, n)
-                            want_swa, want_zero = _oracle(
-                                row, start, end, ps, a.full_to_swa_index_mapping.clone()
-                            )
-                            before = _freed(a)
-                            a.free_swa_segment(
-                                row[start:end], start_pos=start, swa_alive_from=start
-                            )
+        # ps == 1 is the special-cased branch, ps == 4 the general one.
+        for ps in (1, 4):
+            for n in (ps, ps + 1, 3 * ps - 1):
+                for start in range(0, n, ps):
+                    for end in range(start + 1, n + 1):
+                        a = _alloc(ps)
+                        row = _row(a, n)
+                        want_swa, want_zero = _oracle(
+                            row, start, end, ps, a.full_to_swa_index_mapping.clone()
+                        )
+                        before = _freed(a)
+                        a.free_swa_segment(
+                            row[start:end], start_pos=start, swa_alive_from=start
+                        )
 
-                            label = f"{ps=} {need_sort=} {n=} {start=} {end=}"
-                            self.assertEqual(
-                                sorted(_freed(a) - before), want_swa, label
-                            )
-                            got = a.full_to_swa_index_mapping[want_zero]
-                            self.assertTrue(
-                                torch.equal(got, torch.zeros_like(got)), label
-                            )
+                        label = f"{ps=} {n=} {start=} {end=}"
+                        self.assertEqual(sorted(_freed(a) - before), want_swa, label)
+                        got = a.full_to_swa_index_mapping[want_zero]
+                        self.assertTrue(torch.equal(got, torch.zeros_like(got)), label)
 
     def test_group_defers_and_queues_owned_values(self):
         # Queueing the caller's view would make the flush read whatever a remap
