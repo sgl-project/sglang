@@ -147,6 +147,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
+        prefill_graph_bs = runner.server_args.cuda_graph_config.prefill.bs or ()
+        max_prefill_num_tokens = max(prefill_graph_bs, default=0)
+        self._full_cg_query_block_capacity = (
+            max_prefill_num_tokens + self.block_size_q - 1
+        ) // self.block_size_q
         if "sparse_init_block" in sparse_cfg:
             self.init_blocks = sparse_cfg["sparse_init_block"]
         else:
@@ -235,6 +240,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # token table; CUDA Graph replay requires an address-stable backing.
         self._cuda_graph_page_table: Optional[torch.Tensor] = None
         self._active_page_table: Optional[torch.Tensor] = None
+        # Full prefill fixes the request axis at capture capacity. Pack active
+        # query blocks so sparse kernels do not launch work for sentinel slots.
+        self._full_cg_query_block_to_req: Optional[torch.Tensor] = None
+        self._active_query_block_to_req: Optional[torch.Tensor] = None
+
         self.use_dense_sparse_decode = (
             (not self.is_npu)
             and envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
@@ -330,14 +340,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
         self._active_page_table = None
+        if not self.is_npu:
+            self._init_full_cg_prefill_query_metadata(forward_batch, in_capture)
         if (
             not self.is_npu
             and in_capture
             and forward_batch.forward_mode == ForwardMode.EXTEND
         ):
             # Full prefill capture runs before decode CUDA Graph initialization.
-            # Allocate the final backing now so decode initialization cannot replace
-            # an address already captured by the prefill graph.
+            # Allocate final backings now so later graph initialization cannot
+            # replace addresses already captured by the prefill graph.
             self._ensure_cuda_graph_page_table(
                 max(forward_batch.batch_size, self._decode_cuda_graph_max_bs)
             )
@@ -540,6 +552,50 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         ) // self.page_size
         self._cuda_graph_page_table = torch.empty(
             (max_bs, max_num_pages),
+            dtype=torch.int32,
+            device=self.req_to_token.device,
+        )
+
+    def _init_full_cg_prefill_query_metadata(
+        self, forward_batch: ForwardBatch, in_capture: bool
+    ):
+        self._active_query_block_to_req = None
+        if forward_batch.forward_mode not in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+        ):
+            return
+
+        if in_capture:
+            num_query_blocks = (
+                forward_batch.input_ids.shape[0] + self.block_size_q - 1
+            ) // self.block_size_q
+            self._ensure_full_cg_query_block_to_req(
+                max(num_query_blocks, self._full_cg_query_block_capacity)
+            )
+            self._active_query_block_to_req = self._full_cg_query_block_to_req[
+                :num_query_blocks
+            ]
+
+        if self._full_cg_query_block_to_req is not None:
+            from sglang.kernels.ops.attention.minimax_sparse.prefill.scheduler import (
+                build_query_block_to_req,
+            )
+
+            build_query_block_to_req(
+                self._full_cg_query_block_to_req,
+                forward_batch.extend_seq_lens[: forward_batch.batch_size],
+                self.block_size_q,
+            )
+
+    def _ensure_full_cg_query_block_to_req(self, num_query_blocks: int):
+        if (
+            self._full_cg_query_block_to_req is not None
+            and self._full_cg_query_block_to_req.shape[0] >= num_query_blocks
+        ):
+            return
+        self._full_cg_query_block_to_req = torch.empty(
+            num_query_blocks,
             dtype=torch.int32,
             device=self.req_to_token.device,
         )
@@ -1497,6 +1553,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_k_scale=layer.idx_k_scale_float,
                 idx_v_scale=layer.idx_v_scale_float,
                 page_size=self.page_size,
+                query_block_to_req=self._active_query_block_to_req,
             )
         if actual_num_tokens < original_num_tokens:
             pad_len = original_num_tokens - actual_num_tokens

@@ -138,47 +138,63 @@ def test_full_prefill_capture_preserves_page_table_backing_for_decode(monkeypatc
         "build_page_table_snapshot",
         lambda *args, **kwargs: None,
     )
+    monkeypatch.setattr(
+        "sglang.kernels.ops.attention.minimax_sparse.prefill.scheduler."
+        "build_query_block_to_req",
+        lambda *args, **kwargs: None,
+    )
 
     backend = object.__new__(MiniMaxSparseAttnBackend)
     backend.is_npu = False
     backend._msa_dec_meta = None
     backend._active_page_table = None
     backend._cuda_graph_page_table = None
+    backend._active_query_block_to_req = None
+    backend._full_cg_query_block_to_req = None
     backend._decode_cuda_graph_max_bs = 4
+    backend._full_cg_query_block_capacity = 2
     backend._msa_owns_decode = False
     backend.req_to_token = torch.zeros((4, 16), dtype=torch.int32)
     backend.kv_pool = SimpleNamespace(size=60)
     backend.page_size = 4
     backend.max_context_len = 16
+    backend.block_size_q = 1
 
     forward_batch = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
         batch_size=2,
+        input_ids=torch.empty(2, dtype=torch.int32),
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
         seq_lens=torch.tensor([8, 8], dtype=torch.int32),
         seq_lens_cpu=torch.tensor([8, 8], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([1, 1], dtype=torch.int32),
         extend_seq_lens_cpu=[1, 1],
     )
 
     backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
     captured_ptr = backend._active_page_table.data_ptr()
+    packed_query_ptr = backend._active_query_block_to_req.data_ptr()
     assert backend._cuda_graph_page_table.shape == (4, 4)
 
     backend.init_cuda_graph_state(max_bs=4, max_num_tokens=4)
     assert backend._cuda_graph_page_table.data_ptr() == captured_ptr
+    assert backend._full_cg_query_block_to_req.data_ptr() == packed_query_ptr
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="page-table replay requires CUDA"
 )
-def test_full_prefill_graph_replay_reads_updated_page_table():
+def test_full_prefill_graph_replay_reads_updated_sparse_metadata():
     page_size = 4
     backend = object.__new__(MiniMaxSparseAttnBackend)
     backend.is_npu = False
     backend._msa_dec_meta = None
     backend._active_page_table = None
     backend._cuda_graph_page_table = None
+    backend._active_query_block_to_req = None
+    backend._full_cg_query_block_to_req = None
     backend._decode_cuda_graph_max_bs = 2
+    backend._full_cg_query_block_capacity = 8
     backend._msa_owns_decode = False
     backend.req_to_token = torch.stack(
         [
@@ -189,29 +205,45 @@ def test_full_prefill_graph_replay_reads_updated_page_table():
     backend.kv_pool = SimpleNamespace(size=32)
     backend.page_size = page_size
     backend.max_context_len = 8
+    backend.block_size_q = 1
 
     forward_batch = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
-        batch_size=1,
-        req_pool_indices=torch.tensor([0], dtype=torch.int64, device="cuda"),
-        seq_lens=torch.tensor([8], dtype=torch.int32, device="cuda"),
-        seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
-        extend_seq_lens_cpu=[8],
+        batch_size=2,
+        input_ids=torch.empty(8, dtype=torch.int32, device="cuda"),
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.int64, device="cuda"),
+        seq_lens=torch.tensor([8, 0], dtype=torch.int32, device="cuda"),
+        seq_lens_cpu=torch.tensor([8, 0], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([8, 0], dtype=torch.int32, device="cuda"),
+        extend_seq_lens_cpu=[8, 0],
     )
     backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
     captured_ptr = backend._active_page_table.data_ptr()
+    packed_query_ptr = backend._active_query_block_to_req.data_ptr()
 
-    replay_output = torch.empty((1, 2), dtype=torch.int32, device="cuda")
+    replay_output = torch.empty((2, 1), dtype=torch.int32, device="cuda")
+    replay_query_schedule = torch.empty(8, dtype=torch.int32, device="cuda")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        replay_output.copy_(backend._active_page_table[:, :2])
+        replay_output.copy_(backend._active_page_table[:, :1])
+        replay_query_schedule.copy_(backend._active_query_block_to_req)
 
-    forward_batch.req_pool_indices.fill_(1)
+    forward_batch.seq_lens.copy_(torch.tensor([4, 4], device="cuda"))
+    forward_batch.seq_lens_cpu.copy_(torch.tensor([4, 4]))
+    forward_batch.extend_seq_lens.copy_(torch.tensor([4, 4], device="cuda"))
+    forward_batch.extend_seq_lens_cpu = [4, 4]
+    forward_batch.forward_mode = ForwardMode.MIXED
     backend.init_forward_metadata_out_graph(forward_batch, in_capture=False)
     assert backend._active_page_table.data_ptr() == captured_ptr
+    assert backend._active_query_block_to_req is None
+    assert backend._full_cg_query_block_to_req.data_ptr() == packed_query_ptr
     graph.replay()
     torch.cuda.synchronize()
 
     torch.testing.assert_close(
-        replay_output.cpu(), torch.tensor([[5, 1]], dtype=torch.int32)
+        replay_output.cpu(), torch.tensor([[2], [5]], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        replay_query_schedule.cpu(),
+        torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.int32),
     )

@@ -285,6 +285,7 @@ def _flash_attn_fwd_with_block_score_kernel(
 def _topk_index_kernel(
     s_ptr,  # Score: h x n x max_seqblock
     ti_ptr,  # topk_idx: h x n x topk
+    query_block_to_req_ptr,  # packed query block -> request id
     # size
     sample_interval: tl.constexpr,
     block_size: tl.constexpr,
@@ -308,6 +309,7 @@ def _topk_index_kernel(
     BLOCK_SIZE_T: tl.constexpr,
     MASK_INIT: tl.constexpr,
     MASK_LOCAL: tl.constexpr,
+    USE_PACKED_QUERY_SCHEDULING: tl.constexpr,
 ):
     tl.static_assert(
         BLOCK_SIZE_K > BLOCK_SIZE_T
@@ -316,9 +318,16 @@ def _topk_index_kernel(
     pid_q = tl.program_id(0)
     pid_b = tl.program_id(1)
     pid_h = tl.program_id(2)
+    if USE_PACKED_QUERY_SCHEDULING:
+        global_q_block = pid_q
+        pid_b = tl.load(query_block_to_req_ptr + global_q_block)
+        if pid_b < 0:
+            return
     # get q k start and len after rmpad
     seq_start = tl.load(cu_seqlens + pid_b)
     block_start = tl.load(cu_seqblocks_q + pid_b)
+    if USE_PACKED_QUERY_SCHEDULING:
+        pid_q = global_q_block - block_start
     block_num = tl.load(cu_seqblocks_q + pid_b + 1) - block_start
     prefix_len = tl.load(prefix_lens + pid_b)
     if pid_q >= block_num:
@@ -431,6 +440,7 @@ def flash_prefill_with_topk_index(
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
+    query_block_to_req: Optional[torch.Tensor] = None,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
@@ -565,10 +575,15 @@ def flash_prefill_with_topk_index(
         dtype=torch.int32,
     )
     # launch kernel
-    grid = (max_seqblock_q, batch_size, num_heads)
+    grid = (
+        (query_block_to_req.shape[0], 1, num_heads)
+        if query_block_to_req is not None
+        else (max_seqblock_q, batch_size, num_heads)
+    )
     _topk_index_kernel[grid](
         score,
         topk_idx,
+        query_block_to_req,
         block_size_q,
         block_size_k,
         cu_seqlens,
@@ -585,5 +600,6 @@ def flash_prefill_with_topk_index(
         topk_idx.stride(2),
         MASK_INIT=False,
         MASK_LOCAL=False,
+        USE_PACKED_QUERY_SCHEDULING=query_block_to_req is not None,
     )
     return o, topk_idx

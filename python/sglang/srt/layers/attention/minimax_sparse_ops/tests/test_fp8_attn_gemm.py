@@ -287,8 +287,26 @@ def test_step3_prefill_all_fp8_vs_dequant_ref():
     k8, kr = qdq(k)
     v8, vr = qdq(v)
     out8 = run_step3_prefill(q8, k8, v8, r2t, sids, tidx, cu, seq_lens, prefix, max_q)
+    query_block_to_req = torch.repeat_interleave(
+        torch.arange(seq_lens.shape[0], device=DEVICE, dtype=torch.int32),
+        torch.diff(cu),
+    )
+    packed_out8 = run_step3_prefill(
+        q8,
+        k8,
+        v8,
+        r2t,
+        sids,
+        tidx,
+        cu,
+        seq_lens,
+        prefix,
+        max_q,
+        query_block_to_req=query_block_to_req,
+    )
     ref = run_step3_prefill(qr, kr, vr, r2t, sids, tidx, cu, seq_lens, prefix, max_q)
     assert out8.dtype == torch.bfloat16
+    torch.testing.assert_close(packed_out8, out8, rtol=0, atol=0)
     torch.testing.assert_close(out8.float(), ref.float(), atol=FP8_ATOL, rtol=FP8_RTOL)
 
 
@@ -445,10 +463,29 @@ def test_indexer_prefill_all_fp8_vs_dequant_ref():
     o8, tidx8 = run_indexer_prefill(
         q8, k8, v8, r2t, sids, cu, seq_lens, prefix, max_q, max_k
     )
+    query_block_to_req = torch.repeat_interleave(
+        torch.arange(seq_lens.shape[0], device=DEVICE, dtype=torch.int32),
+        torch.diff(cu),
+    )
+    packed_o8, packed_tidx8 = run_indexer_prefill(
+        q8,
+        k8,
+        v8,
+        r2t,
+        sids,
+        cu,
+        seq_lens,
+        prefix,
+        max_q,
+        max_k,
+        query_block_to_req=query_block_to_req,
+    )
     oref, tidxref = run_indexer_prefill(
         qr, kr, vr, r2t, sids, cu, seq_lens, prefix, max_q, max_k
     )
     assert o8.dtype == torch.bfloat16
+    torch.testing.assert_close(packed_o8, o8, rtol=0, atol=0)
+    torch.testing.assert_close(packed_tidx8, tidx8, rtol=0, atol=0)
     torch.testing.assert_close(o8.float(), oref.float(), atol=FP8_ATOL, rtol=FP8_RTOL)
     assert _topk_overlap(tidx8, tidxref) >= 0.9
 

@@ -65,6 +65,7 @@ def minimax_sparse_prefill(
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
+    query_block_to_req: Optional[torch.Tensor] = None,
     seqlens_cpu: Optional[List[int]] = None,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
@@ -86,6 +87,8 @@ def minimax_sparse_prefill(
         cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k, seqlens_cpu
         )
+    if query_block_to_req is not None:
+        all_seqblock_q = query_block_to_req.shape[0]
 
     # All seqlen is less than topk, use full attention
     # Step 1: Flash attention with topk index (using index head)
@@ -111,6 +114,7 @@ def minimax_sparse_prefill(
         cu_seqblocks_q=cu_seqblocks_q,
         max_seqblock_q=max_seqblock_q,
         all_seqblock_q=all_seqblock_q,
+        query_block_to_req=query_block_to_req,
         q_scale=idx_q_scale,
         k_scale=idx_k_scale,
         v_scale=idx_v_scale,
@@ -164,6 +168,7 @@ def minimax_sparse_prefill(
                 sm_scale=sm_scale,
                 cu_seqblocks_q=cu_seqblocks_q,
                 max_seqblock_q=max_seqblock_q,
+                query_block_to_req=query_block_to_req,
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
@@ -186,6 +191,7 @@ def minimax_sparse_prefill(
             sm_scale=sm_scale,
             cu_seqblocks_q=cu_seqblocks_q,
             max_seqblock_q=max_seqblock_q,
+            query_block_to_req=query_block_to_req,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,

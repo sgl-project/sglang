@@ -44,6 +44,7 @@ def _gqa_share_sparse_fwd_kernel(
     t_ptr,  # topk_idx: kh x n x k
     o_ptr,  # O: n x h x d
     page_table_ptr,  # batch-local physical page ids
+    query_block_to_req_ptr,  # packed query block -> request id
     # seqlens
     cu_seqlens_q,
     cu_seqblocks_q,
@@ -95,17 +96,25 @@ def _gqa_share_sparse_fwd_kernel(
     IS_FP8: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     ONE_PAGE_PER_BLOCK: tl.constexpr,
+    USE_PACKED_QUERY_SCHEDULING: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # get batch id and head id
     pid_q = tl.program_id(0)
     pid_kh = tl.program_id(1)
     pid_b = tl.program_id(2)
+    if USE_PACKED_QUERY_SCHEDULING:
+        global_q_block = pid_q
+        pid_b = tl.load(query_block_to_req_ptr + global_q_block)
+        if pid_b < 0:
+            return
     pid_h = pid_kh * gqa_group_size
     # get q k start and len after rmpad
     q_start = tl.load(cu_seqlens_q + pid_b)
     q_len = tl.load(cu_seqlens_q + pid_b + 1) - q_start
     q_block_start = tl.load(cu_seqblocks_q + pid_b)
+    if USE_PACKED_QUERY_SCHEDULING:
+        pid_q = global_q_block - q_block_start
     q_block_len = tl.load(cu_seqblocks_q + pid_b + 1) - q_block_start
     seq_len = tl.load(seq_lens + pid_b)
     prefix_len = tl.load(prefix_lens + pid_b)
@@ -279,6 +288,7 @@ def flash_prefill_with_gqa_share_sparse(
     use_tma: bool = True,
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
+    query_block_to_req: Optional[torch.Tensor] = None,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
@@ -319,14 +329,18 @@ def flash_prefill_with_gqa_share_sparse(
     )
     # launch kernel
     num_q_loop = (
-        max_seqblock_q // 131072 + 1
+        1 if query_block_to_req is not None else max_seqblock_q // 131072 + 1
     )  # calculate multiple queries in one kernel if seqlence length is too long
     BLOCK_SIZE_Q = triton.next_power_of_2(block_size_q)
     BLOCK_SIZE_K = triton.next_power_of_2(block_size_k)
     grid = (
-        triton.cdiv(triton.cdiv(max_seqlen_q, block_size_q), num_q_loop),
-        num_k_heads,
-        batch_size,
+        (query_block_to_req.shape[0], num_k_heads, 1)
+        if query_block_to_req is not None
+        else (
+            triton.cdiv(triton.cdiv(max_seqlen_q, block_size_q), num_q_loop),
+            num_k_heads,
+            batch_size,
+        )
     )
     num_warps, num_stages = _prefill_main_attention_kernel_config()
     _gqa_share_sparse_fwd_kernel[grid](
@@ -337,6 +351,7 @@ def flash_prefill_with_gqa_share_sparse(
         topk_idx,
         o,
         page_table,
+        query_block_to_req,
         cu_seqlens,
         cu_seqblocks_q,
         seq_lens,
@@ -374,6 +389,7 @@ def flash_prefill_with_gqa_share_sparse(
         IS_FP8=is_fp8,
         PAGE_SIZE=page_size,
         ONE_PAGE_PER_BLOCK=page_size == block_size_k,
+        USE_PACKED_QUERY_SCHEDULING=query_block_to_req is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
