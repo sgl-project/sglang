@@ -227,9 +227,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                draft_num_layers = int(eagle_draft_num_layers) * kvc.ps.attn_dcp_size
                 self._cell_size = int(
-                    self._cell_size
-                    * (1 + int(eagle_draft_num_layers) / int(num_layers))
+                    self._cell_size * (1 + draft_num_layers / int(num_layers))
                 )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
@@ -486,8 +486,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                             if i < draft_layers
                         ]
                     )
-                self._draft_swa_full_layers_num = banded_depths
-                self._draft_full_layers_num = draft_layers - banded_depths
+                dcp_size = kvc.ps.attn_dcp_size
+                self._draft_swa_full_layers_num = banded_depths * dcp_size
+                self._draft_full_layers_num = (draft_layers - banded_depths) * dcp_size
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
 
