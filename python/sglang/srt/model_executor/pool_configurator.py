@@ -683,7 +683,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             decode_alloc = 2 * get_alloc_len_per_decode()
         per_request = trailing_tokens + decode_alloc
 
-        num_reqs = get_schedule().max_running_requests // kvc.ps.attn_dp_size
+        num_reqs = max(1, get_schedule().max_running_requests // kvc.ps.attn_dp_size)
         if get_disagg().disaggregation_mode == "decode":
             self._swa_cap = (
                 per_request * num_reqs
@@ -800,7 +800,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.is_speculative = get_spec().speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
         self.requested_max_running_requests_per_worker = (
-            get_schedule().max_running_requests // kvc.ps.attn_dp_size
+            max(1, get_schedule().max_running_requests // kvc.ps.attn_dp_size)
             if get_schedule().max_running_requests is not None
             else None
         )
