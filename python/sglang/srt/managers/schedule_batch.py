@@ -855,6 +855,7 @@ class Req(ReqDllmMixin):
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -924,13 +925,14 @@ class Req(ReqDllmMixin):
             return_hidden_states
         )
 
-        # extra key for classifying the request (e.g. cache_salt)
+        # Extra key for caller-defined request classification.
         if lora_id is not None:
             extra_key = (
                 extra_key or ""
             ) + lora_id  # lora_id is concatenated to the extra key
 
         self.extra_key = extra_key
+        self.cache_salt = cache_salt or None
         self.lora_id = lora_id
         self.routing_key = routing_key
 
@@ -1359,6 +1361,7 @@ class Req(ReqDllmMixin):
                         token_ids=token_ids_to_match,
                         extra_key=self.extra_key,
                         limit=key_limit,
+                        cache_salt=self.cache_salt,
                     ),
                     req=self,
                     cow_mamba=cow_mamba,
@@ -1776,6 +1779,7 @@ class Req(ReqDllmMixin):
             "bootstrap_room": self.bootstrap_room,
             "priority": self.priority,
             "extra_key": self.extra_key,
+            "cache_salt": self.cache_salt,
             "routing_key": self.routing_key,
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
         }

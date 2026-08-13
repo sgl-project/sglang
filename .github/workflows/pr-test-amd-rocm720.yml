@@ -832,8 +832,9 @@ jobs:
       matrix:
         # run_suite.py load-balances the suite's parametrized cases and
         # standalone files over these partitions, so the count is free to
-        # choose. Two shards keep each one near the measured ~30 min of case
-        # time while halving the ~2h per-job container pull + install.
+        # choose. Two shards measured 45-65 min of case work each, inside the
+        # 180 min step timeout, and halve the ~2h per-job container pull plus
+        # dependency install.
         part: [0, 1]
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
