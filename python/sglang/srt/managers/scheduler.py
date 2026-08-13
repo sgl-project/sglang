@@ -4067,16 +4067,19 @@ class Scheduler(
         # with no process_batch_result running to publish it; gating this
         # behind is_fully_idle froze /get_loads, DP balancing, and the
         # router-facing LoadStat at their last busy values for the whole
-        # stall. For the router socket the busy->idle transition publishes
-        # immediately (the gauge changed) and an unchanged gauge is deduped
-        # to a slow heartbeat, so a spinning loop costs one send per
-        # heartbeat; the snapshot is shared between both sinks.
-        snapshot = self.publish_load_snapshot(force=True)
+        # stall. Force only when fully idle: the stalled path spins without
+        # ever reaching maybe_sleep_on_idle (it returns at the gate) and
+        # get_loads is O(parked queue) there, so it must ride the normal
+        # interval throttles — freshness bounded by a few spin iterations —
+        # while the truly idle path keeps its immediate force=True publish
+        # over O(empty) queues, with --sleep-on-idle as its escape hatch.
+        fully_idle = self.is_fully_idle()
+        snapshot = self.publish_load_snapshot(force=fully_idle)
         self.load_publisher.publish_load_stat(
-            self.load_inquirer.get_loads, force=True, snapshot=snapshot
+            self.load_inquirer.get_loads, force=fully_idle, snapshot=snapshot
         )
 
-        if not self.is_fully_idle():
+        if not fully_idle:
             return
 
         if self.enable_unified_memory:

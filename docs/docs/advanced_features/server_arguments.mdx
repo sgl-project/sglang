@@ -942,7 +942,13 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--kv-events-config`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Note that a bindable (wildcard-host) TCP endpoint here also reserves a load-publishing range of dp_size ports packed after the KV-event (and, when overlapping, replay) range, unless `--load-publish-endpoint` moves or disables it.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--load-publish-endpoint`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bind address for the runtime-load PUB socket that load-aware routers subscribe to, e.g. `tcp://*:6000`; rank r binds port+r and `/server_info` advertises the base under the `kv_events` block. Must be a wildcard-host TCP address. Defaults to the dp_size ports packed after the `--kv-events-config` range; set it explicitly to move the range off a port conflict, or to the literal `off` to disable load publishing while keeping KV events.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
