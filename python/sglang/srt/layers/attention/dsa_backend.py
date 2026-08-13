@@ -208,6 +208,17 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
 _PLAN_TOPK_V2 = None
 
 
+def _is_kpool_metadata_fusion_supported(
+    index_kpool: int, page_size: int, index_topk: int
+) -> bool:
+    return (
+        index_kpool > 1
+        and page_size == 64
+        and page_size % index_kpool == 0
+        and index_topk % index_kpool == 0
+    )
+
+
 def _get_plan_topk_v2():
     """Lazy, cached resolver for the JIT top-k v2 plan refresher.
 
@@ -458,18 +469,18 @@ class DeepseekSparseAttnBackend(
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
         # The fused metadata kernels are already the standard path for
-        # kpool<=1 backends; this flag extends them to the kpool=16 geometry,
-        # which is validated only with page_size=64 and pool-aligned topk.
+        # kpool<=1 backends; this flag extends them to page-aligned KPool
+        # geometries with pool-aligned topk.
         # Any other geometry keeps the eager path: the env var is global and
         # may be set fleet-wide across heterogeneous DSA backends, so an
         # unsupported backend must degrade gracefully, not fail startup.
         _kpool_fusion_requested = (
             envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION.get()
         )
-        _kpool_fusion_supported = (
-            self.dsa_index_kpool == 16
-            and self.real_page_size == 64
-            and self.dsa_index_topk % self.dsa_index_kpool == 0
+        _kpool_fusion_supported = _is_kpool_metadata_fusion_supported(
+            self.dsa_index_kpool,
+            self.real_page_size,
+            self.dsa_index_topk,
         )
         # The fused kernels and the multi-step sibling-copy dedup are
         # CUDA-only (every replay call site guards on is_cuda() and not
@@ -489,8 +500,8 @@ class DeepseekSparseAttnBackend(
             logger.warning(
                 "SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION is set but this "
                 "DSA backend's geometry is outside the validated envelope "
-                "(index_kpool=%s, page_size=%s, index_topk=%s; validated: "
-                "index_kpool=16, page_size=64, pool-aligned topk) — keeping "
+                "(index_kpool=%s, page_size=%s, index_topk=%s; required: "
+                "page_size=64, page-aligned pool, pool-aligned topk) — keeping "
                 "the eager metadata path for this backend.",
                 self.dsa_index_kpool,
                 self.real_page_size,
@@ -2446,7 +2457,7 @@ class DeepseekSparseAttnBackend(
             self.ingraph_verify_metadata_enabled
             and is_cuda()
             and not _is_hip
-            and get_parallel().dcp_size == 1
+            and not get_parallel().dcp_enabled
             and (self.dsa_index_kpool <= 1 or self.experimental_kpool_metadata_fusion)
             and self.dsa_decode_impl != "flashmla_kv"
         )

@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     DeepseekSparseAttnMultiStepBackend,
+    _is_kpool_metadata_fusion_supported,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -102,13 +103,13 @@ class TestSiblingCopyFallback(CustomTestCase):
 
 
 class TestInGraphVerifyEligibility(CustomTestCase):
-    def _eligible(self, dcp_size):
+    def _eligible(self, dcp_enabled):
         backend = MagicMock(spec=DeepseekSparseAttnBackend)
         backend.ingraph_verify_metadata_enabled = True
         backend.dsa_index_kpool = 16
         backend.experimental_kpool_metadata_fusion = True
         backend.dsa_decode_impl = "trtllm"
-        parallel = MagicMock(dcp_size=dcp_size)
+        parallel = MagicMock(dcp_enabled=dcp_enabled)
 
         with patch(
             "sglang.srt.layers.attention.dsa_backend.is_cuda", return_value=True
@@ -118,11 +119,25 @@ class TestInGraphVerifyEligibility(CustomTestCase):
         ):
             return DeepseekSparseAttnBackend._ingraph_verify_metadata_eligible(backend)
 
-    def test_single_dcp_rank_is_eligible(self):
-        self.assertTrue(self._eligible(dcp_size=1))
+    def test_uninitialized_dcp_group_is_eligible(self):
+        self.assertTrue(self._eligible(dcp_enabled=False))
 
     def test_dcp_is_not_eligible(self):
-        self.assertFalse(self._eligible(dcp_size=4))
+        self.assertFalse(self._eligible(dcp_enabled=True))
+
+
+class TestKPoolMetadataFusionGeometry(CustomTestCase):
+    def test_final_checkpoint_geometry_is_supported(self):
+        self.assertTrue(_is_kpool_metadata_fusion_supported(4, 64, 2048))
+
+    def test_legacy_checkpoint_geometry_is_supported(self):
+        self.assertTrue(_is_kpool_metadata_fusion_supported(16, 64, 2048))
+
+    def test_non_page_aligned_pool_is_not_supported(self):
+        self.assertFalse(_is_kpool_metadata_fusion_supported(6, 64, 2048))
+
+    def test_non_pool_aligned_topk_is_not_supported(self):
+        self.assertFalse(_is_kpool_metadata_fusion_supported(4, 64, 2049))
 
 
 if __name__ == "__main__":
