@@ -575,12 +575,11 @@ class KimiK3MoE(nn.Module):
         # (TP8/EP8 MegaMoE + SP-MoE): +4~5% output tok/s and −5% ITL over
         # bs 1–32, GSM8K unchanged — so it is on whenever the shape allows,
         # no flag.
-        # EP a2a only: with plain-TP experts the fused front already lands both
-        # partial sums in one collective (_forward_fused), a strictly better
-        # overlap than two streams.
+        # In NPU attention-TP compatibility mode, the all-gather and
+        # reduce-scatter remain on the current stream while only the shared
+        # MLP runs on the side stream.
         self._sbo_shared_overlap = (
             self._ep_a2a
-            and not self._shared_experts_attn_tp_comm
             and self.shared_experts is not None
             and self.alt_stream is not None
         )
@@ -959,20 +958,43 @@ class KimiK3MoE(nn.Module):
             return self._latent_norm(latent)
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
-    def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Run TP-sharded shared experts while DeepEP tokens stay scattered."""
+    def _prepare_shared_experts_input(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, bool]:
+        """Gather shared-expert input on the current stream when required."""
         if not self._shared_experts_attn_tp_comm:
-            return self.shared_experts(hidden_states)
+            return hidden_states, False
 
         group = get_parallel().attn_tp_group
         # SP-MoE presents one contiguous token shard per attention-TP rank;
         # the DP local buffer is the full reassembled per-replica batch.
         gathered_hidden_states = get_local_dp_buffer(group)
         attn_tp_all_gather_into_tensor(gathered_hidden_states, hidden_states)
-        gathered_shared_output = self.shared_experts(gathered_hidden_states)
+        return gathered_hidden_states, True
+
+    @staticmethod
+    def _finalize_shared_experts_output(
+        gathered_shared_output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        needs_reduce_scatter: bool,
+    ) -> torch.Tensor:
+        """Reduce-scatter shared-expert output on the current stream."""
+        if not needs_reduce_scatter:
+            return gathered_shared_output
+
         shared_output = torch.empty_like(hidden_states)
         attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
         return shared_output
+
+    def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run TP-sharded shared experts while DeepEP tokens stay scattered."""
+        shared_input, needs_reduce_scatter = self._prepare_shared_experts_input(
+            hidden_states
+        )
+        gathered_shared_output = self.shared_experts(shared_input)
+        return self._finalize_shared_experts_output(
+            gathered_shared_output, hidden_states, needs_reduce_scatter
+        )
 
     def _forward_unfused(
         self,
@@ -993,18 +1015,40 @@ class KimiK3MoE(nn.Module):
         # bandwidth away from the critical path.
         shared_output = None
         shared_event = None
+        shared_output_needs_reduce_scatter = False
 
         def issue_shared():
             nonlocal shared_output, shared_event
+            nonlocal shared_output_needs_reduce_scatter
             if self.shared_experts is None or hidden_states.shape[0] == 0:
                 return
             if self._sbo_shared_overlap:
-                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                shared_input, shared_output_needs_reduce_scatter = (
+                    self._prepare_shared_experts_input(hidden_states)
+                )
+                current_stream = torch.cuda.current_stream()
+                # Keep HCCL collectives on the current stream. The alternate
+                # stream only executes the shared-expert MLP.
+                shared_input.record_stream(self.alt_stream)
+                self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
-                    shared_output = self._forward_shared_experts(hidden_states)
+                    shared_output = self.shared_experts(shared_input)
                     shared_event = self.alt_stream.record_event()
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
+
+        def join_shared():
+            nonlocal shared_output
+            if shared_event is None:
+                return
+            # Join as late as possible, then keep the attention-TP collective
+            # on the current stream before the shared output is consumed.
+            torch.cuda.current_stream().wait_event(shared_event)
+            shared_output = self._finalize_shared_experts_output(
+                shared_output,
+                hidden_states,
+                shared_output_needs_reduce_scatter,
+            )
 
         # Front: gate + TopK (+ latent down-proj when the merged front covers it).
         # The gate and the latent down-proj read the same hidden_states, so the
@@ -1026,8 +1070,7 @@ class KimiK3MoE(nn.Module):
 
         if not self.use_latent_moe:
             expert_output = self.experts(hidden_states, topk_output)
-            if shared_event is not None:
-                torch.cuda.current_stream().wait_event(shared_event)
+            join_shared()
             if shared_output is not None:
                 expert_output = expert_output + shared_output
             if self.tp_size > 1:
@@ -1066,10 +1109,7 @@ class KimiK3MoE(nn.Module):
             latent = self._reduce_latent(expert_output)
             # up_proj is replicated, so the routed output is now fully reduced.
             out, _ = self.routed_expert_up_proj(latent)
-        if shared_event is not None:
-            # SBO join: as late as possible, so the side-stream shared experts
-            # get the whole routed a2a + latent tail to hide under.
-            torch.cuda.current_stream().wait_event(shared_event)
+        join_shared()
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
             # ones need the partial-sum reduction.
