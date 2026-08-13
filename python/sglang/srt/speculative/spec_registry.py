@@ -92,8 +92,9 @@ class CustomSpecAlgo:
     def supports_target_verify_for_draft(self) -> bool:
         return False
 
-    def supports_target_verify_war_read_done(self) -> bool:
-        return False
+    def is_war_publish_phase(self, forward_mode) -> bool:
+        # The step's last shared-buffer-reading phase owns the WAR read-done publish.
+        return forward_mode.is_draft_extend_v2()
 
     def supports_ragged_verify(self) -> bool:
         return False

@@ -8,11 +8,13 @@ CPU-only policy tests intentionally cannot exercise this cross-process handle.
 import gc
 import multiprocessing as mp
 import queue
+import time
 import unittest
+from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.utils.cuda_ipc_transport_utils import (
+from sglang.srt.multimodal.transport.cuda_ipc import (
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
     _pool_handle_cache_clear,
@@ -25,39 +27,40 @@ register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
 
 def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue):
     """Create a tokenizer-worker-like CUDA IPC pool in a spawned producer."""
-    pool = source = pool_slice = proxy = None
+    pool = source = proxy = None
     try:
         torch.cuda.set_device(0)
         pool = MmItemMemoryPool(
             memory_size=1 << 20,
-            recycle_interval=60,
+            recycle_interval=0.01,
             base_gpu_id=0,
+            consumer_count=1,
         )
         source = torch.arange(35, dtype=torch.float32, device="cuda").reshape(5, 7)
-        expected = source.cpu().tolist()
-        sync_meta, pool_slice, byte_offset = pool.return_a_slice_tensor_with_flag(
-            source
+        expected = torch.arange(35, dtype=torch.float32).reshape(5, 7).tolist()
+        proxy = pool.wrap_tensor(
+            source,
+            use_pool_handle_cache=True,
         )
-        if pool_slice is None:
+        if proxy is None:
             raise RuntimeError("test tensor did not fit in the CUDA IPC pool")
-        pool_slice.copy_(source.view(torch.int8).view(-1), non_blocking=True)
-        torch.cuda.synchronize()
-        proxy = CudaIpcTensorTransportProxy(
-            data=pool_slice,
-            info_data=source,
-            sync_buffer_meta=sync_meta,
-            pool_ipc_handle=pool._pool_ipc_handle,
-            pool_byte_offset=byte_offset,
-            pool_device_index=pool._pool_device_index,
-        )
+        # Intentionally do not synchronize the producer. The consumer stream
+        # wait must order its copy after the producer-ready write.
         proxy_queue.put((proxy, expected))
         if not consumer_done.wait(timeout=60):
             raise TimeoutError("consumer did not release the CUDA IPC tensor")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if pool.active_lease_count == 0:
+                break
+            time.sleep(0.01)
+        else:
+            raise TimeoutError("pool did not observe the stream-ordered consumer ack")
     except Exception as exc:  # pragma: no cover - returned to the parent
         result_queue.put(("error", repr(exc)))
         return
     finally:
-        del proxy, pool_slice, source
+        del proxy, source
         if pool is not None:
             pool.shutdown()
             del pool
@@ -118,6 +121,21 @@ class TestCudaIpcTransport(CustomTestCase):
                     producer.terminate()
                     producer.join(timeout=10)
             self.assertEqual(producer.exitcode, 0)
+
+    def test_uncached_mapping_waits_before_proxy_release(self):
+        proxy = object.__new__(CudaIpcTensorTransportProxy)
+        proxy.proxy_state = {"ipc_extra": {"use_pool_handle_cache": False}}
+        proxy._pool_storage = None
+        stream = Mock()
+
+        with patch(
+            "sglang.srt.multimodal.transport.cuda_ipc.torch.cuda.current_stream",
+            return_value=stream,
+        ):
+            proxy._retain_storage_until_stream_completes(object(), 0)
+
+        stream.synchronize.assert_called_once_with()
+        self.assertIsNone(proxy._pool_storage)
 
 
 if __name__ == "__main__":

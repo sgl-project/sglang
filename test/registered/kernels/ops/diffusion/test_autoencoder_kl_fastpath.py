@@ -10,6 +10,9 @@ from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
 )
 from sglang.multimodal_gen.runtime.models.vaes import flux2_vae_cuda_opt as vae_opt
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    use_vae_fast_path,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -38,17 +41,20 @@ def test_autoencoder_kl_fastpath_install():
     ref = vae.decode(z)
 
     opt = vae_opt.maybe_optimize_autoencoder_kl(vae)
-    gate = getattr(opt, vae_opt.GATE_ATTR, None)
-    assert gate is not None and not gate.enabled
     # Wrappers must not change parameter FQNs; strict load must round-trip.
     assert {n for n, _ in opt.named_parameters()} == ref_names
     opt.load_state_dict(ref_sd, strict=True)
     # Gate off: bit-for-bit the original path.
     assert torch.equal(opt.decode(z), ref)
-    # Gate on: fast path runs and stays close; gate off again restores exact.
-    gate.enabled = True
-    torch.testing.assert_close(opt.decode(z).float(), ref.float(), atol=0.1, rtol=0)
-    gate.enabled = False
+    # use_vae_fast_path() is a no-op when nothing registered a gate, so check
+    # the wrappers went in before relying on it to switch paths.
+    assert any(
+        isinstance(m, (vae_opt.FusedGroupNormSiLU, vae_opt.FusedUpsample2xConv2d))
+        for m in opt.modules()
+    )
+    # Gate on: fast path runs and stays close; leaving the scope restores exact.
+    with use_vae_fast_path(opt, True):
+        torch.testing.assert_close(opt.decode(z).float(), ref.float(), atol=0.1, rtol=0)
     assert torch.equal(opt.decode(z), ref)
 
 
