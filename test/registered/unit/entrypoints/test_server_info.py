@@ -506,6 +506,26 @@ class TestLoadPublishEndpointValidation(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "overlaps"):
             args.check_load_publish_args()
 
+    def test_rejects_null_publisher(self):
+        # publisher='null' disables KV events, so there is nothing to advertise
+        # through — accepting the opt-in would silently do nothing.
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config='{"publisher": "null"}',
+            load_publish_endpoint="auto",
+        )
+        with self.assertRaisesRegex(ValueError, "null"):
+            args.check_load_publish_args()
+
+    def test_rejects_unparseable_kv_events_config(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config="{not json",
+            load_publish_endpoint="auto",
+        )
+        with self.assertRaisesRegex(ValueError, "not parseable"):
+            args.check_load_publish_args()
+
     def test_off_and_valid_endpoint_pass(self):
         for endpoint in (None, "off", "OFF", "auto", "tcp://*:6000"):
             with self.subTest(endpoint=endpoint):

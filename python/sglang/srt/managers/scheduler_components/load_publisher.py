@@ -51,7 +51,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Publish at most once per this many calls unless force=True.
+# Default call throttle (overridden with the DP-snapshot interval so the two
+# sinks fire in phase). Publish at most once per this many calls unless force.
 LOAD_PUBLISH_INTERVAL = 5
 
 # An unchanged stat is re-sent at most this often; a changed one always goes
@@ -126,6 +127,7 @@ class SchedulerLoadPublisher:
         kv_events_config: Optional[str],
         ps: ParallelState,
         load_publish_endpoint: Optional[str] = None,
+        publish_interval: int = LOAD_PUBLISH_INTERVAL,
     ) -> None:
         # _socket is None == disabled: every early return below leaves it so,
         # and publish_load_stat then skips the snapshot entirely.
@@ -133,6 +135,7 @@ class SchedulerLoadPublisher:
         self._rank = 0
         self._seq = count()
         self._publish_counter = 0
+        self._publish_interval = max(1, publish_interval)
         # Last sent counts + timestamp, driving the dedup/heartbeat.
         self._last_counts: Optional[tuple] = None
         self._last_publish_ts = 0.0
@@ -145,6 +148,12 @@ class SchedulerLoadPublisher:
             # Malformed config: the KV publisher would fail too; stay a no-op.
             return
         if cfg.publisher == "null" or not cfg.endpoint:
+            # KV publishing itself is off, so there is nothing to advertise
+            # through and nothing to bind alongside.
+            logger.info(
+                "load-publisher disabled: --kv-events-config publisher is "
+                "'null' or has no endpoint"
+            )
             return
         # Same resolver /server_info advertises with, so a router never
         # subscribes to a range this declines — except a runtime bind failure
@@ -190,8 +199,8 @@ class SchedulerLoadPublisher:
         force: bool = False,
         snapshot: Optional[LoadSnapshot] = None,
     ) -> None:
-        """Publish a load snapshot, throttled to [`LOAD_PUBLISH_INTERVAL`]
-        calls unless `force`; an unchanged stat is re-sent at most once per
+        """Publish a load snapshot, throttled to `publish_interval` calls
+        unless `force`; an unchanged stat is re-sent at most once per
         [`LOAD_PUBLISH_HEARTBEAT_S`], a changed one always immediately.
 
         `load_provider` reads live scheduler state
@@ -207,7 +216,7 @@ class SchedulerLoadPublisher:
             return
 
         self._publish_counter += 1
-        if not force and self._publish_counter < LOAD_PUBLISH_INTERVAL:
+        if not force and self._publish_counter < self._publish_interval:
             return
         # Reset where the throttle passes, not on send: a dedup hit or
         # provider failure would otherwise leave it saturated, silently

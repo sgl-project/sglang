@@ -393,6 +393,10 @@ class Scheduler(
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
+    # Class-level default so on_idle's stall gate works even if a fork
+    # overrides init_load_publisher (which would otherwise not set it).
+    _last_stall_publish_ts: float = float("-inf")
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -2113,13 +2117,15 @@ class Scheduler(
 
     def init_load_publisher(self) -> None:
         # Router-facing load reporting; rank gating and no-op fallback live
-        # inside the component.
+        # inside the component. Same interval as the DP-balancing writer so
+        # the two fire in phase and the load sink always reuses that snapshot
+        # instead of walking the queues itself.
         self.load_publisher = SchedulerLoadPublisher(
             kv_events_config=get_observability().kv_events_config,
             ps=self.ps,
             load_publish_endpoint=get_observability().load_publish_endpoint,
+            publish_interval=get_observability().load_snapshot_publish_interval,
         )
-        self._last_stall_publish_ts = float("-inf")
 
     def init_load_inquirer(self) -> None:
         self.total_prefill_uncached_tokens = 0

@@ -9178,29 +9178,40 @@ class ServerArgs:
 
     def check_load_publish_args(self):
         """Fail fast at the entrypoint on a --load-publish-endpoint the
-        scheduler would decline (unbindable, overlapping the KV range, u16
-        overflow, or no kv-events publisher to advertise through) rather than
-        only warning from a scheduler subprocess. Routes through the same
-        resolver the scheduler binds and /server_info advertises with."""
-        if not self.load_publish_endpoint:
-            return
+        scheduler would decline (no active kv-events publisher to advertise
+        through, unbindable, overlapping the KV range, u16 overflow) rather
+        than only warning — or silently doing nothing — from a scheduler
+        subprocess. Routes through the same resolver the scheduler binds and
+        /server_info advertises with."""
+        mode = (self.load_publish_endpoint or "").strip()
+        if not mode or mode.lower() == "off":
+            return  # disabled; nothing to validate
+
         from sglang.srt.disaggregation.kv_events import (
             KVEventsConfig,
             resolve_load_pub_range,
         )
 
-        kv_endpoint = replay_endpoint = None
-        if self.kv_events_config:
-            try:
-                cfg = KVEventsConfig.from_cli(self.kv_events_config)
-                kv_endpoint, replay_endpoint = cfg.endpoint, cfg.replay_endpoint
-            except Exception:
-                pass  # malformed config fails on the KV publisher itself
+        if not self.kv_events_config:
+            raise ValueError(
+                "--load-publish-endpoint requires --kv-events-config: routers"
+                " discover the load range through /server_info's kv_events"
+                " block, absent without a publisher."
+            )
+        try:
+            cfg = KVEventsConfig.from_cli(self.kv_events_config)
+        except Exception as e:
+            raise ValueError(f"--kv-events-config is not parseable: {e}")
+        if cfg.publisher == "null" or not cfg.endpoint:
+            raise ValueError(
+                "--load-publish-endpoint needs an active --kv-events-config"
+                " publisher; got publisher='null' or an empty endpoint."
+            )
         _, reason = resolve_load_pub_range(
-            kv_endpoint=kv_endpoint,
-            replay_endpoint=replay_endpoint,
+            kv_endpoint=cfg.endpoint,
+            replay_endpoint=cfg.replay_endpoint,
             dp_size=self.dp_size,
-            load_publish_endpoint=self.load_publish_endpoint,
+            load_publish_endpoint=mode,
         )
         if reason:
             raise ValueError(reason)
@@ -9531,7 +9542,8 @@ class ServerArgs:
                                                   # resolved
                 "load_topic": "load",             # SUB filter for the load
                                                   # socket; present iff
-                                                  # load_endpoint_port_base is
+                                                  # load_endpoint_port_base
+                                                  # is present
             }
 
         Returns None (i.e. "no publisher to describe") when any of:

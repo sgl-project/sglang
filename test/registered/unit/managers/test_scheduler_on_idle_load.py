@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -19,7 +19,7 @@ from sglang.srt.managers.scheduler import Scheduler
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestOnIdleStallPublish(unittest.TestCase):
+class TestOnIdleStallPublish(CustomTestCase):
     def _stalled_scheduler(self) -> Scheduler:
         s = Scheduler.__new__(Scheduler)
         s.maybe_send_health_check_signal = MagicMock()

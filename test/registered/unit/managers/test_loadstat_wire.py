@@ -278,19 +278,22 @@ class TestLoadPublisherGating(CustomTestCase):
         open_sock.assert_not_called()
 
     def test_bind_failure_disables_without_raising(self):
-        # An occupied port must not take down scheduler startup over a
-        # routing hint; the publisher logs and stays a no-op.
+        # An occupied port must not take down scheduler startup over a routing
+        # hint; the publisher logs and stays a no-op. Opted in (auto) so the
+        # bind is actually reached — otherwise the feature is just off.
         import zmq
 
         with patch(
             "sglang.srt.managers.scheduler_components.load_publisher."
             "_open_pub_socket",
             side_effect=zmq.ZMQError,
-        ):
+        ) as open_sock:
             pub = SchedulerLoadPublisher(
                 kv_events_config=ZMQ_ENDPOINT,
                 ps=ParallelState.trivial(),
+                load_publish_endpoint="auto",
             )
+        open_sock.assert_called_once()  # the bind was attempted and failed
         self.assertFalse(pub.enable)
         pub.publish_load_stat(MagicMock(), force=True)  # still a no-op
 
