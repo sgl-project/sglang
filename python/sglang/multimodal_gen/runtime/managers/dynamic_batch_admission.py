@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Admission control for native diffusion batching.
+"""Compatibility and admission control for native diffusion batching.
 
 Native diffusion batching is model, resolution, device, and implementation
 dependent. The scheduler treats `--batching-max-size` as the public ceiling;
@@ -9,10 +9,12 @@ combinations.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from dataclasses import dataclass
 from difflib import get_close_matches
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
@@ -40,6 +42,155 @@ _BATCHING_RULE_KEYS = frozenset(
         "calibration",
     }
 )
+
+
+def _freeze_signature_value(value: Any):
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return tuple(
+            (str(key), _freeze_signature_value(item))
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_signature_value(item) for item in value)
+    return repr(value)
+
+
+def _sampling_param_signature_items(
+    req: Req, *, exclude_num_outputs_per_prompt: bool
+) -> list[tuple[str, Any]] | None:
+    sampling_params = req.sampling_params
+    if sampling_params is None:
+        return None
+    try:
+        sampling_fields = dataclasses.fields(sampling_params)
+    except TypeError:
+        return None
+
+    return [
+        (
+            field.name,
+            _freeze_signature_value(getattr(sampling_params, field.name, None)),
+        )
+        for field in sampling_fields
+        if not field.metadata.get("batch_sig_exclude", False)
+        and not (
+            exclude_num_outputs_per_prompt and field.name == "num_outputs_per_prompt"
+        )
+    ]
+
+
+def get_dynamic_batch_signature(
+    req: Req, *, exclude_num_outputs_per_prompt: bool
+) -> tuple[Any, ...] | None:
+    cache_attr = (
+        "_dynamic_batch_sig_without_num_outputs"
+        if exclude_num_outputs_per_prompt
+        else "_dynamic_batch_sig"
+    )
+    cached = getattr(req, cache_attr, None)
+    if cached is not None:
+        return cached
+
+    items = _sampling_param_signature_items(
+        req,
+        exclude_num_outputs_per_prompt=exclude_num_outputs_per_prompt,
+    )
+    if items is None:
+        return None
+
+    profile_signature = (
+        (True, req.profile_all_stages, req.num_profiled_timesteps)
+        if req.profile
+        else (False,)
+    )
+    items.append(("profiling", profile_signature))
+
+    diffusers_kwargs = (req.extra or {}).get("diffusers_kwargs")
+    if diffusers_kwargs:
+        items.append(
+            ("diffusers_kwargs", _freeze_signature_value(diffusers_kwargs))
+        )
+
+    signature = tuple(items)
+    setattr(req, cache_attr, signature)
+    return signature
+
+
+def get_dynamic_batch_reject_reason(
+    base_req: Req,
+    candidate_req: Req,
+    *,
+    exclude_num_outputs_per_prompt: bool = False,
+) -> str | None:
+    if base_req.is_warmup or candidate_req.is_warmup:
+        return "warmup"
+    if (
+        base_req.realtime_session_id
+        or base_req.session is not None
+        or candidate_req.realtime_session_id
+        or candidate_req.session is not None
+    ):
+        return "realtime_session"
+    if not isinstance(base_req.prompt, str) or not isinstance(
+        candidate_req.prompt, str
+    ):
+        return "prompt_type"
+    if (
+        getattr(base_req, "image_path", None) is not None
+        or getattr(candidate_req, "image_path", None) is not None
+    ):
+        return "image_conditioning"
+    if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
+        return "return_file_paths_only"
+
+    base_signature = get_dynamic_batch_signature(
+        base_req,
+        exclude_num_outputs_per_prompt=exclude_num_outputs_per_prompt,
+    )
+    candidate_signature = get_dynamic_batch_signature(
+        candidate_req,
+        exclude_num_outputs_per_prompt=exclude_num_outputs_per_prompt,
+    )
+    if base_signature is None or candidate_signature is None:
+        return "signature_unavailable"
+    if base_signature == candidate_signature:
+        return None
+    if len(base_signature) != len(candidate_signature):
+        return "signature_mismatch"
+
+    for (name, base_value), (candidate_name, candidate_value) in zip(
+        base_signature, candidate_signature
+    ):
+        if name != candidate_name:
+            return "signature_mismatch"
+        if base_value == candidate_value:
+            continue
+        if name == "profiling":
+            return "profiling"
+        if name == "diffusers_kwargs":
+            return "extra.diffusers_kwargs"
+        return f"sampling_params.{name}"
+    return "signature_mismatch"
+
+
+def are_requests_batch_compatible(
+    base_req: Req,
+    candidate_req: Req,
+    *,
+    exclude_num_outputs_per_prompt: bool = False,
+) -> bool:
+    return (
+        get_dynamic_batch_reject_reason(
+            base_req,
+            candidate_req,
+            exclude_num_outputs_per_prompt=exclude_num_outputs_per_prompt,
+        )
+        is None
+    )
 
 
 @dataclass(frozen=True)

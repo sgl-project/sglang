@@ -3,12 +3,9 @@
 import dataclasses
 import multiprocessing as mp
 import os
-import signal
 import sys
-import threading
 import time
 
-import psutil
 import uvicorn
 
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
@@ -24,7 +21,10 @@ from sglang.multimodal_gen.runtime.server_args import (
     prepare_server_args,
     set_global_server_args,
 )
-from sglang.multimodal_gen.runtime.utils.common import is_port_available
+from sglang.multimodal_gen.runtime.utils.common import (
+    is_port_available,
+    kill_process_tree,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import init_diffusion_tracing
 from sglang.multimodal_gen.utils import kill_itself_when_parent_died
@@ -51,45 +51,6 @@ def _find_available_port(
     raise RuntimeError(
         f"No available port found after {max_attempts} attempts (start={start})"
     )
-
-
-def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
-    """Kill the process and all its child processes."""
-    # Remove sigchld handler to avoid spammy logs.
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-
-    if parent_pid is None:
-        parent_pid = os.getpid()
-        include_parent = False
-
-    try:
-        itself = psutil.Process(parent_pid)
-    except psutil.NoSuchProcess:
-        return
-
-    children = itself.children(recursive=True)
-    for child in children:
-        if child.pid == skip_pid:
-            continue
-        try:
-            child.kill()
-        except psutil.NoSuchProcess:
-            pass
-
-    if include_parent:
-        try:
-            if parent_pid == os.getpid():
-                itself.kill()
-                sys.exit(0)
-
-            itself.kill()
-
-            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
-            # so we send an additional signal to kill them.
-            itself.send_signal(signal.SIGQUIT)
-        except psutil.NoSuchProcess:
-            pass
 
 
 def _process_names(processes) -> str:

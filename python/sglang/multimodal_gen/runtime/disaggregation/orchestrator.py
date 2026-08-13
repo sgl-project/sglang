@@ -37,8 +37,12 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     encode_transfer_msg,
     is_transfer_message,
 )
-from sglang.multimodal_gen.runtime.dynamic_batching import (
+from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
     are_requests_batch_compatible,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    OutputBatch,
+    get_first_dimension_size,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 
@@ -697,21 +701,7 @@ class DiffusionServer:
                 registered,
             )
 
-    @staticmethod
-    def _output_size(value) -> int | None:
-        if value is None:
-            return None
-        if isinstance(value, (list, tuple)):
-            return len(value)
-        if hasattr(value, "shape") and len(value.shape) > 0:
-            return int(value.shape[0])
-        return None
-
     def _handle_glm_shard_result_frames(self, frames: list) -> None:
-        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-            OutputBatch,
-        )
-
         tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
         shard_id = scalar_fields.get("request_id")
         shard = self._glm_shards.pop(shard_id, None)
@@ -729,7 +719,7 @@ class DiffusionServer:
         client = shard.client
         total = max(1, int(client.req.num_outputs_per_prompt or 1))
         for name, value in (("output", output), ("output_file_paths", output_paths)):
-            size = self._output_size(value)
+            size = get_first_dimension_size(value)
             if size is not None and size != total:
                 error = (
                     f"GLM fan-out {name} size mismatch: got {size}, expected {total}"

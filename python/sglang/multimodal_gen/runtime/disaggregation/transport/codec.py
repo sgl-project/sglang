@@ -13,8 +13,6 @@ from dataclasses import dataclass
 import torch
 import zmq
 
-from sglang.multimodal_gen.runtime.platforms import current_platform
-
 logger = logging.getLogger(__name__)
 
 _DTYPE_TO_STR = {
@@ -50,7 +48,7 @@ class TensorWrapper:
     """Expose a CPU-contiguous tensor's data buffer for zero-copy ZMQ send."""
 
     def __init__(self, tensor: torch.Tensor):
-        if not current_platform.is_cpu():
+        if tensor.is_cuda or tensor.is_npu:
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
