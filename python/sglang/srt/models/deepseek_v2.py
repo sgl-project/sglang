@@ -128,7 +128,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
 )
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.utils.cp_utils import (
@@ -1913,6 +1913,16 @@ class DeepseekV2AttentionMLA(
                 prefix=add_prefix("attn_mqa", prefix),
             )
 
+        # Embedding variants (e.g. DeepseekV3BidirectionalModel) run the backbone
+        # with encoder-style bidirectional attention by declaring is_causal=False
+        # on the HF config. Only the MHA (non-absorbed) prefill path honors it:
+        # the absorbed-MLA kernels are causal-only, so these models are served
+        # prefill-only through attn_mha. attn_mqa (decode/absorbed) stays causal.
+        mha_attn_type = (
+            AttentionType.DECODER
+            if getattr(config, "is_causal", True)
+            else AttentionType.ENCODER_ONLY
+        )
         self.attn_mha = RadixAttention(
             self.num_local_heads,
             self.qk_nope_head_dim + self.qk_rope_head_dim,
@@ -1922,6 +1932,7 @@ class DeepseekV2AttentionMLA(
             v_head_dim=self.v_head_dim,
             quant_config=quant_config,
             prefix=add_prefix("attn_mha", prefix),
+            attn_type=mha_attn_type,
         )
 
         self.alt_stream = alt_stream

@@ -2704,3 +2704,18 @@ def _hrm_text_attention_force(view: Any) -> dict:
             "attention."
         )
     return {"attention_backend": "triton"}
+
+
+def _deepseek_bidirectional_attention_force(view: Any) -> dict:
+    """DeepseekV3BidirectionalModel serves encoder-style (bidirectional)
+    embeddings through the MLA MHA prefill path. Only the Triton backend honors
+    non-causal (ENCODER_ONLY) attention on that path; the flashinfer MLA prefill
+    ignores it and silently runs causal, producing wrong embeddings."""
+    if view.attention_backend not in (None, "triton"):
+        logger.warning(
+            f"Overriding --attention-backend "
+            f"{view.attention_backend!r} -> 'triton': only the "
+            "Triton backend supports DeepseekV3BidirectionalModel's "
+            "bidirectional (encoder-style) attention."
+        )
+    return {"attention_backend": "triton"}

@@ -3735,6 +3735,7 @@ class ServerArgs:
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
         from sglang.srt.arg_groups.overrides import (
+            _deepseek_bidirectional_attention_force,
             _hrm_text_attention_force,
             run_post_process_pass,
         )
@@ -3767,6 +3768,30 @@ class ServerArgs:
                 "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
                 "--disable-cuda-graph for correctness of the bidirectional "
                 "prompt attention."
+            )
+
+        # DeepseekV3BidirectionalModel is a DeepSeek-V3 MoE served as an
+        # encoder-style embedding model (is_causal=False). Bidirectional
+        # attention is only honored on the non-absorbed MHA prefill path, and
+        # only the Triton backend honors ENCODER_ONLY there (flashinfer's MLA
+        # prefill silently runs causal). The absorbed-MLA kernels are causal-
+        # only and are exactly what CUDA-graph capture pins, so disable graph
+        # capture to keep prefill on the MHA path. Prefix reuse and split
+        # prefills reuse K/V that depend on later prompt tokens, so both are
+        # invalid under bidirectional attention.
+        if "DeepseekV3BidirectionalModel" in getattr(hf_config, "architectures", []):
+            run_post_process_pass(self, _deepseek_bidirectional_attention_force)
+            self.chunked_prefill_size = -1
+            self.disable_radix_cache = True
+            self.disable_cuda_graph = True
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            logger.warning(
+                "DeepseekV3BidirectionalModel detected: forcing "
+                "--attention-backend triton, --chunked-prefill-size -1, "
+                "--disable-radix-cache, and --disable-cuda-graph for "
+                "correctness of the bidirectional (encoder-style) prompt "
+                "attention on the MHA prefill path."
             )
 
         # EmbeddingGemma is a Gemma3TextModel with bidirectional prompt
