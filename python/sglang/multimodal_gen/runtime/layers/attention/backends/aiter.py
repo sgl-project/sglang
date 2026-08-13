@@ -29,9 +29,27 @@ _fp8_dtype = torch.float8_e4m3fn
 # fmha_fwd_hd128_fp8_gfx950 ASM kernel. Support full MHA with q/k/v head_dim == 128 -- e.g., Wan 2.2 self- and cross-attention.
 _FMHA_FP8_HEAD_DIM = 128
 
+_FP8_MAX = torch.finfo(_fp8_dtype).max
+
 
 if _use_fp8_attn:
     logger.info("DiT FP8 attention enabled via SGLANG_DIFFUSION_AITER_FP8_ATTN=1")
+
+
+@torch.compile(dynamic=False)
+def _per_tensor_quant_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Bit-exact drop-in for ``aiter.per_tensor_quant(x, quant_dtype=fp8)``, 5.6x
+    faster on [1, 90000, 40, 128] bf16 (3.43 ms -> 0.61 ms on gfx950).
+
+    aiter's reference upcasts to fp32 and runs abs/max/div/cast as four more eager
+    kernels; its fused HIP/Triton paths decompose over rows of ``size(-1)``, which
+    at head_dim 128 is one workgroup per 128 elements contending on one atomic.
+    ``dynamic=False`` is load-bearing: with ``dynamic=True`` this is both slower
+    and no longer bit-exact.
+    """
+    min_val, max_val = torch.aminmax(x)
+    scale = torch.maximum(-min_val.float(), max_val.float()) / _FP8_MAX
+    return (x.float() / scale).to(_fp8_dtype), scale.reshape(1)
 
 
 def _can_use_fmha_fp8_prefill(
@@ -160,9 +178,9 @@ class AITerImpl(AttentionImpl):
         """
         if _use_fp8_attn:
             if query.dtype != _fp8_dtype:
-                q_fp8, q_scale = aiter.per_tensor_quant(query, quant_dtype=_fp8_dtype)
-                k_fp8, k_scale = aiter.per_tensor_quant(key, quant_dtype=_fp8_dtype)
-                v_fp8, v_scale = aiter.per_tensor_quant(value, quant_dtype=_fp8_dtype)
+                q_fp8, q_scale = _per_tensor_quant_fp8(query)
+                k_fp8, k_scale = _per_tensor_quant_fp8(key)
+                v_fp8, v_scale = _per_tensor_quant_fp8(value)
             else:
                 q_fp8, k_fp8, v_fp8 = query, key, value
                 one = torch.tensor(1.0, dtype=torch.float32, device=query.device)
