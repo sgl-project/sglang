@@ -129,18 +129,18 @@ pub struct MmWiring {
 /// One MM worker, spawned via `Runtime::start_mm_workers` (which owns the
 /// pinning policy for this pool — see its docs).
 pub struct MmWorker {
-    rx: flume::Receiver<MmRequest>,
-    tm: flume::Sender<TmEvent>,
+    mm_rx: flume::Receiver<MmRequest>,
+    tm_tx: flume::Sender<TmEvent>,
     ctx: Arc<MmContext>,
 }
 
 impl MmWorker {
     pub fn new(
-        rx: flume::Receiver<MmRequest>,
-        tm: flume::Sender<TmEvent>,
+        mm_rx: flume::Receiver<MmRequest>,
+        tm_tx: flume::Sender<TmEvent>,
         ctx: Arc<MmContext>,
     ) -> Self {
-        Self { rx, tm, ctx }
+        Self { mm_rx, tm_tx, ctx }
     }
 }
 
@@ -149,7 +149,7 @@ impl Runnable for MmWorker {
     /// shutdown). One request at a time, so the pool size bounds MM
     /// concurrency; an error rejects the request back to the client.
     fn run(self) {
-        while let Ok(req) = self.rx.recv() {
+        while let Ok(req) = self.mm_rx.recv() {
             let rid = req.rid;
             let event = match process(&self.ctx, &rid, req.work) {
                 Ok(input_ids) => {
@@ -161,7 +161,7 @@ impl Runnable for MmWorker {
                     TmEvent::MmFailed { rid, message }
                 }
             };
-            if self.tm.send(event).is_err() {
+            if self.tm_tx.send(event).is_err() {
                 return; // to-scheduler gone: shutdown
             }
         }
