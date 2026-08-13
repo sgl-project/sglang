@@ -315,6 +315,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
+    resolve_image_processor_backend,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
@@ -812,7 +813,7 @@ class Scheduler(
                     tokenizer_mode=get_serving().tokenizer_mode,
                     trust_remote_code=get_model().trust_remote_code,
                     revision=get_model().revision,
-                    use_fast=not get_mm().disable_fast_image_processor,
+                    image_processor_backend=resolve_image_processor_backend(get_mm()),
                     tokenizer_backend=get_serving().tokenizer_backend,
                     model_name=get_model().model_path,
                 )
@@ -828,7 +829,11 @@ class Scheduler(
 
         # Load multimodal processor for M-RoPE fallback computation.
         self._mm_processor = None
-        if self.model_config.is_multimodal and self.processor is not None:
+        if (
+            self.model_config.is_multimodal
+            and self.processor is not None
+            and not server_args.language_model_only
+        ):
             try:
                 import_processors("sglang.srt.multimodal.processors")
                 self._mm_processor = get_mm_processor(
@@ -2412,6 +2417,7 @@ class Scheduler(
                 ),
                 routing_key=recv_req.routing_key,
                 extra_key=recv_req.extra_key,
+                cache_salt=recv_req.cache_salt,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
@@ -3881,6 +3887,12 @@ class Scheduler(
             assert _batch_result is batch_result
             # Delay-sample is non-spec only; relays the sampled bonus tokens.
             self._relay_forward_payload(batch_result.future_indices, batch_result)
+
+        # Run device-to-host copy on a separate stream to avoid blocking the
+        # forward stream. The copy waits for the sampled result and can overlap
+        # with subsequent forward computation.
+        self.copy_stream.wait_stream(self.forward_stream)
+        with self.copy_stream_ctx:
             batch_result.copy_to_cpu(
                 return_logprob=cur_batch.return_logprob,
                 return_hidden_states=cur_batch.return_hidden_states,

@@ -157,7 +157,7 @@ This section provides deployment configurations optimized for different hardware
         - **MI325X (256GB)** runs with tp=2.
         - **MI355X (288GB)** runs with tp=2.
     - **FP4**: The FP4 quantized model requires ~250GB for weights, cutting memory by almost 4x. NVFP4 ([nvidia/Qwen3.5-397B-A17B-NVFP4-V2](https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4-V2)) requires B200/B300 (Blackwell architecture); AMD provides an MXFP4 checkpoint ([amd/Qwen3.5-397B-A17B-MXFP4](https://huggingface.co/amd/Qwen3.5-397B-A17B-MXFP4)) for MI355X.
-        - **B200 (183GB)** runs with tp=4. (NVFP4)
+        - **B200 (183GB)** runs with tp=4 (tp=2 with expert parallelism 2 when MTP is enabled). (NVFP4)
         - **B300 (275GB)** runs with tp=2. (NVFP4)
         - **MI355X (288GB)** runs with tp=2 (use tp=4 for low concurrency). (MXFP4)
 
@@ -191,7 +191,7 @@ This section provides deployment configurations optimized for different hardware
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>183GB</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4 / 2 + EP2 (MTP)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>B300</td>
