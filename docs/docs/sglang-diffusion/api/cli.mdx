@@ -234,6 +234,8 @@ VLA action pipelines use model-specific controls for residency inside their comp
 
 FSDP owns DiT sharding and placement. Combine explicit FSDP only with a resident DiT; explicit DiT `component-offload` or `layerwise-offload` cannot be combined with `--use-fsdp-inference true`. Auxiliary encoders and VAEs may still use either offload mode independently.
 
+When DiT layerwise offload is selected, `--dit-layerwise-resident-layers` keeps part of the DiT on the accelerator. Use `--dit-layerwise-residency-policy leading` (the compatibility default) or `strided` to choose how those resident layers are distributed. These options tune the selected layerwise mode; they do not select component placement by themselves.
+
 The previous `--dit-cpu-offload`, `--text-encoder-cpu-offload`, `--image-encoder-cpu-offload`, `--vae-cpu-offload`, `--cpu-offload-components`, `--dit-layerwise-offload`, and `--layerwise-offload-components` options remain accepted for compatibility and emit a deprecation warning. Do not mix them with `--component-residency` in one command. Migration examples:
 
 | Compatibility option | Typical `--component-residency` replacement |

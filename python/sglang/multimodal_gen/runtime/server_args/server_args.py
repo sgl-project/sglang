@@ -43,6 +43,8 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     DIT_COMPONENT_NAMES,
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
+    RESIDENCY_POLICIES,
+    RESIDENCY_POLICY_LEADING,
     cpu_offload_component_matches,
     cpu_offload_flags_for_layerwise_components,
     is_dit_component_name,
@@ -336,8 +338,10 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
-    # If set, keep this many leading DiT layers resident on GPU
+    # If set, keep this many DiT layers resident on GPU
     dit_layerwise_resident_layers: float = 0.0
+    # Which layers those are: the leading ones, or spread evenly over the stack.
+    dit_layerwise_residency_policy: str = RESIDENCY_POLICY_LEADING
     offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
@@ -1485,10 +1489,21 @@ class ServerArgs(DisaggServerArgsMixin):
             == ComponentResidencyMode.COMPONENT_OFFLOAD
         )
 
-    def should_stage_transformer_on_cpu(self, component_name: str) -> bool:
-        return (
-            self.component_residency_mode(component_name)
-            != ComponentResidencyMode.RESIDENT
+    def should_load_component_on_cpu(
+        self,
+        component_name: str,
+        *,
+        can_configure_layerwise_after_load: bool = False,
+    ) -> bool:
+        """Whether loading should start on CPU before residency setup"""
+        mode = self.component_residency_mode(component_name)
+        if mode == ComponentResidencyMode.COMPONENT_OFFLOAD:
+            return True
+        if mode != ComponentResidencyMode.LAYERWISE_OFFLOAD:
+            return False
+        return can_configure_layerwise_after_load or (
+            self.explicit_component_residency_mode(component_name)
+            == ComponentResidencyMode.LAYERWISE_OFFLOAD
         )
 
     def any_component_uses_residency_mode(self, mode: ComponentResidencyMode) -> bool:
@@ -2182,13 +2197,28 @@ class ServerArgs(DisaggServerArgsMixin):
             "--dit-layerwise-resident-layers",
             type=float,
             default=ServerArgs.dit_layerwise_resident_layers,
-            help="With --component-residency dit=layerwise-offload, keep this many leading DiT layers "
+            help="With --component-residency dit=layerwise-offload, keep this many DiT layers "
             "permanently resident on GPU (retained across denoise steps) and stream "
-            "only the tail with --dit-offload-prefetch-size. 0.0 = off (pure "
+            "the rest with --dit-offload-prefetch-size; which layers stay resident "
+            "is --dit-layerwise-residency-policy. 0.0 = off (pure "
             "streaming). Between 0.0 and 1.0 = ratio of layers; >= 1 = absolute "
             "count. Unlike raising the prefetch size, resident layers are transferred "
             "once (not re-streamed every step), so this trades VRAM for lower denoise "
             "latency when memory is available.",
+        )
+        parser.add_argument(
+            "--dit-layerwise-residency-policy",
+            type=str,
+            choices=RESIDENCY_POLICIES,
+            default=ServerArgs.dit_layerwise_residency_policy,
+            help="Which layers --dit-layerwise-resident-layers keeps resident. "
+            "'leading' (default) keeps the first N, which crams the whole "
+            "weight stream into the tail of each step. 'strided' spreads the "
+            "resident layers evenly over the stack so the same bytes move over "
+            "the whole step instead: same VRAM, same bytes, only a different "
+            "schedule. Worth trying when weight streaming overlaps "
+            "memory-bound compute -- the transfers stop competing with it for "
+            "L2 and DRAM bandwidth, which is where the gain comes from.",
         )
 
         # offload flags
@@ -3000,6 +3030,33 @@ class ServerArgs(DisaggServerArgsMixin):
                 "layerwise-offloaded. It only applies together with "
                 "--component-residency dit=layerwise-offload."
             )
+
+        if self.dit_layerwise_residency_policy not in RESIDENCY_POLICIES:
+            # argparse's choices= only covers the CLI; ServerArgs is also
+            # constructed directly by the Python API, and without this the bad
+            # value would surface as a ValueError inside the GPU worker at
+            # model-load time.
+            raise ValueError(
+                f"Invalid --dit-layerwise-residency-policy "
+                f"{self.dit_layerwise_residency_policy!r}; expected one of "
+                f"{RESIDENCY_POLICIES}."
+            )
+
+        if self.dit_layerwise_residency_policy != RESIDENCY_POLICY_LEADING:
+            if not self.is_dit_layerwise_offload_selected:
+                logger.warning(
+                    "--dit-layerwise-residency-policy has no effect because the DiT is "
+                    "not layerwise-offloaded. It only applies together with "
+                    "--component-residency dit=layerwise-offload."
+                )
+            elif self.dit_layerwise_resident_layers <= 0:
+                # With nothing resident every layer streams, so there is no
+                # layout to choose and the policies are the same run.
+                logger.warning(
+                    "--dit-layerwise-residency-policy has no effect because "
+                    "--dit-layerwise-resident-layers is 0: every layer is streamed, "
+                    "so there is no resident set to place."
+                )
 
         # validate layerwise offload conflicts
         if envs.SGLANG_CACHE_DIT_ENABLED and self.use_fsdp_inference:

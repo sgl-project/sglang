@@ -153,8 +153,8 @@ class TransformerLoader(ComponentLoader):
         component_server_args = _server_args_for_transformer_component(
             server_args, component_name
         )
-        component_cpu_offload = server_args.should_stage_transformer_on_cpu(
-            component_name
+        component_cpu_offload = server_args.should_load_component_on_cpu(
+            component_name, can_configure_layerwise_after_load=True
         )
         if bool(component_server_args.dit_cpu_offload) != component_cpu_offload:
             component_server_args = copy.copy(component_server_args)

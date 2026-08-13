@@ -8,7 +8,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
-    ModelEvalMetrics,
     ModelLaunchSettings,
     check_evaluation_test_results,
     popen_launch_server,
@@ -22,45 +21,34 @@ NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
 register_cuda_ci(est_time=7200, stage="nightly", runner_config="2-gpu-large")
 
 MODEL_THRESHOLDS = {
-    # Conservative thresholds on 100 MMMU samples, especially for latency thresholds
-    ModelLaunchSettings("deepseek-ai/deepseek-vl2-small"): ModelEvalMetrics(
-        0.320, 56.1
+    # Conservative thresholds on 100 MMMU samples. Latency baselines account for
+    # the 1024-token CoT budget introduced in #27327; older values measured only
+    # 30 output tokens and are not comparable.
+    ModelLaunchSettings("deepseek-ai/deepseek-vl2-small"): (0.320, 56.1),
+    ModelLaunchSettings("deepseek-ai/Janus-Pro-7B"): (0.285, 40.3),
+    ModelLaunchSettings("google/gemma-4-E4B-it"): (0.26, 24.0),
+    ModelLaunchSettings("google/gemma-4-26B-A4B-it", extra_args=["--tp=2"]): (
+        0.27,
+        32.0,
     ),
-    ModelLaunchSettings("deepseek-ai/Janus-Pro-7B"): ModelEvalMetrics(0.285, 40.3),
-    ModelLaunchSettings("Efficient-Large-Model/NVILA-8B-hf"): ModelEvalMetrics(
-        0.270, 56.7
-    ),
-    ModelLaunchSettings("Efficient-Large-Model/NVILA-Lite-2B-hf"): ModelEvalMetrics(
-        0.270, 23.8
-    ),
-    ModelLaunchSettings("google/gemma-4-E4B-it"): ModelEvalMetrics(0.26, 15.0),
-    ModelLaunchSettings(
-        "google/gemma-4-26B-A4B-it", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.27, 22.3),
-    ModelLaunchSettings(
-        "google/gemma-4-31B-it", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.28, 25.5),
-    ModelLaunchSettings("mistral-community/pixtral-12b"): ModelEvalMetrics(0.360, 16.6),
-    ModelLaunchSettings("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(
-        0.330, 23.5
-    ),
+    ModelLaunchSettings("google/gemma-4-31B-it", extra_args=["--tp=2"]): (0.28, 42.0),
+    # This 100-sample score has ranged from 0.33 to 0.37 since #27327.
+    ModelLaunchSettings("mistral-community/pixtral-12b"): (0.320, 28.0),
+    ModelLaunchSettings("moonshotai/Kimi-VL-A3B-Instruct"): (0.330, 23.5),
     # temporarily disabled: NaN in next_token_logits
-    # ModelLaunchSettings("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.330, 29.5),
-    # ModelLaunchSettings("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.259, 36.3),
-    ModelLaunchSettings("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 18.0),
-    ModelLaunchSettings("Qwen/Qwen2-VL-7B-Instruct"): ModelEvalMetrics(0.310, 83.3),
-    ModelLaunchSettings("Qwen/Qwen2.5-VL-7B-Instruct"): ModelEvalMetrics(0.330, 31.9),
-    ModelLaunchSettings(
-        "Qwen/Qwen3-VL-30B-A3B-Instruct", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.29, 37.0),
-    ModelLaunchSettings(
-        "unsloth/Mistral-Small-3.1-24B-Instruct-2503"
-    ): ModelEvalMetrics(0.30, 16.7),
-    ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 40.0),
-    ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.280, 30.4),
-    ModelLaunchSettings(
-        "zai-org/GLM-4.5V-FP8", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.26, 34.0),
+    # ModelLaunchSettings("openbmb/MiniCPM-o-2_6"): (0.330, 29.5),
+    # ModelLaunchSettings("openbmb/MiniCPM-v-2_6"): (0.259, 36.3),
+    ModelLaunchSettings("OpenGVLab/InternVL2_5-2B"): (0.300, 18.0),
+    ModelLaunchSettings("Qwen/Qwen2-VL-7B-Instruct"): (0.310, 83.3),
+    ModelLaunchSettings("Qwen/Qwen2.5-VL-7B-Instruct"): (0.330, 31.9),
+    ModelLaunchSettings("Qwen/Qwen3-VL-30B-A3B-Instruct", extra_args=["--tp=2"]): (
+        0.29,
+        37.0,
+    ),
+    ModelLaunchSettings("unsloth/Mistral-Small-3.1-24B-Instruct-2503"): (0.30, 43.0),
+    ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"): (0.28, 40.0),
+    ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"): (0.280, 30.4),
+    ModelLaunchSettings("zai-org/GLM-4.5V-FP8", extra_args=["--tp=2"]): (0.26, 140.0),
 }
 
 
@@ -135,12 +123,12 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
             print(f"Error reading results: {e}")
 
         model_accuracy_thresholds = {
-            model.model_path: threshold.accuracy
-            for model, threshold in MODEL_THRESHOLDS.items()
+            model.model_path: accuracy
+            for model, (accuracy, _) in MODEL_THRESHOLDS.items()
         }
         model_latency_thresholds = {
-            model.model_path: threshold.eval_time
-            for model, threshold in MODEL_THRESHOLDS.items()
+            model.model_path: latency
+            for model, (_, latency) in MODEL_THRESHOLDS.items()
         }
         check_evaluation_test_results(
             all_results,

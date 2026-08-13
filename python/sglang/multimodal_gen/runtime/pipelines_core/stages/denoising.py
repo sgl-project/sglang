@@ -32,6 +32,10 @@ from sglang.kernels.ops.diffusion.fused_ln_modulate import (
     mount_fused_ln_modulate,
     unmount_fused_ln_modulate,
 )
+from sglang.kernels.ops.diffusion.hunyuan_qknorm import (
+    mount_hunyuan_qknorm,
+    unmount_hunyuan_qknorm,
+)
 from sglang.kernels.ops.diffusion.ltx2_rmsnorm_modulate import (
     mount_ltx2_rms_norm_modulate,
     unmount_ltx2_rms_norm_modulate,
@@ -170,6 +174,11 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "fused gate RMSNorm (BF16-native Triton)",
         mount_fused_gate_rmsnorm,
         unmount_fused_gate_rmsnorm,
+    ),
+    (
+        "HunyuanVideo strided QK RMSNorm",
+        mount_hunyuan_qknorm,
+        unmount_hunyuan_qknorm,
     ),
 )
 

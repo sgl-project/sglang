@@ -2223,12 +2223,6 @@ class ModelLaunchSettings:
                 self.extra_args.append(fixed_arg)
 
 
-class ModelEvalMetrics:
-    def __init__(self, accuracy: float, eval_time: float):
-        self.accuracy = accuracy
-        self.eval_time = eval_time
-
-
 def extract_trace_link_from_bench_one_batch_server_output(output: str) -> str:
     match = re.search(r"\[Profile\]\((.*?)\)", output)
     if match:

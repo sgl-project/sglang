@@ -7,6 +7,13 @@ LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP = "image_encoder"
 LAYERWISE_OFFLOAD_VAE_GROUP = "vae"
 LAYERWISE_OFFLOAD_DEFAULT_GROUP = "default"
 
+# Which layers --dit-layerwise-resident-layers keeps on the GPU. Lives here
+# rather than in layerwise_offload.py because server_args needs it for the CLI
+# choices and layerwise_offload.py imports server_args, which would be a cycle.
+RESIDENCY_POLICY_LEADING = "leading"
+RESIDENCY_POLICY_STRIDED = "strided"
+RESIDENCY_POLICIES = (RESIDENCY_POLICY_LEADING, RESIDENCY_POLICY_STRIDED)
+
 # Components whose layerwise policy has been validated as a better default than
 # component-level CPU offload when the user has not pinned their placement.
 LAYERWISE_OFFLOAD_DEFAULT_GROUP_COMPONENTS = (

@@ -870,7 +870,11 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.should_cpu_offload_component("transformer_2"))
         self.assertTrue(args.should_cpu_offload_component("audio_vae"))
         self.assertTrue(args.should_cpu_offload_component("connectors"))
-        self.assertTrue(args.should_stage_transformer_on_cpu("transformer_2"))
+        self.assertTrue(
+            args.should_load_component_on_cpu(
+                "transformer_2", can_configure_layerwise_after_load=True
+            )
+        )
         self.assertFalse(args.dit_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
 
@@ -971,8 +975,33 @@ class TestOffloadDefaults(unittest.TestCase):
             args.component_residency_mode("connectors"),
             ComponentResidencyMode.RESIDENT,
         )
-        self.assertTrue(args.should_stage_transformer_on_cpu("transformer"))
-        self.assertFalse(args.should_stage_transformer_on_cpu("transformer_2"))
+        self.assertTrue(
+            args.should_load_component_on_cpu(
+                "transformer", can_configure_layerwise_after_load=True
+            )
+        )
+        self.assertFalse(args.should_load_component_on_cpu("transformer_2"))
+
+    def test_dynamic_component_cpu_staging_preserves_legacy_layerwise_behavior(self):
+        new_policy = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={"component_residency": ["text_encoder=layerwise-offload"]},
+        )
+        self.assertTrue(new_policy.should_load_component_on_cpu("text_encoder"))
+
+        legacy_policy = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={
+                "performance_mode": "manual",
+                "layerwise_offload_components": ["text_encoder"],
+            },
+        )
+        self.assertFalse(legacy_policy.should_load_component_on_cpu("text_encoder"))
+        self.assertTrue(
+            legacy_policy.should_load_component_on_cpu(
+                "text_encoder", can_configure_layerwise_after_load=True
+            )
+        )
 
     def test_component_residency_group_predicates_cover_dynamic_encoders(self):
         policies = normalize_component_residency(
