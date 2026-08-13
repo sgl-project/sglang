@@ -1297,6 +1297,24 @@ class Envs:
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
 
+    # MiniMax-M3 IndexCache: reuse the sparse block selection (topk_idx) across
+    # sparse layers during DECODE, recomputing the lightning indexer only on 1 of
+    # every STRIDE sparse layers and reusing the last selection on the other
+    # STRIDE-1. Removes most of the per-step indexer score + top-k cost.
+    # 0/1 = OFF (compute every layer, stock behavior). Any value > 1 is an
+    # approximation (adjacent layers may pick slightly different blocks), so gate
+    # on accuracy (e.g. GSM8K) and sweep STRIDE.
+    SGLANG_MINIMAX_INDEXCACHE_STRIDE = EnvInt(0)
+    # IndexCache reuse mode (only used when STRIDE > 1):
+    #   "full" - on reuse layers skip the indexer entirely and reuse BOTH the
+    #            index-head output (idx_o) and the block selection (topk_idx).
+    #            Max speedup, stronger approximation.
+    #   "topk" - on reuse layers still run the indexer to recompute idx_o, but
+    #            substitute the cached block selection into the main sparse attn.
+    #            Isolates the accuracy impact of selection reuse (no perf win
+    #            without a dedicated index-value kernel; use for the A/B study).
+    SGLANG_MINIMAX_INDEXCACHE_MODE = EnvStr("full")
+
     # MiniMax-M3 on ROCm force-disables custom all-reduce in its model override
     # (arg_groups/overrides.py) when aiter all-reduce fusion is off. Set this to
     # opt back in and keep custom/quick all-reduce enabled -- e.g. to run the
