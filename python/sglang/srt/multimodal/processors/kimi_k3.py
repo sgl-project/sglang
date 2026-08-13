@@ -273,6 +273,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             input_text, resize_configs, original_input_ids, image_sizes
         )
         deferred_config = {
+            "backend": "gpu",
             "image_mean": list(self._image_mean),
             "image_std": list(self._image_std),
             "transparent_bg_config": self._transparent_bg_config,
