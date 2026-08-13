@@ -19,9 +19,10 @@ USER root
 
 # Pin Level-Zero UMD + IGC (rolling PPA once faulted libze on B580; see sgl-kernel-xpu#296).
 # Keep in lockstep with the host xe KMD; override via --build-arg.
-ARG COMPUTE_RUNTIME_VERSION=26.05.37020.3
-ARG IGC_VERSION=2.28.4+20760
-ARG GMM_VERSION=22.9.0
+ARG COMPUTE_RUNTIME_VERSION=26.18.38308.1
+ARG IGC_VERSION=2.34.4+21428
+ARG GMM_VERSION=22.10.0
+
 RUN apt-get update && apt-get install -y software-properties-common curl && \
     add-apt-repository -y ppa:kobuk-team/intel-graphics && \
     apt-get update && \
