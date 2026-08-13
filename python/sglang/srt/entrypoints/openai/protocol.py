@@ -529,6 +529,14 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    content_hash: Optional[str] = None
+
+    @field_validator("content_hash")
+    @classmethod
+    def validate_content_hash(cls, value: Optional[str]) -> Optional[str]:
+        from sglang.srt.multimodal.cache import parse_content_hash
+
+        return parse_content_hash(value)
 
 
 class ChatCompletionMessageContentVideoURL(BaseModel):
