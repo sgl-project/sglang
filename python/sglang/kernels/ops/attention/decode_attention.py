@@ -631,9 +631,11 @@ def _decode_grouped_att_m_fwd(
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
-    # [TODO] work around shmem limit on MI3xx
-    if _is_hip and Lk >= 576:
-        BLOCK = 16
+    if _is_hip:
+        # [TODO] work around shmem limit on MI3xx
+        # At head_dim <= 128 the 32-token tile leaves the KV read at ~2 TB/s on
+        # gfx950; 64 tokens roughly doubles it from bs1/4k up to bs64/80k.
+        BLOCK = 16 if Lk >= 576 else (64 if Lk <= 128 else 32)
 
     if Lk == 576:
         BLOCK_DMODEL = 512
