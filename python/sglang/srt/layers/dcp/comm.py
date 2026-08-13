@@ -417,11 +417,12 @@ def init_fi_a2a_workspace(
     # Call once per process BEFORE CUDA-graph capture: the FlashInfer init syncs
     # the stream and barriers cross-rank, neither of which is capturable.
     #
-    # Note(kpham-sgl): the send buffers are allocated here, not on first use.
-    # The DCP a2a runs once per MLA layer inside the decode graph, and nothing
-    # eager touches it first -- the FlashInfer autotune pass skips the exchange
-    # (_select_local_dcp_heads_for_autotune). So a lazy allocation lands during
-    # capture and comes from the graph's private pool.
+    # Note(kpham-sgl): the DCP a2a runs once per MLA layer inside the decode
+    # graph, and nothing eager touches it first -- the FlashInfer autotune pass
+    # skips the exchange (_select_local_dcp_heads_for_autotune). So the send
+    # buffers are allocated here rather than on first use, which would land in
+    # capture and take memory from the graph's private pool; and once captured
+    # graphs bake in their addresses, they can never be freed to grow.
     global _FI_A2A_STATE
     if _FI_A2A_STATE is not None:
         return
@@ -509,8 +510,7 @@ def _fi_a2a_send_buffers(
 ):
     """Send tensors for the FlashInfer exchange, sliced to ``batch``.
 
-    Note(kpham-sgl): cached entries are never replaced. Captured graphs bake in
-    these addresses, so freeing one to grow it would strand those pointers.
+    Cached entries are never replaced -- see init_fi_a2a_workspace().
     """
     state = _FI_A2A_STATE
     cache = state["send_buffers"]
