@@ -6,7 +6,6 @@ from typing import Optional
 
 import msgspec
 import torch
-
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
@@ -393,7 +392,7 @@ class DraftBlockProposer:
         else:
             raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
 
-        draft_num_tokens = bs * gamma
+        draft_num_tokens = bs * draft_width
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,

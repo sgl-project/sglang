@@ -5,10 +5,9 @@ from typing import Callable, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
@@ -19,6 +18,8 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
+from sglang.srt.utils import add_prefix
+from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,47 @@ def gather_and_crop_vocab(
 ) -> torch.Tensor:
     full_logits = tensor_model_parallel_all_gather(local_logits, dim=-1)
     return full_logits[..., : int(lm_head.org_vocab_size)]
+
+
+def build_independent_lm_head(
+    *, draft_vocab_size: int, hidden_size: int, quant_config, prefix: str
+) -> ParallelLMHead:
+    """The reduced, checkpoint-owned draft head of a speculators DSpark model.
+
+    A plain ParallelLMHead so the existing vocab-parallel weight loader shards
+    and pads it exactly like a target head; org_vocab_size == draft_vocab_size,
+    so compute_base_logits' gather_and_crop_vocab crops the all-gathered logits
+    back to draft space.
+    """
+    return ParallelLMHead(
+        draft_vocab_size,
+        hidden_size,
+        quant_config=quant_config,
+        prefix=prefix,
+    )
+
+
+def scatter_draft_logits_to_target(
+    draft_logits: torch.Tensor,
+    *,
+    draft_to_target: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Place each draft column j at target column draft_to_target[j], leaving
+    unmapped target columns at -inf (zero softmax mass). ``out`` is a
+    caller-owned target-width buffer whose leading dims match ``draft_logits``.
+    """
+    out.fill_(float("-inf"))
+    out.index_copy_(out.dim() - 1, draft_to_target, draft_logits)
+    return out
+
+
+def _is_dspark_d2t_weight(name: str) -> bool:
+    return name == "d2t" or name.endswith(".d2t")
+
+
+def _is_dspark_t2d_weight(name: str) -> bool:
+    return name == "t2d" or name.endswith(".t2d")
 
 
 def run_markov_block(
@@ -55,7 +97,12 @@ def run_markov_block(
             token_ids=prev_tokens,
             hidden_states=step_hidden,
         )
-        next_tokens = sampler(step_logits, step_idx)
+        sampled = sampler(step_logits, step_idx)
+        # Reduced-vocab checkpoints sample a draft-space id; map it to a target
+        # id before storing it and before it conditions the next step's
+        # markov_w1 (whose input vocabulary is the target vocabulary). Identity
+        # for full-vocab heads, so corrected_logits stays draft-space here.
+        next_tokens = head.map_sampled_to_target(sampled)
         sampled_tokens.append(next_tokens)
         corrected_logits.append(step_logits.unsqueeze(1))
         prev_tokens = next_tokens
@@ -66,19 +113,88 @@ def run_markov_block(
 
 
 class VanillaMarkov(nn.Module):
-
     markov_head_type = "vanilla"
 
-    def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        draft_vocab_size: Optional[int] = None,
+    ) -> None:
         super().__init__()
+        # markov_w1 consumes the previously sampled TARGET token id, so its
+        # input row count is always the target vocab. markov_w2 emits the draft
+        # distribution: the reduced draft vocab when the checkpoint ships an
+        # independent head + d2t map, else the full (target) vocab.
         self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
         if self.markov_rank <= 0:
             raise ValueError(
                 f"VanillaMarkov requires markov_rank > 0, got {self.markov_rank}."
             )
+        self.draft_vocab_size = (
+            int(draft_vocab_size) if draft_vocab_size is not None else self.vocab_size
+        )
+        self.reduced_vocab = self.draft_vocab_size != self.vocab_size
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
-        self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+        self.markov_w2 = nn.Linear(self.markov_rank, self.draft_vocab_size, bias=False)
+        # Absolute draft->target id map (target = draft + d2t[draft]); filled
+        # from the checkpoint's d2t table in load_weights. None (identity map)
+        # for full-vocab heads. Non-persistent: reconstructed from d2t on load,
+        # never read back from a saved state dict.
+        if self.reduced_vocab:
+            self.register_buffer(
+                "draft_to_target",
+                torch.arange(self.draft_vocab_size, dtype=torch.long),
+                persistent=False,
+            )
+        else:
+            self.draft_to_target = None
+        self._draft_to_target_loaded = False
+
+    def map_sampled_to_target(self, sampled_tokens: torch.Tensor) -> torch.Tensor:
+        """Map draft-space sampled ids to target-space ids; identity when the
+        head shares the full target vocab."""
+        if self.draft_to_target is None:
+            return sampled_tokens
+        return self.draft_to_target[sampled_tokens.long()]
+
+    @property
+    def draft_to_target_loaded(self) -> bool:
+        return self._draft_to_target_loaded
+
+    def load_draft_to_target(self, d2t: torch.Tensor) -> None:
+        """Load the checkpoint's d2t delta table (target = draft + d2t[draft]),
+        following the vLLM/speculators convention. Validates the geometry so a
+        mismatched or out-of-range table fails at load, not at sample time."""
+        if self.draft_to_target is None:
+            raise ValueError(
+                "DSpark markov head received a d2t table but was built for the "
+                "full target vocab (no reduced draft head)."
+            )
+        d2t = d2t.view(-1)
+        if d2t.numel() != self.draft_vocab_size:
+            raise ValueError(
+                f"DSpark d2t length {d2t.numel()} != draft_vocab_size "
+                f"{self.draft_vocab_size}."
+            )
+        draft_ids = torch.arange(self.draft_vocab_size, device=d2t.device)
+        target_ids = d2t.to(torch.long) + draft_ids
+        if int(target_ids.min()) < 0 or int(target_ids.max()) >= self.vocab_size:
+            raise ValueError(
+                "DSpark d2t maps outside the target vocab "
+                f"[0, {self.vocab_size}); got range "
+                f"[{int(target_ids.min())}, {int(target_ids.max())}]."
+            )
+        if torch.unique(target_ids).numel() != self.draft_vocab_size:
+            raise ValueError(
+                "DSpark d2t must map each draft token to a unique target token; "
+                "duplicate target ids cannot be represented by the corrected-logit "
+                "scatter."
+            )
+        self.draft_to_target.copy_(target_ids.to(self.draft_to_target.device))
+        self._draft_to_target_loaded = True
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -132,11 +248,21 @@ class VanillaMarkov(nn.Module):
 
 
 class GatedMarkovHead(VanillaMarkov):
-
     markov_head_type = "gated"
 
-    def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
-        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        hidden_size: int,
+        draft_vocab_size: Optional[int] = None,
+    ) -> None:
+        super().__init__(
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            draft_vocab_size=draft_vocab_size,
+        )
         self.gate_proj = nn.Linear(int(hidden_size) + markov_rank, markov_rank)
 
     def compute_gate(
@@ -163,11 +289,21 @@ class GatedMarkovHead(VanillaMarkov):
 
 
 class RNNHead(VanillaMarkov):
-
     markov_head_type = "rnn"
 
-    def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
-        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        hidden_size: int,
+        draft_vocab_size: Optional[int] = None,
+    ) -> None:
+        super().__init__(
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            draft_vocab_size=draft_vocab_size,
+        )
         self.hidden_size = int(hidden_size)
         self.state_size = markov_rank
         self.joint_proj = nn.Linear(2 * markov_rank + self.hidden_size, 3 * markov_rank)
@@ -254,7 +390,11 @@ class RNNHead(VanillaMarkov):
             prev_emb = self.get_prev_embeddings(prev_tokens)
             state, bias = self._rnn_step(state, prev_emb, hidden_states[:, step_idx, :])
             step_logits = base_logits[:, step_idx, :] + bias
-            next_tokens = sampler(step_logits, step_idx)
+            sampled = sampler(step_logits, step_idx)
+            # Draft-space id -> target-space id (identity for full-vocab); the
+            # target id both gets stored and conditions the next RNN step's
+            # markov_w1. See run_markov_block for the rationale.
+            next_tokens = self.map_sampled_to_target(sampled)
             sampled_tokens.append(next_tokens)
             corrected_logits.append(step_logits.unsqueeze(1))
             prev_tokens = next_tokens
@@ -264,7 +404,9 @@ class RNNHead(VanillaMarkov):
         )
 
 
-def build_markov_head(config) -> Optional[nn.Module]:
+def build_markov_head(
+    config, *, draft_vocab_size: Optional[int] = None
+) -> Optional[nn.Module]:
     markov_rank = int(getattr(config, "markov_rank", 0))
     if markov_rank <= 0:
         raise ValueError(
@@ -272,23 +414,34 @@ def build_markov_head(config) -> Optional[nn.Module]:
             f"semi-AR draft); got markov_rank={markov_rank}."
         )
     markov_head_type = str(getattr(config, "markov_head_type", "vanilla")).lower()
+    # vocab_size is the target vocab (markov_w1 input); draft_vocab_size, when
+    # set, is the reduced markov_w2 output. They are equal for full-vocab heads.
     vocab_size = int(config.vocab_size)
     hidden_size = int(config.hidden_size)
     if markov_head_type == "vanilla":
-        return VanillaMarkov(vocab_size=vocab_size, markov_rank=markov_rank)
+        return VanillaMarkov(
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            draft_vocab_size=draft_vocab_size,
+        )
     if markov_head_type == "gated":
         return GatedMarkovHead(
-            vocab_size=vocab_size, markov_rank=markov_rank, hidden_size=hidden_size
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            hidden_size=hidden_size,
+            draft_vocab_size=draft_vocab_size,
         )
     if markov_head_type == "rnn":
         return RNNHead(
-            vocab_size=vocab_size, markov_rank=markov_rank, hidden_size=hidden_size
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            hidden_size=hidden_size,
+            draft_vocab_size=draft_vocab_size,
         )
     raise ValueError(f"Unsupported DSpark markov_head_type={markov_head_type!r}.")
 
 
 class DSparkConfidenceHead(nn.Module):
-
     def __init__(
         self,
         *,
@@ -354,15 +507,15 @@ def build_confidence_head(config) -> Optional[nn.Module]:
     )
 
 
+# embed_tokens is always shared from the target; lm_head is handled separately
+# (kept for a reduced draft head, skipped when the target head is shared).
 _DSPARK_SKIPPED_WEIGHT_PREFIXES = (
     "embed_tokens.",
-    "lm_head.",
     "rotary_emb.",
 )
 
 
 class DSparkDraftMixin:
-
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self._fused_kv_write_cache = None
@@ -382,15 +535,65 @@ class DSparkDraftMixin:
         # either way, since the caller always hands it exactly `gamma` real
         # draft-hidden slots regardless of which convention produced them.
         self.gamma = int(dspark_config.resolve_gamma(default=self.block_size))
-        self.markov_head = build_markov_head(config)
+        self.markov_head = build_markov_head(
+            config, draft_vocab_size=dspark_config.draft_vocab_size
+        )
         self.confidence_head = build_confidence_head(config)
-        self.lm_head: Optional[nn.Module] = None
+        # A speculators checkpoint with a reduced draft vocab ships its own
+        # small lm_head (loaded in load_weights); a full-vocab draft leaves this
+        # None and shares the target head via attach_shared_modules.
+        if self.markov_head.reduced_vocab:
+            self.lm_head: Optional[nn.Module] = build_independent_lm_head(
+                draft_vocab_size=int(self.markov_head.draft_vocab_size),
+                hidden_size=int(config.hidden_size),
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+            )
+        else:
+            self.lm_head = None
+        # Reused eager buffer for lifting draft-space corrected logits into
+        # target-vocab columns (reduced-vocab probabilistic verify only).
+        self._corrected_target_scratch: Optional[torch.Tensor] = None
+
+    @property
+    def uses_reduced_draft_vocab(self) -> bool:
+        return self.markov_head is not None and self.markov_head.reduced_vocab
 
     def attach_shared_modules(
         self, *, embed_tokens: nn.Module, lm_head: nn.Module
     ) -> None:
         self.embed_tokens = embed_tokens
-        self.lm_head = lm_head
+        # Full-vocab drafts share the target lm_head; a reduced-vocab draft keeps
+        # the independent head built (and loaded) for it in __init__.
+        if self.lm_head is None:
+            self.lm_head = lm_head
+
+    def scatter_corrected_to_target(
+        self, corrected_logits: torch.Tensor, *, target_width: int
+    ) -> torch.Tensor:
+        """Lift draft-space markov-corrected block logits into target-vocab
+        columns (unmapped columns -inf) so target-space rejection sampling and
+        the block-accept estimator index them by the same target ids the drafts
+        were mapped to. Reuses one eager scratch buffer; only ever called
+        outside cuda-graph capture (the folded accept path is greedy-only)."""
+        draft_to_target = self.markov_head.draft_to_target
+        assert draft_to_target is not None, "scatter requires a reduced draft head"
+        bs, gamma_rows, _ = corrected_logits.shape
+        need = (bs, gamma_rows, int(target_width))
+        buf = self._corrected_target_scratch
+        if (
+            buf is None
+            or tuple(buf.shape) != need
+            or buf.dtype != corrected_logits.dtype
+            or buf.device != corrected_logits.device
+        ):
+            buf = torch.empty(
+                need, dtype=corrected_logits.dtype, device=corrected_logits.device
+            )
+            self._corrected_target_scratch = buf
+        return scatter_draft_logits_to_target(
+            corrected_logits, draft_to_target=draft_to_target, out=buf
+        )
 
     def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         # Embeds with the shared target embedding INSIDE the draft graph
@@ -401,21 +604,25 @@ class DSparkDraftMixin:
     def compute_base_logits(
         self, hidden: torch.Tensor
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Project the draft's raw final hidden through the target lm_head.
+        """Project the draft's raw final hidden through the lm_head into base
+        logits: target-vocab-wide for a shared head, draft-vocab-wide for a
+        reduced independent head (org_vocab_size == draft vocab).
 
         muP targets (Inkling) train the draft against a FOLDED head (weights
         pre-divided by logits_mup_width_multiplier) while serving attaches the
         target's unfolded head, so the division happens here — exactly once,
         keeping base logits in the scale the markov bias and confidence head
         were trained against. DSparkWorkerV2 wires the multiplier from the
-        target config; it stays None for non-muP targets.
+        target config; it stays None for non-muP targets. A reduced independent
+        head is the draft's own trained head (not the target's), so the folding
+        does not apply to it.
         """
         if self.lm_head is None:
             raise ValueError(
                 "DSpark dense draft requires the target lm_head "
                 "(call attach_shared_modules first)."
             )
-        if self.logits_mup_width_multiplier:
+        if self.logits_mup_width_multiplier and not self.uses_reduced_draft_vocab:
             hidden = hidden / self.logits_mup_width_multiplier
         weight = self.lm_head.weight
         if hidden.dtype != weight.dtype:
@@ -427,9 +634,25 @@ class DSparkDraftMixin:
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         markov_weights = []
         confidence_weights = []
+        lm_head_weights = []
         backbone_weights = []
         params_dict = dict(self.named_parameters())
+        reduced_vocab = self.uses_reduced_draft_vocab
         for name, loaded_weight in weights:
+            if _is_dspark_d2t_weight(name):
+                # Draft->target id map; only meaningful for a reduced draft head.
+                if reduced_vocab:
+                    self.markov_head.load_draft_to_target(loaded_weight)
+                continue
+            if _is_dspark_t2d_weight(name):
+                # Inverse (target->draft) map; training-only, never used at inference.
+                continue
+            if name.startswith("lm_head."):
+                # Keep the checkpoint's own head only for a reduced draft vocab;
+                # full-vocab drafts share the target head, so drop it here.
+                if reduced_vocab:
+                    lm_head_weights.append((name, loaded_weight))
+                continue
             if any(name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES):
                 continue
             if name.startswith("confidence_head."):
@@ -453,9 +676,48 @@ class DSparkDraftMixin:
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 
+        self._load_independent_lm_head(
+            lm_head_weights=lm_head_weights, params_dict=params_dict
+        )
         self._load_confidence_weights(
             confidence_weights=confidence_weights, params_dict=params_dict
         )
+        if reduced_vocab and not self.markov_head.draft_to_target_loaded:
+            raise ValueError(
+                "DSpark reduced-vocab draft (draft_vocab_size is set) requires a "
+                "d2t draft->target map in the checkpoint, but none was found. "
+                "Provide the speculators checkpoint's d2t table; the target head "
+                "cannot be substituted for a reduced draft vocab."
+            )
+
+    def _load_independent_lm_head(
+        self,
+        *,
+        lm_head_weights: list,
+        params_dict: dict,
+    ) -> None:
+        if not self.uses_reduced_draft_vocab:
+            return
+        loaded_names = set()
+        for name, loaded_weight in lm_head_weights:
+            if name not in params_dict:
+                raise ValueError(
+                    f"DSpark unexpected lm_head weight {name!r} not found in model "
+                    "parameters."
+                )
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_names.add(name)
+
+        expected = {name for name in params_dict if name.startswith("lm_head.")}
+        missing = expected - loaded_names
+        if missing:
+            raise ValueError(
+                "DSpark reduced-vocab draft is missing independent lm_head weights "
+                f"{sorted(missing)}. The checkpoint must ship its own reduced "
+                "lm_head; the shared target head cannot cover a reduced draft vocab."
+            )
 
     def _load_confidence_weights(
         self,
@@ -721,7 +983,6 @@ class DSparkDraftMixin:
 
 
 class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
-
     def prune_to_ctx_kv_injection(self) -> None:
         self.markov_head = None
         self.confidence_head = None

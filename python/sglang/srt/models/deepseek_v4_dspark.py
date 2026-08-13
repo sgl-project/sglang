@@ -6,8 +6,6 @@ from typing import Iterable, List, Optional, Tuple
 import msgspec
 import torch
 import torch.nn.functional as F
-from torch import nn
-
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
@@ -59,6 +57,7 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.utils import add_prefix, is_blackwell_supported, is_npu
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
+from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +87,6 @@ def apply_rotary_emb(
 
 
 class DSparkAttention(MqaAttentionBase):
-
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -111,9 +109,9 @@ class DSparkAttention(MqaAttentionBase):
             wo_b_reduce_results=True,
             rope_original_seq_len=0,
         )
-        assert (
-            self.compress_ratio == 0
-        ), "DSpark draft attention requires compress_ratio == 0."
+        assert self.compress_ratio == 0, (
+            "DSpark draft attention requires compress_ratio == 0."
+        )
         self.window_size = int(
             getattr(config, "sliding_window", None) or config.window_size
         )
@@ -349,7 +347,6 @@ def _resolve_dspark_pool() -> DeepSeekV4TokenToKVPool:
 
 
 class MarkovW2ShardGeometry(msgspec.Struct, frozen=True):
-
     tp_size: int
     org_vocab_start: int
     org_vocab_end: int
@@ -358,7 +355,6 @@ class MarkovW2ShardGeometry(msgspec.Struct, frozen=True):
 
 
 class DSparkV4MarkovHead(nn.Module):
-
     markov_head_type = "vanilla"
 
     def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
@@ -479,6 +475,12 @@ class DSparkV4MarkovHead(nn.Module):
         logits = self.project_bias(embed)
         return logits, embed
 
+    def map_sampled_to_target(self, sampled_tokens: torch.Tensor) -> torch.Tensor:
+        # run_markov_block contract: the dsv4 self-draft samples in the full
+        # target vocab (markov_w2 spans the target head's vocab), so a sampled
+        # id already IS a target id -- identity, no reduced-vocab d2t map here.
+        return sampled_tokens
+
     def sample_block(
         self,
         base_logits: torch.Tensor,
@@ -524,7 +526,6 @@ def build_dspark_v4_confidence_head(
 
 
 class DSparkV4Stage(DeepseekV4DecoderLayer):
-
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -667,6 +668,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         return DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
             hf_config, quant_config
         )
+
+    @property
+    def uses_reduced_draft_vocab(self) -> bool:
+        # DSparkWorkerV2 contract: the dsv4 self-draft samples in the full
+        # target vocab (markov_w2 spans the target head's vocab), so it never
+        # uses a reduced independent head or a draft->target scatter.
+        return False
 
     def __init__(
         self,
@@ -1010,12 +1018,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         stage_id, rest = parts[1], parts[2]
 
         if rest.startswith("markov_head."):
-            return f"markov_head.{rest[len('markov_head.'):]}"
+            return f"markov_head.{rest[len('markov_head.') :]}"
 
         if rest.startswith("confidence_head."):
             if self.confidence_head is None:
                 return None
-            return f"confidence_head.{rest[len('confidence_head.'):]}"
+            return f"confidence_head.{rest[len('confidence_head.') :]}"
 
         mapped_rest = rest
         mapped_rest = mapped_rest.replace("attn.", "self_attn.", 1)

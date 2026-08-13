@@ -4,7 +4,6 @@ from dataclasses import replace
 from typing import Optional
 
 import torch
-
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
@@ -36,6 +35,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
+    DraftBlockResult,
     make_next_draft_input,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
@@ -74,7 +74,6 @@ _is_npu = is_npu()
 
 
 class DSparkWorkerV2(BaseSpecWorker):
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -229,6 +228,20 @@ class DSparkWorkerV2(BaseSpecWorker):
                 lm_head=lm_head,
             )
 
+        # Reduced-vocab speculators checkpoints (independent draft head + d2t)
+        # sample in draft space; the verify/accept and block-accept paths then
+        # lift the markov-corrected block into target-vocab columns. Full-vocab
+        # drafts (the common case) never touch the target-vocab scatter buffer.
+        self._reduced_draft_vocab = self.draft_model.uses_reduced_draft_vocab
+        if self.ps.tp_rank == 0 and self._reduced_draft_vocab:
+            logger.info(
+                "DSpark draft uses an independent reduced-vocab head "
+                "(draft_vocab_size=%s, target_vocab_size=%s); sampling draft-space "
+                "ids and mapping to target ids via the checkpoint d2t table.",
+                int(self.draft_model.markov_head.draft_vocab_size),
+                int(self.draft_model.markov_head.vocab_size),
+            )
+
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
             gamma=self.gamma,
@@ -339,6 +352,33 @@ class DSparkWorkerV2(BaseSpecWorker):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
         return target_model.model.get_input_embeddings()
+
+    def _resolve_corrected_vocab_space(
+        self,
+        draft_block: DraftBlockResult,
+        *,
+        target_logits: Optional[torch.Tensor],
+    ) -> DraftBlockResult:
+        """Scatter draft-space markov-corrected block logits into target-vocab
+        columns for a reduced-vocab draft, so the target-space rejection sampler
+        and block-accept estimator index them by the mapped target ids. A no-op
+        for full-vocab drafts and for greedy folded proposals (corrected logits
+        are None there)."""
+        if (
+            not self._reduced_draft_vocab
+            or draft_block.corrected_logits is None
+            or target_logits is None
+        ):
+            return draft_block
+        corrected_target = self.draft_model.scatter_corrected_to_target(
+            draft_block.corrected_logits, target_width=int(target_logits.shape[-1])
+        )
+        return DraftBlockResult(
+            draft_tokens=draft_block.draft_tokens,
+            corrected_logits=corrected_target,
+            greedy_mask=draft_block.greedy_mask,
+            temperatures=draft_block.temperatures,
+        )
 
     @property
     def carries_confidence(self) -> bool:
@@ -739,6 +779,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)
+
+        # Reduced-vocab drafts: lift the draft-space corrected block into
+        # target-vocab columns once, so both accept_and_finalize and
+        # observe_verify_step below read it in the target space their token ids
+        # already live in. No-op for full-vocab / greedy-folded proposals.
+        draft_block = self._resolve_corrected_vocab_space(
+            draft_block, target_logits=logits_output.next_token_logits
+        )
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph

@@ -16,9 +16,6 @@
 from pathlib import Path
 from typing import Optional
 
-from transformers import PretrainedConfig
-from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
-
 from sglang.srt.configs.model_config_parser_registry import (
     ModelConfigParserBase,
     get_model_config_parser,
@@ -26,6 +23,8 @@ from sglang.srt.configs.model_config_parser_registry import (
 )
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, lru_cache_frozenset
+from transformers import PretrainedConfig
+from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from ..hf_transformers_patches import _ensure_gguf_version
 from .common import (
@@ -61,17 +60,66 @@ _LONGCAT_ARCHS = {
 }
 
 
-def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
+def _normalize_speculators_draft_config_dict(config_dict: dict) -> Optional[dict]:
+    """Flatten a native speculators draft config into a Transformers config.
+
+    Speculators checkpoints keep the backbone config under
+    ``transformer_layer_config`` and intentionally omit a top-level
+    ``model_type``.  AutoConfig therefore rejects otherwise self-contained
+    public checkpoints before SGLang can inspect their draft metadata.
+    """
+    speculator_type = config_dict.get("speculators_model_type")
+    transformer_config = config_dict.get("transformer_layer_config")
+    if (
+        not isinstance(speculator_type, str)
+        or speculator_type.lower() != "dspark"
+        or not isinstance(transformer_config, dict)
+    ):
+        return None
+    if not transformer_config.get("model_type"):
+        return None
+
+    normalized = dict(transformer_config)
+    normalized.update(
+        {
+            key: value
+            for key, value in config_dict.items()
+            if key != "transformer_layer_config"
+        }
+    )
+    # The nested backbone owns model_type. A native speculators auto_map may
+    # use its own config runtime, which SGLang neither needs nor imports.
+    normalized["model_type"] = transformer_config["model_type"]
+    if "target_layer_ids" not in normalized and isinstance(
+        normalized.get("aux_hidden_state_layer_ids"), (list, tuple)
+    ):
+        normalized["target_layer_ids"] = normalized["aux_hidden_state_layer_ids"]
+    normalized.pop("auto_map", None)
+    return normalized
+
+
+def _try_load_special_config(model, revision: Optional[str], **kwargs):
+    """Handle configs that cannot go directly through AutoConfig.
+
+    Keep the format probe shared so the ordinary model path performs the same
+    single get_config_dict call it used for LongCat before DSpark support.
+    """
     config_dict, _ = PretrainedConfig.get_config_dict(
         model, revision=revision, **kwargs
     )
-    architectures = config_dict.get("architectures") or []
-    if not any(arch in _LONGCAT_ARCHS for arch in architectures):
-        return None
+    normalized = _normalize_speculators_draft_config_dict(config_dict)
+    if normalized is not None:
+        model_type = normalized.pop("model_type")
+        config = AutoConfig.for_model(model_type, **normalized)
+        config._name_or_path = model
+        return config
 
-    return _CONFIG_REGISTRY["longcat_flash"].from_pretrained(
-        model, revision=revision, **kwargs
-    )
+    architectures = config_dict.get("architectures") or []
+    if any(arch in _LONGCAT_ARCHS for arch in architectures):
+        return _CONFIG_REGISTRY["longcat_flash"].from_pretrained(
+            model, revision=revision, **kwargs
+        )
+    return None
 
 
 @register_model_config_parser("hf")
@@ -83,7 +131,7 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = _try_load_longcat_config(model, revision, **kwargs)
+        config = _try_load_special_config(model, revision, **kwargs)
         if config is None:
             config = AutoConfig.from_pretrained(
                 model,

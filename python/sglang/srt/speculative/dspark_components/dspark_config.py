@@ -5,7 +5,6 @@ import logging
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
-
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
 if TYPE_CHECKING:
@@ -58,12 +57,23 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
     markov_rank: int
     markov_head_type: Optional[str]
     speculators_convention: bool
+    # None for the ordinary DSpark checkpoint that samples in the full target
+    # vocab and shares the target lm_head. A speculators-trained checkpoint with
+    # an independent, reduced-vocabulary head (RedHatAI/*-speculator.dspark)
+    # sets this to its draft vocab size (e.g. 32000); the draft then samples in
+    # draft space and maps back to target ids via the checkpoint's d2t table.
+    draft_vocab_size: Optional[int] = None
 
     def resolve_gamma(self, *, default: Optional[int] = None) -> Optional[int]:
         return self.gamma if self.gamma is not None else default
 
     def require_markov(self) -> bool:
         return int(self.markov_rank) > 0
+
+    def uses_reduced_draft_vocab(self, *, target_vocab_size: int) -> bool:
+        return self.draft_vocab_size is not None and int(self.draft_vocab_size) < int(
+            target_vocab_size
+        )
 
 
 class DSparkRuntimeConfig(msgspec.Struct, frozen=True):
@@ -200,6 +210,46 @@ def _get_speculators_config(config: Any) -> dict:
         return dict(cfg)
     except Exception:
         return {}
+
+
+def resolve_target_vocab_size(draft_hf_config: Any) -> Optional[int]:
+    """The draft transformer/embedding vocab, i.e. the target vocab the Markov
+    head's markov_w1 and the shared embedding operate in. Read from the same
+    nested/top-level locations as the rest of the draft config."""
+    text_config = _get_text_config(draft_hf_config)
+    raw = _cfg_get(
+        text_config, "vocab_size", _cfg_get(draft_hf_config, "vocab_size", None)
+    )
+    return int(raw) if raw is not None else None
+
+
+def resolve_draft_vocab_size(draft_hf_config: Any) -> Optional[int]:
+    """The reduced draft-head vocab for speculators DSpark checkpoints, or None
+    when the draft shares the full target vocab/head.
+
+    Kept as the single resolution point (used by both parse_dspark_draft_config
+    and the model's head construction) so the two never disagree on geometry.
+    """
+    dspark_cfg = _get_dspark_config(draft_hf_config)
+    text_config = _get_text_config(draft_hf_config)
+    raw = _cfg_get(draft_hf_config, "draft_vocab_size", None)
+    if raw is None:
+        raw = dspark_cfg.get(
+            "draft_vocab_size", _cfg_get(text_config, "draft_vocab_size", None)
+        )
+    if raw is None:
+        return None
+    value = int(raw)
+    if value <= 0:
+        raise ValueError(f"DSpark draft_vocab_size must be positive, got {value}.")
+    target_vocab_size = resolve_target_vocab_size(draft_hf_config)
+    if target_vocab_size is not None and value > target_vocab_size:
+        raise ValueError(
+            f"DSpark draft_vocab_size={value} exceeds the target vocab "
+            f"{target_vocab_size}; a reduced draft head cannot be larger than "
+            "the vocab its d2t table maps into."
+        )
+    return value
 
 
 def _resolve_speculators_proposal_gamma(config: Any) -> Optional[int]:
@@ -399,7 +449,9 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     gamma = (
         int(prefixed_block_size)
         if prefixed_block_size is not None
-        else speculators_gamma if speculators_gamma is not None else base.block_size
+        else speculators_gamma
+        if speculators_gamma is not None
+        else base.block_size
     )
 
     if prefixed_target_layer_ids is not None:
@@ -426,4 +478,5 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
         speculators_convention=speculators_convention,
+        draft_vocab_size=resolve_draft_vocab_size(draft_hf_config),
     )

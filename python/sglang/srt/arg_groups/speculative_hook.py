@@ -30,7 +30,14 @@ def _resolve_speculative_algorithm_alias(
     """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
 
     is_gemma4_draft = False
-    if speculative_draft_model_path:
+    # Only EAGLE-family aliases need to inspect the draft architecture. Loading
+    # every draft config here rejects native speculators checkpoints before the
+    # actual model-config parser can normalize them.
+    if speculative_draft_model_path and speculative_algorithm in (
+        "EAGLE",
+        "EAGLE3",
+        "NEXTN",
+    ):
         from sglang.srt.utils.hf_transformers_utils import get_config
 
         cfg = get_config(
