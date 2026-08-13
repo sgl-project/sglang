@@ -305,7 +305,7 @@ def forward_mla_core_npu(
     attn_output = attn_output.contiguous()
     if (
         attn_output.shape[0] >= 65536
-        or attn_output.shape[-1] >= 65536
+        or attn_output.shape[-1] * attn_output.shape[-2] >= 65536
         or m.w_vc.shape[-1] >= 65536
     ):
         # npu_transpose_batchmatmul does not support dimensions >= 65536.
