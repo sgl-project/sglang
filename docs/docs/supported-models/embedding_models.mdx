@@ -168,6 +168,12 @@ print("Embedding:", response["data"][0]["embedding"])
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bare <code>Qwen3Model</code> backbone (no LM head); served natively on SGLang's fused Qwen3 kernels and auto-classified as an embedding model</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Giga-Embeddings (DeepSeek-V3)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`ai-sage/Giga-Embeddings-instruct-10B-A1.8B-0826`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bidirectional (encoder-style) DeepSeek-V3 MoE embedding model (<code>DeepseekV3BidirectionalModel</code>, <code>is_causal=false</code>); mean pooling + L2 normalization, auto-classified as an embedding model</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>BGE</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`BAAI/bge-large-en-v1.5`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A</td>
