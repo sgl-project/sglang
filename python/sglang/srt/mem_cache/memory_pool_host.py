@@ -160,6 +160,7 @@ class MambaPoolHost(HostKVCache):
             requested_bytes / 1e9,
             self.layout,
         )
+
         self.temporal_device_ptrs = torch.tensor(
             [
                 device_pool.mamba_cache.temporal[i].data_ptr()
