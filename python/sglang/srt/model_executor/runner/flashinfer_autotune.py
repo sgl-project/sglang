@@ -99,21 +99,16 @@ def should_run_flashinfer_autotune(
     )
 
     from sglang.srt.layers.quantization.fp8_utils import (
-        get_fp8_gemm_runner_backend,
+        flashinfer_per_tensor_fp8_supported,
+        resolve_mxfp8_dense_gemm_backend,
     )
-    from sglang.srt.utils import is_sm100_supported, is_sm120_supported
 
-    model_uses_modelopt_fp8 = model_quantization in (
-        "modelopt",
-        "modelopt_fp8",
-        "modelopt_mixed",
-    )
-    # SM120 satisfies is_blackwell_supported(), so resolve_mxfp8_dense_gemm_backend
-    # sends it to the same tunable FlashInfer CUTLASS MXFP8 dense GEMM as SM100;
-    # without this the kernel always runs at tactic=-1.
-    fp8_gemm_needs_autotune = get_fp8_gemm_runner_backend().is_flashinfer_cutlass() or (
-        model_uses_modelopt_fp8 and (is_sm100_supported() or is_sm120_supported())
-    )
+    if model_quantization == "mxfp8":
+        fp8_gemm_needs_autotune = resolve_mxfp8_dense_gemm_backend().is_flashinfer()
+    elif model_quantization in ("modelopt", "modelopt_fp8", "modelopt_mixed"):
+        fp8_gemm_needs_autotune = flashinfer_per_tensor_fp8_supported()
+    else:
+        fp8_gemm_needs_autotune = False
 
     if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
         return False
@@ -170,7 +165,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
 
 
 @contextlib.contextmanager
-def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool):
+def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
     from flashinfer.autotuner import autotune
 
     mr = model_runner
@@ -193,27 +188,24 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
     # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
     mr.forward_stream.wait_stream(torch.cuda.current_stream())
     with torch.get_device_module(mr.device).stream(mr.forward_stream):
-        maybe_skip_logits = contextlib.nullcontext()
-        if skip_logits:
-            from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+        from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
-            maybe_skip_logits = autotune_dummy_run_mode()
         skip_ops = get_flashinfer_autotune_skip_ops(mr)
         with autotune(
             True,
             cache=str(autotune_cache),
             skip_ops=skip_ops,
-        ), maybe_skip_logits:
+        ), autotune_dummy_run_mode(run_lm_head=run_lm_head):
             yield
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")
 
 
 def run_flashinfer_autotune_forward(
-    model_runner: ModelRunner, forward_fn: Callable[[], None], *, skip_logits: bool
+    model_runner: ModelRunner, forward_fn: Callable[[], None], *, run_lm_head: bool
 ) -> None:
     """Run flashinfer autotune forward."""
-    with flashinfer_autotune_context(model_runner, skip_logits=skip_logits):
+    with flashinfer_autotune_context(model_runner, run_lm_head=run_lm_head):
         forward_fn()
 
 
@@ -222,7 +214,7 @@ def maybe_flashinfer_autotune_speculative_draft(
     forward_fn: Callable[[], None],
     *,
     post_warmup_hook: Optional[Callable[[], None]] = None,
-    skip_logits: bool = False,
+    run_lm_head: bool = True,
 ) -> None:
     """Run speculative draft flashinfer autotune."""
     mr = runner.model_runner
@@ -245,7 +237,7 @@ def maybe_flashinfer_autotune_speculative_draft(
         if post_warmup_hook is not None:
             post_warmup_hook()
 
-    run_flashinfer_autotune_forward(mr, run_and_reset, skip_logits=skip_logits)
+    run_flashinfer_autotune_forward(mr, run_and_reset, run_lm_head=run_lm_head)
     tuned_phases.add(phase_key)
 
 
@@ -316,7 +308,7 @@ def maybe_flashinfer_autotune_extend(
         f"({batch_size} seqs x {per_req} tokens).",
     )
     try:
-        run_flashinfer_autotune_forward(mr, forward_fn, skip_logits=True)
+        run_flashinfer_autotune_forward(mr, forward_fn, run_lm_head=False)
     except torch.OutOfMemoryError:
         # The pass is an optimization; without headroom for the extend-shaped
         # forward, fall back to untuned extend buckets instead of failing.
