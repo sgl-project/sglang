@@ -250,8 +250,10 @@ export const config = {
           flags: ["--encoder-parallel dp"],
           disabled: (s) => (s.topology_mode === "manual"
             ? Number(s.tp_size)
-            : config.commandBuilder.resource.autoTopology(s).tp_size) > 1 || s.nodes > 1,
-          disableReason: "Encoder DP requires TP1 and a single-node DiT DP1 topology.",
+            : config.commandBuilder.resource.autoTopology(s).tp_size) > 1,
+          disableReason: "The server rejects encoder DP with TP > 1 (encoder_parallel=dp requires tp_size=1).",
+          soft: (s) => s.nodes > 1,
+          softReason: "Runs across nodes, but the measured 1.9× encode speedup comes from a single-node 2× H100 run; cross-node encoder DP is unverified.",
           description: "Useful for a real request batch; it is not bitwise-identical to fold scheduling.",
         },
         {
