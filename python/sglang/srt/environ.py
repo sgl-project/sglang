@@ -1297,6 +1297,20 @@ class Envs:
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
 
+    # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
+    # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)
+    # with a per-query CUSTOM block_table
+    SGLANG_MINIMAX_NPU_PREFILL_FIA = EnvBool(True)
+
+    # MiniMax-M3 NPU sparse INDEXER (decode + verify topk block selection): route
+    # through the native AscendC packed indexer op instead of the Triton indexer.
+    SGLANG_MINIMAX_NPU_NATIVE_INDEXER = EnvBool(False)
+
+    # MiniMax-M3 NPU sparse MAIN-attention (decode-main + verify-main): route the
+    # sparse main attention through the native AscendC sparse-attention op with the
+    # cached block_table override.
+    SGLANG_MINIMAX_NPU_NATIVE_ATTN = EnvBool(False)
+
     # MiniMax-M3 on ROCm force-disables custom all-reduce in its model override
     # (arg_groups/overrides.py) when aiter all-reduce fusion is off. Set this to
     # opt back in and keep custom/quick all-reduce enabled -- e.g. to run the
