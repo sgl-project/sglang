@@ -24,6 +24,7 @@ from sglang.kernels.ops.activation.activation import (
 )
 from sglang.kernels.ops.diffusion.bitexact_gate import (
     BitExactFusionGate,
+    flashinfer_rmsnorm_diagnostic_hint,
     tensors_equal,
 )
 from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
@@ -111,6 +112,7 @@ def _ernie_norm_scale_shift(
                     "ERNIE fused-norm fast path is not bit-exact against this "
                     "platform's rmsnorm dispatch; falling back to eager"
                 ),
+                diagnostic_hint=flashinfer_rmsnorm_diagnostic_hint,
             )
 
     return _eager_norm_scale_shift(norm, x, scale, shift)
@@ -165,6 +167,7 @@ def _ernie_gated_norm_scale_shift(
                     "ERNIE fused gated-norm fast path is not bit-exact against "
                     "this platform's rmsnorm dispatch; falling back to eager"
                 ),
+                diagnostic_hint=flashinfer_rmsnorm_diagnostic_hint,
             )
 
     res = residual_gate_add(residual, update, gate)

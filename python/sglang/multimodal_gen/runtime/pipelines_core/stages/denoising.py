@@ -1531,12 +1531,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         batch: Req,
     ) -> None:
         """
-        manage dit's residency by reporting the active sequential use
-
-        only applicable for dual-dit architecture like Wan
+        manage dit residency by reporting the active sequential use
 
         Args:
-            current_model: the next active dit, transformer_1 or transformer_2
+            current_model: the next active dit
         """
         manager = self._component_residency_manager
 
