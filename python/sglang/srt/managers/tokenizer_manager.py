@@ -1046,6 +1046,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.audio_data = [obj.audio_data]
             if contains_mm_input:
                 self._validate_mm_limits(obj)
+                self._normalize_mm_content_hashes(obj)
 
             mm_inputs = None
             mm_processor_input = (
@@ -1149,6 +1150,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
+
+    @staticmethod
+    def _normalize_mm_content_hashes(obj: GenerateReqInput) -> None:
+        """Merge Native/OpenAI content identities and validate their alignment."""
+        from sglang.srt.multimodal.cache import parse_content_hash
+        from sglang.srt.utils import ImageData
+
+        images = obj.image_data or []
+        explicit = obj.mm_content_hashes
+        inline = [
+            image.content_hash if isinstance(image, ImageData) else None
+            for image in images
+        ]
+        if explicit is None and not any(inline):
+            return
+        if explicit is None:
+            explicit = inline
+        if len(explicit) != len(images):
+            raise ValueError(
+                f"mm_content_hashes has {len(explicit)} entries for "
+                f"{len(images)} images"
+            )
+
+        normalized = []
+        for index, (provided, embedded) in enumerate(zip(explicit, inline)):
+            provided = parse_content_hash(provided)
+            embedded = parse_content_hash(embedded)
+            if provided is not None and embedded is not None and provided != embedded:
+                raise ValueError(f"Conflicting content hashes for image_data[{index}]")
+            normalized.append(provided or embedded)
+        obj.mm_content_hashes = normalized
 
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
@@ -1399,6 +1431,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
+                cache_salt=obj.cache_salt,
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
@@ -2010,6 +2043,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 await self._wait_for_model_update_from_disk(obj)
             )
 
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
