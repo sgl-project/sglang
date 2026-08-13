@@ -1470,8 +1470,7 @@ class Engine(EngineScoreMixin, EngineBase):
     ) -> List[bytes]:
         """One serialized payload per TP rank: each rank deserializes only its
         own copy, so producer-side CUDA-IPC refcounts drop cleanly after every
-        load. flattened_bucket callers pass pre-serialized per-rank payloads.
-        """
+        load. flattened_bucket callers pass pre-serialized per-rank payloads."""
         if load_format == "flattened_bucket":
             return normalize_serialized_named_tensor_payloads(
                 cast(List[SerializedTensorPayload], tensors)
