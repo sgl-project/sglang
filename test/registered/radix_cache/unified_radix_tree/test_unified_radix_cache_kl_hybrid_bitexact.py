@@ -25,9 +25,9 @@ Measured avg_kl_div:
 extra coverage rather than as the guard for one fix. CI runs `1-gpu-large`, which
 is SM90.
 
-These classes do not use UnifiedRadixTreeTestMixin: it bundles gsm8k and mmlu,
-which an undertrained checkpoint cannot gate on, and each class here runs the
-harness its regression was actually reproduced with.
+These classes do not use UnifiedRadixTreeTestMixin: it bundles a gsm8k case an
+undertrained checkpoint cannot gate on, and each class here runs the harness its
+regression was actually reproduced with.
 
 The imported `test_`-prefixed helpers are aliased so pytest does not collect them
 as tests.
