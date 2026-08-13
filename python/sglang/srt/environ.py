@@ -895,6 +895,17 @@ class Envs:
     # MNNVL-fabric devices (GB200/GB300) when nnodes > 1; set 0/1 to
     # override in either direction.
     SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE = EnvBool(False)
+    # FlashInfer PCIe-IPC all-reduce, for switch-free intra-node hosts (no
+    # NVLink, no multicast) where the backends above do not apply. Which shapes
+    # the kernels take is FlashInfer's own decision, not a size knob here: an
+    # unsupported shape is reported as such and the caller keeps its NCCL path.
+    SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
+    # Elements its workspace is sized for. It cannot grow after construction, so
+    # 0 sizes it for the widest decode (cuda_graph_config[decode].max_bs *
+    # hidden), leaving prefill chunks on NCCL -- measured faster than routing
+    # them here. Raise it to hand larger reductions to the kernels, at
+    # ~2 * world_size * max_numel * itemsize bytes per rank.
+    SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
