@@ -15,6 +15,7 @@ RUN apt-get update && \
     gcc \
     g++ \
     make \
+    libssl-dev \
     libsqlite3-dev \
     google-perftools \
     libtbb-dev \
