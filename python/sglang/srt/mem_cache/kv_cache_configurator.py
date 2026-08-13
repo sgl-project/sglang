@@ -81,6 +81,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
+    cdiv,
     get_available_gpu_memory,
     get_device_memory_capacity,
     is_float4_e2m1fn_x2,
@@ -1870,6 +1871,15 @@ class KVCacheConfigurator:
 
         return token_capacity
 
+    def _requested_max_num_reqs_per_worker(self) -> Optional[int]:
+        """Split the global ``--max-running-requests`` across attn dp workers.
+        Rounds up and floors at 1.
+        """
+        requested = get_schedule().max_running_requests
+        if requested is None:
+            return None
+        return max(1, cdiv(requested, self.ps.attn_dp_size))
+
     def resolve_max_num_reqs(self, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
@@ -1877,12 +1887,10 @@ class KVCacheConfigurator:
         estimated = int(token_capacity / self.model_config.context_len * 512)
         estimated = max(min(estimated, 4096), 2048)
 
-        max_num_reqs = get_schedule().max_running_requests
-        if max_num_reqs is not None:
-            requested_per_worker = max_num_reqs // self.ps.attn_dp_size
+        requested_per_worker = self._requested_max_num_reqs_per_worker()
+        if requested_per_worker is not None:
             max_num_reqs = min(requested_per_worker, token_capacity // 2)
         else:
-            requested_per_worker = None
             max_num_reqs = min(estimated, token_capacity // 2)
 
         capped_by_mamba = False
@@ -2038,7 +2046,7 @@ class KVCacheConfigurator:
             if has_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
-                    get_schedule().max_running_requests // self.ps.attn_dp_size,
+                    self._requested_max_num_reqs_per_worker(),
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
@@ -2054,8 +2062,7 @@ class KVCacheConfigurator:
             # Use explicitly set max_running_requests when radix cache is disabled
             get_context().override(
                 "mamba_pool.from_max_running_requests",
-                max_mamba_cache_size=get_schedule().max_running_requests
-                // self.ps.attn_dp_size,
+                max_mamba_cache_size=self._requested_max_num_reqs_per_worker(),
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot). Skipped under replayssm.
@@ -2095,7 +2102,7 @@ class KVCacheConfigurator:
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
-                    get_schedule().max_running_requests // self.ps.attn_dp_size,
+                    self._requested_max_num_reqs_per_worker(),
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = per_req * (capped_reqs + 1) * D
