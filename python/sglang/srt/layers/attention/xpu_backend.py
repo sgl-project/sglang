@@ -855,8 +855,9 @@ class XPUAttentionBackend(AttentionBackend):
         if not self.use_mla:
             # Do multi-head attention
 
-            # Only the MHA kernels below take num_splits; the MLA path uses
-            # flash_mla_decode, which has no such argument.
+            # Only the MHA kernels below take num_splits. The MLA path calls
+            # flash_mla_decode, whose own num_kv_splits already defaults to 1
+            # (no split-KV), so it needs no deterministic override here.
             kwargs["num_splits"] = self.num_splits
 
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -1003,6 +1004,12 @@ class XPUAttentionBackend(AttentionBackend):
                 metadata.page_table,
                 self.workspace,
                 layer.scaling,
+                # flash_mla_decode's heuristic only kicks in when num_kv_splits
+                # < 1, and it derives the split count from batch * num_heads and
+                # seq_len_kv, which is not batch-invariant. Pin it to 1 (the
+                # kernel's current default) so the reduction order stays fixed
+                # regardless of upstream default changes.
+                num_kv_splits=1,
             )
 
         out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
