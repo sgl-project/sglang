@@ -3769,6 +3769,24 @@ class ServerArgs:
                 "prompt attention."
             )
 
+        # Qwen3BidirectionalModel is a Qwen3 backbone served as an encoder-style
+        # embedding model (is_causal=False). Bidirectional attention over the
+        # whole prompt makes prefix reuse and split prefills invalid (K/V depend
+        # on later tokens), and the captured prefill CUDA graph corrupts the
+        # non-causal attention, so disable all three for correctness.
+        if "Qwen3BidirectionalModel" in getattr(hf_config, "architectures", []):
+            self.chunked_prefill_size = -1
+            self.disable_radix_cache = True
+            self.disable_cuda_graph = True
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            logger.warning(
+                "Qwen3BidirectionalModel detected: forcing "
+                "--chunked-prefill-size -1, --disable-radix-cache, and "
+                "--disable-cuda-graph for correctness of the bidirectional "
+                "(encoder-style) prompt attention."
+            )
+
         # EmbeddingGemma is a Gemma3TextModel with bidirectional prompt
         # attention. Prefix reuse and split prefills would reuse K/V states
         # whose values depend on later prompt tokens, so both are invalid.
