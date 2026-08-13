@@ -20,7 +20,6 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
-import logging
 import warnings
 from typing import Optional
 
@@ -38,8 +37,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.runtime_context import get_parallel
-
-logger = logging.getLogger(__name__)
 
 
 def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
@@ -387,39 +384,9 @@ def all_gather_kv_cache_for_dcp(
 _FI_A2A_STATE: Optional[dict] = None
 
 
-def _alloc_fi_a2a_send(
-    *,
-    batch: int,
-    h_per_rank: int,
-    cp_size: int,
-    head_dim: int,
-    dtype: torch.dtype,
-    device: torch.device,
-):
-    partial_o = torch.empty(
-        batch, h_per_rank, cp_size, head_dim, dtype=dtype, device=device
-    )
-    # Note(kpham-sgl): the a2a wants softmax_stats as [..., cp_size, S] with
-    # S >= 2, but never reads it -- it moves the field as opaque bytes, and S=2
-    # is the one size that skips TMA for it. So slot 0 carries our LSE and slot
-    # 1 is dead weight we still ship; zero it once here, not per call.
-    softmax_stats = torch.zeros(
-        batch, h_per_rank, cp_size, 2, dtype=torch.float32, device=device
-    )
-    return partial_o, softmax_stats
-
-
-def init_fi_a2a_workspace(
-    cp_group: "GroupCoordinator",
-    *,
-    max_batch: int = 0,
-    h_per_rank: int = 0,
-    head_dim: int = 0,
-    dtype: Optional[torch.dtype] = None,
-) -> None:
+def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
     # Call once per process BEFORE CUDA-graph capture: the FlashInfer init syncs
-    # the stream and barriers cross-rank, neither of which is capturable. Send
-    # buffers too -- allocated lazily they would come from the graph's pool.
+    # the stream and barriers cross-rank, neither of which is capturable.
     global _FI_A2A_STATE
     if _FI_A2A_STATE is not None:
         return
@@ -476,75 +443,10 @@ def init_fi_a2a_workspace(
     # REQUIRED barrier before the first alltoall: every rank must finish init,
     # else a rank writes a peer's FIFO before it is ready -> deadlock.
     dist.barrier(group=cp_group.device_group)
-    send_buffers = {}
-    if dtype is not None:
-        send_buffers[(h_per_rank, cp_size, head_dim, dtype)] = _alloc_fi_a2a_send(
-            batch=max_batch,
-            h_per_rank=h_per_rank,
-            cp_size=cp_size,
-            head_dim=head_dim,
-            dtype=dtype,
-            device=torch.cuda.current_device(),
-        )
-
     _FI_A2A_STATE = {
         "workspace": workspace,
         "cp_rank": cp_rank,
-        "max_batch": max_batch,
-        "send_buffers": send_buffers,
     }
-
-
-def _fi_a2a_send_buffers(
-    *,
-    batch: int,
-    h_per_rank: int,
-    cp_size: int,
-    head_dim: int,
-    dtype: torch.dtype,
-    device: torch.device,
-):
-    """Send tensors for the FlashInfer exchange, sliced to ``batch``.
-
-    Cached entries are never replaced -- see init_fi_a2a_workspace().
-    """
-    state = _FI_A2A_STATE
-    cache = state["send_buffers"]
-    key = (h_per_rank, cp_size, head_dim, dtype)
-    entry = cache.get(key)
-
-    if entry is None:
-        # Sized for max_batch so this stays the only allocation for the shape.
-        logger.warning(
-            "fi_a2a send buffers were pre-sized for %s but the model produced "
-            "%s; allocating now. Fix the derivation in "
-            "_pre_initialize_fi_a2a_workspace to keep this out of CUDA-graph "
-            "capture.",
-            sorted(str(k) for k in cache),
-            key,
-        )
-        entry = _alloc_fi_a2a_send(
-            batch=max(batch, state["max_batch"]),
-            h_per_rank=h_per_rank,
-            cp_size=cp_size,
-            head_dim=head_dim,
-            dtype=dtype,
-            device=device,
-        )
-        cache[key] = entry
-
-    if entry[0].shape[0] >= batch:
-        return entry[0][:batch], entry[1][:batch]
-
-    # Eager decode above the captured max: transient, leave the cached one be.
-    return _alloc_fi_a2a_send(
-        batch=batch,
-        h_per_rank=h_per_rank,
-        cp_size=cp_size,
-        head_dim=head_dim,
-        dtype=dtype,
-        device=device,
-    )
 
 
 def dcp_a2a_lse_reduce(
@@ -637,13 +539,14 @@ def _dcp_fi_a2a_lse_reduce(
     assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
     H_per_rank = H // N
 
-    partial_o, softmax_stats = _fi_a2a_send_buffers(
-        batch=B,
-        h_per_rank=H_per_rank,
-        cp_size=N,
-        head_dim=D,
-        dtype=cp_attn_out.dtype,
-        device=cp_attn_out.device,
+    # Note(kpham-sgl): empty(), not zeros() -- the pack below fills partial_o and
+    # stats slot 0, and slot 1 is never read by anyone. The a2a moves the stats
+    # field as opaque bytes and we only ever read slot 0 back off the wire.
+    partial_o = torch.empty(
+        B, H_per_rank, N, D, dtype=cp_attn_out.dtype, device=cp_attn_out.device
+    )
+    softmax_stats = torch.empty(
+        B, H_per_rank, N, 2, dtype=torch.float32, device=cp_attn_out.device
     )
     dcp_pack_a2a_send(
         cp_attn_out,
