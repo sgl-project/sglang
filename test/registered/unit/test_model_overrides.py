@@ -511,7 +511,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {
                     "quantization": "modelopt_mixed",
                     "moe_runner_backend": "marlin",
-                    "attention_backend": "flashinfer",
+                    "attention_backend": "trtllm_mha",
                 },
             )
 
@@ -541,7 +541,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {
                     "quantization": "modelopt_mixed",
                     "moe_runner_backend": "flashinfer_trtllm",
-                    "attention_backend": "flashinfer",
+                    "attention_backend": "trtllm_mha",
                 },
             )
 
@@ -666,6 +666,20 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         ):
             self.assertNotIn(
                 "attention_backend", _nemotron_h_overrides(server_args, hf_config)
+            )
+
+    def test_nemotron_h_target_only_sm100_uses_trtllm_mha(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        server_args, hf_config = self._nemotron_h_args(quantized_layers={})
+
+        with (
+            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+        ):
+            self.assertEqual(
+                _nemotron_h_overrides(server_args, hf_config)["attention_backend"],
+                "trtllm_mha",
             )
 
     def test_nemotron_h_explicit_split_attention_backend_wins(self):
@@ -1239,7 +1253,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {
                     "quantization": "modelopt_fp4",
                     "moe_runner_backend": "flashinfer_trtllm",
-                    "attention_backend": "flashinfer",
+                    "attention_backend": "trtllm_mha",
                 },
             )
             hf_mixed = _hf("MIXED_PRECISION")
@@ -1289,7 +1303,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         {
                             "quantization": modelopt_quantization,
                             "moe_runner_backend": "flashinfer_trtllm",
-                            "attention_backend": "flashinfer",
+                            "attention_backend": "trtllm_mha",
                         },
                     )
 

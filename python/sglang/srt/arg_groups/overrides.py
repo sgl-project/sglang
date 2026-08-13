@@ -1299,17 +1299,8 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         else:
             overrides["moe_runner_backend"] = "flashinfer_cutlass"
 
-    # FlashInfer target verification can materially change acceptance for
-    # Nemotron-H speculative decoding on Blackwell. On SM100, TRT-LLM MHA is
-    # the fastest validated target backend and also accelerates the eligible
-    # MTP / DSpark drafts; it requires paged KV and the Mamba extra buffer.
-    # TRT-LLM MHA prefill is not supported on SM120/121, where Triton target
-    # verification plus a FlashInfer draft preserves the expected acceptance.
-    # DFlash keeps its existing config-aware draft resolver: the public draft's
-    # full-attention layout falls back to FlashInfer, while a future compatible
-    # all-sliding or explicitly causal draft can retain TRT-LLM MHA.
-    # Keep the target-only default unchanged, and never override an explicitly
-    # selected unified/split target backend or an explicit draft backend.
+    # Nemotron-H attention is architecture-sensitive on Blackwell. Use validated
+    # defaults while preserving explicit target and draft backend choices.
     if is_blackwell_supported() and server_args.is_attention_backend_not_set():
         if server_args.speculative_algorithm is not None:
             speculative_algorithm = server_args.speculative_algorithm.upper()
@@ -1333,7 +1324,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
                 ):
                     overrides["speculative_draft_attention_backend"] = "flashinfer"
         elif is_sm100_supported():
-            overrides["attention_backend"] = "flashinfer"
+            overrides["attention_backend"] = "trtllm_mha"
     return overrides
 
 
