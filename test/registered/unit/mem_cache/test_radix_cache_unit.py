@@ -31,6 +31,7 @@ from array import array
 import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -98,6 +99,16 @@ class TestRadixKey(unittest.TestCase):
         # Edge cases
         self.assertEqual(list(key[2:2].token_ids), [])  # Empty slice
         self.assertEqual(list(key[:].token_ids), [1, 2, 3, 4, 5])  # Full slice
+
+    def test_cache_salt_is_preserved_by_slicing(self):
+        key = RadixKey(
+            array("q", [1, 2, 3, 4]),
+            extra_key="classification",
+            cache_salt="tenant-a",
+        )
+        sliced = key[1:3]
+        self.assertEqual(sliced.extra_key, "classification")
+        self.assertEqual(sliced.cache_salt, "tenant-a")
 
     def test_getitem_invalid_index(self):
         """Test __getitem__ with invalid indices."""
@@ -391,23 +402,7 @@ class TestRadixCache(unittest.TestCase):
         )
         self.assertEqual(cache.total_size(), 5)
 
-    def test_cache_unfinished_req_deferred_free_keeps_original_indices(self):
-        class DeferredFreeAllocator:
-            device = torch.device("cpu")
-
-            def __init__(self):
-                self.free_group = []
-                self.freed = None
-
-            def free_group_begin(self):
-                self.free_group = []
-
-            def free_segment(self, free_index, *, start_pos):
-                self.free_group.append(free_index)
-
-            def free_group_end(self):
-                self.freed = torch.cat(self.free_group)
-
+    def test_cache_unfinished_req_deferred_free_owns_original_indices(self):
         class ReqToTokenPool:
             def __init__(self, row):
                 self.req_to_token = row.unsqueeze(0)
@@ -415,11 +410,19 @@ class TestRadixCache(unittest.TestCase):
             def write(self, indices, values):
                 self.req_to_token[indices] = values
 
-        allocator = DeferredFreeAllocator()
+        allocator = TokenToKVPoolAllocator(
+            size=16,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
         cache = RadixCache.create_simulated(mock_allocator=allocator)
         token_ids = array("q", [1, 2, 3])
-        tree_indices = torch.tensor([10, 11, 12], dtype=torch.int64)
-        request_indices = torch.tensor([20, 21, 22], dtype=torch.int64)
+        tree_indices = allocator.alloc(3)
+        request_indices = allocator.alloc(3)
+        assert tree_indices is not None
+        assert request_indices is not None
         cache.insert(
             InsertParams(
                 key=RadixKey(array("q", token_ids)),
@@ -431,16 +434,22 @@ class TestRadixCache(unittest.TestCase):
             req_pool_idx=0,
             cache_protected_len=0,
             extra_key=None,
+            cache_salt=None,
             priority=0,
             last_node=cache.root_node,
         )
         req.get_fill_ids.return_value = token_ids
 
+        available_before_free = allocator.available_size()
         allocator.free_group_begin()
         cache.cache_unfinished_req(req)
         allocator.free_group_end()
 
-        torch.testing.assert_close(allocator.freed, request_indices)
+        self.assertEqual(
+            allocator.available_size(),
+            available_before_free + request_indices.numel(),
+        )
+        torch.testing.assert_close(allocator.free_pages[-3:], request_indices)
         torch.testing.assert_close(
             cache.req_to_token_pool.req_to_token[0], tree_indices
         )
@@ -580,6 +589,107 @@ class TestRadixCache(unittest.TestCase):
 
         # Non-existent extra_key should not match
         self.assertEqual(len(result4.device_indices), 0)
+
+    def test_cache_salt_isolation_is_independent_of_extra_key(self):
+        cache = RadixCache.create_simulated()
+        tokens = array("q", [1, 2, 3])
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey(tokens, extra_key="bc", cache_salt="a"),
+                value=torch.tensor([10, 20, 30], dtype=torch.int64),
+            )
+        )
+        cache.insert(
+            InsertParams(
+                key=RadixKey(tokens, extra_key="c", cache_salt="ab"),
+                value=torch.tensor([40, 50, 60], dtype=torch.int64),
+            )
+        )
+
+        first = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(tokens, extra_key="bc", cache_salt="a"))
+        )
+        second = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(tokens, extra_key="c", cache_salt="ab"))
+        )
+        torch.testing.assert_close(
+            first.device_indices, torch.tensor([10, 20, 30], dtype=torch.int64)
+        )
+        torch.testing.assert_close(
+            second.device_indices, torch.tensor([40, 50, 60], dtype=torch.int64)
+        )
+
+    def test_cache_salt_is_included_in_store_and_remove_events(self):
+        mock_allocator = unittest.mock.Mock()
+        mock_allocator.device = torch.device("cpu")
+        cache = RadixCache.create_simulated(
+            mock_allocator=mock_allocator,
+            page_size=2,
+            enable_kv_cache_events=True,
+        )
+        tokens = array("q", [1, 2, 3, 4])
+        cache.insert(
+            InsertParams(
+                key=RadixKey(tokens, cache_salt="tenant-a"),
+                value=torch.tensor([10, 20, 30, 40], dtype=torch.int64),
+            )
+        )
+        cache.evict(EvictParams(num_tokens=len(tokens)))
+        events = cache.take_events()
+        stored = [event for event in events if isinstance(event, BlockStored)]
+        removed = [event for event in events if isinstance(event, BlockRemoved)]
+
+        self.assertEqual(len(stored), 2)
+        self.assertTrue(
+            all(event.metadata.cache_salt == "tenant-a" for event in stored)
+        )
+        self.assertEqual(stored[1].parent_block_hash, stored[0].block_hashes[0])
+        self.assertEqual(
+            removed[0].block_hashes,
+            [event.block_hashes[0] for event in stored],
+        )
+
+        unsalted = RadixCache.create_simulated(page_size=2, enable_kv_cache_events=True)
+        unsalted.insert(InsertParams(key=RadixKey(tokens), value=None))
+        unsalted_hashes = [
+            event.block_hashes[0]
+            for event in unsalted.take_events()
+            if isinstance(event, BlockStored)
+        ]
+        self.assertNotEqual(
+            unsalted_hashes, [event.block_hashes[0] for event in stored]
+        )
+
+    def test_cache_salt_event_hashes_are_preserved_across_node_split(self):
+        cache = RadixCache.create_simulated(page_size=2, enable_kv_cache_events=True)
+        original = RadixKey(array("q", [1, 2, 3, 4]), cache_salt="tenant-a")
+        cache.insert(
+            InsertParams(
+                key=original,
+                value=torch.tensor([10, 20, 30, 40], dtype=torch.int64),
+            )
+        )
+        original_node = cache.match_prefix(
+            MatchPrefixParams(key=original)
+        ).last_device_node
+        original_hashes = list(original_node.event_hash_value)
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 9, 10]), cache_salt="tenant-a"),
+                value=torch.tensor([10, 20, 90, 100], dtype=torch.int64),
+            )
+        )
+        split_child = cache.match_prefix(
+            MatchPrefixParams(key=original)
+        ).last_device_node
+        split_parent = split_child.parent
+
+        self.assertEqual(
+            split_parent.event_hash_value + split_child.event_hash_value,
+            original_hashes,
+        )
 
     def test_lock_ref_operations(self):
         """Test lock reference counting operations."""
