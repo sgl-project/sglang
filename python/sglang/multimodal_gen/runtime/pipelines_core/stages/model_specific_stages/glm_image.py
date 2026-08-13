@@ -15,7 +15,6 @@ from sglang.multimodal_gen.configs.sample.glmimage import (
     GLM_IMAGE_RESOLUTION_ALIGNMENT,
     align_glm_image_resolution,
 )
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -26,6 +25,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
@@ -374,7 +374,7 @@ class GlmImageAR(PipelineStage):
             Tuple of the D16 prior token IDs, optional source-image token IDs,
             and optional usage statistics returned by an external AR server.
         """
-        device = get_local_torch_device()
+        device = current_platform.get_local_torch_device()
         _validate_glm_image_resolution_alignment(width, height)
 
         is_text_to_image = image is None or len(image) == 0
@@ -478,7 +478,7 @@ class GlmImageAR(PipelineStage):
         server_args: ServerArgs,
         device: Optional[torch.device] = None,
     ) -> tuple[list[torch.Tensor], list[dict[str, int] | None]]:
-        device = device or get_local_torch_device()
+        device = device or current_platform.get_local_torch_device()
         _validate_glm_image_resolution_alignment(width, height)
 
         input_ids = []
@@ -675,7 +675,7 @@ class GlmImageAR(PipelineStage):
         else:
             ar_condition_images = None
 
-        device = get_local_torch_device()
+        device = current_platform.get_local_torch_device()
 
         if ar_condition_images is not None:
             height = height or ar_condition_images[0].height
@@ -1079,7 +1079,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         height = batch.height
         width = batch.width
 
-        device = get_local_torch_device()
+        device = current_platform.get_local_torch_device()
         batch_size = _num_outputs_per_prompt(batch)
         max_sequence_length = 1024
         seed = getattr(batch, "seed", None)
