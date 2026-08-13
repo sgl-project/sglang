@@ -2821,10 +2821,9 @@ class ServerArgs:
         Optional[Literal["cpu", "cuda_ipc", "cuda_vmm"]],
         "Transport multimodal features through CPU memory, a bounded CUDA IPC "
         "pool, or a bounded CUDA VMM pool. "
-        "Unset resolves automatically: multimodal models on single-node CUDA "
-        "deployments (without disaggregation) use cuda_ipc; validated multi-node "
-        "GB200/GB300 MNNVL models use cuda_vmm when an IMEX channel is available; "
-        "all other deployments use cpu. GPU transports reserve "
+        "Unset uses cpu except for validated multi-node GB200/GB300 MNNVL models, "
+        "which use cuda_vmm when an IMEX channel is available. Select cuda_ipc "
+        "explicitly for single-node GPU transport. GPU transports reserve "
         "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and fall "
         "back to CPU transport when the pool is full.",
         NS("mm"),
@@ -4589,17 +4588,10 @@ class ServerArgs:
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
-        from sglang.srt.configs.model_config import is_deepseek_v4, is_nemotron_h
+        from sglang.srt.configs.model_config import is_deepseek_v4
         from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
         rules = [
-            # NemotronH's hybrid Mamba2 prefill is not BCG-safe: the mamba
-            # state-track write is not wired into the captured buffers, so a
-            # replay can commit a cache slot it never wrote.
-            (
-                "NemotronH (hybrid Mamba2 prefill)",
-                lambda: is_nemotron_h(self.get_model_config().hf_config),
-            ),
             # DSV4 is BCG-compatible but introduces heavy memory pressure: the
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
             (
@@ -7769,10 +7761,10 @@ class ServerArgs:
     def _handle_multimodal_feature_transport(self):
         """Resolve multimodal feature transport before tokenizer workers start.
 
-        GPU transports use a fixed pool on ``base_gpu_id`` and therefore reduce
-        the memory left for model/KV-cache allocations. The legacy CUDA IPC flag
-        and environment variable remain supported so existing deployments map
-        to this single policy.
+        CUDA IPC is opt-in because its fixed pool on ``base_gpu_id`` reduces the
+        memory left for model/KV-cache allocations. Multi-node MNNVL deployments
+        may still auto-select CUDA VMM. The legacy CUDA IPC flag and environment
+        variable remain supported so existing deployments map to this policy.
         """
         requested_transport = self.mm_feature_transport
         legacy_ipc_is_set = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.is_set()
@@ -7812,16 +7804,12 @@ class ServerArgs:
                 and self.disaggregation_mode == "null"
             ):
                 # A full GPU pool always degrades to CPU transport per tensor.
-                # CUDA IPC is intra-node; multi-node auto-selection is limited
-                # to GB200/GB300 systems where the runtime already enables the
-                # MNNVL/IMEX communication stack.
+                # Keep CUDA IPC opt-in because even an idle pool consumes HBM
+                # that would otherwise back the KV cache. Multi-node
+                # auto-selection is limited to GB200/GB300 systems where the
+                # runtime already enables the MNNVL/IMEX communication stack.
                 if self.nnodes == 1:
-                    requested_transport = "cuda_ipc"
-                    logger.info(
-                        "Multimodal feature transport auto-resolved to cuda_ipc "
-                        "(single-node CUDA). Pass --mm-feature-transport=cpu to "
-                        "opt out."
-                    )
+                    requested_transport = "cpu"
                 elif is_mnnvl_fabric_device() and os.path.exists(
                     "/dev/nvidia-caps-imex-channels/channel0"
                 ):
