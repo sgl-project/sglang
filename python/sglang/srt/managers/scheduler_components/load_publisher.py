@@ -62,11 +62,6 @@ LOAD_MIN_COMPUTE_INTERVAL_S = 0.05
 # the idle spin loop (on_idle force-publishes every iteration).
 LOAD_PUBLISH_HEARTBEAT_S = 1.0
 
-# Re-warn about publish failures at most this often. Wall-clock, not a count:
-# failures are driven by the scheduler loop, so a count bound would still
-# flood at loop rate.
-FAIL_WARN_PERIOD_S = 60.0
-
 # Small HWM: load is a gauge, so shedding at a full pipe loses readings the
 # next heartbeat supersedes. ZMQ_CONFLATE (true newest-wins) is unusable — it
 # keeps a single frame, breaking the 3-frame framing — so a bounded backlog
@@ -145,8 +140,7 @@ class SchedulerLoadPublisher:
         self._last_counts: Optional[tuple] = None
         self._last_publish_ts = 0.0
         self._last_compute_ts = float("-inf")
-        self._fail_count = 0
-        self._last_fail_warn_ts = float("-inf")
+        self._publish_failed = False
         if not is_kv_publisher_rank(kv_events_config, ps):
             return
         try:
@@ -212,7 +206,7 @@ class SchedulerLoadPublisher:
         [`LOAD_MIN_COMPUTE_INTERVAL_S`].
 
         Best-effort: never crashes the loop (routers fall back to their own
-        counter); failures re-warn at most once per [`FAIL_WARN_PERIOD_S`].
+        counter).
         """
         if self._socket is None:
             return
@@ -261,32 +255,20 @@ class SchedulerLoadPublisher:
                 )
             )
             seq = next(self._seq).to_bytes(8, "big")
-            try:
-                self._socket.send_multipart(
-                    (LOAD_TOPIC.encode(), seq, payload), zmq.NOBLOCK
-                )
-            except zmq.Again:
-                # Unreachable under PUB (it sheds at HWM, never blocks); kept
-                # so a socket-type change still retries rather than deduping
-                # away a send nobody got.
-                return
-            # Recorded on enqueue. A silent HWM drop leaves a changed reading
-            # unseen until the next heartbeat; that is inherent to PUB.
+            # PUB never blocks — it sheds at HWM. A silently dropped reading is
+            # superseded by the next heartbeat.
+            self._socket.send_multipart((LOAD_TOPIC.encode(), seq, payload))
             self._last_counts = counts
             self._last_publish_ts = now
-            self._fail_count = 0
+            self._publish_failed = False
         except Exception:
-            self._fail_count += 1
-            now = time.monotonic()
-            if (
-                self._fail_count == 1
-                or now - self._last_fail_warn_ts >= FAIL_WARN_PERIOD_S
-            ):
-                self._last_fail_warn_ts = now
+            # Never crash the scheduler loop over a routing hint; log once per
+            # failure episode (this runs every loop, so don't flood).
+            if not self._publish_failed:
+                self._publish_failed = True
                 logger.warning(
-                    "load-publisher: publish_load_stat failed (%d consecutive); "
-                    "load-aware routers fall back to their in-flight load signal",
-                    self._fail_count,
+                    "load-publisher: publish failed; routers fall back to "
+                    "their in-flight load signal",
                     exc_info=True,
                 )
 

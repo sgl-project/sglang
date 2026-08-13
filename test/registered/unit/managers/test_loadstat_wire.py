@@ -343,7 +343,7 @@ class TestLoadPublisherGating(CustomTestCase):
         # subscriber loop handles both.
         pub, _ = self._build()
         pub.publish_load_stat(self._provider(running=1), force=True)
-        (frames, _flags), _ = pub._socket.send_multipart.call_args
+        (frames,), _ = pub._socket.send_multipart.call_args
         topic, seq, payload = frames
         self.assertEqual(topic, b"load")
         self.assertEqual(seq, (0).to_bytes(8, "big"))
@@ -369,24 +369,6 @@ class TestLoadPublisherGating(CustomTestCase):
             fake_time.monotonic.return_value = 101.5  # heartbeat elapsed
             pub.publish_load_stat(provider, force=True)
             self.assertEqual(pub._socket.send_multipart.call_count, 2)
-
-    def test_hwm_dropped_send_is_retried_not_deduped(self):
-        # Belt-and-braces guard: a real PUB send never raises Again (ZMQ
-        # sheds per-subscriber at HWM, silently), but if the socket type or
-        # contract ever changes, the dedup state must stay untouched so the
-        # next call retries the reading instead of suppressing an unchanged
-        # gauge until the heartbeat.
-        import zmq
-
-        pub, _ = self._build()
-        provider = self._provider(running=1)
-        pub._socket.send_multipart.side_effect = zmq.Again()
-        pub.publish_load_stat(provider, force=True)
-        self.assertIsNone(pub._last_counts)
-        pub._socket.send_multipart.side_effect = None
-        pub.publish_load_stat(provider, force=True)
-        self.assertEqual(pub._last_counts, (1, 2, 3, 4))
-        self.assertEqual(pub._socket.send_multipart.call_count, 2)
 
     def test_call_throttle_stays_engaged_across_dedup_hits(self):
         # Regression: the counter must reset when the throttle PASSES, not
