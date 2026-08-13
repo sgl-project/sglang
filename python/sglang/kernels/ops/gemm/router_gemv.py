@@ -17,10 +17,19 @@ import torch
 import triton
 import triton.language as tl
 
-_BLOCK_N = 16
-_BLOCK_K = 512
-_SPLIT_K = 4
 _MAX_M = 64
+
+# (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps) per M bucket. BLOCK_M == 1 is
+# the GEMV formulation (weight re-read per row); above it the rows share one
+# weight read through an MFMA tile, which is what a decode batch needs.
+_CONFIGS = ((8, (1, 16, 512, 4, 16)), (_MAX_M, (16, 16, 256, 8, 4)))
+
+
+def _config(m: int):
+    for max_m, cfg in _CONFIGS:
+        if m <= max_m:
+            return cfg
+    return _CONFIGS[-1][1]
 
 
 @triton.jit
@@ -30,11 +39,13 @@ def _router_gemv_kernel(
     out_ptr,
     partials_ptr,  # [SPLIT_K, M, N] fp32 scratch (always fully overwritten)
     counter_ptr,  # [num_n_blocks * M] int32, all-zero between launches
+    M,
     K,
     N,
     stride_xm,
     stride_wn,
     stride_om,
+    BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
     SPLIT_K: tl.constexpr,
@@ -43,30 +54,55 @@ def _router_gemv_kernel(
     pid_m = tl.program_id(1)
     pid_k = tl.program_id(2)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    acc = tl.zeros((BLOCK_N,), tl.float32)
-    for k0 in range(pid_k * BLOCK_K, K, BLOCK_K * SPLIT_K):
-        offs_k = k0 + tl.arange(0, BLOCK_K)
-        xv = tl.load(x_ptr + pid_m * stride_xm + offs_k).to(tl.float32)
-        wv = tl.load(w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :]).to(
-            tl.float32
-        )
-        acc += tl.sum(wv * xv[None, :], axis=1)
+    if BLOCK_M == 1:
+        acc = tl.zeros((BLOCK_N,), tl.float32)
+        for k0 in range(pid_k * BLOCK_K, K, BLOCK_K * SPLIT_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            xv = tl.load(x_ptr + pid_m * stride_xm + offs_k).to(tl.float32)
+            wv = tl.load(w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :]).to(
+                tl.float32
+            )
+            acc += tl.sum(wv * xv[None, :], axis=1)
+        acc = acc[None, :]
+        offs_m = pid_m + tl.zeros((1,), tl.int32)
+    else:
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < M
+        acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+        for k0 in range(pid_k * BLOCK_K, K, BLOCK_K * SPLIT_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            xv = tl.load(
+                x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :],
+                mask=mask_m[:, None],
+                other=0.0,
+            )
+            wv = tl.load(w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :])
+            acc += tl.dot(xv, tl.trans(wv), out_dtype=tl.float32)
 
-    part_base = (pid_k * tl.num_programs(1) + pid_m) * N
-    tl.store(partials_ptr + part_base + offs_n, acc)
+    part_base = (pid_k * tl.num_programs(1) + pid_m) * (BLOCK_M * N)
+    tl.store(
+        partials_ptr + part_base + tl.arange(0, BLOCK_M)[:, None] * N + offs_n, acc
+    )
 
-    # Last CTA for this (n-block, row) reduces all SPLIT_K partials and resets
-    # the counter, keeping the buffer reusable with no separate zeroing launch.
+    # Last CTA for this (n-block, row tile) reduces all SPLIT_K partials and
+    # resets the counter, keeping the buffer reusable with no zeroing launch.
     count = tl.atomic_add(
         counter_ptr + pid_n * tl.num_programs(1) + pid_m, 1, sem="acq_rel"
     )
     if count == SPLIT_K - 1:
-        total = tl.zeros((BLOCK_N,), tl.float32)
+        total = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
         for s in range(SPLIT_K):
             total += tl.load(
-                partials_ptr + (s * tl.num_programs(1) + pid_m) * N + offs_n
+                partials_ptr
+                + (s * tl.num_programs(1) + pid_m) * (BLOCK_M * N)
+                + tl.arange(0, BLOCK_M)[:, None] * N
+                + offs_n
             )
-        tl.store(out_ptr + pid_m * stride_om + offs_n, total)
+        tl.store(
+            out_ptr + offs_m[:, None] * stride_om + offs_n,
+            total,
+            mask=(offs_m < M)[:, None],
+        )
         tl.atomic_xchg(counter_ptr + pid_n * tl.num_programs(1) + pid_m, 0)
 
 
@@ -76,9 +112,10 @@ _scratch: Dict[Tuple[torch.device, int], Tuple[torch.Tensor, torch.Tensor]] = {}
 def _get_scratch(device: torch.device, n: int) -> Tuple[torch.Tensor, torch.Tensor]:
     key = (device, n)
     if key not in _scratch:
+        max_split_k = max(cfg[3] for _, cfg in _CONFIGS)
         _scratch[key] = (
-            torch.empty(_SPLIT_K * _MAX_M * n, dtype=torch.float32, device=device),
-            torch.zeros((n // _BLOCK_N) * _MAX_M, dtype=torch.int32, device=device),
+            torch.empty(max_split_k * _MAX_M * n, dtype=torch.float32, device=device),
+            torch.zeros(n * _MAX_M // 16, dtype=torch.int32, device=device),
         )
     return _scratch[key]
 
@@ -86,11 +123,12 @@ def _get_scratch(device: torch.device, n: int) -> Tuple[torch.Tensor, torch.Tens
 def router_gemv_supported(x: torch.Tensor, w: torch.Tensor) -> bool:
     m, k = x.shape
     n = w.shape[0]
+    _, block_n, block_k, _, _ = _config(m)
     return (
         x.stride(1) == 1
         and w.stride(1) == 1
-        and n % _BLOCK_N == 0
-        and k % _BLOCK_K == 0
+        and n % block_n == 0
+        and k % block_k == 0
         and m <= _MAX_M
     )
 
@@ -99,23 +137,40 @@ def router_gemv(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """Router logits in fp32; caller guards with router_gemv_supported()."""
     m, k = x.shape
     n = w.shape[0]
+    block_m, block_n, block_k, split_k, num_warps = _config(m)
     partials, counter = _get_scratch(x.device, n)
     out = torch.empty(m, n, device=x.device, dtype=torch.float32)
-    grid = (n // _BLOCK_N, m, _SPLIT_K)
+    grid = (n // block_n, triton.cdiv(m, block_m), split_k)
     _router_gemv_kernel[grid](
         x,
         w,
         out,
         partials,
         counter,
+        m,
         k,
         n,
         x.stride(0),
         w.stride(0),
         out.stride(0),
-        BLOCK_K=_BLOCK_K,
-        BLOCK_N=_BLOCK_N,
-        SPLIT_K=_SPLIT_K,
-        num_warps=16,
+        BLOCK_M=block_m,
+        BLOCK_K=block_k,
+        BLOCK_N=block_n,
+        SPLIT_K=split_k,
+        num_warps=num_warps,
     )
     return out
+
+
+if __name__ == "__main__":
+    # ponytail: self-check instead of a CI test file; needs a GPU.
+    torch.manual_seed(0)
+    for m in (1, 2, 8, 16, 17, 32, 64):
+        x = torch.randn(m, 6144, dtype=torch.bfloat16, device="cuda")
+        w = torch.randn(128, 6144, dtype=torch.bfloat16, device="cuda")
+        assert router_gemv_supported(x, w)
+        got = router_gemv(x, w)
+        ref = torch.mm(x, w.t(), out_dtype=torch.float32)
+        err = (got - ref).abs().max().item() / ref.abs().max().item()
+        assert err < 2e-2, (m, err)
+        print(f"m={m:3d} rel_err={err:.2e} ok")
