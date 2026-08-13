@@ -59,6 +59,11 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         # This approach follows the original implementation.
         # TODO: make config of type Qwen3VLMoeConfig, so that we can directly obtain deepstack_visual_indexes.
         self.deepstack_embed_to_decoder_layer = range(3)
+        # Use HF deepstack order only if rl_on_policy_target is set;
+        # otherwise, retain original order for inference accuracy.
+        self.use_hf_deepstack_order = (
+            get_global_server_args().rl_on_policy_target is not None
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -95,10 +100,6 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        # Use HF deepstack order only if rl_on_policy_target is set; 
-        # otherwise, retain original order for inference accuracy.
-        use_hf_deepstack_order = get_global_server_args().rl_on_policy_target is not None
-
         aux_hidden_states = []
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
@@ -109,7 +110,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                     hidden_states + residual if residual is not None else hidden_states
                 )
 
-            if use_hf_deepstack_order:
+            if self.use_hf_deepstack_order:
                 # HF-order path (RL on-policy / FSDP). SGLang applies residual at the START of the
                 # next layer, so to match HF's (hidden_states + residual) + deepstack, deepstack for
                 # the previous layer is added after residual via post_residual_addition.
@@ -144,7 +145,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         # Handle deepstack for the last processed layer (HF-order path only).
         last_deepstack = (
             self.get_deepstack_embeds(self.end_layer - 1, input_deepstack_embeds)
-            if use_hf_deepstack_order
+            if self.use_hf_deepstack_order
             else None
         )
 
