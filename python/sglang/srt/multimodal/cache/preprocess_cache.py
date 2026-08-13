@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import dataclasses
 import sys
 import threading
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Generic, Optional, TypeVar
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Generic,
+    Optional,
+    Protocol,
+    TypeVar,
+    runtime_checkable,
+)
 
 import numpy as np
 import torch
@@ -42,6 +50,13 @@ class _Entry(Generic[V]):
     size_bytes: int
 
 
+@runtime_checkable
+class CacheSizeProvider(Protocol):
+    """Explicitly expose the owned values that count against a cache budget."""
+
+    def cache_size_items(self) -> Sequence[Any]: ...
+
+
 def estimate_cache_size_bytes(value: Any) -> Optional[int]:
     """Estimate owned CPU bytes, returning None for GPU-backed artifacts."""
     seen: set[int] = set()
@@ -66,14 +81,8 @@ def estimate_cache_size_bytes(value: Any) -> Optional[int]:
             return len(item)
         if isinstance(item, str):
             return len(item.encode())
-        if dataclasses.is_dataclass(item):
-            total = 0
-            for field in dataclasses.fields(item):
-                child_size = visit(getattr(item, field.name))
-                if child_size is None:
-                    return None
-                total += child_size
-            return total
+        if isinstance(item, CacheSizeProvider):
+            return visit(item.cache_size_items())
         if isinstance(item, Mapping):
             total = 0
             for key, child in item.items():
@@ -139,15 +148,22 @@ class MultimodalPreprocessCache(Generic[K, V]):
             self.hits += 1
             return entry.value
 
-    def get_if_present(self, key: K, predicate: Callable[[V], bool]) -> Optional[V]:
+    def get_if_present(
+        self,
+        key: K,
+        predicate: Callable[[V], bool],
+        *,
+        evict_on_reject: bool = False,
+    ) -> Optional[V]:
         """Atomically use a compatible entry without counting an absent miss."""
         with self._lock:
             entry = self._entries.get(key)
             if entry is None:
                 return None
             if not predicate(entry.value):
-                self._entries.pop(key)
-                self.current_size_bytes -= entry.size_bytes
+                if evict_on_reject:
+                    self._entries.pop(key)
+                    self.current_size_bytes -= entry.size_bytes
                 return None
             self._entries.move_to_end(key)
             self.hits += 1

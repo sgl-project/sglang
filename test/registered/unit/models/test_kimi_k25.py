@@ -602,6 +602,21 @@ class _HFProcessor:
         )
 
 
+def _k3_preprocess_config(
+    *, patch_size=14, in_patch_limit=16384
+) -> KimiK3PreprocessConfig:
+    return KimiK3PreprocessConfig(
+        patch_size=patch_size,
+        merge_kernel_size=2,
+        in_patch_limit=in_patch_limit,
+        patch_limit_on_one_side=512,
+        fixed_output_tokens=None,
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
+        transparent_bg_config=None,
+    )
+
+
 @pytest.mark.parametrize(
     ("processor_cls", "wrapper_cls"),
     [
@@ -622,6 +637,7 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
         mm_preprocess_cache_size_mb=0,
         trust_mm_content_hashes=False,
         base_gpu_id=0,
+        rl_on_policy_target=None,
     )
     processor = processor_cls(
         hf_config=SimpleNamespace(media_placeholder_token_id=42),
@@ -1159,7 +1175,7 @@ def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
     processor.mm_feature_transport = "cpu"
     processor.use_cuda_ipc = False
     processor._processor = SimpleNamespace(
-        _patch_size=2,
+        preprocess_config=_k3_preprocess_config(patch_size=2),
         prepare_deferred=Mock(
             return_value=(
                 torch.tensor([[1, 99, 99, 2, 99, 3]]),
@@ -1229,11 +1245,7 @@ def test_kimi_k3_defers_only_when_raw_transport_is_smaller(
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_feature_transport = "cpu"
     processor._processor = SimpleNamespace(
-        _patch_size=14,
-        _merge_kernel_size=2,
-        _in_patch_limit=in_patch_limit,
-        _patch_limit_on_one_side=512,
-        _fixed_output_tokens=None,
+        preprocess_config=_k3_preprocess_config(in_patch_limit=in_patch_limit),
     )
     image = torch.zeros(image_shape, dtype=torch.uint8)
 
@@ -1284,6 +1296,7 @@ def test_kimi_k3_keeps_gpu_transport_preprocessing_eager(transport):
 def test_kimi_k3_rejects_silently_dropped_images():
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_tokens = Mock()
+    processor.mm_preprocess_cache = MultimodalPreprocessCache(0)
     processor.load_mm_data = AsyncMock(return_value=SimpleNamespace(images=[object()]))
 
     with pytest.raises(ValueError, match="expected 2, loaded 1"):
@@ -1291,13 +1304,14 @@ def test_kimi_k3_rejects_silently_dropped_images():
             processor.process_mm_data_async(
                 image_data=["image-1", "image-2"],
                 input_text="<|media_pad|><|media_pad|>",
-                request_obj=SimpleNamespace(video_data=None),
+                request_obj=SimpleNamespace(video_data=None, mm_content_hashes=None),
             )
         )
 
 
 def test_kimi_k3_uses_token_ids_to_preserve_media_boundaries():
     processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_preprocess_cache = MultimodalPreprocessCache(0)
     processor.mm_feature_transport = "cpu"
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
     processor.mm_feature_transport = "cuda_ipc"
@@ -1316,7 +1330,7 @@ def test_kimi_k3_uses_token_ids_to_preserve_media_boundaries():
         processor.process_mm_data_async(
             image_data=["image-1", "image-2"],
             input_text=[1, 99, 2, 99, 3],
-            request_obj=SimpleNamespace(video_data=None),
+            request_obj=SimpleNamespace(video_data=None, mm_content_hashes=None),
         )
     )
 

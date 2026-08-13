@@ -30,6 +30,14 @@ class _Artifact:
     def cache_value(self):
         return self
 
+    def cache_size_items(self):
+        return (
+            self.content_digest,
+            self.artifact_key,
+            self.feature_hash,
+            self.feature,
+        )
+
 
 @dataclass(frozen=True)
 class _FutureMediaInput:

@@ -107,6 +107,22 @@ def resolve_encoder_feature_method(model, modality: Modality):
     raise TypeError(f"Model does not implement {modality.name.lower()} encoding")
 
 
+@runtime_checkable
+class EncoderMediaProcessorConfigProvider(Protocol):
+    """Model contract for optional encoder-side media preprocessing."""
+
+    encoder_media_processor_config: EncoderMediaProcessorConfig
+
+
+def resolve_encoder_media_processor_config(
+    model: object,
+) -> EncoderMediaProcessorConfig:
+    """Resolve a model-declared capability without model-name dispatch."""
+    if isinstance(model, EncoderMediaProcessorConfigProvider):
+        return model.encoder_media_processor_config
+    return EncoderMediaProcessorConfig()
+
+
 def hash_raw_encoder_item(value: Any) -> int:
     """Hash raw CPU media including layout metadata, before owner materialization."""
     if isinstance(value, torch.Tensor):

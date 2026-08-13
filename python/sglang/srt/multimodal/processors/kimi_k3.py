@@ -393,7 +393,9 @@ class KimiK3ImageProcessor(
             image_token_regex=re.compile(r"(?:<\|media_pad\|>)+"),
         ).build(_processor)
 
-        preprocess_config = KimiK3PreprocessConfig.from_media_processor(_processor)
+        preprocess_config = KimiK3PreprocessConfig.from_media_processor(
+            _processor.media_processor
+        )
 
         processor = KimiK3GPUProcessorWrapper(
             _processor,
@@ -726,8 +728,7 @@ class KimiK3ImageProcessor(
                     f"expected {expected_image_count}, found {placeholder_count} token(s)"
                 )
         if (
-            not hasattr(self, "mm_preprocess_cache")
-            or any(self._is_preprocessed_input(item) for item in image_data)
+            any(self._is_preprocessed_input(item) for item in image_data)
             or not self.mm_preprocess_cache.enabled
         ):
             return await self._process_mm_data_uncached(
