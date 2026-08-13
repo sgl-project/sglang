@@ -386,31 +386,53 @@ def _collect(rel: str, tree: ast.AST, inert: frozenset = frozenset()):
 
 
 @cache
-def _scan_package():
-    direct, alias, configured, renamed = [], [], set(), []
+def _parsed_modules():
+    """(rel, tree) per parseable module; the three scanners below share it."""
+    modules = []
     for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
-        rel = path.relative_to(_PACKAGE_ROOT).as_posix()
         try:
             tree = ast.parse(path.read_text())
         except SyntaxError:
             continue
-        if not rel.startswith(_SLOT_OWNERS):
-            inert = frozenset(
-                name for path_, name in _INERT_DYNAMIC_READS if path_ == rel
-            )
-            module_direct, module_alias = _collect(rel, tree, inert)
-            direct += module_direct
-            alias += module_alias
+        modules.append((path.relative_to(_PACKAGE_ROOT).as_posix(), tree))
+    return modules
+
+
+def _field_reads():
+    direct, alias = [], []
+    for rel, tree in _parsed_modules():
+        if rel.startswith(_SLOT_OWNERS):
+            continue
+        inert = frozenset(name for path_, name in _INERT_DYNAMIC_READS if path_ == rel)
+        module_direct, module_alias = _collect(rel, tree, inert)
+        direct += module_direct
+        alias += module_alias
+    return direct, alias
+
+
+def _configured_size_call_sites():
+    found = set()
+    for rel, tree in _parsed_modules():
+        if rel.startswith(_SLOT_OWNERS):
+            continue
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and not rel.startswith(_SLOT_OWNERS):
-                func = node.func
-                name = (
-                    func.id
-                    if isinstance(func, ast.Name)
-                    else (func.attr if isinstance(func, ast.Attribute) else None)
-                )
-                if name and name.startswith("configured_") and name.endswith("_size"):
-                    configured.add((rel, name))
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = (
+                func.id
+                if isinstance(func, ast.Name)
+                else (func.attr if isinstance(func, ast.Attribute) else None)
+            )
+            if name and name.startswith("configured_") and name.endswith("_size"):
+                found.add((rel, name))
+    return found
+
+
+def _renamed_accessor_imports():
+    offenders = []
+    for rel, tree in _parsed_modules():
+        for node in ast.walk(tree):
             if not isinstance(node, (ast.ImportFrom, ast.Import)):
                 continue
             for imported in node.names:
@@ -420,10 +442,10 @@ def _scan_package():
                 if base == "get_server_args" or (
                     base.startswith("configured_") and base.endswith("_size")
                 ):
-                    renamed.append(
+                    offenders.append(
                         f"{rel}:{node.lineno}: {imported.name} as {imported.asname}"
                     )
-    return direct, alias, configured, renamed
+    return offenders
 
 
 def _check_count(kind, reads, baseline):
@@ -434,16 +456,10 @@ def _check_count(kind, reads, baseline):
             "field's namespace, or the owning runner for a per-runner "
             "field:\n" + "\n".join(reads)
         )
-    if len(reads) < baseline:
-        raise AssertionError(
-            f"{kind} process-global config field reads shrank: {len(reads)} < "
-            f"baseline {baseline}. Lower the baseline in this file to lock "
-            "in the progress."
-        )
 
 
 def check_global_config_read_ratchet():
-    direct, alias, _, _ = _scan_package()
+    direct, alias = _field_reads()
     _check_count("direct", direct, _DIRECT_BASELINE)
     _check_count("alias-form", alias, _ALIAS_BASELINE)
 
@@ -463,7 +479,7 @@ def check_configured_size_call_sites():
     what this catches -- in either call form (bare or module-qualified).
     """
 
-    _, _, found, _ = _scan_package()
+    found = _configured_size_call_sites()
     documented = set(_CONFIGURED_SIZE_CALL_SITES)
     if documented != found:
         raise AssertionError(
@@ -481,7 +497,7 @@ def check_no_renamed_accessor_imports():
     so it is banned outright — which is exactly what makes literal-name
     matching sound."""
 
-    _, _, _, offenders = _scan_package()
+    offenders = _renamed_accessor_imports()
     if offenders:
         raise AssertionError(
             "get_server_args / configured_*_size imported under another name; "

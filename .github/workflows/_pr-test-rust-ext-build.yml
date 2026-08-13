@@ -200,6 +200,7 @@ jobs:
           # Best-effort, like ci_cleanup_venv.sh: under set -e a failing EXIT trap
           # would fail the step, and nothing here is worth keeping for a postmortem.
           trap 'rm -rf "${venv_root}" || true' EXIT
+          workspace_tested=0
           for python_bin in "${{ steps.py310.outputs.python-path }}" "${{ steps.py312.outputs.python-path }}"; do
               minor="$("${python_bin}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
               export CARGO_TARGET_DIR="${cargo_target_root}/py${minor}"
@@ -212,9 +213,16 @@ jobs:
               # Run once while PyO3's interpreter and target fingerprints match.
               if [ "${minor}" = "3.12" ]; then
                   bash scripts/ci/run_rust_workspace_tests.sh
+                  workspace_tested=1
               fi
               deactivate
           done
+          # A saved cache entry stands for "cargo test --workspace passed", so an
+          # interpreter bump that silently skips it must fail here instead.
+          if [ "${workspace_tested}" -ne 1 ]; then
+              echo "::error::no 3.12 interpreter in the build loop; cargo test --workspace never ran"
+              exit 1
+          fi
 
       - name: Verify modules and stage for upload
         env:

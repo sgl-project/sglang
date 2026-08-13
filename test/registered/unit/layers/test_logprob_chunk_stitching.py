@@ -10,10 +10,10 @@ import unittest
 from types import SimpleNamespace
 
 import torch
-from utils import coverage_cases
 
 from sglang.srt.layers.logprob_processor import InputLogprobProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.logprob_test_utils import coverage_cases
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
@@ -26,6 +26,8 @@ TOKEN_IDS_CYCLE = [[0, 3], None, [1], []]
 # start == extend_len is the zero-logprob-row shape. Order determines the cyclic
 # width-3/4 heterogeneous coverage cases.
 SEQ_SPEC_MENU = ((1, 1), (2, 2), (3, 0), (4, 1), (5, 5), (2, 0), (6, 2))
+# 7 singletons + 7*7 ordered pairs + 4*7 wide cases each at width 3 and 4.
+EXPECTED_CASES = 112
 
 
 def _build_batch(seq_specs, with_token_ids):
@@ -95,8 +97,10 @@ class TestLogprobChunkStitching(CustomTestCase):
     def _sweep(self, with_token_ids):
         torch.manual_seed(0)
         proc = InputLogprobProcessor()
+        combos = list(coverage_cases(SEQ_SPEC_MENU, max_seqs=4))
+        self.assertEqual(len(combos), EXPECTED_CASES)
         tried = 0
-        for combo in coverage_cases(SEQ_SPEC_MENU, max_seqs=4):
+        for combo in combos:
             batch = _build_batch(list(combo), with_token_ids)
             # Same unit as the production gate: grid rows, not logprob rows.
             total_rows = batch[0].shape[0]

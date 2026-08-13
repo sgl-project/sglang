@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+"""Runs every static ratchet in one process, so the package is parsed once."""
+
+import sys
 
 from check_decode_bookkeeping_ownership import (
     check_bookkeeping_sites_match_owner_allowlist,
@@ -27,9 +30,20 @@ def main():
         check_parallel_adoption_ratchet,
         check_server_args_mutation_ratchet,
     )
+    # Every ratchet runs even after one fails: they guard independent
+    # invariants, and a raw traceback per run would hide the rest.
+    failures = []
     for check in checks:
-        check()
+        try:
+            check()
+        except AssertionError as exc:
+            failures.append(f"[{check.__name__}] {exc}")
+
+    for failure in failures:
+        print(failure, file=sys.stderr)
+        print(file=sys.stderr)
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

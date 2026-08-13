@@ -1,9 +1,7 @@
 import pathlib
-import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from check_no_bare_pytest_main import find_bare_pytest_main
 
 
@@ -41,6 +39,22 @@ if "__main__" == __name__:
     exit_code = pytest.main([__file__])
 """
         self.assertEqual(self.check_source(source), 3)
+
+    def test_accepts_assigned_result_that_is_later_exited(self):
+        source = """
+if __name__ == "__main__":
+    exit_code = pytest.main([__file__])
+    sys.exit(exit_code)
+"""
+        self.assertIsNone(self.check_source(source))
+
+    def test_accepts_assigned_result_that_is_raised(self):
+        source = """
+if __name__ == "__main__":
+    exit_code = pytest.main([__file__])
+    raise SystemExit(exit_code)
+"""
+        self.assertIsNone(self.check_source(source))
 
     def test_rejects_nested_discarded_result(self):
         source = """

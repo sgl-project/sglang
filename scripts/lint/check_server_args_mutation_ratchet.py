@@ -1,12 +1,10 @@
-"""Ratchet guard: server_args mutations outside the resolution pipeline may
-only decrease.
+"""Guard: no server_args mutation outside the resolution pipeline.
 
 After ``ServerArgs.__post_init__`` returns, the instance carries the resolved
 configuration; the resolution pipeline (``server_args.py`` and
 ``arg_groups/``) is the only place that computes it. Every assignment to a
-``server_args`` field elsewhere weakens that contract, so the count below is
-an exact pin: new mutations must not appear, and removals must lower the
-baseline to lock in the progress.
+``server_args`` field elsewhere weakens that contract. The migration is done,
+so this is a flat ban rather than a decreasing count.
 
 There is no post-resolution mutation entry point on the instance any more:
 resolved config changes go to the context bags via
@@ -63,12 +61,6 @@ def check_server_args_mutation_ratchet():
             "(passes / declare_late_resolution), change resolved config "
             "with get_context().override(source, ...), or hand the value "
             "to its runner as a constructor argument — do not assign fields."
-        )
-    if count < _BASELINE:
-        raise AssertionError(
-            f"server_args mutations outside the resolution pipeline "
-            f"shrank: {count} < baseline {_BASELINE}. Lower the baseline "
-            "in this file to lock in the progress."
         )
 
 

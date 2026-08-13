@@ -18,7 +18,8 @@ class TestRegisteredTestFileFilter(unittest.TestCase):
 
     def test_non_test_helpers_are_excluded(self):
         self.assertFalse(ci_register.is_registered_test_file("cpu/utils.py"))
-        self.assertFalse(ci_register.is_registered_test_file("unit/layers/utils.py"))
+        self.assertFalse(ci_register.is_registered_test_file("unit/conftest.py"))
+        self.assertFalse(ci_register.is_registered_test_file("unit/__init__.py"))
 
     def test_standard_test_file_is_collectable(self):
         self.assertTrue(ci_register.is_registered_test_file("unit/test_example.py"))

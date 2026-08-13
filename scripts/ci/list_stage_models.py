@@ -104,10 +104,6 @@ _FILE_EXTENSIONS = (
     ".onnx",
 )
 
-# This model scanner can skip every `utils.py`: the only registered one is
-# CPU-only, while the others are non-test helpers.
-_NON_TEST_BASENAMES = frozenset({"conftest.py", "__init__.py", "utils.py"})
-
 
 def looks_like_model_id(value: str, deny: Optional[Set[str]] = None) -> bool:
     """Heuristic: does ``value`` look like a HuggingFace repo id?
@@ -271,11 +267,11 @@ def collect_suite_files(
     ci_register = _load_ci_register(repo_root)
     backend = getattr(ci_register.HWBackend, backend_name.upper())
 
-    pattern = os.path.join(repo_root, "test", "registered", "**", "*.py")
+    registered_root = os.path.join(repo_root, "test", "registered")
     files = sorted(
         f
-        for f in glob.glob(pattern, recursive=True)
-        if os.path.basename(f) not in _NON_TEST_BASENAMES
+        for f in glob.glob(os.path.join(registered_root, "**", "*.py"), recursive=True)
+        if ci_register.is_registered_test_file(os.path.relpath(f, registered_root))
     )
 
     suite_files: Dict[str, List[str]] = {}

@@ -35,11 +35,11 @@ def is_pytest_main_call(node: ast.AST) -> bool:
     )
 
 
-def propagates_exit_code(node: ast.Call, parents: dict[int, ast.AST]) -> bool:
-    parent = parents.get(id(node))
-    if not isinstance(parent, ast.Call) or node not in parent.args:
+def is_exit_call(node: ast.AST, parents: dict[int, ast.AST]) -> bool:
+    """``sys.exit(...)``, or a ``SystemExit(...)`` that is actually raised."""
+    if not isinstance(node, ast.Call):
         return False
-    func = parent.func
+    func = node.func
     if (
         isinstance(func, ast.Attribute)
         and func.attr == "exit"
@@ -47,13 +47,45 @@ def propagates_exit_code(node: ast.Call, parents: dict[int, ast.AST]) -> bool:
         and func.value.id == "sys"
     ):
         return True
-    grandparent = parents.get(id(parent))
+    parent = parents.get(id(node))
     return (
         isinstance(func, ast.Name)
         and func.id == "SystemExit"
-        and isinstance(grandparent, ast.Raise)
-        and grandparent.exc is parent
+        and isinstance(parent, ast.Raise)
+        and parent.exc is node
     )
+
+
+def assigned_names(node: ast.AST) -> list[str]:
+    if isinstance(node, ast.Assign):
+        return [t.id for t in node.targets if isinstance(t, ast.Name)]
+    if isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+        return [node.target.id] if isinstance(node.target, ast.Name) else []
+    return []
+
+
+def exited_names(nodes: list[ast.AST], parents: dict[int, ast.AST]) -> set[str]:
+    """Names handed to an exit call, so the two-step form still propagates."""
+    return {
+        arg.id
+        for node in nodes
+        if is_exit_call(node, parents)
+        for arg in node.args
+        if isinstance(arg, ast.Name)
+    }
+
+
+def propagates_exit_code(
+    node: ast.Call, parents: dict[int, ast.AST], exited: set[str]
+) -> bool:
+    parent = parents.get(id(node))
+    if (
+        isinstance(parent, ast.Call)
+        and node in parent.args
+        and is_exit_call(parent, parents)
+    ):
+        return True
+    return any(name in exited for name in assigned_names(parent))
 
 
 def runtime_nodes(node: ast.AST):
@@ -81,18 +113,20 @@ def find_bare_pytest_main(path: pathlib.Path) -> int | None:
     for node in ast.walk(tree):
         if not isinstance(node, ast.If) or not is_main_guard(node.test):
             continue
-        for statement in node.body:
-            nodes = list(runtime_nodes(statement))
-            parents = {
-                id(child): parent
-                for parent in nodes
-                for child in ast.iter_child_nodes(parent)
-            }
-            for candidate in nodes:
-                if is_pytest_main_call(candidate) and not propagates_exit_code(
-                    candidate, parents
-                ):
-                    return candidate.lineno
+        # Whole guard body at once: `code = pytest.main(...)` and the
+        # `sys.exit(code)` that propagates it are separate statements.
+        nodes = [n for statement in node.body for n in runtime_nodes(statement)]
+        parents = {
+            id(child): parent
+            for parent in nodes
+            for child in ast.iter_child_nodes(parent)
+        }
+        exited = exited_names(nodes, parents)
+        for candidate in nodes:
+            if is_pytest_main_call(candidate) and not propagates_exit_code(
+                candidate, parents, exited
+            ):
+                return candidate.lineno
     return None
 
 
