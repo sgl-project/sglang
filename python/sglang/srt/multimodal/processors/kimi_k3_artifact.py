@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from typing import Optional
+from typing import Any, Optional, Protocol
 
 import torch
+
+
+class KimiK3MediaProcessorConfigProvider(Protocol):
+    """Typed view of the HF media processor state consumed by this adapter."""
+
+    media_proc_cfg: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -23,7 +30,9 @@ class KimiK3PreprocessConfig:
     transparent_bg_config: Optional[dict]
 
     @classmethod
-    def from_media_processor(cls, media_processor) -> KimiK3PreprocessConfig:
+    def from_media_processor(
+        cls, media_processor: KimiK3MediaProcessorConfigProvider
+    ) -> KimiK3PreprocessConfig:
         config = media_processor.media_proc_cfg
         return cls(
             patch_size=int(config["patch_size"]),
@@ -51,7 +60,13 @@ class KimiK3ResizeConfig:
 
     @classmethod
     def from_dict(cls, value: dict) -> KimiK3ResizeConfig:
-        return cls(**{name: int(value[name]) for name in cls.__annotations__})
+        return cls(
+            num_tokens=int(value["num_tokens"]),
+            new_width=int(value["new_width"]),
+            new_height=int(value["new_height"]),
+            pad_width=int(value["pad_width"]),
+            pad_height=int(value["pad_height"]),
+        )
 
     def as_dict(self) -> dict[str, int]:
         return {
@@ -123,6 +138,7 @@ class KimiK3ImageArtifact:
         return (
             self.content_digest,
             self.artifact_key,
+            self.feature_identity,
             self.feature_hash,
             self.original_size,
             (
