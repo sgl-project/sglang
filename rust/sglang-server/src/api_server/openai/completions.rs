@@ -23,8 +23,8 @@ use tokio::sync::mpsc;
 use super::super::guard::AbortGuard;
 use super::super::submit::submit;
 use super::{
-    AppState, MAX_OPENAI_CHOICES, collect_output, indexed_egress_stream, openai_error,
-    streaming_error, submit_generation, unix_seconds_u32,
+    AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_egress_stream,
+    openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::ids::Rid;
 use crate::message::{
@@ -64,7 +64,7 @@ async fn completions(
     let request = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
-            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text());
+            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
     let stream = request.stream.unwrap_or(false);
@@ -74,6 +74,7 @@ async fn completions(
         return openai_error(
             StatusCode::BAD_REQUEST,
             format!("The model `{model}` does not exist"),
+            false,
         );
     }
 
@@ -81,33 +82,44 @@ async fn completions(
         return openai_error(
             StatusCode::BAD_REQUEST,
             "prompt_embeds is not supported by the Rust frontend",
+            false,
         );
     }
     if request.suffix.is_some() {
         return openai_error(
             StatusCode::BAD_REQUEST,
             "suffix is not supported by this model",
+            false,
         );
     }
     if request.best_of.is_some_and(|best_of| best_of != 1) {
         return openai_error(
             StatusCode::BAD_REQUEST,
             "best_of values greater than 1 are not supported",
+            false,
         );
     }
     if request.max_tokens == Some(0) {
-        return openai_error(StatusCode::BAD_REQUEST, "max_tokens must be positive");
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "max_tokens must be positive",
+            false,
+        );
     }
     if request.n == Some(0) {
-        return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1");
+        return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1", false);
     }
     let prompts = match completion_prompt_specs(&request.prompt) {
         Ok(prompts) => prompts,
-        Err(message) => return openai_error(StatusCode::BAD_REQUEST, message),
+        Err(message) => {
+            return openai_error(StatusCode::BAD_REQUEST, &message, false);
+        }
     };
     let mut sampling = match completion_sampling_params(&request) {
         Ok(sampling) => sampling,
-        Err(message) => return openai_error(StatusCode::BAD_REQUEST, message),
+        Err(message) => {
+            return openai_error(StatusCode::BAD_REQUEST, &message, false);
+        }
     };
     if let Err(error) = sampling.normalize(
         state.server_args.skip_tokenizer_init,
@@ -117,7 +129,7 @@ async fn completions(
             .vocab_size
             .unwrap_or(u64::MAX),
     ) {
-        return openai_error(StatusCode::BAD_REQUEST, error.to_string());
+        return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false);
     }
 
     let n = request.n.unwrap_or(1) as usize;
@@ -127,6 +139,7 @@ async fn completions(
             return openai_error(
                 StatusCode::BAD_REQUEST,
                 format!("prompt count times n exceeds the maximum of {MAX_OPENAI_CHOICES}"),
+                false,
             );
         }
     };
@@ -235,6 +248,7 @@ async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<Str
         return Err(openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "service unavailable",
+            false,
         ));
     };
     match rx.recv().await {
@@ -242,10 +256,11 @@ async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<Str
             openai_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "detokenized prompt is not valid UTF-8",
+                false,
             )
         }),
         Some(EgressItem::Error(crate::error::Error::Validation(message))) => {
-            Err(openai_error(StatusCode::BAD_REQUEST, message))
+            Err(openai_error(StatusCode::BAD_REQUEST, &message, false))
         }
         Some(EgressItem::Error(error)) => {
             let status = StatusCode::from_u16(error.http_status())
@@ -253,11 +268,13 @@ async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<Str
             Err(openai_error(
                 status,
                 format!("failed to decode prompt for echo: {error}"),
+                false,
             ))
         }
         Some(_) | None => Err(openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to decode prompt for echo: reply channel closed",
+            false,
         )),
     }
 }
@@ -358,7 +375,9 @@ pub(super) async fn unary_completion(
     for choice in submitted {
         let output = match collect_output(choice.rx, &mut guard, &choice.rid).await {
             Ok(output) => output,
-            Err((status, message)) => return openai_error(status, message),
+            Err((status, message)) => {
+                return openai_error(status, &message, false);
+            }
         };
 
         prompt_tokens
@@ -525,7 +544,7 @@ pub(super) fn completion_event_stream(
 
         while let Some((index, item)) = events.next().await {
             let Some(item) = item else {
-                yield streaming_error(500, "response truncated before completion");
+                yield error_payload(StatusCode::INTERNAL_SERVER_ERROR, "response truncated before completion").to_string();
                 continue;
             };
             let output = match item {
@@ -536,7 +555,7 @@ pub(super) fn completion_event_stream(
                 }
                 EgressItem::Error(error) => {
                     guard.disarm(&rids[index]);
-                    yield streaming_error(error.http_status(), error.to_string());
+                    yield error_payload(StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.to_string()).to_string();
                     continue;
                 }
                 EgressItem::Control(_) | EgressItem::Data(_) => continue,
@@ -547,7 +566,7 @@ pub(super) fn completion_event_stream(
                 .as_ref()
                 .and_then(|reason| reason.abort_status())
             {
-                yield streaming_error(code, message);
+                yield error_payload(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), message).to_string();
                 continue;
             }
 

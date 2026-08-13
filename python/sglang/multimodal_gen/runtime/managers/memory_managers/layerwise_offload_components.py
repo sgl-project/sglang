@@ -7,6 +7,13 @@ LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP = "image_encoder"
 LAYERWISE_OFFLOAD_VAE_GROUP = "vae"
 LAYERWISE_OFFLOAD_DEFAULT_GROUP = "default"
 
+# Which layers --dit-layerwise-resident-layers keeps on the GPU. Lives here
+# rather than in layerwise_offload.py because server_args needs it for the CLI
+# choices and layerwise_offload.py imports server_args, which would be a cycle.
+RESIDENCY_POLICY_LEADING = "leading"
+RESIDENCY_POLICY_STRIDED = "strided"
+RESIDENCY_POLICIES = (RESIDENCY_POLICY_LEADING, RESIDENCY_POLICY_STRIDED)
+
 # Components whose layerwise policy has been validated as a better default than
 # component-level CPU offload when the user has not pinned their placement.
 LAYERWISE_OFFLOAD_DEFAULT_GROUP_COMPONENTS = (
@@ -47,10 +54,60 @@ CPU_OFFLOAD_FLAG_NAMES = (
     "image_encoder_cpu_offload",
     "vae_cpu_offload",
 )
+CPU_OFFLOAD_ALL_COMPONENTS = "all"
 
 
 def is_dit_component_name(component_name: str) -> bool:
     return component_name in DIT_COMPONENT_NAMES
+
+
+def normalize_cpu_offload_components(
+    component_names: str | Sequence[str] | None,
+) -> list[str] | None:
+    """Normalize component keys accepted by ``--cpu-offload-components``."""
+    if component_names is None:
+        return None
+
+    raw_components = (
+        [component_names] if isinstance(component_names, str) else component_names
+    )
+    normalized_components: list[str] = []
+    for raw_component in raw_components:
+        if not isinstance(raw_component, str):
+            raise ValueError(f"Invalid CPU offload component name: {raw_component}.")
+        normalized_components.extend(
+            component_name
+            for value in raw_component.split(",")
+            if (component_name := value.strip().replace("-", "_").lower())
+        )
+
+    unique_components = list(dict.fromkeys(normalized_components))
+    if "none" in unique_components:
+        if len(unique_components) != 1:
+            raise ValueError("'none' cannot be combined with other components.")
+        return []
+    return unique_components or None
+
+
+def cpu_offload_component_matches(
+    component_name: str,
+    selected_component_names: Collection[str] | None,
+) -> bool:
+    if selected_component_names is None:
+        return False
+    if CPU_OFFLOAD_ALL_COMPONENTS in selected_component_names:
+        return True
+    if component_name in selected_component_names:
+        return True
+    if LAYERWISE_OFFLOAD_DIT_GROUP in selected_component_names:
+        return is_dit_component_name(component_name)
+    if LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP in selected_component_names:
+        return is_text_encoder_component_name(component_name)
+    if LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP in selected_component_names:
+        return component_name in ("image_encoder", "condition_image_encoder")
+    if LAYERWISE_OFFLOAD_VAE_GROUP in selected_component_names:
+        return is_vae_component_name(component_name)
+    return False
 
 
 def is_text_encoder_component_name(component_name: str) -> bool:
