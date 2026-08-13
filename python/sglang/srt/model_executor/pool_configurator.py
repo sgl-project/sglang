@@ -674,7 +674,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             swa_max_total_num_tokens=swa_tokens,
             c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
             c128_max_total_num_tokens=full_token // 128,
-            c4_state_pool_size=swa_tokens // self.swa_storage_page_size * self.c4_ring_size,
+            c4_state_pool_size=swa_tokens
+            // self.swa_storage_page_size
+            * self.c4_ring_size,
             c128_state_pool_size=0,
         )
 
