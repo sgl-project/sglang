@@ -2,7 +2,7 @@ import hashlib
 import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 import torch
@@ -18,6 +18,22 @@ class EncoderMediaProcessorConfig:
 
     image_decode_mode: bool | str = False
     preserve_media_metadata: bool = False
+
+
+@runtime_checkable
+class EncoderMediaProcessorConfigProvider(Protocol):
+    """Model contract for optional encoder-side media preprocessing."""
+
+    encoder_media_processor_config: EncoderMediaProcessorConfig
+
+
+def resolve_encoder_media_processor_config(
+    model: object,
+) -> EncoderMediaProcessorConfig:
+    """Resolve a model-declared capability without model-name dispatch."""
+    if isinstance(model, EncoderMediaProcessorConfigProvider):
+        return model.encoder_media_processor_config
+    return EncoderMediaProcessorConfig()
 
 
 def hash_raw_encoder_item(value: Any) -> int:

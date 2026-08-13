@@ -37,6 +37,8 @@ class MediaArtifact(Protocol):
 
     def cache_value(self) -> MediaArtifact: ...
 
+    def cache_size_items(self) -> Sequence[Any]: ...
+
 
 ArtifactT = TypeVar("ArtifactT", bound=MediaArtifact)
 
@@ -175,14 +177,16 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
                 isinstance(value, MediaArtifact)
                 and value.artifact_key == key
                 and value.content_digest == content_digest
-                and self.artifact_usable(value, allow_featureless=allow_featureless)
             ),
+            evict_on_reject=True,
         )
         if artifact is not None:
             self.validate_artifact(
                 artifact,
                 MediaArtifactInput(content_digest, key, modality, None),
             )
+            if not self.artifact_usable(artifact, allow_featureless=allow_featureless):
+                return None
         return artifact
 
     async def prepare_media_artifacts(

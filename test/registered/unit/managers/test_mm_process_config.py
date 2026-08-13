@@ -170,14 +170,18 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
     def _server_args(mm_feature_transport):
         return SimpleNamespace(
             mm_feature_transport=mm_feature_transport,
+            image_processor_backend="auto",
             disable_fast_image_processor=False,
             skip_tokenizer_init=False,
             mm_process_config={},
+            mm_preprocess_cache_size_mb=0,
+            trust_mm_content_hashes=False,
             mm_processor_worker_num=0,
             mm_io_worker_num=0,
             tokenizer_worker_num=1,
             base_gpu_id=2,
             tp_size=8,
+            rl_on_policy_target=None,
         )
 
     @staticmethod

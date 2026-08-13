@@ -108,3 +108,31 @@ class KimiK3ImageArtifact:
         if self.feature is None or self.feature.device.type == "cpu":
             return self
         return replace(self, feature=None)
+
+    def cache_size_items(self) -> tuple:
+        """Return every owned value that contributes to the CPU cache budget."""
+        deferred = None
+        if self.deferred is not None:
+            deferred = (
+                self.deferred.backend,
+                self.deferred.feature_layout,
+                self.deferred.image_mean,
+                self.deferred.image_std,
+                self.deferred.transparent_bg_config,
+            )
+        return (
+            self.content_digest,
+            self.artifact_key,
+            self.feature_hash,
+            self.original_size,
+            (
+                self.resize_config.num_tokens,
+                self.resize_config.new_width,
+                self.resize_config.new_height,
+                self.resize_config.pad_width,
+                self.resize_config.pad_height,
+            ),
+            self.grid_thw,
+            self.feature,
+            deferred,
+        )

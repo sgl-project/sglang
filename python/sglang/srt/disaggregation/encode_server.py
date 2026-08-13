@@ -60,10 +60,10 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.srt.model_loader import get_model
 from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
-    EncoderMediaProcessorConfig,
     EncoderPreprocessOutput,
     get_encoder_preprocessed_items,
     invoke_encoder_preprocessor,
+    resolve_encoder_media_processor_config,
 )
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
@@ -366,10 +366,8 @@ class MMEncoder:
             load_config=self.load_config,
             device_config=self.device_config,
         )
-        self.encoder_media_processor_config = getattr(
-            self.model,
-            "encoder_media_processor_config",
-            EncoderMediaProcessorConfig(),
+        self.encoder_media_processor_config = resolve_encoder_media_processor_config(
+            self.model
         )
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
 

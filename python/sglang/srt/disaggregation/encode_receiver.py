@@ -2182,7 +2182,7 @@ class MMReceiverBase(ABC):
 
         return num_items_assigned
 
-    def _extract_url_data(self, request_obj) -> List[Dict]:
+    def _extract_url_data(self, request_obj: GenerateReqInput) -> List[Dict]:
         def flatten_mm_items(items):
             if not isinstance(items, list):
                 return [items]
@@ -2204,14 +2204,13 @@ class MMReceiverBase(ABC):
             return mm_item
 
         mm_data = []
-        image_hashes = getattr(request_obj, "mm_content_hashes", None)
+        image_hashes = request_obj.mm_content_hashes
         image_index = 0
-        for attr, modality in [
-            ("image_data", Modality.IMAGE),
-            ("video_data", Modality.VIDEO),
-            ("audio_data", Modality.AUDIO),
+        for mm_items, modality in [
+            (request_obj.image_data, Modality.IMAGE),
+            (request_obj.video_data, Modality.VIDEO),
+            (request_obj.audio_data, Modality.AUDIO),
         ]:
-            mm_items = getattr(request_obj, attr, None)
             if mm_items:
                 mm_items = flatten_mm_items(mm_items)
                 for mm_item in mm_items:
