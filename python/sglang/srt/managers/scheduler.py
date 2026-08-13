@@ -2112,7 +2112,6 @@ class Scheduler(
         self.load_publisher = SchedulerLoadPublisher(
             kv_events_config=get_observability().kv_events_config,
             ps=self.ps,
-            dp_size=self.server_args.dp_size,
             load_publish_endpoint=get_observability().load_publish_endpoint,
         )
 
@@ -4054,21 +4053,17 @@ class Scheduler(
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
-        # Publish before the fully-idle gate: a no-batch-but-not-idle stall
-        # (queues parked under KV pressure / disagg transfer) has no
-        # process_batch_result to publish the growing gauge, and gating here
-        # froze /get_loads, DP balancing, and the LoadStat for the stall.
-        # Force only when fully idle — the stalled path returns at the gate
-        # without sleeping and get_loads is O(parked queue), so it rides the
-        # normal throttles; the idle path keeps immediate force over empty
-        # queues, with --sleep-on-idle as its escape hatch.
-        fully_idle = self.is_fully_idle()
-        snapshot = self.publish_load_snapshot(force=fully_idle)
-        self.load_publisher.publish_load_stat(
-            self.load_inquirer.get_loads, force=fully_idle, snapshot=snapshot
-        )
-
-        if not fully_idle:
+        # Publish (throttled) before the fully-idle gate: a no-batch-but-not-
+        # idle stall (queues parked under KV pressure / disagg transfer) has
+        # no process_batch_result to publish the growing gauge, and gating
+        # here froze /get_loads, DP balancing, and the LoadStat for the
+        # stall. Non-forced so this spinning path rides the interval + compute
+        # floors; the fully-idle forced publish runs post-flush below.
+        if not self.is_fully_idle():
+            snapshot = self.publish_load_snapshot(force=False)
+            self.load_publisher.publish_load_stat(
+                self.load_inquirer.get_loads, force=False, snapshot=snapshot
+            )
             return
 
         if self.enable_unified_memory:
@@ -4098,6 +4093,13 @@ class Scheduler(
 
         # reset token ratio
         self.new_token_ratio_tracker.reset()
+
+        # Fully-idle publish, post-flush so the gauge reflects compacted KV.
+        # Forced (immediate) so the busy->idle transition is never delayed.
+        snapshot = self.publish_load_snapshot(force=True)
+        self.load_publisher.publish_load_stat(
+            self.load_inquirer.get_loads, force=True, snapshot=snapshot
+        )
 
         # sleep until next event
         self.maybe_sleep_on_idle()

@@ -165,13 +165,13 @@ def resolve_load_pub_range(
     """
     if dp_size < 1:
         return None, None
+    if load_publish_endpoint and load_publish_endpoint.strip().lower() == "off":
+        return None, None
     reserved = [  # per-rank ranges the KV-event publisher itself claims
         (port, port + dp_size)
         for port in (parse_tcp_port(kv_endpoint), parse_tcp_port(replay_endpoint))
         if port is not None
     ]
-    if load_publish_endpoint and load_publish_endpoint.strip().lower() == "off":
-        return None, None
     if load_publish_endpoint:
         # Discovery needs the kv_events block, absent for a non-tcp KV
         # endpoint — so an explicit range there would bind but never advertise.

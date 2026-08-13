@@ -468,5 +468,38 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
         json.dumps(info)
 
 
+class TestLoadPublishEndpointValidation(CustomTestCase):
+    """--load-publish-endpoint fails fast at the entrypoint, not silently in a
+    scheduler subprocess log."""
+
+    def test_requires_kv_events_config(self):
+        args = ServerArgs(model_path="dummy", load_publish_endpoint="tcp://*:6000")
+        with self.assertRaisesRegex(ValueError, "kv-events"):
+            args.check_server_args()
+
+    def test_rejects_non_bindable_endpoint(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
+            page_size=64,
+            load_publish_endpoint="tcp://10.0.0.5:6000",
+        )
+        with self.assertRaisesRegex(ValueError, "bindable"):
+            args.check_server_args()
+
+    def test_off_and_valid_endpoint_pass(self):
+        for endpoint in ("off", "tcp://*:6000"):
+            with self.subTest(endpoint=endpoint):
+                args = ServerArgs(
+                    model_path="dummy",
+                    kv_events_config=(
+                        '{"publisher": "zmq", "endpoint": "tcp://*:5557"}'
+                    ),
+                    page_size=64,
+                    load_publish_endpoint=endpoint,
+                )
+                args.check_server_args()  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

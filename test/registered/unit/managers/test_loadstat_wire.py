@@ -85,15 +85,15 @@ class TestLoadPublisherGating(CustomTestCase):
 
     def _build(self, *, config=ZMQ_ENDPOINT, dp_size=1, explicit=None, **ps_overrides):
         """Construct a publisher with the socket bind stubbed out, returning
-        (publisher, captured _open_pub_socket mock)."""
+        (publisher, captured _open_pub_socket mock). dp_size lives on the ps,
+        which the publisher reads (no separate param to disagree with it)."""
         with patch(
             "sglang.srt.managers.scheduler_components.load_publisher."
             "_open_pub_socket"
         ) as open_sock:
             pub = SchedulerLoadPublisher(
                 kv_events_config=config,
-                ps=ParallelState.trivial(**ps_overrides),
-                dp_size=dp_size,
+                ps=ParallelState.trivial(dp_size=dp_size, **ps_overrides),
                 load_publish_endpoint=explicit,
             )
         return pub, open_sock
@@ -268,7 +268,6 @@ class TestLoadPublisherGating(CustomTestCase):
             pub = SchedulerLoadPublisher(
                 kv_events_config=ZMQ_ENDPOINT,
                 ps=ParallelState.trivial(),
-                dp_size=1,
             )
         self.assertFalse(pub.enable)
         pub.publish_load_stat(MagicMock(), force=True)  # still a no-op
@@ -392,21 +391,53 @@ class TestLoadPublisherGating(CustomTestCase):
     def test_call_throttle_stays_engaged_across_dedup_hits(self):
         # Regression: the counter must reset when the throttle PASSES, not
         # when a send happens. Resetting only on the send path let one dedup
-        # hit leave the counter saturated, silently disengaging the throttle
-        # — every subsequent decode step then ran the O(queue) provider.
+        # hit saturate the counter, running the O(queue) provider every step.
+        # Time advances past the compute floor each call, so the counter is
+        # what gates: a working counter fires the provider at counts 5 and 10.
         pub, _ = self._build()
         provider = self._provider(running=1)
+        clock = [100.0]
         with patch(
             "sglang.srt.managers.scheduler_components.load_publisher.time"
         ) as fake_time:
-            fake_time.monotonic.return_value = 100.0
-            pub.publish_load_stat(provider, force=True)  # publishes, count=1
-            for _ in range(10):  # steady decode: unchanged gauge, no force
+            fake_time.monotonic.side_effect = lambda: clock[0]
+            for _ in range(10):
+                clock[0] += 0.1
                 pub.publish_load_stat(provider)
-            # The provider may run once per LOAD_PUBLISH_INTERVAL (calls 5
-            # and 10), never per call; the deduped sends stay at 1.
-            self.assertEqual(provider.call_count, 3)
-            self.assertEqual(pub._socket.send_multipart.call_count, 1)
+            self.assertEqual(provider.call_count, 2)
+
+    def test_provider_is_floored_on_the_stalled_spin_path(self):
+        # A no-batch stall spins on_idle without sleeping, calling non-forced
+        # at loop rate; the compute floor must bound the O(queue) provider
+        # regardless of how often the counter clears.
+        pub, _ = self._build()
+        provider = self._provider(running=1)
+        clock = [100.0]
+        with patch(
+            "sglang.srt.managers.scheduler_components.load_publisher.time"
+        ) as fake_time:
+            fake_time.monotonic.side_effect = lambda: clock[0]
+            for _ in range(100):  # time frozen: floor lets the provider run once
+                pub.publish_load_stat(provider)
+            self.assertEqual(provider.call_count, 1)
+            clock[0] += 0.06  # floor elapsed
+            for _ in range(5):  # next counter pass clears the floor too
+                pub.publish_load_stat(provider)
+            self.assertEqual(provider.call_count, 2)
+
+    def test_provider_failure_never_raises(self):
+        # get_loads raising must not crash the scheduler loop; it warns and
+        # leaves the counter reset (not saturated).
+        def boom():
+            raise RuntimeError("get_loads exploded")
+
+        pub, _ = self._build()
+        with self.assertLogs(
+            "sglang.srt.managers.scheduler_components.load_publisher",
+            level="WARNING",
+        ):
+            pub.publish_load_stat(boom, force=True)
+        self.assertEqual(pub._publish_counter, 0)
 
     def test_changed_stat_publishes_immediately(self):
         # The busy->idle (and idle->busy) transition must never be delayed:

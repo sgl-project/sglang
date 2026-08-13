@@ -9174,6 +9174,23 @@ class ServerArgs:
                 "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
             )
 
+        # Fail fast at the entrypoint rather than in a scheduler subprocess log.
+        if self.load_publish_endpoint and self.load_publish_endpoint != "off":
+            if not self.kv_events_config:
+                raise ValueError(
+                    "--load-publish-endpoint requires --kv-events-config: routers"
+                    " discover the load range through /server_info's kv_events"
+                    " block, absent without a publisher."
+                )
+            from sglang.srt.disaggregation.kv_events import parse_bindable_tcp
+
+            if parse_bindable_tcp(self.load_publish_endpoint) is None:
+                raise ValueError(
+                    f"--load-publish-endpoint={self.load_publish_endpoint!r} must"
+                    " be a bindable wildcard-host tcp:// address (e.g."
+                    " tcp://*:6000), or 'off'."
+                )
+
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
@@ -9513,11 +9530,10 @@ class ServerArgs:
           1..65535, or a bare unbracketed IPv6 host, which is
           ambiguous).
 
-        NOTE for load-socket consumers: when load_endpoint_port_base is
-        present, endpoint_host is a wildcard ("*", "0.0.0.0", "::") — never
-        dialable. Pair the load port with the worker's own URL host (as the
-        KV SUB endpoints require); splicing endpoint_host yields tcp://*:PORT
-        and connects to nothing.
+        NOTE for load-socket consumers: pair the load port with the worker's
+        own URL host, as with the KV SUB endpoints — endpoint_host is a
+        wildcard ("*", "0.0.0.0", "::") whenever the default packing applies,
+        so splicing it yields tcp://*:PORT and connects to nothing.
 
         Reuses parse_advertisable_tcp and resolve_load_pub_range — the same
         helpers the scheduler binds through — so the advertisement cannot

@@ -52,6 +52,11 @@ logger = logging.getLogger(__name__)
 # Publish at most once per this many calls unless force=True.
 LOAD_PUBLISH_INTERVAL = 5
 
+# Floor on how often the O(queue) provider runs. Caps compute on the stalled
+# no-batch path (on_idle spins without sleeping and calls with force=False),
+# where the call throttle alone would still fire at loop rate / INTERVAL.
+LOAD_MIN_COMPUTE_INTERVAL_S = 0.05
+
 # An unchanged stat is re-sent at most this often; a changed one always goes
 # out immediately, so transitions are never delayed. Bounds the send rate on
 # the idle spin loop (on_idle force-publishes every iteration).
@@ -74,7 +79,8 @@ _encoder = msgspec.msgpack.Encoder()
 class LoadStat(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
-    omit_defaults=True,  # type: ignore[call-arg]
+    # No omit_defaults: it would trim trailing fields, shortening a wire
+    # shape the router decodes positionally.
     gc=False,  # type: ignore[call-arg]
     tag=True,  # type: ignore[call-arg]
 ):
@@ -97,7 +103,8 @@ class LoadStat(
 
 def _open_pub_socket(endpoint: str) -> zmq.Socket:
     """Bind the load PUB socket. Module-level so tests can stub the one side
-    effect while exercising the real gating and port derivation."""
+    effect while exercising the real gating and port derivation. Not
+    get_zmq_socket: that sets SNDHWM=0, defeating LOAD_PUB_HWM."""
     sock = zmq.Context.instance().socket(zmq.PUB)
     try:
         sock.set_hwm(LOAD_PUB_HWM)
@@ -126,7 +133,6 @@ class SchedulerLoadPublisher:
         *,
         kv_events_config: Optional[str],
         ps: ParallelState,
-        dp_size: int,
         load_publish_endpoint: Optional[str] = None,
     ) -> None:
         # _socket is None == disabled: every early return below leaves it so,
@@ -138,6 +144,7 @@ class SchedulerLoadPublisher:
         # Last sent counts + timestamp, driving the dedup/heartbeat.
         self._last_counts: Optional[tuple] = None
         self._last_publish_ts = 0.0
+        self._last_compute_ts = float("-inf")
         self._fail_count = 0
         self._last_fail_warn_ts = float("-inf")
         if not is_kv_publisher_rank(kv_events_config, ps):
@@ -155,7 +162,7 @@ class SchedulerLoadPublisher:
         resolved, reason = resolve_load_pub_range(
             kv_endpoint=cfg.endpoint,
             replay_endpoint=cfg.replay_endpoint,
-            dp_size=dp_size,
+            dp_size=ps.dp_size,
             load_publish_endpoint=load_publish_endpoint,
         )
         if resolved is None:
@@ -199,9 +206,10 @@ class SchedulerLoadPublisher:
 
         `load_provider` reads live scheduler state
         (`SchedulerLoadInquirer.get_loads`), used over metrics stats which
-        are only populated under `--enable-metrics`. Skipped entirely when
-        the caller passes `snapshot` (one it already computed for the
-        DP-balancing sink this cycle), so the queues are never walked twice.
+        are only populated under `--enable-metrics`. Skipped when the caller
+        passes `snapshot` (one it already computed for the DP-balancing sink
+        this cycle), and otherwise rate-limited to
+        [`LOAD_MIN_COMPUTE_INTERVAL_S`].
 
         Best-effort: never crashes the loop (routers fall back to their own
         counter); failures re-warn at most once per [`FAIL_WARN_PERIOD_S`].
@@ -217,15 +225,27 @@ class SchedulerLoadPublisher:
         # disengaging the throttle onto the O(queue) provider every step.
         self._publish_counter = 0
 
+        now = time.monotonic()
         try:
-            load = snapshot if snapshot is not None else load_provider()
+            if snapshot is not None:
+                load = snapshot
+            else:
+                # Floor the provider so a never-sleeping stall doesn't run it
+                # at loop rate. A changed gauge still gets out within the
+                # floor; only forced (fully-idle) calls bypass it.
+                if (
+                    not force
+                    and now - self._last_compute_ts < LOAD_MIN_COMPUTE_INTERVAL_S
+                ):
+                    return
+                self._last_compute_ts = now
+                load = load_provider()
             counts = (
                 load.num_running_reqs,
                 load.num_waiting_reqs,
                 load.num_used_tokens,
                 load.max_total_num_tokens,
             )
-            now = time.monotonic()
             if (
                 counts == self._last_counts
                 and now - self._last_publish_ts < LOAD_PUBLISH_HEARTBEAT_S
@@ -250,7 +270,8 @@ class SchedulerLoadPublisher:
                 # so a socket-type change still retries rather than deduping
                 # away a send nobody got.
                 return
-            # Record only after a successful hand-off so a failure retries.
+            # Recorded on enqueue. A silent HWM drop leaves a changed reading
+            # unseen until the next heartbeat; that is inherent to PUB.
             self._last_counts = counts
             self._last_publish_ts = now
             self._fail_count = 0
