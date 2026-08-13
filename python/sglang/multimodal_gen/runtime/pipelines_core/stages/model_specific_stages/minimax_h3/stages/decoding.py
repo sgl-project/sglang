@@ -89,11 +89,12 @@ def _reverse_normalize_latents(
         )
     view_shape = [1] * latents.ndim
     view_shape[1] = int(mean.shape[0])
-    # 故意不用原地：batch.latents / batch.audio_latents 是去噪阶段在 InferenceMode
-    # 内分配的 inference tensor，而 --vae-cpu-offload 会让本 stage 跑在
-    # torch.inference_mode(False) 下（PipelineExecutor._stage_needs_version_counters），
-    # 此时原地写 inference tensor 直接抛错。保持 mul 再 add 的两步舍入顺序，
-    # 不用 addcmul，避免引入 FMA 带来的数值差异。
+    # Out of place on purpose. batch.latents / batch.audio_latents are
+    # inference tensors allocated inside the denoising stage's InferenceMode,
+    # while --vae-cpu-offload runs this stage under torch.inference_mode(False)
+    # (PipelineExecutor._stage_needs_version_counters), where writing to one in
+    # place raises. Keep the mul-then-add rounding order rather than addcmul so
+    # the result does not shift with FMA contraction.
     return latents * std.view(*view_shape) + mean.view(*view_shape)
 
 

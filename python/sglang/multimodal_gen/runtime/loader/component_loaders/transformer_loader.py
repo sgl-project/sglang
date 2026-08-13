@@ -224,6 +224,21 @@ class TransformerLoader(ComponentLoader):
                 component_server_args.model_variant
             )
             checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
+        if component_server_args.minimax_h3_adaln_online:
+            if cls_name != "MiniMaxH3DiTModel":
+                raise ValueError(
+                    "--minimax-h3-adaln-online is only supported by MiniMax H3"
+                )
+            if adaln_cache_path is not None:
+                raise ValueError(
+                    "--minimax-h3-adaln-online and --minimax-h3-adaln-cache-path "
+                    "are mutually exclusive"
+                )
+            # Keep the weights off-device; the model rebuilds the AdaLN
+            # outputs from the checkpoint for each request's timestep plan.
+            init_params["adaln_weight_files"] = safetensors_list
+            checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
+
         if (
             init_params["quant_config"] is None
             and component_server_args.transformer_weights_path is not None
