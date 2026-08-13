@@ -151,7 +151,9 @@ class MmSpec(msgspec.Struct, frozen=True, kw_only=True):
             im_end_id=self.vision_end_token_id,
             video_token_id=self.video_token_id,
             mrope_positions=torch.from_numpy(encoded.mrope.reshape(3, -1)),
-            mrope_position_delta=torch.tensor([[encoded.mrope_delta]], dtype=torch.long),
+            mrope_position_delta=torch.tensor(
+                [[encoded.mrope_delta]], dtype=torch.long
+            ),
         )
 
 
