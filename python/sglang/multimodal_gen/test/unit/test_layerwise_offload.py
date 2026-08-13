@@ -28,10 +28,15 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_s
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
     LayerwiseOffloadManager,
+    compute_streamed_layers,
     configure_layerwise_offload_modules,
     get_layerwise_offload_component_names_for_pipeline,
     is_layerwise_offloaded_module,
     is_resident_layerwise_module,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    RESIDENCY_POLICY_LEADING,
+    RESIDENCY_POLICY_STRIDED,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -176,6 +181,7 @@ def _server_args(**kwargs):
         vae_cpu_offload=False,
         dit_offload_prefetch_size=1,
         dit_layerwise_resident_layers=0.0,
+        dit_layerwise_residency_policy=RESIDENCY_POLICY_LEADING,
         pin_cpu_memory=False,
     )
     defaults.update(kwargs)
@@ -627,7 +633,14 @@ def _patch_fake_device(monkeypatch):
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
 
 
-def _resident_manager(model, *, num_layers, prefetch_size=1, resident_layers=0):
+def _resident_manager(
+    model,
+    *,
+    num_layers,
+    prefetch_size=1,
+    resident_layers=0,
+    residency_policy=RESIDENCY_POLICY_LEADING,
+):
     return LayerwiseOffloadManager(
         model=model,
         layers_attr_str="blocks",
@@ -636,6 +649,7 @@ def _resident_manager(model, *, num_layers, prefetch_size=1, resident_layers=0):
         pin_cpu_memory=False,
         prefetch_size=prefetch_size,
         resident_layers=resident_layers,
+        residency_policy=residency_policy,
     )
 
 
@@ -696,6 +710,87 @@ def test_prepare_for_next_req_repins_residents(monkeypatch):
     # The next denoise re-pins the resident set (union of prefetch window + residents).
     manager.prepare_for_next_req(non_blocking=False)
     assert {0, 1, 2} <= manager._gpu_layers
+
+
+def _record_prepare(manager, monkeypatch):
+    """Log the order of prefetches and stream waits inside prepare_for_next_req.
+
+    The order is the contract: prepare_for_next_req runs from the layer-0
+    pre-hook on every denoise step, so anything issued before the blocking
+    wait_stream is something the compute stream will sit and wait for.
+    """
+    log: list = []
+    original = manager.prefetch_layer
+
+    def spy(layer_idx, non_blocking=True):
+        log.append(("prefetch", layer_idx, non_blocking))
+        return original(layer_idx, non_blocking=non_blocking)
+
+    class _RecordingStream(_FakeStream):
+        def wait_stream(self, _stream) -> None:
+            log.append(("wait_stream",))
+
+    monkeypatch.setattr(manager, "prefetch_layer", spy)
+    monkeypatch.setattr(
+        _FakeDeviceModule, "current_stream", staticmethod(_RecordingStream)
+    )
+    return log
+
+
+def test_blocking_prepare_waits_for_residents_only(monkeypatch):
+    # Regression: the head of the stream used to be issued before the
+    # wait_stream. wait_stream drains the whole copy stream, so under `leading`
+    # that made every denoise step block on layer `resident_layers` -- a full
+    # transfer that is not needed for another `resident_layers` layers, while
+    # layer 0 was already pinned. Costs one layer transfer per step on the
+    # default path, which is the path nobody passes a flag to get.
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=3
+    )
+    _arm_residency(manager)
+    manager.release_all()
+
+    log = _record_prepare(manager, monkeypatch)
+    manager.prepare_for_next_req(non_blocking=False)
+
+    wait = log.index(("wait_stream",))
+    before = [entry for entry in log[:wait] if entry[0] == "prefetch"]
+    after = [entry for entry in log[wait:] if entry[0] == "prefetch"]
+    assert [entry[1] for entry in before] == [0, 1, 2]
+    assert all(entry[2] is False for entry in before)
+    # Layer 3 is the first streamed layer, and it is issued after the wait and
+    # asynchronously, so the pre-hook's own wait_event is what blocks on it.
+    assert [entry[1] for entry in after] == [3]
+    assert all(entry[2] is True for entry in after)
+
+
+def test_warmup_prepare_prefetches_the_layer_that_runs_first(monkeypatch):
+    # At load time residency is not armed yet, so there is no resident set and
+    # the forward will start at layer 0 whatever the policy says. Deriving the
+    # head of the stream from the policy here would warm layer
+    # `resident_layers` under `leading`, i.e. not the one about to run.
+    _patch_fake_device(monkeypatch)
+    for policy in (RESIDENCY_POLICY_LEADING, RESIDENCY_POLICY_STRIDED):
+        manager = _resident_manager(
+            _MultiBlockModel(6),
+            num_layers=6,
+            prefetch_size=1,
+            resident_layers=3,
+            residency_policy=policy,
+        )
+        assert manager._head_of_stream() == [0], policy
+
+
+def test_configure_resolves_residency_policy(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    comp = _ResidentComponent(8)
+    comp.configure_layerwise_offload(
+        _server_args(dit_layerwise_residency_policy=RESIDENCY_POLICY_STRIDED)
+    )
+    assert comp.layerwise_offload_managers[0].residency_policy == (
+        RESIDENCY_POLICY_STRIDED
+    )
 
 
 def test_holds_residents_reflects_configuration(monkeypatch):
@@ -814,3 +909,136 @@ def test_enable_offload_rearms_after_disable(monkeypatch):
     assert tuple(model.blocks[2].weight.shape) == (1,)
     manager.prefetch_layer(2, non_blocking=False)
     assert torch.equal(model.blocks[2].weight.data, original)
+
+
+# ---------------------------------------------------------------------------
+# --dit-layerwise-residency-policy: which layers stay resident.
+#
+# `leading` keeps 0..r-1, so every transfer lands in one burst at the tail of
+# the step. `strided` spreads them, so the same bytes move at 1/(n/(n-r)) of the
+# peak rate and each transfer gets that many layers of compute to hide behind.
+# That matters when the model also runs a collective per layer: measured on
+# 8 GPUs the ulysses SendRecv total went 2589.7 -> 4016.0 ms once the DiT
+# streamed, for identical collective volume.
+# ---------------------------------------------------------------------------
+def test_leading_policy_keeps_todays_prefix_layout():
+    # Regression guard: `leading` is the default, and changing it would silently
+    # re-time every existing deployment.
+    for num_layers, resident in ((4, 2), (50, 35), (12, 1), (7, 6)):
+        assert compute_streamed_layers(
+            num_layers=num_layers,
+            resident_layers=resident,
+            policy=RESIDENCY_POLICY_LEADING,
+        ) == tuple(range(resident, num_layers))
+
+
+def test_strided_policy_layout_is_pinned_for_the_h3_dit():
+    # 50 layers with 35 resident is the measured MiniMax-H3 operating point.
+    # Pinned exactly so a later "simplification" of the ramp cannot quietly
+    # change the schedule this policy exists to produce.
+    assert compute_streamed_layers(
+        num_layers=50, resident_layers=35, policy=RESIDENCY_POLICY_STRIDED
+    ) == (0, 3, 7, 10, 13, 17, 20, 23, 27, 30, 33, 37, 40, 43, 47)
+
+
+def test_both_policies_partition_the_stack():
+    for num_layers in range(1, 33):
+        for resident in range(0, num_layers + 1):
+            for policy in (RESIDENCY_POLICY_LEADING, RESIDENCY_POLICY_STRIDED):
+                streamed = compute_streamed_layers(
+                    num_layers=num_layers, resident_layers=resident, policy=policy
+                )
+                # Every layer is either streamed or resident, never both and
+                # never neither -- a gap here would strand a layer with no
+                # weights at forward time.
+                assert len(streamed) == len(set(streamed)) == num_layers - resident
+                assert set(streamed) <= set(range(num_layers))
+
+
+def test_policies_agree_at_the_degenerate_ends():
+    for num_layers in (1, 4, 50):
+        for resident in (0, num_layers):
+            assert compute_streamed_layers(
+                num_layers=num_layers,
+                resident_layers=resident,
+                policy=RESIDENCY_POLICY_LEADING,
+            ) == compute_streamed_layers(
+                num_layers=num_layers,
+                resident_layers=resident,
+                policy=RESIDENCY_POLICY_STRIDED,
+            )
+
+
+def test_strided_release_keeps_the_spread_resident_set(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    # 8 layers, 4 resident -> streams every other layer.
+    manager = _resident_manager(
+        _MultiBlockModel(8),
+        num_layers=8,
+        resident_layers=4,
+        residency_policy=RESIDENCY_POLICY_STRIDED,
+    )
+    streamed = set(manager._streamed_order)
+    resident = set(range(8)) - streamed
+    assert streamed == {0, 2, 4, 6}
+
+    _arm_residency(manager)
+    for layer_idx in range(8):
+        manager.prefetch_layer(layer_idx, non_blocking=False)
+    for layer_idx in range(8):
+        manager.release_layer(layer_idx)
+
+    # Non-force release frees exactly the streamed layers, whatever their index.
+    assert manager._gpu_layers == resident
+    manager.release_all()
+    assert not manager._gpu_layers
+
+
+def test_next_streamed_skips_residents_and_wraps(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(8),
+        num_layers=8,
+        resident_layers=4,
+        residency_policy=RESIDENCY_POLICY_STRIDED,
+    )
+    # Streamed = {0, 2, 4, 6}. From layer 1 the next transfer to issue is 2, not
+    # 1+1 handled as "the following index" -- under this policy the immediate
+    # successor is usually resident and prefetching it would be a no-op.
+    assert manager._next_streamed(after=1, count=1) == [2]
+    assert manager._next_streamed(after=2, count=2) == [4, 6]
+    # Past the last streamed layer it wraps into the next step.
+    assert manager._next_streamed(after=6, count=2) == [0, 2]
+    # -1 is the "before the step starts" probe used when priming.
+    assert manager._next_streamed(after=-1, count=1) == [0]
+
+
+class _RunnableBlockModel(torch.nn.Module):
+    """Blocks that actually run, so the registered hooks fire for real."""
+
+    def __init__(self, n: int) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([_OrderedLinearLayer(1.0) for _ in range(n)])
+
+
+def test_strided_forward_leaves_exactly_the_resident_set(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    model = _RunnableBlockModel(8)
+    manager = _resident_manager(
+        model,
+        num_layers=8,
+        resident_layers=4,
+        residency_policy=RESIDENCY_POLICY_STRIDED,
+    )
+
+    hidden = torch.ones(1, 2)
+    for _ in range(2):  # two denoise steps: residents must survive the first
+        for layer in model.blocks:
+            hidden = layer(hidden)
+
+    # The pre-hook on layer 0 arms residency and primes; the post-hooks release
+    # only streamed layers. After two full steps the GPU should hold the
+    # resident set plus whatever the prefetch window pulled in ahead.
+    resident = set(range(8)) - set(manager._streamed_order)
+    assert resident <= manager._gpu_layers
+    assert len(manager._gpu_layers) <= len(resident) + manager.prefetch_size
