@@ -292,7 +292,7 @@ class SWAComponent(TreeComponent):
                 )
                 return 0
             full_cd.value = value_slice.clone()
-            cache_actions.append(FreeDeviceKV([old_full]))
+            cache_actions.append(FreeDeviceKV([old_full], start_pos=total_prefix_len))
             cache_actions.append(SWARebuild(node.id, value_slice))
             return 0
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
@@ -310,7 +310,9 @@ class SWAComponent(TreeComponent):
                 )
                 return start_idx
             node.component_data[BASE_COMPONENT_TYPE].value = new_full.clone()
-            cache_actions.append(FreeDeviceKV([old_full]))
+            cache_actions.append(
+                FreeDeviceKV([old_full], start_pos=total_prefix_len + start_idx)
+            )
             cache_actions.append(SWARebuild(node.id, new_full))
             return start_idx
         else:

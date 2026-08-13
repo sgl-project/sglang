@@ -5382,6 +5382,18 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
             [mock.call(first, start_pos=0), mock.call(second, start_pos=0)]
         )
 
+    def test_apply_cache_action_forwards_free_device_kv_start_pos(self):
+        """Producers slice mid-page (an insert-overlap dup range, a partial SWA
+        recover), so the row offset has to reach the allocator. With start_pos=0
+        it would treat indices[0] as a page head and release the whole first
+        page -- including the part another node still owns."""
+        cache = mock.MagicMock()
+        idx = torch.tensor([4, 5])
+        UnifiedRadixCache._apply_cache_action(cache, FreeDeviceKV([idx], start_pos=6))
+        cache.token_to_kv_pool_allocator.free_segment.assert_called_once_with(
+            idx, start_pos=6
+        )
+
     def test_apply_cache_action_routes_free_component_device_kv(self):
         cache = mock.MagicMock()
         component = mock.MagicMock()
