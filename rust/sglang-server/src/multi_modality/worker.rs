@@ -87,7 +87,7 @@ fn process(
         })?;
         tokenizer.encode(text).map_err(|error| error.to_string())
     })?;
-    let mut packed = sglang_mm::qwen_vl::pack_result(output)?;
+    let mut packed = sglang_mm::qwen_vl::pack_output(output)?;
     apply_caller_hashes(&mut packed.hashes, &caller_hashes);
     let features = if ctx.feature_shm {
         park_features_in_shm(&packed.features, &packed.grids)
