@@ -138,11 +138,15 @@ class MultimodalPreprocessCache(Generic[K, V]):
             self.hits += 1
             return entry.value
 
-    def peek(self, key: K) -> Optional[V]:
-        """Return a value without changing LRU order or counters."""
+    def get_if_present(self, key: K, predicate: Callable[[V], bool]) -> Optional[V]:
+        """Atomically use a compatible entry without counting an absent miss."""
         with self._lock:
             entry = self._entries.get(key)
-            return None if entry is None else entry.value
+            if entry is None or not predicate(entry.value):
+                return None
+            self._entries.move_to_end(key)
+            self.hits += 1
+            return entry.value
 
     def put(
         self,
@@ -271,9 +275,12 @@ class MultimodalPreprocessCache(Generic[K, V]):
         return task
 
     def reserve_many(
-        self, keys: list[K]
+        self,
+        keys: list[K],
+        *,
+        predicate: Optional[Callable[[K, V], bool]] = None,
     ) -> list[CacheLookup[V] | CacheReservation[K, V]]:
-        """Reserve cache misses so owners can compute them in one batch."""
+        """Atomically use compatible hits and reserve the remaining keys."""
         results: list[CacheLookup[V] | CacheReservation[K, V]] = []
         with self._lock:
             for key in keys:
@@ -285,11 +292,16 @@ class MultimodalPreprocessCache(Generic[K, V]):
                     continue
 
                 entry = self._entries.get(key)
-                if entry is not None:
+                if entry is not None and (
+                    predicate is None or predicate(key, entry.value)
+                ):
                     self._entries.move_to_end(key)
                     self.hits += 1
                     results.append(CacheLookup(entry.value, hit=True))
                     continue
+                if entry is not None:
+                    self._entries.pop(key)
+                    self.current_size_bytes -= entry.size_bytes
 
                 self.misses += 1
                 inflight = self._inflight.get(key)

@@ -8,7 +8,6 @@ images onto the checkpoint-configured background
 at load time.
 """
 
-import asyncio
 import math
 import re
 from typing import Dict, List, Optional, Union
@@ -23,15 +22,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
-from sglang.srt.multimodal.cache import (
-    CacheLookup,
-    CacheReservation,
-    MediaSnapshot,
-    build_artifact_key,
-    build_feature_hash,
-    parse_content_hash,
-    snapshot_media,
-)
+from sglang.srt.multimodal.cache import build_feature_hash
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
 )
@@ -51,6 +42,7 @@ from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 from sglang.srt.multimodal.processors.kimi_k3_artifact import (
     KimiK3DeferredConfig,
     KimiK3ImageArtifact,
+    KimiK3PreprocessConfig,
     KimiK3ResizeConfig,
 )
 from sglang.srt.multimodal.processors.kimi_k25 import (
@@ -60,10 +52,14 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     _grid_thw_from_resize_config,
     navit_resize_config,
 )
+from sglang.srt.multimodal.processors.media_artifact import (
+    MediaArtifactCacheMixin,
+    MediaArtifactInput,
+)
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
-from sglang.srt.utils import ImageData, is_cuda, load_image
+from sglang.srt.utils import is_cuda
 
 
 def _encode_k3_special_tokens(tokenizer, text: str) -> list[int]:
@@ -166,9 +162,24 @@ def _k3_to_cuda_chw(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
 
 
 class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
-    def __init__(self, *args, transparent_bg_config=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._transparent_bg_config = transparent_bg_config
+    def __init__(self, hf_processor, image_token, image_token_id, config):
+        self.preprocess_config = config
+        super().__init__(
+            hf_processor,
+            image_token=image_token,
+            image_token_id=image_token_id,
+            patch_size=config.patch_size,
+            merge_kernel_size=config.merge_kernel_size,
+            in_patch_limit=config.in_patch_limit,
+            patch_limit_on_one_side=config.patch_limit_on_one_side,
+            fixed_output_tokens=config.fixed_output_tokens,
+            image_mean=config.image_mean,
+            image_std=config.image_std,
+        )
+        self._transparent_bg_config = config.transparent_bg_config
+
+    def preprocess_fingerprint_payload(self):
+        return self.preprocess_config
 
     def _prepare_input_ids(
         self, input_text, resize_configs, original_input_ids, image_sizes
@@ -347,8 +358,13 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         )
 
 
-class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
+class KimiK3ImageProcessor(
+    KimiGridMMDataMixin,
+    MediaArtifactCacheMixin[KimiK3ImageArtifact],
+    SGLangBaseProcessor,
+):
     models = [KimiK3ForConditionalGeneration]
+    artifact_modality = Modality.IMAGE
     # K3 accuracy is sensitive to the chroma upsampling used for common 4:2:0
     # JPEG inputs. This mode uses interpolated nvJPEG upsampling when the K3
     # image dependency is installed and otherwise falls back to PIL.
@@ -368,40 +384,16 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             image_token_regex=re.compile(r"(?:<\|media_pad\|>)+"),
         ).build(_processor)
 
-        media_proc_cfg = _processor.media_processor.media_proc_cfg
+        preprocess_config = KimiK3PreprocessConfig.from_media_processor(_processor)
 
         processor = KimiK3GPUProcessorWrapper(
             _processor,
             image_token=mm_tokens.image_token,
             image_token_id=mm_tokens.image_token_id,
-            patch_size=media_proc_cfg["patch_size"],
-            merge_kernel_size=media_proc_cfg["merge_kernel_size"],
-            in_patch_limit=media_proc_cfg["in_patch_limit"],
-            patch_limit_on_one_side=media_proc_cfg["patch_limit_on_one_side"],
-            fixed_output_tokens=media_proc_cfg.get("fixed_output_tokens"),
-            image_mean=media_proc_cfg["image_mean"],
-            image_std=media_proc_cfg["image_std"],
-            transparent_bg_config=media_proc_cfg.get("transparent_bg_config"),
+            config=preprocess_config,
         )
         super().__init__(hf_config, server_args, processor, *args, **kwargs)
         self.mm_tokens = mm_tokens
-
-    def preprocess_fingerprint_payload(self):
-        payload = super().preprocess_fingerprint_payload()
-        payload["kimi_k3"] = {
-            "patch_size": self._processor._patch_size,
-            "merge_kernel_size": self._processor._merge_kernel_size,
-            "in_patch_limit": self._processor._in_patch_limit,
-            "patch_limit_on_one_side": self._processor._patch_limit_on_one_side,
-            "fixed_output_tokens": self._processor._fixed_output_tokens,
-            "image_mean": self._processor._image_mean,
-            "image_std": self._processor._image_std,
-            "transparent_bg_config": self._processor._transparent_bg_config,
-            "preprocessing_backend": "gpu" if is_cuda() else "cpu",
-            "feature_transport": self.mm_feature_transport,
-            "resize_antialias": True,
-        }
-        return payload
 
     def _should_defer_gpu_preprocessing(self, images) -> bool:
         if (
@@ -418,17 +410,18 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
 
         raw_bytes = 0
         processed_bytes = 0
-        patch_size = self._processor._patch_size
+        config = self._processor.preprocess_config
+        patch_size = config.patch_size
         for image in images:
             width, height = _get_image_dimensions(image)
             resize_config = navit_resize_config(
                 width,
                 height,
                 patch_size,
-                self._processor._merge_kernel_size,
-                self._processor._in_patch_limit,
-                self._processor._patch_limit_on_one_side,
-                self._processor._fixed_output_tokens,
+                config.merge_kernel_size,
+                config.in_patch_limit,
+                config.patch_limit_on_one_side,
+                config.fixed_output_tokens,
             )
             if isinstance(image, torch.Tensor):
                 channels = (
@@ -465,7 +458,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             base_output.images, resize_configs, offsets
         ):
             grid_thw = _grid_thw_from_resize_config(
-                resize_config, self._processor._patch_size
+                resize_config, self._processor.preprocess_config.patch_size
             )
             item = MultimodalDataItem(
                 modality=Modality.IMAGE,
@@ -487,51 +480,6 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             mm_items=items,
             im_token_id=self.mm_tokens.image_token_id,
         )
-
-    @staticmethod
-    def _artifact_preprocess_kwargs(source) -> dict:
-        if isinstance(source, ImageData):
-            detail = source.detail
-            max_dynamic_patch = source.max_dynamic_patch
-            preprocess_kwargs = source.preprocess_kwargs
-        elif isinstance(source, dict):
-            detail = source.get("detail")
-            max_dynamic_patch = source.get("max_dynamic_patch")
-            preprocess_kwargs = source.get("preprocess_kwargs")
-        else:
-            return {}
-        return {
-            key: value
-            for key, value in {
-                "detail": None if detail == "auto" else detail,
-                "max_dynamic_patch": max_dynamic_patch,
-                "preprocess_kwargs": preprocess_kwargs,
-            }.items()
-            if value not in (None, {})
-        }
-
-    def _artifact_key(self, content_digest: str, source) -> str:
-        return build_artifact_key(
-            content_digest,
-            modality="image",
-            processor_fingerprint=self.processor_fingerprint,
-            preprocess_kwargs=self._artifact_preprocess_kwargs(source),
-        )
-
-    @classmethod
-    def _decode_media_snapshot(cls, snapshot: MediaSnapshot):
-        data = snapshot.data
-        if isinstance(data, torch.Tensor):
-            return data
-        if isinstance(data, np.ndarray):
-            return torch.from_numpy(data)
-        if isinstance(data, Image.Image):
-            data.load()
-            return data
-        image, _ = load_image(data, cls.gpu_image_decode)
-        if isinstance(image, Image.Image):
-            image.load()
-        return image
 
     def _make_artifact(
         self,
@@ -560,9 +508,9 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             deferred=deferred,
         )
 
-    def _prepare_artifact_batch(
+    def prepare_artifact_batch(
         self,
-        entries: list[tuple[str, str, object]],
+        entries: list[MediaArtifactInput],
         *,
         processor=None,
     ) -> list[KimiK3ImageArtifact]:
@@ -572,7 +520,9 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         eager_indices = []
         eager_images = []
 
-        for index, (content_digest, artifact_key, image) in enumerate(entries):
+        config = processor.preprocess_config
+        for index, entry in enumerate(entries):
+            image = entry.media
             if not self._should_defer_gpu_preprocessing([image]):
                 eager_indices.append(index)
                 eager_images.append(image)
@@ -582,19 +532,17 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             resize_config = navit_resize_config(
                 width,
                 height,
-                processor._patch_size,
-                processor._merge_kernel_size,
-                processor._in_patch_limit,
-                processor._patch_limit_on_one_side,
-                processor._fixed_output_tokens,
+                config.patch_size,
+                config.merge_kernel_size,
+                config.in_patch_limit,
+                config.patch_limit_on_one_side,
+                config.fixed_output_tokens,
             )
-            grid_thw = _grid_thw_from_resize_config(
-                resize_config, processor._patch_size
-            )
+            grid_thw = _grid_thw_from_resize_config(resize_config, config.patch_size)
             feature = to_chw_uint8(image).cpu().contiguous()
             artifacts[index] = self._make_artifact(
-                content_digest=content_digest,
-                artifact_key=artifact_key,
+                content_digest=entry.content_digest,
+                artifact_key=entry.artifact_key,
                 original_size=(width, height),
                 resize_config=resize_config,
                 grid_thw=grid_thw,
@@ -602,9 +550,9 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 deferred=KimiK3DeferredConfig(
                     backend="gpu",
                     feature_layout="chw",
-                    image_mean=tuple(processor._image_mean),
-                    image_std=tuple(processor._image_std),
-                    transparent_bg_config=processor._transparent_bg_config,
+                    image_mean=config.image_mean,
+                    image_std=config.image_std,
+                    transparent_bg_config=config.transparent_bg_config,
                 ),
             )
 
@@ -612,181 +560,22 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             features, sizes, configs, grids = processor.prepare_image_features(
                 eager_images
             )
-            for index, feature, size, config, grid in zip(
+            for index, feature, size, resize_config, grid in zip(
                 eager_indices, features, sizes, configs, grids
             ):
-                content_digest, artifact_key, _ = entries[index]
+                entry = entries[index]
                 artifacts[index] = self._make_artifact(
-                    content_digest=content_digest,
-                    artifact_key=artifact_key,
+                    content_digest=entry.content_digest,
+                    artifact_key=entry.artifact_key,
                     original_size=size,
-                    resize_config=config,
+                    resize_config=resize_config,
                     grid_thw=grid,
                     feature=feature,
                 )
 
         if any(artifact is None for artifact in artifacts):
             raise RuntimeError("Kimi-K3 artifact batch did not produce every image")
-        return artifacts
-
-    async def _run_artifact_batch(
-        self, entries: list[tuple[str, str, object]]
-    ) -> list[KimiK3ImageArtifact]:
-        if self.mm_processor_executor is None:
-            return self._prepare_artifact_batch(entries)
-        return await self.mm_processor_executor.run(
-            self._prepare_artifact_batch, entries
-        )
-
-    @staticmethod
-    def _artifact_usable(
-        artifact: KimiK3ImageArtifact, allow_featureless: bool
-    ) -> bool:
-        return artifact.has_feature or allow_featureless
-
-    async def prepare_media_artifacts(
-        self,
-        image_data,
-        request_obj,
-        *,
-        featureless_hit_mask: Optional[list[bool]] = None,
-    ) -> list[KimiK3ImageArtifact]:
-        """Resolve identities and preprocess only per-image cache misses."""
-        image_count = len(image_data)
-        caller_hashes = getattr(request_obj, "mm_content_hashes", None)
-        if caller_hashes is None:
-            caller_hashes = [None] * image_count
-        if len(caller_hashes) != image_count:
-            raise ValueError(
-                f"mm_content_hashes has {len(caller_hashes)} entries for "
-                f"{image_count} images"
-            )
-        caller_hashes = [parse_content_hash(value) for value in caller_hashes]
-        if featureless_hit_mask is None:
-            featureless_hit_mask = [False] * image_count
-        if len(featureless_hit_mask) != image_count:
-            raise ValueError("featureless_hit_mask must align with image_data")
-
-        artifacts: list[Optional[KimiK3ImageArtifact]] = [None] * image_count
-        snapshots: list[Optional[MediaSnapshot]] = [None] * image_count
-        keys: list[Optional[str]] = [None] * image_count
-
-        # Trusted callers may use a metadata hit without touching the source.
-        load_indices = []
-        for index, (source, caller_hash, allow_featureless) in enumerate(
-            zip(image_data, caller_hashes, featureless_hit_mask)
-        ):
-            if self.trust_mm_content_hashes and caller_hash is not None:
-                key = self._artifact_key(caller_hash, source)
-                keys[index] = key
-                cached = self.mm_preprocess_cache.peek(key)
-                if cached is not None and self._artifact_usable(
-                    cached, allow_featureless
-                ):
-                    artifacts[index] = self.mm_preprocess_cache.get(key)
-                    continue
-            load_indices.append(index)
-
-        snapshot_futures = {
-            index: self.io_executor.submit(snapshot_media, image_data[index])
-            for index in load_indices
-        }
-        for index, future in snapshot_futures.items():
-            snapshot = await asyncio.wrap_future(future)
-            caller_hash = caller_hashes[index]
-            if caller_hash is not None and caller_hash != snapshot.content_digest:
-                raise ValueError(
-                    f"content hash mismatch for image_data[{index}]: "
-                    f"expected {caller_hash}, got {snapshot.content_digest}"
-                )
-            snapshots[index] = snapshot
-            keys[index] = self._artifact_key(snapshot.content_digest, image_data[index])
-            cached = self.mm_preprocess_cache.peek(keys[index])
-            if cached is not None and self._artifact_usable(
-                cached, featureless_hit_mask[index]
-            ):
-                artifacts[index] = self.mm_preprocess_cache.get(keys[index])
-
-        # Deduplicate misses before decode and reserve them against other requests.
-        first_index_by_key = {}
-        previous_metadata = {}
-        for index in load_indices:
-            if artifacts[index] is not None:
-                continue
-            key = keys[index]
-            if key not in first_index_by_key:
-                first_index_by_key[key] = index
-                previous_metadata[key] = self.mm_preprocess_cache.pop(key)
-
-        unique_keys = list(first_index_by_key)
-        reservations = self.mm_preprocess_cache.reserve_many(unique_keys)
-        resolved_by_key = {}
-        owners = []
-        for key, reservation in zip(unique_keys, reservations):
-            if isinstance(reservation, CacheLookup):
-                resolved_by_key[key] = reservation.value
-            elif reservation.owner:
-                owners.append(reservation)
-
-        if owners:
-            owner_task = self.mm_preprocess_cache.create_background_task(
-                self._fulfill_artifact_reservations(
-                    owners,
-                    first_index_by_key,
-                    snapshots,
-                    previous_metadata,
-                    resolved_by_key,
-                )
-            )
-            # The cache owns this shared work. Cancelling the request that won
-            # a reservation must not fail another request already joining it.
-            await asyncio.shield(owner_task)
-
-        for key, reservation in zip(unique_keys, reservations):
-            if isinstance(reservation, CacheReservation) and not reservation.owner:
-                resolved_by_key[key] = await self.mm_preprocess_cache.wait(reservation)
-
-        for index in range(image_count):
-            if artifacts[index] is None:
-                artifacts[index] = resolved_by_key[keys[index]]
-        return artifacts
-
-    async def _fulfill_artifact_reservations(
-        self,
-        owners: list[CacheReservation[str, KimiK3ImageArtifact]],
-        first_index_by_key: dict[str, int],
-        snapshots: list[Optional[MediaSnapshot]],
-        previous_metadata: dict[str, KimiK3ImageArtifact],
-        resolved_by_key: dict[str, KimiK3ImageArtifact],
-    ) -> None:
-        try:
-            owner_entries = []
-            for reservation in owners:
-                index = first_index_by_key[reservation.key]
-                snapshot = snapshots[index]
-                image = await asyncio.wrap_future(
-                    self.io_executor.submit(self._decode_media_snapshot, snapshot)
-                )
-                owner_entries.append((snapshot.content_digest, reservation.key, image))
-            owner_artifacts = await self._run_artifact_batch(owner_entries)
-            for reservation, artifact in zip(owners, owner_artifacts):
-                old = previous_metadata.get(reservation.key)
-                if old is not None and old.feature_hash != artifact.feature_hash:
-                    raise ValueError(
-                        "Kimi-K3 cached artifact feature hash changed for identical "
-                        f"identity {reservation.key}"
-                    )
-                self.mm_preprocess_cache.fulfill(
-                    reservation,
-                    artifact,
-                    cache_value=artifact.cache_value(),
-                )
-                resolved_by_key[reservation.key] = artifact
-        except BaseException as error:
-            for reservation in owners:
-                if not reservation.future.done():
-                    self.mm_preprocess_cache.fail(reservation, error)
-            raise
+        return [artifact for artifact in artifacts if artifact is not None]
 
     def compose_request(
         self,
@@ -915,7 +704,10 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 image_data, input_text, request_obj, **kwargs
             )
 
-        artifacts = await self.prepare_media_artifacts(image_data, request_obj)
+        artifacts = await self.prepare_media_artifacts(
+            image_data,
+            content_hashes=getattr(request_obj, "mm_content_hashes", None),
+        )
         return self.compose_request(input_text, artifacts)
 
     def get_mm_data(self, prompt, embeddings, **kwargs):

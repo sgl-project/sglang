@@ -1,6 +1,7 @@
 import hashlib
 import inspect
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
@@ -9,6 +10,14 @@ import torch
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 
 LOCAL_PREPROCESSED_KEY = "encoder_local_preprocessed"
+
+
+@dataclass(frozen=True)
+class EncoderMediaProcessorConfig:
+    """Optional model-declared media loading behavior for encoder mode."""
+
+    image_decode_mode: bool | str = False
+    preserve_media_metadata: bool = False
 
 
 def hash_raw_encoder_item(value: Any) -> int:

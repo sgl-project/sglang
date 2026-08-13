@@ -60,6 +60,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.srt.model_loader import get_model
 from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
+    EncoderMediaProcessorConfig,
     EncoderPreprocessOutput,
     get_encoder_preprocessed_items,
     invoke_encoder_preprocessor,
@@ -365,6 +366,11 @@ class MMEncoder:
             load_config=self.load_config,
             device_config=self.device_config,
         )
+        self.encoder_media_processor_config = getattr(
+            self.model,
+            "encoder_media_processor_config",
+            EncoderMediaProcessorConfig(),
+        )
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
         self.context = zmq.asyncio.Context(2)
@@ -666,25 +672,27 @@ class MMEncoder:
         Load a single multimodal data.
         If data is precomputed, returns directly.
         Static method that can be pickled for multiprocessing"""
+        media_metadata = {}
         content_hash = None
         if isinstance(data, dict):
             if "url" not in data:
                 return data
+            media_metadata = {key: value for key, value in data.items() if key != "url"}
             content_hash = parse_content_hash(data.get("content_hash"))
             data = data["url"]
         try:
             if modality == Modality.IMAGE:
-                if self.model_type == "kimi_k3" and content_hash is not None:
+                if content_hash is not None:
                     snapshot = snapshot_media(data)
                     if snapshot.content_digest != content_hash:
                         raise BadRequestError(
-                            "Kimi-K3 encoder content hash mismatch: "
+                            "Encoder media content hash mismatch: "
                             f"expected {content_hash}, got {snapshot.content_digest}"
                         )
                     data = snapshot.data
                 gpu_image_decode = (
-                    "nvjpeg_fancy"
-                    if self.use_image_processor_gpu and self.model_type == "kimi_k3"
+                    self.encoder_media_processor_config.image_decode_mode
+                    if self.use_image_processor_gpu
                     else False
                 )
                 img, _ = load_image(data, gpu_image_decode)
@@ -695,11 +703,14 @@ class MMEncoder:
                 ):
                     # Needed only when `img` is a PIL image
                     img = img.convert("RGB")
-                if self.model_type == "kimi_k3" and content_hash is not None:
+                if (
+                    media_metadata
+                    and self.encoder_media_processor_config.preserve_media_metadata
+                ):
                     return {
                         "type": "image",
                         "image": img,
-                        "content_hash": content_hash,
+                        **media_metadata,
                     }
                 return img
             elif modality == Modality.VIDEO:

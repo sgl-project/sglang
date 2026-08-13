@@ -19,6 +19,9 @@ from PIL import Image
 
 CONTENT_HASH_PREFIX = "sha256:"
 _SHA256_HEX_LENGTH = 64
+_MEDIA_ENVELOPE_FIELDS = frozenset(
+    {"type", "format", "url", "image", "video", "audio", "content_hash"}
+)
 
 
 def parse_content_hash(value: Optional[str]) -> Optional[str]:
@@ -155,6 +158,41 @@ def snapshot_media(media: Any) -> MediaSnapshot:
     if isinstance(media, np.ndarray):
         return _snapshot_ndarray(media)
     raise TypeError(f"Unsupported media identity input: {type(media).__name__}")
+
+
+def media_preprocess_kwargs(
+    source: Any, *, defaults: Optional[Mapping[str, Any]] = None
+) -> dict[str, Any]:
+    """Conservatively capture per-request options that can affect an artifact.
+
+    Unknown options are included instead of allow-listed. This may create a safe
+    false miss for a metadata-only option, but it prevents a new model option
+    from silently creating a false cache hit.
+    """
+    defaults = defaults or {}
+    if dataclasses.is_dataclass(source):
+        values = {
+            field.name: getattr(source, field.name)
+            for field in dataclasses.fields(source)
+            if field.name not in _MEDIA_ENVELOPE_FIELDS
+        }
+    elif isinstance(source, Mapping):
+        values = {
+            key: value
+            for key, value in source.items()
+            if key not in _MEDIA_ENVELOPE_FIELDS
+        }
+    else:
+        return {}
+
+    result = {}
+    for key, value in values.items():
+        if value is None or (isinstance(value, Mapping) and not value):
+            continue
+        if key in defaults and _canonicalize(value) == _canonicalize(defaults[key]):
+            continue
+        result[key] = value
+    return result
 
 
 def _qualified_type_name(value: Any) -> str:

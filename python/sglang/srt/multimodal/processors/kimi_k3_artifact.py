@@ -2,10 +2,43 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
+
+
+@dataclass(frozen=True)
+class KimiK3PreprocessConfig:
+    """The single source of truth for K3 artifact-producing choices."""
+
+    patch_size: int
+    merge_kernel_size: int
+    in_patch_limit: int
+    patch_limit_on_one_side: int
+    fixed_output_tokens: Optional[int]
+    image_mean: tuple[float, ...]
+    image_std: tuple[float, ...]
+    transparent_bg_config: Optional[dict]
+
+    @classmethod
+    def from_media_processor(cls, media_processor) -> KimiK3PreprocessConfig:
+        config = media_processor.media_proc_cfg
+        return cls(
+            patch_size=int(config["patch_size"]),
+            merge_kernel_size=int(config["merge_kernel_size"]),
+            in_patch_limit=int(config["in_patch_limit"]),
+            patch_limit_on_one_side=int(config["patch_limit_on_one_side"]),
+            fixed_output_tokens=(
+                None
+                if config.get("fixed_output_tokens") is None
+                else int(config["fixed_output_tokens"])
+            ),
+            image_mean=tuple(float(value) for value in config["image_mean"]),
+            image_std=tuple(float(value) for value in config["image_std"]),
+            transparent_bg_config=deepcopy(config.get("transparent_bg_config")),
+        )
 
 
 @dataclass(frozen=True)

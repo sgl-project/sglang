@@ -6,7 +6,17 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    Union,
+    runtime_checkable,
+)
 
 import numpy as np
 import torch
@@ -45,6 +55,13 @@ from sglang.srt.utils import (
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
+
+
+@runtime_checkable
+class PreprocessFingerprintProvider(Protocol):
+    """A wrapped processor with explicit artifact-producing configuration."""
+
+    def preprocess_fingerprint_payload(self) -> Any: ...
 
 
 @dataclasses.dataclass
@@ -417,15 +434,23 @@ class BaseMultimodalProcessor(ABC):
 
     def preprocess_fingerprint_payload(self) -> dict[str, Any]:
         """Stable processor choices that may change per-media artifacts."""
+        wrapped_processor = (
+            self._processor.preprocess_fingerprint_payload()
+            if isinstance(self._processor, PreprocessFingerprintProvider)
+            else None
+        )
         return {
             "wrapper_class": (
                 f"{type(self._processor).__module__}."
                 f"{type(self._processor).__qualname__}"
             ),
             "gpu_image_decode": self.gpu_image_decode,
+            "image_processor_backend": self.image_processor_backend,
+            "feature_transport": self.mm_feature_transport,
             "image_config": self.image_config,
             "video_config": self.video_config,
             "audio_config": self.audio_config,
+            "wrapped_processor": wrapped_processor,
         }
 
     def clear_preprocess_cache(self) -> None:

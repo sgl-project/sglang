@@ -19,6 +19,7 @@ from sglang.srt.disaggregation.encode_receiver import (
     EmbeddingData,
     MMReceiverHTTP,
     MultiModalEmbeddingData,
+    _encoder_media_item,
     _select_mm_processor_prompt,
 )
 from sglang.srt.disaggregation.encode_server import MMEncoder, _get_mm_grid_dim
@@ -30,6 +31,7 @@ from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.multimodal.cache import snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
     LOCAL_PREPROCESSED_KEY,
+    EncoderMediaProcessorConfig,
     EncoderPreprocessOutput,
     get_encoder_preprocessed_items,
     hash_raw_encoder_item,
@@ -105,6 +107,11 @@ def _encoder(model_type="kimi_k3"):
         hf_config=SimpleNamespace(
             vision_config=SimpleNamespace(merge_kernel_size=(2, 2))
         )
+    )
+    encoder.encoder_media_processor_config = (
+        KimiK3ForConditionalGeneration.encoder_media_processor_config
+        if model_type == "kimi_k3"
+        else EncoderMediaProcessorConfig()
     )
     return encoder
 
@@ -420,6 +427,14 @@ def test_epd_receiver_keeps_content_hash_aligned_with_image():
             "content_hash": digest,
         }
     ]
+
+    assert _encoder_media_item(receiver._extract_url_data(request)[0]) == {
+        "url": "image",
+        "detail": "high",
+        "max_dynamic_patch": 12,
+        "preprocess_kwargs": {"crop": False},
+        "content_hash": digest,
+    }
 
 
 def test_kimi_k3_epd_aggregates_original_image_sizes_in_part_order():

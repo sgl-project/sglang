@@ -6,6 +6,7 @@ from sglang.srt.multimodal.cache.identity import (
     build_artifact_key,
     build_feature_hash,
     build_processor_fingerprint,
+    media_preprocess_kwargs,
     parse_content_hash,
     snapshot_media,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "build_feature_hash",
     "build_processor_fingerprint",
     "estimate_cache_size_bytes",
+    "media_preprocess_kwargs",
     "parse_content_hash",
     "snapshot_media",
 ]
