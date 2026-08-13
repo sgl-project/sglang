@@ -10,7 +10,6 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
-    mamba_state_chunk_size,
 )
 from sglang.srt.utils.common import (
     Range,
@@ -2631,7 +2630,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
         cache_chunk_size = mamba_cache_chunk_size()
-        state_chunk_size = mamba_state_chunk_size()
+        state_chunk_size = getattr(
+            self.model_config.hf_text_config, "mamba_chunk_size", 64
+        )
 
         def _force_track_h(i: int) -> int:
             assert i % cache_chunk_size == 0

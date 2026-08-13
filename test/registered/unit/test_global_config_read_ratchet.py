@@ -13,8 +13,7 @@ modules that own the slot.
 Where the remaining reads live (``runtime_context.py``, exempt by module):
 
 - **Derived members.** ``@property`` / method members of ``ServerArgs``
-  (``mamba_cache_chunk_size``, ``mamba_state_chunk_size``,
-  ``max_speculative_num_draft_tokens``,
+  (``mamba_cache_chunk_size``, ``max_speculative_num_draft_tokens``,
   ``use_mla_backend()``, ``get_attention_backends()``, ``get_model_config()``,
   ``cutedsl_moe_max_num_tokens()``) are computed from several fields plus the HF
   config, so they are not namespace leaves and ``ServerArgs`` is their only

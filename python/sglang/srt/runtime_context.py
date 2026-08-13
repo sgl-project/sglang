@@ -1435,21 +1435,6 @@ def mamba_cache_chunk_size() -> int:
     return get_server_args().mamba_cache_chunk_size
 
 
-def mamba_state_chunk_size() -> int:
-    """The model's recurrent-state chunk size, independent of page size."""
-    # Keep runtime_context importable before optional attention kernels are available.
-    try:
-        from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE
-    except ImportError:
-        CHUNK_SIZE = 64
-
-    return getattr(
-        get_server_args().get_model_config().hf_config,
-        "mamba_chunk_size",
-        CHUNK_SIZE,
-    )
-
-
 def max_speculative_num_draft_tokens() -> int | None:
     """The largest draft-token count speculative decoding may use.
 
