@@ -144,10 +144,6 @@ TRITON_ATTENTION_MODELS = {
 AMD_FAILING_VLM_MODELS = {
     # GLM-4.1V processor not registered yet (Glm4vForConditionalGeneration)
     "zai-org/GLM-4.1V-9B-Thinking",
-    # Server exits during startup: AttributeError: 'CLIPImageProcessor' object
-    # has no attribute 'tokenizer'. Fails the whole file, so the models after it
-    # -- including the current Qwen3-VL -- never get evaluated.
-    "OpenGVLab/InternVL2_5-2B",
 }
 
 

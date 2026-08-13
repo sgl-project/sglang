@@ -18,14 +18,7 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=3600,
-    suite="nightly-8-gpu-mi35x-qwen3-235b-mxfp4",
-    nightly=True,
-    disabled=(
-        "Rank 0 scheduler dies during initialization on MI35x; failed every "
-        "nightly run from 2026-08-07 to 2026-08-12. Re-enable with the job in "
-        "the AMD nightlies once the launch is fixed."
-    ),
+    est_time=3600, suite="nightly-8-gpu-mi35x-qwen3-235b-mxfp4", nightly=True
 )
 
 QWEN3_MODEL_PATH = "amd/Qwen3-235B-A22B-Instruct-2507-mxfp4"
