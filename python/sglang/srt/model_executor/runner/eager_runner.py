@@ -263,7 +263,17 @@ class EagerRunner(BaseRunner):
         if cp_v2_active:
             prepare_cp_forward(forward_batch)
 
-        if forward_batch.needs_forward_metadata_init() or cp_v2_active:
+        # Target verify can arrive with ``forward_metadata_ready`` set by an
+        # upstream/speculative planning step.  That mark does not initialize
+        # the final target hybrid backend, and unlike a graph replay eager has
+        # no static metadata load to fill the gap.  Re-plan target verify from
+        # the final batch every time; eager metadata is intentionally derived
+        # directly from the live ``spec_info`` tensors.
+        if (
+            forward_batch.needs_forward_metadata_init()
+            or cp_v2_active
+            or forward_batch.forward_mode.is_target_verify()
+        ):
             if model_runner.ps.attn_dcp_size > 1 and hasattr(
                 model_runner.model, "prepare_context_parallel_metadata_for_dcp"
             ):

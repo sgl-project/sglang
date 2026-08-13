@@ -1234,6 +1234,7 @@
                   {
                     "group": "Qwen",
                     "pages": [
+                      "cookbook/autoregressive/Qwen/Qwen3.8",
                       "cookbook/autoregressive/Qwen/Qwen3.6",
                       "cookbook/autoregressive/Qwen/Qwen3.5",
                       "cookbook/autoregressive/Qwen/Qwen3",
@@ -1276,6 +1277,12 @@
                     "group": "Meituan",
                     "pages": [
                       "cookbook/autoregressive/Meituan/LongCat-2.0"
+                    ]
+                  },
+                  {
+                    "group": "RedNote",
+                    "pages": [
+                      "cookbook/autoregressive/RedNote/Dots3-Note"
                     ]
                   },
                   {
