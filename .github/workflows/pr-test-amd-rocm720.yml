@@ -20,10 +20,10 @@ on:
         description: 'ROCm image version'
         required: false
         type: choice
-        default: rocm724
+        default: rocm720
         options:
-          - rocm724
           - rocm720
+          - rocm724
       target_stage_select:
         description: "Select a stage to run from dropdown (leave empty for auto-detect)"
         required: false
@@ -94,7 +94,7 @@ on:
         description: 'ROCm image version'
         required: false
         type: string
-        default: rocm724
+        default: rocm720
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         required: false
@@ -140,7 +140,7 @@ permissions:
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   AMD_CI_IMAGE: ${{ inputs.amd_ci_image }}
-  ROCM_VERSION: ${{ inputs.rocm_version || 'rocm724' }}
+  ROCM_VERSION: ${{ inputs.rocm_version || 'rocm720' }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
@@ -250,7 +250,7 @@ jobs:
     with:
       ref: ${{ inputs.pr_head_sha || inputs.ref || '' }}
       runner_arch: ${{ inputs.runner_arch || 'mi300' }}
-      rocm_version: ${{ inputs.rocm_version || 'rocm724' }}
+      rocm_version: ${{ inputs.rocm_version || 'rocm720' }}
       aiter_ref: ${{ inputs.aiter_ref }}
       amd_ci_image: ${{ inputs.amd_ci_image }}
       continue_on_error: true
