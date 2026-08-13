@@ -45,8 +45,10 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    pack_state_types,
     resolve_dcp_dst_entry_indices,
     resolve_state_component_dst_index,
+    unpack_state_types,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
@@ -140,6 +142,7 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: List[List[int]]
     dst_kv_layer_ids: List[int]
     dst_state_layer_ids: List[List[int]]
+    dst_state_types: List[StateType] = dataclasses.field(default_factory=list)
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
@@ -176,6 +179,7 @@ class KVArgsRegisterInfo:
                 if len(msg) > 13 and msg[13] != b""
                 else []
             ),
+            dst_state_types=unpack_state_types(msg[18]) if len(msg) > 18 else [],
             staging_base_ptr=(
                 struct.unpack("Q", msg[14])[0]
                 if len(msg) > 14 and len(msg[14]) == 8
@@ -924,23 +928,17 @@ class MooncakeKVManager(CommonKVManager):
             dst_device_data_ptrs=dst_device_kv_ptrs,
         )
 
-    def _find_draft_swa_component_index(
-        self, prefill_state_indices: List
-    ) -> Optional[int]:
+    def _swa_state_component_indices(self, prefill_state_indices: List) -> List[int]:
         state_types = self.kv_args.state_types
-        for state_type in (StateType.SWA, StateType.SWA_RING):
-            matching_indices = [
-                index
-                for index, item in enumerate(state_types)
-                if item == state_type
-                and index < len(prefill_state_indices)
-                and prefill_state_indices[index] is not None
-            ]
-            if len(matching_indices) >= 2:
-                return matching_indices[-1]
-        return None
+        return [
+            index
+            for index, item in enumerate(state_types)
+            if item in (StateType.SWA, StateType.SWA_RING)
+            and index < len(prefill_state_indices)
+            and prefill_state_indices[index] is not None
+        ]
 
-    def send_kvcache_with_draft_swa(
+    def send_kvcache_with_swa_states(
         self,
         req: TransferInfo,
         prefill_kv_indices: npt.NDArray[np.int32],
@@ -948,19 +946,17 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         prefill_state_indices: List,
         target_rank_registration_info: KVArgsRegisterInfo,
-    ) -> Optional[Tuple[int, int]]:
-        """Batch the final target KV and DSV4 draft SWA into one RDMA submit.
+    ) -> Optional[Tuple[int, set[int]]]:
+        """Batch the final target KV and SWA states into one RDMA submit.
 
         Returns ``None`` when the request is not eligible. Otherwise returns the
-        transfer status and the source state-component index consumed here.
+        transfer status and source state-component indices consumed here.
         """
         if self.enable_custom_mem_pool or not self.is_mla_backend:
             return None
 
-        component_index = self._find_draft_swa_component_index(
-            prefill_state_indices
-        )
-        if component_index is None:
+        component_indices = self._swa_state_component_indices(prefill_state_indices)
+        if not component_indices:
             return None
 
         self._validate_envelope_kv_layout(
@@ -970,37 +966,6 @@ class MooncakeKVManager(CommonKVManager):
         )
 
         state_types = self.kv_args.state_types
-        state_type = state_types[component_index]
-        dst_component_index = resolve_state_component_dst_index(
-            state_types,
-            target_rank_registration_info.dst_state_types,
-            component_index,
-        )
-        if (
-            dst_component_index
-            >= len(target_rank_registration_info.dst_state_data_ptrs)
-            or dst_component_index >= len(req.dst_state_indices)
-        ):
-            return -1, component_index
-
-        src_state_indices = list(prefill_state_indices[component_index])
-        dst_state_indices = list(req.dst_state_indices[dst_component_index])
-        if len(src_state_indices) != len(dst_state_indices):
-            if self._requires_exact_state_index_match(state_type):
-                raise RuntimeError(
-                    f"{state_type.upper()} state index length mismatch: "
-                    f"prefill={len(src_state_indices)}, "
-                    f"dst={len(dst_state_indices)}"
-                )
-            logger.warning(
-                "len(prefill_state_indices) = %s, len(dst_state_indices) = %s",
-                len(src_state_indices),
-                len(dst_state_indices),
-            )
-            common_len = min(len(src_state_indices), len(dst_state_indices))
-            src_state_indices = src_state_indices[:common_len]
-            dst_state_indices = dst_state_indices[:common_len]
-
         kv_block_groups = self._build_kvcache_transfer_block_groups(
             src_data_ptrs=self.kv_args.kv_data_ptrs,
             dst_data_ptrs=dst_kv_ptrs,
@@ -1010,18 +975,53 @@ class MooncakeKVManager(CommonKVManager):
             src_layer_ids=self.kv_args.kv_layer_ids,
             dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
         )
-        state_block_groups = self._build_kvcache_transfer_block_groups(
-            src_data_ptrs=self.kv_args.state_data_ptrs[component_index],
-            dst_data_ptrs=target_rank_registration_info.dst_state_data_ptrs[
-                dst_component_index
-            ],
-            item_lens=self.kv_args.state_item_lens[component_index],
-            prefill_data_indices=np.asarray(src_state_indices, dtype=np.int32),
-            dst_data_indices=np.asarray(dst_state_indices, dtype=np.int32),
-            state_type=state_type,
-        )
-        if kv_block_groups is None or state_block_groups is None:
-            return -1, component_index
+        if kv_block_groups is None:
+            return -1, set(component_indices)
+
+        state_block_groups = []
+        for component_index in component_indices:
+            state_type = state_types[component_index]
+            dst_component_index = resolve_state_component_dst_index(
+                state_types,
+                target_rank_registration_info.dst_state_types,
+                component_index,
+            )
+            if dst_component_index >= len(
+                target_rank_registration_info.dst_state_data_ptrs
+            ) or dst_component_index >= len(req.dst_state_indices):
+                return -1, set(component_indices)
+
+            src_state_indices = list(prefill_state_indices[component_index])
+            dst_state_indices = list(req.dst_state_indices[dst_component_index])
+            if len(src_state_indices) != len(dst_state_indices):
+                if self._requires_exact_state_index_match(state_type):
+                    raise RuntimeError(
+                        f"{state_type.upper()} state index length mismatch: "
+                        f"prefill={len(src_state_indices)}, "
+                        f"dst={len(dst_state_indices)}"
+                    )
+                logger.warning(
+                    "len(prefill_state_indices) = %s, len(dst_state_indices) = %s",
+                    len(src_state_indices),
+                    len(dst_state_indices),
+                )
+                common_len = min(len(src_state_indices), len(dst_state_indices))
+                src_state_indices = src_state_indices[:common_len]
+                dst_state_indices = dst_state_indices[:common_len]
+
+            block_groups = self._build_kvcache_transfer_block_groups(
+                src_data_ptrs=self.kv_args.state_data_ptrs[component_index],
+                dst_data_ptrs=target_rank_registration_info.dst_state_data_ptrs[
+                    dst_component_index
+                ],
+                item_lens=self.kv_args.state_item_lens[component_index],
+                prefill_data_indices=np.asarray(src_state_indices, dtype=np.int32),
+                dst_data_indices=np.asarray(dst_state_indices, dtype=np.int32),
+                state_type=state_type,
+            )
+            if block_groups is None:
+                return -1, set(component_indices)
+            state_block_groups.extend(block_groups)
 
         transfer_blocks = [
             block
@@ -1030,7 +1030,7 @@ class MooncakeKVManager(CommonKVManager):
         ]
         return (
             self._transfer_data(req.mooncake_session_id, transfer_blocks),
-            component_index,
+            set(component_indices),
         )
 
     def send_kvcache_dcp(
@@ -1889,7 +1889,7 @@ class MooncakeKVManager(CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
-                        batched_state_component_index = None
+                        batched_state_component_indices = None
                         if (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
@@ -1930,7 +1930,7 @@ class MooncakeKVManager(CommonKVManager):
                                 and not skip_state
                                 and chunked_dst_device_kv_indice is None
                             ):
-                                batched_result = self.send_kvcache_with_draft_swa(
+                                batched_result = self.send_kvcache_with_swa_states(
                                     req,
                                     kv_chunk.prefill_kv_indices,
                                     target_rank_registration_info.dst_kv_ptrs,
@@ -1951,7 +1951,7 @@ class MooncakeKVManager(CommonKVManager):
                                     dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
                                 )
                             else:
-                                ret, batched_state_component_index = batched_result
+                                ret, batched_state_component_indices = batched_result
                         elif (
                             self.enable_staging
                             and staging_strategy is not None
@@ -2016,11 +2016,7 @@ class MooncakeKVManager(CommonKVManager):
                                     kv_chunk.state_indices,
                                     executor,
                                     target_rank_registration_info,
-                                    (
-                                        {batched_state_component_index}
-                                        if batched_state_component_index is not None
-                                        else None
-                                    ),
+                                    batched_state_component_indices,
                                 )
                                 if state_rc != 0:
                                     with self.session_lock:
@@ -2552,6 +2548,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_state_layer_ids = pack_int_lists(
                 self.kv_mgr.kv_args.state_layer_ids, "I"
             )
+            packed_state_types = pack_state_types(self.kv_mgr.kv_args.state_types)
             packed_kv_layer_ids = b"".join(
                 struct.pack("I", layer_id)
                 for layer_id in self.kv_mgr.kv_args.kv_layer_ids
@@ -2604,6 +2601,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             staging_total_size_str,
                             dst_dcp_size,
                             dst_dcp_rank,
+                            packed_state_types,
                         ]
                     )
             except zmq.ZMQError:

@@ -30,16 +30,14 @@ class TestMooncakeDSparkTransferBatch(unittest.TestCase):
         manager._transfer_data = MagicMock(return_value=0)
         return manager
 
-    def test_only_repeated_swa_has_a_draft_component(self):
+    def test_finds_all_available_swa_components(self):
         manager = self._manager()
-        self.assertEqual(
-            manager._find_draft_swa_component_index([[1], [2], [3]]), 2
-        )
+        self.assertEqual(manager._swa_state_component_indices([[1], [2], [3]]), [0, 2])
 
         manager.kv_args.state_types = [StateType.SWA, StateType.C128_STATE]
-        self.assertIsNone(manager._find_draft_swa_component_index([[1], [2]]))
+        self.assertEqual(manager._swa_state_component_indices([[1], [2]]), [0])
 
-    def test_target_kv_and_draft_swa_share_one_submit(self):
+    def test_target_kv_and_swa_states_share_one_submit(self):
         manager = self._manager()
         req = SimpleNamespace(
             mooncake_session_id="session",
@@ -57,7 +55,7 @@ class TestMooncakeDSparkTransferBatch(unittest.TestCase):
             dst_state_data_ptrs=[[600], [700], [800]],
         )
 
-        result = manager.send_kvcache_with_draft_swa(
+        result = manager.send_kvcache_with_swa_states(
             req=req,
             prefill_kv_indices=np.asarray([1, 2], dtype=np.int32),
             dst_kv_ptrs=[500],
@@ -66,12 +64,13 @@ class TestMooncakeDSparkTransferBatch(unittest.TestCase):
             target_rank_registration_info=registration,
         )
 
-        self.assertEqual(result, (0, 2))
+        self.assertEqual(result, (0, {0, 2}))
         manager._validate_envelope_kv_layout.assert_called_once_with([500], 4, 1)
         manager._transfer_data.assert_called_once_with(
             "session",
             [
                 (104, 512, 8),
+                (272, 688, 8),
                 (440, 856, 8),
             ],
         )

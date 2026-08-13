@@ -1010,6 +1010,21 @@ def resolve_dcp_dst_entry_indices(
     ]
 
 
+def pack_state_types(state_types) -> bytes:
+    return ",".join(
+        state_type.value if isinstance(state_type, Enum) else str(state_type)
+        for state_type in (state_types or [])
+    ).encode("ascii")
+
+
+def unpack_state_types(data: bytes):
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    if not data:
+        return []
+    return [StateType(value) for value in data.decode("ascii").split(",") if value]
+
+
 def resolve_state_component_dst_index(src_state_types, dst_state_types, src_index: int):
     """Map a source state component to the matching destination component.
 
