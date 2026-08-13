@@ -1377,9 +1377,15 @@ class MooncakeKVManager(CommonKVManager):
                         or rc
                     )
             elif st == StateType.DSPARK_DRAFT_KV:
-                if (
-                    dst_item_lens and list(src_item_lens) != list(dst_item_lens)
-                ) or len(indices) != len(dst_indices):
+                # Empty dst_item_lens means the decode side registered fewer
+                # state components than prefill, i.e. no draft KV component at
+                # all -- treat that as a mismatch rather than skipping the
+                # comparison, matching the MAMBA branch above. Per-rank draft
+                # geometry differing between the two sides silently corrupts
+                # low pages and overruns the registered buffer on high ones.
+                if list(src_item_lens) != list(dst_item_lens) or len(indices) != len(
+                    dst_indices
+                ):
                     logger.error(
                         "DSPARK draft KV mismatch for room %s: item_lens %s vs %s, "
                         "indices %d vs %d",
