@@ -16,7 +16,7 @@ from ..common.utils import (
 
 
 
-# PORT (vllm/models/minimax_m3/amd/ops/sparse_attn.py): CDNA sub-tiling params.
+# CDNA sub-tiling params.
 # gfx950 -> SUB_K = BLOCK_SIZE_K//2, gfx942 -> //4. SGLANG_SPARSE_ATTN_SUBK=0
 # disables and restores the original dense path.
 _SPARSE_SUBK_CACHE = None
@@ -232,13 +232,10 @@ def _gqa_share_sparse_fwd_kernel(
         q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_KD)
         # sparse attention
         if SUB_K > 0:
-            # PORT of vLLM's gfx950 sparse-attn sub-tiling
-            # (vllm/models/minimax_m3/amd/ops/sparse_attn.py): split each
+            # Split each
             # BLOCK_SIZE_K-token KV block into SUB_K-token sub-tiles so each
-            # QK/PV MFMA is right-sized. vLLM: "5x+ kernel speedup over the dense
-            # path in an MI350 sweep". Measured here: their kernel 48.0ms vs this
-            # one 103.2ms for the same 57 prefill calls (2.2x).
-            # Numerically equivalent (flash-softmax reassociation).
+            # QK/PV MFMA is right-sized. Numerically equivalent to the dense
+            # path (flash-softmax reassociation).
             NUM_SUB: tl.constexpr = BLOCK_SIZE_K // SUB_K
             for i in range(real_topk):
                 c = tl.load(t_ptr_j).to(tl.int32) * BLOCK_SIZE_K

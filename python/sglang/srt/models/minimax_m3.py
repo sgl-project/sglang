@@ -735,10 +735,9 @@ class MiniMaxM3Attention(nn.Module):
             and self.index_rotary_emb is self.rotary_emb
         )
 
-        # Opt-in prefill ports (both default off -> byte-identical behavior):
-        # PORT A (dfd35ad2a8, prefill half): skip-layer index elision in the
-        # fused rope+cache kernel. PORT B (c15159643d, adapted): aiter
-        # fused_qknorm_idxrqknorm builtin for extend-mode rope+cache.
+        # Opt-in prefill toggles (both default off -> byte-identical behavior):
+        # (A) skip-layer index elision in the fused rope+cache kernel;
+        # (B) aiter fused_qknorm_idxrqknorm builtin for extend-mode rope+cache.
         self._prefill_skip_index_env = envs.SGLANG_OPT_USE_PREFILL_SKIP_INDEX.get()
         self._aiter_rope_cache_env = envs.SGLANG_OPT_USE_AITER_ROPE_CACHE.get()
 
@@ -1018,7 +1017,7 @@ class MiniMaxM3Attention(nn.Module):
             k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
             idx_k_cache = kv_pool.get_index_k_buffer(layer_id)
             is_extend_mode = not forward_batch.forward_mode.is_decode_or_idle()
-            # PORT A (dfd35ad2a8, prefill half): an index-topk "skip" layer
+            # Index elision: an index-topk "skip" layer
             # reuses the group source layer's top-k in prefill AND (via decode
             # top-k reuse) in decode, so its idx_q/idx_k are never consumed and
             # its idx-K cache is never read. Drop the index arms of the fused
@@ -1033,7 +1032,7 @@ class MiniMaxM3Attention(nn.Module):
                     _skip_index = _sb.prefill_skip_index_elision(
                         layer_id, self.disable_index_value
                     )
-            # PORT B (c15159643d, adapted): aiter fused_qknorm_idxrqknorm
+            # aiter fused_qknorm_idxrqknorm
             # builtin for extend-mode rope+cache when the packed fused-GEMM row
             # is available. Skip layers stay on the Triton kernel with
             # skip_index=True (the builtin always does the index arms).

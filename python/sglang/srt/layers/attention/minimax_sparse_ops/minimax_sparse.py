@@ -118,7 +118,7 @@ def minimax_sparse_prefill(
 
     # All seqlen is less than topk, use full attention
     if cached_topk_idx is not None:
-        # Index cache hit (ATOM #1354): reuse a prior sparse layer's reduced
+        # Index cache hit: reuse a prior sparse layer's reduced
         # top-k, skipping Step 1 (flash-index attention + top-k) and Step 2
         # (reduce). idx_o is unused downstream for disable_index_value layers.
         idx_o = None
@@ -169,8 +169,7 @@ def minimax_sparse_prefill(
     # no attn-sink input, so keep the Triton path when sink is present.
     o = None
     if envs.SGLANG_OPT_USE_ATOM_PREFILL.get():
-        # PORT (alexsun07 1d5282863c + 6f1821cfe0 + 1185d5ca88), adapted to the
-        # NHD KV pool: gather this batch's context spans into a SHUFFLE-5D
+        # Gather this batch's context spans from the NHD KV pool into a SHUFFLE-5D
         # scratch and run AITER's Gluon paged attention per query token. Any
         # unsupported case (gate False or runtime error) falls back to the
         # Triton kernel below.
@@ -317,7 +316,7 @@ def minimax_sparse_decode(
     return_topk_idx: bool = False,
     topk_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # PORT (alexsun07 dfd35ad2a8, decode half): index cache for DECODE. When
+    # Index cache for DECODE. When
     # cached_topk_idx is given (a skip layer of an index-topk group), reuse the
     # group source layer's reduced top-k and skip Step 1 (flash-index decode +
     # top-k) and Step 2 (reduce) entirely; the skip layer never reads

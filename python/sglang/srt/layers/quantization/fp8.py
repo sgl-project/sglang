@@ -122,8 +122,7 @@ _is_gfx95_supported = is_gfx95_supported()
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 # SGLANG_FORCE_MXFP8_BLOCK_CONVERT=1 opts into that same block-fp8 path on
 # gfx950 (MI35x): it routes the fp8 GEMMs / fused MoE through the mature aiter
-# block-scale kernels instead of the native MX dot_scaled path (measured +20%
-# throughput at equal accuracy on MiniMax-M3, GSM8K 0.9719 vs 0.9689).
+# block-scale kernels instead of the native MX dot_scaled path.
 _mxfp8_to_block_fp8_required = mxfp8_block_convert_required() or get_bool_env_var(
     "SGLANG_FORCE_MXFP8_BLOCK_CONVERT"
 )

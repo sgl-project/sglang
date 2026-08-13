@@ -676,8 +676,7 @@ def flash_prefill_with_topk_index(
         and q_scale is None
         and k_scale is None
     ):
-        # PORT (alexsun07 m3-atom-prefill-port 6acfd933d7 + 191624ff8a):
-        # source layers never use idx_o, so run the minimal ATOM-style
+        # Source layers never use idx_o, so run the minimal
         # score-only kernel (~1.6x faster) with per-page K addressing
         # (bit-exact topk; -8.4% more at page_size>1).
         _index_block_score_only_kernel[grid](
