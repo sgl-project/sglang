@@ -24,7 +24,7 @@ from sglang.srt.utils import (
     is_hip,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import mxfp_supported
+from sglang.srt.utils.common import is_gfx95_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -79,7 +79,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         self.with_bias = False
 
         if not self.is_checkpoint_mxfp4_serialized:
-            if not mxfp_supported():
+            if not is_gfx95_supported():
                 raise NotImplementedError(
                     "Online MXFP4 quantization for MoE layers requires an AMD ROCm "
                     "device with FP4 hardware support (gfx95x, e.g. MI355x)."
@@ -196,9 +196,18 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         extra_weight_attrs["weight_loader"] = weight_loader
 
         # WEIGHTS
+        # Serialized MXFP4 must keep the aiter-aligned dims from
+        # get_moe_weight_sizes(): w13_weight_scale / w2_weight_scale below are
+        # still sized off w13_up_dim / w2_down_dim, and `weight_padded` is
+        # advertised to the loader, so allocating the raw (unpadded) dims here
+        # desyncs the weights from their scales.
         w13_shape = (
             num_experts,
-            2 * intermediate_size_per_partition,
+            (
+                w13_up_dim
+                if self.is_checkpoint_mxfp4_serialized
+                else 2 * intermediate_size_per_partition
+            ),
             hidden_size // 2 if self.is_checkpoint_mxfp4_serialized else hidden_size,
         )
         w13_weight = torch.nn.Parameter(
@@ -217,7 +226,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             num_experts,
             hidden_size,
             (
-                intermediate_size_per_partition // 2
+                w2_down_dim
                 if self.is_checkpoint_mxfp4_serialized
                 else intermediate_size_per_partition
             ),

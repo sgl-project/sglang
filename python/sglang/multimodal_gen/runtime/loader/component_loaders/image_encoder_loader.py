@@ -16,8 +16,14 @@ class ImageEncoderLoader(TextEncoderLoader):
     component_names = ["image_encoder"]
     expected_library = "transformers"
 
-    def should_offload(self, server_args, model_config: ModelConfig | None = None):
-        should_offload = server_args.image_encoder_cpu_offload
+    def should_offload(
+        self,
+        server_args,
+        model_config: ModelConfig | None = None,
+        component_name: str | None = None,
+    ):
+        component_name = component_name or "image_encoder"
+        should_offload = server_args.should_cpu_offload_component(component_name)
         if not should_offload:
             return False
         # _fsdp_shard_conditions is in arch_config, not directly on model_config
@@ -54,7 +60,6 @@ class ImageEncoderLoader(TextEncoderLoader):
         finalize_encoder_folding(
             encoder_config,
             server_args.encoder_parallel,
-            batched=server_args.batching_max_size > 1,
         )
 
         # Always start with local device; load_model will adjust for offload if needed
@@ -67,6 +72,7 @@ class ImageEncoderLoader(TextEncoderLoader):
             cpu_offload_flag=(
                 cpu_offload_flag
                 if cpu_offload_flag is not None
-                else server_args.image_encoder_cpu_offload
+                else server_args.should_cpu_offload_component(component_name)
             ),
+            component_name=component_name,
         )

@@ -24,20 +24,26 @@ use tokio::sync::mpsc;
 
 use super::AppState;
 use super::frame::{
-    OutputAccumulator, cumulative_frame_string, error_value, frame_value, stream_frame_string,
-    tag_value,
+    OutputAccumulator, cumulative_frame_string, frame_value, stream_frame_string, tag_value,
 };
 use super::guard::AbortGuard;
-use super::submit::{pre_submit_error, submit};
+use super::submit::submit;
 use crate::environ::env_bool;
 use crate::ids::Rid;
 use crate::message::{EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams};
+use crate::utils::response::{error_response, error_value};
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/generate", post(generate))
         .merge(health_routes())
+}
+
+/// native api error response: unary → `code` plus the JSON `body`,
+/// streaming → 200 with one SSE error frame + `[DONE]`.
+pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Response {
+    error_response(code, error_value(code.as_u16(), message), stream)
 }
 
 /// `/health` + `/health_generate`. Both env knobs are resolved ONCE here, at
@@ -61,6 +67,10 @@ fn health_routes() -> Router<AppState> {
         .route("/health_generate", probe)
 }
 
+/// Sentinel host that makes the KV connector no-op. Parity with
+/// `sglang.srt.disaggregation.utils.FAKE_BOOTSTRAP_HOST`.
+const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
+
 /// `GET /health_generate` — deep health: confirm the scheduler → detok path is
 /// producing output. 200 iff the egress heartbeat advances within `timeout`
 /// (from `SGLANG_HEALTH_CHECK_TIMEOUT`, frozen at router build), else 503.
@@ -80,6 +90,10 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
     // Fire the probe (the heartbeat is the signal, not its own response). A busy
     // scheduler skips it with no terminal frame, so its detok registration is
     // cleaned up only by the `AbortGuard` below.
+    //
+    // On a PD node the scheduler 400-aborts room-less requests, so inject the
+    // same fake bootstrap pair Python uses (`FAKE_BOOTSTRAP_HOST` / room 0).
+    let pd = state.server_args.is_disaggregation();
     let probe = GenerateRequest {
         // The `HEALTH_CHECK_<uuid>` rid form
         rid: Rid::new_health_check(),
@@ -91,6 +105,8 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
             ..Default::default()
         },
         stream: false,
+        bootstrap_host: pd.then(|| FAKE_BOOTSTRAP_HOST.into()),
+        bootstrap_room: pd.then_some(0),
         ..Default::default()
     };
     let (rid, _keepalive) =
@@ -138,20 +154,25 @@ async fn generate(
         // can only answer unary — as Python's does (FastAPI rejects before its
         // handler runs).
         Err(rejection) => {
-            return pre_submit_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
         }
     };
     let stream = body.stream;
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form → the response is a JSON array.
-    let (payloads, is_batch) = match body.into_requests() {
+    let (mut payloads, is_batch) = match body.into_requests() {
         Ok(v) => v,
         // The error carries its own status (a bad batch is `Validation` → 400).
         Err(e) => {
             let code = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::BAD_REQUEST);
-            return pre_submit_error(code, &e.to_string(), stream);
+            return native_error(code, &e.to_string(), stream);
         }
     };
+    // Media I/O (URL downloads, file reads) happens here, on the API runtime
+    // — never on the MM worker pool (see `prefetch`).
+    if let Err(e) = super::prefetch::prefetch_all(&mut payloads).await {
+        return native_error(StatusCode::BAD_REQUEST, &e, stream);
+    }
     if !is_batch {
         // `into_requests` guarantees exactly one payload for a non-batch body.
         let payload = payloads
@@ -233,7 +254,7 @@ async fn drain_unary(
                     StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return (status, error_value(code, &e.to_string()), true);
             }
-            EgressItem::Control(_) => continue, // never on `/generate`
+            EgressItem::Control(_) | EgressItem::Data(_) => continue, // never on `/generate`
         }
     }
     // Sender dropped without a terminal item: the shard dropped this request (a
@@ -366,7 +387,7 @@ fn generation_event_stream(
                         terminal = Some(out);
                     }
                     EgressItem::Error(e) => failed = Some(e),
-                    EgressItem::Control(_) => {} // never on /generate
+                    EgressItem::Control(_) | EgressItem::Data(_) => {} // never on /generate
                 }
             }
 
