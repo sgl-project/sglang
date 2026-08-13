@@ -141,11 +141,17 @@ DCP adds a context-independent decode collective while cutting context-dependent
 
 ## Compositions
 
-### DCP × DSpark
+### DCP × speculative decoding
 
-DSpark proposal stays replicated. DCP enters at target verification, where static mode gives every request the same candidate width and reuses the decode-shaped path. MLA verification builds rank-local lengths and block tables, then follows the same local-attention-and-merge path as decode. KDA stages recurrent state and commits only the accepted prefix. DCP saves target MLA KV, not draft KV or KDA state.
+The draft KV cache is replicated: every DCP rank stores the full draft context. DCP only stripes the target MLA KV, so it saves target cache, not draft cache.
 
-Current limits: Kimi K3 requires `SGLANG_RAGGED_VERIFY_MODE=static`; compact and cap-accept modes are not yet validated. Target verify and draft extend use the DCP-capable decode backend. HiCache+DCP currently rejects speculative decoding.
+Target verify and decode use the DCP-aware MLA kernels `cutedsl_mla` (FlashInfer cute-dsl) and `tokenspeed_mla` (TokenSpeed). Both:
+
+1. Build a rank-local page table from the cyclic token map (`owner(p) = p mod c`).
+2. Run attention against that shard, passing `cp_world`, `cp_rank`, and the global KV lengths so causality still sees the full sequence.
+3. Return a rank-local `(output, LSE)` that the usual DCP all-to-all merge combines.
+
+Draft steps use the same backends against the replicated draft cache, so they skip DCP metadata. Kimi K3 DCP selects `cutedsl_mla` or `tokenspeed_mla` automatically.
 
 ### DCP × PD disaggregation
 
@@ -166,13 +172,6 @@ HiCache keeps one widened logical page space across L1 and L2. The controller se
 Before H2D or D2H, both index lists keep positions owned by this rank and map `i` to `floor(i / c)`. Transfers cover whole widened pages, and every rank moves its shard independently, with no DCP collective. For Kimi K3 this applies to MLA KV; KDA/Mamba state uses its own request-indexed host pool.
 
 The current scope is MLA L1/L2. L3, LMCache, HiSparse, non-MLA KV host pools, speculative decoding, and PD decode are not supported in this combination.
-
-## Current boundaries
-
-- Triton MHA/GQA DCP uses a heavier path: Q all-gather, LSE all-gather, FP32 output all-reduce, and head slicing. Extend does not support score modifiers, sinks, custom masks, or sliding windows.
-- Kimi K3 disables symmetric memory under DCP; its CUDA-graph combination is not yet validated.
-- Startup does not yet enforce DCP containment inside effective attention-TP groups.
-- Profile real deployments, especially large MoE models. The decode collective is additive with expert, pipeline, and PD traffic.
 
 ## References
 
