@@ -18,7 +18,7 @@ from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
-    get_world_group,
+    get_replica_group,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -517,19 +517,16 @@ class TextEncodingStage(ConditionEncodingStage):
 
         dp splits the request batch across ranks and all-gathers the outputs,
         so each rank must hold a full encoder replica it can run alone. The
-        DiT's TP/SP layout is irrelevant to that: encoders are only ever
-        sharded through folding, which is gated on its own below.
+        DiT's parallel layout is irrelevant to that: encoders are only ever
+        sharded through folding, which is gated on its own below, and the
+        split stays inside the replica group — the ranks that share this
+        batch — so pipeline replicas never mix requests.
         """
         if server_args.encoder_parallel not in ("auto", "dp"):
             return None
         # a folded encoder is sharded over its folding group, so a single rank
         # cannot encode a batch slice by itself
         if encoder_config.parallel_folding_mode is not None:
-            return None
-        # dp_size > 1 already splits requests across pipeline replicas one
-        # level up; re-splitting inside a replica would desync the scheduler's
-        # batch accounting
-        if (server_args.dp_size or 1) != 1:
             return None
         # the gather rebuilds a BaseEncoderOutput, which only a TextEncoder
         # forward produces -- a raw transformers encoder returns its own output
@@ -539,7 +536,7 @@ class TextEncodingStage(ConditionEncodingStage):
             return None
         if not text_encoder.supports_dp_encode:
             return None
-        group = get_world_group()
+        group = get_replica_group()
         if group.world_size <= 1:
             return None
         # explicit dp trusts the operator on an unmeasured topology; auto does not

@@ -710,8 +710,20 @@ class ServerArgs(DisaggServerArgsMixin):
         replica_size = (self.num_gpus or tp_size) // dp_size
 
         fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
+        # An explicit fold policy is honored for any multi-rank replica —
+        # pure-TP (replica == tp) and dp>1 shapes included. Encoder layout is
+        # independent of the DiT's parallelism; the replica group is simply
+        # "the ranks that share this batch". `auto` keeps its conservative
+        # proposals below and never folds a pure-TP replica.
+        fold_replica = (
+            self.encoder_parallel == "fold"
+            and not self.disagg_mode
+            and replica_size > 1
+        )
 
-        if fold_world:
+        if fold_replica:
+            mode = "replica"
+        elif fold_world:
             mode = "world"
         elif tp_size == 1 and sp_degree > 1:
             # Preserve prior behavior for dp>1 / disaggregated SP runs.
@@ -1892,7 +1904,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "single-request latency) and data-parallels eligible native "
                 "text encoders at batch>1; `fold` always tensor-parallels the "
                 "encoder weights; `dp` never folds and splits the batch across "
-                "ranks (best batched throughput; requires DP=1); "
+                "the replica's ranks (best batched throughput); "
                 "`replicate` disables both. The default is `auto`."
             ),
         )
@@ -3171,12 +3183,6 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
-        # dp only needs each rank to hold a runnable encoder replica; the DiT's
-        # TP layout does not shard encoders (only folding does, and an explicit
-        # dp policy drops folding at load time). dp_size > 1 stays rejected:
-        # requests are already split across pipeline replicas one level up.
-        if self.encoder_parallel == "dp" and (self.dp_size or 1) != 1:
-            raise ValueError("encoder_parallel=dp requires dp_size=1")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""

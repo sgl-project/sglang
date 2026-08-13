@@ -40,7 +40,10 @@ def _worker() -> int:
         BaseEncoderOutput,
         TextEncoderConfig,
     )
-    from sglang.multimodal_gen.runtime.distributed import get_world_group
+    from sglang.multimodal_gen.runtime.distributed import (
+        get_replica_group,
+        get_world_group,
+    )
     from sglang.multimodal_gen.runtime.distributed.parallel_state import (
         get_tp_group,
         maybe_init_distributed_environment_and_model_parallel,
@@ -78,6 +81,10 @@ def _worker() -> int:
     )
     if group is None:
         failures.append("dp gate refused a replicated encoder under tp>1")
+    elif group is not get_replica_group():
+        failures.append("dp gate returned a group other than the replica group")
+    if get_replica_group().world_size != _WORLD:
+        failures.append("replica group size mismatch (dp_size==1: replica == world)")
 
     # --- sharded + gathered encode must equal the replicated forward ---
     if group is not None:

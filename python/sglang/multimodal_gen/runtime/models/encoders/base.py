@@ -36,6 +36,12 @@ def get_folding_tp_group(config: EncoderConfig):
     if mode == "world":
         # the whole single-replica DiT (all GPUs), regardless of tp/sp/cfg.
         return get_world_group()
+    if mode == "replica":
+        # the ranks serving this rank's pipeline replica (== world when
+        # dp_size is 1); the shape-independent choice for explicit folding
+        from sglang.multimodal_gen.runtime.distributed import get_replica_group
+
+        return get_replica_group()
     if mode is None:
         return get_tp_group()
     raise ValueError(f"Unsupported encoder folding mode: {mode!r}")

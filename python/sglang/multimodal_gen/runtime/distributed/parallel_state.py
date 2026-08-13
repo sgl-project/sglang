@@ -66,6 +66,9 @@ _SP: SequenceParallelGroupCoordinator | None = None
 _PP: PipelineGroupCoordinator | None = None
 _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
+# all ranks serving one pipeline replica (every dim except dp); with
+# dp_size == 1 it coincides with the world group
+_REPLICA: GroupCoordinator | None = None
 _VAE_DECODE: GroupCoordinator | None = None
 _DIT: ProcessGroup | None = None
 _VAE: ProcessGroup | None = None
@@ -187,6 +190,7 @@ def init_parallel_group_coordinator(
         "sequence",
         "classifier_free_guidance",
         "vae_decode",
+        "replica",
     ], f"parallel_mode {parallel_mode} is not supported"
     if parallel_mode == "pipeline":
         return PipelineGroupCoordinator(
@@ -324,6 +328,16 @@ def get_dp_group() -> GroupCoordinator:
     return _DP
 
 
+def get_replica_group() -> GroupCoordinator:
+    """The ranks that share this rank's request batch — its pipeline replica.
+
+    Encoder-side collectives (batch data-parallel encode, replica-wide
+    folding) must use this group rather than the world group, which spans
+    replicas when dp_size > 1."""
+    assert _REPLICA is not None, "replica group is not initialized"
+    return _REPLICA
+
+
 # xDiT
 def initialize_model_parallel(
     data_parallel_size: int = 1,
@@ -419,6 +433,15 @@ def initialize_model_parallel(
         local_rank=get_world_group().local_rank,
         backend=backend,
         parallel_mode="data",
+    )
+
+    global _REPLICA
+    assert _REPLICA is None, "replica group is already initialized"
+    _REPLICA = init_parallel_group_coordinator(
+        group_ranks=rank_generator.get_ranks("tp-sp-pp-cfg"),
+        local_rank=get_world_group().local_rank,
+        backend=backend,
+        parallel_mode="replica",
     )
 
     global _CFG
@@ -920,7 +943,7 @@ def init_vae_group(
 
 def destroy_model_parallel() -> None:
     """Set the groups to none and destroy them."""
-    global _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE
+    global _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE, _REPLICA
 
     _clear_srt_tp_group()
     # The IPC transport keeps CUDA mappings associated with the current
@@ -930,7 +953,7 @@ def destroy_model_parallel() -> None:
 
     IPC_A2A.reset()
 
-    for group in (_TP, _SP, _DP, _CFG, _PP, _VAE_DECODE):
+    for group in (_TP, _SP, _DP, _CFG, _PP, _REPLICA, _VAE_DECODE):
         if group is not None:
             group.destroy()
 
@@ -954,4 +977,4 @@ def destroy_model_parallel() -> None:
         if group is not None:
             torch.distributed.destroy_process_group(group)
 
-    _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE = (None,) * 8
+    _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE, _REPLICA = (None,) * 9
