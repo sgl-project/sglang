@@ -16,6 +16,7 @@
 import dataclasses
 import logging
 from contextlib import contextmanager
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -69,6 +70,26 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedLinearMethod",
     "PackWeightMethod",
 }
+
+
+@lru_cache(maxsize=None)
+def _supports_mm_fp32_out_dtype(device_type: str, dtype: torch.dtype) -> bool:
+    """Whether ``torch.mm(..., out_dtype=torch.float32)`` works for ``dtype``.
+
+    Not every backend implements the mixed input/output GEMM: on ROCm the
+    non-hipBLASLt paths (e.g. the Composable Kernel BLAS backend used by some
+    AMD CI images) raise
+    ``gemm input type at::BFloat16 and output type float is not supported``.
+    Probe once per (device, dtype) with a tiny GEMM and fall back to the
+    explicit FP32 cast when unsupported.
+    """
+    try:
+        probe = torch.zeros(1, 1, dtype=dtype, device=device_type)
+        torch.mm(probe, probe, out_dtype=torch.float32)
+        return True
+    except (RuntimeError, TypeError):
+        return False
+
 
 # None outside a FlashInfer autotune pass; inside one, whether that pass runs the
 # LM head. Not-None means the forward's output is discarded -- attention backends
@@ -712,6 +733,9 @@ class LogitsProcessor(nn.Module):
                     hidden_states.is_cuda
                     and hidden_states.dtype == lm_head.weight.dtype
                     and hidden_states.dtype in (torch.float16, torch.bfloat16)
+                    and _supports_mm_fp32_out_dtype(
+                        hidden_states.device.type, hidden_states.dtype
+                    )
                 )
                 if use_mm_out_dtype:
                     logits = torch.mm(

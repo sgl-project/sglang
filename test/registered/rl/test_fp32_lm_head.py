@@ -6,7 +6,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessor,
+    _supports_mm_fp32_out_dtype,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -37,6 +40,18 @@ class TestLMHeadFP32(unittest.TestCase):
             hasattr(torch, "xpu") and torch.xpu.is_available()
         ):
             raise unittest.SkipTest("needs CUDA GPU or XPU")
+
+    @staticmethod
+    def _expected_operation(dtype):
+        # The fused mm(out_dtype=fp32) path is only taken where the BLAS
+        # backend implements it (notably not on some ROCm backends), so the
+        # expectation has to be probed the same way the kernel selects it.
+        # Warm the cache here: the probe itself calls torch.mm, which would
+        # otherwise be intercepted by the mock inside _run_case.
+        supported = torch.cuda.is_available() and _supports_mm_fp32_out_dtype(
+            torch.device(get_device()).type, dtype
+        )
+        return "mm" if supported else "matmul"
 
     def _make_logprocessor(self, vocab_size, enable_fp32):
         # LogitsProcessor reads get_exec().features.enable_fp32_lm_head
@@ -121,7 +136,7 @@ class TestLMHeadFP32(unittest.TestCase):
         )
 
     def test_flag_true_fp16_activations(self):
-        expected_operation = "mm" if torch.cuda.is_available() else "matmul"
+        expected_operation = self._expected_operation(torch.float16)
         expected_dtype = (
             torch.float32 if expected_operation == "matmul" else torch.float16
         )
@@ -135,7 +150,7 @@ class TestLMHeadFP32(unittest.TestCase):
         )
 
     def test_flag_true_bf16_activations(self):
-        expected_operation = "mm" if torch.cuda.is_available() else "matmul"
+        expected_operation = self._expected_operation(torch.bfloat16)
         expected_dtype = (
             torch.float32 if expected_operation == "matmul" else torch.bfloat16
         )
