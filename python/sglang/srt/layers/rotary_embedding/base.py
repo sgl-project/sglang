@@ -478,9 +478,9 @@ class RotaryEmbedding(BaseFusedOp):
             q_2d = query.dim() == 2
             k_2d = key.dim() == 2
             if q_2d:
-                query = query.unsqueeze(1)
+                query = query.view(query.shape[0], -1, self.head_size)
             if k_2d:
-                key = key.unsqueeze(1)
+                key = key.view(key.shape[0], -1, self.head_size)
             q_out, k_out = torch.ops.sgl_kernel.rotary_embedding(
                 positions,
                 query,
@@ -490,9 +490,9 @@ class RotaryEmbedding(BaseFusedOp):
                 self.is_neox_style,
             )
             if q_2d:
-                q_out = q_out.squeeze(1)
+                q_out = q_out.view(q_out.shape[0], -1)
             if k_2d:
-                k_out = k_out.squeeze(1)
+                k_out = k_out.view(k_out.shape[0], -1)
             return q_out, k_out
 
 
