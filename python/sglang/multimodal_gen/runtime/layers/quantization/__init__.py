@@ -8,10 +8,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
-from sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8 import (
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
     ModelOptFp8Config as ModelOptFp8DiffusionConfig,
 )
