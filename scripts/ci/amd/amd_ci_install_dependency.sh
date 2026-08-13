@@ -48,11 +48,22 @@ docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
 # Helper function to install with retries and fallback PyPI mirror
 install_with_retry() {
   local max_attempts=3
-  local cmd="$@"
+  # Keep the command as an argv array and run it directly. Do NOT flatten it
+  # into a string and `eval` it: arguments that contain spaces or shell
+  # metacharacters get re-parsed by the shell. Two ways that bit us:
+  #   * "sgl-eval @ git+https://..." (PEP 508) split into three words, so pip
+  #     saw a bare "@" -> "Invalid requirement: '@'".
+  #   * 'httpx>=0.25.0' was treated as a redirect, creating a file named
+  #     "=0.25.0" and silently never installing httpx.
+  local -a cmd=("$@")
+  local -a fallback_index_args=(
+    --index-url https://mirrors.aliyun.com/pypi/simple/
+    --trusted-host mirrors.aliyun.com
+  )
 
   for attempt in $(seq 1 $max_attempts); do
-    echo "Attempt $attempt/$max_attempts: $cmd"
-    if eval "$cmd"; then
+    echo "Attempt $attempt/$max_attempts: ${cmd[*]}"
+    if "${cmd[@]}"; then
       echo "Success!"
       return 0
     fi
@@ -61,9 +72,9 @@ install_with_retry() {
       echo "Failed, retrying in 5 seconds..."
       sleep 5
       # Try with alternative PyPI index on retry
-      if [[ "$cmd" =~ "pip install" ]] && [ $attempt -eq 2 ]; then
-        cmd="$cmd --index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com"
-        echo "Using fallback PyPI mirror: $cmd"
+      if [[ " ${cmd[*]} " == *" pip install "* ]] && [ $attempt -eq 2 ]; then
+        cmd+=("${fallback_index_args[@]}")
+        echo "Using fallback PyPI mirror: ${cmd[*]}"
       fi
     fi
   done
