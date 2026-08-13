@@ -135,9 +135,11 @@ fn parse_caller_hash(entry: &str) -> Option<u64> {
 }
 
 /// One parked result: the buffers the drain-time Python adapter needs (the
-/// expanded `input_ids` travel separately, via `TmEvent::MmEncoded`). The qwen
-/// shape (`sglang_mm::qwen_vl::pack_output`); generalizes to a
-/// named-tensor handoff once a family needs a different one.
+/// expanded `input_ids` travel separately, via `TmEvent::MmEncoded`).
+///
+/// TODO(mm-families): these fields are the shape the only current family
+/// (qwen_vl) produces; generalize to a named-tensor handoff when a family
+/// needs a different one.
 pub struct MmEncodedEntry {
     pub features: FeatureStore,
     /// Per item `[t, h, w]` patch grid.
@@ -225,6 +227,9 @@ fn process(
         })?;
         tokenizer.encode(text).map_err(|error| error.to_string())
     })?;
+    // TODO(mm-families): the one family-specific call in this worker — dispatch
+    // on the spec's `family` (as `registry::pipeline_from_spec` does) once a
+    // second family lands.
     let mut packed = sglang_mm::qwen_vl::pack_output(output)?;
     apply_caller_hashes(&mut packed.hashes, &caller_hashes);
     let features = if ctx.feature_shm {
