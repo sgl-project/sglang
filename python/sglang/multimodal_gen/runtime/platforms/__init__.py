@@ -115,7 +115,26 @@ def rocm_platform_plugin() -> str | None:
         finally:
             amdsmi.amdsmi_shut_down()
     except Exception as e:
-        logger.debug("ROCm platform is unavailable: %s", e)
+        logger.debug("ROCm platform is unavailable via amdsmi: %s", e)
+
+    if not is_rocm:
+        # amdsmi is optional and absent from some ROCm images; without this,
+        # detection falls through to CpuPlatform with no error.
+        try:
+            import torch
+
+            if (
+                getattr(torch.version, "hip", None) is not None
+                and torch.cuda.is_available()
+                and torch.cuda.device_count() > 0
+            ):
+                is_rocm = True
+                logger.warning(
+                    "ROCm detected via torch, but amdsmi is unavailable. Install "
+                    "amdsmi for full platform introspection."
+                )
+        except Exception as exc:
+            logger.debug("torch ROCm detection failed: %s", exc)
 
     return (
         "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform" if is_rocm else None
