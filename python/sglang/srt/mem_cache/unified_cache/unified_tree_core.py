@@ -968,10 +968,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             dup_start = max(0, state.params.prev_prefix_len - state.total_prefix_length)
             if dup_start < consumed_from:
                 step_actions.append(
-                    FreeDeviceKV(
-                        [value_slice[dup_start:consumed_from]],
-                        start_pos=state.total_prefix_length + dup_start,
-                    )
+                    FreeDeviceKV([value_slice[dup_start:consumed_from]])
                 )
 
         if self._inc_hit_count_and_check(node, state.params.chunked):

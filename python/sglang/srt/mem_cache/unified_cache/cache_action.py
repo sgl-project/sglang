@@ -31,17 +31,9 @@ class ReplaceWriteThroughOnNodeSplit(msgspec.Struct, frozen=True):
 
 
 class FreeDeviceKV(msgspec.Struct, frozen=True):
-    """Free unreferenced device KV slots (a SWA-aware combined free).
-
-    ``start_pos`` is where ``indices[0]`` sits in the request's kv row. The
-    allocator needs it to know the first page's offset -- deriving it from the
-    index value would mean reading device memory. It applies to every tensor in
-    ``indices``, so a producer whose tensors start at different row positions
-    must emit one action each.
-    """
+    """Free unreferenced device KV slots (a SWA-aware combined free)."""
 
     indices: list[torch.Tensor]
-    start_pos: int = 0
 
 
 class ComponentAction(msgspec.Struct, frozen=True):

@@ -883,13 +883,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 [action.new_node_id, action.new_child_node_id],
             )
         elif isinstance(action, FreeDeviceKV):
-            # start_pos, not 0: a producer may slice mid-page (an insert-overlap
-            # dup range, a partial SWA recover), and the allocator derives the
-            # first page's offset from it.
+            # tree values are page-aligned copies of a kv row: page-exact segments
             for indices in action.indices:
-                self.token_to_kv_pool_allocator.free_segment(
-                    indices, start_pos=action.start_pos
-                )
+                self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
             self._execute_and_commit_kv_backup(action)
         else:
