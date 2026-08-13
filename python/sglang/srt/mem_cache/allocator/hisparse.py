@@ -371,6 +371,13 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_swa(self, free_indices: torch.Tensor):
         self.logical_attn_allocator.free_swa(free_indices)
 
+    def free_swa_segment(
+        self, free_index: torch.Tensor, *, start_pos: int, swa_alive_from: int
+    ):
+        self.logical_attn_allocator.free_swa_segment(
+            free_index, start_pos=start_pos, swa_alive_from=swa_alive_from
+        )
+
     def available_size(self) -> int:
         return min(
             self.logical_attn_allocator.available_size(),

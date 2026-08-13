@@ -2489,6 +2489,25 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.swa_attn_allocator.free(live)
         self.swa_attn_allocator.clear_inverse_history()
 
+    def free_segment(
+        self,
+        free_index: torch.Tensor,
+        *,
+        start_pos: int,
+        swa_alive_from: Optional[int] = None,
+    ) -> None:
+        """free() is atomic here: it filters the swa side against v2p and then
+        clears BOTH inverse histories. The parent splits the two sides into
+        full_attn_allocator.free_segment plus free_swa, which skips that."""
+        self.free(free_index)
+
+    def free_swa_segment(
+        self, free_index: torch.Tensor, *, start_pos: int, swa_alive_from: int
+    ) -> None:
+        """Opt out of the parent's fixed-shape path: the swa v2p IS the mapping
+        here (no mapping table) and a tombstone is -1, not 0."""
+        self.free_swa(free_index)
+
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:

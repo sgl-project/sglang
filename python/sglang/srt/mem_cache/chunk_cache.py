@@ -84,7 +84,15 @@ class ChunkCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
         ]
-        self.token_to_kv_pool_allocator.free(kv_indices)
+        # The SWA prefix below swa_evicted_seqlen was already released by
+        # out-of-window eviction. req.kv is set: release_kv_cache, the only
+        # caller, returns early while req_pool_idx is None and asserts the two
+        # share a lifetime.
+        self.token_to_kv_pool_allocator.free_segment(
+            kv_indices,
+            start_pos=req.cache_protected_len,
+            swa_alive_from=req.kv.swa_evicted_seqlen,
+        )
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[
