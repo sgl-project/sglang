@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -405,17 +406,25 @@ class DSparkWorkerV2(BaseSpecWorker):
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
+    def _linear_accept_indices(self, bs: int) -> torch.Tensor:
+        num_indices = bs * self.verify_num_draft_tokens
+        if (
+            self._linear_accept_index_cache is None
+            or self._linear_accept_index_cache.numel() < num_indices
+        ):
+            self._linear_accept_index_cache = torch.arange(
+                num_indices, dtype=torch.int64, device=self.device
+            )
+        return self._linear_accept_index_cache[:num_indices].view(
+            bs, self.verify_num_draft_tokens
+        )
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
     ) -> GenerationBatchResult:
-        if getattr(batch, "return_logprob", False):
-            raise ValueError(
-                "DSpark speculative decoding does not support return_logprob yet."
-            )
-
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
@@ -708,6 +717,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        if batch.return_logprob:
+            compute_spec_v2_logprobs(
+                batch,
+                logits_output,
+                accept.out_tokens.reshape(-1),
+                self._linear_accept_indices(bs),
+                self.verify_num_draft_tokens - 1,
+            )
+
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)
