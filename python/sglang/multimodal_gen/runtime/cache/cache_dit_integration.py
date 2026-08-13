@@ -273,16 +273,26 @@ DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS: dict[str, DualTransformerBlockAdapterSpec]
 }
 
 
-# Custom BlockAdapter for DiT models absent from cache-dit's BlockAdapterRegister.
-# Value: (blocks attr, forward_pattern). forward_pattern must
-# match the block's forward signature (see cache_dit.ForwardPattern; e.g., ERNIE
-# uses Pattern_3). has_separate_cfg follows the run (passed by
-# enable_cache_on_transformer); cache-dit auto-resolves the remaining
-# fields.
-_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, tuple[str, ForwardPattern]] = {
-    "ErnieImageTransformer2DModel": ("layers", ForwardPattern.Pattern_3),
-    "Krea2Transformer2DModel": ("transformer_blocks", ForwardPattern.Pattern_3),
-    "MiniMaxH3DiTModel": ("blocks", ForwardPattern.Pattern_3),
+@dataclass(frozen=True)
+class CustomBlockAdapterSpec:
+    blocks_attr: str
+    forward_pattern: ForwardPattern
+
+
+# Custom BlockAdapter metadata for models absent from cache-dit's registry.
+_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
+    "ErnieImageTransformer2DModel": CustomBlockAdapterSpec(
+        blocks_attr="layers",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
+    "Krea2Transformer2DModel": CustomBlockAdapterSpec(
+        blocks_attr="transformer_blocks",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
+    "MiniMaxH3DiTModel": CustomBlockAdapterSpec(
+        blocks_attr="blocks",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
 }
 
 
@@ -295,17 +305,16 @@ def _build_custom_block_adapter(
     spec = _CUSTOM_BLOCK_ADAPTER_SPECS.get(transformer.__class__.__name__)
     if spec is None:
         return None
-    blocks_attr, forward_pattern = spec
-    blocks = getattr(transformer, blocks_attr, None)
+    blocks = getattr(transformer, spec.blocks_attr, None)
     if blocks is None:
         raise ValueError(
             f"Transformer {transformer.__class__.__name__} has no attribute "
-            f"{blocks_attr!r} for cache-dit blocks."
+            f"{spec.blocks_attr!r} for cache-dit blocks."
         )
     return BlockAdapter(
         transformer=transformer,
         blocks=blocks,
-        forward_pattern=forward_pattern,
+        forward_pattern=spec.forward_pattern,
         has_separate_cfg=has_separate_cfg,
     )
 

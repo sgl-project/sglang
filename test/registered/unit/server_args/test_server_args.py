@@ -262,19 +262,17 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
-    def test_default_transport_is_cuda_ipc_for_multimodal_model(self, _mock_is_cuda):
+    def test_default_transport_is_cpu_for_multimodal_model(self, _mock_is_cuda):
         server_args = ServerArgs(model_path="dummy")
         self._set_model_type(server_args, is_multimodal=True)
 
         with patch.dict(os.environ, {}, clear=False):
             envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
-            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+            with self.assertNoLogs(server_args_module.logger, level="INFO"):
                 server_args._handle_multimodal_feature_transport()
 
-            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
-            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-
-        self.assertIn("auto-resolved to cuda_ipc", "\n".join(logs.output))
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @patch("sglang.srt.server_args.os.path.exists", return_value=True)
     @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True)
@@ -362,7 +360,7 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
-    def test_default_transport_is_cuda_ipc_for_language_only_model(self, _mock_is_cuda):
+    def test_default_transport_is_cpu_for_language_only_model(self, _mock_is_cuda):
         server_args = ServerArgs(model_path="dummy", language_only=True)
         self._set_model_type(server_args, is_multimodal=True)
 
@@ -370,8 +368,8 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
             server_args._handle_multimodal_feature_transport()
 
-            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
-            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @patch("sglang.srt.server_args.is_cuda", return_value=False)
     def test_cuda_ipc_rejects_non_nvidia_platforms(self, _mock_is_cuda):
@@ -660,6 +658,23 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_kv")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_kv")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_hisparse_accepts_flashinfer_sparse_mla_on_cuda_fp8(self, _mock_is_hip):
+        """SM120 GLM DSA resolves both DSA backends to flashinfer_sparse_mla, so
+        the fp8 hisparse allow-set must admit it or --enable-hisparse cannot
+        start there at all. The device/arch narrowing happens later, in
+        _validate_flashinfer_sparse_mla_backend."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="fp8_e4m3",
+            dsa_prefill_backend="flashinfer_sparse_mla",
+            dsa_decode_backend="flashinfer_sparse_mla",
+        )
+
+        server_args._validate_hisparse_dsa_backend("dsa_prefill_backend", "prefill")
+        server_args._validate_hisparse_dsa_backend("dsa_decode_backend", "decode")
 
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_defaults_to_tilelang_on_rocm(self, _mock_is_hip):
