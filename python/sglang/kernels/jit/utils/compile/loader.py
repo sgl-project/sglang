@@ -140,6 +140,12 @@ def load_jit(
                     spec.module_name,
                     e,
                 )
+                # A leaf is named after the dependency list it was built from,
+                # so the rebuild below lands on this exact name and publishing
+                # it would find the directory already there and keep the broken
+                # one -- leaving every later process to fail twice and rebuild
+                # for nothing. We hold the lock, so drop it now.
+                shutil.rmtree(prebuilt.parent, ignore_errors=True)
 
         # Build into a private staging directory, then publish it by renaming.
         # Building in place would let another process observe a leaf that exists

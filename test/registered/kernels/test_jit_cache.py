@@ -287,6 +287,24 @@ def test_a_foreign_leaf_does_not_block_a_valid_one(tmp_path):
     assert cache.find_prebuilt(scope=tmp_path, module_name="m") == good / "m.so"
 
 
+def test_a_hit_survives_an_unwritable_cache(tmp_path, monkeypatch):
+    """Touching the leaf is bookkeeping; it must never turn a hit into a crash.
+
+    The cache root can be a read-only mount, and a prune racing the lookup
+    leaves nothing to touch -- either way `os.utime` raises, and before this it
+    escaped `find_prebuilt` and took `load_jit` down on an otherwise good hit.
+    """
+    header = _write(tmp_path / "a.h", "x")
+    scope = tmp_path / "scope"
+    _publish_leaf(scope, [header], module_name="m")
+
+    def deny(*args, **kwargs):
+        raise PermissionError("read-only file system")
+
+    monkeypatch.setattr(cache.os, "utime", deny)
+    assert cache.find_prebuilt(scope=scope, module_name="m") is not None
+
+
 def test_missing_library_is_not_a_hit(tmp_path):
     dep = _write(tmp_path / "dep.h", "// v1")
     leaf = _publish_leaf(tmp_path, [dep])
@@ -404,10 +422,10 @@ def test_generated_ninja_asks_both_compilers_for_dependencies():
     compile_commands = [
         line
         for line in text.splitlines()
-        if line.startswith("  command = ") and " -c $in" in line
+        if line.startswith("  command = ") and ' -c "$in"' in line
     ]
     assert len(compile_commands) == 2
-    assert all("-MD -MF $out.d" in line for line in compile_commands)
+    assert all('-MD -MF "$out.d"' in line for line in compile_commands)
 
 
 def test_pure_cpp_module_does_not_link_the_gpu_runtime():

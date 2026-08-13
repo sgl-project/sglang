@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import os
 import pathlib
+import shlex
 import subprocess
 from typing import List
 
@@ -35,7 +36,38 @@ _NINJA_TIMEOUT_S = 1800
 
 
 def _escape(path: str) -> str:
-    return path.replace(":", "$:").replace(" ", "$ ")
+    """Escape a path for a ninja *path* field (a build statement's in/out)."""
+    return path.replace("$", "$$").replace(":", "$:").replace(" ", "$ ")
+
+
+def _arg(path: str) -> str:
+    """Render a path as one shell word inside a rule command.
+
+    Ninja's own escaping only survives ninja's parser: `$ ` reaches the command
+    line as a plain space, and every command runs through a shell, so an
+    unquoted include or library directory with a space in it arrives at the
+    compiler as several arguments. Quote for the shell first, then escape what
+    ninja still reads -- `$` is special everywhere in a build file.
+    """
+    return shlex.quote(path).replace("$", "$$")
+
+
+def _quote_path_flags(flags: List[str]) -> List[str]:
+    """Shell-quote the directory carried by every ``-I``/``-L`` flag.
+
+    Applied once, at the end, wherever the flag came from -- this layer, the
+    toolchain, or the caller -- so a directory with a space in it stays one
+    argument. Anything else is passed through untouched.
+    """
+    quoted: List[str] = []
+    for flag in flags:
+        for prefix in ("-I", "-L"):
+            if flag.startswith(prefix) and len(flag) > len(prefix):
+                quoted.append(prefix + _arg(flag[len(prefix) :]))
+                break
+        else:
+            quoted.append(flag)
+    return quoted
 
 
 def generate(spec: BuildSpec) -> str:
@@ -49,35 +81,39 @@ def generate(spec: BuildSpec) -> str:
 
     host_cc, device_cc = toolchain.compilers()
     includes = toolchain.base_include_paths() + list(spec.include_paths)
-    include_flags = [f"-I{_escape(path)}" for path in includes]
+    include_flags = [f"-I{path}" for path in includes]
 
-    cxxflags = toolchain.base_cxx_flags() + list(spec.cflags) + include_flags
-    cudaflags = (
+    cxxflags = _quote_path_flags(
+        toolchain.base_cxx_flags() + list(spec.cflags) + include_flags
+    )
+    cudaflags = _quote_path_flags(
         toolchain.base_cuda_flags()
         + toolchain.target_flags()
         + list(spec.cuda_cflags)
         + include_flags
     )
-    ldflags = toolchain.base_link_flags(with_device=with_device) + list(spec.ldflags)
+    ldflags = _quote_path_flags(
+        toolchain.base_link_flags(with_device=with_device) + list(spec.ldflags)
+    )
 
     lines = [
         "ninja_required_version = 1.3",
-        f"cxx = {host_cc}",
-        f"nvcc = {device_cc}",
+        f"cxx = {_arg(host_cc)}",
+        f"nvcc = {_arg(device_cc)}",
         f"cxxflags = {' '.join(cxxflags)}",
         f"cudaflags = {' '.join(cudaflags)}",
         f"ldflags = {' '.join(ldflags)}",
         "",
         "rule compile_cxx",
         "  depfile = $out.d",
-        "  command = $cxx -MD -MF $out.d $cxxflags -c $in -o $out",
+        '  command = $cxx -MD -MF "$out.d" $cxxflags -c "$in" -o "$out"',
         "",
         "rule compile_cuda",
         "  depfile = $out.d",
-        "  command = $nvcc -MD -MF $out.d $cudaflags -c $in -o $out",
+        '  command = $nvcc -MD -MF "$out.d" $cudaflags -c "$in" -o "$out"',
         "",
         "rule link",
-        "  command = $cxx $in $ldflags -o $out",
+        '  command = $cxx $in $ldflags -o "$out"',
         "",
     ]
 

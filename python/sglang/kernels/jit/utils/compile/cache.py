@@ -382,7 +382,13 @@ def find_prebuilt(*, scope: pathlib.Path, module_name: str) -> Optional[pathlib.
         if candidate.is_file():
             # Keep the mtime ordering meaningful: it is what puts this leaf
             # first next time, and what a size-bounded GC would evict by.
-            os.utime(leaf, None)
+            # Bookkeeping only, so it must never turn a hit into a failure: the
+            # cache root can be a read-only mount, and a prune racing the
+            # is_file() above leaves nothing here to touch.
+            try:
+                os.utime(leaf, None)
+            except OSError:
+                pass
             return candidate
 
     if reason:
