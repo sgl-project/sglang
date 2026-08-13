@@ -143,6 +143,7 @@ NIGHTLY_SUITES = {
         "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
+        "nightly-amd-8-gpu-mi35x-deepseek-v4-flash",
         # MI35x 8-GPU suite (different model configs)
         "nightly-amd-8-gpu-mi35x",
     ],
