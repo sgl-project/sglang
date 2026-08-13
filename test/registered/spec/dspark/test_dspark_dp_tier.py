@@ -5,10 +5,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.speculative.dspark_components.dspark_draft import (
-    DraftBlockProposer,
-    _make_num_token_non_padded,
-)
+from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     local_verify_tier_num_tokens,
@@ -88,25 +85,6 @@ class TestDraftDpSyncMetadata(CustomTestCase):
         self.assertEqual(forward_batch.num_token_non_padded.dtype, torch.int32)
         self.assertEqual(forward_batch.num_token_non_padded_cpu, 6)
         self.assertTrue(forward_batch.can_run_dp_cuda_graph)
-
-
-class TestDraftForwardNumTokenNonPadded(CustomTestCase):
-    def test_omits_device_scalar_without_token_padding(self):
-        with patch(
-            "sglang.srt.speculative.dspark_components.dspark_draft.enable_num_token_non_padded",
-            return_value=False,
-        ):
-            self.assertIsNone(_make_num_token_non_padded(2, "cpu"))
-
-    def test_preserves_device_scalar_with_token_padding(self):
-        with patch(
-            "sglang.srt.speculative.dspark_components.dspark_draft.enable_num_token_non_padded",
-            return_value=True,
-        ):
-            num_token_non_padded = _make_num_token_non_padded(2, "cpu")
-
-        self.assertEqual(num_token_non_padded.item(), 2)
-        self.assertEqual(num_token_non_padded.dtype, torch.int32)
 
 
 class TestBusyIdleGraphKeyIdentity(CustomTestCase):
