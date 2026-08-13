@@ -105,3 +105,5 @@
 /python/sglang/srt/speculative/frozen_kv_mtp_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl @pyc96
 /python/sglang/kernels/ops/speculative/ngram_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/kernels/jit/csrc/ngram_corpus @hnyls2002 @Qiaolin-Yu @kpham-sgl
+/python/sglang/srt/models/laguna.py @Jiminator
+/python/sglang/srt/configs/laguna.py @Jiminator

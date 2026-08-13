@@ -133,6 +133,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       " float eps, float fp8_min, float fp8_max, bool scale_ue8m0, bool fuse_silu_and_mul, Tensor? masked_m) -> ()");
   m.impl("sgl_per_token_group_quant_8bit_v2", torch::kCUDA, &sgl_per_token_group_quant_8bit_v2);
 
+  // Compatibility API: SGLang runtime dispatches to the JIT implementation,
+  // but external sgl_kernel consumers still rely on this exported CUDA op.
   m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
   m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
 

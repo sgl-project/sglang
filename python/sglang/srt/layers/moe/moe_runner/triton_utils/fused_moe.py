@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -92,6 +93,8 @@ if not _is_cuda and not _is_hip and not _is_xpu:
         _has_vllm_ops = False
 
 padding_size = get_moe_padding_size(_use_aiter)
+
+logger = logging.getLogger(__name__)
 
 
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
@@ -363,7 +366,7 @@ def swiglu_no_interleaved_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
 
 
 @functools.lru_cache()
-def _down_moe_use_tma():
+def _moe_support_tma():
     return support_tensor_descriptor()
 
 
@@ -409,11 +412,26 @@ def _prepare_fused_moe_run(
         per_channel_quant=per_channel_quant,
         return_down_config=True,
     )
-    down_moe_use_tma = (
-        _down_moe_use_tma()
-        and down_config is not None
-        and down_config.pop("USE_TMA", False)
-    )
+    # Copy config to avoid mutating the lru_cached dict returned by
+    # get_moe_configs; we pop USE_TMA below.
+    config = dict(config)
+    # Up-projection TMA is opt-in: only enabled when the up config file
+    # explicitly carries "USE_TMA": true (produced by tuning). By default the
+    # existing up config files do not contain this key, so existing users are
+    # unaffected unless they re-tune with the updated script.
+    up_tma_requested = config.pop("USE_TMA", False)
+    up_moe_use_tma = _moe_support_tma() and up_tma_requested
+    if up_moe_use_tma:
+        logger.warning_once(
+            "Up MoE TMA is enabled (USE_TMA=true in the up-projection config). "
+            "This requires a config produced by the updated tuning script. "
+        )
+    down_tma_requested = down_config is not None and down_config.pop("USE_TMA", False)
+    down_moe_use_tma = _moe_support_tma() and down_tma_requested
+    if down_moe_use_tma:
+        logger.warning_once(
+            "Down MoE TMA is enabled (USE_TMA=true in the down-projection config)."
+        )
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, config["BLOCK_SIZE_M"], E
@@ -423,6 +441,7 @@ def _prepare_fused_moe_run(
         config,
         down_config,
         down_moe_use_tma,
+        up_moe_use_tma,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -441,6 +460,7 @@ def _fused_moe_kernel_sequence(
     config: Dict[str, Any],
     down_config: Optional[Dict[str, Any]],
     down_moe_use_tma: bool,
+    up_moe_use_tma: bool,
     *,
     b1: Optional[torch.Tensor],
     b2: Optional[torch.Tensor],
@@ -568,6 +588,7 @@ def _fused_moe_kernel_sequence(
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
         c_sorted=down_moe_use_tma,
+        b_use_tma=up_moe_use_tma,
         filter_expert=filter_expert,
     )
 
@@ -619,7 +640,9 @@ def _fused_moe_kernel_sequence(
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
             assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
-            assert _is_cuda or _is_hip, "DeepSeek V4 only supports CUDA/HIP downstream"
+            assert (
+                _is_cuda or _is_hip or _is_xpu
+            ), "DeepSeek V4 only supports CUDA/HIP/XPU downstream"
 
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
@@ -629,8 +652,8 @@ def _fused_moe_kernel_sequence(
                     swiglu_limit_for_triton = swiglu_limit
                 else:
                     assert (
-                        _is_cuda
-                    ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
+                        _is_cuda or _is_xpu
+                    ), "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
                     swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
             else:
                 half = N // 2
@@ -685,6 +708,17 @@ def _fused_moe_kernel_sequence(
                 x = intermediate_cache1.view(-1, N)
                 d = x.shape[-1] // 2
                 intermediate_cache2.copy_(F.silu(x[..., :d]) * x[..., d:])
+    elif activation == "situ" and is_gated:
+        d = N // 2
+        x = intermediate_cache1.view(-1, N)
+        gate = x[..., :d].float()
+        up = x[..., d:].float()
+        situ_beta = gemm1_alpha if gemm1_alpha is not None else 4.0
+        gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+        situ_linear_beta = gemm1_limit
+        if situ_linear_beta is not None:
+            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+        intermediate_cache2.copy_((gate * up).to(intermediate_cache1.dtype))
     elif activation == "gelu" and is_gated:
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
@@ -914,6 +948,7 @@ def fused_experts_impl(
         config,
         down_config,
         down_moe_use_tma,
+        up_moe_use_tma,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -942,6 +977,7 @@ def fused_experts_impl(
         config,
         down_config,
         down_moe_use_tma,
+        up_moe_use_tma,
         b1=b1,
         b2=b2,
         use_fp8_w8a8=use_fp8_w8a8,
