@@ -223,14 +223,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self._override_weight_loader(
             self.conv1d.weight,
-            mamba_v2_sharded_weight_loader(
-                [
-                    query_key_settings,
-                    query_key_settings,
-                    value_settings,
-                ],
-                self.attn_tp_size,
-                self.attn_tp_rank,
+            self._make_conv1d_weight_loader(
+                mamba_v2_sharded_weight_loader(
+                    [
+                        query_key_settings,
+                        query_key_settings,
+                        value_settings,
+                    ],
+                    self.attn_tp_size,
+                    self.attn_tp_rank,
+                )
             ),
         )
 
@@ -313,7 +315,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def _bind_packed_weight_loaders(self, module):
         """Bind packed-checkpoint-aware loaders to all relevant params of a merged module."""
-        for attr_name in ("weight", "weight_scale_inv", "weight_scale", "input_scale"):
+        for attr_name in (
+            "weight",
+            "weight_scale_inv",
+            "weight_scale",
+            "weight_scale_2",
+            "input_scale",
+        ):
             param = getattr(module, attr_name, None)
             if param is None:
                 continue
@@ -322,6 +330,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 continue
             wrapped_loader = self._make_packed_weight_loader(module, original_loader)
             self._override_weight_loader(param, wrapped_loader)
+
+    @staticmethod
+    def _make_conv1d_weight_loader(original_weight_loader):
+        """Accept equivalent Conv1d singleton-channel representations."""
+
+        def weight_loader(param, loaded_weight):
+            if (
+                loaded_weight.ndim == param.data.ndim + 1
+                and loaded_weight.shape[1] == 1
+            ):
+                loaded_weight = loaded_weight.squeeze(1)
+            elif loaded_weight.ndim + 1 == param.data.ndim and param.data.shape[1] == 1:
+                loaded_weight = loaded_weight.unsqueeze(1)
+            original_weight_loader(param, loaded_weight)
+
+        return weight_loader
 
     @staticmethod
     def _get_split_sizes_for_param(module, param, loaded_shard_id):
