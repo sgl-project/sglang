@@ -40,10 +40,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
 from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
     are_requests_batch_compatible,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-    OutputBatch,
-    get_first_dimension_size,
-)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 
 logger = logging.getLogger(__name__)
@@ -120,7 +117,7 @@ class DiffusionServer:
         decoder_capacity: int = 4,
         p2p_mode: bool = True,
         server_args=None,
-        glm_ar_fanout: bool = False,
+        glm_distributed_mode_enabled: bool = False,
     ):
         self._frontend_endpoint = frontend_endpoint
         self._encoder_work_endpoints = encoder_work_endpoints
@@ -162,13 +159,15 @@ class DiffusionServer:
         self._decoder_tta: deque[_RoleTTAEntry] = deque()
 
         self._transfer_mode = p2p_mode
-        self._glm_ar_fanout = glm_ar_fanout
+        self._glm_distributed_mode_enabled = glm_distributed_mode_enabled
         self._server_args = server_args
         self._glm_ar_queue: deque[_GlmClientEntry] = deque()
         self._glm_shard_queue: deque[_GlmShardEntry] = deque()
         self._glm_shards: dict[str, _GlmShardEntry] = {}
         self._glm_shard_workers: dict[str, int] = {}
-        self._glm_worker_available = [not glm_ar_fanout] * self._num_denoisers
+        self._glm_worker_available = [
+            not glm_distributed_mode_enabled
+        ] * self._num_denoisers
         self._glm_ar_executor: ThreadPoolExecutor | None = None
         self._glm_ar_future: Future | None = None
         self._glm_ar_clients: list[_GlmClientEntry] = []
@@ -176,9 +175,9 @@ class DiffusionServer:
         self._glm_batch_max_size = 1
         self._glm_batch_delay_s = 0.0
 
-        if glm_ar_fanout:
+        if glm_distributed_mode_enabled:
             if server_args is None:
-                raise ValueError("server_args is required for GLM AR fan-out")
+                raise ValueError("server_args is required for GLM distributed mode")
             from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
                 GlmImageAR,
             )
@@ -280,7 +279,7 @@ class DiffusionServer:
         for i, ep in enumerate(self._denoiser_work_endpoints):
             sock, _ = get_zmq_socket(self._context, zmq.PUSH, ep, bind=False)
             denoiser_pushes.append(sock)
-            if self._glm_ar_fanout:
+            if self._glm_distributed_mode_enabled:
                 denoiser_monitors.append(
                     sock.get_monitor_socket(
                         events=zmq.EVENT_CONNECTED | zmq.EVENT_DISCONNECTED
@@ -347,7 +346,7 @@ class DiffusionServer:
                     if monitor in events:
                         self._handle_glm_worker_monitor(worker_idx, monitor)
 
-                if self._glm_ar_fanout:
+                if self._glm_distributed_mode_enabled:
                     self._poll_glm_ar_result()
                     self._drain_glm_ar_queue()
                     self._drain_glm_shard_queue()
@@ -371,7 +370,7 @@ class DiffusionServer:
             self._handle_transfer_result(frames, role)
             return
 
-        if self._glm_ar_fanout and role == RoleType.DENOISER:
+        if self._glm_distributed_mode_enabled and role == RoleType.DENOISER:
             self._handle_glm_shard_result_frames(frames)
         elif role == RoleType.DECODER:
             self._handle_decoder_result_frames(frames)
@@ -466,7 +465,7 @@ class DiffusionServer:
             self._tracker.transition(request_id, RequestState.ENCODER_WAITING)
         except ValueError:
             pass
-        if self._glm_ar_fanout:
+        if self._glm_distributed_mode_enabled:
             if (
                 not isinstance(req.prompt, str)
                 or getattr(req, "image_path", None) is not None
@@ -704,7 +703,7 @@ class DiffusionServer:
         client = shard.client
         total = max(1, int(client.req.num_outputs_per_prompt or 1))
         for name, value in (("output", output), ("output_file_paths", output_paths)):
-            size = get_first_dimension_size(value)
+            size = len(value) if value is not None else None
             if size is not None and size != total:
                 error = (
                     f"GLM fan-out {name} size mismatch: got {size}, expected {total}"
@@ -925,7 +924,7 @@ class DiffusionServer:
             self._decoder_tta = deque(
                 e for e in self._decoder_tta if e.request_id not in timed_set
             )
-            if self._glm_ar_fanout:
+            if self._glm_distributed_mode_enabled:
                 self._glm_ar_queue = deque(
                     entry
                     for entry in self._glm_ar_queue
@@ -1031,7 +1030,7 @@ class DiffusionServer:
         prealloc = msg.get("preallocated_slots", [])
         info["free_preallocated_slots"] = list(prealloc)
         peers[idx] = info
-        if role == RoleType.DENOISER and self._glm_ar_fanout:
+        if role == RoleType.DENOISER and self._glm_distributed_mode_enabled:
             self._glm_worker_available[idx] = True
 
         logger.info(
@@ -1440,7 +1439,7 @@ class DiffusionServer:
             "decoder_peers": len(self._decoder_peers),
             "tracker": self._tracker.snapshot(),
         }
-        if self._glm_ar_fanout:
+        if self._glm_distributed_mode_enabled:
             stats.update(
                 {
                     "glm_ar_queue_depth": len(self._glm_ar_queue),

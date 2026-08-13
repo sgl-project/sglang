@@ -14,13 +14,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.g
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
-class GlmImageTerminalDecodingStage(DecodingStage):
+class GlmImageDenoiserDecodingStage(DecodingStage):
     @property
     def role_affinity(self) -> RoleType:
         return RoleType.DENOISER
 
 
-class GlmImageTerminalBeforeDenoisingStage(GlmImageBeforeDenoisingStage):
+class GlmImageDenoiserBeforeDenoisingStage(GlmImageBeforeDenoisingStage):
     @property
     def role_affinity(self) -> RoleType:
         return RoleType.DENOISER
@@ -40,7 +40,7 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        is_terminal_denoiser = (
+        is_glm_distributed_denoiser = (
             self._disagg_role == RoleType.DENOISER
             and server_args.srt_encoder_url is not None
         )
@@ -53,8 +53,8 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
         before_denoising_stage_cls = (
-            GlmImageTerminalBeforeDenoisingStage
-            if is_terminal_denoiser
+            GlmImageDenoiserBeforeDenoisingStage
+            if is_glm_distributed_denoiser
             else GlmImageBeforeDenoisingStage
         )
         self.add_stage(
@@ -75,9 +75,9 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
             ),
         )
 
-        if is_terminal_denoiser:
+        if is_glm_distributed_denoiser:
             self.add_stage(
-                GlmImageTerminalDecodingStage(
+                GlmImageDenoiserDecodingStage(
                     vae=self.get_module("vae"), pipeline=self
                 ),
                 "decoding_stage",

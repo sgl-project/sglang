@@ -46,22 +46,6 @@ logger = init_logger(__name__)
 SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
 
 
-def get_first_dimension_size(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, (list, tuple)):
-        return len(value)
-
-    shape = getattr(value, "shape", None)
-    if shape is not None:
-        try:
-            if len(shape) > 0:
-                return int(shape[0])
-        except Exception:
-            return None
-    return None
-
-
 @dataclass
 class BatchMetricsWindow:
     """Counters accumulated between dynamic batching metric logs.

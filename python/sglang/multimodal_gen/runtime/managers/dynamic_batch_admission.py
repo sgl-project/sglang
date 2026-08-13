@@ -120,32 +120,32 @@ def get_dynamic_batch_signature(
     return signature
 
 
-def get_dynamic_batch_reject_reason(
+def are_requests_batch_compatible(
     base_req: Req,
     candidate_req: Req,
     *,
     exclude_num_outputs_per_prompt: bool = False,
-) -> str | None:
+) -> bool:
     if base_req.is_warmup or candidate_req.is_warmup:
-        return "warmup"
+        return False
     if (
         base_req.realtime_session_id
         or base_req.session is not None
         or candidate_req.realtime_session_id
         or candidate_req.session is not None
     ):
-        return "realtime_session"
+        return False
     if not isinstance(base_req.prompt, str) or not isinstance(
         candidate_req.prompt, str
     ):
-        return "prompt_type"
+        return False
     if (
         getattr(base_req, "image_path", None) is not None
         or getattr(candidate_req, "image_path", None) is not None
     ):
-        return "image_conditioning"
+        return False
     if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
-        return "return_file_paths_only"
+        return False
 
     base_signature = get_dynamic_batch_signature(
         base_req,
@@ -155,42 +155,7 @@ def get_dynamic_batch_reject_reason(
         candidate_req,
         exclude_num_outputs_per_prompt=exclude_num_outputs_per_prompt,
     )
-    if base_signature is None or candidate_signature is None:
-        return "signature_unavailable"
-    if base_signature == candidate_signature:
-        return None
-    if len(base_signature) != len(candidate_signature):
-        return "signature_mismatch"
-
-    for (name, base_value), (candidate_name, candidate_value) in zip(
-        base_signature, candidate_signature
-    ):
-        if name != candidate_name:
-            return "signature_mismatch"
-        if base_value == candidate_value:
-            continue
-        if name == "profiling":
-            return "profiling"
-        if name == "diffusers_kwargs":
-            return "extra.diffusers_kwargs"
-        return f"sampling_params.{name}"
-    return "signature_mismatch"
-
-
-def are_requests_batch_compatible(
-    base_req: Req,
-    candidate_req: Req,
-    *,
-    exclude_num_outputs_per_prompt: bool = False,
-) -> bool:
-    return (
-        get_dynamic_batch_reject_reason(
-            base_req,
-            candidate_req,
-            exclude_num_outputs_per_prompt=exclude_num_outputs_per_prompt,
-        )
-        is None
-    )
+    return base_signature is not None and base_signature == candidate_signature
 
 
 @dataclass(frozen=True)

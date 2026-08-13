@@ -467,7 +467,7 @@ class SchedulerDisaggMixin:
 
         sa = self.server_args
 
-        if self._is_glm_terminal_denoiser():
+        if self._is_glm_distributed_denoiser():
             self._preallocated_slots = {}
             register_msg = TransferRegisterMsg(
                 role=self._disagg_role.value,
@@ -478,10 +478,10 @@ class SchedulerDisaggMixin:
             self._recv_prefetch_thread = threading.Thread(
                 target=self._recv_prefetch_loop,
                 daemon=True,
-                name="recv-prefetch-glm-terminal-denoiser",
+                name="recv-prefetch-glm-distributed-denoiser",
             )
             self._recv_prefetch_thread.start()
-            logger.info("GLM terminal denoiser registered")
+            logger.info("GLM distributed denoiser registered")
             return
 
         # Pool size: configurable, default 256 MiB
@@ -943,7 +943,7 @@ class SchedulerDisaggMixin:
                     if is_multi_rank:
                         self._broadcast_to_all_ranks(("compute",))
                         self._broadcast_req_to_all_ranks(req)
-                    self._disagg_terminal_denoiser_compute(req, request_id, role_name)
+                    self._disagg_glm_denoiser_compute(req, request_id, role_name)
 
                 self._consecutive_error_count = 0
 
@@ -1340,11 +1340,11 @@ class SchedulerDisaggMixin:
         (:meth:`_disagg_non_rank0_event_loop`).
         """
         if self._disagg_role == RoleType.DENOISER:
-            if not self._is_glm_terminal_denoiser():
+            if not self._is_glm_distributed_denoiser():
                 _init_disagg_request_scheduler(self, req)
 
             with self._disagg_trace_dispatch(req):
-                if self._is_glm_terminal_denoiser():
+                if self._is_glm_distributed_denoiser():
                     req.save_output = False
                     req.return_file_paths_only = False
                     self.worker.execute_forward([req])
@@ -1503,14 +1503,14 @@ class SchedulerDisaggMixin:
             duration_s,
         )
 
-    def _is_glm_terminal_denoiser(self: Scheduler) -> bool:
+    def _is_glm_distributed_denoiser(self: Scheduler) -> bool:
         return (
             self._disagg_role == RoleType.DENOISER
             and self.worker.pipeline.pipeline_name == "GlmImagePipeline"
             and self.server_args.srt_encoder_url is not None
         )
 
-    def _disagg_terminal_denoiser_compute(
+    def _disagg_glm_denoiser_compute(
         self: Scheduler, req: Req, request_id: str, role_name: str
     ) -> None:
         req.save_output = False
@@ -1542,7 +1542,7 @@ class SchedulerDisaggMixin:
             else:
                 self._disagg_metrics.record_request_complete(request_id)
         logger.debug(
-            "Terminal %s: processed %s in %.2f s",
+            "GLM distributed %s: processed %s in %.2f s",
             role_name,
             request_id,
             time.monotonic() - start_time,

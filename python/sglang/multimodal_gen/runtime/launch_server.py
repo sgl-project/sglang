@@ -567,14 +567,14 @@ def launch_disagg_server(server_args: ServerArgs):
     configure_logger(server_args)
     set_global_server_args(server_args)
 
-    is_glm_ar_fanout = (
+    glm_distributed_mode_enabled = (
         type(server_args.pipeline_config).__name__ == "GlmImagePipelineConfig"
         and server_args.srt_encoder_url is not None
         and server_args.encoder_urls is None
         and server_args.decoder_urls is None
     )
     required_urls = [("--denoiser-urls", server_args.denoiser_urls)]
-    if not is_glm_ar_fanout:
+    if not glm_distributed_mode_enabled:
         required_urls.extend(
             [
                 ("--encoder-urls", server_args.encoder_urls),
@@ -625,9 +625,9 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
-        denoiser_capacity=1 if is_glm_ar_fanout else 2,
+        denoiser_capacity=1 if glm_distributed_mode_enabled else 2,
         server_args=server_args,
-        glm_ar_fanout=is_glm_ar_fanout,
+        glm_distributed_mode_enabled=glm_distributed_mode_enabled,
     )
     diffusion_server.start()
 
@@ -708,13 +708,14 @@ def launch_disagg_role(server_args: ServerArgs):
     cfg_parallel_explicit = server_args.is_arg_explicitly_set(
         "enable_cfg_parallel"
     ) or server_args.is_arg_explicitly_set("cfg_parallel_degree")
-    if (
-        not cfg_parallel_explicit
-        and role_tp * role_sp * cfg_degree * server_args.dp_size > server_args.num_gpus
+    required_devices = role_tp * role_sp * cfg_degree * server_args.dp_size
+    if not cfg_parallel_explicit and (
+        required_devices > server_args.num_gpus
+        or server_args.num_gpus % required_devices != 0
     ):
         logger.warning(
-            "Disabling CFG parallel for %s role because tp=%d, sp=%d, cfg=%d, "
-            "dp=%d requires more than %d devices",
+            "Disabling auto-enabled CFG parallel for %s role because tp=%d, "
+            "sp=%d, cfg=%d, dp=%d is incompatible with %d devices",
             role_type.value,
             role_tp,
             role_sp,
@@ -724,6 +725,19 @@ def launch_disagg_role(server_args: ServerArgs):
         )
         role_overrides["enable_cfg_parallel"] = False
         role_overrides["cfg_parallel_degree"] = 1
+        cfg_degree = 1
+        required_devices = role_tp * role_sp * server_args.dp_size
+
+    if (
+        required_devices > server_args.num_gpus
+        or server_args.num_gpus % required_devices != 0
+    ):
+        raise ValueError(
+            f"Invalid parallelism for {role_type.value} role: "
+            f"tp={role_tp}, sp={role_sp}, cfg={cfg_degree}, "
+            f"dp={server_args.dp_size} requires groups of {required_devices} "
+            f"devices, but num_gpus={server_args.num_gpus}"
+        )
 
     base_dict = {
         f.name: getattr(server_args, f.name) for f in dataclasses.fields(server_args)

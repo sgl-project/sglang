@@ -40,14 +40,13 @@ from sglang.multimodal_gen.runtime.managers.cpu_worker import CPUWorker
 from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
     BatchAdmissionController,
     are_requests_batch_compatible,
-    get_dynamic_batch_reject_reason,
+    get_dynamic_batch_signature,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     BatchMetricsWindow,
     OutputBatch,
-    get_first_dimension_size,
 )
 from sglang.multimodal_gen.runtime.post_training.scheduler_post_training_mixin import (
     SchedulerPostTrainingMixin,
@@ -433,14 +432,69 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     def _get_dynamic_batch_reject_reason(
         self, base_req: Req, candidate_req: Req
     ) -> str | None:
+        if self._can_dynamic_batch(base_req, candidate_req):
+            return None
+        if base_req.is_warmup or candidate_req.is_warmup:
+            return "warmup"
+        if self._has_realtime_session(base_req) or self._has_realtime_session(
+            candidate_req
+        ):
+            return "realtime_session"
+        if not isinstance(base_req.prompt, str) or not isinstance(
+            candidate_req.prompt, str
+        ):
+            return "prompt_type"
+        if (
+            getattr(base_req, "image_path", None) is not None
+            or getattr(candidate_req, "image_path", None) is not None
+        ):
+            return "image_conditioning"
+        if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
+            return "return_file_paths_only"
+
+        base_signature = self._get_cached_signature(base_req)
+        candidate_signature = self._get_cached_signature(candidate_req)
+        if base_signature is None or candidate_signature is None:
+            return "signature_unavailable"
+        return (
+            self._find_sampling_param_mismatch_field(
+                base_signature, candidate_signature
+            )
+            or "signature_mismatch"
+        )
+
+    def _get_cached_signature(self, req: Req) -> tuple[Any, ...] | None:
         exclude_num_outputs = (
             self.server_args.pipeline_config.supports_sequential_dit_inference()
         )
-        return get_dynamic_batch_reject_reason(
-            base_req,
-            candidate_req,
+        return get_dynamic_batch_signature(
+            req,
             exclude_num_outputs_per_prompt=exclude_num_outputs,
         )
+
+    @staticmethod
+    def _find_sampling_param_mismatch_field(
+        base_signature: tuple[Any, ...], candidate_signature: tuple[Any, ...]
+    ) -> str | None:
+        if len(base_signature) != len(candidate_signature):
+            return "sampling_params"
+        for (name, base_value), (candidate_name, candidate_value) in zip(
+            base_signature, candidate_signature
+        ):
+            if name != candidate_name:
+                return "sampling_params"
+            if base_value == candidate_value:
+                continue
+            if name == "profiling":
+                return "profiling"
+            if name == "diffusers_kwargs":
+                return "extra.diffusers_kwargs"
+            return f"sampling_params.{name}"
+        return None
+
+    @staticmethod
+    def _has_realtime_session(req: Req) -> bool:
+        return bool(req.realtime_session_id) or req.session is not None
 
     def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
         """Return whether `candidate_req` can be merged into a batch with `base_req`."""
@@ -684,6 +738,22 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         return merged_req
 
+    @staticmethod
+    def _count_first_dim(value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            return len(value)
+
+        shape = getattr(value, "shape", None)
+        if shape is not None:
+            try:
+                if len(shape) > 0:
+                    return int(shape[0])
+            except Exception:
+                return None
+        return None
+
     def _slice_batched_value(
         self, value: Any, start: int, end: int, total_items: int
     ) -> Any:
@@ -696,7 +766,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 return list(sliced) if isinstance(value, list) else tuple(sliced)
             return deepcopy(value)
 
-        value_items = get_first_dimension_size(value)
+        value_items = self._count_first_dim(value)
         if value_items == total_items:
             try:
                 return value[start:end]
@@ -712,8 +782,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         """Split a merged result only when outputs map one-to-one to requests."""
         per_req_counts = [req.num_outputs_per_prompt for req in reqs]
         total_items = sum(per_req_counts)
-        output_items = get_first_dimension_size(output_batch.output)
-        output_path_items = get_first_dimension_size(output_batch.output_file_paths)
+        output_items = self._count_first_dim(output_batch.output)
+        output_path_items = self._count_first_dim(output_batch.output_file_paths)
 
         if output_items is None and output_path_items is None:
             logger.warning(
