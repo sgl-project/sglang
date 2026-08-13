@@ -48,7 +48,7 @@ class TensorWrapper:
     """Expose a CPU-contiguous tensor's data buffer for zero-copy ZMQ send."""
 
     def __init__(self, tensor: torch.Tensor):
-        if tensor.is_cuda:
+        if tensor.is_cuda or tensor.is_npu:
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()

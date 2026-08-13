@@ -25,9 +25,5 @@ class BaseSWAKVPool(KVCache):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def set_swa_loc(self, loc: torch.Tensor) -> None:
-        raise NotImplementedError()
-
-    @abc.abstractmethod
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         raise NotImplementedError()

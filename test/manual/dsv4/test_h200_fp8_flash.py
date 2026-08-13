@@ -53,7 +53,7 @@ class TestH200Fp8FlashBalanced(DSV4FlashAime25TestBase):
         "1",
         "--speculative-num-draft-tokens",
         "2",
-        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
         "128",
         "--max-running-requests",
         "128",
@@ -77,7 +77,7 @@ class TestH200Fp8FlashMaxThroughput(DSV4FlashAime25TestBase):
         "--enable-dp-attention",
         "--moe-a2a-backend",
         "deepep",
-        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
         "128",
         "--max-running-requests",
         "256",
@@ -98,8 +98,8 @@ class TestH200Fp8FlashCP(DSV4FlashAime25TestBase):
         "4",
         "--moe-a2a-backend",
         "deepep",
-        "--enable-nsa-prefill-context-parallel",
-        "--nsa-prefill-cp-mode",
+        "--enable-dsa-prefill-context-parallel",
+        "--dsa-prefill-cp-mode",
         "round-robin-split",
         "--chunked-prefill-size",
         "16384",
@@ -112,7 +112,6 @@ class TestH200Fp8FlashCP(DSV4FlashAime25TestBase):
     ]
     EXTRA_ENV = {
         **H200_FP8_ENV,
-        "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "1",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
     }
 

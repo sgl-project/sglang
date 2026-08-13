@@ -6,7 +6,7 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-register_cuda_ci(est_time=7200, suite="nightly-4-gpu-gb300", nightly=True)
+register_cuda_ci(est_time=7200, stage="nightly", runner_config="4-gpu-gb300")
 
 MODEL_PATH = "Qwen/Qwen3.5-397B-A17B-FP8"
 
@@ -17,56 +17,64 @@ COMMON_ARGS = [
     "--enable-flashinfer-allreduce-fusion",
     "--attention-backend=trtllm_mha",
     "--mem-fraction-static=0.8",
+    "--mamba-scheduler-strategy=extra_buffer",
     "--enable-multimodal",
     "--enable-metrics",
 ]
 
-MTP_ARGS = [
+TP_MTP_ARGS = [
     "--speculative-algorithm=EAGLE",
     "--speculative-num-steps=3",
     "--speculative-eagle-topk=1",
     "--speculative-num-draft-tokens=4",
-    "--mamba-scheduler-strategy=extra_buffer",
-    "--page-size=64",
+]
+
+DP_MTP_ARGS = [
+    "--speculative-algorithm=EAGLE",
+    "--speculative-num-steps=1",
+    "--speculative-eagle-topk=1",
+    "--speculative-num-draft-tokens=2",
 ]
 
 
 class TestQwen35Fp8(unittest.TestCase):
-    """Qwen3.5-397B FP8 on GB300 (4x B200 NVL4, tp=4)."""
+    """Qwen3.5-397B FP8 on GB300 (4x GB300 NVL4, tp=4)."""
 
     def test_qwen35_fp8(self):
         variants = [
             ModelLaunchSettings(
                 MODEL_PATH,
                 tp_size=4,
-                extra_args=COMMON_ARGS,
-                variant="TP4",
-            ),
-            ModelLaunchSettings(
-                MODEL_PATH,
-                tp_size=4,
-                extra_args=COMMON_ARGS + ["--dp-size=4", "--enable-dp-attention"],
-                variant="TP4+DP4+DPA",
+                extra_args=COMMON_ARGS + TP_MTP_ARGS,
+                variant="TP4+MTP",
             ),
             ModelLaunchSettings(
                 MODEL_PATH,
                 tp_size=4,
                 extra_args=COMMON_ARGS
                 + ["--dp-size=4", "--enable-dp-attention"]
-                + MTP_ARGS,
+                + DP_MTP_ARGS,
                 variant="TP4+DP4+DPA+MTP",
-                env={"SGLANG_ENABLE_SPEC_V2": "1"},
             ),
         ]
 
         run_combined_tests(
             models=variants,
             test_name="Qwen3.5-397B-FP8",
+            # Pinned to what `ns eval --benchmarks=mmmu-pro:1` sent implicitly --
+            # its `:1` suffix means temperature 0.7, not greedy -- so the baseline
+            # carries over unchanged. Do not "simplify" these away.
             accuracy_params=AccuracyTestParams(
-                dataset="mmmu-pro", baseline_accuracy=0.78, repeat=1, max_tokens=32768
+                dataset="mmmu_pro_vision",
+                baseline_accuracy=0.76,
+                repeat=1,
+                max_tokens=32768,
+                temperature=0.7,
+                seed=0,
+                sgl_eval_thinking=False,
             ),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_gb300",
+                result_dir="performance_results_gb300",
             ),
         )
 

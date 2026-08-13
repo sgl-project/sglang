@@ -12,6 +12,7 @@ from sglang.srt.debug_utils.comparator.dims_spec import (
     DimSpec,
     _SingletonDimUtil,
     parse_dims,
+    without_dim_names,
 )
 from sglang.srt.debug_utils.comparator.log_sink import log_sink
 from sglang.srt.debug_utils.comparator.utils import Pair, _FrozenBase
@@ -213,6 +214,6 @@ def execute_axis_aligner_plan(
     pattern: Optional[str] = plan.pattern.x if side == "x" else plan.pattern.y
 
     if pattern is not None:
-        tensor = rearrange(tensor.rename(None), pattern)
+        tensor = rearrange(without_dim_names(tensor), pattern)
 
     return tensor

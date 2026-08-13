@@ -42,9 +42,9 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
         request_obj,
         max_req_input_len,
         *args,
-        **kwargs
+        **kwargs,
     ):
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,

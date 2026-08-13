@@ -15,7 +15,7 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=30, suite="stage-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=30, suite="base-a-test-cpu", nightly=True)
 
 _PNG_MAGIC: bytes = b"\x89PNG"
 
@@ -37,7 +37,6 @@ def _make_comparison_record(
         x_baseline=baseline,
         x_target=target,
         name=name,
-        diff_threshold=1e-3,
         seq_dim=seq_dim,
     )
     return ComparisonTensorRecord(**info.model_dump())
@@ -66,7 +65,6 @@ class TestPerTokenVisualizer:
             x_baseline=torch.randn(4, 8),
             x_target=torch.randn(4, 8),
             name="no_per_token",
-            diff_threshold=1e-3,
         )
         record = ComparisonTensorRecord(**info.model_dump())
 

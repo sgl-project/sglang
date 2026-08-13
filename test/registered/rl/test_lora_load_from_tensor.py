@@ -10,7 +10,7 @@ import sglang as sgl
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=102, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=102, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd")
 
 MODEL_PATH = "Qwen/Qwen3-0.6B"
@@ -342,9 +342,11 @@ class TestLoRALoadFromTensor(CustomTestCase):
         }
         serialized = MultiprocessingSerializer.serialize(bucket_dict, output_str=True)
 
+        # flattened_bucket callers pass one serialized copy per TP rank, same
+        # as Engine.update_weights_from_tensor.
         result = self.engine.load_lora_adapter_from_tensors(
             lora_name="self_cognition_Alice_flattened",
-            tensors=serialized,
+            tensors=[serialized],
             config_dict=self.lora_config_dict,
             load_format="flattened_bucket",
         )

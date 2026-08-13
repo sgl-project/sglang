@@ -23,6 +23,7 @@ from sglang.srt.entrypoints.warmup import warmup
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 
@@ -168,15 +169,18 @@ def launch_server_process_and_send_one_request(
     )
 
 
-def refine_server_args(server_args: ServerArgs, compile_args: CompileArgs):
-    # Disable cuda graph and torch compile to save time
-    server_args.disable_cuda_graph = True
-    server_args.enable_torch_compile = False
+def compile_server_args(args, compile_args: CompileArgs) -> ServerArgs:
+    """The config this script serves with: no cuda graph, no torch compile, and a
+    watchdog that outlives the compilation."""
+    args.enable_torch_compile = False
+    # Watchdog timeout follows compile_args.timeout because compilation takes long.
+    args.watchdog_timeout = compile_args.timeout
+    args.warmups = "compile-deep-gemm"
+    server_args = ServerArgs.from_cli_args(args)
+    server_args.cuda_graph_config[Phase.DECODE].backend = Backend.DISABLED
+    server_args.cuda_graph_config[Phase.PREFILL].backend = Backend.DISABLED
     print(f"Disable CUDA Graph and Torch Compile to save time...")
-
-    # Set watchdog timeout to compile_args.timeout because compilation will take a long time
-    server_args.watchdog_timeout = compile_args.timeout
-    server_args.warmups = "compile-deep-gemm"
+    return server_args
 
 
 def run_compile(server_args: ServerArgs, compile_args: CompileArgs):
@@ -209,9 +213,7 @@ if __name__ == "__main__":
     ServerArgs.add_cli_args(parser)
     CompileArgs.add_cli_args(parser)
     args = parser.parse_args()
-    server_args = ServerArgs.from_cli_args(args)
     compile_args = CompileArgs.from_cli_args(args)
-
-    refine_server_args(server_args, compile_args)
+    server_args = compile_server_args(args, compile_args)
 
     run_compile(server_args, compile_args)

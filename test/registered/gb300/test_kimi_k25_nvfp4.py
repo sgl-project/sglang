@@ -6,53 +6,77 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-register_cuda_ci(est_time=7200, suite="nightly-4-gpu-gb300", nightly=True)
+register_cuda_ci(est_time=7200, stage="nightly", runner_config="4-gpu-gb300")
 
 MODEL_PATH = "nvidia/Kimi-K2.5-NVFP4"
+DRAFT_MODEL_PATH = "lightseekorg/kimi-k2.5-eagle3-mla"
 
 COMMON_ARGS = [
     "--trust-remote-code",
     "--reasoning-parser=kimi_k2",
     "--tool-call-parser=kimi_k2",
     "--quantization=modelopt_fp4",
-    "--attention-backend=trtllm_mla",
+    "--attention-backend=tokenspeed_mla",
+    "--kv-cache-dtype=fp8_e4m3",
     "--moe-runner-backend=flashinfer_trtllm",
     "--mem-fraction-static=0.8",
-    "--enable-multimodal",
     "--enable-metrics",
+    "--speculative-algorithm=EAGLE3",
+    f"--speculative-draft-model-path={DRAFT_MODEL_PATH}",
+    "--speculative-draft-model-quantization=unquant",
+]
+
+TP_EAGLE_ARGS = [
+    "--speculative-num-steps=3",
+    "--speculative-eagle-topk=1",
+    "--speculative-num-draft-tokens=4",
+]
+
+DP_EAGLE_ARGS = [
+    "--speculative-num-steps=1",
+    "--speculative-eagle-topk=1",
+    "--speculative-num-draft-tokens=2",
 ]
 
 
 class TestKimiK25Nvfp4(unittest.TestCase):
-    """Kimi-K2.5 NVFP4 on GB300 (4x B200 NVL4, tp=4).
-
-    No EAGLE/MTP support for Kimi-K2.5 — only TP and TP+DP+DPA variants.
-    """
+    """Kimi-K2.5 NVFP4 + EAGLE3 on GB300 (4x GB300 NVL4, tp=4)."""
 
     def test_kimi_k25_nvfp4(self):
         variants = [
             ModelLaunchSettings(
                 MODEL_PATH,
                 tp_size=4,
-                extra_args=COMMON_ARGS,
-                variant="TP4",
+                extra_args=COMMON_ARGS + TP_EAGLE_ARGS,
+                variant="TP4+EAGLE3",
             ),
             ModelLaunchSettings(
                 MODEL_PATH,
                 tp_size=4,
-                extra_args=COMMON_ARGS + ["--dp-size=4", "--enable-dp-attention"],
-                variant="TP4+DP4+DPA",
+                extra_args=COMMON_ARGS
+                + ["--dp-size=4", "--enable-dp-attention"]
+                + DP_EAGLE_ARGS,
+                variant="TP4+DP4+DPA+EAGLE3",
             ),
         ]
 
         run_combined_tests(
             models=variants,
             test_name="Kimi-K2.5-NVFP4",
+            # Pinned to what `ns eval --benchmarks=mmmu-pro:1` sent implicitly --
+            # its `:1` suffix means temperature 0.7, not greedy -- so the baseline
+            # carries over unchanged. Do not "simplify" these away.
             accuracy_params=AccuracyTestParams(
-                dataset="mmmu-pro", baseline_accuracy=0.69, repeat=1, max_tokens=32768
+                dataset="mmmu_pro_vision",
+                baseline_accuracy=0.69,
+                repeat=1,
+                max_tokens=32768,
+                temperature=0.7,
+                seed=0,
+                sgl_eval_thinking=False,
             ),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_gb300",
+                result_dir="performance_results_gb300",
             ),
         )
 

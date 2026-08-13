@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2026 Liquid AI. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,7 +30,11 @@ import torch.nn.functional as F
 from transformers import Siglip2VisionConfig
 
 from sglang.srt.layers.activation import get_act_fn
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -201,6 +207,7 @@ class Siglip2Attention(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int | torch.Tensor,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         """Forward pass with variable-length attention.
 
@@ -212,7 +219,11 @@ class Siglip2Attention(nn.Module):
         Returns:
             (1, total_tokens, embed_dim) attention output
         """
-        return self.attn(hidden_states, cu_seqlens=cu_seqlens)
+        return self.attn(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            forward_metadata=forward_metadata,
+        )
 
 
 class Siglip2MLP(nn.Module):
@@ -277,6 +288,7 @@ class Siglip2EncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int | torch.Tensor,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         """Forward pass for encoder layer.
 
@@ -292,6 +304,7 @@ class Siglip2EncoderLayer(nn.Module):
             hidden_states=hidden_states,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            forward_metadata=forward_metadata,
         )
         hidden_states = residual + hidden_states
 
@@ -337,15 +350,21 @@ class Siglip2Encoder(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int | torch.Tensor,
         return_all_hidden_states: bool = False,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor | list[torch.Tensor]:
         hidden_states_pool = [inputs_embeds]
         hidden_states = inputs_embeds
+        if forward_metadata is None:
+            forward_metadata = prepare_vision_attention_metadata(
+                cu_seqlens, device=hidden_states.device
+            )
 
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                forward_metadata=forward_metadata,
             )
             if return_all_hidden_states:
                 hidden_states_pool.append(hidden_states)
@@ -462,12 +481,16 @@ class Siglip2VisionTransformer(nn.Module):
             Vision features tensor
         """
         hidden_states = self.embeddings(pixel_values_packed, spatial_shapes)
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=hidden_states.device
+        )
 
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             return_all_hidden_states=select_layers is not None,
+            forward_metadata=forward_metadata,
         )
 
         encoder_outputs = resolve_visual_encoder_outputs(

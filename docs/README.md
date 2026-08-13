@@ -1,131 +1,166 @@
 # SGLang Documentation
 
-This is the documentation website for the SGLang project (https://github.com/sgl-project/sglang).
+The official documentation and cookbook for [SGLang](https://github.com/sgl-project/sglang) — a high-performance serving framework for large language models and vision-language models.
 
-We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase.
-Most documentation files are located under the `docs/` folder.
+- **Docs**: Getting started guides, installation, and reference
+- **Cookbook**: Battle-tested recipes for deploying specific models (Qwen, DeepSeek, Llama, GLM, etc.) on various hardware
 
-## Docs Workflow
 
-### Install Dependency
-
-**Linux:**
-```bash
-apt-get update && apt-get install -y pandoc parallel retry
-pip install -r requirements.txt
-```
-
-**macOS:**
-```bash
-brew install pandoc parallel retry
-pip install -r requirements.txt
-```
-
-### Update Documentation
-
-Update your Jupyter notebooks in the appropriate subdirectories under `docs/`. If you add new files, remember to update `index.rst` (or relevant `.rst` files) accordingly.
-
-- **`pre-commit run --all-files`** manually runs all configured checks, applying fixes if possible. If it fails the first time, re-run it to ensure lint errors are fully resolved. Make sure your code passes all checks **before** creating a Pull Request.
-
-```bash
-# 1) Compile all Jupyter notebooks
-make compile  # This step can take a long time (10+ mins). You can consider skipping this step if you can make sure your added files are correct.
-make html
-
-# 2) Compile and Preview documentation locally with auto-build
-# This will automatically rebuild docs when files change
-# Open your browser at the displayed port to view the docs
-bash serve.sh
-
-# 2a) Alternative ways to serve documentation
-# Directly use make serve
-make serve
-# With custom port
-PORT=8080 make serve
-
-# 3) Clean notebook outputs
-# nbstripout removes notebook outputs so your PR stays clean
-pip install nbstripout
-find . -name '*.ipynb' -exec nbstripout {} \;
-
-# 4) Pre-commit checks and create a PR
-# After these checks pass, push your changes and open a PR on your branch
-pre-commit run --all-files
-```
-
-## Documentation Style Guidelines
-
-- For common functionalities, we prefer **Jupyter Notebooks** over Markdown so that all examples can be executed and validated by our docs CI pipeline. For complex features (e.g., distributed serving), Markdown is preferred.
-- Keep in mind the documentation execution time when writing interactive Jupyter notebooks. Each interactive notebook will be run and compiled against every commit to ensure they are runnable, so it is important to apply some tips to reduce the documentation compilation time:
-  - Use small models (e.g., `qwen/qwen2.5-0.5b-instruct`) for most cases to reduce server launch time.
-  - Reuse the launched server as much as possible to reduce server launch time.
-- Do not use absolute links (e.g., `https://docs.sglang.io/get_started/install.html`). Always prefer relative links (e.g., `../get_started/install.md`).
-- Follow the existing examples to learn how to launch a server, send a query and other common styles.
-
-## Documentation Build, Deployment, and CI
-
-The SGLang documentation pipeline is based on **Sphinx** and supports rendering Jupyter notebooks (`.ipynb`) into HTML/Markdown for web display. Detailed logits can be found in the [Makefile](./Makefile).
-
-### Notebook Execution (`make compile`)
-
-The `make compile` target is responsible for executing notebooks before rendering:
-
-* Finds all `.ipynb` files under `docs/` (excluding `_build/`)
-* Executes notebooks in parallel using GNU Parallel, with a relatively small `--mem-fraction-static`
-* Wraps execution with `retry` to reduce flaky failures
-* Executes notebooks via `jupyter nbconvert --execute --inplace`
-* Records execution timing in `logs/timing.log`
-
-This step ensures notebooks contain up-to-date outputs with each commit in the main branch before rendering.
-
-### Web Rendering (`make html`)
-
-After compilation, Sphinx builds the website:
-
-* Reads Markdown, reStructuredText, and Jupyter notebooks
-* Renders them into HTML pages
-* Outputs the website into:
+## Project structure
 
 ```
-docs/_build/html/
+.
+├── docs.json              # Site configuration (navigation, theme, metadata)
+├── index.mdx              # Homepage
+├── docs/                  # Documentation pages
+│   └── get-started/
+│       └── install.mdx    # Installation guide
+├── cookbook/              # Model deployment recipes (one .mdx page per model)
+│   ├── intro.mdx          # Cookbook overview and recipe index
+│   └── autoregressive/    # Autoregressive recipes (also: diffusion/, omni/, …)
+│       └── DeepSeek/
+│           └── DeepSeek-V4.mdx
+└── src/snippets/          # Config-driven cookbook engine
+    ├── _deployment.jsx    # Shared deploy-matrix engine (no model-specific code)
+    ├── _playground.jsx    # Shared override-playground engine
+    └── configs/
+        └── deepseek-ai/   # Per-model config + benchmarks (HF-org folder)
+            └── deepseek-v4.jsx
 ```
 
-This directory is the source for online documentation hosting.
+Pages are `.mdx` files with YAML frontmatter. Navigation is defined in `docs.json`.
 
-### Markdown Export (`make markdown`)
+## Local development
 
-To support downstream consumers, we add a **new Makefile target**:
+### Prerequisites
+
+- Node.js >= 20
+
+### Setup
 
 ```bash
-make markdown
+# Install the CLI
+npm i -g mint
+
+# From docs/ (where docs.json lives), start the dev server (hot reload)
+mint dev
 ```
 
-This target:
+Preview at `http://localhost:3000`.
 
-* Does **not modify** `make compile`
-* Scans all `.ipynb` files (excluding `_build/`)
-* Converts notebooks directly to Markdown using `jupyter nbconvert --to markdown`
-* Writes Markdown artifacts into the existing build directory:
-
-```
-docs/_build/html/markdown/<relative-path>.md
-```
-
-Example:
-
-```
-docs/advanced_features/lora.ipynb
-→ docs/_build/html/markdown/advanced_features/lora.md
-```
-
-### CI Execution
-
-In our [CI](https://github.com/sgl-project/sglang/blob/main/.github/workflows/release-docs.yml), the documentation pipeline first gets all the executed results and renders HTML and Markdown by:
+### Useful commands
 
 ```bash
-make compile    # execute notebooks (ensure outputs are up to date)
-make html       # build website as usual
-make markdown   # export markdown artifacts into _build/html/markdown
+mint dev            # Start local preview server
+mint broken-links   # Check for broken links
+mint update         # Update the CLI
 ```
 
-Then, the compiled results are forced pushed to [sgl-project.io](https://github.com/sgl-project/sgl-project.github.io) for rendering. In other words, sgl-project.io is push-only. All the changes of SGLang docs should be made directly in SGLang main repo, then push to the sgl-project.io.
+## Contributing
+
+We welcome contributions! Whether you want to add a recipe for a new model, improve existing docs, or fix a typo — PRs are appreciated.
+
+### Quick edit (GitHub)
+
+1. Navigate to the file you want to edit on GitHub
+2. Click the pencil icon to edit
+3. Submit a pull request
+
+### Local development workflow
+
+```bash
+# 1. Fork sgl-project/sglang and clone your fork
+git clone https://github.com/<YOUR_USERNAME>/sglang.git
+cd sglang/docs
+
+# 2. Create a branch
+git checkout -b my-changes
+
+# 3. Start the dev server and make your changes
+mint dev
+
+# 4. Verify links aren't broken
+mint broken-links
+
+# 5. Commit and push
+git add <files>
+git commit -m "docs: describe your change"
+git push origin my-changes
+
+# 6. Open a pull request on GitHub
+```
+
+### Adding a new cookbook recipe
+
+The autoregressive cookbook is **config-driven**: two shared engines —
+`src/snippets/_deployment.jsx` (the deploy matrix) and `src/snippets/_playground.jsx`
+(the override playground) — contain **no** model-specific code. Adding a model means adding
+*data*: a per-model config (plus optional benchmarks) that both engines consume, and an
+`.mdx` page that imports them. Copy [`DeepSeek-V4`](cookbook/autoregressive/DeepSeek/DeepSeek-V4.mdx)
+as the reference instance.
+
+**Recommended — use the Claude Code skill `/cookbook-add-model`.** It walks the whole flow
+interactively: collect the model card + verified `sglang serve` recipes → instantiate the
+template → wire up the nav/card → validate → fill in measured benchmarks. Related skills:
+`/cookbook-migrate-model` (port an existing legacy-template page) and `/cookbook-review-pr`
+(review a cookbook PR against the checklist).
+
+**The files it creates / edits — using DeepSeek-V4 as the example:**
+
+| File | Purpose |
+|---|---|
+| `src/snippets/configs/deepseek-ai/deepseek-v4.jsx` | Per-model config: `supportedHardware`, `variants`, `quantizations`, `strategies`, the `cells[]` deploy matrix (verified env + flags per `hw × variant × quant × strategy × nodes`), and `playgroundFeatures`. |
+| `src/snippets/configs/deepseek-ai/deepseek-v4-benchmarks.jsx` | One entry per cell with measured speed/accuracy + the `sglang_version` it ran on. Optional — skip until you have numbers. |
+| `cookbook/autoregressive/DeepSeek/DeepSeek-V4.mdx` | The page: imports the engines + config, renders `<Deployment>` / `<Playground>`, and adds prose (intro + specs + license, config tips, advanced usage). |
+| `docs.json` | Nav entry under Cookbook → category → vendor. |
+| `cookbook/autoregressive/intro.mdx` | Vendor `<Card>` on the category homepage. |
+
+Note the two folder conventions: under `configs/` the folder is the **HuggingFace org**
+(`deepseek-ai`); under `cookbook/` it's the **display vendor** (`DeepSeek`). The page wires
+everything together with data only — no engine edits:
+
+```mdx
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { Playground } from "/src/snippets/_playground.jsx";
+import { config }     from "/src/snippets/configs/deepseek-ai/deepseek-v4.jsx";
+import { benchmarks } from "/src/snippets/configs/deepseek-ai/deepseek-v4-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+<Playground config={config} />
+```
+
+Keep `tag: NEW` on the new page and strip it from same-vendor siblings (≤1 per vendor), then
+validate from `docs/`: `mint validate`, `mint broken-links`, and `mint dev` for a visual
+smoke test.
+
+> Diffusion / omni / specbundle pages follow their own category structure — don't force the
+> autoregressive config-driven template on them.
+
+### Writing guidelines
+
+- Use active voice: "Run the command" not "The command should be run"
+- Address the reader as "you"
+- Keep sentences concise — one idea per sentence
+- Lead with the goal, then the steps
+- Use consistent terminology
+- Include concrete examples and code snippets
+
+## Acknowledgements
+
+Thank you to all the authors who contributed to the original documentation in `sglang/docs/` and the original cookbook in [`sgl-cookbook`](https://github.com/sgl-project/sgl-cookbook). The migration to the new Mintlify-based documentation was led by the following [ACM-VIT](https://github.com/ACM-VIT) students:
+
+[@Adhyan Jain](https://github.com/Adhyan-Jain), [@Maitri-shah29](https://github.com/Maitri-shah29), [@architnigam](https://github.com/architnigam), [@Nakul-Sinha](https://github.com/Nakul-Sinha), [@divyamagrawal06](https://github.com/divyamagrawal06), [@A-Taman](https://github.com/A-Taman), [@nimeshas](https://github.com/nimeshas), [@IshhanKheria](https://github.com/IshhanKheria), [@Krishang-Zinzuwadia](https://github.com/Krishang-Zinzuwadia), [@pokymono](https://github.com/pokymono), [@Ishitajoshii](https://github.com/Ishitajoshii), [@AdityaVKochar](https://github.com/AdityaVKochar)
+
+Advised by [@adarshxs](https://github.com/adarshxs) (ACM-VIT) and [@wisclmy0611](https://github.com/wisclmy0611), [@Richardczl98](https://github.com/Richardczl98) (LMSYS).
+
+## Community
+
+- [GitHub](https://github.com/sgl-project/sglang)
+- [Slack](https://slack.sglang.io/)
+- [Discord](https://discord.gg/4ugb2t6YY2)
+- [X / Twitter](https://x.com/lmsysorg)
+- [LinkedIn](https://www.linkedin.com/company/sgl-project/)
+
+## License
+
+Apache License 2.0 — see the [LICENSE](LICENSE) for details.

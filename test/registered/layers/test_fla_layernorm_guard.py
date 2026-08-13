@@ -8,10 +8,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.attention.fla.layernorm_gated import (
+from sglang.kernels.ops.attention.fla.layernorm_gated import (
     _layer_norm_fwd as layer_norm_fwd,
 )
-from sglang.srt.layers.attention.fla.layernorm_gated import (
+from sglang.kernels.ops.attention.fla.layernorm_gated import (
     layernorm_fn,
     rms_norm_ref,
 )
@@ -19,7 +19,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=60,
-    suite="stage-b-test-2-gpu-large",
+    stage="base-b",
+    runner_config="2-gpu-large",
     disabled="Temporarily disabled",
 )
 

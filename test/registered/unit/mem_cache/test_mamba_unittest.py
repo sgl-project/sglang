@@ -1,7 +1,9 @@
 import unittest
+from array import array
 
 import torch
 
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
@@ -14,17 +16,24 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
-from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
-from sglang.srt.mem_cache.mamba_radix_cache import LRUList, MambaRadixCache, TreeNode
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
+    MambaPool,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
+
+
+def _event_hashes(events):
+    return [block_hash for event in events for block_hash in event.block_hashes]
 
 
 class TestMamba(unittest.TestCase):
@@ -54,7 +63,6 @@ class TestMamba(unittest.TestCase):
             head_num=head_num,
             head_dim=head_dim,
             full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
             enable_memory_saver=False,
             mamba_pool=None,
@@ -107,7 +115,7 @@ class TestMamba(unittest.TestCase):
         )
 
         assert req_to_token_pool.available_size() == max_num_reqs
-        assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size
+        assert req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size
 
         sampling_params = SamplingParams(
             temperature=0,
@@ -116,41 +124,103 @@ class TestMamba(unittest.TestCase):
         req = Req(
             rid=0,
             origin_input_text="",
-            origin_input_ids=[],
+            origin_input_ids=array("q"),
             sampling_params=sampling_params,
         )
 
         # alloc req
         req_to_token_pool.alloc([req])
         assert req_to_token_pool.available_size() == max_num_reqs - 1
-        assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
+        assert (
+            req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
+        )
 
         # free req
         req_to_token_pool.free_mamba_cache(req)
         req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
-        assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size
+        assert req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size
 
         # alloc req without free mamba cache
         req.mamba_pool_idx = None
         req_to_token_pool.alloc([req])
         req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
-        assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
+        assert (
+            req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
+        )
 
         # alloc again
         req_to_token_pool.alloc([req])
         assert req_to_token_pool.available_size() == max_num_reqs - 1
-        assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
+        assert (
+            req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
+        )
+
+    def test_mamba_pool_deduplicated_conv_window_axis(self):
+        class WindowFirstMambaPool(MambaPool):
+            conv_window_axis = 0
+
+        num_mamba_layers = 2
+        spec_state_size = 3
+        speculative_num_draft_tokens = 4
+        window_size = 3
+        conv_dim = 5
+
+        pool = object.__new__(WindowFirstMambaPool)
+        physical, view = pool._allocate_deduplicated_conv_window(
+            conv_shape=(window_size, conv_dim),
+            num_mamba_layers=num_mamba_layers,
+            spec_state_size=spec_state_size,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            conv_dtype=torch.float32,
+        )
+
+        shared_window_size = speculative_num_draft_tokens + window_size - 1
+        self.assertEqual(
+            physical.shape,
+            (
+                num_mamba_layers,
+                spec_state_size + 1,
+                shared_window_size,
+                conv_dim,
+            ),
+        )
+        self.assertEqual(
+            view.shape,
+            (
+                num_mamba_layers,
+                spec_state_size + 1,
+                speculative_num_draft_tokens,
+                window_size,
+                conv_dim,
+            ),
+        )
+
+        physical.copy_(
+            torch.arange(
+                physical.numel(), dtype=physical.dtype, device=physical.device
+            ).reshape_as(physical)
+        )
+        for step in range(speculative_num_draft_tokens):
+            torch.testing.assert_close(
+                view[:, :, step],
+                physical[:, :, step : step + window_size],
+            )
+        torch.testing.assert_close(view[:, :, :-1, 1:], view[:, :, 1:, :-1])
+
+        view[0, 0, 0, 1, 0] = -1
+        self.assertEqual(view[0, 0, 1, 0, 0].item(), -1)
 
     def test_mamba_radix_cache_1(self):
         tree, allocator, req_to_token_pool, make_dummy_req = (
             self._setup_tree_and_allocator()
         )
+        mamba_allocator = req_to_token_pool.mamba_allocator
         mamba_pool = req_to_token_pool.mamba_pool
         # test
         print(
-            f"[Start] allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
+            f"[Start] allocator mamba available size: {mamba_allocator.available_size()}, full available size: {allocator.available_size()}"
         )
         req1 = make_dummy_req()
         req1_token_ids, req1_kv_indices = [1, 2, 3], allocator.alloc(3)
@@ -158,7 +228,7 @@ class TestMamba(unittest.TestCase):
         print(
             f"req1: inserting, req1_token_ids: {req1_token_ids}, req1_kv_indices: {req1_kv_indices}"
         )
-        key = RadixKey(req1_token_ids)
+        key = RadixKey(array("q", req1_token_ids))
         result = tree.insert(
             InsertParams(
                 key=key,
@@ -168,7 +238,7 @@ class TestMamba(unittest.TestCase):
         )
         prefix_len = result.prefix_len
         print(
-            f"req1: prefix_len: {prefix_len}, allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
+            f"req1: prefix_len: {prefix_len}, allocator mamba available size: {mamba_allocator.available_size()}, full available size: {allocator.available_size()}"
         )
         req2 = make_dummy_req()
         req2_token_ids, req2_kv_indices = [1, 2, 3, 4, 5, 6, 7], allocator.alloc(7)
@@ -176,7 +246,7 @@ class TestMamba(unittest.TestCase):
         print(
             f"req2: inserting, req2_token_ids: {req2_token_ids}, req2_kv_indices: {req2_kv_indices}"
         )
-        key = RadixKey(req2_token_ids)
+        key = RadixKey(array("q", req2_token_ids))
         result = tree.insert(
             InsertParams(
                 key=key,
@@ -186,7 +256,7 @@ class TestMamba(unittest.TestCase):
         )
         prefix_len = result.prefix_len
         print(
-            f"req2: prefix_len: {prefix_len}, allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
+            f"req2: prefix_len: {prefix_len}, allocator mamba available size: {mamba_allocator.available_size()}, full available size: {allocator.available_size()}"
         )
 
         req3 = make_dummy_req()
@@ -195,7 +265,7 @@ class TestMamba(unittest.TestCase):
         print(
             f"req3: inserting, req3_token_ids: {req3_token_ids}, req3_kv_indices: {req3_kv_indices}"
         )
-        key = RadixKey(req3_token_ids)
+        key = RadixKey(array("q", req3_token_ids))
         result = tree.insert(
             InsertParams(
                 key=key,
@@ -205,7 +275,7 @@ class TestMamba(unittest.TestCase):
         )
         prefix_len = result.prefix_len
         print(
-            f"req3: prefix_len: {prefix_len}, allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
+            f"req3: prefix_len: {prefix_len}, allocator mamba available size: {mamba_allocator.available_size()}, full available size: {allocator.available_size()}"
         )
         req4 = make_dummy_req()
         req4_token_ids, req4_kv_indices = [1, 2, 3, 4, 5, 60, 70], allocator.alloc(7)
@@ -213,7 +283,7 @@ class TestMamba(unittest.TestCase):
         print(
             f"req4: inserting, req4_token_ids: {req4_token_ids}, req4_kv_indices: {req4_kv_indices}"
         )
-        key = RadixKey(req4_token_ids)
+        key = RadixKey(array("q", req4_token_ids))
         result = tree.insert(
             InsertParams(
                 key=key,
@@ -223,7 +293,7 @@ class TestMamba(unittest.TestCase):
         )
         prefix_len = result.prefix_len
         print(
-            f"req4: prefix_len: {prefix_len}, allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
+            f"req4: prefix_len: {prefix_len}, allocator mamba available size: {mamba_allocator.available_size()}, full available size: {allocator.available_size()}"
         )
 
         tree.pretty_print()
@@ -244,7 +314,9 @@ class TestMamba(unittest.TestCase):
         tree.pretty_print()
 
         req5_token_ids = [1, 2, 3, 4, 5]
-        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req5_token_ids)))
+        result = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", req5_token_ids)))
+        )
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req5: token_ids: {req5_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -252,7 +324,9 @@ class TestMamba(unittest.TestCase):
         assert len(kv_indices) == 0
 
         req6_token_ids = [1, 2, 3, 4, 5, 60, 70]
-        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req6_token_ids)))
+        result = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", req6_token_ids)))
+        )
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req6: token_ids: {req6_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -261,7 +335,9 @@ class TestMamba(unittest.TestCase):
         assert len(last_node.key) == 2
 
         req7_token_ids = [1, 2, 3, 4, 5, 6, 7]
-        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req7_token_ids)))
+        result = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", req7_token_ids)))
+        )
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req7: token_ids: {req7_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -278,7 +354,9 @@ class TestMamba(unittest.TestCase):
         tree.pretty_print()
 
         req8_token_ids = [1, 2, 3, 4, 5, 60, 70]
-        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req8_token_ids)))
+        result = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", req8_token_ids)))
+        )
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req8: token_ids: {req8_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -289,7 +367,9 @@ class TestMamba(unittest.TestCase):
         req9_token_ids = [1, 2, 3, 4, 5, 6, 7]
         req9 = make_dummy_req()
         result = tree.match_prefix(
-            MatchPrefixParams(key=RadixKey(req9_token_ids), req=req9, cow_mamba=True)
+            MatchPrefixParams(
+                key=RadixKey(array("q", req9_token_ids)), req=req9, cow_mamba=True
+            )
         )
         kv_indices, last_node = result.device_indices, result.last_device_node
         assert req9.mamba_pool_idx is not None
@@ -306,6 +386,65 @@ class TestMamba(unittest.TestCase):
         print(available_and_evictable_str(tree))
         tree.sanity_check()
 
+    def test_mamba_lru_match_refreshes_only_used_node(self):
+        """A prefix-cache hit must refresh only the matched leaf's mamba state in
+        the mamba LRU, not its ancestors. Whole-chain refresh clustered a session's
+        states adjacently, so under mamba-pool pressure eviction dropped whole cold
+        sessions instead of the intermediate states reuse never needs. Guards against
+        reverting the mamba list to reset_node_and_parents_mru.
+        """
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator()
+        )
+
+        def insert(token_ids):
+            req = make_dummy_req()
+            kv = allocator.alloc(len(token_ids))
+            tree.insert(
+                InsertParams(
+                    key=RadixKey(array("q", token_ids)),
+                    value=kv,
+                    mamba_value=req.mamba_pool_idx.unsqueeze(0),
+                )
+            )
+
+        def match_leaf(token_ids):
+            return tree.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+            ).last_device_node
+
+        def mamba_lru_mru_to_lru():
+            lst = tree.mamba_lru_list
+            order, x = [], getattr(lst.head, lst.nxt)
+            while x is not None and x is not lst.tail and x.id in lst.cache:
+                order.append(x)
+                x = getattr(x, lst.nxt)
+            return order
+
+        # Two independent sessions, each a 2-node mamba chain:
+        #   root -> a1 -> b1  and  root -> a2 -> b2
+        insert([1, 2, 3])
+        insert([1, 2, 3, 4, 5, 6])
+        insert([7, 8, 9])
+        insert([7, 8, 9, 10, 11, 12])
+
+        b1 = match_leaf([1, 2, 3, 4, 5, 6])
+        a1 = b1.parent
+        b2 = match_leaf([7, 8, 9, 10, 11, 12])
+        a2 = b2.parent
+        # Session 2 was matched last, so session 1's ancestor a1 is older than a2.
+        order = mamba_lru_mru_to_lru()
+        self.assertGreater(order.index(a1), order.index(a2))
+
+        # Re-access session 1. Only its consumed leaf (b1) moves to MRU; its ancestor
+        # a1 must stay put -- whole-chain reset would bump a1 right behind b1, making
+        # it newer than a2.
+        self.assertIs(match_leaf([1, 2, 3, 4, 5, 6]), b1)
+        order = mamba_lru_mru_to_lru()
+        self.assertIs(order[0], b1)
+        self.assertGreater(order.index(a1), order.index(a2))
+        tree.sanity_check()
+
     def test_mamba_radix_cache_kv_events(self):
         tree, allocator, _, make_dummy_req = self._setup_tree_and_allocator(
             enable_kv_cache_events=True
@@ -315,7 +454,7 @@ class TestMamba(unittest.TestCase):
         stored_hashes = []
 
         req1 = make_dummy_req()
-        key1 = RadixKey([1, 2, 3])
+        key1 = RadixKey(array("q", [1, 2, 3]))
         tree.insert(
             InsertParams(
                 key=key1,
@@ -330,7 +469,7 @@ class TestMamba(unittest.TestCase):
         stored_hashes.extend(e.block_hashes[0] for e in stored_events)
 
         req2 = make_dummy_req()
-        key2 = RadixKey([1, 2, 3, 4, 5])
+        key2 = RadixKey(array("q", [1, 2, 3, 4, 5]))
         tree.insert(
             InsertParams(
                 key=key2,
@@ -355,9 +494,9 @@ class TestMamba(unittest.TestCase):
         result = tree.evict(EvictParams(num_tokens=1))
         self.assertGreaterEqual(result.num_tokens_evicted, 1)
         events = tree.take_events()
-        removed_hashes = [
-            e.block_hashes[0] for e in events if isinstance(e, BlockRemoved)
-        ]
+        removed_hashes = _event_hashes(
+            [e for e in events if isinstance(e, BlockRemoved)]
+        )
         self.assertCountEqual(removed_hashes, stored_hashes)
 
     def test_mamba_radix_cache_kv_events_split_hash(self):
@@ -367,7 +506,7 @@ class TestMamba(unittest.TestCase):
         tree.take_events()  # Clear the reset event.
 
         req1 = make_dummy_req()
-        key1 = RadixKey([1, 2, 3, 4])
+        key1 = RadixKey(array("q", [1, 2, 3, 4]))
         tree.insert(
             InsertParams(
                 key=key1,
@@ -382,7 +521,7 @@ class TestMamba(unittest.TestCase):
         split_parent_hash = first_insert_events[1].block_hashes[0]
 
         req2 = make_dummy_req()
-        key2 = RadixKey([1, 2, 5, 6])
+        key2 = RadixKey(array("q", [1, 2, 5, 6]))
         tree.insert(
             InsertParams(
                 key=key2,
@@ -394,14 +533,17 @@ class TestMamba(unittest.TestCase):
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
         self.assertEqual(len(second_insert_events), 2)
-        self.assertEqual(second_insert_events[0].token_ids, [5])
+        self.assertEqual(list(second_insert_events[0].token_ids), [5])
         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
 
     def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
         """Helper to create a MambaRadixCache with allocator for testing."""
-        set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", page_size=1)
-        )
+        server_args = ServerArgs(model_path="dummy", page_size=1)
+        # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
+        # loads the HF config for self.model_path — impossible for the dummy model.
+        # Mirror the property's default for a dummy HF config: FLA_CHUNK_SIZE.
+        server_args._mamba_cache_chunk_size = FLA_CHUNK_SIZE
+        set_global_server_args_for_scheduler(server_args)
         size = 128
         dtype = torch.bfloat16
         head_num = 2
@@ -449,7 +591,6 @@ class TestMamba(unittest.TestCase):
             head_num=head_num,
             head_dim=head_dim,
             full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
             enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool,
@@ -478,7 +619,7 @@ class TestMamba(unittest.TestCase):
             req = Req(
                 rid=0,
                 origin_input_text="",
-                origin_input_ids=[],
+                origin_input_ids=array("q"),
                 sampling_params=sampling_params,
             )
             req_to_token_pool.alloc([req])
@@ -486,59 +627,12 @@ class TestMamba(unittest.TestCase):
 
         return tree, allocator, req_to_token_pool, make_dummy_req
 
-    def test_hi_mamba_tombstone_cleanup_respects_host_ref(self):
-        tree = object.__new__(HiMambaRadixCache)
-        root = TreeNode()
-        parent = TreeNode()
-        deleted = TreeNode()
-
-        root.key = RadixKey([])
-        parent.key = RadixKey([1])
-        deleted.key = RadixKey([2])
-        parent.parent = root
-        deleted.parent = parent
-        parent.value = torch.tensor([1], dtype=torch.int64)
-        parent.protect_host()
-        root.children[parent.key.child_key(1)] = parent
-
-        class RecordingCacheController:
-            def __init__(self):
-                self.device_evictions = []
-                self.host_evictions = []
-
-            def evict_device(self, value):
-                self.device_evictions.append(value)
-
-            def evict_host(self, value):
-                self.host_evictions.append(value)
-
-        tree.root_node = root
-        tree.page_size = 1
-        tree.full_lru_list = LRUList(mamba=False)
-        tree.full_lru_list.insert_mru(parent)
-        tree.cache_controller = RecordingCacheController()
-        tree.full_evictable_size_ = len(parent.value)
-        tree.evictable_full_device_leaves = {parent}
-        tree.evictable_full_host_leaves = set()
-
-        result_node, full_evicted, mamba_evicted = (
-            tree._iteratively_delete_tombstone_leaf(deleted)
-        )
-
-        self.assertIs(result_node, deleted)
-        self.assertEqual(full_evicted, 0)
-        self.assertEqual(mamba_evicted, 0)
-        self.assertIs(root.children[parent.key.child_key(1)], parent)
-        self.assertTrue(tree.full_lru_list.in_list(parent))
-        self.assertEqual(tree.cache_controller.device_evictions, [])
-        self.assertEqual(tree.cache_controller.host_evictions, [])
-
     def test_mamba_pool_cpu_offload(self):
         """MambaPool.get_cpu_copy / load_cpu_copy round-trips conv and temporal state."""
         _, _, req_to_token_pool, _ = self._setup_tree_and_allocator()
         mamba_pool = req_to_token_pool.mamba_pool
         n = 3
-        indices = mamba_pool.alloc(n)
+        indices = req_to_token_pool.mamba_allocator.alloc(n)
         self.assertIsNotNone(indices)
 
         # Write known sentinel values at the allocated slots.
@@ -593,7 +687,7 @@ class TestMamba(unittest.TestCase):
         n_tokens = 4
         kv_indices = allocator.alloc(n_tokens)
         self.assertIsNotNone(kv_indices)
-        mamba_indices = mamba_pool.alloc(1)
+        mamba_indices = req_to_token_pool.mamba_allocator.alloc(1)
         self.assertIsNotNone(mamba_indices)
 
         # Write sentinel values into KV buffers (all full-attention layers).
@@ -668,7 +762,7 @@ class TestMamba(unittest.TestCase):
 
         # Step 1: Insert [1,2,3] to create first node
         req1 = make_dummy_req()
-        key1 = RadixKey([1, 2, 3])
+        key1 = RadixKey(array("q", [1, 2, 3]))
         tree.insert(
             InsertParams(
                 key=key1,
@@ -681,7 +775,7 @@ class TestMamba(unittest.TestCase):
         # Step 2: Insert [1,2,3,4,5,6,7] with prev_prefix_len=0 (free all matched)
         # Creates tree: [1,2,3] -> [4,5,6,7]
         req2 = make_dummy_req()
-        key2 = RadixKey([1, 2, 3, 4, 5, 6, 7])
+        key2 = RadixKey(array("q", [1, 2, 3, 4, 5, 6, 7]))
         result = tree.insert(
             InsertParams(
                 key=key2,
@@ -699,7 +793,7 @@ class TestMamba(unittest.TestCase):
         # Matched prefix = 7 (across two nodes: [1,2,3] len=3, [4,5,6,7] len=4)
         # Protected [0..1], freed [2..6] = 5 slots, new [7] = 1 slot stored
         req3 = make_dummy_req()
-        key3 = RadixKey([1, 2, 3, 4, 5, 6, 7, 8])
+        key3 = RadixKey(array("q", [1, 2, 3, 4, 5, 6, 7, 8]))
         result = tree.insert(
             InsertParams(
                 key=key3,
@@ -716,7 +810,7 @@ class TestMamba(unittest.TestCase):
         # Step 4: Insert [1,2,3,4,5,6,7,8,9] with prev_prefix_len=8 (covers all matched)
         # Matched prefix = 8, prev_prefix_len=8 => nothing freed
         req4 = make_dummy_req()
-        key4 = RadixKey([1, 2, 3, 4, 5, 6, 7, 8, 9])
+        key4 = RadixKey(array("q", [1, 2, 3, 4, 5, 6, 7, 8, 9]))
         result = tree.insert(
             InsertParams(
                 key=key4,

@@ -101,10 +101,9 @@ class TransferTensorBuffer:
     def write_tensor(
         self,
         handle: SlotHandle,
-        name: str,
         tensor: torch.Tensor,
         byte_offset: int = 0,
-        stream: torch.cuda.Stream | None = None,
+        stream: torch.Stream | None = None,
     ) -> int:
         """Copy a tensor into the pool slot. Returns bytes written."""
         src_tensor = tensor.contiguous()
@@ -122,7 +121,7 @@ class TransferTensorBuffer:
         src_bytes = src_tensor.view(torch.uint8).reshape(-1)
 
         if stream is not None:
-            with torch.cuda.stream(stream):
+            with torch.get_device_module().stream(stream):
                 dst.copy_(src_bytes, non_blocking=True)
         else:
             dst.copy_(src_bytes, non_blocking=True)
@@ -136,7 +135,7 @@ class TransferTensorBuffer:
         dtype: torch.dtype,
         byte_offset: int = 0,
         device: torch.device | str = "cpu",
-        stream: torch.cuda.Stream | None = None,
+        stream: torch.Stream | None = None,
     ) -> torch.Tensor:
         """Read a tensor from the pool slot. Returns a clone on target device."""
         nbytes = 1
@@ -157,12 +156,12 @@ class TransferTensorBuffer:
         if same_device:
             # Clone to decouple tensor lifetime from pool slot
             if stream is not None:
-                with torch.cuda.stream(stream):
+                with torch.get_device_module().stream(stream):
                     return src.clone()
             return src.clone()
 
         if stream is not None:
-            with torch.cuda.stream(stream):
+            with torch.get_device_module().stream(stream):
                 return src.to(device, non_blocking=True)
         return src.to(device, non_blocking=True)
 
@@ -170,7 +169,7 @@ class TransferTensorBuffer:
         self,
         handle: SlotHandle,
         tensors: dict[str, torch.Tensor | list[torch.Tensor] | None],
-        stream: torch.cuda.Stream | None = None,
+        stream: torch.Stream | None = None,
     ) -> dict[str, list[dict]]:
         """Batch-write GPU tensors into a slot. Returns a manifest for later reads."""
         manifest: dict[str, list[dict]] = {}
@@ -178,7 +177,7 @@ class TransferTensorBuffer:
 
         # Ensure copy stream sees all prior compute kernels
         if stream is not None:
-            stream.wait_stream(torch.cuda.current_stream())
+            stream.wait_stream(torch.get_device_module().current_stream())
 
         for name, value in tensors.items():
             if value is None:
@@ -186,7 +185,7 @@ class TransferTensorBuffer:
 
             entries = []
             if isinstance(value, torch.Tensor):
-                nbytes = self.write_tensor(handle, name, value, byte_offset, stream)
+                nbytes = self.write_tensor(handle, value, byte_offset, stream)
                 entries.append(
                     {
                         "offset": byte_offset,
@@ -201,9 +200,7 @@ class TransferTensorBuffer:
                 for i, t in enumerate(value):
                     if t is None:
                         continue
-                    nbytes = self.write_tensor(
-                        handle, f"{name}[{i}]", t, byte_offset, stream
-                    )
+                    nbytes = self.write_tensor(handle, t, byte_offset, stream)
                     entries.append(
                         {
                             "offset": byte_offset,
@@ -225,7 +222,7 @@ class TransferTensorBuffer:
         handle: SlotHandle,
         manifest: dict[str, list[dict]],
         device: torch.device | str = "cpu",
-        stream: torch.cuda.Stream | None = None,
+        stream: torch.Stream | None = None,
     ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
         """Batch-read tensors from a slot using a manifest."""
         result: dict[str, torch.Tensor | list[torch.Tensor]] = {}
@@ -261,12 +258,3 @@ class TransferTensorBuffer:
                 )
 
         return result
-
-    def free_slots_count(self, typical_request_size: int) -> int:
-        """Estimate how many requests of typical size can still be buffered."""
-        return self._allocator.count_free_slots(typical_request_size)
-
-    def get_stats(self) -> dict:
-        alloc_stats = self._allocator.get_stats()
-        alloc_stats["role"] = self._role_name
-        return alloc_stats

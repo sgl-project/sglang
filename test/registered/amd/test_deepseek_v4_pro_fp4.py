@@ -36,35 +36,20 @@ DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
 )
 # Pro is 1.6T; weight load + warmup is much longer than Flash 285B.
 SERVER_LAUNCH_TIMEOUT = 5400
+FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
 
-# Common DeepSeek-V4 env vars (AMD ROCm 7.2 path: tilelang + AITER + ROCm700A).
-# Source of truth: python/run_dsv4.sh.
 COMMON_ENV_VARS = {
-    "SGLANG_OPT_USE_FUSED_COMPRESS": "false",
-    "SGLANG_OPT_USE_OLD_COMPRESSOR": "true",
-    "SGLANG_OPT_USE_TILELANG_SWA_PREPARE": "false",
-    "SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK": "false",
-    "SGLANG_OPT_USE_FUSED_HASH_TOPK": "false",
-    "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "false",
-    "SGLANG_OPT_USE_TILELANG_MHC_PRE": "false",
-    "SGLANG_OPT_USE_TILELANG_MHC_POST": "false",
-    "SGLANG_ENABLE_THINKING": "1",
-    "SGLANG_USE_AITER": "1",
-    "SGLANG_USE_ROCM700A": "1",
-    "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH": "1",
-    "SGLANG_OPT_DPSK_V4_RADIX": "0",
-    "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "false",
-    "SGLANG_OPT_USE_FUSED_STORE_CACHE": "false",
-    "SGLANG_TOPK_TRANSFORM_512_TORCH": "1",
-    "SGLANG_OPT_USE_TILELANG_INDEXER": "true",
-    "SGLANG_HACK_FLASHMLA_BACKEND": "tilelang",
+    "SGLANG_DEFAULT_THINKING": "1",
     "SGLANG_DSV4_REASONING_EFFORT": "max",
+    "SGLANG_USE_ROCM700A": "0",
+    "SGLANG_DP_USE_GATHERV": "1",
+    "SGLANG_HACK_FLASHMLA_BACKEND": FLASHMLA_BACKEND,
+    "AITER_BF16_FP8_MOE_BOUND": "0",
 }
 
-# FP4 variant: FP4 mixed-precision experts.
+# FP4 variant
 FP4_ENV_VARS = {
     "SGLANG_DSV4_FP4_EXPERTS": "true",
-    "SGLANG_FORCE_TRITON_MOE_FP8": "0",
 }
 
 
@@ -89,6 +74,10 @@ class TestDeepseekV4ProFp4(CustomTestCase):
             "256",
             "--page-size",
             "256",
+            "--mem-fraction-static",
+            "0.90",
+            "--swa-full-tokens-ratio",
+            "0.1",
             "--chunked-prefill-size",
             "8192",
             "--disable-shared-experts-fusion",
@@ -126,11 +115,15 @@ class TestDeepseekV4ProFp4(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v4-pro-fp4)\n"
+                f"### test_gsm8k (deepseek-v4-pro-fp4, {FLASHMLA_BACKEND})\n"
                 f'{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.92)
 
+    @unittest.skipIf(
+        os.environ.get("SGLANG_DSV4_ACCURACY_ONLY") == "1",
+        "SGLANG_DSV4_ACCURACY_ONLY=1: accuracy-only run (skipping perf)",
+    )
     def test_b_perf_8k_1k(self):
         json_output = "/tmp/deepseek_v4_pro_fp4_perf.json"
         if os.path.exists(json_output):
@@ -181,7 +174,7 @@ class TestDeepseekV4ProFp4(CustomTestCase):
             report_results = results_data
 
         summary_lines = [
-            "### test_perf_8k_1k (deepseek-v4-pro-fp4)",
+            f"### test_perf_8k_1k (deepseek-v4-pro-fp4, {FLASHMLA_BACKEND})",
             "input_len=8192 output_len=1024",
             "",
             "| batch size | latency (s) | input throughput (tok/s) | output throughput (tok/s) | ITL (ms) |",
@@ -206,4 +199,12 @@ class TestDeepseekV4ProFp4(CustomTestCase):
 
 
 if __name__ == "__main__":
+    # run_suite.py's run_one_file launches each test file with `python3 <file> -f`,
+    # which enables unittest fail-fast. For this file, `test_a_gsm8k` (accuracy)
+    # and `test_b_perf_8k_1k` (performance) are independent measurements that
+    # share a very expensive server launch in setUpClass; we want perf data even
+    # if accuracy fails. Strip `-f` locally so subsequent test methods still run.
+    import sys
+
+    sys.argv = [a for a in sys.argv if a not in ("-f", "--failfast")]
     unittest.main()

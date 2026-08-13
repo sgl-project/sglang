@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
 
 from __future__ import annotations
@@ -8,7 +10,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import torch
 from torch.nn import Module
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.parameter import BlockQuantScaleParameter, ModelWeightParameter
@@ -21,6 +22,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
@@ -147,7 +149,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
 
         block_n, block_k = (
             self.quant_config.weight_block_size[0],
@@ -269,7 +271,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
 
         if self.quant_config.is_checkpoint_int8_serialized:
             params_dtype = torch.int8
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
 
         block_n, block_k = (
             self.quant_config.weight_block_size[0],

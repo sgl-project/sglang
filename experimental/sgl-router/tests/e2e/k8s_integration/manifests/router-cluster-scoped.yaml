@@ -1,0 +1,67 @@
+# sgl-router deployment with ClusterRole for cross-namespace discovery test.
+# Watches workers in ALL namespaces via cluster-scoped EndpointSlice access.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sgl-router-cluster
+  namespace: sgl-router-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sgl-router-cluster
+  template:
+    metadata:
+      labels:
+        app: sgl-router-cluster
+    spec:
+      serviceAccountName: sgl-router-cluster
+      containers:
+        - name: router
+          image: sgl-router:e2e
+          imagePullPolicy: Never
+          # Configured entirely via CLI flags. No --service-discovery-namespace
+          # means a cluster-wide EndpointSlice watch (all namespaces); the
+          # `cross-ns-test=true` selector term scopes it to this test's workers.
+          args:
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8091"
+            - "--model-id"
+            - "tiny"
+            - "--tokenizer-path"
+            - "/etc/tokenizer/tiny.json"
+            - "--policy"
+            - "round_robin"
+            - "--service-discovery"
+            - "--selector"
+            - "app=sglang,cross-ns-test=true"
+          ports:
+            - containerPort: 8091
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8091
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8091
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sgl-router-cluster
+  namespace: sgl-router-test
+spec:
+  selector:
+    app: sgl-router-cluster
+  ports:
+    - name: http
+      port: 8091
+      targetPort: 8091

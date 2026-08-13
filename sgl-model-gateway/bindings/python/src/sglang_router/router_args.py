@@ -17,6 +17,22 @@ except ModuleNotFoundError:
 
 logger = logging.getLogger(__name__)
 
+# Single source of truth for routing-policy CLI choices. Keep this in sync with
+# `policy_from_str` in router.py and the `PolicyType` enum exposed by the Rust
+# binding (sglang_router_rs). The Rust standalone binary (src/main.rs) accepts a
+# subset of these — extending its `value_parser` and `parse_policy` to match is
+# tracked separately.
+_POLICY_CHOICES = (
+    "random",
+    "round_robin",
+    "cache_aware",
+    "power_of_two",
+    "bucket",
+    "manual",
+    "consistent_hashing",
+    "prefix_hash",
+)
+
 
 @dataclasses.dataclass
 class RouterArgs:
@@ -151,7 +167,15 @@ class RouterArgs:
     jwt_issuer: Optional[str] = None
     jwt_audience: Optional[str] = None
     jwt_jwks_uri: Optional[str] = None
+    jwt_role_claim: str = "roles"
     jwt_role_mapping: Dict[str, str] = dataclasses.field(default_factory=dict)
+    # HTTP client connection pool tuning for upstream worker requests
+    pool_idle_timeout_secs: int = 50
+    connect_timeout_secs: int = 10
+    pool_max_idle_per_host: int = 500
+    tcp_keepalive_secs: int = 30
+    # Enable WebAssembly support
+    enable_wasm: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -188,6 +212,9 @@ class RouterArgs:
         )
         request_group = parser.add_argument_group(
             "Request Handling", "Request timeout and ID configuration"
+        )
+        http_client_group = parser.add_argument_group(
+            "HTTP Client", "Tuning for upstream HTTP client connection pooling"
         )
         rate_limit_group = parser.add_argument_group(
             "Rate Limiting", "Concurrent request and queue limits"
@@ -257,46 +284,21 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=[
-                "random",
-                "round_robin",
-                "cache_aware",
-                "power_of_two",
-                "manual",
-                "consistent_hashing",
-                "prefix_hash",
-            ],
+            choices=_POLICY_CHOICES,
             help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
         )
         routing_group.add_argument(
             f"--{prefix}prefill-policy",
             type=str,
             default=None,
-            choices=[
-                "random",
-                "round_robin",
-                "cache_aware",
-                "power_of_two",
-                "manual",
-                "bucket",
-                "consistent_hashing",
-                "prefix_hash",
-            ],
+            choices=_POLICY_CHOICES,
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
         routing_group.add_argument(
             f"--{prefix}decode-policy",
             type=str,
             default=None,
-            choices=[
-                "random",
-                "round_robin",
-                "cache_aware",
-                "power_of_two",
-                "manual",
-                "consistent_hashing",
-                "prefix_hash",
-            ],
+            choices=_POLICY_CHOICES,
             help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
         )
         routing_group.add_argument(
@@ -467,6 +469,12 @@ class RouterArgs:
             default={},
             help="Label selector for decode server pods in PD mode (format: key1=value1 key2=value2)",
         )
+        k8s_group.add_argument(
+            f"--{prefix}bootstrap-port-annotation",
+            type=str,
+            default=RouterArgs.bootstrap_port_annotation,
+            help="Kubernetes annotation key for bootstrap port (PD mode)",
+        )
         # Prometheus configuration
         prometheus_group.add_argument(
             f"--{prefix}prometheus-port",
@@ -512,6 +520,32 @@ class RouterArgs:
             nargs="*",
             default=[],
             help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
+        )
+
+        # HTTP client connection pool tuning
+        http_client_group.add_argument(
+            f"--{prefix}pool-idle-timeout-secs",
+            type=int,
+            default=RouterArgs.pool_idle_timeout_secs,
+            help="Idle timeout in seconds for pooled upstream HTTP connections",
+        )
+        http_client_group.add_argument(
+            f"--{prefix}connect-timeout-secs",
+            type=int,
+            default=RouterArgs.connect_timeout_secs,
+            help="Timeout in seconds for new upstream HTTP connections",
+        )
+        http_client_group.add_argument(
+            f"--{prefix}pool-max-idle-per-host",
+            type=int,
+            default=RouterArgs.pool_max_idle_per_host,
+            help="Maximum idle upstream HTTP connections to keep per host",
+        )
+        http_client_group.add_argument(
+            f"--{prefix}tcp-keepalive-secs",
+            type=int,
+            default=RouterArgs.tcp_keepalive_secs,
+            help="TCP keepalive idle time in seconds for upstream HTTP connections",
         )
 
         # Rate limiting configuration
@@ -726,6 +760,12 @@ class RouterArgs:
             choices=["memory", "none", "oracle", "postgres", "redis"],
             help="History storage backend for conversations and responses (default: memory)",
         )
+        backend_group.add_argument(
+            f"--{prefix}enable-wasm",
+            action="store_true",
+            default=RouterArgs.enable_wasm,
+            help="Enable WebAssembly support",
+        )
 
         # Oracle configuration
         oracle_group.add_argument(
@@ -901,6 +941,12 @@ class RouterArgs:
             help="Explicit JWKS URI. If not provided, discovered from issuer via .well-known/openid-configuration",
         )
         auth_group.add_argument(
+            f"--{prefix}jwt-role-claim",
+            type=str,
+            default=RouterArgs.jwt_role_claim,
+            help="JWT claim name containing the role (default: 'roles')",
+        )
+        auth_group.add_argument(
             f"--{prefix}jwt-role-mapping",
             type=str,
             nargs="*",
@@ -959,9 +1005,6 @@ class RouterArgs:
         args_dict["decode_selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}decode_selector", None)
         )
-
-        # Mooncake-specific annotation
-        args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
 
         # Parse control plane API keys
         args_dict["control_plane_api_keys"] = cls._parse_control_plane_api_keys(

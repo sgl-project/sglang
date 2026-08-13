@@ -1,11 +1,20 @@
 # SGLang public APIs
 
+# sglang.srt.environ must run before the rest of this file's imports
+# (hf_transformers_patches, lang.api, ...), which pull in torch and
+# FlashInfer: those claim these cache dirs early, and the first value set is
+# the one that sticks. Safe here -- environ has no heavy dependency (no torch).
+from sglang.srt.environ import redirect_third_party_caches
+
+redirect_third_party_caches()
+
 # Install stubs early for platforms where certain dependencies are unavailable
 # (e.g. macOS/MPS has no triton, and torch.mps lacks Stream / set_device /
 # get_device_properties).  This must run before any downstream imports.
+import platform as _platform
 import sys as _sys
 
-if _sys.platform == "darwin":
+if _sys.platform == "darwin" and _platform.machine() == "arm64":
     try:
         import torch as _torch
 
@@ -22,6 +31,7 @@ if _sys.platform == "darwin":
         del _torch
     except ImportError:
         pass
+del _platform
 del _sys
 
 from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
@@ -67,6 +77,7 @@ from sglang.utils import LazyImport
 from sglang.version import __version__
 
 Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
+Crusoe = LazyImport("sglang.lang.backend.crusoe", "Crusoe")
 LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")
 OpenAI = LazyImport("sglang.lang.backend.openai", "OpenAI")
 VertexAI = LazyImport("sglang.lang.backend.vertexai", "VertexAI")
@@ -104,6 +115,7 @@ __all__ = [
     "unconditional_likelihood_normalized",
     "ServerArgs",
     "Anthropic",
+    "Crusoe",
     "LiteLLM",
     "OpenAI",
     "VertexAI",

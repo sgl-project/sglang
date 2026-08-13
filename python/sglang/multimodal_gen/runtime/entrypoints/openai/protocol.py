@@ -2,7 +2,7 @@ import time
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -13,6 +13,20 @@ class ImageResponseData(BaseModel):
     url: Optional[str] = None
     revised_prompt: Optional[str] = None
     file_path: Optional[str] = None
+    resize: Optional[str] = None
+
+
+class ImagePromptTokensDetails(BaseModel):
+    cached_tokens: int = 0
+
+
+class ImageUsage(BaseModel):
+    prompt_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    prompt_tokens_details: Optional[ImagePromptTokensDetails] = None
+    reasoning_tokens: Optional[int] = 0
+    image_count: Optional[int] = None
 
 
 class ImageResponse(BaseModel):
@@ -21,6 +35,7 @@ class ImageResponse(BaseModel):
     data: List[ImageResponseData]
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
+    usage: Optional[ImageUsage] = None
 
 
 class ImageGenerationsRequest(BaseModel):
@@ -50,6 +65,8 @@ class ImageGenerationsRequest(BaseModel):
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     enable_teacache: Optional[bool] = False
+    max_sequence_length: Optional[int] = None
+    flow_shift: Optional[float] = None
     # Upscaling
     enable_upscaling: Optional[bool] = False
     upscaling_model_path: Optional[str] = None
@@ -57,6 +74,10 @@ class ImageGenerationsRequest(BaseModel):
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
     perf_dump_path: Optional[str] = None
+    # Progressive resolution generation
+    progressive_mode: Optional[str] = None
+    progressive_levels: Optional[int] = None
+    progressive_delta: Optional[float] = None
 
 
 # Video API protocol models
@@ -80,12 +101,17 @@ class VideoResponse(BaseModel):
     num_outputs: Optional[int] = None
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
+    action: Optional[Dict[str, Any]] = None
 
 
 class VideoGenerationsRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     prompt: str
     input_reference: Optional[str] = None
     reference_url: Optional[str] = None
+    video_path: Optional[str] = None
+    video_url: Optional[str] = None
     model: Optional[str] = None
     n: Optional[int] = 1
     num_outputs_per_prompt: Optional[int] = None
@@ -105,6 +131,8 @@ class VideoGenerationsRequest(BaseModel):
         None  # for CFG vs guidance distillation (e.g., QwenImage)
     )
     negative_prompt: Optional[str] = None
+    max_sequence_length: Optional[int] = None
+    flow_shift: Optional[float] = None
     enable_teacache: Optional[bool] = False
     # Frame interpolation
     enable_frame_interpolation: Optional[bool] = False
@@ -121,6 +149,9 @@ class VideoGenerationsRequest(BaseModel):
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
     perf_dump_path: Optional[str] = None
+    profile: Optional[bool] = False
+    num_profiled_timesteps: Optional[int] = None
+    profile_all_stages: Optional[bool] = False
 
 
 class VideoListResponse(BaseModel):
@@ -130,6 +161,32 @@ class VideoListResponse(BaseModel):
 
 class VideoRemixRequest(BaseModel):
     prompt: str
+
+
+class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
+    type: Literal["init"]
+    # WebSocket does not support multipart/form-data image uploads
+    first_frame: Optional[bytes | str] = None
+    condition_inputs: Optional[Dict[str, Any]] = None
+    max_chunks: Optional[int] = Field(default=None, ge=1)
+    seed: Optional[int] = 42
+    guidance_scale: Optional[float] = 1.0
+    size: Optional[str] = "832x480"
+    profile: Optional[bool] = False
+    num_profiled_timesteps: Optional[int] = None
+    profile_all_stages: Optional[bool] = False
+    realtime_output_format: Optional[Literal["raw", "webp", "jpeg"]] = None
+    realtime_preview_max_width: Optional[int] = None
+    realtime_output_pacing: Optional[bool] = False
+    realtime_causal_sink_size: Optional[int] = None
+    realtime_causal_kv_cache_num_frames: Optional[int] = None
+
+
+class RealtimeEvent(BaseModel):
+    type: Literal["event"]
+    kind: str
+    payload: Any = None
+    event_id: Optional[int] = None
 
 
 # Mesh API protocol models

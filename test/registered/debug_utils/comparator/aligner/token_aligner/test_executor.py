@@ -21,15 +21,20 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import 
     TokenAlignerStepAux,
     TokenLocator,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import TokenLayout
+from sglang.srt.debug_utils.comparator.dims_spec import (
+    TokenLayout,
+    apply_dim_names,
+    without_dim_names,
+)
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="stage-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=1, suite="base-c-test-cpu")
 
 
 def _named(tensor: torch.Tensor, names: list[str]) -> torch.Tensor:
-    return tensor.refine_names(*names)
+    return apply_dim_names(tensor, names)
 
 
 class TestExecuteAlignment:
@@ -38,8 +43,8 @@ class TestExecuteAlignment:
     def test_thd_vs_thd_identity(self):
         """Two identical thd sides produce element-wise equal aligned tensors."""
         torch.manual_seed(42)
-        hidden_step0 = torch.randn(5, 8).refine_names("t", "h")
-        hidden_step1 = torch.randn(2, 8).refine_names("t", "h")
+        hidden_step0 = apply_dim_names(torch.randn(5, 8), ["t", "h"])
+        hidden_step1 = apply_dim_names(torch.randn(2, 8), ["t", "h"])
 
         aux = TokenAlignerStepAux(
             input_ids=[10, 20, 30, 40, 50],
@@ -83,7 +88,7 @@ class TestExecuteAlignment:
             layouts=Pair(x=TokenLayout.T, y=TokenLayout.T),
         )
 
-        tensors = {0: torch.randn(5, 8).refine_names("t", "h")}
+        tensors = {0: apply_dim_names(torch.randn(5, 8), ["t", "h"])}
         aligned: Pair[torch.Tensor] = execute_token_aligner(
             plan=plan, tensor_of_step_pair=Pair(x=tensors, y=tensors)
         )
@@ -121,7 +126,7 @@ class TestTokenDim:
 
         assert aligned.x.shape == (3, 5, 8)
         assert torch.equal(aligned.x, aligned.y)
-        plain: torch.Tensor = tensor.rename(None)
+        plain: torch.Tensor = without_dim_names(tensor)
         for i in range(5):
             assert torch.equal(
                 aligned.x.select(dim=1, index=i), plain.select(dim=1, index=i)
@@ -140,7 +145,7 @@ class TestTokenDim:
         )
 
         assert aligned.x.shape == (3, 8, 5)
-        plain: torch.Tensor = tensor.rename(None)
+        plain: torch.Tensor = without_dim_names(tensor)
         for i in range(5):
             assert torch.equal(
                 aligned.x.select(dim=2, index=i), plain.select(dim=2, index=i)
@@ -159,7 +164,7 @@ class TestTokenDim:
         )
 
         assert aligned.x.shape == (5, 8)
-        plain: torch.Tensor = tensor.rename(None)
+        plain: torch.Tensor = without_dim_names(tensor)
         for i in range(5):
             assert torch.equal(aligned.x[i], plain.select(dim=0, index=i))
 
@@ -202,7 +207,7 @@ class TestTokenDim:
         )
 
         assert aligned.x.shape == (2, 3, 5, 4, 8)
-        plain: torch.Tensor = tensor.rename(None)
+        plain: torch.Tensor = without_dim_names(tensor)
         for i in range(5):
             assert torch.equal(
                 aligned.x.select(dim=2, index=i), plain.select(dim=2, index=i)
@@ -216,7 +221,7 @@ class TestBSHDExecutor:
         """Standard "b s h d": B=dim0, S=dim1. [2, 3, 4, 5] -> collapse -> [6, 4, 5]."""
         torch.manual_seed(42)
         tensor: torch.Tensor = _named(torch.randn(2, 3, 4, 5), ["b", "s", "h", "d"])
-        flat: torch.Tensor = tensor.rename(None).reshape(6, 4, 5)
+        flat: torch.Tensor = tensor.reshape(6, 4, 5)
 
         locator = TokenLocator(
             steps=[0, 0, 0],
@@ -242,7 +247,7 @@ class TestBSHDExecutor:
         """Minimal 3D "b s h": B=dim0, S=dim1. [2, 3, 4] -> collapse -> [6, 4]."""
         torch.manual_seed(42)
         tensor: torch.Tensor = _named(torch.randn(2, 3, 4), ["b", "s", "h"])
-        flat: torch.Tensor = tensor.rename(None).reshape(6, 4)
+        flat: torch.Tensor = tensor.reshape(6, 4)
 
         locator = TokenLocator(
             steps=[0, 0, 0, 0],
@@ -269,7 +274,7 @@ class TestBSHDExecutor:
         """Non-leading "h b s d": B=dim1, S=dim2. [4, 2, 3, 5] -> collapse -> [4, 6, 5]."""
         torch.manual_seed(42)
         tensor: torch.Tensor = _named(torch.randn(4, 2, 3, 5), ["h", "b", "s", "d"])
-        flat: torch.Tensor = tensor.rename(None).reshape(4, 6, 5)
+        flat: torch.Tensor = tensor.reshape(4, 6, 5)
 
         locator = TokenLocator(
             steps=[0, 0, 0],
@@ -299,7 +304,7 @@ class TestBSHDExecutor:
         tensor: torch.Tensor = _named(
             torch.randn(2, 3, 4, 5, 6), ["e", "b", "s", "h", "d"]
         )
-        flat: torch.Tensor = tensor.rename(None).reshape(2, 12, 5, 6)
+        flat: torch.Tensor = tensor.reshape(2, 12, 5, 6)
 
         locator = TokenLocator(
             steps=[0, 0, 0],
@@ -327,7 +332,7 @@ class TestBSHDExecutor:
         """B and S at end: "h d b s". [4, 5, 2, 3] -> collapse -> [4, 5, 6]."""
         torch.manual_seed(42)
         tensor: torch.Tensor = _named(torch.randn(4, 5, 2, 3), ["h", "d", "b", "s"])
-        flat: torch.Tensor = tensor.rename(None).reshape(4, 5, 6)
+        flat: torch.Tensor = tensor.reshape(4, 5, 6)
 
         locator = TokenLocator(
             steps=[0, 0, 0],
@@ -356,7 +361,7 @@ class TestBSHDExecutor:
         torch.manual_seed(42)
         tensor_thd: torch.Tensor = _named(torch.randn(6, 8), ["t", "h"])
         tensor_bshd: torch.Tensor = _named(torch.randn(2, 3, 8), ["b", "s", "h"])
-        flat_bshd: torch.Tensor = tensor_bshd.rename(None).reshape(6, 8)
+        flat_bshd: torch.Tensor = tensor_bshd.reshape(6, 8)
 
         locator = TokenLocator(
             steps=[0, 0, 0],
@@ -374,7 +379,7 @@ class TestBSHDExecutor:
 
         assert aligned.x.shape == (3, 8)
         assert aligned.y.shape == (3, 8)
-        assert torch.equal(aligned.x[0], tensor_thd.rename(None)[0])
+        assert torch.equal(aligned.x[0], tensor_thd[0])
         assert torch.equal(aligned.y[0], flat_bshd[0])
         assert torch.equal(aligned.y[2], flat_bshd[5])
 
@@ -385,7 +390,7 @@ class TestBSHDExecutor:
         # batch-major flatten: rearrange("s b h -> (b s) h")
         from einops import rearrange
 
-        flat: torch.Tensor = rearrange(tensor.rename(None), "s b h -> (b s) h")
+        flat: torch.Tensor = rearrange(tensor, "s b h -> (b s) h")
 
         locator = TokenLocator(
             steps=[0, 0, 0],

@@ -22,7 +22,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     QwenImageRolloutPipelineMixin,
 )
-from sglang.multimodal_gen.runtime.models.vision_utils import resize
+from sglang.multimodal_gen.runtime.utils.condition_expansion import (
+    PromptToSampleBatchExpander,
+)
+from sglang.multimodal_gen.runtime.utils.vision import resize
 from sglang.multimodal_gen.utils import calculate_dimensions
 
 
@@ -148,6 +151,8 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
 
     vae_sp: bool = False
 
+    vae_precision: str = "bf16"
+
     dit_config: DiTConfig = field(default_factory=QwenImageDitConfig)
     # VAE
     vae_config: VAEConfig = field(default_factory=QwenImageVAEConfig)
@@ -168,6 +173,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (qwen_image_postprocess_text,)
     )
+
     text_encoder_extra_args: list[dict] = field(
         default_factory=lambda: [
             dict(
@@ -177,6 +183,34 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
             None,
         ]
     )
+
+    def expand_conditioning_to_sample_batch(self, batch):
+        expander = PromptToSampleBatchExpander.from_batch(batch)
+        if expander is None:
+            return batch
+
+        for field_name in (
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "prompt_attention_mask",
+            "negative_attention_mask",
+            "prompt_embeds_mask",
+            "negative_prompt_embeds_mask",
+            "prompt_seq_lens",
+            "negative_prompt_seq_lens",
+        ):
+            expander.expand_field(batch, field_name)
+        return batch
+
+    def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
+        tok_kwargs.setdefault("truncation", True)
+
+        if tok_kwargs.get("max_length") is not None:
+            tok_kwargs["padding"] = "max_length"
+        else:
+            tok_kwargs.setdefault("max_length", 1024)
+            tok_kwargs["padding"] = True
+        return tokenizer(prompts, **tok_kwargs)
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)
@@ -770,22 +804,31 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
         return cond_kwargs
 
     def _unpad_and_unpack_latents(self, latents, batch):
-        vae_scale_factor = self.get_vae_scale_factor()
         channels = self.dit_config.arch_config.in_channels
         batch_size = latents.shape[0]
-        layers = batch.num_frames
 
-        height = 2 * (int(batch.height) // (vae_scale_factor * 2))
-        width = 2 * (int(batch.width) // (vae_scale_factor * 2))
+        img_shapes = batch.img_shapes
+        generated_shapes = img_shapes[0][:-1] if img_shapes and img_shapes[0] else []
+        if not generated_shapes:
+            raise ValueError("Qwen-Image-Layered requires generated latent shapes.")
+        if len({tuple(shape) for shape in generated_shapes}) != 1:
+            raise ValueError(
+                "Qwen-Image-Layered generated latent shapes must match, got "
+                f"{generated_shapes}."
+            )
+        layers = len(generated_shapes)
+        _, latent_height, latent_width = generated_shapes[0]
+        height = 2 * int(latent_height)
+        width = 2 * int(latent_width)
 
         latents = maybe_unpad_latents(latents, batch)
         latents = latents.view(
-            batch_size, layers + 1, height // 2, width // 2, channels // 4, 2, 2
+            batch_size, layers, height // 2, width // 2, channels // 4, 2, 2
         )
         latents = latents.permute(0, 1, 4, 2, 5, 3, 6)
 
         latents = latents.reshape(
-            batch_size, layers + 1, channels // (2 * 2), height, width
+            batch_size, layers, channels // (2 * 2), height, width
         )
         latents = latents.permute(0, 2, 1, 3, 4)  # (b, c, f, h, w)
         return latents, batch_size, channels, height, width

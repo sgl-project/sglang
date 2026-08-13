@@ -1,6 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=34, suite="stage-b-test-1-gpu-small-amd")
 
 # Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
@@ -12,8 +14,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+from sglang.kernels.ops.mamba.triton_ops import mamba_chunk_scan_combined
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
-from sglang.srt.layers.attention.mamba.ops import mamba_chunk_scan_combined
 from sglang.srt.utils import get_device
 from sglang.srt.utils.common import is_hip
 from sglang.utils import is_in_ci

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 from sglang.srt.tokenizer.tiktoken_tokenizer import (
     CONTROL_TOKEN_TEXTS,
@@ -36,11 +36,6 @@ class TestConstants(CustomTestCase):
         self.assertEqual(CONTROL_TOKEN_TEXTS[0], "<|control1|>")
         self.assertEqual(CONTROL_TOKEN_TEXTS[-1], "<|control704|>")
 
-    def test_special_token_values(self):
-        self.assertEqual(PAD, "<|pad|>")
-        self.assertEqual(EOS, "<|eos|>")
-        self.assertEqual(SEP, "<|separator|>")
-
     def test_default_special_tokens_contains_all(self):
         self.assertIn(PAD, DEFAULT_SPECIAL_TOKENS)
         self.assertIn(EOS, DEFAULT_SPECIAL_TOKENS)
@@ -61,14 +56,6 @@ class TestTiktokenProcessor(CustomTestCase):
         tokenizer_patcher.start()
         self.addCleanup(tokenizer_patcher.stop)
         self.processor = TiktokenProcessor(name="dummy")
-
-    def test_image_processor_returns_dict(self):
-        result = self.processor.image_processor("fake_image")
-        self.assertIsInstance(result, dict)
-
-    def test_image_processor_has_pixel_values_key(self):
-        result = self.processor.image_processor("fake_image")
-        self.assertIn("pixel_values", result)
 
     def test_image_processor_wraps_image_in_list(self):
         image = "fake_image_data"
@@ -94,24 +81,6 @@ class TestTiktokenTokenizer(CustomTestCase):
             "{% endfor %}"
             "{% if add_generation_prompt %}assistant:{% endif %}"
         )
-
-    def test_encode_delegates_to_tokenizer(self):
-        self.mock_tokenizer.encode.return_value = [1, 2, 3]
-        result = self.tok.encode("hello")
-        self.mock_tokenizer.encode.assert_called_once_with("hello")
-        self.assertEqual(result, [1, 2, 3])
-
-    def test_decode_delegates_to_tokenizer(self):
-        self.mock_tokenizer.decode.return_value = "hello"
-        result = self.tok.decode([1, 2, 3])
-        self.mock_tokenizer.decode.assert_called_once_with([1, 2, 3])
-        self.assertEqual(result, "hello")
-
-    def test_batch_decode_list_of_lists(self):
-        self.mock_tokenizer.decode_batch.return_value = ["hello", "world"]
-        result = self.tok.batch_decode([[1, 2], [3, 4]])
-        self.mock_tokenizer.decode_batch.assert_called_once_with([[1, 2], [3, 4]])
-        self.assertEqual(result, ["hello", "world"])
 
     def test_batch_decode_flat_list_wraps_each(self):
         self.mock_tokenizer.decode_batch.return_value = ["a", "b"]

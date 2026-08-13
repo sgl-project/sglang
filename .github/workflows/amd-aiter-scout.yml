@@ -2,8 +2,8 @@ name: AMD AITER Scout
 
 on:
   schedule:
-    - cron: '0 20 * * 1'   # Monday 20:00 UTC
-    - cron: '0 20 * * 4'   # Thursday 20:00 UTC
+    - cron: '0 20 * * 6'   # Saturday 20:00 UTC
+    # - cron: '0 20 * * 4'   # Thursday 20:00 UTC (temporarily disabled)
   workflow_dispatch:
     inputs:
       aiter_ref:
@@ -12,7 +12,7 @@ on:
         type: string
         default: 'main'
       job_filter:
-        description: 'Comma-separated workflows to run: nightly-amd, nightly-amd-rocm720, pr-test-amd, pr-test-amd-rocm720. Default: all'
+        description: 'Workflows: nightly-amd, nightly-amd-rocm720, pr-test-amd (ROCm 7.0 shadow), pr-test-amd-rocm720 (ROCm 7.2 gate). Default: all'
         required: false
         type: string
         default: 'all'
@@ -21,6 +21,12 @@ on:
         required: false
         type: boolean
         default: true
+
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
 
 concurrency:
   group: amd-aiter-scout-${{ github.run_id }}
@@ -88,7 +94,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-amd.yml
     secrets: inherit
     with:
-      ref: ${{ github.sha }}
+      ref: amd/aiter-ci
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
@@ -99,7 +105,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-amd-rocm720.yml
     secrets: inherit
     with:
-      ref: ${{ github.sha }}
+      ref: amd/aiter-ci
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
@@ -110,6 +116,7 @@ jobs:
     uses: ./.github/workflows/pr-test-amd.yml
     secrets: inherit
     with:
+      ref: amd/aiter-ci
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
@@ -120,6 +127,7 @@ jobs:
     uses: ./.github/workflows/pr-test-amd-rocm720.yml
     secrets: inherit
     with:
+      ref: amd/aiter-ci
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
@@ -138,6 +146,7 @@ jobs:
         run: |
           echo "## AMD AITER Scout Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **SGLang ref:** \`amd/aiter-ci\`" >> $GITHUB_STEP_SUMMARY
           echo "- **AITER SHA:** \`${{ needs.resolve-aiter.outputs.aiter_sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **AITER commit:** https://github.com/ROCm/aiter/commit/${{ needs.resolve-aiter.outputs.aiter_sha }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -145,8 +154,8 @@ jobs:
           echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| Nightly AMD (AITER Latest) | \`${{ needs.call-nightly-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Nightly AMD ROCm 7.2 | \`${{ needs.call-nightly-amd-rocm720.result }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| PR Test AMD (AITER Latest) | \`${{ needs.call-pr-test-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| PR Test AMD ROCm 7.2 | \`${{ needs.call-pr-test-amd-rocm720.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Test AMD ROCm 7.0 Shadow | \`${{ needs.call-pr-test-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Test AMD ROCm 7.2 Gate | \`${{ needs.call-pr-test-amd-rocm720.result }}\` |" >> $GITHUB_STEP_SUMMARY
 
       - name: Check if any job failed
         run: |

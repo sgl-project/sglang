@@ -27,7 +27,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -453,7 +455,7 @@ class _FluxLastLayer(nn.Module):
         return x
 
 
-class Hunyuan3D2DiT(CachableDiT, OffloadableDiTMixin):
+class Hunyuan3D2DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
     """Hunyuan3D DiT model (Flux-style architecture for Hunyuan3D-2.0)."""
 
     _aliases = ["hy3dgen.shapegen.models.Hunyuan3DDiT"]
@@ -485,7 +487,7 @@ class Hunyuan3D2DiT(CachableDiT, OffloadableDiTMixin):
         **kwargs,
     ):
         super().__init__(config=config, hf_config=hf_config or {}, **kwargs)
-        arch = config.arch_config
+        arch = self.config
 
         in_channels = arch.in_channels
         context_in_dim = arch.context_in_dim
@@ -499,7 +501,7 @@ class Hunyuan3D2DiT(CachableDiT, OffloadableDiTMixin):
         qkv_bias = arch.qkv_bias
         time_factor = arch.time_factor
         guidance_embed = arch.guidance_embed
-        supported_attention_backends = arch._supported_attention_backends
+        supported_attention_backends = self._supported_attention_backends
 
         self.in_channels = in_channels
         self.context_in_dim = context_in_dim
@@ -560,7 +562,7 @@ class Hunyuan3D2DiT(CachableDiT, OffloadableDiTMixin):
 
         self.final_layer = _FluxLastLayer(self.hidden_size, 1, self.out_channels)
 
-        # OffloadableDiTMixin
+        # LayerwiseOffloadableModuleMixin
         self.layer_names = ["double_blocks", "single_blocks"]
 
     def forward(

@@ -79,17 +79,19 @@ class BaseHostCache:
 @dataclasses.dataclass
 class TopkCaptureOutput:
     """Holds GPU tensors captured during forward for overlap scheduling.
-    Call copy_to_cpu() inside forward stream (before copy_done.record()),
-    then finalize() after copy_done.synchronize().
+    map_device_tensors() D2H-copies them before copy_done.record() (may run on
+    the dedicated result-copy stream); finalize() runs after copy_done.synchronize().
     """
 
     out_cache_loc: torch.Tensor
     topk: torch.Tensor
     host_cache: BaseHostCache
 
-    def copy_to_cpu(self):
-        self.out_cache_loc = self.out_cache_loc.to("cpu", non_blocking=True)
-        self.topk = self.topk.to("cpu", non_blocking=True)
+    def map_device_tensors(self, fn):
+        # Device-tensor fields only; caller injects the copy+safety primitive
+        # (see GenerationBatchResult.copy_to_cpu).
+        self.out_cache_loc = fn(self.out_cache_loc)
+        self.topk = fn(self.topk)
 
     def finalize(self):
         self.host_cache.buffer[self.out_cache_loc] = self.topk
@@ -147,10 +149,16 @@ class BaseTopkCapturer:
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        start_len: int = 0,
     ) -> torch.Tensor:
-        cache_pool_idx = req_to_token_pool.req_to_token[req_pool_idx][
-            : seqlen - 1
-        ].cpu()
+        if start_len < 0:
+            raise ValueError(f"{start_len=} must be non-negative")
+        start_len = min(start_len, seqlen - 1)
+        cache_pool_idx = (
+            req_to_token_pool.req_to_token[req_pool_idx][start_len : seqlen - 1]
+            .cpu()
+            .clone()
+        )
         return self.host_cache.buffer[cache_pool_idx]
 
     def on_forward_end(

@@ -23,9 +23,12 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    BlockStoredMetadata,
+    BlockStoredWithMetadata,
     StorageMedium,
 )
 from sglang.srt.mem_cache.utils import (
+    compute_node_event_hash_values,
     compute_node_hash_values,
     hash_str_to_int64,
 )
@@ -43,15 +46,22 @@ class KVCacheEventMixin:
             # Compute hash_value lazily if not already set
             if node.hash_value is None:
                 node.hash_value = compute_node_hash_values(node, self.page_size)
+            event_hash_values = (
+                compute_node_event_hash_values(node, self.page_size)
+                if node.key.cache_salt is not None
+                else node.hash_value
+            )
 
             # Get parent's last hash value for first page
             parent_block_hash = None
             if node.parent is not None and node.parent != self.root_node:
-                if (
-                    node.parent.hash_value is not None
-                    and len(node.parent.hash_value) > 0
-                ):
-                    parent_block_hash = hash_str_to_int64(node.parent.hash_value[-1])
+                if node.key.cache_salt is not None:
+                    parent_hash_values = node.parent.event_hash_value
+                    assert parent_hash_values is not None
+                else:
+                    parent_hash_values = node.parent.hash_value
+                if parent_hash_values:
+                    parent_block_hash = hash_str_to_int64(parent_hash_values[-1])
 
             page_index = 0
             logical_len = len(node.key)
@@ -65,26 +75,32 @@ class KVCacheEventMixin:
                 if is_bigram:
                     page_tokens = [(raw[j], raw[j + 1]) for j in range(start, end)]
                 else:
-                    page_tokens = raw[start:end]
+                    page_tokens = list(raw[start:end])
 
-                block_hash = hash_str_to_int64(node.hash_value[page_index])
+                block_hash = hash_str_to_int64(event_hash_values[page_index])
 
-                self.kv_event_queue.append(
-                    BlockStored(
-                        block_hashes=[block_hash],
-                        parent_block_hash=parent_block_hash,
-                        token_ids=page_tokens,
-                        block_size=len(page_tokens),
-                        lora_id=None,
-                        medium=medium,
+                event_args = {
+                    "block_hashes": [block_hash],
+                    "parent_block_hash": parent_block_hash,
+                    "token_ids": page_tokens,
+                    "block_size": len(page_tokens),
+                    "lora_id": None,
+                    "medium": medium,
+                }
+                if node.key.cache_salt is None:
+                    event = BlockStored(**event_args)
+                else:
+                    event = BlockStoredWithMetadata(
+                        **event_args,
+                        metadata=BlockStoredMetadata(cache_salt=node.key.cache_salt),
                     )
-                )
+                self.kv_event_queue.append(event)
 
                 parent_block_hash = block_hash
                 page_index += 1
 
     def _record_remove_event(self, node: Any, medium=None):
-        # One BlockRemoved per chunk.
+        # One BlockRemoved per radix node.
         # ``medium`` defaults to StorageMedium.GPU but callers may override for
         # lower-tier removals (e.g. StorageMedium.CPU when evicting from host).
         if self.enable_kv_cache_events:
@@ -94,21 +110,27 @@ class KVCacheEventMixin:
             # Compute hash_value lazily if not already set (must match what was stored)
             if node.hash_value is None:
                 node.hash_value = compute_node_hash_values(node, self.page_size)
+            event_hash_values = (
+                compute_node_event_hash_values(node, self.page_size)
+                if node.key.cache_salt is not None
+                else node.hash_value
+            )
 
-            page_index = 0
+            block_hashes = []
             logical_len = len(node.key)
+            page_index = 0
             for start in range(0, logical_len, self.page_size):
                 end = min(start + self.page_size, logical_len)
                 if end <= start:
                     continue
 
-                block_hash = hash_str_to_int64(node.hash_value[page_index])
-
-                self.kv_event_queue.append(
-                    BlockRemoved(block_hashes=[block_hash], medium=medium)
-                )
-
+                block_hashes.append(hash_str_to_int64(event_hash_values[page_index]))
                 page_index += 1
+
+            if block_hashes:
+                self.kv_event_queue.append(
+                    BlockRemoved(block_hashes=block_hashes, medium=medium)
+                )
 
     def _record_all_cleared_event(self):
         if self.enable_kv_cache_events:

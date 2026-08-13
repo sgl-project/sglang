@@ -36,10 +36,31 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 
+def select_kv_publisher_dp_rank(
+    attn_dp_size: int, attn_dp_rank: int, dp_rank: Optional[int]
+) -> int:
+    """Index used to offset this scheduler's KV-event publisher port.
+
+    Each independent KV cache must publish on its own port so a consumer can
+    subscribe per replica. There are always ``dp_size`` such publishers; which
+    rank distinguishes them depends on the parallelism mode:
+
+    - DP-attention (``attn_dp_size > 1``): each attention-DP rank owns a KV
+      cache shard, so distinguish by ``attn_dp_rank``.
+    - Pure DP (``attn_dp_size == 1``): every worker has ``attn_dp_rank == 0``,
+      so distinguish by ``dp_rank`` (the data-parallel replica index).
+
+    Both span ``0..dp_size-1``, matching the ``dp_size`` advertised in
+    ``/server_info`` and the per-rank ports the router subscribes to.
+    """
+    if attn_dp_size > 1:
+        return attn_dp_rank
+    return dp_rank or 0
+
+
 class EventBatch(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
-    omit_defaults=True,  # type: ignore[call-arg]
     gc=False,  # type: ignore[call-arg]
 ):
     ts: float
@@ -50,7 +71,6 @@ class EventBatch(
 class KVCacheEvent(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
-    omit_defaults=True,  # type: ignore[call-arg]
     gc=False,  # type: ignore[call-arg]
     tag=True,
 ):
@@ -64,6 +84,12 @@ class StorageMedium(str, enum.Enum):
     CPU = "CPU_PINNED"  # L2: host pinned memory
     DISK = "DISK"  # L3: SSD / NVMe
     EXTERNAL = "EXTERNAL"  # L4: shared / remote pool (e.g. Mooncake)
+
+
+class BlockStoredMetadata(msgspec.Struct, omit_defaults=True, gc=False):
+    """Typed request metadata attached to a stored KV block."""
+
+    cache_salt: str
 
 
 class OffloadedState:
@@ -92,6 +118,16 @@ class BlockStored(KVCacheEvent):
     medium: Optional[str] = None
 
 
+class BlockStoredWithMetadata(BlockStored, tag="BlockStored", kw_only=True):
+    """BlockStored wire extension used only when typed metadata is present.
+
+    A separate struct keeps unsalted events at their legacy array length; an
+    optional field on BlockStored would still serialize a trailing null.
+    """
+
+    metadata: BlockStoredMetadata
+
+
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
     medium: Optional[str] = None
@@ -102,6 +138,10 @@ class AllBlocksCleared(KVCacheEvent):
 
 
 class KVEventBatch(EventBatch):
+    # BlockStoredWithMetadata deliberately stays out of this tagged union.
+    # Existing typed consumers decode its shared "BlockStored" tag as the base
+    # type and ignore the trailing metadata; adding both types would give
+    # msgspec duplicate tags and make the union invalid.
     events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
 
 
@@ -118,9 +158,6 @@ class EventPublisher(ABC):
     - Publishers annotate events with the dp rank
     - This allows consumers to distinguish events from different DP ranks
     """
-
-    def __init__(self, attn_dp_rank: int = 0):
-        self._attn_dp_rank = attn_dp_rank
 
     @abstractmethod
     def publish(self, events: EventBatch) -> None:
@@ -183,7 +220,6 @@ class ZmqEventPublisher(EventPublisher):
         topic: str = "",
     ) -> None:
         # Storage
-        super().__init__(attn_dp_rank)
         self._event_queue = Queue[Optional[EventBatch]](maxsize=max_queue_size)
         self._buffer = deque[tuple[int, bytes]](maxlen=buffer_steps)
 
@@ -260,10 +296,15 @@ class ZmqEventPublisher(EventPublisher):
             self._pub = self._ctx.socket(zmq.PUB)
             self._pub.set_hwm(self._hwm)
             # Heuristic: bind if wildcard / * present, else connect.
-            # bind stable, connect volatile convention
+            # bind stable, connect volatile convention.
+            # ``0.0.0.0`` is the IPv4 bind-all wildcard alongside ``*``
+            # and ``::``; ``/server_info`` advertises it as a wildcard,
+            # so the publisher must bind it for the advertised endpoint
+            # to actually be listening.
             if (
                 "*" in self._endpoint
                 or "::" in self._endpoint
+                or "0.0.0.0" in self._endpoint
                 or self._endpoint.startswith("ipc://")
                 or self._endpoint.startswith("inproc://")
             ):

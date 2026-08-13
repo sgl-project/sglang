@@ -1,8 +1,12 @@
 import unittest
+from array import array
+from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -14,23 +18,25 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
+
+
+def _event_hashes(events):
+    return [block_hash for event in events for block_hash in event.block_hashes]
 
 
 class _DummyReq:
     def __init__(self):
         self._kv_committed_len = 0
         self.swa_prefix_lock_released = False
-
-    def pop_committed_kv_cache(self):
-        return self._kv_committed_len
+        self.kv = SimpleNamespace(swa_evicted_seqlen=0)
 
 
 def _build_swa_tree(
@@ -41,6 +47,7 @@ def _build_swa_tree(
     kv_size: int = 64,
     kv_size_swa: int = 32,
     sliding_window_size: int = 4,
+    enable_kv_cache_events: bool = False,
 ):
     head_num = 8
     head_dim = 128
@@ -69,7 +76,6 @@ def _build_swa_tree(
         head_dim=head_dim,
         swa_attention_layer_ids=swa_attention_layer_ids,
         full_attention_layer_ids=full_attention_layer_ids,
-        enable_kvcache_transpose=False,
         device=device,
     )
     allocator = SWATokenToKVPoolAllocator(
@@ -89,6 +95,7 @@ def _build_swa_tree(
             disable=False,
             is_eagle=is_eagle,
             sliding_window_size=sliding_window_size,
+            enable_kv_cache_events=enable_kv_cache_events,
         ),
     )
     return tree, allocator, req_to_token_pool
@@ -110,12 +117,12 @@ def _swa_alloc(allocator, need_size):
 def _insert(tree, allocator, token_ids):
     indices = _swa_alloc(allocator, len(token_ids))
     assert indices is not None
-    tree.insert(InsertParams(key=RadixKey(token_ids), value=indices))
+    tree.insert(InsertParams(key=RadixKey(array("q", token_ids)), value=indices))
 
 
 def _insert_chain(tree, allocator, token_ids):
     _insert(tree, allocator, token_ids)
-    match = tree.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
+    match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", token_ids))))
     return match.last_device_node
 
 
@@ -133,53 +140,124 @@ class TestSWA(unittest.TestCase):
     def tearDownClass(cls):
         pass
 
-    def test_swa_memory_pool(self):
-        size = 16
-        size_swa = 16
-        page_size = 1
-        head_num = 8
-        head_dim = 128
-        num_layers = 48
-        global_interval = 4
-        dtype = torch.bfloat16
-        device = get_device()
-        full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
-        full_attention_layer_ids_set = set(full_attention_layer_ids)
-        swa_attention_layer_ids = [
-            i for i in range(num_layers) if i not in full_attention_layer_ids_set
+    def test_swa_radix_cache_kv_events(self):
+        tree, allocator, _ = _build_swa_tree(
+            is_eagle=False, enable_kv_cache_events=True
+        )
+        tree.take_events()  # Clear the reset event.
+
+        _insert(tree, allocator, [1, 2, 3, 4])
+        first_insert_events = [
+            e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
-        pool = SWAKVPool(
-            size=size,
-            size_swa=size_swa,
-            page_size=page_size,
-            dtype=dtype,
-            head_num=head_num,
-            head_dim=head_dim,
-            swa_attention_layer_ids=swa_attention_layer_ids,
-            full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
-            device=device,
+        self.assertEqual(len(first_insert_events), 4)
+        self.assertEqual([e.token_ids[0] for e in first_insert_events], [1, 2, 3, 4])
+
+        _insert(tree, allocator, [1, 2, 3, 4, 5, 6])
+        second_insert_events = [
+            e for e in tree.take_events() if isinstance(e, BlockStored)
+        ]
+        self.assertEqual(len(second_insert_events), 2)
+        self.assertEqual([e.token_ids[0] for e in second_insert_events], [5, 6])
+
+        stored_hashes = [
+            e.block_hashes[0] for e in first_insert_events + second_insert_events
+        ]
+
+        # Evicting only SWA tokens tombstones nodes but keeps full KV blocks.
+        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        self.assertEqual(result.num_tokens_evicted, 0)
+        self.assertGreaterEqual(result.swa_num_tokens_evicted, 1)
+        self.assertEqual(
+            [e for e in tree.take_events() if isinstance(e, BlockRemoved)], []
         )
-        alloc = SWATokenToKVPoolAllocator(
-            size=size,
-            size_swa=size_swa,
+
+        result = tree.evict(EvictParams(num_tokens=1, swa_num_tokens=0))
+        self.assertGreaterEqual(result.num_tokens_evicted, 1)
+        removed_hashes = _event_hashes(
+            [e for e in tree.take_events() if isinstance(e, BlockRemoved)]
+        )
+        self.assertCountEqual(removed_hashes, stored_hashes)
+
+    def test_swa_radix_cache_kv_events_split_hash(self):
+        tree, allocator, _ = _build_swa_tree(
+            is_eagle=False, enable_kv_cache_events=True
+        )
+        tree.take_events()  # Clear the reset event.
+
+        _insert(tree, allocator, [1, 2, 3, 4])
+        first_insert_events = [
+            e for e in tree.take_events() if isinstance(e, BlockStored)
+        ]
+        self.assertEqual(len(first_insert_events), 4)
+        split_parent_hash = first_insert_events[1].block_hashes[0]
+
+        _insert(tree, allocator, [1, 2, 5, 6])
+        second_insert_events = [
+            e for e in tree.take_events() if isinstance(e, BlockStored)
+        ]
+        self.assertEqual(len(second_insert_events), 2)
+        self.assertEqual(list(second_insert_events[0].token_ids), [5])
+        self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
+
+    def test_swa_memory_pool_paged_free_clears_full_page_mapping(self):
+        page_size = 4
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
             page_size=page_size,
-            dtype=dtype,
-            device=device,
-            kvcache=pool,
-            need_sort=False,
+            kv_size=16,
+            kv_size_swa=16,
+            sliding_window_size=page_size,
+        )
+
+        full_indices = _swa_alloc(allocator, page_size)
+        self.assertEqual(allocator.swa_available_size(), 16 - page_size)
+
+        allocator.free_swa(full_indices[:1])
+        self.assertEqual(allocator.swa_available_size(), 16)
+        self.assertTrue(
+            torch.all(
+                allocator.full_to_swa_index_mapping[full_indices.to(torch.int64)] == 0
+            )
+        )
+
+        allocator.free_swa(full_indices[1:2])
+        self.assertEqual(allocator.swa_available_size(), 16)
+
+    def test_free_swa_group_owns_deferred_indices(self):
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            kv_size=32,
+            kv_size_swa=32,
+        )
+        index_batches = []
+        for size in (2, 3, 1, 4):
+            indices = _swa_alloc(allocator, size)
+            assert indices is not None
+            index_batches.append(indices)
+        original_indices = torch.cat([indices.clone() for indices in index_batches])
+
+        available_before_free = allocator.swa_available_size()
+        allocator.free_group_begin()
+        for indices in index_batches:
+            allocator.free_swa(indices)
+
+        self.assertEqual(len(allocator.swa_free_group), len(index_batches))
+        self.assertEqual(allocator.swa_available_size(), available_before_free)
+        for indices in index_batches:
+            indices.zero_()
+        allocator.free_group_end()
+
+        self.assertTrue(
+            torch.equal(
+                allocator.full_to_swa_index_mapping[original_indices.to(torch.int64)],
+                torch.zeros_like(original_indices),
+            )
         )
         self.assertEqual(
-            alloc.full_available_size() + alloc.swa_available_size(), size + size_swa
+            allocator.swa_available_size(),
+            available_before_free + original_indices.numel(),
         )
-        index = alloc.alloc(1)
-        self.assertEqual(
-            alloc.full_available_size() + alloc.swa_available_size(),
-            size_swa + size_swa - 2,
-        )
-        alloc.free_swa(index)
-        result = alloc.translate_loc_from_full_to_swa(index)
-        print(result)
 
     def test_swa_radix_cache_1(self):
         # args
@@ -217,7 +295,6 @@ class TestSWA(unittest.TestCase):
             head_dim=head_dim,
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
         )
         # setup token to kv pool allocator
@@ -250,7 +327,7 @@ class TestSWA(unittest.TestCase):
         print(
             f"req1: inserting, req1_token_ids: {req1_token_ids}, req1_kv_indices: {req1_kv_indices}"
         )
-        key = RadixKey(req1_token_ids)
+        key = RadixKey(array("q", req1_token_ids))
         result = tree.insert(InsertParams(key=key, value=req1_kv_indices[: len(key)]))
         prefix_len = result.prefix_len
         print(
@@ -261,7 +338,7 @@ class TestSWA(unittest.TestCase):
         print(
             f"req2: inserting, req2_token_ids: {req2_token_ids}, req2_kv_indices: {req2_kv_indices}"
         )
-        key = RadixKey(req2_token_ids)
+        key = RadixKey(array("q", req2_token_ids))
         result = tree.insert(InsertParams(key=key, value=req2_kv_indices[: len(key)]))
         prefix_len = result.prefix_len
         print(
@@ -272,7 +349,7 @@ class TestSWA(unittest.TestCase):
         print(
             f"req3: inserting, req3_token_ids: {req3_token_ids}, req3_kv_indices: {req3_kv_indices}"
         )
-        key = RadixKey(req3_token_ids)
+        key = RadixKey(array("q", req3_token_ids))
         result = tree.insert(InsertParams(key=key, value=req3_kv_indices[: len(key)]))
         prefix_len = result.prefix_len
         print(
@@ -283,7 +360,7 @@ class TestSWA(unittest.TestCase):
         print(
             f"req4: inserting, req4_token_ids: {req4_token_ids}, req4_kv_indices: {req4_kv_indices}"
         )
-        key = RadixKey(req4_token_ids)
+        key = RadixKey(array("q", req4_token_ids))
         result = tree.insert(InsertParams(key=key, value=req4_kv_indices[: len(key)]))
         prefix_len = result.prefix_len
         print(
@@ -313,7 +390,9 @@ class TestSWA(unittest.TestCase):
         tree.pretty_print()
 
         req5_token_ids = [1, 2, 3, 4, 5]
-        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req5_token_ids)))
+        result = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", req5_token_ids)))
+        )
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req5: token_ids: {req5_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -321,7 +400,9 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(len(kv_indices), 0)
 
         req6_token_ids = [1, 2, 3, 4, 5, 60, 70]
-        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req6_token_ids)))
+        result = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", req6_token_ids)))
+        )
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req6: token_ids: {req6_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -371,7 +452,6 @@ class TestSWA(unittest.TestCase):
             head_dim=head_dim,
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
         )
         # setup token to kv pool allocator
@@ -405,7 +485,7 @@ class TestSWA(unittest.TestCase):
         print(
             f"req1: inserting, req1_token_ids: {req1_token_ids}, req1_kv_indices: {req1_kv_indices}"
         )
-        key = RadixKey(req1_token_ids)
+        key = RadixKey(array("q", req1_token_ids))
         result = tree.insert(InsertParams(key=key, value=req1_kv_indices[: len(key)]))
         prefix_len = result.prefix_len
         self.assertEqual(prefix_len, 0)
@@ -417,7 +497,7 @@ class TestSWA(unittest.TestCase):
         print(
             f"req2: inserting, req2_token_ids: {req2_token_ids}, req2_kv_indices: {req2_kv_indices}"
         )
-        key = RadixKey(req2_token_ids)
+        key = RadixKey(array("q", req2_token_ids))
         result = tree.insert(InsertParams(key=key, value=req2_kv_indices[: len(key)]))
         prefix_len = result.prefix_len
         self.assertEqual(prefix_len, 2)
@@ -429,7 +509,7 @@ class TestSWA(unittest.TestCase):
         print(
             f"req3: inserting, req3_token_ids: {req3_token_ids}, req3_kv_indices: {req3_kv_indices}"
         )
-        key = RadixKey(req3_token_ids)
+        key = RadixKey(array("q", req3_token_ids))
         result = tree.insert(InsertParams(key=key, value=req3_kv_indices[: len(key)]))
         prefix_len = result.prefix_len
         self.assertEqual(prefix_len, 0)
@@ -441,7 +521,7 @@ class TestSWA(unittest.TestCase):
         print(
             f"req4: inserting, req4_token_ids: {req4_token_ids}, req4_kv_indices: {req4_kv_indices}"
         )
-        key = RadixKey(req4_token_ids)
+        key = RadixKey(array("q", req4_token_ids))
         result = tree.insert(InsertParams(key=key, value=req4_kv_indices[: len(key)]))
         prefix_len = result.prefix_len
         self.assertEqual(prefix_len, 4)
@@ -490,7 +570,9 @@ class TestSWA(unittest.TestCase):
         tree.pretty_print()
 
         req5_token_ids = [1, 2, 3, 4, 5]
-        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req5_token_ids)))
+        result = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", req5_token_ids)))
+        )
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req5: token_ids: {req5_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -498,7 +580,9 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(len(kv_indices), 0)  # no swa prefix matched
 
         req6_token_ids = [1, 2, 3, 4, 5, 60, 70]
-        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req6_token_ids)))
+        result = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", req6_token_ids)))
+        )
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req6: token_ids: {req6_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -515,17 +599,18 @@ class TestSWA(unittest.TestCase):
         # Case 1: is_insert=True should pass bigram key and use cache_protected_len.
         req = _DummyReq()
         req.req_pool_idx = 0
-        req.origin_input_ids = [1, 2, 3, 4, 5, 6]
-        req.output_ids = []
+        req.origin_input_ids = array("q", [1, 2, 3, 4, 5, 6])
+        req.output_ids = array("q")
         req._kv_committed_len = len(req.origin_input_ids)
         kv_indices = allocator.alloc(req._kv_committed_len)
         req_to_token_pool.write(
             (req.req_pool_idx, slice(0, req._kv_committed_len)), kv_indices
         )
         req.extra_key = None
+        req.cache_salt = None
         req.last_node = tree.root_node
         req.swa_uuid_for_lock = None
-        req.swa_evicted_seqlen = 0
+        req.kv.swa_evicted_seqlen = 0
         req.cache_protected_len = 1
         # Intentionally mismatch to ensure code does not use len(prefix_indices).
         req.prefix_indices = torch.tensor([7, 8, 9, 10, 11], device=tree.device)
@@ -540,7 +625,9 @@ class TestSWA(unittest.TestCase):
             return original_insert(params)
 
         tree.insert = wrapped_insert
-        tree.cache_finished_req(req, is_insert=True)
+        tree.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req._kv_committed_len
+        )
 
         self.assertEqual(captured["prev_prefix_len"], req.cache_protected_len)
         self.assertTrue(captured["is_bigram"])
@@ -550,17 +637,18 @@ class TestSWA(unittest.TestCase):
         # even when len(prefix_indices) is intentionally larger.
         req2 = _DummyReq()
         req2.req_pool_idx = 1
-        req2.origin_input_ids = [11, 12, 13, 14, 15, 16]
-        req2.output_ids = []
+        req2.origin_input_ids = array("q", [11, 12, 13, 14, 15, 16])
+        req2.output_ids = array("q")
         req2._kv_committed_len = len(req2.origin_input_ids)
         kv_indices2 = allocator.alloc(req2._kv_committed_len)
         req_to_token_pool.write(
             (req2.req_pool_idx, slice(0, req2._kv_committed_len)), kv_indices2
         )
         req2.extra_key = None
+        req2.cache_salt = None
         req2.last_node = tree.root_node
         req2.swa_uuid_for_lock = None
-        req2.swa_evicted_seqlen = 0
+        req2.kv.swa_evicted_seqlen = 0
         req2.cache_protected_len = 1
         req2.prefix_indices = torch.tensor([21, 22, 23, 24, 25], device=tree.device)
 
@@ -572,7 +660,9 @@ class TestSWA(unittest.TestCase):
             return original_free(indices)
 
         allocator.free = wrapped_free
-        tree.cache_finished_req(req2, is_insert=False)
+        tree.cache_finished_req(
+            req2, is_insert=False, kv_len_to_handle=req2._kv_committed_len
+        )
 
         # EAGLE + page_size=1 => page_aligned_len = committed_len - 1 = 5
         # Expected frees:
@@ -667,7 +757,9 @@ class TestSWASplitLeafOnInsert(CustomTestCase):
         with envs.SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT.override(True):
             inserted_leaf = _insert_chain(tree, allocator, token_ids)
         self.assertEqual(len(inserted_leaf.value), 4)
-        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
+        match = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+        )
         self.assertEqual(match.device_indices.shape[0], 12)
         self.assertIs(match.last_device_node, inserted_leaf)
 
