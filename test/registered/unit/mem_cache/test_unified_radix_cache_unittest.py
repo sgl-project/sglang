@@ -3736,7 +3736,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(result.swa_host_hit_length, len(leaf.key))
 
-    def test_swa_branching_seqlen_uses_deeper_full_hit(self):
+    def test_swa_branching_seqlen_uses_device_full_hit(self):
         if (
             not self.cfg.has_swa
             or self.cfg.has_mamba

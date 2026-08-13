@@ -753,7 +753,6 @@ class SWAComponent(TreeComponent):
         # that boundary so insertion creates a tombstone instead of live SWA KV.
         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
-        # Insert a reached SWA branch without shortening the forward chunk.
         branching_seqlen = req.swa_branching_seqlen
         if (
             branching_seqlen is not None
