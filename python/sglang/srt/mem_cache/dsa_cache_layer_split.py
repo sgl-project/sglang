@@ -337,6 +337,8 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         del self.kv_buffer
         del self.remote_kv_buffer
         self.index_key_cache.clear()
+        del self._dsa_move_kv_ptrs
+        del self._dsa_move_index_ptrs
 
     # ---- MLA latent KV: owned-only writes, owner-broadcast reads ----------
 
@@ -512,18 +514,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         return self.remote_kv_buffer
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        size_limit = self.size + self.page_size
-        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
-        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
-        if tgt_loc.numel() == 0:
-            return
-        tgt_loc_flat = tgt_loc.view(-1).long()
-        src_loc_flat = src_loc.view(-1).long()
-        for kv_cache in self.kv_buffer:
-            if kv_cache.shape[0] == 0:
-                continue
-            kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
-        self.index_key_cache.move(tgt_loc, src_loc)
+        DSATokenToKVPool.move_kv_cache(self, tgt_loc, src_loc)
 
     # ---- DSA indexer buffer: owned-only writes, owner-broadcast reads -----
 
