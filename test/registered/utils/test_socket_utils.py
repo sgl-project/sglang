@@ -153,6 +153,29 @@ class TestSocketUtilities(CustomTestCase):
         finally:
             sock.close()
 
+    def test_get_open_port_rejects_invalid_env_port(self):
+        """SGLANG_PORT must be a concrete, valid TCP port."""
+        for invalid_port in (-1, 0, 65536):
+            with self.subTest(invalid_port=invalid_port):
+                with patch.dict(
+                    os.environ, {"SGLANG_PORT": str(invalid_port)}
+                ), self.assertRaisesRegex(ValueError, "must be between 1 and 65535"):
+                    get_open_port()
+
+    @patch(
+        "sglang.srt.utils.network.is_port_available",
+        side_effect=(False, AssertionError("scanned beyond port 65535")),
+    )
+    def test_get_open_port_stops_at_max_port(self, mock_is_port_available):
+        """An occupied port 65535 must fail instead of scanning forever."""
+        with patch.dict(os.environ, {"SGLANG_PORT": "65535"}):
+            with self.assertRaisesRegex(
+                RuntimeError, "No available TCP port at or above SGLANG_PORT=65535"
+            ):
+                get_open_port()
+
+        mock_is_port_available.assert_called_once_with(65535)
+
 
 class TestReservePort(CustomTestCase):
     def test_reserve_port_returns_port_and_socket(self):
