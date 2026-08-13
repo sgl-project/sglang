@@ -29,6 +29,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -1733,7 +1734,11 @@ def _lean_decode_launch_params(num_kv_heads, kv_group_num):
     # XCD remap for ROCm only when rows are one-per-kv-head and divisible by 8.
     XCD_REMAP = (num_kv_heads % 8 == 0 and num_head_blocks == 1) if _is_hip else False
     NUM_XCDS = 8 if XCD_REMAP else 1
-    total_programs = _lean_num_cus() * 2
+    # Grid = round(CU_count * multiplier); multiplier defaults to 1.0 (one CTA per CU) and
+    # is overridable via SGLANG_FORCE_LEAN_GRID_CU_MULT for grid A/B tuning without a rebuild.
+    total_programs = max(
+        1, round(_lean_num_cus() * envs.SGLANG_FORCE_LEAN_GRID_CU_MULT.get())
+    )
     if XCD_REMAP:
         # The XCD remap requires the grid to be a whole number of XCDs.
         total_programs = max((total_programs // NUM_XCDS) * NUM_XCDS, NUM_XCDS)
