@@ -194,18 +194,25 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
         self,
         key: str,
         content_digest: str,
+        modality: Modality,
         *,
         allow_featureless: bool,
     ) -> Optional[ArtifactT]:
-        return self.mm_preprocess_cache.get_if_present(
+        artifact = self.mm_preprocess_cache.get_if_present(
             key,
-            lambda artifact: (
-                isinstance(artifact, MediaArtifact)
-                and artifact.artifact_key == key
-                and artifact.content_digest == content_digest
-                and self.artifact_usable(artifact, allow_featureless=allow_featureless)
+            lambda value: (
+                isinstance(value, MediaArtifact)
+                and value.artifact_key == key
+                and value.content_digest == content_digest
+                and self.artifact_usable(value, allow_featureless=allow_featureless)
             ),
         )
+        if artifact is not None:
+            self.validate_artifact(
+                artifact,
+                MediaArtifactInput(content_digest, key, modality, None),
+            )
+        return artifact
 
     def _normalize_content_hashes(
         self,
@@ -242,7 +249,7 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
             if self.trust_mm_content_hashes and caller_hash is not None:
                 key = self._artifact_key(caller_hash, source, modality=modality)
                 artifact = self._get_cached_artifact(
-                    key, caller_hash, allow_featureless=True
+                    key, caller_hash, modality, allow_featureless=True
                 )
                 if artifact is not None:
                     lookups[index] = MediaArtifactLookup(
@@ -277,7 +284,10 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
                 artifact_key=key,
                 snapshot=snapshot,
                 cached_artifact=self._get_cached_artifact(
-                    key, snapshot.content_digest, allow_featureless=True
+                    key,
+                    snapshot.content_digest,
+                    modality,
+                    allow_featureless=True,
                 ),
                 identity_source="server_computed",
             )
