@@ -41,13 +41,8 @@ Start the server with the Hugging Face model ID:
 ```bash Command
 sglang serve \
   --model-path robbyant/lingbot-video-moe-30b-a3b \
-  --text-encoder-cpu-offload \
   --port 30010
 ```
-
-`--text-encoder-cpu-offload` is the memory-oriented profile used by the
-single-GPU server CI case. Remove it when the complete pipeline fits in GPU
-memory and lower prompt-encoding latency matters more.
 
 ## 4. Generate a video
 
