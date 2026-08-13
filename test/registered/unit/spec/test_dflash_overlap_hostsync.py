@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -273,6 +274,152 @@ class TestFilterBatchHostIndices(CustomTestCase):
         torch.testing.assert_close(a.reserved_seq_lens_cpu, b.reserved_seq_lens_cpu)
         self.assertEqual(a.reserved_seq_lens_sum, b.reserved_seq_lens_sum)
         torch.testing.assert_close(a.future_indices, b.future_indices)
+
+
+@unittest.skipUnless(_HAS_CUDA, "MRoPE cache requires CUDA")
+class TestDFlashMropeDeltaGpuCache(CustomTestCase):
+    def test_reuses_cache_and_invalidates_on_source_change(self):
+        from sglang.srt.managers.schedule_batch import MultimodalInputs
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+        mm_input = MultimodalInputs(
+            mm_items=[],
+            mrope_position_delta=torch.tensor([[3]], dtype=torch.int64),
+        )
+
+        cache = ForwardBatch._get_or_create_mrope_delta_gpu_cache(mm_input, "cuda")
+        self.assertEqual(
+            cache.device, torch.device("cuda", torch.cuda.current_device())
+        )
+        torch.testing.assert_close(cache.cpu(), torch.tensor([[3]], dtype=torch.int64))
+        self.assertIs(
+            ForwardBatch._get_or_create_mrope_delta_gpu_cache(mm_input, "cuda"),
+            cache,
+        )
+
+        mm_input.mrope_position_delta = torch.tensor([[7]], dtype=torch.int64)
+        reassigned_cache = ForwardBatch._get_or_create_mrope_delta_gpu_cache(
+            mm_input, "cuda"
+        )
+        self.assertIsNot(reassigned_cache, cache)
+        torch.testing.assert_close(
+            reassigned_cache.cpu(), torch.tensor([[7]], dtype=torch.int64)
+        )
+
+        mm_input.mrope_position_delta.add_(2)
+        mutated_cache = ForwardBatch._get_or_create_mrope_delta_gpu_cache(
+            mm_input, "cuda"
+        )
+        self.assertIsNot(mutated_cache, reassigned_cache)
+        torch.testing.assert_close(
+            mutated_cache.cpu(), torch.tensor([[9]], dtype=torch.int64)
+        )
+
+
+class TestMultimodalMropeCacheInvalidation(CustomTestCase):
+    def test_merge_invalidates_derived_caches(self):
+        from sglang.srt.managers.schedule_batch import MultimodalInputs
+
+        left = MultimodalInputs(
+            mm_items=[],
+            mrope_position_delta=torch.tensor([[2]], dtype=torch.int64),
+            mrope_position_delta_repeated_cache=torch.tensor([[1]], dtype=torch.int64),
+            mrope_position_delta_gpu_cache=torch.tensor([[2]], dtype=torch.int64),
+            mrope_position_delta_gpu_cache_source_id=1,
+            mrope_position_delta_gpu_cache_source_version=0,
+        )
+        right = MultimodalInputs(
+            mm_items=[],
+            mrope_position_delta=torch.tensor([[5]], dtype=torch.int64),
+        )
+
+        left.merge(right)
+
+        torch.testing.assert_close(
+            left.mrope_position_delta,
+            torch.tensor([[2], [5]], dtype=torch.int64),
+        )
+        self.assertIsNone(left.mrope_position_delta_repeated_cache)
+        self.assertIsNone(left.mrope_position_delta_gpu_cache)
+        self.assertIsNone(left.mrope_position_delta_gpu_cache_source_id)
+        self.assertIsNone(left.mrope_position_delta_gpu_cache_source_version)
+
+
+class TestDFlashFlashInferHostPlanning(CustomTestCase):
+    def test_sliding_window_respects_host_length_contract(self):
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            FlashInferIndicesUpdaterPrefill,
+        )
+
+        updater = object.__new__(FlashInferIndicesUpdaterPrefill)
+        updater.sliding_window_size = 4
+        updater._swa_kv_pool = None
+        updater.prefill_wrapper_ragged = object()
+        updater.kv_indptr = [object(), object()]
+        updater.qo_indptr = [object(), object()]
+        calls = []
+
+        def record_call(*args, **kwargs):
+            calls.append((args, kwargs))
+
+        updater.call_begin_forward = record_call
+        # Cover P < W, P = W - 1, P = W, and P > W.
+        seq_lens = torch.tensor([2, 3, 4, 7], dtype=torch.int64)
+        verify_block_size = 4
+        seq_lens_cpu = seq_lens + verify_block_size
+        wrappers = [object(), object()]
+
+        updater.update_sliding_window(
+            req_pool_indices=torch.arange(seq_lens.numel(), dtype=torch.int64),
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_sum=int(seq_lens.sum()),
+            prefix_lens=None,
+            prefill_wrappers=wrappers,
+            use_ragged=False,
+            encoder_lens=None,
+            spec_info=SimpleNamespace(
+                num_accept_tokens=None,
+                num_tokens_per_req=verify_block_size,
+                spec_input_type=SpecInputType.DFLASH_VERIFY,
+                host_seq_lens_include_verify_block=True,
+            ),
+        )
+
+        self.assertEqual(len(calls), 2)
+        torch.testing.assert_close(calls[0][0][3], torch.tensor([2, 3, 4, 4]))
+        self.assertEqual(calls[0][0][4], 13)
+        torch.testing.assert_close(
+            calls[0][1]["paged_kernel_lens_cpu"], torch.tensor([6, 7, 8, 8])
+        )
+        torch.testing.assert_close(calls[1][0][3], seq_lens)
+        self.assertEqual(calls[1][0][4], 16)
+        torch.testing.assert_close(calls[1][1]["paged_kernel_lens_cpu"], seq_lens_cpu)
+
+        # The legacy fallback still provides prefix-only CPU lengths and must
+        # retain its original sliding-window metadata for the blocking plan().
+        calls.clear()
+        updater.update_sliding_window(
+            req_pool_indices=torch.arange(seq_lens.numel(), dtype=torch.int64),
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.clone(),
+            seq_lens_sum=int(seq_lens.sum()),
+            prefix_lens=None,
+            prefill_wrappers=wrappers,
+            use_ragged=False,
+            encoder_lens=None,
+            spec_info=SimpleNamespace(
+                num_accept_tokens=None,
+                num_tokens_per_req=verify_block_size,
+                spec_input_type=SpecInputType.DFLASH_VERIFY,
+                host_seq_lens_include_verify_block=False,
+            ),
+        )
+
+        torch.testing.assert_close(
+            calls[0][1]["paged_kernel_lens_cpu"], torch.tensor([2, 3, 4, 4])
+        )
+        torch.testing.assert_close(calls[1][1]["paged_kernel_lens_cpu"], seq_lens)
 
 
 if __name__ == "__main__":
