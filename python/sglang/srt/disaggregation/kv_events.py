@@ -176,12 +176,17 @@ def resolve_load_pub_range(
         # Discovery needs the kv_events block, absent for a non-tcp KV
         # endpoint — so an explicit range there would bind but never advertise.
         if parse_tcp_port(kv_endpoint) is None:
+            absent = (
+                "without --kv-events-config"
+                if kv_endpoint is None
+                else f"for endpoint {kv_endpoint!r}"
+            )
             return None, (
                 f"--load-publish-endpoint={load_publish_endpoint!r} needs a "
                 f"routable tcp:// --kv-events-config endpoint: routers "
                 f"discover the load range through /server_info's kv_events "
-                f"block, which is absent for {kv_endpoint!r}, so the socket "
-                f"would be bound but never advertised"
+                f"block, absent {absent}, so the socket would be bound but "
+                f"never advertised"
             )
         resolved = parse_bindable_tcp(load_publish_endpoint)
         if resolved is None:

@@ -84,6 +84,16 @@ class TestResolveLoadPubRange(CustomTestCase):
             load_publish_endpoint="tcp://*:7000",
         )
         self.assertIsNotNone(loud)
+        # A missing config surfaces at startup — the message must not read
+        # "absent for None".
+        _, no_cfg = resolve_load_pub_range(
+            kv_endpoint=None,
+            replay_endpoint=None,
+            dp_size=1,
+            load_publish_endpoint="tcp://*:7000",
+        )
+        self.assertNotIn("None", no_cfg)
+        self.assertIn("without --kv-events-config", no_cfg)
 
 
 class TestSelectKvPublisherDpRank(CustomTestCase):
