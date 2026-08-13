@@ -1,13 +1,14 @@
 //! Resolve I/O-backed media sources on the API runtime, before MM dispatch.
 //!
-//! The MM worker pool is fixed, core-pinned CPU capacity: a slow image host — or
+//! The MM worker pool is fixed, core-pinned CPU capacity: a slow media host — or
 //! a file on a hanging network mount — must never occupy it, and a request's
-//! images must download concurrently, not in `n * REQUEST_TIMEOUT`. URLs and
+//! media must download concurrently, not in `n * REQUEST_TIMEOUT`. URLs and
 //! file paths resolve here through `sglang-mm`'s `fetch_bytes_budgeted` (one
 //! owner for proxy/timeout/cap semantics) and ride out-of-band as
 //! [`crate::message::MmData::prefetched`], which
 //! [`crate::message::mm_payload::to_mm_input`] swaps back in.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -29,18 +30,49 @@ static PERMITS: Semaphore = Semaphore::const_new(32);
 /// enforced *here* rather than in `sglang_mm::driver::process`, where 64 sources
 /// of 64 MiB would already be resident. The driver keeps its own checks as the
 /// backstop for callers without a prefetch layer.
-pub async fn prefetch_all(requests: &mut [GenerateRequest]) -> Result<(), String> {
+pub async fn prefetch_all(
+    requests: &mut [GenerateRequest],
+    modality_limits: &BTreeMap<String, usize>,
+) -> Result<(), String> {
     // The item budget rejects before a single byte is fetched.
     let plan = |mm: &Option<Box<MmData>>| -> Result<Vec<String>, String> {
-        let Some(image_data) = mm.as_deref().and_then(|m| m.image_data.as_ref()) else {
+        let Some(mm) = mm.as_deref() else {
             return Ok(Vec::new());
         };
-        if item_count(image_data) > MAX_ITEMS_PER_REQUEST {
+        // Fixed modality order is part of the handoff contract: external
+        // processors walk image, video, then audio and consume this vector in
+        // the same order.
+        let values = [
+            ("image", mm.image_data.as_ref()),
+            ("video", mm.video_data.as_ref()),
+            ("audio", mm.audio_data.as_ref()),
+        ];
+        let items = values
+            .iter()
+            .filter_map(|(_, value)| *value)
+            .map(item_count)
+            .sum::<usize>();
+        if items > MAX_ITEMS_PER_REQUEST {
             return Err(format!(
                 "multimodal request exceeds {MAX_ITEMS_PER_REQUEST} media items"
             ));
         }
-        Ok(io_sources(image_data))
+        for (modality, value) in values {
+            let count = value.map(item_count).unwrap_or_default();
+            if let Some(limit) = modality_limits.get(modality)
+                && count > *limit
+            {
+                let display = modality[..1].to_uppercase() + &modality[1..];
+                return Err(format!(
+                    "{display} count {count} exceeds limit {limit} per request."
+                ));
+            }
+        }
+        Ok(values
+            .iter()
+            .filter_map(|(_, value)| *value)
+            .flat_map(io_sources)
+            .collect())
     };
     let plans = requests
         .iter()
@@ -121,6 +153,36 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn mixed_modalities_preserve_image_video_audio_order() {
+        let base = std::env::temp_dir().join(format!("sglang-prefetch-mm-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = [base.join("image"), base.join("video"), base.join("audio")];
+        for (path, body) in
+            paths
+                .iter()
+                .zip([b"image".as_ref(), b"video".as_ref(), b"audio".as_ref()])
+        {
+            std::fs::write(path, body).unwrap();
+        }
+        let mut requests = vec![GenerateRequest {
+            mm: Some(Box::new(MmData {
+                image_data: Some(Value::from(paths[0].display().to_string())),
+                video_data: Some(Value::from(paths[1].display().to_string())),
+                audio_data: Some(Value::from(paths[2].display().to_string())),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
+        prefetch_all(&mut requests, &BTreeMap::new()).await.unwrap();
+        std::fs::remove_dir_all(base).ok();
+        let fetched = &requests[0].mm.as_ref().unwrap().prefetched;
+        assert_eq!(
+            fetched.iter().map(Bytes::as_ref).collect::<Vec<_>>(),
+            vec![b"image".as_ref(), b"video".as_ref(), b"audio".as_ref()]
+        );
+    }
+
     /// URLs and file paths resolve concurrently into `prefetched` in source
     /// order; CPU-only sources and mm-free requests are untouched.
     #[tokio::test]
@@ -137,7 +199,7 @@ mod tests {
             ])),
             GenerateRequest::default(),
         ];
-        prefetch_all(&mut requests).await.unwrap();
+        prefetch_all(&mut requests, &BTreeMap::new()).await.unwrap();
         std::fs::remove_file(&path).ok();
         let fetched = &requests[0].mm.as_ref().unwrap().prefetched;
         // The one-shot server answers in accept order, so contents may swap
@@ -151,7 +213,10 @@ mod tests {
     #[tokio::test]
     async fn failed_download_rejects() {
         let mut requests = vec![mm_request(Value::from("http://127.0.0.1:1/nope.png"))];
-        let err = prefetch_all(&mut requests).await.err().unwrap();
+        let err = prefetch_all(&mut requests, &BTreeMap::new())
+            .await
+            .err()
+            .unwrap();
         assert!(err.contains("media fetch"), "{err}");
     }
 
@@ -163,11 +228,33 @@ mod tests {
             .map(|i| Value::from(format!("/definitely/not/here-{i}.png")))
             .collect();
         let mut requests = vec![mm_request(Value::Array(sources))];
-        let err = prefetch_all(&mut requests).await.err().unwrap();
+        let err = prefetch_all(&mut requests, &BTreeMap::new())
+            .await
+            .err()
+            .unwrap();
         assert_eq!(
             err,
             format!("multimodal request exceeds {MAX_ITEMS_PER_REQUEST} media items")
         );
+        assert!(requests[0].mm.as_ref().unwrap().prefetched.is_empty());
+    }
+
+    #[tokio::test]
+    async fn per_modality_budget_rejects_before_fetching() {
+        let mut requests = vec![GenerateRequest {
+            mm: Some(Box::new(MmData {
+                image_data: Some(Value::Array(vec![
+                    Value::from("/definitely/not/here-0.png"),
+                    Value::from("/definitely/not/here-1.png"),
+                ])),
+                video_data: Some(Value::Array(vec![Value::from("/definitely/not/here.mp4")])),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
+        let limits = BTreeMap::from([("image".to_owned(), 1), ("video".to_owned(), 1)]);
+        let err = prefetch_all(&mut requests, &limits).await.err().unwrap();
+        assert_eq!(err, "Image count 2 exceeds limit 1 per request.");
         assert!(requests[0].mm.as_ref().unwrap().prefetched.is_empty());
     }
 

@@ -30,6 +30,7 @@ struct AppState {
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
     chat_formatter: Option<openai::ChatFormatter>,
+    chat_processor: Option<Arc<dyn crate::NativeChatProcessor>>,
     /// Egress heartbeat (bumped per drained ring frame).
     egress_activity: ActivityCounter,
 }
@@ -39,18 +40,23 @@ pub async fn serve(
     senders: Senders,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
+    chat_processor: Option<Arc<dyn crate::NativeChatProcessor>>,
     egress_activity: ActivityCounter,
     // The SAME set ingress releases from — see `Ingress::on_abort`. Constructing a
     // local one here would leave the api server admitting rids that nothing ever
     // releases.
     shutdown: flume::Receiver<()>,
 ) {
-    let chat_formatter = openai::load_chat_support(&server_args);
+    let chat_formatter = chat_processor
+        .is_none()
+        .then(|| openai::load_chat_support(&server_args))
+        .flatten();
     let state = AppState {
         senders,
         egress_buf,
         server_args: server_args.clone(),
         chat_formatter,
+        chat_processor,
         egress_activity,
     };
     // Each endpoint module registers its own routes and merges here.

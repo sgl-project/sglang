@@ -76,10 +76,8 @@ async fn model_info(State(state): State<AppState>) -> Response {
         "model_path": sa.model_path,
         "tokenizer_path": sa.tokenizer_path,
         "is_generation": true,
-        // Python's `TokenizerManager` merges this into every request
-        // (`{**preferred, **client}`); this server has no equivalent yet, so
-        // `RustServer.launch` REFUSES to start when it is set. It can therefore
-        // only be null here — echoing it keeps the field's shape.
+        // Native `/generate` applies this beneath each client's explicit
+        // sampling fields, matching Python's `{**preferred, **client}` merge.
         "preferred_sampling_params": sa.preferred_sampling_params,
         "weight_version": serde_json::Value::Null,
     });

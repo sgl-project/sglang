@@ -7758,6 +7758,15 @@ class ServerArgs:
                 "and min_new_tokens are unavailable."
             )
 
+    def _rust_server_supports_cuda_vmm(self) -> bool:
+        """Whether an external Rust-server integration owns CUDA-VMM handoff.
+
+        The OSS native multimodal adapter does not. Model packages may override
+        this capability only when their scheduler-side drain creates and owns
+        the CUDA-VMM transport lifecycle.
+        """
+        return False
+
     def _handle_multimodal_feature_transport(self):
         """Resolve multimodal feature transport before tokenizer workers start.
 
@@ -7870,7 +7879,10 @@ class ServerArgs:
                     "--mm-feature-transport=cuda_vmm does not support pipeline "
                     "parallelism."
                 )
-            if envs.SGLANG_RUST_SERVER.get():
+            if (
+                envs.SGLANG_RUST_SERVER.get()
+                and not self._rust_server_supports_cuda_vmm()
+            ):
                 raise ValueError(
                     "--mm-feature-transport=cuda_vmm is not supported with "
                     "SGLANG_RUST_SERVER."

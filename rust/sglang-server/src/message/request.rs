@@ -123,9 +123,27 @@ pub struct GenerateBody {
     pub video_data: Option<rmpv::Value>,
     #[serde(default)]
     pub audio_data: Option<rmpv::Value>,
+    /// Optional compact placeholder contract used by pre-tokenized multimodal
+    /// clients. Kept opaque here; the selected MM component validates and
+    /// expands it against its own token vocabulary.
+    #[serde(default)]
+    pub multimodal_placeholders: Option<rmpv::Value>,
 }
 
 impl GenerateBody {
+    /// Apply the operator's launch-time sampling defaults beneath the request's
+    /// own values, matching Python TokenizerManager's
+    /// `{**preferred_sampling_params, **request.sampling_params}` merge.
+    pub fn apply_preferred_sampling(&mut self, preferred: &serde_json::Value) -> Result<(), Error> {
+        match &mut self.sampling_params {
+            Some(params) => params.apply_preferred(preferred),
+            None => SamplingParamsInput::from_preferred(preferred).map(|params| {
+                self.sampling_params = Some(params);
+            }),
+        }
+        .map_err(|e| Error::Validation(format!("invalid preferred_sampling_params: {e}")))
+    }
+
     /// Validate, normalize and fan the body into one [`GenerateRequest`] per
     /// prompt + `is_batch` (list form — a 1-element list is still a batch → JSON
     /// array response). The Rust counterpart of Python
@@ -155,6 +173,7 @@ impl GenerateBody {
             image_data,
             video_data,
             audio_data,
+            multimodal_placeholders,
             mm_hashes,
             // Unported `GenerateReqInput` fields land here and are dropped, as they
             // are on the Python path.
@@ -357,6 +376,8 @@ impl GenerateBody {
             .map_err(|e| Error::Validation(format!("video_data: {e}")))?;
         let audios = split_mm_column(audio_data, n, is_batch, MmBroadcast::AsIs)
             .map_err(|e| Error::Validation(format!("audio_data: {e}")))?;
+        let placeholders = split_placeholder_column(multimodal_placeholders, n, is_batch)
+            .map_err(|e| Error::Validation(format!("multimodal_placeholders: {e}")))?;
 
         // Every column above is exactly `n` long, so zip them by value: each
         // request takes ownership of its cell, with no indexing or bounds checks.
@@ -378,6 +399,7 @@ impl GenerateBody {
             images,
             videos,
             audios,
+            placeholders,
         )
         .map(
             |(
@@ -398,6 +420,7 @@ impl GenerateBody {
                 image_data,
                 video_data,
                 audio_data,
+                multimodal_placeholders,
             )| GenerateRequest {
                 rid,
                 text,
@@ -424,7 +447,7 @@ impl GenerateBody {
                 decode_tp_size,
                 routed_dp_rank,
                 disagg_prefill_dp_rank,
-                mm: pack_mm(image_data, video_data, audio_data),
+                mm: pack_mm(image_data, video_data, audio_data, multimodal_placeholders),
             },
         )
         .collect();
@@ -449,16 +472,54 @@ fn pack_mm(
     image_data: Option<rmpv::Value>,
     video_data: Option<rmpv::Value>,
     audio_data: Option<rmpv::Value>,
+    multimodal_placeholders: Option<rmpv::Value>,
 ) -> Option<Box<MmData>> {
-    if image_data.is_none() && video_data.is_none() && audio_data.is_none() {
+    if image_data.is_none()
+        && video_data.is_none()
+        && audio_data.is_none()
+        && multimodal_placeholders.is_none()
+    {
         return None;
     }
     Some(Box::new(MmData {
         image_data,
         video_data,
         audio_data,
+        multimodal_placeholders,
         ..Default::default()
     }))
+}
+
+fn split_placeholder_column(
+    value: Option<rmpv::Value>,
+    n: usize,
+    is_batch: bool,
+) -> Result<Vec<Option<rmpv::Value>>, String> {
+    let Some(value) = value else {
+        return Ok(vec![None; n]);
+    };
+    let rmpv::Value::Array(items) = value else {
+        return Err("must be a list".into());
+    };
+    if items.is_empty() {
+        return Ok(vec![Some(rmpv::Value::Array(Vec::new())); n]);
+    }
+    if matches!(items.first(), Some(rmpv::Value::Map(_))) {
+        if is_batch {
+            return Err("must be a list of lists for batch processing".into());
+        }
+        return Ok(vec![Some(rmpv::Value::Array(items))]);
+    }
+    if !matches!(items.first(), Some(rmpv::Value::Array(_))) {
+        return Err("entries must be objects, or lists of objects for a batch".into());
+    }
+    if items.len() != n {
+        return Err(format!(
+            "list length {} does not match batch size {n}",
+            items.len()
+        ));
+    }
+    Ok(items.into_iter().map(Some).collect())
 }
 
 /// How a scalar mm value broadcasts across a batch: images become a one-image
@@ -532,6 +593,7 @@ pub struct MmWorkItem {
     pub image_data: Option<rmpv::Value>,
     pub video_data: Option<rmpv::Value>,
     pub audio_data: Option<rmpv::Value>,
+    pub multimodal_placeholders: Option<rmpv::Value>,
     /// See [`MmData::prefetched`].
     pub prefetched: Vec<Bytes>,
     /// See [`GenerateBody::mm_hashes`].
@@ -644,6 +706,7 @@ pub struct MmData {
     pub image_data: Option<rmpv::Value>,
     pub video_data: Option<rmpv::Value>,
     pub audio_data: Option<rmpv::Value>,
+    pub multimodal_placeholders: Option<rmpv::Value>,
     /// Bytes of `image_data`'s I/O-backed sources, resolved by
     /// `api_server::prefetch` in `mm_payload::io_sources` order so MM workers
     /// never block on I/O. Out-of-band: the values above stay as the client
@@ -666,6 +729,7 @@ impl GenerateRequest {
             mm_value_present(&mm.image_data)
                 || mm_value_present(&mm.video_data)
                 || mm_value_present(&mm.audio_data)
+                || mm_value_present(&mm.multimodal_placeholders)
         })
     }
 
@@ -682,6 +746,7 @@ impl GenerateRequest {
             work.image_data = m.image_data.take();
             work.video_data = m.video_data.take();
             work.audio_data = m.audio_data.take();
+            work.multimodal_placeholders = m.multimodal_placeholders.take();
             work.prefetched = std::mem::take(&mut m.prefetched);
             work.mm_hashes = std::mem::take(&mut m.mm_hashes);
         }
@@ -1017,6 +1082,30 @@ mod tests {
         let video = ps[1].mm.as_ref().unwrap().video_data.clone().unwrap();
         assert_eq!(video.as_str(), Some("v"));
         assert!(ps[1].has_multimodal());
+    }
+
+    #[test]
+    fn compact_mm_placeholders_follow_meta_batch_shape() {
+        let single = r#"{"input_ids":[9],"image_data":"u","multimodal_placeholders":[{"type":"image","token_index":0,"item_index":0}]}"#;
+        let (reqs, is_batch) = requests(single).unwrap();
+        assert!(!is_batch);
+        let value = reqs[0]
+            .mm
+            .as_ref()
+            .unwrap()
+            .multimodal_placeholders
+            .as_ref()
+            .unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 1);
+
+        let batched = r#"{"input_ids":[[9],[8]],"image_data":["u","v"],"multimodal_placeholders":[[{"type":"image","token_index":0,"item_index":0}],[{"type":"image","token_index":0,"item_index":0}]]}"#;
+        let (reqs, is_batch) = requests(batched).unwrap();
+        assert!(is_batch);
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs.iter().all(|request| request.has_multimodal()));
+
+        let invalid = r#"{"input_ids":[[9],[8]],"image_data":["u","v"],"multimodal_placeholders":[{"type":"image","token_index":0,"item_index":0}]}"#;
+        assert!(requests(invalid).is_err());
     }
 
     /// A scalar broadcast is budget-checked before the deep clones (16 MiB ×

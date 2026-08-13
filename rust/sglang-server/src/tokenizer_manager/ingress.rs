@@ -227,7 +227,7 @@ impl Ingress {
                 // Validate, then register the sink before the request leaves Rust.
                 // Failures move to `Failed` and fall through to the reject arm.
                 RequestState::Received => {
-                    if let Err(e) = validate(&mut req, &self.limits) {
+                    if let Err(e) = validate(&mut req, &self.limits, self.mm.enabled) {
                         let _ = req.state.apply(Event::Error(e)); // → Failed
                         continue;
                     }
@@ -352,7 +352,8 @@ impl Ingress {
                 // a text request has no ids yet.
                 RequestState::PreSendValidating => {
                     if let RequestKind::Generate(g) = &mut req.kind
-                        && let Err(e) = check_total_tokens(g, &self.limits)
+                        && let Err(e) = validate_input_ids(g, &self.limits)
+                            .and_then(|()| check_total_tokens(g, &self.limits))
                     {
                         let _ = req.state.apply(Event::Error(e)); // → Failed
                         continue;
@@ -572,7 +573,7 @@ impl Ingress {
 /// `Received → Validating` + admissibility check. Under `skip_tokenizer_init` a
 /// generate request must already carry token ids (no tokenizer to byte-encode
 /// text); control requests carry none and are exempt.
-fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
+fn validate(req: &mut Request, limits: &Limits, mm_enabled: bool) -> Result<(), Error> {
     let (skip_tokenizer_init, vocab_size) = (limits.skip_tokenizer_init, limits.vocab_size);
     let _ = req
         .state
@@ -605,7 +606,13 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
     // reaches the embedding lookup and kills the scheduler process, so 400
     // here instead — mirroring the Python `TokenizerManager` validation.
     if let RequestKind::Generate(g) = &req.kind {
-        if let Some(ids) = &g.input_ids {
+        // A model-owned MM processor may accept a compact sentinel outside the
+        // vocabulary and normalize it while expanding media placeholders. The
+        // final IDs are checked unconditionally in PreSendValidating, before
+        // anything reaches the scheduler.
+        if !(mm_enabled && g.has_multimodal())
+            && let Some(ids) = &g.input_ids
+        {
             for &id in ids {
                 if id < 0 || id as u64 >= vocab_size {
                     return Err(Error::Validation(format!(
@@ -652,6 +659,20 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
         ));
     }
 
+    Ok(())
+}
+
+fn validate_input_ids(g: &GenerateRequest, limits: &Limits) -> Result<(), Error> {
+    if let Some(ids) = &g.input_ids {
+        for &id in ids {
+            if id < 0 || id as u64 >= limits.vocab_size {
+                return Err(Error::Validation(format!(
+                    "input_ids contains out-of-vocabulary token id {id}; valid range is [0, {})",
+                    limits.vocab_size
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1075,7 +1096,7 @@ mod tests {
             r
         };
         let disabled = test_limits();
-        let err = validate(&mut req(true), &disabled).unwrap_err();
+        let err = validate(&mut req(true), &disabled, false).unwrap_err();
         assert_eq!(err.http_status(), 400);
         assert!(
             err.to_string().contains("--enable-return-hidden-states"),
@@ -1084,12 +1105,12 @@ mod tests {
         // Not asking for them (the client sent `false`, or sent nothing and
         // `into_requests` resolved the default), or asking on a server that
         // supports them, is fine.
-        assert!(validate(&mut req(false), &disabled).is_ok());
+        assert!(validate(&mut req(false), &disabled, false).is_ok());
         let enabled = Limits {
             enable_return_hidden_states: true,
             ..test_limits()
         };
-        assert!(validate(&mut req(true), &enabled).is_ok());
+        assert!(validate(&mut req(true), &enabled, false).is_ok());
     }
 
     /// End-to-end through `drive`: an over-context request is rejected on the way
@@ -1235,14 +1256,14 @@ mod tests {
     fn oversized_rid_is_rejected() {
         let mut req = generate_req(51, SamplingParams::default());
         req.rid = "x".repeat(MAX_RID_LEN + 1).into();
-        let err = validate(&mut req, &test_limits()).expect_err("must be rejected");
+        let err = validate(&mut req, &test_limits(), false).expect_err("must be rejected");
         assert_eq!(err.http_status(), 400);
         assert!(err.to_string().contains("over the"), "{err}");
 
         // A uuid-sized rid — what Python mints — is nowhere near the cap.
         let mut req = generate_req(52, SamplingParams::default());
         req.rid = "0123456789abcdef0123456789abcdef".into();
-        assert!(validate(&mut req, &test_limits()).is_ok());
+        assert!(validate(&mut req, &test_limits(), false).is_ok());
     }
 
     /// A request rejected BEFORE `register_detok` must not send `Deregister`: the
@@ -1350,6 +1371,27 @@ mod tests {
             Err(_) | Ok(DetokMsg::Deregister { .. }) => {}
             Ok(_) => panic!("out-of-vocab token_ids_logprob must not be admitted"),
         }
+    }
+
+    #[test]
+    fn multimodal_processor_may_normalize_a_sentinel_before_final_validation() {
+        let mut req = generate_req(24, SamplingParams::default());
+        let RequestKind::Generate(g) = &mut req.kind else {
+            unreachable!()
+        };
+        g.input_ids = Some(vec![-103]);
+        g.mm = Some(Box::new(crate::message::MmData {
+            audio_data: Some(rmpv::Value::from("audio.wav")),
+            ..Default::default()
+        }));
+
+        assert!(validate(&mut req, &test_limits(), true).is_ok());
+        let RequestKind::Generate(g) = &mut req.kind else {
+            unreachable!()
+        };
+        assert!(validate_input_ids(g, &test_limits()).is_err());
+        g.input_ids = Some(vec![70]);
+        assert!(validate_input_ids(g, &test_limits()).is_ok());
     }
 
     /// A valid request is registered and handed onward — never deregistered.
@@ -1488,14 +1530,14 @@ mod tests {
         // The worker parks its result, as it always does before MmEncoded.
         ingress.mm.sidecar.park(
             "mm-gone".into(),
-            crate::mm::MmSidecarEntry {
+            crate::mm::MmSidecarEntry::Qwen(crate::mm::QwenMmSidecarEntry {
                 features: crate::mm::FeatureStore::Inline(vec![]),
                 grids: vec![],
                 hashes: vec![],
                 offsets: vec![],
                 mrope: vec![],
                 mrope_delta: 0,
-            },
+            }),
         );
         ingress.on_abort(AbortSource::Guard("mm-gone".to_string().into()));
         assert_eq!(consumer.drain(16).headers.len(), 1, "only the AbortReq");

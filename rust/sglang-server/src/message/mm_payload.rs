@@ -11,6 +11,96 @@ use sglang_mm::driver::{ImageSource, MmInput};
 
 use super::request::MmWorkItem;
 
+/// Fully resolved media payload for an external native MM component. All I/O
+/// sources were prefetched on the async API layer; data URLs and bare base64
+/// are decoded here on the MM worker.
+pub struct ResolvedMediaWork {
+    pub text: Option<String>,
+    pub input_ids: Option<Vec<i32>>,
+    pub images: Vec<Vec<u8>>,
+    pub videos: Vec<Vec<u8>>,
+    pub audios: Vec<Vec<u8>>,
+    pub multimodal_placeholders: Option<Value>,
+}
+
+/// Resolve image/video/audio values in the prefetch contract's fixed modality
+/// order. This is the generic loader seam used by external processors.
+pub fn resolve_media_work(work: MmWorkItem) -> Result<ResolvedMediaWork, String> {
+    let mut prefetched = work.prefetched.iter();
+    let images = collect_media(work.image_data.as_ref(), &mut prefetched, "image_data")?;
+    let videos = collect_media(work.video_data.as_ref(), &mut prefetched, "video_data")?;
+    let audios = collect_media(work.audio_data.as_ref(), &mut prefetched, "audio_data")?;
+    if prefetched.next().is_some() {
+        return Err("media prefetch produced more payloads than the request consumes".into());
+    }
+    Ok(ResolvedMediaWork {
+        text: work.text,
+        input_ids: work.input_ids,
+        images,
+        videos,
+        audios,
+        multimodal_placeholders: work.multimodal_placeholders,
+    })
+}
+
+fn collect_media(
+    value: Option<&Value>,
+    prefetched: &mut std::slice::Iter<Bytes>,
+    field: &str,
+) -> Result<Vec<Vec<u8>>, String> {
+    fn one(
+        value: &Value,
+        prefetched: &mut std::slice::Iter<Bytes>,
+        field: &str,
+        out: &mut Vec<Vec<u8>>,
+    ) -> Result<(), String> {
+        match value {
+            Value::Nil => Ok(()),
+            Value::String(value) => {
+                let source = value
+                    .as_str()
+                    .ok_or_else(|| format!("non-utf8 {field} source"))?;
+                if is_io_source(source) {
+                    out.push(
+                        prefetched
+                            .next()
+                            .ok_or_else(|| format!("I/O-backed {field} source was not prefetched"))?
+                            .to_vec(),
+                    );
+                } else {
+                    out.push(sglang_mm::common::fetch::fetch_bytes(source)?);
+                }
+                Ok(())
+            }
+            Value::Binary(bytes) => {
+                out.push(bytes.clone());
+                Ok(())
+            }
+            Value::Array(values) => {
+                for value in values {
+                    one(value, prefetched, field, out)?;
+                }
+                Ok(())
+            }
+            Value::Map(entries) => {
+                let source = entries
+                    .iter()
+                    .find(|(key, _)| key.as_str() == Some("url"))
+                    .map(|(_, value)| value)
+                    .ok_or_else(|| format!("{field} object requires a url field"))?;
+                one(source, prefetched, field, out)
+            }
+            _ => Err(format!("unsupported {field} shape")),
+        }
+    }
+
+    let mut out = Vec::new();
+    if let Some(value) = value {
+        one(value, prefetched, field, &mut out)?;
+    }
+    Ok(out)
+}
+
 /// True for sources the API layer must resolve before MM dispatch: I/O — network
 /// *or* disk, since a network mount can hang past any HTTP timeout — never runs
 /// on the fixed MM worker pool (see `api_server::prefetch`). `data:` and bare
@@ -26,16 +116,25 @@ pub fn is_io_source(src: &str) -> bool {
 /// The I/O-backed sources of an `image_data` value, in `collect_images` order.
 pub fn io_sources(value: &Value) -> Vec<String> {
     let mut out = Vec::new();
-    let mut walk = |value: &Value| {
-        if let Some(src) = value.as_str().filter(|s| is_io_source(s)) {
-            out.push(src.to_owned());
+    fn walk(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(value) => {
+                if let Some(src) = value.as_str().filter(|s| is_io_source(s)) {
+                    out.push(src.to_owned());
+                }
+            }
+            Value::Array(values) => values.iter().for_each(|value| walk(value, out)),
+            Value::Map(entries) => {
+                if let Some((_, source)) =
+                    entries.iter().find(|(key, _)| key.as_str() == Some("url"))
+                {
+                    walk(source, out);
+                }
+            }
+            _ => {}
         }
-    };
-    if let Value::Array(values) = value {
-        values.iter().for_each(&mut walk);
-    } else {
-        walk(value);
     }
+    walk(value, &mut out);
     out
 }
 
@@ -56,6 +155,9 @@ pub fn to_mm_input(work: MmWorkItem) -> Result<MmInput, String> {
     let present = |v: &Option<Value>| v.as_ref().is_some_and(value_present);
     if present(&work.video_data) || present(&work.audio_data) {
         return Err("unsupported modality: video/audio input".into());
+    }
+    if present(&work.multimodal_placeholders) {
+        return Err("unsupported multimodal_placeholders contract for this processor".into());
     }
     let mut images = Vec::new();
     if let Some(image_data) = &work.image_data {
@@ -202,6 +304,32 @@ mod tests {
 
         let err = to_mm_input(image_work(image)).err().unwrap();
         assert!(err.contains("not prefetched"), "{err}");
+    }
+
+    #[test]
+    fn generic_media_accepts_structured_url_items() {
+        let structured = |url: &str| {
+            Value::Map(vec![
+                (Value::from("url"), Value::from(url)),
+                (Value::from("max_dynamic_patch"), Value::from(16)),
+            ])
+        };
+        let work = MmWorkItem {
+            image_data: Some(structured("https://example.test/image.png")),
+            video_data: Some(structured("file:///tmp/video.mp4")),
+            audio_data: Some(Value::from("data:audio/wav;base64,YQ==")),
+            prefetched: vec![Bytes::from_static(b"image"), Bytes::from_static(b"video")],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            io_sources(work.image_data.as_ref().unwrap()),
+            vec!["https://example.test/image.png"]
+        );
+        let resolved = resolve_media_work(work).unwrap();
+        assert_eq!(resolved.images, vec![b"image".to_vec()]);
+        assert_eq!(resolved.videos, vec![b"video".to_vec()]);
+        assert_eq!(resolved.audios, vec![b"a".to_vec()]);
     }
 
     #[test]

@@ -111,6 +111,7 @@ pub(super) fn app_state(senders: Senders) -> super::AppState {
         egress_buf: 8,
         server_args: server_args(),
         chat_formatter: None,
+        chat_processor: None,
         egress_activity: Default::default(),
     }
 }

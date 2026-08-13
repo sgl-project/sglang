@@ -36,8 +36,9 @@ use super::{
     AppState, ChatFormatter, collect_output, contains_media, error_payload, indexed_egress_stream,
     openai_error, submit_generation, unix_seconds_u32,
 };
+use crate::NativeChatOutput;
 use crate::ids::Rid;
-use crate::message::{ChunkExtras, EgressItem, GenerateRequest, OneOrMany, SamplingParams};
+use crate::message::{ChunkExtras, EgressItem, GenerateRequest, MmData, OneOrMany, SamplingParams};
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -45,13 +46,17 @@ pub(super) fn routes() -> Router<AppState> {
 
 async fn chat_completions(
     State(state): State<AppState>,
-    body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let request = match body {
+    let raw_request = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
+    };
+    let request: CreateChatCompletionRequest = match serde_json::from_value(raw_request.clone()) {
+        Ok(request) => request,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
     if request.model != state.server_args.served_model_name {
         return openai_error(
@@ -63,7 +68,9 @@ async fn chat_completions(
     if request.messages.is_empty() {
         return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty", false);
     }
-    if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
+    if state.chat_processor.is_none()
+        && serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages))
+    {
         return openai_error(
             StatusCode::BAD_REQUEST,
             "image, audio, video, and file message content is not supported",
@@ -113,7 +120,7 @@ async fn chat_completions(
     let parser = tools_enabled
         .then(|| state.server_args.tool_call_parser.clone())
         .flatten();
-    if tools_enabled && parser.is_none() {
+    if tools_enabled && parser.is_none() && state.chat_processor.is_none() {
         return openai_error(
             StatusCode::BAD_REQUEST,
             "tool calls require --tool-call-parser",
@@ -136,7 +143,7 @@ async fn chat_completions(
     });
     let tools_slice = tools.as_deref().unwrap_or_default();
 
-    let (request, prompt) = match prepare_chat_request(&state, request).await {
+    let (request, prompt) = match prepare_chat_request(&state, request, raw_request).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
@@ -184,9 +191,24 @@ async fn chat_completions(
                 .expect("chat prompt exists until the last choice")
                 .clone()
         };
-        let native = GenerateRequest {
+        let (text, input_ids, mm) = match choice_prompt {
+            PreparedChatPrompt::Text(prompt) => (Some(prompt), None, None),
+            PreparedChatPrompt::Native(output) => {
+                let mm = MmData {
+                    image_data: output.image_data,
+                    video_data: output.video_data,
+                    audio_data: output.audio_data,
+                    multimodal_placeholders: output.multimodal_placeholders,
+                    ..Default::default()
+                };
+                (None, Some(output.input_ids), Some(Box::new(mm)))
+            }
+        };
+        let mut native = GenerateRequest {
             rid: rid.clone(),
-            text: Some(choice_prompt),
+            text,
+            input_ids,
+            mm,
             // Rendered templates own their special tokens — the pool must not
             // add another BOS/EOS (Python's `add_special_tokens=False`).
             skip_special_tokens: true,
@@ -198,6 +220,14 @@ async fn chat_completions(
             return_text_in_logprobs: want_logprobs.then_some(true),
             ..Default::default()
         };
+        if let Err(error) = super::super::prefetch::prefetch_all(
+            std::slice::from_mut(&mut native),
+            &state.server_args.limit_mm_data_per_request,
+        )
+        .await
+        {
+            return openai_error(StatusCode::BAD_REQUEST, error, false);
+        }
         let rx = match submit_generation(&state, native, stream, &mut guard).await {
             Ok(rx) => rx,
             Err(response) => return response,
@@ -242,14 +272,47 @@ async fn chat_completions(
     }
 }
 
-/// Render the chat template for an OpenAI request, mapping a missing
-/// formatter or a render failure to the standard 400. The rendered prompt is
-/// submitted as text — the tokenizer pool encodes it (with
-/// `skip_special_tokens`, since the template owns its special tokens).
+#[derive(Clone)]
+pub(super) enum PreparedChatPrompt {
+    Text(String),
+    Native(NativeChatOutput),
+}
+
+/// Render the chat template with either the default formatter or a model-owned
+/// processor, mapping failures to the standard OpenAI 400 response.
 pub(super) async fn prepare_chat_request(
     state: &AppState,
     mut request: CreateChatCompletionRequest,
-) -> Result<(CreateChatCompletionRequest, String), Response> {
+    raw_request: serde_json::Value,
+) -> Result<(CreateChatCompletionRequest, PreparedChatPrompt), Response> {
+    if let Some(processor) = state.chat_processor.clone() {
+        let request_json = raw_request.to_string();
+        let output = tokio::task::spawn_blocking(move || processor.process(&request_json))
+            .await
+            .map_err(|error| {
+                openai_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("chat processor task failed: {error}"),
+                    false,
+                )
+            })?
+            .map_err(|error| {
+                openai_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("chat template render failed: {error}"),
+                    false,
+                )
+            })?;
+        if output.input_ids.is_empty() {
+            return Err(openai_error(
+                StatusCode::BAD_REQUEST,
+                "chat template produced no input tokens",
+                false,
+            ));
+        }
+        return Ok((request, PreparedChatPrompt::Native(output)));
+    }
+
     let Some(formatter) = state.chat_formatter.clone() else {
         return Err(openai_error(
             StatusCode::BAD_REQUEST,
@@ -269,7 +332,7 @@ pub(super) async fn prepare_chat_request(
             false,
         )
     })?;
-    Ok((request, prompt))
+    Ok((request, PreparedChatPrompt::Text(prompt)))
 }
 
 /// Full sampling resolution for an OpenAI request, mirroring the Python

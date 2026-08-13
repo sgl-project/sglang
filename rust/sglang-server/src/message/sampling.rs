@@ -26,7 +26,7 @@
 //!   * `n > 1` (parallel sampling) is rejected — the rust egress maps one rid to
 //!     one response, so every sample past the first would be dropped.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
@@ -217,6 +217,12 @@ pub struct SamplingParams {
     /// Set by `normalize`; tells the scheduler its own pass can early-return.
     #[serde(skip_deserializing)]
     pub is_normalized: bool,
+    /// API fields that were present in the request object. Serde defaults erase
+    /// that distinction, but the server needs it to apply operator-provided
+    /// preferred sampling params with the same precedence as Python:
+    /// `preferred | request`.
+    #[serde(skip)]
+    pub(crate) explicit_fields: BTreeSet<String>,
 }
 
 /// The `/generate` body's `sampling_params`: one object (broadcast to every
@@ -247,17 +253,78 @@ impl<'de> Deserialize<'de> for SamplingParamsInput {
             }
 
             fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-                SamplingParams::deserialize(MapAccessDeserializer::new(map))
+                let value = serde_json::Value::deserialize(MapAccessDeserializer::new(map))?;
+                sampling_params_from_value(value)
                     .map(|p| SamplingParamsInput::One(Box::new(p)))
+                    .map_err(serde::de::Error::custom)
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
-                Vec::deserialize(SeqAccessDeserializer::new(seq)).map(SamplingParamsInput::Many)
+                let values =
+                    Vec::<serde_json::Value>::deserialize(SeqAccessDeserializer::new(seq))?;
+                values
+                    .into_iter()
+                    .map(sampling_params_from_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(SamplingParamsInput::Many)
+                    .map_err(serde::de::Error::custom)
             }
         }
 
         deserializer.deserialize_any(InputVisitor)
     }
+}
+
+fn sampling_params_from_value(value: serde_json::Value) -> Result<SamplingParams, String> {
+    let explicit_fields = value
+        .as_object()
+        .ok_or_else(|| "sampling_params must be an object".to_string())?
+        .keys()
+        .cloned()
+        .collect();
+    let mut params: SamplingParams = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    params.explicit_fields = explicit_fields;
+    Ok(params)
+}
+
+impl SamplingParamsInput {
+    /// Merge launch-time preferred params beneath request params. A request key
+    /// wins even when it explicitly carries the type's normal default or null.
+    pub fn apply_preferred(&mut self, preferred: &serde_json::Value) -> Result<(), String> {
+        match self {
+            Self::One(params) => apply_preferred_to_one(params, preferred),
+            Self::Many(params) => params
+                .iter_mut()
+                .try_for_each(|params| apply_preferred_to_one(params, preferred)),
+        }
+    }
+
+    /// Parse preferred params when a request omitted `sampling_params` entirely.
+    pub fn from_preferred(preferred: &serde_json::Value) -> Result<Self, String> {
+        sampling_params_from_value(preferred.clone()).map(|params| Self::One(Box::new(params)))
+    }
+}
+
+fn apply_preferred_to_one(
+    params: &mut SamplingParams,
+    preferred: &serde_json::Value,
+) -> Result<(), String> {
+    let mut merged = preferred
+        .as_object()
+        .ok_or_else(|| "preferred_sampling_params must be a JSON object".to_string())?
+        .clone();
+    let request = serde_json::to_value(&*params)
+        .map_err(|e| e.to_string())?
+        .as_object()
+        .cloned()
+        .expect("SamplingParams serializes as an object");
+    for field in &params.explicit_fields {
+        if let Some(value) = request.get(field) {
+            merged.insert(field.clone(), value.clone());
+        }
+    }
+    *params = sampling_params_from_value(serde_json::Value::Object(merged))?;
+    Ok(())
 }
 
 impl Default for SamplingParams {
@@ -297,6 +364,7 @@ impl Default for SamplingParams {
             stop_str_max_len: 0,
             stop_regex_max_len: 0,
             is_normalized: false,
+            explicit_fields: BTreeSet::new(),
         }
     }
 }
@@ -994,5 +1062,36 @@ mod tests {
         let json = serde_json::json!({ "stop": stops }).to_string();
         let err = norm_err(&json).to_string();
         assert!(err.contains("at most"), "{err}");
+    }
+
+    #[test]
+    fn preferred_params_fill_only_omitted_request_fields() {
+        let preferred = serde_json::json!({
+            "temperature": 0.25,
+            "top_p": 0.75,
+            "max_new_tokens": 4096
+        });
+        let mut input: SamplingParamsInput =
+            serde_json::from_str(r#"{"temperature": 1.0, "top_p": null}"#).unwrap();
+        input.apply_preferred(&preferred).unwrap();
+        let SamplingParamsInput::One(params) = input else {
+            panic!("expected scalar params")
+        };
+        assert_eq!(params.temperature, 1.0, "explicit default wins");
+        assert_eq!(params.top_p, 1.0, "explicit null keeps the type default");
+        assert_eq!(params.max_new_tokens, Some(4096), "omitted uses preferred");
+    }
+
+    #[test]
+    fn preferred_params_apply_to_every_batched_object() {
+        let preferred = serde_json::json!({"temperature": 0.25, "top_p": 0.75});
+        let mut input: SamplingParamsInput =
+            serde_json::from_str(r#"[{"temperature": 0.5}, {"top_p": 0.9}]"#).unwrap();
+        input.apply_preferred(&preferred).unwrap();
+        let SamplingParamsInput::Many(params) = input else {
+            panic!("expected batched params")
+        };
+        assert_eq!((params[0].temperature, params[0].top_p), (0.5, 0.75));
+        assert_eq!((params[1].temperature, params[1].top_p), (0.25, 0.9));
     }
 }

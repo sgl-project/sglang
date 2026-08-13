@@ -134,17 +134,72 @@ fn parse_caller_hash(entry: &str) -> Option<u64> {
     u64::from_str_radix(&hex[hex.len().saturating_sub(16)..], 16).ok()
 }
 
-/// One parked result: the buffers the drain-time Python adapter needs (the
-/// expanded `input_ids` travel separately, via `TmEvent::MmEncoded`). The qwen
-/// drain shape (`sglang_mm::qwen_vl::pack_drain`); generalizes to a
-/// named-tensor handoff once a family needs a different one.
-pub struct MmSidecarEntry {
+/// The existing Qwen-specific drain shape. It remains the default OSS adapter;
+/// external model packages use [`GenericMmSidecarEntry`] instead.
+pub struct QwenMmSidecarEntry {
     pub features: FeatureStore,
     pub grids: Vec<[u32; 3]>,
     pub hashes: Vec<u64>,
     pub offsets: Vec<(u32, u32)>,
     pub mrope: Vec<i64>,
     pub mrope_delta: i64,
+}
+
+/// Numeric storage owned by a generic multimodal item. The worker creates these
+/// vectors off the Python scheduler thread; the PyO3 drain wraps them into NumPy
+/// without copying.
+pub enum GenericTensorData {
+    F32(Vec<f32>),
+    I64(Vec<i64>),
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+}
+
+/// One model-agnostic tensor with an explicit logical shape.
+pub struct GenericTensor {
+    pub shape: Vec<usize>,
+    pub data: GenericTensorData,
+}
+
+/// One modality item produced by an external MM component. `metadata_json` is
+/// interpreted only by the owning model package; the OSS runtime transports it
+/// opaquely and never branches on private fields.
+pub struct GenericMmItem {
+    pub modality: String,
+    pub feature: GenericTensor,
+    pub hash: u64,
+    pub offsets: Vec<(u32, u32)>,
+    pub metadata_json: String,
+}
+
+/// Generic sidecar for external model packages. Request-level metadata carries
+/// the owning processor's special-token and position information.
+pub struct GenericMmSidecarEntry {
+    pub items: Vec<GenericMmItem>,
+    pub metadata_json: String,
+}
+
+/// One parked result. The default path stays Qwen-shaped for compatibility;
+/// external processors use the generic, modality-tagged representation.
+pub enum MmSidecarEntry {
+    Qwen(QwenMmSidecarEntry),
+    Generic(GenericMmSidecarEntry),
+}
+
+/// Complete result of one native MM processor invocation.
+pub struct MmProcessOutput {
+    pub input_ids: Vec<i32>,
+    pub sidecar: MmSidecarEntry,
+}
+
+/// Injectable native MM component. Implementations run on the fixed Rust MM
+/// worker pool and must not retain request-scoped Python objects.
+pub trait NativeMmProcessor: Send + Sync {
+    fn process(
+        &self,
+        work: crate::message::MmWorkItem,
+        tokenizer: Option<&dyn TextTokenizer>,
+    ) -> Result<MmProcessOutput, String>;
 }
 
 /// Where a result's feature buffers live between worker and drain.
@@ -178,14 +233,10 @@ impl Sidecar {
 
 /// Shared state of the mm path, built once at `start_mm_workers`.
 pub struct Context {
-    pub family: Box<dyn sglang_mm::pipeline::MmFamilyProcessor>,
+    pub processor: Arc<dyn NativeMmProcessor>,
     /// `None` under `skip_tokenizer_init` (requests must carry `input_ids`).
     pub tokenizer: Option<Arc<dyn TextTokenizer>>,
     pub sidecar: Sidecar,
-    /// Park feature buffers in POSIX shm. Set by the Python launcher
-    /// (`NativeMmHost._use_feature_shm`) exactly when the scheduler broadcasts
-    /// across TP ranks and will unwrap `ShmPointerMMData`.
-    pub feature_shm: bool,
 }
 
 impl Context {
@@ -194,15 +245,73 @@ impl Context {
         tokenizer: Option<Arc<dyn TextTokenizer>>,
         sidecar: Sidecar,
     ) -> Result<Self, String> {
+        Ok(Self {
+            processor: Arc::new(QwenMmProcessor::new(spec_json)?),
+            tokenizer,
+            sidecar,
+        })
+    }
+
+    pub fn with_processor(
+        processor: Arc<dyn NativeMmProcessor>,
+        tokenizer: Option<Arc<dyn TextTokenizer>>,
+        sidecar: Sidecar,
+    ) -> Self {
+        Self {
+            processor,
+            tokenizer,
+            sidecar,
+        }
+    }
+}
+
+struct QwenMmProcessor {
+    family: Box<dyn sglang_mm::pipeline::MmFamilyProcessor>,
+    feature_shm: bool,
+}
+
+impl QwenMmProcessor {
+    fn new(spec_json: &str) -> Result<Self, String> {
         let feature_shm = serde_json::from_str::<serde_json::Value>(spec_json)
             .ok()
             .and_then(|v| v.get("feature_shm").and_then(|b| b.as_bool()))
             .unwrap_or(false);
         Ok(Self {
             family: sglang_mm::registry::pipeline_from_spec(spec_json)?,
-            tokenizer,
-            sidecar,
             feature_shm,
+        })
+    }
+}
+
+impl NativeMmProcessor for QwenMmProcessor {
+    fn process(
+        &self,
+        work: crate::message::MmWorkItem,
+        tokenizer: Option<&dyn TextTokenizer>,
+    ) -> Result<MmProcessOutput, String> {
+        let input = crate::message::mm_payload::to_mm_input(work)?;
+        let output = sglang_mm::driver::process(self.family.as_ref(), input, |text| {
+            let tokenizer = tokenizer.ok_or_else(|| {
+                "skip_tokenizer_init is set: multimodal text prompts require input_ids".to_string()
+            })?;
+            tokenizer.encode(text).map_err(|error| error.to_string())
+        })?;
+        let drain = sglang_mm::qwen_vl::pack_drain(output)?;
+        let features = if self.feature_shm {
+            park_features_in_shm(&drain.features, &drain.grids)
+        } else {
+            FeatureStore::Inline(drain.features)
+        };
+        Ok(MmProcessOutput {
+            input_ids: drain.input_ids,
+            sidecar: MmSidecarEntry::Qwen(QwenMmSidecarEntry {
+                features,
+                grids: drain.grids,
+                hashes: drain.hashes,
+                offsets: drain.offsets,
+                mrope: drain.mrope,
+                mrope_delta: drain.mrope_delta,
+            }),
         })
     }
 }
@@ -215,32 +324,19 @@ fn process(
     mut work: crate::message::MmWorkItem,
 ) -> Result<Vec<i32>, String> {
     let caller_hashes = std::mem::take(&mut work.mm_hashes);
-    let input = crate::message::mm_payload::to_mm_input(work)?;
-    let output = sglang_mm::driver::process(ctx.family.as_ref(), input, |text| {
-        let tokenizer = ctx.tokenizer.as_ref().ok_or_else(|| {
-            "skip_tokenizer_init is set: multimodal text prompts require input_ids".to_string()
-        })?;
-        tokenizer.encode(text).map_err(|error| error.to_string())
-    })?;
-    let mut drain = sglang_mm::qwen_vl::pack_drain(output)?;
-    apply_caller_hashes(&mut drain.hashes, &caller_hashes);
-    let features = if ctx.feature_shm {
-        park_features_in_shm(&drain.features, &drain.grids)
-    } else {
-        FeatureStore::Inline(drain.features)
-    };
-    ctx.sidecar.park(
-        rid.as_str().to_owned(),
-        MmSidecarEntry {
-            features,
-            grids: drain.grids,
-            hashes: drain.hashes,
-            offsets: drain.offsets,
-            mrope: drain.mrope,
-            mrope_delta: drain.mrope_delta,
-        },
-    );
-    Ok(drain.input_ids)
+    let mut output = ctx.processor.process(work, ctx.tokenizer.as_deref())?;
+    match &mut output.sidecar {
+        MmSidecarEntry::Qwen(entry) => apply_caller_hashes(&mut entry.hashes, &caller_hashes),
+        MmSidecarEntry::Generic(entry) => {
+            let mut hashes: Vec<u64> = entry.items.iter().map(|item| item.hash).collect();
+            apply_caller_hashes(&mut hashes, &caller_hashes);
+            for (item, hash) in entry.items.iter_mut().zip(hashes) {
+                item.hash = hash;
+            }
+        }
+    }
+    ctx.sidecar.park(rid.as_str().to_owned(), output.sidecar);
+    Ok(output.input_ids)
 }
 
 /// Split the flat feature buffer per item (`t*h*w` rows per grid) and park each

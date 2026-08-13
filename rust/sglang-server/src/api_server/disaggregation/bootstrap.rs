@@ -442,6 +442,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(ServerArgs::from_json(server_args_json).unwrap()),
+            chat_processor: None,
         };
         (crate::runtime::start(cfg).expect("start runtime"), addr)
     }

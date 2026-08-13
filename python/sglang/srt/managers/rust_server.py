@@ -373,19 +373,6 @@ class RustServer:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
         server_args = scheduler.server_args
-        # `TokenizerManager` merges these under each request's own sampling params
-        # (`{**preferred, **obj.sampling_params}`), and this server replaces that
-        # manager wholesale — so honouring the flag is not implemented here yet.
-        # Refuse rather than run: silently dropping it means generating with
-        # sampling the operator did not configure, and `/get_model_info` would go on
-        # advertising values no request ever receives.
-        if server_args.preferred_sampling_params:
-            raise ValueError(
-                "SGLANG_RUST_SERVER does not yet apply --preferred-sampling-params "
-                "(the Python TokenizerManager merges it into every request; the rust "
-                "ingress has no equivalent). Launch without SGLANG_RUST_SERVER, or "
-                "drop --preferred-sampling-params and send those values per request."
-            )
         http_addr = f"{server_args.host}:{server_args.port}"
 
         # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,
@@ -470,6 +457,13 @@ class RustServer:
         """
         self.server.wait_ingress(timeout_ms)
 
+    def _build_native_mm(self, entry):
+        assert self.mm_spec is not None
+        return NativeMmHost.build_native_mm(self.mm_spec, entry)
+
+    def _prepare_native_mm_for_dispatch(self, mm_inputs) -> None:
+        """Model-package hook for an owned device feature transport."""
+
     def drain(self, max_recv: int) -> List[Any]:
         """Ingress: non-blocking drain of the in-process ring → list of decoded
         request objects. The scheduler's request receiver calls this instead of
@@ -519,7 +513,8 @@ class RustServer:
                 # path. `None` for a text-only request on a multimodal model.
                 native = self.server.take_mm(obj.rid)
                 if native is not None:
-                    obj.mm_inputs = NativeMmHost.build_native_mm(self.mm_spec, native)
+                    obj.mm_inputs = self._build_native_mm(native)
+                    self._prepare_native_mm_for_dispatch(obj.mm_inputs)
             out.append(obj)
         return out
 

@@ -3,8 +3,11 @@
 //! dump ([`ServerArgs`] / [`ModelConfig`]), and the [`RuntimeConfig`] pairing
 //! them for `runtime::start`.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+use serde::Deserialize;
 
 /// Boot knobs specific to the embedded rust server — none of these exist in
 /// the Python `server_args` dump (see [`ServerArgs`]); they arrive as explicit
@@ -42,6 +45,9 @@ pub struct RuntimeConfig {
     /// config-endpoint metadata). `Arc` so cloning the config (and, downstream,
     /// each `AppState`) is cheap; immutable after construction.
     pub server_args: Arc<ServerArgs>,
+    /// Optional model-package renderer for chat templates the OSS server does
+    /// not own. Native `/generate` and the default chat formatter are unchanged.
+    pub chat_processor: Option<Arc<dyn crate::NativeChatProcessor>>,
 }
 
 impl Default for RuntimeConfig {
@@ -51,6 +57,7 @@ impl Default for RuntimeConfig {
             server_args: Arc::new(
                 ServerArgs::from_json("{}").expect("empty server_args blob parses"),
             ),
+            chat_processor: None,
         }
     }
 }
@@ -133,6 +140,11 @@ pub struct ServerArgs {
     /// field silently missing.
     #[serde(default)]
     pub enable_return_hidden_states: bool,
+    /// Per-modality media-count limits from `--limit-mm-data-per-request`.
+    /// The scheduler validates the keys at startup; ingress enforces the
+    /// counts before fetching or preprocessing any media.
+    #[serde(default, deserialize_with = "deserialize_optional_map")]
+    pub limit_mm_data_per_request: BTreeMap<String, usize>,
     /// Output slots reserved per request on top of its input (eagle stores draft
     /// tokens there). Not a `server_args` field — `TokenizerManager` derives it and
     /// `RustServer._build_server_args` stamps it in, so both sides count alike.
@@ -220,6 +232,13 @@ fn default_worker_num() -> usize {
     1
 }
 
+fn deserialize_optional_map<'de, D>(deserializer: D) -> Result<BTreeMap<String, usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<BTreeMap<String, usize>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
 impl ServerArgs {
     /// Parse the blob; errors on malformed JSON or a wrongly-typed field.
     pub fn from_json(s: &str) -> Result<Self, String> {
@@ -245,6 +264,10 @@ impl ServerArgs {
                 "unknown disaggregation_mode '{}' in server_args",
                 self.disaggregation_mode
             ));
+        }
+        if let Some(preferred) = &self.preferred_sampling_params {
+            crate::message::SamplingParamsInput::from_preferred(preferred)
+                .map_err(|e| format!("invalid preferred_sampling_params: {e}"))?;
         }
         Ok(())
     }
@@ -296,5 +319,16 @@ impl ServerArgs {
     pub fn api_worker_num(&self) -> usize {
         4.max(self.tokenizer_worker_num)
             .max(self.detokenizer_worker_num)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerArgs;
+
+    #[test]
+    fn null_multimodal_limits_match_an_unset_map() {
+        let args = ServerArgs::from_json(r#"{"limit_mm_data_per_request":null}"#).unwrap();
+        assert!(args.limit_mm_data_per_request.is_empty());
     }
 }
