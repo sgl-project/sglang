@@ -1,6 +1,6 @@
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import attention_backends_of, resolving_view
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
@@ -94,7 +94,6 @@ class DllmConfig:
                 "dllm prefill_block_size must be a positive multiple of block_size "
                 f"and no smaller than it: {prefill_block_size=}, {block_size=}"
             )
-        prefill_attention_backend, _ = attention_backends_of(cfg)
         # Each dLLM step needs one complete block; reject smaller budgets
         # to avoid unschedulable requests and scheduler livelock.
         max_prefill_tokens = getattr(cfg, "max_prefill_tokens", None)
@@ -103,11 +102,6 @@ class DllmConfig:
                 "max_prefill_tokens must be at least the dLLM block_size: "
                 f"{max_prefill_tokens=}, {block_size=}"
             )
-        _validate_multi_block_prefill_backend(
-            block_size=block_size,
-            prefill_block_size=prefill_block_size,
-            prefill_attention_backend=prefill_attention_backend,
-        )
 
         return DllmConfig(
             algorithm=cfg.dllm_algorithm,
