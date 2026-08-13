@@ -355,8 +355,8 @@ class DraftBlockProposer:
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            num_token_non_padded=torch.tensor(
-                draft_num_tokens, dtype=torch.int32, device=device
+            num_token_non_padded=torch.tensor(draft_num_tokens, dtype=torch.int32).to(
+                device, non_blocking=True
             ),
             num_token_non_padded_cpu=draft_num_tokens,
         )
