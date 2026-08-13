@@ -47,7 +47,6 @@ class TestQwen35_4BW8A8Xeon(unittest.TestCase):
                 batch_sizes=[16],
                 input_lens=(1024,),
                 output_lens=(1024,),
-                enable_profile=False,
                 baseline_output_throughput=390.0,
             ),
             share_server=True,

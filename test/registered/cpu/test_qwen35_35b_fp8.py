@@ -1,8 +1,7 @@
 """Nightly accuracy + performance test for Qwen3.5-35B-A3B-FP8 on CPU.
 
 35B MoE with 3B active params, FP8 weight quantization, TP=6 on Xeon.
-MMLU baseline: 0.83 (~87% for MoE class - 4% buffer).
-Using MMLU instead of GSM8K because thinking chains make GSM8K very slow on CPU.
+GSM8K baseline: 0.83.
 
 Registry: nightly-xeon-models suite"""
 
@@ -50,7 +49,6 @@ class TestQwen35_35BFPS8Xeon(unittest.TestCase):
                 batch_sizes=[16],
                 input_lens=(1024,),
                 output_lens=(1024,),
-                enable_profile=False,
                 baseline_output_throughput=100.0,
             ),
             share_server=True,
