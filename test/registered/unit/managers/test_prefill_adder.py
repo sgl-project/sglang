@@ -186,7 +186,7 @@ class TestPrefillAdder(CustomTestCase):
             dllm_algorithm_config=None,
             dllm_prefill_block_size=128,
             dllm_fdfo=True,
-            attention_backend="flashinfer",
+            attention_backend=None,
             prefill_attention_backend=None,
             decode_attention_backend=None,
         )
@@ -228,36 +228,6 @@ class TestPrefillAdder(CustomTestCase):
                 ValueError, "max_prefill_tokens must be at least"
             ):
                 DllmConfig.from_server_args(server_args)
-
-    def test_dllm_prefill_block_size_uses_unmaterialized_backend(self):
-        from sglang.srt.arg_groups.overrides import resolved_view
-
-        server_args = SimpleNamespace(
-            dllm_algorithm="LowConfidence",
-            model_path="dummy",
-            revision=None,
-            max_running_requests=2,
-            dllm_algorithm_config=None,
-            dllm_prefill_block_size=128,
-            dllm_fdfo=True,
-            attention_backend=None,
-            prefill_attention_backend=None,
-            decode_attention_backend=None,
-            _resolved_overrides=[
-                ("_dllm_attention_backend", {"attention_backend": "flashinfer"}),
-            ],
-        )
-        model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["LLaDA2MoeModelLM"])
-        )
-
-        with patch(
-            "sglang.srt.dllm.config.ModelConfig.from_server_args",
-            return_value=model_config,
-        ):
-            config = DllmConfig.from_server_args(resolved_view(server_args))
-
-        self.assertEqual(config.prefill_block_size, 128)
 
     def test_dllm_prefill_uses_phase_budget_and_block_aligned_context(self):
         adder = self.create_dllm_adder(is_prefill=True)

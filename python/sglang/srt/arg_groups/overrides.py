@@ -1913,6 +1913,14 @@ def _attention_backend_dual_chunk(view: Any) -> dict:
     return {}
 
 
+def resolve_default_page_size(view: Any) -> int:
+    if view.page_size is not None:
+        return view.page_size
+    if is_hip() and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d":
+        return 64
+    return 1 if not is_musa() else 64
+
+
 @register_post_process
 def _page_size_default(view: Any) -> dict:
     if view.page_size is not None:
@@ -1930,10 +1938,7 @@ def _page_size_default(view: Any) -> dict:
             "Setting page_size=64 as default for "
             "SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d."
         )
-        return {"page_size": 64}
-    if not is_musa():
-        return {"page_size": 1}
-    return {"page_size": 64}
+    return {"page_size": resolve_default_page_size(view)}
 
 
 @register_post_process
@@ -2168,6 +2173,17 @@ def _dllm_overlap_disable(view: Any) -> dict:
     return {"disable_overlap_schedule": True}
 
 
+def resolve_dllm_page_size(
+    *,
+    page_size: int,
+    block_size: int,
+    disable_radix_cache: bool,
+) -> int:
+    if not disable_radix_cache and page_size % block_size != 0:
+        return block_size
+    return min(page_size, block_size)
+
+
 @register_post_process
 def _dllm_page_size(view: Any) -> dict:
     if view.dllm_algorithm is None:
@@ -2175,12 +2191,18 @@ def _dllm_page_size(view: Any) -> dict:
     from sglang.srt.dllm.config import DllmConfig
 
     config = DllmConfig.from_server_args(view)
+    page_size = resolve_dllm_page_size(
+        page_size=view.page_size,
+        block_size=config.block_size,
+        disable_radix_cache=view.disable_radix_cache,
+    )
+    if page_size == view.page_size:
+        return {}
     if not view.disable_radix_cache and view.page_size % config.block_size != 0:
         logger.warning(
             f"Setting page size to {config.block_size} for diffusion LLM inference"
         )
-        return {"page_size": config.block_size}
-    if view.page_size > config.block_size:
+    else:
         # Legacy scheduler-init fallback, folded into the pass: the page
         # size must not exceed the dllm block size.
         logger.warning(
@@ -2188,8 +2210,7 @@ def _dllm_page_size(view: Any) -> dict:
             f"The page size {view.page_size} should not be larger than dllm block size {config.block_size}."
             f"Page size now falls back to {config.block_size}"
         )
-        return {"page_size": config.block_size}
-    return {}
+    return {"page_size": page_size}
 
 
 def validate_declarations(

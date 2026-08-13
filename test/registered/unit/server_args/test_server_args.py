@@ -64,23 +64,162 @@ class TestPrepareServerArgs(CustomTestCase):
         )
         args = SimpleNamespace(
             dllm_algorithm="LowConfidence",
-            _cuda_graph_config_locked=set(),
+            cuda_graph_config=config,
+            page_size=32,
+            disable_radix_cache=False,
+            _resolved_overrides=[("_dllm_page_size", {"page_size": 32})],
+            max_prefill_tokens=768,
+        )
+        dllm_config = SimpleNamespace(
+            block_size=32,
+            prefill_block_size=128,
+            max_running_requests=8,
+        )
+        with patch(
+            "sglang.srt.dllm.config.DllmConfig.from_server_args",
+            return_value=dllm_config,
+        ):
+            capture_bs = ServerArgs._generate_dllm_prefill_cuda_graph_batch_sizes(
+                args, 512
+            )
+
+        self.assertEqual(capture_bs, list(range(32, 513, 32)))
+
+    def test_dllm_prefill_graph_buckets_only_for_multi_block(self):
+        config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.BREAKABLE, max_bs=512)
+        )
+        args = SimpleNamespace(
+            dllm_algorithm="LowConfidence",
+            cuda_graph_config=config,
+            page_size=32,
+            disable_radix_cache=False,
+            _resolved_overrides=[],
+            max_prefill_tokens=768,
+        )
+        dllm_config = SimpleNamespace(
+            block_size=32,
+            prefill_block_size=32,
+            max_running_requests=8,
+        )
+        with patch(
+            "sglang.srt.dllm.config.DllmConfig.from_server_args",
+            return_value=dllm_config,
+        ):
+            capture_bs = ServerArgs._generate_dllm_prefill_cuda_graph_batch_sizes(
+                args, 512
+            )
+
+        self.assertIsNone(capture_bs)
+
+    def test_dllm_prefill_graph_buckets_preserve_explicit_config(self):
+        config = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
+            prefill=PhaseConfig(
+                backend=Backend.BREAKABLE,
+                max_bs=512,
+                bs=[128, 256],
+            ),
+        )
+        args = SimpleNamespace(
+            cuda_graph_config=config,
+            chunked_prefill_size=512,
+            device="cuda",
+            context_length=None,
+            max_total_tokens=None,
+            model_path="model",
+            dllm_algorithm="LowConfidence",
+            max_prefill_tokens=768,
+            mem_fraction_static=0.8,
+            torch_compile_max_bs=None,
+            enable_symm_mem=False,
+        )
+        args.use_mla_backend = lambda: False
+        args._generate_effective_prefill_cuda_graph_batch_sizes = MagicMock()
+
+        ServerArgs._handle_gpu_memory_settings(args, 80 * 1024)
+
+        self.assertEqual(config.prefill.bs, [128, 256])
+        args._generate_effective_prefill_cuda_graph_batch_sizes.assert_not_called()
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_dllm_hip_disables_cuda_graph(self, _mock):
+        config = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL),
+            prefill=PhaseConfig(backend=Backend.BREAKABLE),
+        )
+        args = SimpleNamespace(
+            dllm_algorithm="LowConfidence",
+            cuda_graph_config=config,
+        )
+
+        ServerArgs._handle_dllm_cuda_graph_compatibility(args)
+
+        self.assertEqual(config.decode.backend, Backend.DISABLED)
+        self.assertEqual(config.prefill.backend, Backend.DISABLED)
+
+    @patch(
+        "sglang.srt.dllm.config.DllmConfig.from_server_args",
+        return_value=SimpleNamespace(
+            block_size=32, prefill_block_size=128, max_running_requests=8
+        ),
+    )
+    def test_dp_reclamp_preserves_exact_dllm_prefill_buckets(self, _mock):
+        config = CudaGraphConfig(
+            prefill=PhaseConfig(
+                backend=Backend.BREAKABLE,
+                max_bs=512,
+                bs=list(range(32, 513, 32)),
+            )
+        )
+        args = SimpleNamespace(
+            dllm_algorithm="LowConfidence",
+            cuda_graph_config=config,
+            page_size=32,
+            disable_radix_cache=False,
+            max_prefill_tokens=512,
+            chunked_prefill_size=512,
+            dp_size=2,
+            tp_size=2,
+            ep_join_mode="none",
+            enable_dp_attention=True,
+            enable_dp_lm_head=False,
+            schedule_conservativeness=1.0,
+            _cuda_graph_config_locked={(Phase.PREFILL, "backend")},
+            _resolved_overrides=[],
+        )
+        args._resolved = lambda: SimpleNamespace(enable_dp_attention=True)
+        args._generate_dllm_prefill_cuda_graph_batch_sizes = (
+            lambda max_bs: ServerArgs._generate_dllm_prefill_cuda_graph_batch_sizes(
+                args, max_bs
+            )
+        )
+        args._generate_prefill_cuda_graph_batch_sizes = (
+            lambda max_bs: ServerArgs._generate_prefill_cuda_graph_batch_sizes(
+                args, max_bs
+            )
+        )
+        args._generate_effective_prefill_cuda_graph_batch_sizes = lambda max_bs: ServerArgs._generate_effective_prefill_cuda_graph_batch_sizes(
+            args, max_bs
+        )
+
+        ServerArgs._handle_data_parallelism(args)
+
+        self.assertEqual(args.chunked_prefill_size, 256)
+        self.assertEqual(config.prefill.max_bs, 256)
+        self.assertEqual(config.prefill.bs, list(range(32, 257, 32)))
+
+    def test_dllm_page_size_preview_does_not_declare_override(self):
+        config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.BREAKABLE, max_bs=512)
+        )
+        args = SimpleNamespace(
+            dllm_algorithm="LowConfidence",
             cuda_graph_config=config,
             page_size=None,
-            attention_backend=None,
-            prefill_attention_backend=None,
-            decode_attention_backend=None,
-            _resolved_overrides=[
-                ("_attention_backend_default", {"attention_backend": "fa3"}),
-                ("_dllm_attention_backend", {"attention_backend": "flashinfer"}),
-                ("_page_size_default", {"page_size": 1}),
-                ("_dllm_page_size", {"page_size": 32}),
-            ],
-            max_prefill_tokens=768,
-            get_attention_backends=lambda: (None, None),
-        )
-        args._resolved_attention_backends = (
-            lambda: ServerArgs._resolved_attention_backends(args)
+            disable_radix_cache=False,
+            _resolved_overrides=[],
+            max_prefill_tokens=512,
         )
         dllm_config = SimpleNamespace(
             block_size=32,
@@ -88,30 +227,96 @@ class TestPrepareServerArgs(CustomTestCase):
             max_running_requests=8,
         )
 
-        with patch(
-            "sglang.srt.dllm.config.DllmConfig.from_server_args",
-            return_value=dllm_config,
+        with (
+            patch(
+                "sglang.srt.arg_groups.overrides.is_hip",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.arg_groups.overrides.is_musa",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.dllm.config.DllmConfig.from_server_args",
+                return_value=dllm_config,
+            ),
         ):
-            ServerArgs._configure_dllm_prefill_cuda_graph_buckets(args)
+            capture_bs = ServerArgs._generate_dllm_prefill_cuda_graph_batch_sizes(
+                args, 512
+            )
 
-        self.assertEqual(config.prefill.bs, list(range(32, 513, 32)))
+        self.assertEqual(capture_bs, list(range(32, 513, 32)))
+        self.assertIsNone(args.page_size)
+        self.assertEqual(args._resolved_overrides, [])
 
-    def test_dllm_prefill_graph_buckets_preserve_explicit_config(self):
+    @patch(
+        "sglang.srt.dllm.config.DllmConfig.from_server_args",
+        return_value=SimpleNamespace(
+            block_size=32, prefill_block_size=1024, max_running_requests=8
+        ),
+    )
+    def test_memory_sizing_reserves_final_dllm_prefill_buckets(self, _mock):
         config = CudaGraphConfig(
-            prefill=PhaseConfig(backend=Backend.BREAKABLE, bs=[128])
+            decode=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
+            prefill=PhaseConfig(backend=Backend.BREAKABLE, max_bs=4096),
         )
         args = SimpleNamespace(
-            dllm_algorithm="LowConfidence",
-            _cuda_graph_config_locked={("prefill", "bs")},
             cuda_graph_config=config,
-            page_size=32,
-            max_prefill_tokens=1024,
-            get_attention_backends=MagicMock(),
+            chunked_prefill_size=4096,
+            device="cuda",
+            context_length=None,
+            max_total_tokens=None,
+            model_path="model",
+            dllm_algorithm="LowConfidence",
+            page_size=None,
+            disable_radix_cache=False,
+            _resolved_overrides=[("_dllm_page_size", {"page_size": 32})],
+            max_prefill_tokens=4096,
+            mem_fraction_static=None,
+            disaggregation_mode="null",
+            max_running_requests=None,
+            speculative_num_draft_tokens=None,
+            tp_size=1,
+            pp_size=1,
+            enable_dp_attention=False,
+            enable_symm_mem=False,
+            language_only=False,
+            torch_compile_max_bs=None,
+        )
+        reserved_bucket_snapshots = []
+        args.use_mla_backend = lambda: False
+        args.post_capture_kv_sizing_planned = lambda: False
+        args._resolved = lambda: SimpleNamespace(enable_dp_attention=False)
+
+        def reserve_for_graph_mb():
+            reserved_bucket_snapshots.append(list(config.prefill.bs))
+            return ServerArgs.reserve_for_graph_mb(args)
+
+        args.reserve_for_graph_mb = reserve_for_graph_mb
+        args.reserve_for_deepep_a2a_mb = lambda: 0
+        args.get_model_config = lambda: SimpleNamespace(is_multimodal=False)
+        args._generate_dllm_prefill_cuda_graph_batch_sizes = (
+            lambda max_bs: ServerArgs._generate_dllm_prefill_cuda_graph_batch_sizes(
+                args, max_bs
+            )
+        )
+        args._generate_prefill_cuda_graph_batch_sizes = (
+            lambda max_bs: ServerArgs._generate_prefill_cuda_graph_batch_sizes(
+                args, max_bs
+            )
+        )
+        args._generate_effective_prefill_cuda_graph_batch_sizes = lambda max_bs: ServerArgs._generate_effective_prefill_cuda_graph_batch_sizes(
+            args, max_bs
         )
 
-        ServerArgs._configure_dllm_prefill_cuda_graph_buckets(args)
+        ServerArgs._handle_gpu_memory_settings(args, 48 * 1024)
 
-        self.assertEqual(config.prefill.bs, [128])
+        expected_bs = list(range(32, 4097, 32))
+        final_graph_reserve_mb = ServerArgs.reserve_for_graph_mb(args)
+        self.assertEqual(config.prefill.bs, expected_bs)
+        self.assertEqual(reserved_bucket_snapshots, [expected_bs])
+        self.assertEqual(final_graph_reserve_mb, len(expected_bs) * 8)
+        self.assertEqual(args.mem_fraction_static, 0.841)
 
 
 class TestMultimodalFeatureTransport(CustomTestCase):

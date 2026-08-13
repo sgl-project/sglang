@@ -102,17 +102,6 @@ class DllmConfig:
                 f"{max_prefill_tokens=}, {block_size=}"
             )
 
-        # Read the resolved backend so declaration overrides are visible during
-        # ServerArgs resolution, before they are materialized onto raw fields.
-        from sglang.srt.arg_groups.overrides import attention_backends_of
-
-        prefill_attention_backend, _ = attention_backends_of(server_args)
-        _validate_multi_block_prefill_backend(
-            block_size=block_size,
-            prefill_block_size=prefill_block_size,
-            prefill_attention_backend=prefill_attention_backend,
-        )
-
         return DllmConfig(
             algorithm=server_args.dllm_algorithm,
             algorithm_config=algorithm_config,

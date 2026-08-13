@@ -2931,6 +2931,10 @@ class ServerArgs:
         # Allow OOT platform plugins to apply server args defaults.
         current_platform.apply_server_args_defaults(self)
 
+        # Resolve dLLM CUDA graph compatibility before graph buckets and the
+        # corresponding memory reserve are computed.
+        self._handle_dllm_cuda_graph_compatibility()
+
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
 
@@ -3026,7 +3030,6 @@ class ServerArgs:
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
-        self._configure_dllm_prefill_cuda_graph_buckets()
 
         # Handle crash dump environment variables (must run before CUDA init).
         self._handle_crash_dump_env()
@@ -3999,7 +4002,7 @@ class ServerArgs:
 
         if prefill_cuda_graph_config.bs is None:
             prefill_cuda_graph_config.bs = (
-                self._generate_prefill_cuda_graph_batch_sizes(
+                self._generate_effective_prefill_cuda_graph_batch_sizes(
                     prefill_cuda_graph_config.max_bs
                 )
             )
@@ -4113,6 +4116,23 @@ class ServerArgs:
         if gpu_mem is not None and gpu_mem > 60 * 1024:
             reserved_mem = max(reserved_mem, 10 * 1024)
         return reserved_mem
+
+    def _handle_dllm_cuda_graph_compatibility(self) -> None:
+        """Resolve dLLM graph support before CUDA graph memory sizing."""
+        if self.dllm_algorithm is None or not is_hip():
+            return
+
+        decode_config = self.cuda_graph_config.decode
+        prefill_config = self.cuda_graph_config.prefill
+        if (
+            decode_config.backend == Backend.DISABLED
+            and prefill_config.backend == Backend.DISABLED
+        ):
+            return
+
+        logger.warning("Cuda graph is disabled for diffusion LLM inference on AMD GPUs")
+        decode_config.backend = Backend.DISABLED
+        prefill_config.backend = Backend.DISABLED
 
     def reserve_for_graph_mb(self) -> float:
         decode_cuda_graph_config = self.cuda_graph_config.decode
@@ -4233,6 +4253,68 @@ class ServerArgs:
         capture_sizes = [s for s in capture_sizes if s <= max_bs]
 
         return capture_sizes
+
+    def _generate_dllm_prefill_cuda_graph_batch_sizes(
+        self, max_bs: int
+    ) -> Optional[List[int]]:
+        """Generate exact-token graph buckets for multi-block dLLM prefill.
+
+        Return ``None`` when the generic prefill schedule should be used.
+        Multi-block dLLM prefill cannot pad upward to a captured bucket because
+        doing so changes its bidirectional block-attention and KV-write
+        semantics, so every reachable aligned token total is captured.
+        """
+        if self.dllm_algorithm is None:
+            return None
+        if self.cuda_graph_config.prefill.backend != Backend.BREAKABLE:
+            return None
+
+        from sglang.srt.arg_groups.overrides import (
+            resolve_default_page_size,
+            resolve_dllm_page_size,
+            resolved_view,
+        )
+        from sglang.srt.dllm.config import DllmConfig
+
+        view = resolved_view(self)
+        dllm_config = DllmConfig.from_server_args(view)
+        if dllm_config.prefill_block_size <= dllm_config.block_size:
+            return None
+
+        page_size = resolve_dllm_page_size(
+            page_size=resolve_default_page_size(view),
+            block_size=dllm_config.block_size,
+            disable_radix_cache=view.disable_radix_cache,
+        )
+        alignment = math.lcm(page_size, dllm_config.block_size)
+        max_tokens = dllm_config.prefill_block_size * dllm_config.max_running_requests
+        if self.max_prefill_tokens is not None:
+            max_tokens = min(max_tokens, self.max_prefill_tokens)
+        max_tokens = min(max_tokens, max_bs)
+        max_tokens = max_tokens // alignment * alignment
+
+        capture_bs = (
+            list(range(alignment, max_tokens + 1, alignment)) if max_tokens > 0 else []
+        )
+        logger.info(
+            "Configured %d exact multi-block dLLM prefill CUDA graph buckets: "
+            "alignment=%d, max_tokens=%d",
+            len(capture_bs),
+            alignment,
+            max_tokens,
+        )
+        return capture_bs
+
+    def _generate_effective_prefill_cuda_graph_batch_sizes(
+        self, max_bs: int
+    ) -> List[int]:
+        """Generate the final prefill graph buckets for the serving mode."""
+        dllm_capture_bs = self._generate_dllm_prefill_cuda_graph_batch_sizes(max_bs)
+        return (
+            dllm_capture_bs
+            if dllm_capture_bs is not None
+            else self._generate_prefill_cuda_graph_batch_sizes(max_bs)
+        )
 
     def _set_default_dsa_kv_cache_dtype(self, major: int, quantization: str) -> None:
         # Moved to the resolution pipeline (arg_groups/overrides.py:
@@ -5476,8 +5558,10 @@ class ServerArgs:
             ):
                 prefill_cfg.max_bs = self.chunked_prefill_size
                 if (Phase.PREFILL, "bs") not in self._cuda_graph_config_locked:
-                    prefill_cfg.bs = self._generate_prefill_cuda_graph_batch_sizes(
-                        prefill_cfg.max_bs
+                    prefill_cfg.bs = (
+                        self._generate_effective_prefill_cuda_graph_batch_sizes(
+                            prefill_cfg.max_bs
+                        )
                     )
 
         # The dp-lm-head validation moved to the resolution pipeline
@@ -6739,76 +6823,29 @@ class ServerArgs:
             "--mamba-backend triton."
         )
 
-    def _configure_dllm_prefill_cuda_graph_buckets(self) -> None:
-        """Install exact-token prefill graph buckets for supported dLLM runs.
-
-        Pure dLLM prefill is page/block aligned and the prefill graph runner
-        intentionally rejects padded buckets.  The generic prefill schedule is
-        therefore a poor fit: it can omit a legal dLLM chunk size.  Generate
-        every reachable aligned total instead, while preserving an explicit
-        user-provided bucket list.
-        """
-        if self.dllm_algorithm is None:
-            return
-        if (Phase.PREFILL, "bs") in self._cuda_graph_config_locked:
-            return
-        if self.cuda_graph_config.prefill.backend != Backend.BREAKABLE:
-            return
-
-        # Read declarations before materialization to configure exact dLLM buckets.
-        prefill_backend, _ = self._resolved_attention_backends()
-        if prefill_backend != "flashinfer":
-            return
-
-        from sglang.srt.arg_groups.overrides import resolved_view
-        from sglang.srt.dllm.config import DllmConfig
+    def _validate_dllm_multi_block_prefill_backend(self) -> None:
+        """Validate multi-block dLLM after its attention backend is final."""
+        from sglang.srt.arg_groups.overrides import (
+            attention_backends_of,
+            resolved_view,
+        )
+        from sglang.srt.dllm.config import (
+            DllmConfig,
+            _validate_multi_block_prefill_backend,
+        )
 
         view = resolved_view(self)
         dllm_config = DllmConfig.from_server_args(view)
-        # Use the resolved page size before declarations are materialized.
-        page_size = view.page_size
-        alignment = math.lcm(page_size, dllm_config.block_size)
-        max_tokens = dllm_config.prefill_block_size * dllm_config.max_running_requests
-
-        # PrefillAdder cannot schedule beyond either the per-round prefill
-        # budget or the graph runner's configured prefill ceiling.
-        if self.max_prefill_tokens is not None:
-            max_tokens = min(max_tokens, self.max_prefill_tokens)
-        if self.cuda_graph_config.prefill.max_bs is not None:
-            max_tokens = min(max_tokens, self.cuda_graph_config.prefill.max_bs)
-
-        max_tokens = max_tokens // alignment * alignment
-        if max_tokens <= 0:
-            self.cuda_graph_config.prefill.bs = []
-            return
-
-        self.cuda_graph_config.prefill.bs = list(
-            range(alignment, max_tokens + 1, alignment)
-        )
-        logger.info(
-            "Configured %d exact dLLM prefill CUDA graph buckets: "
-            "alignment=%d, max_tokens=%d",
-            len(self.cuda_graph_config.prefill.bs),
-            alignment,
-            max_tokens,
+        prefill_attention_backend, _ = attention_backends_of(view)
+        _validate_multi_block_prefill_backend(
+            block_size=dllm_config.block_size,
+            prefill_block_size=dllm_config.prefill_block_size,
+            prefill_attention_backend=prefill_attention_backend,
         )
 
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
-        # On AMD/HIP, disable cuda graph for DLLM (the attention_backend
-        # resolution moved to the pipeline: arg_groups/overrides.py
-        # _dllm_attention_backend, invoked below at its legacy slot).
-        if is_hip():
-            if (
-                self.cuda_graph_config.decode.backend != Backend.DISABLED
-                or self.cuda_graph_config.prefill.backend != Backend.DISABLED
-            ):
-                logger.warning(
-                    "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
-                )
-                self.cuda_graph_config.decode.backend = Backend.DISABLED
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         from sglang.srt.arg_groups.overrides import (
             _dllm_attention_backend,
@@ -6817,6 +6854,7 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _dllm_attention_backend)
+        self._validate_dllm_multi_block_prefill_backend()
         run_post_process_pass(self, _dllm_overlap_disable)
 
         # The page-size alignment + block-size cap for dllm moved to the

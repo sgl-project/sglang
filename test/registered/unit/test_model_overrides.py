@@ -521,6 +521,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "SDARForCausalLM",
             "llama",
             dllm_algorithm="LowConfidence",
+            dllm_prefill_block_size=128,
             disable_radix_cache=True,
             attention_backend="triton",
         )
