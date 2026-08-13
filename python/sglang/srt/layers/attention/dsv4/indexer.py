@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -485,9 +486,9 @@ class C4IndexerBackendMixin:
     ) -> bool:
         if not envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.get():
             return False
-        # This path calls CUDA DeepGEMM and assumes the CUDA FP8+FP32 packed
-        # indexer cache layout. Explicitly reject HIP, NPU, and other devices.
-        if not is_cuda() or is_hip():
+        # CUDA uses DeepGEMM (single-request plan); HIP uses aiter fp8_mqa_logits
+        # (batch-aware). Reject platforms that are neither (NPU, XPU, ...).
+        if not is_cuda() and not is_hip():
             return False
         # The gather plan is built from eager, child-local ForwardBatch metadata.
         # Rewritten, TBO-split, and graph-backed batches must use the paged path.
@@ -495,17 +496,24 @@ class C4IndexerBackendMixin:
             forward_batch.forward_mode != ForwardMode.EXTEND
             or forward_batch._original_forward_mode is not None
             or forward_batch.tbo_parent_token_range is not None
-            or forward_batch.batch_size != 1
             or indexer_metadata.use_prefill_cuda_graph
         ):
             return False
-        if (
-            c4_indexer.use_fp4_indexer
-            or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
-            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
-            or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-        ):
+        # FP4 indexer and TileLang use different kernels/layouts on both platforms.
+        if c4_indexer.use_fp4_indexer or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
             return False
+        if not is_hip():
+            # CUDA DeepGEMM non-paged path only supports single-request batches,
+            # and the aiter/torch paged flags select alternate CUDA kernels.
+            if (
+                forward_batch.batch_size != 1
+                or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+                or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            ):
+                return False
+        # On HIP, SGLANG_OPT_USE_AITER_INDEXER / SGLANG_FP8_PAGED_MQA_LOGITS_TORCH
+        # are forced defaults, not user intent to keep the paged kernel, so they
+        # must not gate the (batch-aware) non-paged aiter path.
         if (
             get_parallel().attn_cp_size != 1
             or self.hisparse_coordinator is not None
@@ -630,6 +638,184 @@ class C4IndexerBackendMixin:
             max_seqlen_k=plan.max_seqlen_k,
         )
 
+    @staticmethod
+    def _forward_nonpaged_indexer_hip(
+        *,
+        q_indexer: torch.Tensor,
+        weights: torch.Tensor,
+        c4_indexer: C4Indexer,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        forward_batch: ForwardBatch,
+        page_table: torch.Tensor,
+        c4_seq_lens: torch.Tensor,
+        query_rows: int,
+    ) -> Optional[torch.Tensor]:
+        """Batch-aware non-paged indexer for ROCm/HIP.
+
+        For each request we gather its c4 KV into a contiguous buffer (in
+        page_table order) and run aiter's non-paged fp8_mqa_logits, then scatter
+        the per-request logits (column-0-aligned) into a combined tensor that the
+        existing topk_transform_512 consumes unchanged. Returns None to fall back
+        to the paged path when the batch shape is not a clean EXTEND (e.g. the
+        query tensor carries padding rows).
+        """
+        from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
+
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if extend_seq_lens_cpu is None or seq_lens_cpu is None:
+            return None
+        batch_size = len(extend_seq_lens_cpu)
+        # Padding rows (query_rows > sum of extend lens) can't be handled here.
+        if int(sum(int(x) for x in extend_seq_lens_cpu)) != query_rows:
+            return None
+
+        max_l = max((int(seq_lens_cpu[r]) // 4 for r in range(batch_size)), default=0)
+        if max_l <= 0:
+            return None
+        combined_logits = torch.full(
+            (query_rows, max_l),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_indexer.device,
+        )
+
+        q_offset = 0
+        for r in range(batch_size):
+            q_len_r = int(extend_seq_lens_cpu[r])
+            if q_len_r <= 0:
+                continue
+            final_c4_len_r = int(seq_lens_cpu[r]) // 4
+            q_end = q_offset + q_len_r
+            if final_c4_len_r <= 0:
+                q_offset = q_end
+                continue
+
+            # Gather this request's c4 KV, following its page table order. All
+            # tokens of a request share the same page table row, so use the first.
+            request_page_table_r = page_table[q_offset : q_offset + 1]
+            gather_seq_lens_r = c4_seq_lens[q_end - 1 : q_end]
+            k_u8, scale_u8 = token_to_kv_pool.get_index_k_scale_buffer(
+                layer_id=c4_indexer.layer_id,
+                seq_len_tensor=gather_seq_lens_r,
+                page_indices=request_page_table_r,
+                seq_len_sum=final_c4_len_r,
+                max_seq_len=final_c4_len_r,
+            )
+            k_fp8 = k_u8.view(FP8_DTYPE)
+            k_scale = scale_u8.view(torch.float32).squeeze(-1)
+
+            ke_r = c4_seq_lens[q_offset:q_end].to(torch.int32)
+            ks_r = torch.zeros_like(ke_r)
+
+            logits_r = fp8_mqa_logits(
+                q_indexer[q_offset:q_end],
+                k_fp8,
+                k_scale,
+                weights[q_offset:q_end],
+                ks_r,
+                ke_r,
+                clean_logits=False,
+            )
+            combined_logits[q_offset:q_end, :final_c4_len_r] = logits_r
+            q_offset = q_end
+
+        return combined_logits
+
+    @staticmethod
+    def _forward_nonpaged_indexer_hip_batched(
+        *,
+        q_indexer: torch.Tensor,
+        weights: torch.Tensor,
+        c4_indexer: C4Indexer,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        forward_batch: ForwardBatch,
+        page_table: torch.Tensor,
+        c4_seq_lens: torch.Tensor,
+        query_rows: int,
+    ) -> Optional[torch.Tensor]:
+        """Single-launch batch-aware non-paged indexer for ROCm/HIP.
+
+        Gathers the whole batch's c4 KV into one contiguous buffer (K_all) and
+        runs a single aiter fp8_mqa_logits over it, writing each request's
+        logits column-0-aligned into a combined [query_rows, max_c4_len] tensor
+        that the existing topk_transform_512 consumes unchanged. Returns None to
+        fall back to the per-request path when the batch shape is not a clean
+        EXTEND (e.g. the query tensor carries padding rows).
+        """
+        from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
+
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if extend_seq_lens_cpu is None or seq_lens_cpu is None:
+            return None
+        batch_size = len(extend_seq_lens_cpu)
+        extend_lens = [int(x) for x in extend_seq_lens_cpu]
+        # Padding rows (query_rows > sum of extend lens) can't be handled here.
+        if sum(extend_lens) != query_rows:
+            return None
+
+        device = q_indexer.device
+        per_req_c4 = [int(seq_lens_cpu[r]) // 4 for r in range(batch_size)]
+        max_c4_len = max(per_req_c4, default=0)
+        if max_c4_len <= 0:
+            return None
+        seq_len_sum = sum(per_req_c4)
+
+        # Each request shares one page-table row; pick its first query token's row.
+        q_starts = [0]
+        for length in extend_lens[:-1]:
+            q_starts.append(q_starts[-1] + length)
+        q_starts_t = torch.tensor(q_starts, dtype=torch.long, device=device)
+        req_page_table = page_table.index_select(0, q_starts_t).contiguous()
+
+        per_req_c4_len = torch.tensor(per_req_c4, dtype=torch.int32, device=device)
+
+        # One batched gather: whole-batch c4 KV concatenated in cu_seq_lens order.
+        k_u8, scale_u8 = token_to_kv_pool.get_index_k_scale_buffer(
+            layer_id=c4_indexer.layer_id,
+            seq_len_tensor=per_req_c4_len,
+            page_indices=req_page_table,
+            seq_len_sum=seq_len_sum,
+            max_seq_len=max_c4_len,
+        )
+        k_fp8 = k_u8.view(FP8_DTYPE)
+        k_scale = scale_u8.view(torch.float32).squeeze(-1)
+
+        # Per-request base offset into K_all (exclusive prefix sum).
+        base = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+        torch.cumsum(per_req_c4_len, dim=0, out=base[1:])
+        req_id = torch.repeat_interleave(
+            torch.arange(batch_size, dtype=torch.long, device=device),
+            torch.tensor(extend_lens, dtype=torch.long, device=device),
+        )
+
+        # Per-query-row KV range into K_all (absolute), causal end per token.
+        cu_kv_start = base[:-1].index_select(0, req_id).to(torch.int32).contiguous()
+        cu_kv_end = (
+            cu_kv_start + c4_seq_lens[:query_rows].to(torch.int32)
+        ).contiguous()
+
+        combined_logits = torch.full(
+            (query_rows, max_c4_len),
+            float("-inf"),
+            dtype=torch.float32,
+            device=device,
+        )
+
+        fp8_mqa_logits(
+            q_indexer,
+            k_fp8,
+            k_scale,
+            weights,
+            cu_kv_start,
+            cu_kv_end,
+            clean_logits=False,
+            out=combined_logits,
+            logits_col_zero=True,
+        )
+        return combined_logits
+
     def forward_c4_indexer(
         self,
         x: torch.Tensor,
@@ -745,15 +931,80 @@ class C4IndexerBackendMixin:
         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
         if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
             _c4sl = _c4sl.unsqueeze(-1)
-        nonpaged_plan = self._get_nonpaged_indexer_plan(
-            c4_indexer=c4_indexer,
-            forward_batch=forward_batch,
-            indexer_metadata=indexer_metadata,
-            page_table=page_table,
-            c4_seq_lens=c4_seq_lens,
-            query_rows=query_rows,
-        )
-        if nonpaged_plan is not None:
+        # ROCm/HIP: route pure-prefill (EXTEND) through aiter's non-paged
+        # fp8_mqa_logits (batch-aware). Returns None (fall back to paged) when the
+        # batch shape isn't a clean EXTEND. CUDA path is untouched below.
+        logits = None
+        if (
+            is_hip()
+            and not use_fp4_indexer
+            and self._can_use_nonpaged_indexer(
+                c4_indexer=c4_indexer,
+                forward_batch=forward_batch,
+                indexer_metadata=indexer_metadata,
+            )
+        ):
+            assert isinstance(q_indexer, torch.Tensor)
+            # Single-launch batched path (default on). Falls back to the
+            # per-request loop when the batch shape is unsupported.
+            if os.environ.get("SGLANG_OPT_DSV4_BATCHED_INDEXER", "1") != "0":
+                logits = self._forward_nonpaged_indexer_hip_batched(
+                    q_indexer=q_indexer,
+                    weights=weights,
+                    c4_indexer=c4_indexer,
+                    token_to_kv_pool=token_to_kv_pool,
+                    forward_batch=forward_batch,
+                    page_table=page_table,
+                    c4_seq_lens=c4_seq_lens,
+                    query_rows=query_rows,
+                )
+            if logits is None:
+                logits = self._forward_nonpaged_indexer_hip(
+                    q_indexer=q_indexer,
+                    weights=weights,
+                    c4_indexer=c4_indexer,
+                    token_to_kv_pool=token_to_kv_pool,
+                    forward_batch=forward_batch,
+                    page_table=page_table,
+                    c4_seq_lens=c4_seq_lens,
+                    query_rows=query_rows,
+                )
+            if logits is not None and os.environ.get("SGLANG_DEBUG_NONPAGED_COMPARE"):
+                _kv_dbg = token_to_kv_pool.get_index_k_with_scale_buffer(
+                    layer_id=c4_indexer.layer_id,
+                )
+                _kv_dbg = _kv_dbg.view(_kv_dbg.shape[0], 64, 1, 132)
+                _paged = fn(
+                    q,
+                    _kv_dbg,
+                    weights,
+                    _c4sl,
+                    page_table,
+                    indexer_metadata.deep_gemm_metadata,
+                    indexer_metadata.max_c4_seq_len,
+                    False,
+                )
+                _w = min(logits.shape[1], _paged.shape[1])
+                _mask = (
+                    torch.arange(_w, device=logits.device)[None, :]
+                    < c4_seq_lens[:, None]
+                )
+                _a = torch.where(_mask, logits[:, :_w], 0.0)
+                _b = torch.where(_mask, _paged[:, :_w], 0.0)
+                torch.testing.assert_close(_a, _b, atol=1e-3, rtol=1e-3)
+
+        if logits is not None:
+            pass
+        elif (
+            nonpaged_plan := self._get_nonpaged_indexer_plan(
+                c4_indexer=c4_indexer,
+                forward_batch=forward_batch,
+                indexer_metadata=indexer_metadata,
+                page_table=page_table,
+                c4_seq_lens=c4_seq_lens,
+                query_rows=query_rows,
+            )
+        ) is not None:
             assert isinstance(q_indexer, torch.Tensor)
             logits = self._forward_nonpaged_indexer(
                 q_indexer=q_indexer,
