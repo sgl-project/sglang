@@ -7,9 +7,11 @@ use std::sync::{Arc, Mutex};
 use super::shm::{ShmSegment, shm_name};
 
 /// One parked result: the buffers the drain-time Python adapter needs (the
-/// expanded `input_ids` travel separately, via `TmEvent::MmEncoded`). The qwen
-/// shape (`sglang_mm::qwen_vl::pack_output`); generalizes to a
-/// named-tensor handoff once a family needs a different one.
+/// expanded `input_ids` travel separately, via `TmEvent::MmEncoded`).
+///
+/// TODO(mm-families): these fields are the shape the only current family
+/// (qwen_vl) produces; generalize to a named-tensor handoff when a family
+/// needs a different one.
 ///
 /// Constructed from outside the module only by tests; the worker parks every
 /// real entry itself.
