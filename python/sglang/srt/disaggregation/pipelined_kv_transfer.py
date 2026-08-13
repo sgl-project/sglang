@@ -19,6 +19,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.common import kv_to_page_indices
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
 
@@ -200,8 +201,14 @@ class LayerPipelinedKVTransferAdapter:
     def _get_config_incompatibility_reason(self) -> Optional[str]:
         if not envs.SGLANG_ENABLE_PIPELINED_KV_TRANSFER.get():
             return "SGLANG_ENABLE_PIPELINED_KV_TRANSFER is not enabled"
-        if self.server_args.speculative_algorithm is not None:
-            return "speculative decoding is unsupported"
+        spec_algo_str = self.server_args.speculative_algorithm
+        if spec_algo_str:
+            spec_algo = SpeculativeAlgorithm.from_string(spec_algo_str)
+            if not (spec_algo.is_eagle() or spec_algo.is_dspark()):
+                return (
+                    f"speculative algorithm {spec_algo_str!r} is unsupported "
+                    "(only EAGLE family and DSPARK support pipelined KV transfer)"
+                )
         if (
             self.ps.attn_dp_size > 1
             and self.server_args.cuda_graph_config.prefill.backend != Backend.DISABLED

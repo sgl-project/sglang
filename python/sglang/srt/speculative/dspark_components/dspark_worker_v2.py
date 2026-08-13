@@ -13,6 +13,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardBatch,
     compute_position,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
@@ -399,6 +400,45 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
 
+    def forward_batch_generation_split_prefill_init(
+        self, batch: ScheduleBatch
+    ) -> ForwardBatch:
+        if getattr(batch, "return_logprob", False):
+            raise ValueError(
+                "DSpark speculative decoding does not support return_logprob yet."
+            )
+        self._verify_planner.note_non_decode_step()
+        self._observers.note_prefill_step()
+        return self.target_worker.forward_batch_generation_split_prefill_init(
+            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+        )
+
+    def forward_batch_generation_split_prefill(
+        self, forward_batch: ForwardBatch, forward_count: int = 1
+    ) -> tuple:
+        return self.target_worker.forward_batch_generation_split_prefill(
+            forward_batch, forward_count
+        )
+
+    def forward_batch_generation_split_prefill_finalize(
+        self,
+        batch: ScheduleBatch,
+        logits_output,
+        forward_batch: ForwardBatch,
+        defer_sample: bool = False,
+        on_publish=None,
+    ) -> GenerationBatchResult:
+        # DSpark KV injection consumes target tokens, so sampling cannot be deferred.
+        batch_output = (
+            self.target_worker.forward_batch_generation_split_prefill_finalize(
+                batch,
+                logits_output,
+                forward_batch,
+                defer_sample=False,
+            )
+        )
+        return self._finalize_prefill(batch, batch_output, on_publish)
+
     def _forward_prefill(
         self, batch: ScheduleBatch, on_publish
     ) -> GenerationBatchResult:
@@ -412,6 +452,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch_output = self.target_worker.forward_batch_generation(
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
+        return self._finalize_prefill(batch, batch_output, on_publish)
+
+    def _finalize_prefill(
+        self,
+        batch: ScheduleBatch,
+        batch_output: GenerationBatchResult,
+        on_publish,
+    ) -> GenerationBatchResult:
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         batch_output.new_seq_lens = batch.seq_lens

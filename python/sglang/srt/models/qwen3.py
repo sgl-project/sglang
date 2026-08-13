@@ -560,8 +560,18 @@ class Qwen3ForCausalLM(nn.Module):
                 forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
                 forward_batch.hidden_states = input_embeds
+            forward_batch.model_specific_states = {"qwen3_aux_hidden_states": []}
+        aux_hidden_states = forward_batch.model_specific_states[
+            "qwen3_aux_hidden_states"
+        ]
         # decoder layer
         for i in range(start, end):
+            if i in self.model.layers_to_capture:
+                aux_hidden_states.append(
+                    forward_batch.hidden_states + forward_batch.residual
+                    if forward_batch.residual is not None
+                    else forward_batch.hidden_states
+                )
             layer = self.model.layers[i]
             forward_batch.hidden_states, forward_batch.residual = layer(
                 positions,
@@ -578,8 +588,13 @@ class Qwen3ForCausalLM(nn.Module):
             forward_batch.hidden_states = hidden_states
             # logits process
             result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+                input_ids,
+                forward_batch.hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states if self.capture_aux_hidden_states else None,
             )
+            forward_batch.model_specific_states = None
         else:
             result = None
 

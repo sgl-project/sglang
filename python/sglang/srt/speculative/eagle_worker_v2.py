@@ -1100,6 +1100,73 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                 )
 
+    def forward_batch_generation_split_prefill_init(
+        self, batch: ScheduleBatch
+    ) -> ForwardBatch:
+        capture_hidden_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+        return self.target_worker.forward_batch_generation_split_prefill_init(
+            batch, capture_hidden_mode=capture_hidden_mode
+        )
+
+    def forward_batch_generation_split_prefill(
+        self, forward_batch: ForwardBatch, forward_count: int = 1
+    ) -> tuple:
+        return self.target_worker.forward_batch_generation_split_prefill(
+            forward_batch, forward_count
+        )
+
+    def forward_batch_generation_split_prefill_finalize(
+        self,
+        batch: ScheduleBatch,
+        logits_output,
+        forward_batch: ForwardBatch,
+        defer_sample: bool = False,
+        on_publish=None,
+    ) -> GenerationBatchResult:
+        # Draft extend consumes target tokens, so target sampling cannot be deferred.
+        batch_output = (
+            self.target_worker.forward_batch_generation_split_prefill_finalize(
+                batch,
+                logits_output,
+                forward_batch,
+                defer_sample=False,
+            )
+        )
+        return self._forward_draft_extend_for_prefill(
+            batch, batch_output, on_publish=on_publish
+        )
+
+    def _forward_draft_extend_for_prefill(
+        self,
+        batch: ScheduleBatch,
+        batch_output: GenerationBatchResult,
+        on_publish=None,
+    ) -> GenerationBatchResult:
+        # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
+        # Extend processed L prompt tokens; next verify iter expects same L.
+        batch_output.new_seq_lens = batch.seq_lens
+        # Publish before draft_extend so the fence is at target-end.
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+
+        with (
+            self.draft_worker.draft_tp_context(self.draft_worker.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft_extend"),
+        ):
+            batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
+                batch,
+                batch_output.logits_output.hidden_states,
+                batch_output.next_token_ids,
+                batch_output.logits_output.mm_input_embeds,
+            )
+        return batch_output
+
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
     ):
@@ -1113,32 +1180,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch_output = self.target_worker.forward_batch_generation(
                 batch, capture_hidden_mode=target_capture_mode
             )
-
-            # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
-            # Extend processed L prompt tokens; next verify iter expects same L.
-            batch_output.new_seq_lens = batch.seq_lens
-            # Publish before draft_extend so the fence is at target-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
-
-            # Draft prefill
-            with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
-                ),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-                spec_stage_span("draft_extend"),
-            ):
-                batch_output.next_draft_input = (
-                    self.draft_worker._draft_extend_for_prefill(
-                        batch,
-                        batch_output.logits_output.hidden_states,
-                        batch_output.next_token_ids,
-                        batch_output.logits_output.mm_input_embeds,
-                    )
-                )
-                return batch_output
+            return self._forward_draft_extend_for_prefill(
+                batch, batch_output, on_publish=on_publish
+            )
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 
