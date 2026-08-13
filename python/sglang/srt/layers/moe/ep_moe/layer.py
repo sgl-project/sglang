@@ -259,20 +259,34 @@ class DeepEPMoE(FusedMoE):
                 topk_output,
             )
 
+        static_scale = self._get_normal_dispatch_static_scale()
         dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+            static_scale=static_scale,
         )
         combine_input = self.run_moe_core(dispatch_output)
         return self.dispatcher.combine(combine_input=combine_input)
+
+    def _get_normal_dispatch_static_scale(self) -> Optional[torch.Tensor]:
+        if (
+            get_moe_a2a_backend().is_deepep()
+            and getattr(self, "use_w4afp8", False)
+            and getattr(self, "w13_input_scale", None) is not None
+        ):
+            return self.w13_input_scale.float()
+        return None
 
     def dispatch(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
+        static_scale = self._get_normal_dispatch_static_scale()
         return self.dispatcher.dispatch(
             hidden_states=hidden_states,
             topk_output=topk_output,
+            static_scale=static_scale,
         )
 
     def run_moe_core(

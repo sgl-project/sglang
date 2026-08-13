@@ -1102,10 +1102,16 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):
         return getattr(self._inners[tbo_subbatch_index or 0], name)(**kwargs)
 
-    def dispatch(self, **kwargs) -> DispatchOutput:
+    def dispatch(
+        self, static_scale: Optional[torch.Tensor] = None, **kwargs
+    ) -> DispatchOutput:
+        if static_scale is not None:
+            kwargs["static_scale"] = static_scale
         return self._execute("dispatch", **kwargs)
 
-    def dispatch_a(self, **kwargs):
+    def dispatch_a(self, static_scale: Optional[torch.Tensor] = None, **kwargs):
+        if static_scale is not None:
+            kwargs["static_scale"] = static_scale
         return self._execute("dispatch_a", **kwargs)
 
     def dispatch_b(self, **kwargs):
