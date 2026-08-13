@@ -882,7 +882,7 @@ def compute_swa_request_cap(
 
     if max_running_requests is None:
         max_running_requests = get_schedule().max_running_requests
-    num_reqs = max_running_requests // attn_dp_size
+    num_reqs = max(1, max_running_requests // attn_dp_size)
     if get_disagg().disaggregation_mode == "decode":
         return (
             per_request * num_reqs
@@ -1066,7 +1066,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
         self.attn_dp_size = kvc.attn_dp_size
         self.requested_max_running_requests_per_worker = (
-            get_schedule().max_running_requests // kvc.attn_dp_size
+            max(1, get_schedule().max_running_requests // kvc.attn_dp_size)
             if get_schedule().max_running_requests is not None
             else None
         )
