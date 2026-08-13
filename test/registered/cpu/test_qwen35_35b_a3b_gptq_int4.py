@@ -47,7 +47,6 @@ class TestQwen35_35BXeon(unittest.TestCase):
                 batch_sizes=[16],
                 input_lens=(1024,),
                 output_lens=(1024,),
-                enable_profile=False,
                 baseline_output_throughput=350.0,
             ),
             share_server=True,

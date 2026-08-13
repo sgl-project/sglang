@@ -47,7 +47,6 @@ class TestLlama31_8BW8A8Xeon(unittest.TestCase):
                 batch_sizes=[16],
                 input_lens=(1024,),
                 output_lens=(1024,),
-                enable_profile=False,
                 baseline_output_throughput=300.0,
             ),
             share_server=True,

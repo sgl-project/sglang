@@ -146,7 +146,6 @@ def run_combined_tests(
                     is_vlm=is_vlm,
                     dataset_name=performance_params.dataset_name,
                     spec_accept_length_threshold=performance_params.spec_accept_length_threshold,
-                    enable_profile=performance_params.enable_profile,
                     skip_server_launch=share_server,
                     baseline_output_throughput=performance_params.baseline_output_throughput,
                 )
