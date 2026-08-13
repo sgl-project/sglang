@@ -659,7 +659,12 @@ class MultimodalInputs:
                 try_add_to_buffer,
             )
 
-            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+            if is_npu():
+                device = torch.npu.current_device()
+            elif torch.cuda.is_available():
+                device = torch.cuda.current_device()
+            else:
+                device = "cpu"
             if not is_feature_buffer_initialized():
                 init_feature_buffer(device)
             reset_buffer_offset()

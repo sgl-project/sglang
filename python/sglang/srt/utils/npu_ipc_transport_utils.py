@@ -229,6 +229,22 @@ class MmItemMemoryPool:
 
         return sync_flag, available_slice, byte_offset
 
+    def wrap_tensor(
+        self, tensor: torch.Tensor, *, use_pool_handle_cache: bool
+    ):
+        sync_flag, available_slice, byte_offset = self.return_a_slice_tensor_with_flag(tensor)
+        if isinstance(available_slice, torch.Tensor):
+            available_slice.copy_(tensor.view(torch.int8).view(-1), non_blocking=True)
+            return NpuIpcTensorTransportProxy(
+                data=available_slice,
+                info_data=tensor,
+                sync_buffer_meta=sync_flag,
+                pool_ipc_handle=self._pool_ipc_handle if use_pool_handle_cache else None,
+                pool_byte_offset=byte_offset,
+                pool_device_index=self._pool_device_index,
+            )
+        return None
+
     def reclaim_chunk(self, chunk: MmItemMemoryChunk):
         self.occupied_chunks.remove(chunk)
         self.available_chunks.append(chunk)
@@ -435,7 +451,7 @@ class NpuIpcTensorTransportProxy:
             recons_shape, dtype=recons_dtype, device=target_device
         )
         start = 0
-        for _ in range(consumer_count):
+        for i in range(consumer_count):
             end = start + slice_tensor.numel()
             reconstructed_tensor.view(torch.int8).view(-1)[start:end] = (
                 slice_tensor.view(torch.int8).view(-1)
@@ -449,7 +465,6 @@ class NpuIpcTensorTransportProxy:
             isinstance(self.reconstruct_tensor, torch.Tensor)
             and self.reconstruct_tensor.device == rebuild_device
         ):
-            logger.info(f"[NPU IPC] Reconstruct: using cached tensor on {rebuild_device}")
             return self.reconstruct_tensor
 
         if self.proxy_state["ipc_extra"]:

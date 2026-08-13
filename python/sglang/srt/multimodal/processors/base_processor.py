@@ -30,6 +30,10 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     MmItemMemoryPool as CudaMmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
 )
+from sglang.srt.utils.npu_ipc_transport_utils import (
+    MmItemMemoryPool as NpuMmItemMemoryPool,
+    NpuIpcTensorTransportProxy,
+)
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     envs,
@@ -414,7 +418,6 @@ class BaseMultimodalProcessor(ABC):
                     per_worker_pool_size,
                     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
                     self.server_args.base_gpu_id,
-                    self.server_args.tp_size,
                 )
             else:
                 self.cudaipc_mmfeature_pool = CudaMmItemMemoryPool(
@@ -1461,8 +1464,8 @@ class BaseMultimodalProcessor(ABC):
         return torch.tensor(input_ids, dtype=torch.long).flatten()
 
     def _wrap_tensor_for_cuda_ipc(self, tensor: torch.Tensor):
-        """helper function to turn a tensor into a cuda-ipc tensor"""
-        if not tensor.is_cuda:
+        """helper function to turn a tensor into a cuda-ipc or npu-ipc tensor"""
+        if not tensor.is_cuda and not tensor.is_npu:
             return tensor
 
         proxy = self.cudaipc_mmfeature_pool.wrap_tensor(
