@@ -1,4 +1,5 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -70,7 +71,13 @@ class TestLMHeadFP32(unittest.TestCase):
         expected_a_dtype,
         expected_b_dtype,
         expected_operation,
+        force_support=None,
     ):
+        # force_support pins what the capability probe reports, so both
+        # branches of the selection are covered on every runner instead of
+        # only the one this host happens to support. The intercepted op is
+        # then emulated rather than executed, since a host that reports no
+        # support would raise on the real call.
         device = get_device()
         BATCH_SIZE, HIDDEN_SIZE, VOCAB_SIZE = 2, 64, 128
         hidden_state = torch.randn(
@@ -104,13 +111,20 @@ class TestLMHeadFP32(unittest.TestCase):
             return original_matmul(a, b, *args, **kw)
 
         def probe_mm(a, b, *args, **kw):
-            if not state["called"]:
+            first = not state["called"]
+            if first:
                 state.update(
                     called=True,
                     operation="mm",
                     a=a.dtype,
                     b=b.dtype,
                     out_dtype=kw.get("out_dtype"),
+                )
+            if first and force_support is not None:
+                # Do not issue the real GEMM: this branch is under test
+                # precisely on hosts that cannot run it.
+                return torch.zeros(
+                    a.shape[0], b.shape[1], dtype=kw["out_dtype"], device=a.device
                 )
             return original_mm(a, b, *args, **kw)
 
@@ -119,7 +133,17 @@ class TestLMHeadFP32(unittest.TestCase):
                 state.update(called=True, ooperationp="linear", a=x.dtype, b=w.dtype)
             return original_linear(x, w, bias)
 
+        support_patch = (
+            patch(
+                "sglang.srt.layers.logits_processor._supports_mm_fp32_out_dtype",
+                new=lambda *a, **kw: force_support,
+            )
+            if force_support is not None
+            else nullcontext()
+        )
+
         with (
+            support_patch,
             patch("torch.matmul", new=probe_matmul),
             patch("torch.mm", new=probe_mm),
             patch("torch.nn.functional.linear", new=probe_linear),
@@ -162,6 +186,22 @@ class TestLMHeadFP32(unittest.TestCase):
             expected_dtype,
             expected_operation,
         )
+
+    def test_probe_supported_selects_mm(self):
+        # Runs the same on every runner, including hosts whose BLAS backend
+        # cannot execute mm(out_dtype=fp32).
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                self._run_case(dtype, True, dtype, dtype, dtype, "mm", True)
+
+    def test_probe_unsupported_falls_back_to_explicit_fp32_matmul(self):
+        # The regression guard: an unsupported backend must take the explicit
+        # FP32 cast instead of raising. Covered on NVIDIA runners too.
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                self._run_case(
+                    dtype, True, dtype, torch.float32, torch.float32, "matmul", False
+                )
 
     def test_flag_true_fp32_falls_back_to_explicit_fp32_matmul(self):
         self._run_case(

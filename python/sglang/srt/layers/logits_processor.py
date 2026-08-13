@@ -76,19 +76,46 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
 def _supports_mm_fp32_out_dtype(device_type: str, dtype: torch.dtype) -> bool:
     """Whether ``torch.mm(..., out_dtype=torch.float32)`` works for ``dtype``.
 
-    Not every backend implements the mixed input/output GEMM: on ROCm the
-    non-hipBLASLt paths (e.g. the Composable Kernel BLAS backend used by some
-    AMD CI images) raise
-    ``gemm input type at::BFloat16 and output type float is not supported``.
-    Probe once per (device, dtype) with a tiny GEMM and fall back to the
-    explicit FP32 cast when unsupported.
+    The mixed input/output GEMM is not universally available on ROCm, for two
+    different reasons depending on the torch build:
+
+    * torch source older than pytorch#161540 (2025-09-02) rejects
+      ``gemm<BFloat16, float>`` and ``gemm<Half, float>`` unconditionally under
+      ``#ifdef USE_ROCM``, before any backend dispatch. This is what the
+      ``rocm700`` CI images hit -- they pin a 2025-08-04 torch.
+    * Newer builds reject only under the Composable Kernel BLAS backend, which
+      has to be selected explicitly via
+      ``torch.backends.cuda.preferred_blas_library("ck")``.
+
+    Rather than enumerate those, probe once per (device, dtype) with a tiny
+    GEMM and fall back to the explicit FP32 cast when unsupported.
+
+    Note this covers ``mm`` only. ``gemm_and_bias`` still rejects FP32 output
+    unconditionally on ROCm as of torch 2.9.1, so a bias-fused
+    ``addmm(out_dtype=fp32)`` would need its own probe.
     """
     try:
         probe = torch.zeros(1, 1, dtype=dtype, device=device_type)
         torch.mm(probe, probe, out_dtype=torch.float32)
-        return True
-    except (RuntimeError, TypeError):
+    except torch.OutOfMemoryError:
+        # Not a capability signal, and lru_cache would pin the false negative
+        # for the lifetime of the process.
+        raise
+    except (RuntimeError, TypeError) as e:
+        logger.info(
+            "FP32 LM head: torch.mm(out_dtype=torch.float32) unavailable for "
+            "%s on %s (%s); using the explicit FP32 cast instead.",
+            dtype,
+            device_type,
+            e,
+        )
         return False
+    logger.debug(
+        "FP32 LM head: using torch.mm(out_dtype=torch.float32) for %s on %s.",
+        dtype,
+        device_type,
+    )
+    return True
 
 
 # None outside a FlashInfer autotune pass; inside one, whether that pass runs the
