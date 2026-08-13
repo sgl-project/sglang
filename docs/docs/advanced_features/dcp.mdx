@@ -135,7 +135,7 @@ Normally each layer all-gathers its absorbed and rotary query components. `--dcp
 | `a2a`, replicated Q | One packed NCCL A2A | Canonical low-latency path |
 | `fi_a2a`, replicated Q | One FlashInfer MNNVL A2A | Requires CUDA, SM90+, and MNNVL fabric |
 
-Kimi K3 enables replicated Q by default and picks `fi_a2a` on MNNVL systems, otherwise `a2a`. Its decode backend is `cutedsl_mla` or `tokenspeed_mla`. The generic defaults remain `ag_rs` and model-resolved query replication.
+Kimi K3 enables replicated Q by default and picks `fi_a2a` on MNNVL systems, otherwise `a2a`. Its decode backend is `cutedsl_mla`. The generic defaults remain `ag_rs` and model-resolved query replication.
 
 DCP adds a context-independent decode collective while cutting context-dependent KV storage and reads by about `c`. Extend is outside that decode cost model: it may gather cached prefix shards, restore token order, and append new tokens, and that work grows with prefix length.
 
@@ -145,13 +145,13 @@ DCP adds a context-independent decode collective while cutting context-dependent
 
 The draft KV cache is replicated: every DCP rank stores the full draft context. DCP only stripes the target MLA KV, so it saves target cache, not draft cache.
 
-Target verify and decode use the DCP-aware MLA kernels `cutedsl_mla` (FlashInfer cute-dsl) and `tokenspeed_mla` (TokenSpeed). Both:
+Target verify and decode use the DCP-aware MLA kernel `cutedsl_mla`. It:
 
-1. Build a rank-local page table from the cyclic token map (`owner(p) = p mod c`).
-2. Run attention against that shard, passing `cp_world`, `cp_rank`, and the global KV lengths so causality still sees the full sequence.
-3. Return a rank-local `(output, LSE)` that the usual DCP all-to-all merge combines.
+1. Builds a rank-local page table from the cyclic token map (`owner(p) = p mod c`).
+2. Runs attention against that shard, passing `cp_world`, `cp_rank`, and the global KV lengths so causality still sees the full sequence.
+3. Returns a rank-local `(output, LSE)` that the usual DCP all-to-all merge combines.
 
-Draft steps use the same backends against the replicated draft cache, so they skip DCP metadata. Kimi K3 DCP selects `cutedsl_mla` or `tokenspeed_mla` automatically.
+Draft steps use the same backend against the replicated draft cache, so they skip DCP metadata. Kimi K3 DCP selects `cutedsl_mla` automatically.
 
 ### DCP × PD disaggregation
 
@@ -175,5 +175,6 @@ The current scope is MLA L1/L2. L3, LMCache, HiSparse, non-MLA KV host pools, sp
 
 ## References
 
+- [DCP and Helix Parallelism roadmap](https://github.com/sgl-project/sglang/issues/29736)
 - [SGLang and Miles Add Day-0 Support for Kimi K3](https://www.lmsys.org/blog/2026-07-27-kimi-k3-day0-support#decode-context-parallelism)
 - [Original SGLang DCP design](https://docs.google.com/document/d/1pjBSID0palpuI7rx8Ck7Z0BcyzBXAgnkDrf9uQg0uqU/edit?tab=t.0)
