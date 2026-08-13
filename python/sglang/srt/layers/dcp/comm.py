@@ -30,6 +30,7 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     _lse_pack_dim,
     correct_attn_out,
     dcp_lse_combine_triton,
+    dcp_pack_a2a_send,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -476,34 +477,10 @@ def dcp_a2a_lse_reduce(
     out_dtype = cp_attn_out.dtype
     lpd = _lse_pack_dim(out_dtype)  # 2 for bf16/fp16
 
-    # Reshape [B, H, D] -> [N, B, H/N, D] — split heads across ranks
-    reshaped_out = cp_attn_out.view(B, N, H_per_rank, D).permute(1, 0, 2, 3)
-    reshaped_lse = cp_attn_lse.view(B, N, H_per_rank).permute(1, 0, 2)
-
     if cuda_graph_buffers is not None:
-        # CUDA graph path with pre-allocated fused buffers.
         send_combined = cuda_graph_buffers["send_combined"]
         recv_combined = cuda_graph_buffers["recv_combined"]
-        send_lse_stg = cuda_graph_buffers["send_lse"]
-        recv_lse_stg = cuda_graph_buffers["recv_lse"]
-
-        send_combined[:, :B, :, :D].copy_(reshaped_out)
-        send_lse_stg[:, :B, :].copy_(reshaped_lse)
-        send_combined[:, :, :, D:].copy_(
-            send_lse_stg.view(out_dtype).view(N, -1, H_per_rank, lpd)
-        )
-
-        cp_group.all_to_all_single(
-            recv_combined.reshape(-1).view(torch.uint8),
-            send_combined.reshape(-1).view(torch.uint8),
-        )
-        recv_output = recv_combined[:, :B, :, :D]
-        recv_lse_stg.view(out_dtype).view(N, -1, H_per_rank, lpd).copy_(
-            recv_combined[:, :, :, D:]
-        )
-        recv_lse = recv_lse_stg[:, :B, :]
     else:
-        send_lse_contig = reshaped_lse.contiguous()  # [N, B, H_per_rank] fp32
         send_combined = torch.empty(
             N,
             B,
@@ -514,30 +491,17 @@ def dcp_a2a_lse_reduce(
         )
         recv_combined = torch.empty_like(send_combined)
 
-        send_combined[:, :, :, :D].copy_(reshaped_out)
-        send_combined[:, :, :, D:].copy_(
-            send_lse_contig.view(out_dtype).view(N, B, H_per_rank, lpd)
-        )
+    dcp_pack_a2a_send(cp_attn_out, cp_attn_lse, send_combined)
 
-        # Transport as raw bytes (uint8): the output may be fp8 (fp8 KV cache),
-        # which pynccl's dtype enum can't send; byte a2a is exact for equal chunks.
-        cp_group.all_to_all_single(
-            recv_combined.reshape(-1).view(torch.uint8),
-            send_combined.reshape(-1).view(torch.uint8),
-        )
+    # Transport as raw bytes (uint8): the output may be fp8 (fp8 KV cache),
+    # which pynccl's dtype enum can't send; byte a2a is exact for equal chunks.
+    cp_group.all_to_all_single(
+        recv_combined.reshape(-1).view(torch.uint8),
+        send_combined.reshape(-1).view(torch.uint8),
+    )
 
-        recv_output = recv_combined[:, :, :, :D]
-        recv_lse_stg = torch.empty(
-            N,
-            B,
-            H_per_rank,
-            dtype=torch.float32,
-            device=cp_attn_out.device,
-        )
-        recv_lse_stg.view(out_dtype).view(N, B, H_per_rank, lpd).copy_(
-            recv_combined[:, :, :, D:]
-        )
-        recv_lse = recv_lse_stg
+    recv_output = recv_combined[:, :B, :, :D]
+    recv_lse = recv_combined.view(torch.float32)[:, :B, :, D // lpd]
 
     combined, _ = dcp_lse_combine_triton(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
