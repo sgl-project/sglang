@@ -110,6 +110,8 @@ class RequestFuncOutput:
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
+    spec_verify_ct: int = 0
+    spec_completion_tokens: int = 0
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
     spec_cap_lens_histogram: List[int] = field(default_factory=list)
@@ -119,6 +121,27 @@ class RequestFuncOutput:
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
         return output
+
+
+def _extract_spec_metrics(meta_info: Dict[str, Any], output: RequestFuncOutput) -> None:
+    """Copy per-request speculative counters from response metadata."""
+    verify_ct = meta_info.get("spec_verify_ct")
+    completion_tokens = meta_info.get("spec_completion_tokens")
+    if completion_tokens is None:
+        completion_tokens = meta_info.get("completion_tokens")
+
+    if verify_ct is not None and completion_tokens is not None:
+        output.spec_verify_ct = int(verify_ct)
+        output.spec_completion_tokens = int(completion_tokens)
+
+    if meta_info.get("spec_accept_length") is not None:
+        output.spec_accept_length = float(meta_info["spec_accept_length"])
+
+
+def _extract_spec_metrics_from_sglext(
+    response_json: Dict[str, Any], output: RequestFuncOutput
+) -> None:
+    _extract_spec_metrics(response_json.get("sglext") or {}, output)
 
 
 def get_auth_headers() -> Dict[str, str]:
@@ -327,13 +350,19 @@ async def async_request_openai_completions(
                         else:
                             data = json.loads(chunk)
 
+                            _extract_spec_metrics_from_sglext(data, output)
+
                             if getattr(args, "cache_report", False):
                                 _extract_cache_from_sglext(data, output)
+
+                            choices = data.get("choices") or []
+                            if not choices:
+                                continue
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            if choices[0]["text"]:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -343,12 +372,12 @@ async def async_request_openai_completions(
                                 # Decoding phase
                                 else:
                                     output.text_chunks.append(
-                                        data["choices"][0]["text"]
+                                        choices[0]["text"]
                                     )
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
+                                generated_text += choices[0]["text"]
                                 output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
@@ -484,9 +513,8 @@ async def async_request_openai_chat_completions(
                             "completion_tokens", output_len
                         )
                         _meta_info = response_json["choices"][0].get("meta_info") or {}
-                        output.spec_accept_length = (
-                            _meta_info.get("spec_accept_length", 0.0) or 0.0
-                        )
+                        _extract_spec_metrics(_meta_info, output)
+                        _extract_spec_metrics_from_sglext(response_json, output)
                         output.spec_cap_length = (
                             _meta_info.get("spec_cap_length", 0.0) or 0.0
                         )
@@ -511,6 +539,7 @@ async def async_request_openai_chat_completions(
                                 pass
                             else:
                                 data = json.loads(chunk)
+                                _extract_spec_metrics_from_sglext(data, output)
                                 # Check for usage info in final chunks. OpenAI-compatible
                                 # servers may emit usage-only chunks with choices=[].
                                 output_len = (data.get("usage") or {}).get(
@@ -725,10 +754,7 @@ async def async_request_sglang_generate(
                             data = orjson.loads(sse_data)
 
                             _meta_info = data.get("meta_info") or {}
-                            if _meta_info.get("spec_accept_length") is not None:
-                                output.spec_accept_length = _meta_info[
-                                    "spec_accept_length"
-                                ]
+                            _extract_spec_metrics(_meta_info, output)
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
@@ -993,6 +1019,68 @@ def flush_server_cache(
     else:
         response = requests.post(base_url + "/flush_cache", headers=get_auth_headers())
     response.raise_for_status()
+
+
+def _get_decode_server_info(
+    server_info: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return the decode worker view from direct or PD-wrapped server info."""
+    if not isinstance(server_info, dict):
+        return None
+
+    decode_info = server_info.get("decode")
+    if isinstance(decode_info, list) and decode_info:
+        return decode_info[0] if isinstance(decode_info[0], dict) else None
+    if isinstance(decode_info, dict):
+        return decode_info
+    return server_info
+
+
+def _get_decode_dp_size(server_info: Optional[Dict[str, Any]]) -> int:
+    decode_info = _get_decode_server_info(server_info)
+    if decode_info is None:
+        return 0
+    try:
+        return int(decode_info.get("dp_size", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _resolve_accept_length(
+    server_info: Optional[Dict[str, Any]],
+    outputs: List[RequestFuncOutput],
+) -> Tuple[Optional[float], str]:
+    """Resolve accept length without mixing DP benchmark runs.
+
+    A decode service with dp_size > 1 uses only per-request counters returned
+    by this benchmark. Other deployments retain the historical /server_info
+    behavior.
+    """
+    decode_info = _get_decode_server_info(server_info)
+    if decode_info is None:
+        return None, "unavailable"
+
+    decode_dp_size = _get_decode_dp_size(server_info)
+
+    if decode_dp_size > 1:
+        total_completion_tokens = 0
+        total_verify_ct = 0
+        for output in outputs:
+            if not output.success or output.spec_verify_ct <= 0:
+                continue
+            total_completion_tokens += output.spec_completion_tokens
+            total_verify_ct += output.spec_verify_ct
+
+        if total_verify_ct > 0:
+            return total_completion_tokens / total_verify_ct, "per_request"
+        return None, "unavailable"
+
+    internal_states = decode_info.get("internal_states")
+    if isinstance(internal_states, list) and internal_states:
+        accept_length = internal_states[0].get("avg_spec_accept_length")
+        if accept_length is not None:
+            return float(accept_length), "server_info"
+    return None, "unavailable"
 
 
 @dataclass
@@ -1578,27 +1666,25 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
+    server_info_json = None
     if "sglang" in backend:
-        server_info = requests.get(
+        server_info_response = requests.get(
             base_url + "/server_info", headers=get_auth_headers()
         )
-        if server_info.status_code == 200:
-            server_info_json = server_info.json()
-            if "decode" in server_info_json:
-                server_info_json = server_info_json["decode"][0]
-            if (
-                "internal_states" in server_info_json
-                and server_info_json["internal_states"]
-            ):
-                accept_length = server_info_json["internal_states"][0].get(
-                    "avg_spec_accept_length", None
-                )
-            else:
-                accept_length = None
-        else:
-            accept_length = None
-    else:
-        accept_length = None
+        if server_info_response.status_code == 200:
+            server_info_json = server_info_response.json()
+
+    accept_length, accept_length_source = _resolve_accept_length(
+        server_info_json, outputs
+    )
+    if (
+        accept_length_source == "unavailable"
+        and _get_decode_dp_size(server_info_json) > 1
+    ):
+        print(
+            "Warning: Decode dp_size > 1, but this benchmark received no "
+            "per-request speculative counters; Accept length is unavailable."
+        )
 
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
@@ -1776,8 +1862,11 @@ async def benchmark(
                 print("{:<40} {:.1f}%".format(label, storage_pct))
     print("=" * 50)
 
-    resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
-    server_info = resp.json() if resp.status_code == 200 else None
+    if server_info_json is None:
+        resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
+        server_info = resp.json() if resp.status_code == 200 else None
+    else:
+        server_info = server_info_json
 
     if (
         metrics.median_ttft_ms is not None
@@ -1835,6 +1924,7 @@ async def benchmark(
             "p99_itl_ms": metrics.p99_itl_ms,
             "concurrency": metrics.concurrency,
             "accept_length": accept_length,
+            "accept_length_source": accept_length_source,
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
@@ -1874,6 +1964,10 @@ async def benchmark(
     result_details = {
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": output_lens,
+        "spec_verify_cts": [output.spec_verify_ct for output in outputs],
+        "spec_completion_tokens": [
+            output.spec_completion_tokens for output in outputs
+        ],
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],

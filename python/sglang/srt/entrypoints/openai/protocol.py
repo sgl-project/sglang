@@ -418,6 +418,8 @@ class SglExt(BaseModel):
 
     routed_experts: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
+    spec_verify_ct: Optional[int] = None
+    spec_completion_tokens: Optional[int] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):

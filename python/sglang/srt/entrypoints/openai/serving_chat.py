@@ -1501,6 +1501,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_tokens = {}
         reasoning_tokens = {}
         completion_tokens = {}
+        spec_verify_ct = {}
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
@@ -1527,6 +1528,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 completion_tokens[index] = content["meta_info"].get(
                     "completion_tokens", 0
                 )
+                if content["meta_info"].get("spec_verify_ct") is not None:
+                    spec_verify_ct[index] = content["meta_info"]["spec_verify_ct"]
                 reasoning_tokens[index] = content["meta_info"].get(
                     "reasoning_tokens", 0
                 )
@@ -1664,7 +1667,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 if first_details is not None:
                     sglext_details = cached_tokens_details_from_dict(first_details)
 
-            if sglext_routed is not None or sglext_details is not None:
+            total_spec_verify_ct = sum(spec_verify_ct.values())
+            total_spec_completion_tokens = sum(
+                completion_tokens[index] for index in spec_verify_ct
+            )
+            if (
+                sglext_routed is not None
+                or sglext_details is not None
+                or total_spec_verify_ct > 0
+            ):
                 sglext_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
@@ -1673,6 +1684,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     sglext=SglExt(
                         routed_experts=sglext_routed,
                         cached_tokens_details=sglext_details,
+                        spec_verify_ct=(
+                            total_spec_verify_ct if total_spec_verify_ct > 0 else None
+                        ),
+                        spec_completion_tokens=(
+                            total_spec_completion_tokens
+                            if total_spec_verify_ct > 0
+                            else None
+                        ),
                     ),
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
@@ -1772,11 +1791,25 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        total_spec_verify_ct = sum(
+            item["meta_info"].get("spec_verify_ct", 0) for item in ret
+        )
+        total_spec_completion_tokens = sum(
+            item["meta_info"].get("completion_tokens", 0)
+            for item in ret
+            if item["meta_info"].get("spec_verify_ct", 0) > 0
+        )
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or total_spec_verify_ct > 0:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                spec_verify_ct=(
+                    total_spec_verify_ct if total_spec_verify_ct > 0 else None
+                ),
+                spec_completion_tokens=(
+                    total_spec_completion_tokens if total_spec_verify_ct > 0 else None
+                ),
             )
 
         for idx, ret_item in enumerate(ret):
