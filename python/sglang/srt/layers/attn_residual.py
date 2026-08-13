@@ -24,7 +24,7 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_npu
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
@@ -37,6 +37,8 @@ def _use_fast(hidden_size: int) -> bool:
     """The TMA kernel needs SM100+ (tcgen05, cp.async.bulk) and its H=7168
     template instantiation; everything else takes the triton pipeline."""
     global _FAST_SUPPORTED
+    if is_npu():
+        return False
     if _FAST_SUPPORTED is None:
         major, _ = torch.cuda.get_device_capability()
         _FAST_SUPPORTED = major >= 10
@@ -208,7 +210,19 @@ def _mix_fused(
 ) -> torch.Tensor:
     """Triton score + combine pair: returns the pre-norm mixture."""
     T, H = prefix_sum.shape
+    if T == 0:
+        return prefix_sum
     cw = get_cw(score_proj, score_norm)
+    if is_npu():
+        from sgl_kernel_npu.kimi_k3.attn_residual import mix_fused
+
+        return mix_fused(
+            prefix_sum,
+            bank,
+            nvb,
+            cw,
+            score_norm.variance_epsilon,
+        )
     n_h_blocks = H // _BLOCK_H
 
     # Step 1: score each row (2D grid, full row-parallelism)
@@ -394,6 +408,8 @@ def _aggregate(
     into bank[:, nvb, :]); the triton path keeps the standalone .write() copy —
     the caller (AttnResidual.forward) owns that fallback.
     """
+    if prefix_sum.shape[0] == 0:
+        return prefix_sum
     if _use_fast(prefix_sum.shape[1]):
         return _aggregate_fast(
             prefix_sum,
