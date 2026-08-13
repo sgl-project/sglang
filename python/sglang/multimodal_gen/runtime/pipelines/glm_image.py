@@ -20,7 +20,7 @@ class GlmImageDenoiserDecodingStage(DecodingStage):
         return RoleType.DENOISER
 
 
-class GlmImageDenoiserBeforeDenoisingStage(GlmImageBeforeDenoisingStage):
+class GlmImageDenoiserPreparationStage(GlmImageBeforeDenoisingStage):
     @property
     def role_affinity(self) -> RoleType:
         return RoleType.DENOISER
@@ -53,7 +53,7 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
         before_denoising_stage_cls = (
-            GlmImageDenoiserBeforeDenoisingStage
+            GlmImageDenoiserPreparationStage
             if is_glm_distributed_denoiser
             else GlmImageBeforeDenoisingStage
         )

@@ -943,7 +943,7 @@ class SchedulerDisaggMixin:
                     if is_multi_rank:
                         self._broadcast_to_all_ranks(("compute",))
                         self._broadcast_req_to_all_ranks(req)
-                    self._disagg_glm_denoiser_compute(req, request_id, role_name)
+                    self._disagg_glm_denoiser_compute(req, request_id)
 
                 self._consecutive_error_count = 0
 
@@ -1511,10 +1511,9 @@ class SchedulerDisaggMixin:
         )
 
     def _disagg_glm_denoiser_compute(
-        self: Scheduler, req: Req, request_id: str, role_name: str
+        self: Scheduler, req: Req, request_id: str
     ) -> None:
         req.save_output = False
-        req.return_file_paths_only = False
         start_time = time.monotonic()
         with self._disagg_trace_dispatch(req):
             output_batch = self.worker.execute_forward([req])
@@ -1523,12 +1522,6 @@ class SchedulerDisaggMixin:
         scalar_fields = {"request_id": request_id}
         if output_batch.output is not None:
             tensor_fields["output"] = output_batch.output
-        if output_batch.audio is not None:
-            tensor_fields["audio"] = output_batch.audio
-        if output_batch.audio_sample_rate is not None:
-            scalar_fields["audio_sample_rate"] = output_batch.audio_sample_rate
-        if output_batch.output_file_paths is not None:
-            scalar_fields["output_file_paths"] = output_batch.output_file_paths
         if output_batch.error is not None:
             scalar_fields["error"] = output_batch.error
         if output_batch.usage is not None:
@@ -1542,8 +1535,7 @@ class SchedulerDisaggMixin:
             else:
                 self._disagg_metrics.record_request_complete(request_id)
         logger.debug(
-            "GLM distributed %s: processed %s in %.2f s",
-            role_name,
+            "GLM distributed denoiser: processed %s in %.2f s",
             request_id,
             time.monotonic() - start_time,
         )

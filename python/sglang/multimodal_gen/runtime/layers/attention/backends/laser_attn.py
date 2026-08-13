@@ -24,6 +24,7 @@ logger = init_logger(__name__)
 
 
 class LaserAttentionBackend(AttentionBackend):
+
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -40,6 +41,7 @@ class LaserAttentionBackend(AttentionBackend):
 
 
 class LaserAttentionImpl(AttentionImpl):
+
     def __init__(
         self,
         num_heads: int,
@@ -60,6 +62,8 @@ class LaserAttentionImpl(AttentionImpl):
         self.max_token = 2**31 - 1
         self.seq_len_pad_base = 256
 
+        # the laser attention operator has issues with small seq_len
+        self.min_seqlen = 2048
         self.sdpa_impl = SDPABackend.get_impl_cls()(
             num_heads,
             head_size,
@@ -164,7 +168,7 @@ class LaserAttentionImpl(AttentionImpl):
         q_seqlen, head_dim = query.shape[1], query.shape[3]
         kv_seqlen = key.shape[1]
 
-        if kv_seqlen != q_seqlen:
+        if q_seqlen < self.min_seqlen or kv_seqlen != q_seqlen:
             output = self.sdpa_impl.forward(
                 query,
                 key,

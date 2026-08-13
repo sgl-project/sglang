@@ -698,25 +698,17 @@ class DiffusionServer:
 
         error = scalar_fields.get("error")
         output = tensor_fields.get("output")
-        audio = tensor_fields.get("audio")
-        output_paths = scalar_fields.get("output_file_paths")
         client = shard.client
         total = max(1, int(client.req.num_outputs_per_prompt or 1))
-        for name, value in (("output", output), ("output_file_paths", output_paths)):
-            size = len(value) if value is not None else None
-            if size is not None and size != total:
-                error = (
-                    f"GLM fan-out {name} size mismatch: got {size}, expected {total}"
-                )
-                output = None
-                audio = None
-                output_paths = None
-                break
+        output_size = len(output) if output is not None else None
+        if output_size is not None and output_size != total:
+            error = (
+                f"GLM fan-out output size mismatch: got {output_size}, "
+                f"expected {total}"
+            )
+            output = None
         result = OutputBatch(
             output=output,
-            output_file_paths=output_paths,
-            audio=audio,
-            audio_sample_rate=scalar_fields.get("audio_sample_rate"),
             error=error,
             peak_memory_mb=scalar_fields.get("peak_memory_mb", 0.0),
             usage=scalar_fields.get("usage"),

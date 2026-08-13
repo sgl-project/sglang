@@ -7,6 +7,7 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from copy import deepcopy
+from enum import Enum
 from typing import Any, Iterator, List
 
 import zmq
@@ -39,8 +40,6 @@ from sglang.multimodal_gen.runtime.ipc_array import (
 from sglang.multimodal_gen.runtime.managers.cpu_worker import CPUWorker
 from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
     BatchAdmissionController,
-    are_requests_batch_compatible,
-    get_dynamic_batch_signature,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -429,11 +428,138 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         )
         return ordered[index]
 
+    def _freeze_signature_value(self, value: Any):
+        """Convert a value into a hashable, order-stable form for signature comparison."""
+        if isinstance(value, (str, int, float, bool, type(None))):
+            return value
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, dict):
+            return {
+                str(k): self._freeze_signature_value(v)
+                for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
+            }
+        if isinstance(value, (list, tuple)):
+            return tuple(self._freeze_signature_value(v) for v in value)
+        return repr(value)
+
+    def _sampling_param_signature_items(self, req: Req) -> list[tuple[str, Any]] | None:
+        """Return per-field sampling-param signature items, skipping batch_sig_exclude fields."""
+        sp = req.sampling_params
+        if sp is None:
+            return None
+
+        try:
+            sp_fields = dataclasses.fields(sp)
+        except Exception:
+            return None
+
+        exclude_num_outputs = (
+            self.server_args.pipeline_config.supports_sequential_dit_inference()
+        )
+        return [
+            (f.name, self._freeze_signature_value(getattr(sp, f.name, None)))
+            for f in sp_fields
+            if not f.metadata.get("batch_sig_exclude", False)
+            and not (exclude_num_outputs and f.name == "num_outputs_per_prompt")
+        ]
+
+    def _diffusers_kwargs_signature_value(self, req: Req) -> Any:
+        return self._freeze_signature_value((req.extra or {}).get("diffusers_kwargs"))
+
+    def _build_dynamic_batch_signature(self, req: Req) -> tuple[Any, ...] | None:
+        """Build the request compatibility signature for dynamic batching.
+
+        The signature is built from batch-shared `SamplingParams` fields, plus
+        generation-affecting `extra.diffusers_kwargs` and profiling settings
+        used by grouped execution.
+        """
+        signature_items = self._sampling_param_signature_items(req)
+        if signature_items is None:
+            return None
+
+        profile_signature = (
+            (True, req.profile_all_stages, req.num_profiled_timesteps)
+            if req.profile
+            else (False,)
+        )
+        signature_items.append(("profiling", profile_signature))
+
+        if req.extra:
+            diffusers_kwargs = req.extra.get("diffusers_kwargs")
+            if diffusers_kwargs:
+                signature_items.append(
+                    (
+                        "diffusers_kwargs",
+                        self._freeze_signature_value(diffusers_kwargs),
+                    )
+                )
+
+        return tuple(signature_items)
+
+    def _get_cached_signature(self, req: Req) -> tuple[Any, ...] | None:
+        cached = getattr(req, "_dynamic_batch_sig", None)
+        if cached is not None:
+            return cached
+        sig = self._build_dynamic_batch_signature(req)
+        req._dynamic_batch_sig = sig  # type: ignore[attr-defined]
+        return sig
+
+    def _find_sampling_param_mismatch_field(
+        self, base_req: Req, candidate_req: Req
+    ) -> str | None:
+        base_items = self._sampling_param_signature_items(base_req)
+        candidate_items = self._sampling_param_signature_items(candidate_req)
+        if base_items is None or candidate_items is None:
+            return None
+
+        if len(base_items) != len(candidate_items):
+            return "sampling_params"
+
+        for (name, base_value), (candidate_name, candidate_value) in zip(
+            base_items, candidate_items
+        ):
+            if name != candidate_name:
+                return "sampling_params"
+            if base_value != candidate_value:
+                return f"sampling_params.{name}"
+
+        base_diffusers_kwargs = self._diffusers_kwargs_signature_value(base_req)
+        candidate_diffusers_kwargs = self._diffusers_kwargs_signature_value(
+            candidate_req
+        )
+        if base_diffusers_kwargs != candidate_diffusers_kwargs:
+            return "extra.diffusers_kwargs"
+
+        if base_req.profile:
+            base_profile = (
+                True,
+                base_req.profile_all_stages,
+                base_req.num_profiled_timesteps,
+            )
+        else:
+            base_profile = (False,)
+
+        if candidate_req.profile:
+            candidate_profile = (
+                True,
+                candidate_req.profile_all_stages,
+                candidate_req.num_profiled_timesteps,
+            )
+        else:
+            candidate_profile = (False,)
+        if base_profile != candidate_profile:
+            return "profiling"
+
+        return None
+
     def _get_dynamic_batch_reject_reason(
         self, base_req: Req, candidate_req: Req
     ) -> str | None:
+        """Return the first reason `candidate_req` cannot batch with `base_req`, or None."""
         if self._can_dynamic_batch(base_req, candidate_req):
             return None
+
         if base_req.is_warmup or candidate_req.is_warmup:
             return "warmup"
         if self._has_realtime_session(base_req) or self._has_realtime_session(
@@ -452,45 +578,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
             return "return_file_paths_only"
 
-        base_signature = self._get_cached_signature(base_req)
-        candidate_signature = self._get_cached_signature(candidate_req)
-        if base_signature is None or candidate_signature is None:
+        base_sig = self._get_cached_signature(base_req)
+        candidate_sig = self._get_cached_signature(candidate_req)
+        if base_sig is None or candidate_sig is None:
             return "signature_unavailable"
+
         return (
-            self._find_sampling_param_mismatch_field(
-                base_signature, candidate_signature
-            )
+            self._find_sampling_param_mismatch_field(base_req, candidate_req)
             or "signature_mismatch"
         )
-
-    def _get_cached_signature(self, req: Req) -> tuple[Any, ...] | None:
-        exclude_num_outputs = (
-            self.server_args.pipeline_config.supports_sequential_dit_inference()
-        )
-        return get_dynamic_batch_signature(
-            req,
-            exclude_num_outputs_per_prompt=exclude_num_outputs,
-        )
-
-    @staticmethod
-    def _find_sampling_param_mismatch_field(
-        base_signature: tuple[Any, ...], candidate_signature: tuple[Any, ...]
-    ) -> str | None:
-        if len(base_signature) != len(candidate_signature):
-            return "sampling_params"
-        for (name, base_value), (candidate_name, candidate_value) in zip(
-            base_signature, candidate_signature
-        ):
-            if name != candidate_name:
-                return "sampling_params"
-            if base_value == candidate_value:
-                continue
-            if name == "profiling":
-                return "profiling"
-            if name == "diffusers_kwargs":
-                return "extra.diffusers_kwargs"
-            return f"sampling_params.{name}"
-        return None
 
     @staticmethod
     def _has_realtime_session(req: Req) -> bool:
@@ -498,14 +594,30 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
     def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
         """Return whether `candidate_req` can be merged into a batch with `base_req`."""
-        exclude_num_outputs = (
-            self.server_args.pipeline_config.supports_sequential_dit_inference()
-        )
-        return are_requests_batch_compatible(
-            base_req,
-            candidate_req,
-            exclude_num_outputs_per_prompt=exclude_num_outputs,
-        )
+        if base_req.is_warmup or candidate_req.is_warmup:
+            return False
+
+        if self._has_realtime_session(base_req) or self._has_realtime_session(
+            candidate_req
+        ):
+            return False
+
+        if not isinstance(base_req.prompt, str) or not isinstance(
+            candidate_req.prompt, str
+        ):
+            return False
+
+        if (
+            getattr(base_req, "image_path", None) is not None
+            or getattr(candidate_req, "image_path", None) is not None
+        ):
+            return False
+        if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
+            return False
+
+        base_sig = self._get_cached_signature(base_req)
+        cand_sig = self._get_cached_signature(candidate_req)
+        return base_sig is not None and base_sig == cand_sig
 
     def _record_batch_dispatch_metrics(
         self,
