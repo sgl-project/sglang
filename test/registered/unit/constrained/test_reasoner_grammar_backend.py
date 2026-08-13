@@ -14,7 +14,13 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
 from sglang.srt.function_call.kimik3_format import THINK_CLOSE
+from sglang.srt.parser.reasoning_parser import (
+    DeepSeekR1Detector,
+)
 from sglang.srt.parser.reasoning_parser import KimiK3Detector as KimiK3ReasoningDetector
+from sglang.srt.parser.reasoning_parser import (
+    MuseGlimmerDetector,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
@@ -138,6 +144,171 @@ class TestReasonerGrammarObject(unittest.TestCase):
         second_mask = torch.zeros((1, 2), dtype=torch.int32)
         obj.fill_vocab_mask(second_mask, 0)
         self.assertEqual(_allowed_token_ids(second_mask, [7, 8, 10]), [8])
+
+
+class TestReasonerGrammarChannelHeaders(unittest.TestCase):
+    EOM = 7
+    START = 8
+    ASSISTANT = 9
+    TO = 10
+    USER = 11
+    SELF = 12
+    MESSAGE = 13
+
+    def _make_object(self, max_header_tokens=16):
+        grammar = MagicMock()
+        grammar.is_terminated.return_value = False
+        obj = ReasonerGrammarObject(
+            grammar=grammar,
+            think_end_ids=[self.EOM],
+            channel_header_end_ids=[self.MESSAGE],
+            channel_reasoning_header_ids=[self.TO, self.SELF],
+            max_channel_header_tokens=max_header_tokens,
+        )
+        obj.maybe_init_reasoning(True)
+        return obj, grammar
+
+    def _accept(self, obj, tokens):
+        for token in tokens:
+            obj.accept_token(token)
+
+    def test_answer_header_is_not_constrained_or_fed_to_grammar(self):
+        obj, grammar = self._make_object()
+        self._accept(obj, [100, self.EOM])
+
+        for token in [self.START, self.ASSISTANT, self.TO, self.USER, self.MESSAGE]:
+            obj.fill_vocab_mask(None, 0)
+            obj.accept_token(token)
+
+        grammar.fill_vocab_mask.assert_not_called()
+        grammar.accept_token.assert_not_called()
+
+        obj.fill_vocab_mask(None, 0)
+        obj.accept_token(200)
+        grammar.fill_vocab_mask.assert_called_once_with(None, 0)
+        grammar.accept_token.assert_called_once_with(200)
+
+    def test_second_reasoning_channel_returns_to_thinking(self):
+        obj, grammar = self._make_object()
+        self._accept(obj, [100, self.EOM, self.TO, self.SELF, self.MESSAGE])
+
+        self.assertTrue(obj._is_thinking())
+        self._accept(obj, [101, self.EOM])
+        self._accept(
+            obj, [self.START, self.ASSISTANT, self.TO, self.USER, self.MESSAGE]
+        )
+        self.assertTrue(obj._is_generation())
+        grammar.accept_token.assert_not_called()
+
+    def test_header_timeout_resumes_grammar(self):
+        obj, grammar = self._make_object(max_header_tokens=3)
+        self._accept(obj, [100, self.EOM, self.START, self.ASSISTANT, self.TO])
+
+        self.assertTrue(obj._is_generation())
+        obj.accept_token(200)
+        grammar.accept_token.assert_called_once_with(200)
+
+    def test_negative_header_limit_waits_indefinitely(self):
+        obj, grammar = self._make_object(max_header_tokens=-1)
+        self._accept(obj, [100, self.EOM] + list(range(20, 60)))
+
+        self.assertTrue(obj._is_waiting_for_channel_header())
+        grammar.accept_token.assert_not_called()
+
+    def test_rollback_restores_header_and_thinking_states(self):
+        obj, _ = self._make_object()
+        self._accept(obj, [100, self.EOM, self.START, self.MESSAGE])
+        self.assertTrue(obj._is_generation())
+
+        obj.rollback(1)
+        self.assertTrue(obj._is_waiting_for_channel_header())
+        obj.rollback(2)
+        self.assertTrue(obj._is_thinking())
+        self.assertEqual(obj._matched_think_end_tokens, 0)
+
+    def test_rollback_only_rewinds_tokens_seen_by_inner_grammar(self):
+        obj, grammar = self._make_object()
+        stream = [
+            100,
+            self.EOM,
+            self.START,
+            self.ASSISTANT,
+            self.TO,
+            self.USER,
+            self.MESSAGE,
+            200,
+            201,
+        ]
+        self._accept(obj, stream)
+
+        obj.rollback(8)
+
+        grammar.rollback.assert_called_once_with(2)
+        self.assertTrue(obj._is_thinking())
+
+    def test_copy_preserves_channel_header_state(self):
+        obj, grammar = self._make_object()
+        self._accept(obj, [100, self.EOM, self.START, self.ASSISTANT])
+
+        copied = obj.copy()
+
+        self.assertTrue(copied._is_waiting_for_channel_header())
+        self.assertEqual(copied._channel_header_tokens, 2)
+        self.assertEqual(copied._state_history, obj._state_history)
+        grammar.copy.assert_called_once()
+
+    def test_non_reasoning_request_constrains_first_token(self):
+        obj, grammar = self._make_object()
+        obj.maybe_init_reasoning(False)
+
+        obj.fill_vocab_mask(None, 0)
+        obj.accept_token(200)
+
+        grammar.fill_vocab_mask.assert_called_once_with(None, 0)
+        grammar.accept_token.assert_called_once_with(200)
+
+    def test_rollback_within_generation_restores_generation_state(self):
+        obj, grammar = self._make_object()
+        self._accept(obj, [100, self.EOM, self.START, self.MESSAGE, 200, 201])
+
+        obj.rollback(1)
+
+        grammar.rollback.assert_called_once_with(1)
+        self.assertTrue(obj._is_generation())
+        self.assertEqual(obj.tokens_after_end, 1)
+
+    def test_rollback_restores_partial_multi_token_think_end_match(self):
+        grammar = MagicMock()
+        obj = ReasonerGrammarObject(
+            grammar=grammar,
+            think_end_ids=[self.EOM, self.START],
+            channel_header_end_ids=[self.MESSAGE],
+        )
+        obj.maybe_init_reasoning(True)
+        self._accept(obj, [100, self.EOM])
+        self.assertEqual(obj._matched_think_end_tokens, 1)
+
+        obj.accept_token(self.START)
+        self.assertTrue(obj._is_waiting_for_channel_header())
+        obj.rollback(1)
+
+        self.assertTrue(obj._is_thinking())
+        self.assertEqual(obj._matched_think_end_tokens, 1)
+
+    def test_multi_token_channel_header_end(self):
+        grammar = MagicMock()
+        obj = ReasonerGrammarObject(
+            grammar=grammar,
+            think_end_ids=[self.EOM],
+            channel_header_end_ids=[self.TO, self.MESSAGE],
+        )
+        obj.maybe_init_reasoning(True)
+        self._accept(obj, [100, self.EOM, self.START, self.TO])
+        self.assertTrue(obj._is_waiting_for_channel_header())
+
+        obj.accept_token(self.MESSAGE)
+        self.assertTrue(obj._is_generation())
+        grammar.accept_token.assert_not_called()
 
 
 class TestReasonerGrammarBackend(unittest.TestCase):
@@ -272,6 +443,34 @@ class TestReasonerGrammarBackend(unittest.TestCase):
             enable_strict_thinking=True,
         )
         self.assertEqual(reasoner.think_end_ids, [2, 3])
+
+    def test_muse_opts_into_channel_header_boundary(self):
+        detector = MuseGlimmerDetector()
+        tokenizer = _DummyTokenizer(
+            {
+                detector.think_end_token: [7],
+                detector.grammar_channel_header_end: [13],
+                detector.grammar_channel_reasoning_header: [10, 12],
+            }
+        )
+
+        reasoner = ReasonerGrammarBackend(
+            _DummyGrammarBackend(), SimpleNamespace(detector=detector), tokenizer
+        )
+
+        self.assertEqual(reasoner.channel_header_end_ids, [13])
+        self.assertEqual(reasoner.channel_reasoning_header_ids, [10, 12])
+
+    def test_non_channel_detector_keeps_direct_transition(self):
+        detector = DeepSeekR1Detector()
+        tokenizer = _DummyTokenizer({detector.think_end_token: [7]})
+
+        reasoner = ReasonerGrammarBackend(
+            _DummyGrammarBackend(), SimpleNamespace(detector=detector), tokenizer
+        )
+
+        self.assertIsNone(reasoner.channel_header_end_ids)
+        self.assertIsNone(reasoner.channel_reasoning_header_ids)
 
     def test_rejects_unencodable_excluded_token(self):
         backend = _DummyGrammarBackend(support_token_filter=True)

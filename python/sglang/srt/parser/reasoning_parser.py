@@ -62,6 +62,12 @@ class StreamingParseResult:
 class BaseReasoningFormatDetector:
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
+    # Most formats transition directly from the reasoning end marker to the
+    # answer body. Channel-framed formats can override these markers so guided
+    # decoding waits for the model-written answer-channel header to finish.
+    grammar_channel_header_end: Optional[str] = None
+    grammar_channel_reasoning_header: Optional[str] = None
+
     def __init__(
         self,
         think_start_token: str,
@@ -1687,6 +1693,9 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
     A single channel may also be cut short by the token cap, in which case there is no
     terminator and the partial body is still attributed to whichever channel was open.
     """
+
+    grammar_channel_header_end = MESSAGE
+    grammar_channel_reasoning_header = " to=self"
 
     def __init__(
         self,
