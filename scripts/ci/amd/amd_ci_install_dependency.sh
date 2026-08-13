@@ -48,11 +48,13 @@ docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
 # Helper function to install with retries and fallback PyPI mirror
 install_with_retry() {
   local max_attempts=3
-  local cmd="$@"
+  local cmd=("$@")
 
   for attempt in $(seq 1 $max_attempts); do
-    echo "Attempt $attempt/$max_attempts: $cmd"
-    if eval "$cmd"; then
+    printf 'Attempt %s/%s:' "$attempt" "$max_attempts"
+    printf ' %q' "${cmd[@]}"
+    printf '\n'
+    if "${cmd[@]}"; then
       echo "Success!"
       return 0
     fi
@@ -61,9 +63,11 @@ install_with_retry() {
       echo "Failed, retrying in 5 seconds..."
       sleep 5
       # Try with alternative PyPI index on retry
-      if [[ "$cmd" =~ "pip install" ]] && [ $attempt -eq 2 ]; then
-        cmd="$cmd --index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com"
-        echo "Using fallback PyPI mirror: $cmd"
+      if [[ " ${cmd[*]} " == *" pip install "* ]] && [ $attempt -eq 2 ]; then
+        cmd+=(--index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com)
+        printf 'Using fallback PyPI mirror:'
+        printf ' %q' "${cmd[@]}"
+        printf '\n'
       fi
     fi
   done
