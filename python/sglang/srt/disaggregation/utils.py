@@ -1010,6 +1010,41 @@ def resolve_dcp_dst_entry_indices(
     ]
 
 
+def resolve_state_component_dst_index(src_state_types, dst_state_types, src_index: int):
+    """Map a source state component to the matching destination component.
+
+    Older registrations did not carry state_types; keep positional behavior in
+    that case. When available, match by StateType occurrence so optional target
+    components (for example C128_STATE) do not shift draft state components.
+    """
+    if not dst_state_types:
+        return src_index
+    if not src_state_types:
+        raise RuntimeError(
+            "Destination state_types are present but source state_types are empty."
+        )
+    if src_index >= len(src_state_types):
+        raise RuntimeError(
+            f"Source state component index {src_index} exceeds "
+            f"state_types length {len(src_state_types)}."
+        )
+
+    state_type = src_state_types[src_index]
+    occurrence = sum(
+        1 for item in src_state_types[: src_index + 1] if item == state_type
+    )
+    seen = 0
+    for dst_index, dst_state_type in enumerate(dst_state_types):
+        if dst_state_type == state_type:
+            seen += 1
+            if seen == occurrence:
+                return dst_index
+
+    raise RuntimeError(
+        f"Decode peer is missing state component {state_type} occurrence {occurrence}."
+    )
+
+
 def append_state_component(
     kv_args: KVArgs,
     state_type: StateType,
