@@ -193,6 +193,11 @@ def _fused_metadata_kernel_general(
     use_swa: tl.constexpr,
     SHIFT: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
+    # Unified-memory dense-view path (page-major envelope shared with the mamba
+    # sub-pool). Both default to the identity for the statically-partitioned
+    # pool, where req_to_token already holds physical ids.
+    v2p_ptr=None,
+    PAGE_MULT: tl.constexpr = 1,
 ):
     pid_b = tl.program_id(0)  # batch index
     pid_c = tl.program_id(1)  # column chunk index
@@ -213,13 +218,25 @@ def _fused_metadata_kernel_general(
         return
 
     i = pid_b
+    # Self-guard on the device-side seq_len: skip column chunks past the
+    # request's live pages (tails keep stale values the attention kernels
+    # never read past cache_seqlens).
+    seq_len = tl.load(seq_lens + i * seq_lens_stride_0).to(tl.int32)
+    if page_size == 1:
+        num_live_pages = seq_len + seq_len_delta
+    else:
+        num_live_pages = (seq_len + seq_len_delta + (1 << SHIFT) - 1) >> SHIFT
+    num_live_pages = tl.minimum(num_live_pages, max_seq_pages)
+    col_start = pid_c * BLOCK_COLS
+    if col_start >= num_live_pages:
+        return
+
     # Load row index for this batch (all threads in block have same i)
     row_idx = tl.load(req_pool_indices + i * req_pool_indices_stride_0)
     row_offset = row_idx * req_to_token_stride_0
 
-    col_start = pid_c * BLOCK_COLS
     col_offsets = col_start + tl.arange(0, BLOCK_COLS)
-    mask = col_offsets < max_seq_pages
+    mask = col_offsets < num_live_pages
 
     # Compute column indices in the source tensor (token offset)
     if page_size == 1:
@@ -238,6 +255,13 @@ def _fused_metadata_kernel_general(
         page_table_val = page_index
     else:
         page_table_val = page_index >> SHIFT
+
+    # Unified memory: virtual page -> physical page -> that layer's dense block.
+    # Derived from page_table_val, NOT page_index, which the SWA branch below
+    # still needs in virtual space. Masked so padded lanes never index the table.
+    if v2p_ptr is not None:
+        page_table_val = tl.load(v2p_ptr + page_table_val, mask=mask, other=0)
+    page_table_val = page_table_val * PAGE_MULT
 
     # Store to page_table
     pt_offsets = i * page_table_stride_0 + col_offsets * page_table_stride_1
@@ -283,6 +307,9 @@ def _fused_metadata_kernel_ps1_no_swa(
     max_seq_pages,
     seq_len_delta: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
+    # Unified-memory dense-view path; identity defaults for the static pool.
+    v2p_ptr=None,
+    PAGE_MULT: tl.constexpr = 1,
 ):
     pid_b = tl.program_id(0)  # batch index
     pid_c = tl.program_id(1)  # column chunk index
@@ -303,13 +330,21 @@ def _fused_metadata_kernel_ps1_no_swa(
         return
 
     i = pid_b
+    # Self-guard on the device-side seq_len: skip column chunks past the
+    # request's live pages (tails keep stale values the attention kernels
+    # never read past cache_seqlens).
+    seq_len = tl.load(seq_lens + i * seq_lens_stride_0).to(tl.int32)
+    num_live_pages = tl.minimum(seq_len + seq_len_delta, max_seq_pages)
+    col_start = pid_c * BLOCK_COLS
+    if col_start >= num_live_pages:
+        return
+
     # Load row index for this batch (all threads in block have same i)
     row_idx = tl.load(req_pool_indices + i * req_pool_indices_stride_0)
     row_offset = row_idx * req_to_token_stride_0
 
-    col_start = pid_c * BLOCK_COLS
     col_offsets = col_start + tl.arange(0, BLOCK_COLS)
-    mask = col_offsets < max_seq_pages
+    mask = col_offsets < num_live_pages
 
     # page_size = 1: col_idx = col_offsets
     rt_offsets = row_offset + col_offsets * req_to_token_stride_1
@@ -318,6 +353,10 @@ def _fused_metadata_kernel_ps1_no_swa(
     )
 
     # page_table = page_index // 1 = page_index
+    # Unified memory: at page_size 1 the virtual token id IS the virtual page id.
+    if v2p_ptr is not None:
+        page_index = tl.load(v2p_ptr + page_index, mask=mask, other=0)
+    page_index = page_index * PAGE_MULT
     pt_offsets = i * page_table_stride_0 + col_offsets * page_table_stride_1
     tl.store(page_table + pt_offsets, page_index, mask=mask, cache_modifier=".cg")
 
@@ -545,6 +584,8 @@ def normal_decode_set_metadata(
     page_size: int,
     swa_page_table: Optional[torch.Tensor] = None,
     token_to_kv_pool: Optional["SWAKVPool"] = None,
+    v2p_page_table: Optional[torch.Tensor] = None,
+    kernel_page_multiplier: int = 1,
 ):
     """
     Fused Triton implementation that replaces 4-5 sequential CUDA kernels with 1-2 kernels:
@@ -552,9 +593,19 @@ def normal_decode_set_metadata(
       2. cu_seqlens_k = cumsum(cache_seqlens) (prefix-sum)
       3. page_indices = req_to_token[pool_idx, stride_idx] (2-D gather)
       4. page_table = page_indices // page_size (floor-divide)
+      4b. (unified memory) page_table = v2p_page_table[page] * kernel_page_multiplier
       5. (optional) swa_page_table for sliding window attention
 
+    Step 4b is folded in rather than applied afterwards so the capture-stable
+    page_table is written already translated: no separate pass a caller could
+    forget, and no temporary to keep pointer-stable across cuda-graph replays.
+    Identity (None / 1) for the statically-partitioned pool.
+
     Achieves ~5.2x speedup on H200 hardware for typical decode workloads.
+
+    Contract: only the live prefix (cdiv(cache_seqlens, page_size) pages) of each
+    page_table / swa_page_table row is (re)written; the tail keeps stale values
+    across CUDA-graph replays, so consumers must bound reads by cache_seqlens.
     """
     assert (
         page_size > 0 and (page_size & (page_size - 1)) == 0
@@ -609,6 +660,8 @@ def normal_decode_set_metadata(
             max_seq_pages,
             seq_len_delta,
             BLOCK_COLS=BLOCK_COLS,
+            v2p_ptr=v2p_page_table,
+            PAGE_MULT=kernel_page_multiplier,
             num_warps=8,
             num_stages=3,
         )
@@ -672,6 +725,8 @@ def normal_decode_set_metadata(
             use_swa,
             shift,
             BLOCK_COLS=BLOCK_COLS,
+            v2p_ptr=v2p_page_table,
+            PAGE_MULT=kernel_page_multiplier,
             num_warps=4,
             num_stages=3,
         )

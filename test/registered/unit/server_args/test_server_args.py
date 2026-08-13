@@ -1,3 +1,4 @@
+import dataclasses
 import importlib
 import json
 import os
@@ -8,7 +9,15 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
+from sglang.srt.arg_groups import pd_disaggregation_hook
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.entrypoints.sidecar import (
+    SGLANG_GRPC_ENDPOINT_ENV,
+    Sidecar,
+    _run_sidecar,
+    build_sidecar_endpoint,
+    start_sidecar,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -34,6 +43,56 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_return_hidden_states_mode_configuration(self):
+        disabled = ServerArgs(model_path="dummy")
+        self.assertFalse(disabled.enable_return_hidden_states)
+        self.assertIsNone(disabled.return_hidden_states_mode)
+
+        last = ServerArgs(
+            model_path="dummy",
+            return_hidden_states_mode="last",
+        )
+        self.assertTrue(last.enable_return_hidden_states)
+        self.assertEqual(last.return_hidden_states_mode, "last")
+
+        legacy_full = ServerArgs(
+            model_path="dummy",
+            enable_return_hidden_states=True,
+        )
+        self.assertTrue(legacy_full.enable_return_hidden_states)
+        self.assertEqual(legacy_full.return_hidden_states_mode, "full")
+
+        parsed_last = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--return-hidden-states-mode",
+                "last",
+            ]
+        )
+        self.assertTrue(parsed_last.enable_return_hidden_states)
+        self.assertEqual(parsed_last.return_hidden_states_mode, "last")
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "return_hidden_states_mode must be one of",
+        ):
+            ServerArgs(
+                model_path="dummy",
+                return_hidden_states_mode="lst",
+            )
+
+    def test_draft_quantization_explicitness_survives_asdict_round_trip(self):
+        inherited = ServerArgs(model_path="dummy", quantization="modelopt_fp4")
+        inherited._handle_missing_default_values()
+        self.assertEqual(inherited.speculative_draft_model_quantization, "modelopt_fp4")
+        self.assertFalse(inherited._speculative_draft_quantization_explicitly_set)
+
+        reconstructed = ServerArgs(**dataclasses.asdict(inherited))
+        reconstructed._handle_missing_default_values()
+
+        self.assertFalse(reconstructed._speculative_draft_quantization_explicitly_set)
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")
@@ -59,7 +118,70 @@ class TestPrepareServerArgs(CustomTestCase):
             os.unlink(config_file)
 
 
+class TestMmEncoderDataParallelLogging(CustomTestCase):
+    def test_logs_when_encoder_dp_has_no_parallelism(self):
+        server_args = ServerArgs(
+            model_path="dummy", mm_enable_dp_encoder=True, tp_size=1
+        )
+
+        with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+            server_args._handle_data_parallelism()
+
+        self.assertIn("TP=1", logs.output[0])
+        self.assertIn("no data-parallel work", logs.output[0])
+
+    def test_logs_encoder_dp_tradeoff_for_tp(self):
+        server_args = ServerArgs(
+            model_path="dummy", mm_enable_dp_encoder=True, tp_size=4
+        )
+
+        with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+            server_args._handle_data_parallelism()
+
+        self.assertIn("TP=4", logs.output[0])
+        self.assertIn("high-resolution or multi-image", logs.output[0])
+
+
+class TestImageProcessorBackend(CustomTestCase):
+    def test_new_backend_does_not_set_legacy_flag(self):
+        server_args = ServerArgs(model_path="dummy", image_processor_backend="pil")
+
+        server_args._handle_deprecated_args()
+
+        self.assertEqual(server_args.image_processor_backend, "pil")
+        self.assertFalse(server_args.disable_fast_image_processor)
+
+    def test_legacy_flag_maps_to_pil_with_one_warning(self):
+        server_args = ServerArgs(model_path="dummy", disable_fast_image_processor=True)
+
+        with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+            server_args._handle_deprecated_args()
+
+        self.assertEqual(server_args.image_processor_backend, "pil")
+        self.assertTrue(server_args.disable_fast_image_processor)
+        self.assertEqual(
+            sum(
+                "--disable-fast-image-processor is deprecated" in x for x in logs.output
+            ),
+            1,
+        )
+
+    def test_legacy_flag_rejects_torchvision_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            image_processor_backend="torchvision",
+            disable_fast_image_processor=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "conflicts.*torchvision"):
+            server_args._handle_deprecated_args()
+
+
 class TestMultimodalFeatureTransport(CustomTestCase):
+    @staticmethod
+    def _set_model_type(server_args, *, is_multimodal):
+        server_args.model_config = SimpleNamespace(is_multimodal=is_multimodal)
+
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):
         server_args = ServerArgs(
@@ -94,6 +216,16 @@ class TestMultimodalFeatureTransport(CustomTestCase):
 
         self.assertIn("deprecated", logs.output[0])
 
+    def test_legacy_keep_flag_rejects_explicit_cuda_vmm(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            keep_mm_feature_on_device=True,
+            mm_feature_transport="cuda_vmm",
+        )
+
+        with self.assertRaisesRegex(ValueError, "conflicts.*cuda_vmm"):
+            server_args._handle_multimodal_feature_transport()
+
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_explicit_cpu_overrides_legacy_environment(self, _mock_is_cuda):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cpu")
@@ -116,6 +248,129 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertEqual(server_args.mm_feature_transport, "cpu")
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_cpu_for_text_only_model(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy")
+        self._set_model_type(server_args, is_multimodal=False)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertNoLogs(server_args_module.logger, level="INFO"):
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_cpu_for_multimodal_model(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy")
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertNoLogs(server_args_module.logger, level="INFO"):
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.os.path.exists", return_value=True)
+    @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch(
+        "sglang.srt.model_loader.utils.supports_cuda_vmm_feature_transport",
+        return_value=True,
+    )
+    def test_default_transport_is_cuda_vmm_for_supported_multinode_mnnvl(
+        self,
+        _mock_supports_cuda_vmm,
+        _mock_is_cuda,
+        _mock_is_mnnvl,
+        _mock_path_exists,
+    ):
+        server_args = ServerArgs(model_path="dummy", nnodes=2)
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_vmm")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        output = "\n".join(logs.output)
+        self.assertIn("auto-resolved to cuda_vmm", output)
+        self.assertIn("CUDA FABRIC", output)
+
+    @patch("sglang.srt.server_args.os.path.exists", return_value=True)
+    @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch(
+        "sglang.srt.model_loader.utils.supports_cuda_vmm_feature_transport",
+        return_value=False,
+    )
+    def test_default_transport_is_cpu_for_unsupported_multinode_model(
+        self,
+        _mock_supports_cuda_vmm,
+        _mock_is_cuda,
+        _mock_is_mnnvl,
+        _mock_path_exists,
+    ):
+        server_args = ServerArgs(model_path="dummy", nnodes=2)
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+            server_args._handle_multimodal_feature_transport()
+
+        self.assertEqual(server_args.mm_feature_transport, "cpu")
+        self.assertIn("has not opted into CUDA VMM", "\n".join(logs.output))
+
+    @patch("sglang.srt.server_args.os.path.exists", return_value=False)
+    @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_cpu_without_imex_channel(
+        self, _mock_is_cuda, _mock_is_mnnvl, _mock_path_exists
+    ):
+        server_args = ServerArgs(model_path="dummy", nnodes=2)
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+
+        self.assertIn("no IMEX channel", "\n".join(logs.output))
+
+    @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_cpu_for_multinode_non_mnnvl(
+        self, _mock_is_cuda, _mock_is_mnnvl
+    ):
+        server_args = ServerArgs(model_path="dummy", nnodes=2)
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_cpu_for_language_only_model(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", language_only=True)
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
     @patch("sglang.srt.server_args.is_cuda", return_value=False)
     def test_cuda_ipc_rejects_non_nvidia_platforms(self, _mock_is_cuda):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_ipc")
@@ -130,6 +385,57 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "single node"):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_vmm_is_explicit_and_uses_shared_budget(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_feature_transport="cuda_vmm",
+            nnodes=2,
+            tokenizer_worker_num=2,
+        )
+
+        with (
+            patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "1"}),
+            envs.SGLANG_MM_FEATURE_CACHE_MB.override(256),
+        ):
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_vmm")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        output = "\n".join(logs.output)
+        self.assertIn("CUDA FABRIC", output)
+        self.assertIn("256 MiB", output)
+        self.assertIn("2 tokenizer worker", output)
+        self.assertIn("falls back to inline CPU", output)
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_cuda_vmm_rejects_non_nvidia_platforms(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_vmm")
+
+        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_vmm_rejects_rust_server(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_vmm")
+
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"),
+        ):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_vmm_rejects_pipeline_parallelism(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy", mm_feature_transport="cuda_vmm", pp_size=2
+        )
+
+        with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
             server_args._handle_multimodal_feature_transport()
 
 
@@ -187,6 +493,56 @@ class TestLoadBalanceMethod(unittest.TestCase):
     def test_pd_decode_defaults_to_round_robin(self):
         server_args = self._load_balance_args(disaggregation_mode="decode")
         self.assertEqual(server_args.load_balance_method, "round_robin")
+
+    def test_pd_prefill_dcp_warns_about_performance(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            dcp_size=4,
+        )
+        with self.assertLogs(pd_disaggregation_hook.logger, level="WARNING") as logs:
+            server_args._handle_pd_disaggregation()
+        self.assertIn("without improving prefill performance", "\n".join(logs.output))
+
+    def test_pd_decode_dcp_forces_chunk_cache(self):
+        server_args = self._load_balance_args(
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="mooncake",
+            dcp_size=4,
+        )
+        self.assertTrue(server_args.disable_radix_cache)
+
+    def test_pd_decode_dcp_rejects_unsupported_transfer_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="fake",
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(ValueError, "mooncake or nixl"):
+            server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_dcp_rejects_radix_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="nixl",
+            disaggregation_decode_enable_radix_cache=True,
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(ValueError, "currently requires chunk cache"):
+            server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_dcp_rejects_hierarchical_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="nixl",
+            enable_hierarchical_cache=True,
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
+            server_args._handle_pd_disaggregation()
 
     def test_pd_decode_radix_cache_rejects_hisparse(self):
         server_args = ServerArgs(
@@ -302,6 +658,23 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_kv")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_kv")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_hisparse_accepts_flashinfer_sparse_mla_on_cuda_fp8(self, _mock_is_hip):
+        """SM120 GLM DSA resolves both DSA backends to flashinfer_sparse_mla, so
+        the fp8 hisparse allow-set must admit it or --enable-hisparse cannot
+        start there at all. The device/arch narrowing happens later, in
+        _validate_flashinfer_sparse_mla_backend."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="fp8_e4m3",
+            dsa_prefill_backend="flashinfer_sparse_mla",
+            dsa_decode_backend="flashinfer_sparse_mla",
+        )
+
+        server_args._validate_hisparse_dsa_backend("dsa_prefill_backend", "prefill")
+        server_args._validate_hisparse_dsa_backend("dsa_decode_backend", "decode")
 
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_defaults_to_tilelang_on_rocm(self, _mock_is_hip):
@@ -1192,17 +1565,6 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
                     self._validate_prefill_only_args(kv_cache_dtype=kv_cache_dtype)
 
 
-class TestSessionRadixCacheServerArgs(unittest.TestCase):
-    def test_requires_priority_radix_eviction_policy(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            enable_session_radix_cache=True,
-            radix_eviction_policy="lru",
-        )
-        with self.assertRaisesRegex(ValueError, "--radix-eviction-policy priority"):
-            server_args._handle_cache_compatibility()
-
-
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
     @patch(
         "sglang.srt.model_executor.runner_backend."
@@ -1287,6 +1649,60 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
 
         self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
         self.assertIn((Phase.DECODE, "backend"), args._cuda_graph_config_locked)
+
+
+class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
+    """LoRA no longer auto-disables the breakable prefill CUDA graph; guards
+    test_bcg_with_lora.py against a rule re-disabling it (vacuous pass)."""
+
+    def _handled_args(self, **overrides):
+        args = ServerArgs(model_path="dummy", **overrides)
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=False,
+            is_multimodal_piecewise_cuda_graph_supported=False,
+        )
+        with (
+            patch("sglang.srt.utils.is_cuda", return_value=True),
+            patch.object(ServerArgs, "use_mla_backend", return_value=False),
+        ):
+            args._handle_cuda_graph_config()
+        return args
+
+    def test_enable_lora_keeps_breakable_prefill_graph(self):
+        args = self._handled_args(enable_lora=True)
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_lora_paths_keep_breakable_prefill_graph(self):
+        args = self._handled_args(lora_paths=["dummy/lora-adapter"])
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_lora_still_disables_tc_piecewise_prefill_graph(self):
+        # Pin the tc_piecewise LoRA rule itself, with the hardware rule
+        # neutralized so this runs on CPU-only CI.
+        args = ServerArgs(model_path="dummy", enable_lora=True)
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=False,
+            is_multimodal_piecewise_cuda_graph_supported=False,
+        )
+        args.cuda_graph_config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
+        )
+        with (
+            patch("sglang.srt.server_args.is_hip", return_value=False),
+            patch("sglang.srt.server_args.is_npu", return_value=False),
+            patch("sglang.srt.server_args.is_cpu", return_value=False),
+            patch("sglang.srt.server_args.is_mps", return_value=False),
+            patch("sglang.srt.server_args.is_xpu", return_value=False),
+        ):
+            args._disable_tc_piecewise_cudagraph_if_incompatible()
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
 
 
 class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
@@ -1535,6 +1951,133 @@ class TestGrpcServerArgs(CustomTestCase):
         with envs.SGLANG_GRPC_PORT.override(45000):
             sa._handle_deprecated_args()
         self.assertEqual(sa.grpc_port, 45000)
+
+    @staticmethod
+    def _sidecar_parser():
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        return parser
+
+    def test_sidecar_builds_loopback_grpc_endpoints(self):
+        self.assertEqual(
+            build_sidecar_endpoint(SimpleNamespace(host="0.0.0.0", grpc_port=50051)),
+            "http://127.0.0.1:50051",
+        )
+        self.assertEqual(
+            build_sidecar_endpoint(SimpleNamespace(host="::", grpc_port=50051)),
+            "http://[::1]:50051",
+        )
+        self.assertEqual(
+            build_sidecar_endpoint(SimpleNamespace(host="[::]", grpc_port=50051)),
+            "http://[::1]:50051",
+        )
+
+    def test_sidecar_args_parse_as_exact_json_argv(self):
+        argv = ["--flag", "value"]
+        parsed = self._sidecar_parser().parse_args(
+            ["--model-path", "dummy", "--sidecar-args", json.dumps(argv)]
+        )
+        self.assertEqual(parsed.sidecar_args, argv)
+
+    def test_start_sidecar_passes_endpoint_and_provider_argv_separately(self):
+        server_args = SimpleNamespace(
+            sidecar="example.sidecar",
+            sidecar_args=[
+                "--sidecar-shutdown-timeout",
+                "42",
+                "--grpc-connections",
+                "2",
+            ],
+            host="127.0.0.1",
+            grpc_port=50051,
+        )
+        with (
+            patch("sglang.srt.entrypoints.sidecar.mp.get_context") as get_context,
+            patch("sglang.srt.entrypoints.sidecar.Sidecar") as sidecar_class,
+        ):
+            start_sidecar(server_args)
+
+        process_kwargs = get_context.return_value.Process.call_args.kwargs
+        self.assertEqual(process_kwargs["name"], "sglang_sidecar_example.sidecar")
+        self.assertEqual(process_kwargs["target"], _run_sidecar)
+        self.assertEqual(
+            process_kwargs["args"],
+            (
+                "example.sidecar",
+                ["--grpc-connections", "2"],
+                "http://127.0.0.1:50051",
+            ),
+        )
+        sidecar_class.assert_called_once_with(
+            get_context.return_value.Process.return_value,
+            "example.sidecar",
+            shutdown_timeout=42.0,
+        )
+
+    def test_sidecar_requires_native_grpc(self):
+        sa = self._args(sidecar="example.sidecar")
+        with self.assertRaisesRegex(ValueError, "requires --grpc-port"):
+            sa._handle_deprecated_args()
+
+    def test_sidecar_rejects_legacy_grpc(self):
+        sa = self._args(sidecar="example.sidecar", smg_grpc_mode=True)
+        with self.assertRaisesRegex(ValueError, "native gRPC server"):
+            sa._handle_deprecated_args()
+
+    def test_sidecar_rejects_empty_value(self):
+        sa = self._args(sidecar="", grpc_port=50051)
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            sa._handle_deprecated_args()
+
+    def test_sidecar_sets_endpoint_env_before_import_and_calls_main(self):
+        main = MagicMock()
+
+        def import_module(module_name):
+            self.assertEqual(module_name, "example.sidecar")
+            self.assertEqual(
+                os.environ[SGLANG_GRPC_ENDPOINT_ENV],
+                "http://127.0.0.1:50051",
+            )
+            self.assertEqual(os.environ["DYN_NAMESPACE"], "pluh")
+            return SimpleNamespace(main=main)
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    SGLANG_GRPC_ENDPOINT_ENV: "http://stale.example:1",
+                    "DYN_NAMESPACE": "pluh",
+                },
+            ),
+            patch("sglang.srt.entrypoints.sidecar.kill_itself_when_parent_died"),
+            patch(
+                "sglang.srt.entrypoints.sidecar.importlib.import_module",
+                side_effect=import_module,
+            ),
+        ):
+            _run_sidecar(
+                "example.sidecar",
+                ["--provider-flag", "value"],
+                "http://127.0.0.1:50051",
+            )
+
+        main.assert_called_once_with(["--provider-flag", "value"])
+
+    def test_sidecar_stop_uses_configured_shutdown_timeout(self):
+        proc = MagicMock(pid=1234)
+        proc.is_alive.side_effect = [True, True]
+        sidecar = Sidecar(
+            proc,
+            "example.sidecar",
+            shutdown_timeout=42.0,
+        )
+
+        with patch("sglang.srt.entrypoints.sidecar.kill_process_tree") as kill_tree:
+            sidecar.stop()
+
+        proc.terminate.assert_called_once_with()
+        proc.join.assert_called_once_with(timeout=42.0)
+        kill_tree.assert_called_once_with(1234, wait_timeout=42.0)
 
     def test_legacy_smg_derives_grpc_port_from_http_port(self):
         sa = self._args(port=30000, smg_grpc_mode=True)

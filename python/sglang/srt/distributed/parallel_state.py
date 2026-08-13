@@ -60,6 +60,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_cuda_alike,
+    is_gfx95_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -184,6 +185,22 @@ def outplace_all_reduce(
     return group._all_reduce_out_place(tensor, outplace_all_reduce_method)
 
 
+@register_custom_op(out_shape="tensor")
+def flashinfer_allreduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    """FlashInfer kAllReduce over ``group_name``.
+
+    Registered as a custom op so it stays opaque under Dynamo and can run inside
+    piecewise CUDA graphs. Applicability is decided by
+    ``GroupCoordinator._can_use_flashinfer_allreduce`` before the call -- this op
+    has no fallback of its own.
+    """
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._flashinfer_allreduce(tensor)
+
+
 @register_custom_op(mutates_args=["output"])
 def reg_all_gather_into_tensor(
     output: torch.Tensor, input: torch.Tensor, group_name: str
@@ -290,6 +307,10 @@ class GroupCoordinator:
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
+        # Which FlashInfer fusion workspace this group owns, or None when the
+        # group is not eligible for the allreduce-only kAllReduce path. Stamped
+        # by _tag_groups_for_flashinfer_allreduce_only() after group init.
+        self._fi_workspace_hint: Optional[str] = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
         if is_cuda_alike():
@@ -310,7 +331,7 @@ class GroupCoordinator:
         for ranks in group_ranks:
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
             if "mooncake" in torch_distributed_backend:
-                from mooncake.ep import MooncakeBackendOptions
+                from mooncake.pg import MooncakeBackendOptions
 
                 pg_active_size = len(ranks)
                 if not recovered_rank and max_world_size is not None:
@@ -347,12 +368,14 @@ class GroupCoordinator:
                     backend="mooncake",
                     pg_options=dev_opts,
                     timeout=subgroup_timeout,
+                    group_desc=f"{group_name}:device",
                 )
                 cpu_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake-cpu",
                     pg_options=cpu_opts,
                     timeout=subgroup_timeout,
+                    group_desc=f"{group_name}:cpu",
                 )
             else:
                 active_ranks = torch.ones(
@@ -365,11 +388,15 @@ class GroupCoordinator:
                     backend=torch_distributed_backend,
                     pg_options=pg_options,
                     timeout=subgroup_timeout,
+                    group_desc=f"{group_name}:device",
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
                 cpu_group = torch.distributed.new_group(
-                    ranks, backend="gloo", timeout=gloo_timeout
+                    ranks,
+                    backend="gloo",
+                    timeout=gloo_timeout,
+                    group_desc=f"{group_name}:cpu",
                 )
             if self.rank in ranks:
                 self.ranks = ranks
@@ -428,6 +455,7 @@ class GroupCoordinator:
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
+                is_symmetric_memory_enabled=self.is_symmetric_memory_enabled(),
             )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
@@ -630,7 +658,10 @@ class GroupCoordinator:
 
         In addition, PyTorch custom ops do not support mutation or returning
         a new tensor in the same op. So we need to figure out if the op is
-        in-place or out-of-place ahead of time.
+        in-place or out-of-place ahead of time — except under Dynamo tracing,
+        where the method selection would guard on the symbolic shape; there we
+        always emit the out-of-place op with method "auto" and resolve the
+        method at runtime inside the op.
         """
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
@@ -660,45 +691,68 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
+        if torch.compiler.is_compiling():
+            if self._can_use_flashinfer_allreduce(input_):
+                return flashinfer_allreduce(input_, group_name=self.unique_name)
+
+            # Byte-size thresholds in method selection (e.g. `_pick_algo` or
+            # `should_mscclpp_allreduce`) would guard on the symbolic token dim
+            # and recompile per shape; defer the selection to runtime inside
+            # the opaque custom op. Groups without any accelerated
+            # communicator keep the inplace split op so their collective
+            # stays outside captured graphs. The symmetric-memory in-place
+            # path below is deliberately bypassed under compile: its raw
+            # pynccl call is untraceable (hard error with fullgraph, graph
+            # break otherwise) and its in-place contract does not fit the
+            # outplace custom op.
+            if (
+                self.ca_comm is None
+                and self.qr_comm is None
+                and self.pymscclpp_comm is None
+                and self.torch_symm_mem_comm is None
+                and self.pynccl_comm is None
+            ):
+                inplace_all_reduce(input_, group_name=self.unique_name)
+                return input_
+            return outplace_all_reduce(
+                input_,
+                group_name=self.unique_name,
+                outplace_all_reduce_method="auto",
+            )
+
         should_use_pymscclpp_allreduce = (
             self.pymscclpp_comm is not None
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
+        )
+        # With the MNNVL opt-in, let CustomAllReduceV2 take eligible (small)
+        # inputs ahead of the symm-mem pynccl fast path; otherwise pynccl
+        # would absorb every all-reduce whenever --enable-symm-mem is on and
+        # v2 never runs. Large inputs fail should_custom_ar and still go to
+        # the symm-mem path below.
+        _ca_takes_input = (
+            _CA_V2_MULTINODE
+            and self.ca_comm is not None
+            and not self.ca_comm.disabled
+            and self.ca_comm.should_custom_ar(input_)
         )
         if (
             self.pynccl_comm is not None
             and self.is_symmetric_memory_enabled()
             and not should_use_pymscclpp_allreduce
+            and not _ca_takes_input
         ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with self.pynccl_comm.change_state(enable=True):
                 self.pynccl_comm.all_reduce(input_)
                 return input_
 
-        outplace_all_reduce_method = None
-        if (
-            self.ca_comm is not None
-            and not self.ca_comm.disabled
-            and not should_use_pymscclpp_allreduce
-            and self.ca_comm.should_custom_ar(input_)
-        ):
-            outplace_all_reduce_method = "ca"
-        elif (
-            self.qr_comm is not None
-            and not self.qr_comm.disabled
-            and self.qr_comm.should_quick_allreduce(input_)
-        ):
-            outplace_all_reduce_method = "qr"
-        elif self.pymscclpp_comm is not None and should_use_pymscclpp_allreduce:
-            outplace_all_reduce_method = "pymscclpp"
-        elif (
-            self.torch_symm_mem_comm is not None
-            and not self.torch_symm_mem_comm.disabled
-            and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
-        ):
-            outplace_all_reduce_method = "torch_symm_mem"
-        elif is_in_tc_piecewise_cuda_graph() and self.pynccl_comm is not None:
-            # For piecewise cuda graph, we use pynccl outplace allreduce
-            outplace_all_reduce_method = "pynccl"
+        if self._can_use_flashinfer_allreduce(input_):
+            return flashinfer_allreduce(input_, group_name=self.unique_name)
+
+        outplace_all_reduce_method = self._resolve_outplace_all_reduce_method(
+            input_=input_,
+            should_use_pymscclpp_allreduce=should_use_pymscclpp_allreduce,
+        )
         if outplace_all_reduce_method is not None:
             return outplace_all_reduce(
                 input_,
@@ -784,9 +838,157 @@ class GroupCoordinator:
         )
         return fused_outputs
 
+    def fused_allreduce_rmsnorm_quant_per_group(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        group_size: int = 128,
+        emit_bf16: bool = False,
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Attempt fused all-reduce + RMSNorm + per-group FP8 quant.
+
+        ROCm/aiter/gfx95-only entry point. Returns ``None`` on any other
+        platform or when the aiter custom-all-reduce communicator cannot
+        service the request, letting the caller fall back to the existing
+        ``fused_allreduce_rmsnorm`` + separate per-group quant path.
+
+        When ``emit_bf16=True`` the fused kernel also writes the
+        pre-quantization bf16/fp16 normed output and returns
+        ``(fp8, residual_out, scale, bf16)`` — used by GDN-style layers that
+        need both an FP8 projection and a bf16 gating projection without
+        launching a separate per-group quant kernel.
+        """
+        if not (is_hip() and is_gfx95_supported()):
+            return None
+
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+        if not hasattr(ca_comm, "custom_fused_ar_rms_per_group_quant"):
+            return None
+
+        # Shape / size eligibility mirrors aiter's internal gate so we fail
+        # fast without entering the HIP kernel dispatch.
+        K = input_.shape[-1]
+        if K % group_size != 0 or K > 16384:
+            return None
+        total_bytes = input_.numel() * input_.element_size()
+        if total_bytes == 0 or total_bytes > 8 * 1024 * 8192:
+            return None
+        if self.world_size == 6:
+            return None
+
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        else:
+            token_num = input_.numel() // K
+            use_1stage_ar = total_bytes <= 128 * 1024
+            if (
+                # Keep the default 128 KiB cutoff except for the measured TP=8
+                # K=7168 graph-replay crossover. K=4096 remains on the default
+                # rule because token_num=8/16 still favored 1-stage there.
+                self.world_size == 8
+                and 4096 < K <= 7168
+                and token_num >= 8
+                and use_1stage_ar
+            ):
+                use_1stage_ar = False
+
+        try:
+            return ca_comm.custom_fused_ar_rms_per_group_quant(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                group_size,
+                use_1stage_ar,
+                emit_bf16=emit_bf16,
+            )
+        except Exception:
+            return None
+
+    def _resolve_outplace_all_reduce_method(
+        self,
+        input_: torch.Tensor,
+        should_use_pymscclpp_allreduce: Optional[bool] = None,
+    ) -> Optional[str]:
+        if should_use_pymscclpp_allreduce is None:
+            should_use_pymscclpp_allreduce = (
+                self.pymscclpp_comm is not None
+                and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
+            )
+        if (
+            self.ca_comm is not None
+            and not self.ca_comm.disabled
+            and not should_use_pymscclpp_allreduce
+            and self.ca_comm.should_custom_ar(input_)
+        ):
+            return "ca"
+        if (
+            self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and self.qr_comm.should_quick_allreduce(input_)
+        ):
+            return "qr"
+        if self.pymscclpp_comm is not None and should_use_pymscclpp_allreduce:
+            return "pymscclpp"
+        if (
+            self.torch_symm_mem_comm is not None
+            and not self.torch_symm_mem_comm.disabled
+            and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
+        ):
+            return "torch_symm_mem"
+        if is_in_tc_piecewise_cuda_graph() and self.pynccl_comm is not None:
+            # For piecewise cuda graph, we use pynccl outplace allreduce
+            return "pynccl"
+        return None
+
+    def _can_use_flashinfer_allreduce(self, input_: torch.Tensor) -> bool:
+        if self._fi_workspace_hint is None:
+            return False
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            can_use_flashinfer_allreduce,
+        )
+
+        return can_use_flashinfer_allreduce(
+            input_,
+            use_attn_tp_group=(self._fi_workspace_hint == "attn_tp"),
+            expected_world_size=self.world_size,
+            expected_group_key=(self.device_group, self.cpu_group),
+        )
+
+    def _flashinfer_allreduce(self, input_: torch.Tensor) -> torch.Tensor:
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            flashinfer_allreduce as _flashinfer_allreduce_impl,
+        )
+
+        return _flashinfer_allreduce_impl(
+            input_, use_attn_tp_group=(self._fi_workspace_hint == "attn_tp")
+        )
+
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:
+        if outplace_all_reduce_method == "auto":
+            outplace_all_reduce_method = self._resolve_outplace_all_reduce_method(
+                input_
+            )
+            if outplace_all_reduce_method == "pymscclpp":
+                # pymscclpp reduces in place and returns its input; feed it a
+                # clone to honor the op's no-mutation contract.
+                input_ = input_.clone()
+            elif outplace_all_reduce_method is None:
+                # Force pynccl over the in-place fallback: it is graph-capture
+                # safe and NCCL is natively out-of-place, avoiding the clone
+                # the in-place fallback needs.
+                if self.pynccl_comm is not None:
+                    outplace_all_reduce_method = "pynccl"
+                else:
+                    out = input_.clone()
+                    self._all_reduce_in_place(out)
+                    return out
         ca_comm = self.ca_comm
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
@@ -927,7 +1129,10 @@ class GroupCoordinator:
             return False
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
-                ca_comm.reduce_scatter(input, output, registered=True)
+                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                    ca_comm.reduce_scatter(input, output, registered=False)
+                else:
+                    ca_comm.reduce_scatter(input, output, registered=True)
             elif is_in_tc_piecewise_cuda_graph():
                 ca_comm.reduce_scatter(input, output, registered=False)
             else:
@@ -938,7 +1143,12 @@ class GroupCoordinator:
         return True
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
-        torch.distributed.all_to_all_single(output, input, group=self.device_group)
+        # pynccl path keeps the a2a exchange CUDA-graph-capturable (DCP a2a backend).
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_to_all_single(output, input)
+        else:
+            torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
     def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
         if self.world_size == 1:
@@ -1832,7 +2042,7 @@ def graph_capture(stream=None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
-            for group in (_DCP, _MOE_EP, _MOE_TP):
+            for group in (_DCP, _ATTN_TP, _MOE_EP, _MOE_TP):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -1844,6 +2054,10 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
+# Read once at import: whether CustomAllReduceV2 is opted in on a multi-node
+# (MNNVL) group. Used on the all_reduce hot path (see GroupCoordinator).
+_CA_V2_MULTINODE = envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get()
+_ENABLE_FLASHINFER_ALLREDUCE_ONLY = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -1859,6 +2073,41 @@ def set_mscclpp_all_reduce(enable: bool):
 def set_torch_symm_mem_all_reduce(enable: bool):
     global _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
+
+
+def set_flashinfer_allreduce_only(enable: bool):
+    global _ENABLE_FLASHINFER_ALLREDUCE_ONLY
+    _ENABLE_FLASHINFER_ALLREDUCE_ONLY = enable
+
+
+def _tag_groups_for_flashinfer_allreduce_only():
+    """Stamp _fi_workspace_hint on the group coordinators that own a FlashInfer
+    fusion workspace, so all_reduce() can dispatch to flashinfer_allreduce()
+    without touching the call sites.
+
+    Only two workspaces exist (see ``_get_workspace_manager``): one for
+    attention TP and one for MoE. A group may only be tagged for the workspace
+    that was rendezvoused on its own peers -- reducing over a workspace built
+    for a different set of peers silently returns wrong data.
+
+    - ``_TP`` is deliberately absent: it *is* ``_ATTN_TP`` when
+      ``attn_tp_size == tp_size``, and a strict superset of it otherwise (DP
+      attention), where the attention workspace addresses the wrong peers.
+    - The MoE workspace rendezvouses on the EP group when ``moe_ep_size > 1``
+      and on the MoE-TP group otherwise, so exactly one of ``_MOE_EP`` /
+      ``_MOE_TP`` is eligible. Tagging both makes a MoE-TP allreduce reduce
+      across the EP peers under hybrid EP+TP (e.g. tp=4, ep=2).
+    """
+    if not _ENABLE_FLASHINFER_ALLREDUCE_ONLY:
+        return
+
+    moe_group = _MOE_EP if (_MOE_EP is not None and _MOE_EP.world_size > 1) else _MOE_TP
+    # Attention is tagged last on purpose: when a coordinator backs both roles
+    # (e.g. _ATTN_TP is _MOE_EP is _TP at tp=4, ep=4) either workspace spans the
+    # same peers and is correct, so we just pick one deterministically.
+    for group, hint in ((moe_group, "moe"), (_ATTN_TP, "attn_tp")):
+        if group is not None:
+            group._fi_workspace_hint = hint
 
 
 # TODO: refactor in-tree platforms to get rid of this wrapper
@@ -1960,17 +2209,6 @@ def init_distributed_environment(
         distributed_init_method,
         backend,
     )
-    if "mooncake" in backend:
-        try:
-            from mooncake import ep as mooncake_ep
-        except ImportError as e:
-            raise ImportError(
-                "Please install mooncake by following the instructions at "
-                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
-                "to run SGLang with Mooncake Backend."
-            ) from e
-        mooncake_ep.set_host_ip(get_local_ip_auto())
-
     if not torch.distributed.is_initialized():
         global _MODEL_PARALLEL_GROUP_TIMEOUT
         assert distributed_init_method is not None, (
@@ -1985,7 +2223,7 @@ def init_distributed_environment(
         _MODEL_PARALLEL_GROUP_TIMEOUT = timeout
 
         if backend == "mooncake":
-            from mooncake.ep import MooncakeBackendOptions
+            from mooncake.pg import MooncakeBackendOptions
 
             use_max_ws = max_world_size and max_world_size > world_size
             ar_size = max_world_size if use_max_ws else world_size
@@ -2276,7 +2514,6 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
-            use_mscclpp_allreduce=False,
             use_custom_allreduce=False,
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),

@@ -58,12 +58,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP, _is_hip
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import (
-    get_forward,
-    get_parallel,
-    get_server_args,
-    get_stream,
-)
+from sglang.srt.runtime_context import get_device, get_forward, get_parallel, get_stream
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -529,7 +524,7 @@ class BailingMoELinearAttention(nn.Module):
             base=self.rope_theta,
             rope_scaling=config.rope_scaling,
             is_neox_style=True,
-            device=get_server_args().device,
+            device=get_device().device,
             dtype=torch.float32,
         )
 
@@ -690,7 +685,7 @@ class BailingMoEAttention(nn.Module):
             max_position=self.max_position_embeddings,
             base=self.rope_theta,
             rope_scaling=config.rope_scaling,
-            device=get_server_args().device,
+            device=get_device().device,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -1089,7 +1084,7 @@ class BailingMoELinearForCausalLM(nn.Module):
                     config.hidden_size,
                     params_dtype=torch.float32,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
             )
             self.logits_processor = LogitsProcessor(config)

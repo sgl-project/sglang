@@ -53,9 +53,9 @@ jobs:
         id: select-workflows
         run: |
           if [[ -n "${{ inputs.job_filter }}" ]]; then
-            echo "workflows=pr-test-amd.yml" >> "$GITHUB_OUTPUT"
+            echo "workflows=pr-test-amd-rocm720.yml" >> "$GITHUB_OUTPUT"
           else
-            echo "workflows=pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml" >> "$GITHUB_OUTPUT"
+            echo "workflows=pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml,nightly-amd-mi355x-disagg.yml" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Fetch Actions data snapshot
@@ -106,7 +106,7 @@ jobs:
           python scripts/ci/utils/query_job_status.py \
             --repo ${{ github.repository }} \
             --job "${{ inputs.job_filter }}" \
-            --workflow "pr-test-amd.yml" \
+            --workflow "pr-test-amd-rocm720.yml" \
             --hours ${{ inputs.hours || '24' }} \
             --input-data-file ci-data/actions-job-snapshot.json \
             --summary
@@ -119,8 +119,9 @@ jobs:
     outputs:
       pr_jobs: ${{ steps.parse.outputs.pr_jobs }}
       nightly_jobs: ${{ steps.parse.outputs.nightly_jobs }}
-      pr_rocm720_jobs: ${{ steps.parse.outputs.pr_rocm720_jobs }}
-      nightly_rocm720_jobs: ${{ steps.parse.outputs.nightly_rocm720_jobs }}
+      pr_rocm700_jobs: ${{ steps.parse.outputs.pr_rocm700_jobs }}
+      nightly_rocm700_jobs: ${{ steps.parse.outputs.nightly_rocm700_jobs }}
+      disagg_jobs: ${{ steps.parse.outputs.disagg_jobs }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -128,37 +129,46 @@ jobs:
       - name: Parse workflow files
         id: parse
         run: |
-          # Parse pr-test-amd.yml and extract job names (exclude utility jobs)
-          # Excluded: call-gate, check-changes, pr-test-amd-finish, cancel, check-all-jobs
-          pr_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-amd.yml | \
-            grep -v -E '^(call-gate|check-changes|pr-test-amd-finish|cancel|check-all-jobs)$' | \
+          # Parse the default ROCm 7.2 PR gate (exclude utility jobs)
+          # Excluded: call-gate, check-changes, finish, cancel, check-all-jobs
+          pr_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-amd-rocm720.yml | \
+            grep -v -E '^(call-gate|check-changes|pr-test-amd-rocm720-finish|cancel|check-all-jobs)$' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "pr_jobs=$pr_jobs" >> $GITHUB_OUTPUT
           echo "PR jobs: $pr_jobs"
 
-          # Parse nightly-test-amd.yml and extract job names (exclude utility jobs)
+          # Parse the default ROCm 7.2 nightly (exclude utility jobs)
           # Excluded: check-all-jobs
-          nightly_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/nightly-test-amd.yml | \
+          nightly_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/nightly-test-amd-rocm720.yml | \
             grep -v -E '^(check-all-jobs)$' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "nightly_jobs=$nightly_jobs" >> $GITHUB_OUTPUT
           echo "Nightly jobs: $nightly_jobs"
 
-          # Parse pr-test-amd-rocm720.yml (exclude utility jobs)
-          # Excluded: call-gate, check-changes, pr-test-amd-finish, cancel, check-all-jobs
-          pr_rocm720_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-amd-rocm720.yml | \
+          # Parse the ROCm 7.0 rollback shadow (exclude utility jobs)
+          # Excluded: call-gate, check-changes, finish, cancel, check-all-jobs
+          pr_rocm700_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-amd.yml | \
             grep -v -E '^(call-gate|check-changes|pr-test-amd-finish|cancel|check-all-jobs)$' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
-          echo "pr_rocm720_jobs=$pr_rocm720_jobs" >> $GITHUB_OUTPUT
-          echo "PR ROCm 7.2 jobs: $pr_rocm720_jobs"
+          echo "pr_rocm700_jobs=$pr_rocm700_jobs" >> $GITHUB_OUTPUT
+          echo "PR ROCm 7.0 shadow jobs: $pr_rocm700_jobs"
 
-          # Parse nightly-test-amd-rocm720.yml (exclude utility jobs)
+          # Parse the ROCm 7.0 rollback shadow nightly (exclude utility jobs)
           # Excluded: check-all-jobs
-          nightly_rocm720_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/nightly-test-amd-rocm720.yml | \
+          nightly_rocm700_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/nightly-test-amd.yml | \
             grep -v -E '^(check-all-jobs)$' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
-          echo "nightly_rocm720_jobs=$nightly_rocm720_jobs" >> $GITHUB_OUTPUT
-          echo "Nightly ROCm 7.2 jobs: $nightly_rocm720_jobs"
+          echo "nightly_rocm700_jobs=$nightly_rocm700_jobs" >> $GITHUB_OUTPUT
+          echo "Nightly ROCm 7.0 shadow jobs: $nightly_rocm700_jobs"
+
+          # Parse nightly-amd-mi355x-disagg.yml (exclude utility jobs)
+          # Excluded: setup, collect-results -- both run on ubuntu-latest and the
+          # snapshot only keeps self-hosted jobs, so they would report as empty.
+          disagg_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/nightly-amd-mi355x-disagg.yml | \
+            grep -v -E '^(setup|collect-results)$' | \
+            jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "disagg_jobs=$disagg_jobs" >> $GITHUB_OUTPUT
+          echo "MI355X disagg jobs: $disagg_jobs"
 
   # PR CI reports using dynamic matrix
   pr-ci-reports:
@@ -194,7 +204,7 @@ jobs:
           python scripts/ci/utils/query_job_status.py \
             --repo ${{ github.repository }} \
             --job "${{ matrix.job_name }}" \
-            --workflow "pr-test-amd.yml" \
+            --workflow "pr-test-amd-rocm720.yml" \
             --hours ${{ inputs.hours || '24' }} \
             --input-data-file ci-data/actions-job-snapshot.json \
             --summary
@@ -233,21 +243,99 @@ jobs:
           python scripts/ci/utils/query_job_status.py \
             --repo ${{ github.repository }} \
             --job "${{ matrix.job_name }}" \
+            --workflow "nightly-test-amd-rocm720.yml" \
+            --hours ${{ inputs.hours || '24' }} \
+            --input-data-file ci-data/actions-job-snapshot.json \
+            --summary
+
+  # ROCm 7.0 rollback-shadow reports using dynamic matrix
+  pr-rocm700-ci-reports:
+    name: PR ROCm700 Shadow - ${{ matrix.job_name }}
+    needs: [parse-workflows, fetch-actions-data]
+    if: ${{ !inputs.job_filter }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        job_name: ${{ fromJson(needs.parse-workflows.outputs.pr_rocm700_jobs) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install tabulate
+
+      - name: Download Actions data snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: ci-data
+
+      - name: Generate PR ROCm 7.0 Shadow Report
+        timeout-minutes: 15
+        run: |
+          python scripts/ci/utils/query_job_status.py \
+            --repo ${{ github.repository }} \
+            --job "${{ matrix.job_name }}" \
+            --workflow "pr-test-amd.yml" \
+            --hours ${{ inputs.hours || '24' }} \
+            --input-data-file ci-data/actions-job-snapshot.json \
+            --summary
+
+  # ROCm 7.0 rollback-shadow nightly reports using dynamic matrix
+  nightly-rocm700-reports:
+    name: Nightly ROCm700 Shadow - ${{ matrix.job_name }}
+    needs: [parse-workflows, fetch-actions-data]
+    if: ${{ !inputs.job_filter }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        job_name: ${{ fromJson(needs.parse-workflows.outputs.nightly_rocm700_jobs) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install tabulate
+
+      - name: Download Actions data snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: ci-data
+
+      - name: Generate Nightly ROCm 7.0 Shadow Report
+        timeout-minutes: 15
+        run: |
+          python scripts/ci/utils/query_job_status.py \
+            --repo ${{ github.repository }} \
+            --job "${{ matrix.job_name }}" \
             --workflow "nightly-test-amd.yml" \
             --hours ${{ inputs.hours || '24' }} \
             --input-data-file ci-data/actions-job-snapshot.json \
             --summary
 
-  # PR ROCm 7.2 CI reports using dynamic matrix
-  pr-rocm720-ci-reports:
-    name: PR ROCm720 - ${{ matrix.job_name }}
+  # MI355X 2N 1P1D disagg nightly reports using dynamic matrix
+  nightly-disagg-reports:
+    name: Nightly MI355X Disagg - ${{ matrix.job_name }}
     needs: [parse-workflows, fetch-actions-data]
     if: ${{ !inputs.job_filter }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        job_name: ${{ fromJson(needs.parse-workflows.outputs.pr_rocm720_jobs) }}
+        job_name: ${{ fromJson(needs.parse-workflows.outputs.disagg_jobs) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -266,52 +354,13 @@ jobs:
           name: actions-job-snapshot
           path: ci-data
 
-      - name: Generate PR ROCm 7.2 Report
+      - name: Generate MI355X Disagg Report
         timeout-minutes: 15
         run: |
           python scripts/ci/utils/query_job_status.py \
             --repo ${{ github.repository }} \
             --job "${{ matrix.job_name }}" \
-            --workflow "pr-test-amd-rocm720.yml" \
-            --hours ${{ inputs.hours || '24' }} \
-            --input-data-file ci-data/actions-job-snapshot.json \
-            --summary
-
-  # Nightly ROCm 7.2 reports using dynamic matrix
-  nightly-rocm720-reports:
-    name: Nightly ROCm720 - ${{ matrix.job_name }}
-    needs: [parse-workflows, fetch-actions-data]
-    if: ${{ !inputs.job_filter }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        job_name: ${{ fromJson(needs.parse-workflows.outputs.nightly_rocm720_jobs) }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install dependencies
-        run: pip install tabulate
-
-      - name: Download Actions data snapshot
-        uses: actions/download-artifact@v4
-        with:
-          name: actions-job-snapshot
-          path: ci-data
-
-      - name: Generate Nightly ROCm 7.2 Report
-        timeout-minutes: 15
-        run: |
-          python scripts/ci/utils/query_job_status.py \
-            --repo ${{ github.repository }} \
-            --job "${{ matrix.job_name }}" \
-            --workflow "nightly-test-amd-rocm720.yml" \
+            --workflow "nightly-amd-mi355x-disagg.yml" \
             --hours ${{ inputs.hours || '24' }} \
             --input-data-file ci-data/actions-job-snapshot.json \
             --summary
@@ -346,7 +395,7 @@ jobs:
           python scripts/ci/utils/query_job_status.py \
             --repo ${{ github.repository }} \
             --runner-report \
-            --workflow "pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml" \
+            --workflow "pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml,nightly-amd-mi355x-disagg.yml" \
             --hours ${{ inputs.hours || '24' }} \
             --input-data-file ci-data/actions-job-snapshot.json \
             --summary

@@ -7,6 +7,8 @@ from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectness
 from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
+from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
+from sglang.test.kits.spec_server_kits import SpecGrammarKit
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -14,7 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-large")
 
 TARGET_MODEL = "Qwen/Qwen3-14B"
 DRAFT_MODEL = "deepseek-ai/dspark_qwen3_14b_block7"
@@ -34,6 +36,8 @@ class TestBasicSanityDSpark(
     BasicSchedulerStressMixin,
     FwdOccupancyMixin,
     GSM8KMixin,
+    JSONConstrainedMixin,
+    SpecGrammarKit,
     CustomTestCase,
 ):
     served_model_name = TARGET_MODEL
@@ -83,6 +87,10 @@ class TestBasicSanityDSpark(
                 "SGLANG_RAGGED_VERIFY_MODE": "compact",
             },
         )
+
+    @unittest.skip("DSPARK rejects return_logprob at admission")
+    def test_grammar_logprob_count_matches_completion_tokens(self):
+        pass
 
     @classmethod
     def tearDownClass(cls):

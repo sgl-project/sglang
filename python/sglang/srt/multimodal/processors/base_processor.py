@@ -19,9 +19,19 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal.cache import (
+    MultimodalPreprocessCache,
+    build_processor_fingerprint,
+)
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    MM_FEATURE_CACHE_SIZE,
+    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+    MmItemMemoryPool,
+    get_mm_feature_pool_size_per_worker,
+)
 from sglang.srt.utils import (
+    CLIENT_MEDIA_EXCEPTIONS,
     envs,
     is_cpu,
     is_npu,
@@ -31,19 +41,10 @@ from sglang.srt.utils import (
     load_video,
     logger,
 )
-from sglang.srt.utils.cuda_ipc_transport_utils import (
-    MM_FEATURE_CACHE_SIZE,
-    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-    CudaIpcTensorTransportProxy,
-    MmItemMemoryPool,
-    get_mm_feature_pool_size_per_worker,
-)
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
-
-_IPC_POOL_HANDLE_CACHE = envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
 
 
 @dataclasses.dataclass
@@ -181,8 +182,14 @@ class MultimodalSpecialTokens:
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
+    prefer_tokenized_input = False
+    precompute_hash_before_cpu_transfer = False
+    # Set by processors that already build input_ids from the request's own
+    # tokens, so the retokenize-avoidance rebuild below has nothing to add.
+    preserve_processor_input_ids = False
     auto_mm_processor_worker_num = 1
     auto_mm_io_worker_num = 4
+    auto_mm_preprocess_cache_size_mb = 0
     supports_mm_processor_concurrency = False
 
     def __init__(
@@ -192,23 +199,65 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
-        self.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
         configured_mm_feature_transport = getattr(
             server_args, "mm_feature_transport", "cpu"
         )
         self.mm_feature_transport = (
             configured_mm_feature_transport
-            if configured_mm_feature_transport in ("cpu", "cuda_ipc")
+            if configured_mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm")
             else "cpu"
         )
         self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
-        self.disable_fast_image_processor = server_args.disable_fast_image_processor
+        self.use_ipc_pool_handle_cache = (
+            self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
+        )
+        self.image_processor_backend = getattr(
+            server_args, "image_processor_backend", "auto"
+        )
+        if getattr(server_args, "disable_fast_image_processor", False):
+            self.image_processor_backend = "pil"
+        self.disable_fast_image_processor = self.image_processor_backend == "pil"
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
 
         mm_process_config = self.server_args.mm_process_config
         self.image_config = mm_process_config.get("image", {})
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
+
+        requested_cache_mb = getattr(
+            self.server_args, "mm_preprocess_cache_size_mb", None
+        )
+        total_cache_mb = (
+            self.auto_mm_preprocess_cache_size_mb
+            if requested_cache_mb is None
+            else requested_cache_mb
+        )
+        tokenizer_worker_num = max(
+            int(getattr(self.server_args, "tokenizer_worker_num", 1)), 1
+        )
+        worker_cache_bytes = total_cache_mb * 1024 * 1024 // tokenizer_worker_num
+        self.mm_preprocess_cache = MultimodalPreprocessCache(
+            max_size_bytes=worker_cache_bytes,
+            max_entries=8192,
+        )
+        self.trust_mm_content_hashes = bool(
+            getattr(self.server_args, "trust_mm_content_hashes", False)
+        )
+        self.processor_fingerprint = (
+            build_processor_fingerprint(self, hf_config, server_args)
+            if self.mm_preprocess_cache.enabled
+            else None
+        )
+        if self.mm_preprocess_cache.enabled:
+            logger.info(
+                "Multimodal preprocess cache enabled for %s: %d MiB total "
+                "(%d MiB per tokenizer worker), at most 8192 entries; "
+                "caller content hashes are %s.",
+                type(self).__name__,
+                total_cache_mb,
+                worker_cache_bytes // (1024 * 1024),
+                "trusted" if self.trust_mm_content_hashes else "verified",
+            )
 
         # Resolve tokenizer: some processors (e.g. InternVL) pass a tokenizer
         # directly as _processor rather than a processor that wraps a tokenizer.
@@ -284,8 +333,11 @@ class BaseMultimodalProcessor(ABC):
                 self.mm_processor_worker_num,
                 "auto" if requested_mm_processor_worker_num == 0 else "explicit",
             )
+        cpu_worker_start_method = (
+            "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
+        )
         self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
-            mp_context=mp.get_context("fork"),
+            mp_context=mp.get_context(cpu_worker_start_method),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
         )
 
@@ -356,7 +408,36 @@ class BaseMultimodalProcessor(ABC):
                 per_worker_pool_size,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
                 self.server_args.base_gpu_id,
+                self.server_args.tp_size,
             )
+
+    @property
+    def keep_mm_features_on_device(self) -> bool:
+        return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm")
+
+    def preprocess_fingerprint_payload(self) -> dict[str, Any]:
+        """Stable processor choices that may change per-media artifacts."""
+        return {
+            "wrapper_class": (
+                f"{type(self._processor).__module__}."
+                f"{type(self._processor).__qualname__}"
+            ),
+            "gpu_image_decode": self.gpu_image_decode,
+            "image_config": self.image_config,
+            "video_config": self.video_config,
+            "audio_config": self.audio_config,
+        }
+
+    def clear_preprocess_cache(self) -> None:
+        self.mm_preprocess_cache.clear()
+
+    def shutdown(self) -> None:
+        """Release executor resources and cached CPU artifacts."""
+        self.clear_preprocess_cache()
+        self.io_executor.shutdown(wait=False, cancel_futures=True)
+        self.cpu_executor.shutdown(wait=False, cancel_futures=True)
+        if self.mm_processor_executor is not None:
+            self.mm_processor_executor.shutdown()
 
     def compute_mrope_positions(self, input_ids, mm_items):
         """Compute M-RoPE positions from expanded input_ids and multimodal items.
@@ -482,6 +563,53 @@ class BaseMultimodalProcessor(ABC):
             return self._processor, self._tokenizer
         return processor, processor.tokenizer
 
+    def _fast_image_processor_device(self, processor) -> Optional[str]:
+        """The device for the fast image processor, or None to leave it unset.
+
+        Resolved from this processor's own ``server_args``: engines sharing a
+        tokenizer process each carry their own ``base_gpu_id``.
+        """
+        server_args = self.server_args
+        if _is_cpu or server_args.rl_on_policy_target is not None:
+            return "cpu"
+        if _is_xpu:
+            return "xpu"
+        if not _is_npu:
+            return f"cuda:{server_args.base_gpu_id}"
+        if processor.__class__.__name__ == "MiniMaxVLProcessor":
+            # MiniMax's image/video processors create 10-dim tensors during
+            # patch extraction, exceeding the Ascend 8-dim limit; patch them
+            # (same pattern as qwen-vl / GLM-4.6V) and run on NPU.
+            from sglang.srt.hardware_backend.npu.modules.minimax_m3_processor import (
+                npu_apply_minimax_m3_image_preprocess_patch,
+                npu_apply_minimax_m3_video_preprocess_patch,
+            )
+
+            npu_apply_minimax_m3_image_preprocess_patch(processor.image_processor)
+            if (
+                hasattr(processor, "video_processor")
+                and processor.video_processor is not None
+            ):
+                npu_apply_minimax_m3_video_preprocess_patch(processor.video_processor)
+            return "npu"
+        if processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
+            # For qwen-vl, the processor hits a reshape issue from the Ascend
+            # dims restriction.
+            from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
+                npu_apply_qwen_image_preprocess_patch,
+            )
+
+            npu_apply_qwen_image_preprocess_patch()
+            return "npu"
+        if processor.__class__.__name__ == "Glm46VProcessor":
+            from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
+                npu_apply_glm46v_image_preprocess_patch,
+            )
+
+            npu_apply_glm46v_image_preprocess_patch()
+            return "npu"
+        return None
+
     def process_mm_data(
         self,
         input_text,
@@ -489,6 +617,7 @@ class BaseMultimodalProcessor(ABC):
         videos=None,
         audios=None,
         processor=None,
+        processor_video_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> dict:
         """
@@ -502,8 +631,13 @@ class BaseMultimodalProcessor(ABC):
                 kwargs.setdefault("images_kwargs", {}).update(self.image_config)
         if videos:
             kwargs["videos"] = videos
-            if self.video_config:
-                kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
+            video_config = (
+                self.video_config
+                if processor_video_config is None
+                else processor_video_config
+            )
+            if video_config:
+                kwargs.setdefault("videos_kwargs", {}).update(video_config)
         if audios:
             if processor.__class__.__name__ in {
                 "Gemma3nProcessor",
@@ -528,31 +662,9 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessor)
             and not self.disable_fast_image_processor
         ):
-            if _is_cpu or get_server_args().rl_on_policy_target is not None:
-                kwargs["device"] = "cpu"
-            elif _is_xpu:
-                kwargs["device"] = "xpu"
-            elif not _is_npu:
-                base_gpu_id = get_server_args().base_gpu_id
-                kwargs["device"] = f"cuda:{base_gpu_id}"
-            elif processor.__class__.__name__ not in {
-                "Glm4vProcessor",
-                "Glm46VProcessor",
-            }:
-                # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
-                from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
-                    npu_apply_qwen_image_preprocess_patch,
-                )
-
-                npu_apply_qwen_image_preprocess_patch()
-                kwargs["device"] = "npu"
-            elif processor.__class__.__name__ == "Glm46VProcessor":
-                from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
-                    npu_apply_glm46v_image_preprocess_patch,
-                )
-
-                npu_apply_glm46v_image_preprocess_patch()
-                kwargs["device"] = "npu"
+            device = self._fast_image_processor_device(processor)
+            if device is not None:
+                kwargs["device"] = device
 
         # Avoid double BOS when the chat template already wrote one.
         if self._tokenizer_auto_adds_specials and isinstance(input_text, str):
@@ -566,16 +678,18 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        if not self.keep_mm_feature_on_device:
+        # Deferred: the hash is computed on the GPU tensor first, and
+        # _precompute_hashes_before_cpu_transfer moves it down afterwards.
+        if (
+            not self.keep_mm_features_on_device
+            and not self.precompute_hash_before_cpu_transfer
+        ):
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
-                if self.use_cuda_ipc:
-                    pass
-                else:
-                    if feature_name in result and isinstance(
-                        result[feature_name], torch.Tensor
-                    ):
-                        result[feature_name] = result[feature_name].to("cpu")
+                if feature_name in result and isinstance(
+                    result[feature_name], torch.Tensor
+                ):
+                    result[feature_name] = result[feature_name].to("cpu")
 
         return result
 
@@ -646,8 +760,7 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
-        except ValueError as e:
-            # Bad input (e.g. invalid base64) -> 400, not 500.
+        except CLIENT_MEDIA_EXCEPTIONS as e:
             data_str = str(data)
             if len(data_str) > 100:
                 data_str = data_str[:100] + "..."
@@ -889,7 +1002,6 @@ class BaseMultimodalProcessor(ABC):
         discard_alpha_channel: bool = True,
         audio_sample_rate: Optional[int] = None,
     ) -> BaseMultiModalProcessorOutput:
-
         BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
 
         input_ids = prompt if isinstance(prompt, list) else None
@@ -1013,6 +1125,17 @@ class BaseMultimodalProcessor(ABC):
         for modality, idx, future in futures:
             try:
                 result = await asyncio.wrap_future(future)
+            except ValueError as e:
+                logger.info(
+                    "[load_mm_data(simple)] invalid %s data at index=%d: %s",
+                    modality.name,
+                    idx,
+                    e,
+                )
+                raise ValueError(
+                    f"An exception occurred while loading {modality.name} data "
+                    f"at index {idx}: {e}"
+                ) from e
             except Exception as e:
                 logger.exception(
                     "[load_mm_data(simple)] error loading %s data at index=%d",
@@ -1154,6 +1277,10 @@ class BaseMultimodalProcessor(ABC):
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
                 )
+            except ValueError as e:
+                raise ValueError(
+                    f"An exception occurred while loading multimodal data: {e}"
+                ) from e
             except Exception as e:
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
@@ -1325,26 +1452,35 @@ class BaseMultimodalProcessor(ABC):
         if not tensor.is_cuda:
             return tensor
 
-        sync_flag, available_slice, byte_offset = (
-            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(tensor)
+        proxy = self.cudaipc_mmfeature_pool.wrap_tensor(
+            tensor,
+            use_pool_handle_cache=self.use_ipc_pool_handle_cache,
         )
-        if isinstance(available_slice, torch.Tensor):
-            available_slice.copy_(tensor.view(torch.int8).view(-1), non_blocking=True)
-            return CudaIpcTensorTransportProxy(
-                data=available_slice,
-                info_data=tensor,
-                sync_buffer_meta=sync_flag,
-                pool_ipc_handle=(
-                    self.cudaipc_mmfeature_pool._pool_ipc_handle
-                    if _IPC_POOL_HANDLE_CACHE
-                    else None
-                ),
-                pool_byte_offset=byte_offset,
-                pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
-            )
-        if self.keep_mm_feature_on_device:
-            return tensor
-        return tensor.cpu()
+        return proxy if proxy is not None else tensor.cpu()
+
+    @staticmethod
+    def _move_feature_to_cpu(value):
+        if isinstance(value, torch.Tensor):
+            return value.cpu()
+        if isinstance(value, list):
+            return [BaseMultimodalProcessor._move_feature_to_cpu(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(BaseMultimodalProcessor._move_feature_to_cpu(v) for v in value)
+        return value
+
+    def _precompute_hashes_before_cpu_transfer(
+        self, mm_items: List[MultimodalDataItem]
+    ) -> None:
+        if not self.precompute_hash_before_cpu_transfer:
+            return
+
+        for item in mm_items:
+            item.set_pad_value()
+            if not self.keep_mm_features_on_device:
+                item.feature = self._move_feature_to_cpu(item.feature)
+                item.precomputed_embeddings = self._move_feature_to_cpu(
+                    item.precomputed_embeddings
+                )
 
     def resolve_image_token_counts(self, images: List) -> List[int]:
         """Per-image expanded token counts, computed without re-tokenizing.
@@ -1458,6 +1594,7 @@ class BaseMultimodalProcessor(ABC):
             # Drift happens when Retokenization is not identity: Decode(X) => String => Re-tokenize => Y, X != Y.
             if (
                 envs.SGLANG_MM_AVOID_RETOKENIZE.get()
+                and not self.preserve_processor_input_ids
                 and base_output.input_ids is not None
                 and input_ids is not None
                 and raw_images
@@ -1564,14 +1701,10 @@ class BaseMultimodalProcessor(ABC):
             ):
                 item.set_pad_value()
 
-        """
-        solution for cuda-ipc memory-leak:
-        1. memory-pool:  each time get a slice from memory-pool and use it as transport-data (with async lock guard)
-        2. if can not get a slice , transport normal tensor
-        3. copy tensor in scheduler and release it (use position mark)
-        4. copy
-        """
+        self._precompute_hashes_before_cpu_transfer(all_collected_items)
 
+        # Wrap GPU features in the bounded IPC pool; pool misses fall back to a
+        # plain CPU tensor. The scheduler copies out and releases each slice.
         if self.use_cuda_ipc:
             # post-process, prepare for cuda-ipc transfer
             for item in all_collected_items:
