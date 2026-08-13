@@ -319,13 +319,14 @@ fn merge_template_stops(request: &mut CreateChatCompletionRequest, formatter: &C
 /// Where an omitted `temperature` / `top_p` gets its value. Mirrors Python's
 /// `to_sampling_params` priority: user value > model generation_config (when
 /// `--sampling-defaults model`) > OpenAI terminal default
-/// (`_DEFAULT_SAMPLING_PARAMS`: chat uses 1.0/1.0).
+/// (`_DEFAULT_SAMPLING_PARAMS`, which differs per endpoint: chat 1.0/1.0,
+/// responses 0.7/1.0).
 pub(super) struct SamplingDefaults {
     /// Model defaults; `None` when the model config doesn't set them or when
     /// `--sampling-defaults openai` (the Python dump is then empty).
     temperature: Option<f64>,
     top_p: Option<f64>,
-    /// OpenAI terminal defaults for chat completions.
+    /// OpenAI terminal defaults for this endpoint.
     fallback_temperature: f64,
     fallback_top_p: f64,
 }
@@ -338,6 +339,14 @@ impl SamplingDefaults {
         fallback_temperature: 1.0,
         fallback_top_p: 1.0,
     };
+    /// `protocol.py` responses `_DEFAULT_SAMPLING_PARAMS`: temperature 0.7, top_p 1.0.
+    pub(super) const RESPONSES: SamplingDefaults = SamplingDefaults {
+        temperature: None,
+        top_p: None,
+        fallback_temperature: 0.7,
+        fallback_top_p: 1.0,
+    };
+
     /// The resolved model defaults (empty in `--sampling-defaults openai`
     /// mode), which slot between the user's values and the OpenAI terminals.
     pub(super) fn with_model_defaults(
@@ -895,6 +904,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sampling.temperature, 1.0);
+        assert_eq!(sampling.top_p, 1.0);
+    }
+
+    /// The responses endpoint has its own OpenAI terminal default (0.7), from
+    /// `protocol.py` `_DEFAULT_SAMPLING_PARAMS` — 1.0 must not leak in.
+    #[test]
+    fn responses_terminal_default_is_0_7_not_1_0() {
+        let openai_mode = DefaultSamplingParams::default();
+        let sampling = chat_sampling_params(
+            &request(),
+            &SamplingDefaults::RESPONSES.with_model_defaults(&openai_mode),
+        )
+        .unwrap();
+        assert_eq!(sampling.temperature, 0.7);
         assert_eq!(sampling.top_p, 1.0);
     }
 

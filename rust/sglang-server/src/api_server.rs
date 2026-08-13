@@ -22,7 +22,7 @@ use crate::tokenizer_manager::ActivityCounter;
 use crate::tokenizer_manager::Senders;
 
 /// Shared handler state: submission handles, immutable server configuration,
-/// and the API-owned chat formatter.
+/// and API-owned formatter state.
 #[derive(Clone)]
 struct AppState {
     senders: Senders,

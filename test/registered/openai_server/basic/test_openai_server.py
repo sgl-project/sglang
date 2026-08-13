@@ -948,6 +948,25 @@ The SmartHome Mini is a compact smart home assistant available in black or white
         assert isinstance(getattr(models[0], "max_model_len", None), int)
 
 
+@unittest.skipUnless(
+    is_rust_server_built(),
+    "embedded rust server extension not built",
+)
+class TestOpenAIResponsesWithRust(TestOpenAICompletionWithRust):
+    """Run the existing text Responses tests through the Rust frontend."""
+
+    run_response = TestOpenAIServerv1Responses.run_response
+    run_response_stream = TestOpenAIServerv1Responses.run_response_stream
+    test_response = TestOpenAIServerv1Responses.test_response
+    test_response_stream = TestOpenAIServerv1Responses.test_response_stream
+    test_response_completion = TestOpenAIServerv1Responses.test_response_completion
+    test_response_completion_stream = (
+        TestOpenAIServerv1Responses.test_response_completion_stream
+    )
+    test_completion = None
+    test_completion_stream = None
+
+
 class TestOpenAIV1Rerank(CustomTestCase):
     @classmethod
     def setUpClass(cls):

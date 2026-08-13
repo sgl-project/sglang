@@ -16,6 +16,8 @@ mod chat;
 mod completions;
 mod models;
 mod reasoning;
+mod response_stream;
+mod responses;
 mod template;
 mod tools;
 
@@ -37,10 +39,11 @@ pub(super) fn routes() -> Router<AppState> {
         .merge(models::routes())
         .merge(completions::routes())
         .merge(chat::routes())
+        .merge(responses::routes())
 }
 
-/// Resolve the chat formatter, or `None` to disable the OpenAI chat-completions
-/// endpoint. Tokenization is the tokenizer pool's job (the api server never
+/// Resolve the chat formatter, or `None` to disable the OpenAI chat/responses
+/// endpoints. Tokenization is the tokenizer pool's job (the api server never
 /// encodes); the formatter needs at most `tokenizer_config.json` — a built-in
 /// `--chat-template` name or a model-path-inferred legacy template resolve
 /// without it, so its absence must not disable chat.
