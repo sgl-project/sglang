@@ -201,15 +201,15 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
-        op="gemm.dsv3_router_gemm",
+        op="gemm.tiny_gemm",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.dsv3_router_gemm:dsv3_router_gemm",
+        target="sglang.kernels.ops.gemm.tiny_gemm:tiny_gemm_bf16",
         capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
-            description="DeepSeek-V3 router GEMM; num_tokens in [1, 16]",
+            description="skinny [m, k] @ [n, k].T with m in [1, max_m]; serves MoE routers and gate projections",
         ),
-        description="DeepSeek-V3 router GEMM (sglang.kernels.jit, JIT-only).",
+        description="Tiny bf16 GEMM (sglang.kernels.jit, JIT-only).",
     )
 )
 
@@ -249,17 +249,19 @@ def dsv3_fused_a_gemm(
     return get_kernel("gemm.dsv3_fused_a_gemm", KernelBackend.AOT)(mat_a, mat_b, output)
 
 
-def dsv3_router_gemm(
-    hidden_states: torch.Tensor,
-    router_weights: torch.Tensor,
+# NOTE: named after the kernel entry, not the op -- a bare `tiny_gemm` here would
+# be shadowed by the submodule of the same name as soon as it is imported.
+def tiny_gemm_bf16(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
     out_dtype: Optional[torch.dtype] = None,
-    output: Optional[torch.Tensor] = None,
+    max_m: int = 16,
 ) -> torch.Tensor:
-    """DeepSeek-V3 router GEMM (JIT-backed). ``out_dtype`` defaults to bfloat16."""
-    impl = get_kernel("gemm.dsv3_router_gemm", KernelBackend.JIT)
-    if out_dtype is None:
-        return impl(hidden_states, router_weights, output=output)
-    return impl(hidden_states, router_weights, out_dtype, output)
+    """Tiny bf16 GEMM ``x[m, k] @ w[n, k].T``, support bf16/fp32 out"""
+    impl = get_kernel("gemm.tiny_gemm", KernelBackend.JIT)
+    return impl(x, w, out, out_dtype=out_dtype, max_m=max_m)
 
 
 __all__ = [
@@ -267,7 +269,7 @@ __all__ = [
     "fp8_scaled_mm",
     "bmm_fp8",
     "dsv3_fused_a_gemm",
-    "dsv3_router_gemm",
+    "tiny_gemm_bf16",
 ]
 
 

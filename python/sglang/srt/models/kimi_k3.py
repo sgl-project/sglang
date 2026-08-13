@@ -1057,7 +1057,7 @@ class KimiK3MoE(nn.Module):
             topk_output, routed_input = routed_input
         else:
             # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
-            # or dsv3_router_gemm); non-CUDA falls back to F.linear (bf16). The
+            # or tiny_gemm_bf16); non-CUDA falls back to F.linear (bf16). The
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)

@@ -112,6 +112,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     _load_fused_indexer_wk,
 )
+from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.dots3_common.fp8 import per_token_group_quant_einsum_fp8
 from sglang.srt.runtime_context import (
     get_device,
@@ -126,7 +127,6 @@ from sglang.srt.utils import (
     ceil_align,
     ceil_div,
     get_bool_env_var,
-    get_device_sm,
     is_cuda,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
@@ -135,16 +135,15 @@ from sglang.srt.utils import (
 
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
-_device_sm = get_device_sm()
 
 # Import-time CUDA kernels would block processor imports on CPU CI.
 if _is_cuda:
     from sgl_kernel import merge_state_v2
 
-    from sglang.kernels.ops.gemm.dsv3_router_gemm import dsv3_router_gemm
+    from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 else:
     merge_state_v2 = None
-    dsv3_router_gemm = None
+    tiny_gemm_bf16 = None
 
 
 def _require_cuda() -> None:
@@ -259,17 +258,18 @@ class Dots3MoEGate(nn.Module):
             )
         else:
             self.e_score_correction_bias = None
+        self.tiny_router_gemm_max_tokens = tiny_router_gemm_max_tokens(
+            num_experts=config.n_routed_experts,
+            hidden_size=config.hidden_size,
+            weight_dtype=self.weight.dtype,
+        )
 
     def forward(self, hidden_states):
         # Use the fused router only for its tuned shapes.
-        if (
-            hidden_states.shape[0] <= 16
-            and hidden_states.shape[1] == 7168
-            and self.weight.shape[0] == 256
-            and _device_sm >= 90
-        ):
-            # router gemm output float32
-            logits = dsv3_router_gemm(hidden_states, self.weight)
+        if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
+            logits = tiny_gemm_bf16(
+                hidden_states, self.weight, max_m=self.tiny_router_gemm_max_tokens
+            )
         else:
             logits = F.linear(hidden_states, self.weight, None)
 
