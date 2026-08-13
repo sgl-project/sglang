@@ -297,6 +297,9 @@ class ServerArgs(DisaggServerArgsMixin):
     minimax_h3_adaln_cache_path: str | None = None
     # Rebuild AdaLN outputs per request from the checkpoint, no sidecar needed.
     minimax_h3_adaln_online: bool = False
+    # Widest timestep plan the rebuild slab is sized for; see
+    # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
+    minimax_h3_adaln_plan_width: int = 4
     # Per-component transformer weight overrides (key = model_index.json component name).
     # Pipelines use this when a checkpoint ships separate quantized weights for
     # secondary DiT components; the generic loader consumes it without model-specific
@@ -1508,6 +1511,17 @@ class ServerArgs(DisaggServerArgsMixin):
                 "request instead of keeping the 24.2 GiB of adaln_proj weights "
                 "resident. Works with any step count or schedule and needs no "
                 "prebuilt artifact. Requires unquantized weights."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-adaln-plan-width",
+            type=int,
+            default=ServerArgs.minimax_h3_adaln_plan_width,
+            help=(
+                "Widest timestep plan --minimax-h3-adaln-online sizes its slab "
+                "for. The default 4 covers every task; a deployment serving "
+                "only t2va (2) or fl2va (3) can shrink the slab proportionally. "
+                "A request exceeding it is rejected rather than truncated."
             ),
         )
         parser.add_argument(

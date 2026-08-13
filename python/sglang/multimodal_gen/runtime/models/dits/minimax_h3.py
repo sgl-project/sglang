@@ -812,7 +812,9 @@ class MiniMaxH3AdalnProj(nn.Module):
 
 # A ref2va request carrying both a visual and an audio reference reaches four
 # distinct timesteps in one step: video, audio, the imgvid condition and the
-# audio reference.
+# audio reference. That is the widest case, so it is the default; a deployment
+# serving only narrower tasks (t2va reaches 2, fl2va 3) can shrink the slab
+# proportionally via --minimax-h3-adaln-plan-width.
 MINIMAX_H3_ADALN_MAX_PLAN_WIDTH = 4
 
 
@@ -841,6 +843,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         model_variant: str | None = None,
         weight_files: list[str] | None = None,
         max_plans: int = 64,
+        max_plan_width: int = MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
     ) -> None:
         super().__init__()
         if (path is None) == (weight_files is None):
@@ -852,6 +855,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         self.model_variant = model_variant
         self.weight_files = weight_files
         self.max_plans = max_plans
+        self.max_plan_width = max_plan_width
         self.num_layers = arch.num_layers
         self.hidden_size = arch.hidden_size
         self.block_width = 6 * MINIMAX_H3_ADALN_MODALITY_NUM * arch.hidden_size
@@ -922,7 +926,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         length can never match. Breakable CUDA graph keys its replay signature
         on tensor pointers, so this is allocated once and only written in place.
         """
-        width = MINIMAX_H3_ADALN_MAX_PLAN_WIDTH
+        width = self.max_plan_width
         self.register_buffer(
             "plan_timesteps",
             torch.zeros((self.max_plans, width), dtype=_FP32_DTYPE, device=device),
@@ -989,6 +993,13 @@ class MiniMaxH3AdalnCache(nn.Module):
             raise ValueError(
                 f"MiniMax H3 AdaLN rebuild needs {len(missing)} plans but "
                 f"max_plans is {self.max_plans}"
+            )
+        widest = max(timesteps.numel() for timesteps in missing.values())
+        if widest > self.max_plan_width:
+            raise ValueError(
+                f"MiniMax H3 AdaLN rebuild hit a {widest}-timestep plan but the "
+                f"slab was allocated for {self.max_plan_width}; raise "
+                "--minimax-h3-adaln-plan-width (t2va needs 2, fl2va 3, ref2va 4)"
             )
 
         device = self.block_params.device
@@ -1450,6 +1461,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         adaln_cache_path: str | None = None,
         adaln_cache_model_variant: str | None = None,
         adaln_weight_files: list[str] | None = None,
+        adaln_plan_width: int = MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         if (
@@ -1540,6 +1552,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 path=adaln_cache_path,
                 model_variant=adaln_cache_model_variant,
                 weight_files=adaln_weight_files,
+                max_plan_width=adaln_plan_width,
             )
             if self._adaln_precomputed
             else None
