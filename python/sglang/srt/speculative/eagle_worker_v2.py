@@ -64,6 +64,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 )
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
+    _prune_draft_extend_logits,
 )
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
@@ -94,7 +95,6 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
-from sglang.srt.utils import require_gathered_buffer
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -192,11 +192,6 @@ def _use_aiter_draft_topk1(
         and hot_token_id is None
         and not use_rejection_sampling
     )
-
-
-def _prune_draft_extend_logits(server_args: ServerArgs) -> bool:
-    """Whether draft-extend may project only its selected row per request."""
-    return not require_gathered_buffer(server_args)
 
 
 logger = logging.getLogger(__name__)
@@ -982,9 +977,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 return_hidden_states_before_norm=False,
             )
 
-        # Prune before lm_head only when no gathered DP buffer requires all
+        # ROCm may prune before lm_head when no gathered DP buffer requires all
         # draft-window rows. The same spec_info field feeds eager and graph
-        # forwards; graph replay copies it into its static select-index buffer.
+        # forwards; other backends retain the established full-row path.
         prune_draft_extend_logits = _prune_draft_extend_logits(self.server_args)
         if prune_draft_extend_logits:
             forward_batch.spec_info.select_index = select_index

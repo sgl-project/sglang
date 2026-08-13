@@ -289,13 +289,27 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
     def test_draft_extend_pruning_and_graph_row_count_gates(self):
         server_args = object()
         with patch(
-            "sglang.srt.speculative.eagle_worker_v2.require_gathered_buffer",
+            "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner._is_hip",
+            True,
+        ), patch(
+            "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner.require_gathered_buffer",
             return_value=False,
         ):
             self.assertTrue(_prune_draft_extend_logits(server_args))
         with patch(
-            "sglang.srt.speculative.eagle_worker_v2.require_gathered_buffer",
+            "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner._is_hip",
+            True,
+        ), patch(
+            "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner.require_gathered_buffer",
             return_value=True,
+        ):
+            self.assertFalse(_prune_draft_extend_logits(server_args))
+        with patch(
+            "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner._is_hip",
+            False,
+        ), patch(
+            "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner.require_gathered_buffer",
+            return_value=False,
         ):
             self.assertFalse(_prune_draft_extend_logits(server_args))
 

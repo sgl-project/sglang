@@ -40,6 +40,7 @@ from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
+    is_hip,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -49,6 +50,14 @@ from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+
+_is_hip = is_hip()
+
+
+def _prune_draft_extend_logits(server_args) -> bool:
+    """Whether ROCm draft-extend may project only its selected request rows."""
+    return _is_hip and not require_gathered_buffer(server_args)
 
 
 @dataclass
@@ -103,9 +112,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
-        # Gathered-buffer modes size the DP logprob buffers for every draft
-        # window row and therefore cannot narrow the lm_head input to one row.
-        self.prune_draft_extend_logits = not self.require_gathered_buffer
+        # Keep non-ROCm backends on the established full-row path. On ROCm,
+        # gathered-buffer modes also require every draft-window row.
+        self.prune_draft_extend_logits = _prune_draft_extend_logits(
+            model_runner.server_args
+        )
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
