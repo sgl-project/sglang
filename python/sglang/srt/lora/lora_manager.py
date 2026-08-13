@@ -981,6 +981,12 @@ class LoRAManager:
             ):
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
+                    if module_name.startswith("model.meta_mlp."):
+                        raise ValueError(
+                            "LoRA on Intern-S2-Mobius model.meta_mlp routed banks "
+                            "is not supported by the baseline; remove routed-expert "
+                            "targets or use a future bank-aware LoRA implementation."
+                        )
                     # FusedMoE submodules outside the decoder layer hierarchy
                     # (e.g. nested helpers under non-".layers." prefixes) have
                     # no resolvable layer id; skip them so we don't index

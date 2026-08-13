@@ -487,7 +487,7 @@ class Hunyuan3D2DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         **kwargs,
     ):
         super().__init__(config=config, hf_config=hf_config or {}, **kwargs)
-        arch = config.arch_config
+        arch = self.config
 
         in_channels = arch.in_channels
         context_in_dim = arch.context_in_dim
@@ -501,7 +501,7 @@ class Hunyuan3D2DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         qkv_bias = arch.qkv_bias
         time_factor = arch.time_factor
         guidance_embed = arch.guidance_embed
-        supported_attention_backends = arch._supported_attention_backends
+        supported_attention_backends = self._supported_attention_backends
 
         self.in_channels = in_channels
         self.context_in_dim = context_in_dim

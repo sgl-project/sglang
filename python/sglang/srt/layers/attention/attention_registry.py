@@ -453,15 +453,29 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             else:
                 linear_attn_backend = Mamba2AttnBackend(runner)
         elif kimi_linear_config(runner.model_config) is not None:
-            linear_attn_backend = KDAAttnBackend(runner)
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.attention.ascend_kda_backend import (
+                    AscendKDAAttnBackend,
+                    AscendKDAHybridLinearAttnBackend,
+                )
+
+                linear_attn_backend = AscendKDAAttnBackend(runner)
+                hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
+            else:
+                linear_attn_backend = KDAAttnBackend(runner)
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:
             spec_result = get_linear_attn_config(runner.model_config.hf_config)
             if spec_result is not None:
                 spec, _ = spec_result
+                cfg = runner.model_config
                 BackendClass = import_backend_class(spec.backend_class_name)
                 linear_attn_backend = BackendClass(runner)
+                if spec.hybrid_backend_class_name is not None:
+                    hybrid_backend_cls = import_backend_class(
+                        spec.hybrid_backend_class_name
+                    )
             else:
                 raise ValueError(
                     "Expected hybrid GDN or NemotronH models, but got unknown model. "

@@ -28,8 +28,8 @@ How `file -> models` is resolved (best effort, recall-favoring)
 How `runner label -> models` is aggregated
     Registration/prewarm decisions are made per GH runner *label* (a runner's
     `runs-on` tag), not per suite. Each suite's runner_config maps to a label
-    via scripts/ci/runner_configs.yml (several configs can share one label,
-    e.g. `4-gpu-h100` and `deepep-4-gpu-h100`), so `runner_labels` carries the
+    via scripts/ci/runner_configs.yml (runner configs may share a label), so
+    `runner_labels` carries the
     per-label UNION -- the set a runner registered under that label must have
     cached before it takes jobs. Suites without a mappable runner_config are
     listed in `unmapped_suites`.
@@ -367,9 +367,8 @@ def load_runner_labels(path: str) -> Dict[str, str]:
     """Parse ``{runner_config: runs_on label}`` out of runner_configs.yml.
 
     The mapping is what turns per-suite model sets into per-runner-LABEL sets:
-    a runner is registered under a `runs_on` label (several runner_configs can
-    share one, e.g. `4-gpu-h100` and `deepep-4-gpu-h100` both run on
-    `4-gpu-h100`), so a runner's cache must cover the union of every suite
+    a runner is registered under a `runs_on` label (runner configs may share a
+    label), so a runner's cache must cover the union of every suite
     that can land on its label. Raises ValueError on an entry without
     `runs_on` or a file with no entries at all -- a format drift must fail
     the workflow loudly, not silently empty the label aggregation.
