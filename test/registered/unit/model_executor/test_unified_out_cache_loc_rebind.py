@@ -25,13 +25,19 @@ Pinned here:
      virtual id -> TWO kernel-facing ids: the swa rail must be derived from
      the still-virtual loc BEFORE the full-side rebind replaces it);
   2. `resolve_swa_write_loc`, the single place unified and static SWA pools
-     diverge on "what is the swa write loc for this batch".
+     diverge on "what is the swa write loc for this batch";
+  3. the new fields survive every batch transformation: DP/cuda-graph padding
+     and the spec draft-input backup cover the swa rail (a shorter swa tensor
+     would be silently sliced by KVWriteLoc.__post_init__ -> out-of-bounds
+     store), and the TBO split carries them into both children (its strict
+     unknown-field check raises otherwise).
 
     python -m pytest test/registered/unit/model_executor/test_unified_out_cache_loc_rebind.py -v
 """
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -192,6 +198,101 @@ class TestResolveSwaWriteLoc(CustomTestCase):
         pool = SimpleNamespace(translate_loc_from_full_to_swa=lambda t: t // 10)
         out = resolve_swa_write_loc(fb, pool)
         self.assertTrue(torch.equal(out, torch.tensor([1, 2], dtype=torch.int64)))
+
+
+class TestPaddingAndBackupCoverSwaRail(CustomTestCase):
+    def _fake_runner_for_pad(self):
+        return SimpleNamespace(
+            attn_backend=SimpleNamespace(get_cuda_graph_seq_len_fill_value=lambda: 0)
+        )
+
+    def test_pad_inputs_pads_swa_rail_with_sink_zero(self):
+        n, padded = 3, 6
+        fb = _make_fb(torch.tensor([11, 12, 13], dtype=torch.int64))
+        fb.positions = torch.arange(n, dtype=torch.int64)
+        fb.lora_ids = [None] * fb.batch_size
+        fb.swa_out_cache_loc = torch.tensor([21, 22, 23], dtype=torch.int64)
+
+        fb._pad_inputs_to_size(self._fake_runner_for_pad(), padded, fb.batch_size)
+
+        self.assertEqual(fb.out_cache_loc.shape[0], padded)
+        self.assertEqual(fb.swa_out_cache_loc.shape[0], padded)
+        # Padded tails go to slot 0 — the reserved dummy-write sink in both
+        # sub-pools' physical spaces.
+        self.assertTrue((fb.out_cache_loc[n:] == 0).all())
+        self.assertTrue((fb.swa_out_cache_loc[n:] == 0).all())
+        # dtype preserved (int64 — every id the allocator emits; a narrowed
+        # rail sneaking back in would fail here).
+        self.assertEqual(fb.swa_out_cache_loc.dtype, torch.int64)
+
+    def test_draft_input_backup_covers_swa_rail(self):
+        n, padded = 2, 4
+        fb = _make_fb(torch.tensor([5, 6], dtype=torch.int64))
+        fb.positions = torch.arange(n, dtype=torch.int64)
+        fb.lora_ids = [None] * fb.batch_size
+        fb.swa_out_cache_loc = torch.tensor([7, 8], dtype=torch.int64)
+        fb.spec_info = SimpleNamespace(
+            is_draft_input=lambda: True,
+            hidden_states=torch.zeros(n, 4),
+            topk_p=None,
+            topk_index=None,
+            draft_probs=None,
+            num_correct_drafts=None,
+        )
+
+        fb._pad_inputs_to_size(self._fake_runner_for_pad(), padded, fb.batch_size)
+
+        # Both write rails are backed up together, so the post-forward restore
+        # rebinds them as a pair.
+        self.assertTrue(hasattr(fb, "output_cache_loc_backup"))
+        self.assertIs(fb.output_cache_loc_backup, fb.out_cache_loc)
+        self.assertIs(fb.swa_output_cache_loc_backup, fb.swa_out_cache_loc)
+
+
+class TestTboSplitCarriesContractFields(CustomTestCase):
+    def test_filter_batch_strict_check_and_swa_slice(self):
+        from sglang.srt.batch_overlap import two_batch_overlap as tbo
+
+        n = 4
+        fb = _make_fb(torch.tensor([10, 11, 12, 13], dtype=torch.int64))
+        fb.batch_size = n
+        fb.input_ids = torch.arange(n, dtype=torch.int64)
+        fb.positions = torch.arange(n, dtype=torch.int64)
+        fb.req_pool_indices = torch.arange(n, dtype=torch.int64)
+        fb.seq_lens = torch.ones(n, dtype=torch.int64)
+        fb.swa_out_cache_loc = torch.tensor([20, 21, 22, 23], dtype=torch.int64)
+        fb.out_cache_loc_is_physical = True
+        fb._unified_kv_loc_translate = lambda t: t
+
+        with patch.object(
+            tbo,
+            "get_parallel",
+            return_value=SimpleNamespace(
+                attn_tp_size=1, tp_size=1, moe_dense_tp_size=1
+            ),
+        ):
+            child = tbo.TboForwardBatchPreparer.filter_batch(
+                fb,
+                start_token_index=1,
+                end_token_index=3,
+                start_seq_index=1,
+                end_seq_index=3,
+                out_num_token_non_padded=torch.tensor([2], dtype=torch.int32),
+            )
+
+        # The strict unknown-field check did not raise, the swa rail is
+        # token-sliced like out_cache_loc, and the contract flag + callable are
+        # inherited by the child.
+        self.assertTrue(
+            torch.equal(child.out_cache_loc, torch.tensor([11, 12], dtype=torch.int64))
+        )
+        self.assertTrue(
+            torch.equal(
+                child.swa_out_cache_loc, torch.tensor([21, 22], dtype=torch.int64)
+            )
+        )
+        self.assertTrue(child.out_cache_loc_is_physical)
+        self.assertIsNotNone(child._unified_kv_loc_translate)
 
 
 if __name__ == "__main__":

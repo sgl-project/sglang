@@ -1634,6 +1634,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        if self.swa_out_cache_loc is not None:
+            # Unified hybrid-SWA write rail: pad alongside out_cache_loc with
+            # the same value 0 (swa slot 0 is the reserved sink). A shorter swa
+            # tensor would be silently sliced by KVWriteLoc.__post_init__ and
+            # the store would read out of bounds.
+            self.swa_out_cache_loc = self._pad_tensor_to_size(
+                self.swa_out_cache_loc, num_tokens
+            )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
@@ -1677,6 +1685,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.spec_info is not None and self.spec_info.is_draft_input():
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
+            self.swa_output_cache_loc_backup = self.swa_out_cache_loc
             self.hidden_states_backup = spec_info.hidden_states
             # spec_info is EagleDraftInput | EagleDraftExtendInput; each carries
             # a disjoint subset of the fields below, so getattr-guard each one.
@@ -1774,6 +1783,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.spec_info.hidden_states = self.hidden_states_backup
             if hasattr(self, "output_cache_loc_backup"):
                 self.out_cache_loc = self.output_cache_loc_backup
+            if self.swa_output_cache_loc_backup is not None:
+                self.swa_out_cache_loc = self.swa_output_cache_loc_backup
 
         elif self.forward_mode.is_decode() or self.forward_mode.is_idle():
             logits_output.next_token_logits = logits_output.next_token_logits[:bs]
@@ -1833,6 +1844,10 @@ def build_inner_fb_view(
         encoder_lens=encoder_lens,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+        # Unified write-loc contract passthrough: inner backends must observe
+        # the same rebound state as the outer batch.
+        swa_out_cache_loc=forward_batch.swa_out_cache_loc,
+        out_cache_loc_is_physical=forward_batch.out_cache_loc_is_physical,
         spec_info=forward_batch.spec_info,
     )
 
