@@ -7,6 +7,7 @@ use crate::config::{BucketConfig, BucketSpec, BucketStage, SloBucketPolicy};
 use crate::policies::admission::CandidateDomain;
 use crate::policies::CacheCandidate;
 use crate::workers::Worker;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Bucket 选择使用的请求字段。
@@ -21,11 +22,53 @@ pub struct BucketRequest {
 #[derive(Debug, Clone)]
 pub struct BucketSelector {
     config: Option<BucketConfig>,
+    /// 与 `config.buckets` 下标对齐，只在构造时计算一次。
+    member_ids: Vec<MemberIndex>,
+}
+
+/// 成员 id 查找结构，语义与 `spec.worker_ids.iter().any(|id| id == &worker.id.0)`
+/// 完全一致：精确字符串匹配（不做归一化 / 大小写折叠 / trim），重复 id 不影响
+/// 结果，空列表匹配零个 worker。
+#[derive(Debug, Clone)]
+enum MemberIndex {
+    /// 直接扫描 `spec.worker_ids`，不额外持有副本。
+    Scan,
+    Set(HashSet<String>),
+}
+
+/// 实测的交叉点：低于该值时一次 SipHash 贵于少数几次短字符串比较。
+const MEMBER_SCAN_MAX: usize = 8;
+
+impl MemberIndex {
+    fn new(worker_ids: &[String]) -> Self {
+        if worker_ids.len() <= MEMBER_SCAN_MAX {
+            Self::Scan
+        } else {
+            Self::Set(worker_ids.iter().cloned().collect())
+        }
+    }
+
+    fn contains(&self, worker_ids: &[String], worker_id: &str) -> bool {
+        match self {
+            Self::Scan => worker_ids.iter().any(|id| id == worker_id),
+            Self::Set(ids) => ids.contains(worker_id),
+        }
+    }
 }
 
 impl BucketSelector {
     pub fn new(config: Option<BucketConfig>) -> Self {
-        Self { config }
+        let member_ids: Vec<MemberIndex> = config
+            .as_ref()
+            .map(|config| {
+                config
+                    .buckets
+                    .iter()
+                    .map(|spec| MemberIndex::new(&spec.worker_ids))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { config, member_ids }
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -42,14 +85,13 @@ impl BucketSelector {
         };
         self.ordered_specs(
             BucketStage::Prefill,
-            request,
             config.ttft_slo_policy,
             |spec| prefill_compatible(spec, request.input_tokens),
             |spec| ttft_eligible(spec, request.ttft_slo_ms),
         )
         .into_iter()
-        .filter_map(|spec| {
-            let members = members(workers, spec);
+        .filter_map(|(spec, member_ids)| {
+            let members = members(workers, &spec.worker_ids, member_ids);
             (!members.is_empty()).then(|| {
                 CandidateDomain::bucket_prefill(
                     spec.id.clone(),
@@ -79,7 +121,6 @@ impl BucketSelector {
         }
         self.ordered_specs(
             BucketStage::Decode,
-            request,
             config.tps_slo_policy,
             |spec| {
                 decode_compatible(
@@ -91,8 +132,8 @@ impl BucketSelector {
             |spec| tps_eligible(spec, request.tps_slo),
         )
         .into_iter()
-        .filter_map(|spec| {
-            let members = members(workers, spec);
+        .filter_map(|(spec, member_ids)| {
+            let members = members(workers, &spec.worker_ids, member_ids);
             (!members.is_empty()).then(|| CandidateDomain::bucket_decode(spec.id.clone(), members))
         })
         .collect()
@@ -109,23 +150,26 @@ impl BucketSelector {
             candidate.max_pending_prefill_tokens = None;
             return Some(candidate);
         };
-        let spec = config.buckets.iter().find(|spec| {
-            spec.stage == BucketStage::Prefill
-                && spec
-                    .worker_ids
-                    .iter()
-                    .any(|id| id == &candidate.worker.id.0)
-                && within(
-                    candidate.uncached_tokens,
-                    spec.min_extend_tokens,
-                    spec.max_extend_tokens,
-                )
-                && spec
-                    .max_context_tokens
-                    .is_none_or(|max_context| request.input_tokens <= max_context)
-                && (config.ttft_slo_policy != SloBucketPolicy::SloFirst
-                    || ttft_eligible(spec, request.ttft_slo_ms))
-        })?;
+        let spec =
+            config
+                .buckets
+                .iter()
+                .zip(self.member_ids.iter())
+                .find_map(|(spec, member_ids)| {
+                    (spec.stage == BucketStage::Prefill
+                        && member_ids.contains(&spec.worker_ids, &candidate.worker.id.0)
+                        && within(
+                            candidate.uncached_tokens,
+                            spec.min_extend_tokens,
+                            spec.max_extend_tokens,
+                        )
+                        && spec
+                            .max_context_tokens
+                            .is_none_or(|max_context| request.input_tokens <= max_context)
+                        && (config.ttft_slo_policy != SloBucketPolicy::SloFirst
+                            || ttft_eligible(spec, request.ttft_slo_ms)))
+                    .then_some(spec)
+                })?;
         candidate.candidate_range_id = spec.id.clone();
         candidate.max_pending_prefill_tokens = spec.max_pending_prefill_tokens;
         Some(candidate)
@@ -139,16 +183,21 @@ impl BucketSelector {
         request: BucketRequest,
     ) -> Option<CandidateDomain> {
         let config = self.config.as_ref()?;
-        let spec = config.buckets.iter().find(|spec| {
-            spec.stage == BucketStage::Prefill
-                && spec.worker_ids.iter().any(|id| id == &primary.id.0)
-                && spec
-                    .max_context_tokens
-                    .is_none_or(|max_context| request.input_tokens <= max_context)
-                && (config.ttft_slo_policy != SloBucketPolicy::SloFirst
-                    || ttft_eligible(spec, request.ttft_slo_ms))
-        })?;
-        let members = members(workers, spec);
+        let (spec, member_ids) =
+            config
+                .buckets
+                .iter()
+                .zip(self.member_ids.iter())
+                .find(|(spec, member_ids)| {
+                    spec.stage == BucketStage::Prefill
+                        && member_ids.contains(&spec.worker_ids, &primary.id.0)
+                        && spec
+                            .max_context_tokens
+                            .is_none_or(|max_context| request.input_tokens <= max_context)
+                        && (config.ttft_slo_policy != SloBucketPolicy::SloFirst
+                            || ttft_eligible(spec, request.ttft_slo_ms))
+                })?;
+        let members = members(workers, &spec.worker_ids, member_ids);
         members
             .iter()
             .any(|worker| worker.id == primary.id)
@@ -164,20 +213,20 @@ impl BucketSelector {
     fn ordered_specs(
         &self,
         stage: BucketStage,
-        _request: BucketRequest,
         slo_policy: SloBucketPolicy,
         compatible: impl Fn(&BucketSpec) -> bool,
         slo_eligible: impl Fn(&BucketSpec) -> bool,
-    ) -> Vec<&BucketSpec> {
+    ) -> Vec<(&BucketSpec, &MemberIndex)> {
         let Some(config) = &self.config else {
             return Vec::new();
         };
-        let mut compatible_specs: Vec<&BucketSpec> = config
+        let mut compatible_specs: Vec<(&BucketSpec, &MemberIndex)> = config
             .buckets
             .iter()
-            .filter(|spec| spec.stage == stage && compatible(spec))
+            .zip(self.member_ids.iter())
+            .filter(|(spec, _)| spec.stage == stage && compatible(spec))
             .collect();
-        compatible_specs.sort_by(|left, right| {
+        compatible_specs.sort_by(|(left, _), (right, _)| {
             left.rank
                 .cmp(&right.rank)
                 .then_with(|| left.id.cmp(&right.id))
@@ -188,11 +237,11 @@ impl BucketSelector {
 
         let mut eligible = Vec::new();
         let mut degraded = Vec::new();
-        for spec in compatible_specs {
+        for (spec, member_ids) in compatible_specs {
             if slo_eligible(spec) {
-                eligible.push(spec);
+                eligible.push((spec, member_ids));
             } else {
-                degraded.push(spec);
+                degraded.push((spec, member_ids));
             }
         }
         match slo_policy {
@@ -210,10 +259,14 @@ impl BucketSelector {
     }
 }
 
-fn members(workers: &[Arc<Worker>], spec: &BucketSpec) -> Vec<Arc<Worker>> {
+fn members(
+    workers: &[Arc<Worker>],
+    worker_ids: &[String],
+    member_ids: &MemberIndex,
+) -> Vec<Arc<Worker>> {
     workers
         .iter()
-        .filter(|worker| spec.worker_ids.iter().any(|id| id == &worker.id.0))
+        .filter(|worker| member_ids.contains(worker_ids, &worker.id.0))
         .cloned()
         .collect()
 }

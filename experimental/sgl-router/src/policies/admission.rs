@@ -606,7 +606,6 @@ impl<'a> FreshLoadLookup<'a> {
                     .unwrap_or(usize::MAX)
             })
     }
-
     fn min_by_pressure_key(
         &self,
         candidates: Vec<Arc<Worker>>,
