@@ -1311,11 +1311,12 @@ def init_unified_mamba_pools(
     # `_mamba_translate` feeds the HiCache offload path, GATED OFF here — wired but inert.
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
-    if use_mla_backend:
-        # Model-level MLA entry points (`set_mla_kv_buffer` / `get_mla_kv_buffer`)
-        # receive VIRTUAL locs and translate to the dense space internally
-        # (eager-prefill-only paths; never captured in a cuda graph).
-        token_to_kv_pool._full_translate = allocator.translate_kv_loc_dense
+    # NOTE: no full-KV translate hook is wired. The model-side MLA entry
+    # points (`set_mla_kv_buffer`/`get_mla_kv_buffer`) receive KERNEL-FACING
+    # (dense) ids: writes carry the ForwardBatch's rebound `out_cache_loc`
+    # (apply_unified_kv_loc_rebind resolves `translate_kv_loc_dense` first),
+    # and read indices are translated at their production sites
+    # (fetch_mha_one_shot_kv_indices / prepare_chunked_kv_indices).
 
     logger.info(
         "[unified-memory-pool] ============================================================"

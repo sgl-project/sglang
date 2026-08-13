@@ -407,7 +407,8 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
 
 class TestFactoryDenseViews(unittest.TestCase):
     """The real SWA factory builds dense sub-pools and wires the matching
-    kernel-facing multipliers into the composite allocator."""
+    kernel-facing multipliers into the composite allocator. End-to-end over
+    that factory, the rebind must emit BOTH kernel-facing rails."""
 
     # _swa_factory geometry: L_full = L_swa = 2, uniform 8/8 dims, ps = 1.
     FULL_MULT = 4  # 2 * L_full
@@ -448,6 +449,37 @@ class TestFactoryDenseViews(unittest.TestCase):
         self.assertEqual(b.token_to_kv_pool.full_kv_pool.k_buffer[0].dim(), 3)
         self.assertEqual(b.token_to_kv_pool.swa_kv_pool.k_buffer[0].dim(), 3)
         self.assertGreater(pool.view_tail_pad_bytes, 0)
+
+    def test_rebind_emits_dense_rails_from_virtual(self):
+        """End-to-end over the real factory: apply_unified_kv_loc_rebind must
+        rebind out_cache_loc to FULL-DENSE ids and fill the swa rail with
+        SWA-DENSE ids — the swa formula over the VIRTUAL ids proves the
+        order-critical rule (a rail computed after the rebind would gather
+        v2p_swa at full-dense ids: garbage)."""
+        from sglang.srt.model_executor.forward_batch_info import (
+            apply_unified_kv_loc_rebind,
+        )
+
+        b = self._bundle()
+        alloc = b.token_to_kv_pool_allocator
+        v = alloc.alloc(4)
+        self.assertIsNotNone(v)
+        expected_full = alloc.full_v2p_page_table[v] * self.FULL_MULT  # ps=1
+        expected_swa = alloc.swa_v2p_page_table[v] * self.SWA_MULT
+        fb = SimpleNamespace(
+            out_cache_loc=v.clone(),
+            swa_out_cache_loc=None,
+            out_cache_loc_is_physical=False,
+            _unified_kv_loc_translate=None,
+        )
+        runner = SimpleNamespace(
+            token_to_kv_pool_allocator=alloc,
+            token_to_kv_pool=b.token_to_kv_pool,
+        )
+        apply_unified_kv_loc_rebind(fb, runner)
+        self.assertTrue(fb.out_cache_loc_is_physical)
+        self.assertTrue(torch.equal(fb.out_cache_loc, expected_full))
+        self.assertTrue(torch.equal(fb.swa_out_cache_loc, expected_swa))
 
 
 if __name__ == "__main__":

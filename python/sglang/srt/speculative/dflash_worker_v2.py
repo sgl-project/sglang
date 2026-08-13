@@ -26,6 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    apply_unified_kv_loc_rebind,
     compute_position,
 )
 from sglang.srt.runtime_context import get_exec, get_schedule
@@ -1158,6 +1159,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
 
+        # No id translation here, deliberately. This door writes into the
+        # DRAFT's own KV pool, which is direct-indexed by the VIRTUAL ids the
+        # draft shares with the target (the configurator sizes it to the
+        # allocator's whole virtual space for exactly that reason), so the locs
+        # must reach `set_kv_buffer` untranslated on every pool kind.
+
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
 
@@ -1684,6 +1691,26 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        # Physical-loc contract: this is the ONE live forward whose
+        # ForwardBatch is hand-built (the block-draft batch is synthetic —
+        # mask-token input_ids, noise embeds, hand-computed positions — so it
+        # cannot go through init_new), so apply the rebind init_new applies.
+        #
+        # WHETHER it translates is the PROBE's call, not this site's, and both
+        # answers occur for a draft runner:
+        #   * sharing the target's allocator while owning a separate,
+        #     virtual-indexed KV pool (the default) -> pool-ownership probe
+        #     fails, rebind is a NO-OP, the loc stays VIRTUAL, which is what
+        #     that pool is indexed by;
+        #   * owning its whole unified stack (compact draft cache hands the
+        #     draft `req_to_token_pool=None`, so it takes the unified fast path
+        #     and builds its own pool + allocator) -> the probe holds and the
+        #     loc is rebound into that pool's own kernel-facing space.
+        # Either way `verify_out_cache_loc` itself stays VIRTUAL for the
+        # ScheduleBatch rail (req_to_token bookkeeping above,
+        # `batch.out_cache_loc` for target verify below, accept bookkeeping
+        # after verify).
+        apply_unified_kv_loc_rebind(forward_batch, self.draft_model_runner)
 
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(forward_batch)

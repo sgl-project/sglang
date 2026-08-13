@@ -521,6 +521,31 @@ class TestMultiEndedAllocator(unittest.TestCase):
         )
         self.assertEqual(int(buf[1].item()), 0)
 
+    def test_slot_zero_sink_invariant_survives_churn(self):
+        """PINNED INVARIANT: virtual 0 <-> physical 0 (the padding sink), so
+        `translate_kv_loc(zeros) == zeros` — after init AND after alloc/free/
+        compaction churn. The cuda-graph capture path RELIES on this: the
+        physical-loc contract replaced capture-time translate with a plain
+        copy of the zero-filled static buffer, which is only equivalent while
+        v2p[0] == 0. If an allocator change breaks this, captured stores would
+        write pad lanes to a live slot."""
+        _, full_alloc, _, full_kv, _ = self._build_pair()
+        zeros = torch.zeros(4, dtype=torch.int64)
+
+        self.assertEqual(int(full_alloc.virtual_to_physical[0].item()), 0)
+        self.assertTrue(torch.equal(full_alloc.translate_kv_loc(zeros), zeros))
+
+        # Churn: allocate, free interior (forces compaction moves), re-allocate.
+        a = self._alloc(full_alloc, full_kv, 6)
+        b = self._alloc(full_alloc, full_kv, 6)
+        self._free(full_alloc, full_kv, a)
+        c = self._alloc(full_alloc, full_kv, 4)
+        self._free(full_alloc, full_kv, b)
+        self._free(full_alloc, full_kv, c)
+
+        self.assertEqual(int(full_alloc.virtual_to_physical[0].item()), 0)
+        self.assertTrue(torch.equal(full_alloc.translate_kv_loc(zeros), zeros))
+
 
 # ---------------------------------------------------------------------------
 # Shared SWA composite — unit tests

@@ -16,6 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    apply_unified_kv_loc_rebind,
     enable_num_token_non_padded,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -303,6 +304,7 @@ class DraftBlockProposer:
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        apply_unified_kv_loc_rebind(idle_batch, self.draft_model_runner)
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
         with torch.inference_mode():
             self.draft_model_runner.forward(idle_batch)
@@ -366,6 +368,18 @@ class DraftBlockProposer:
             num_token_non_padded=_make_num_token_non_padded(draft_num_tokens, device),
             num_token_non_padded_cpu=draft_num_tokens,
         )
+        # Hand-built live forward (mask-token input_ids, hand-computed
+        # positions), so it cannot go through init_new. Apply the rebind
+        # init_new applies; `verify_cache_loc_2d` itself stays VIRTUAL for the
+        # ScheduleBatch rail (the req_to_token window it was gathered from, the
+        # target-verify write, and the accept bookkeeping after verify).
+        #
+        # This call is a NO-OP here, and must be: the DSPARK draft runner
+        # shares the target's allocator but owns a SEPARATE KV pool, indexed
+        # directly by the virtual ids it shares, so the rebind's pool-ownership
+        # probe declines and the draft indices stay virtual. The call stays
+        # because the probe — not the call site — is what decides.
+        apply_unified_kv_loc_rebind(draft_forward_batch, self.draft_model_runner)
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
         if (

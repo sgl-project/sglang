@@ -441,6 +441,10 @@ def apply_unified_kv_loc_rebind(fb, model_runner) -> None:
             allocator,
             (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWATokenToKVPoolAllocator),
         )
+        # A speculative draft runner is handed the TARGET's allocator but owns
+        # a SEPARATE KV pool, direct-indexed by the virtual ids it shares. Its
+        # locs must stay virtual, so the rebind is a no-op there.
+        or allocator.get_kvcache() is not model_runner.token_to_kv_pool
         or fb.out_cache_loc is None
     ):
         return
@@ -940,6 +944,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
+
+        # Unified memory pool: rebind out_cache_loc to kernel-facing ids (a
+        # fresh tensor — the ScheduleBatch tensor stays VIRTUAL). Runs BEFORE
+        # the idle early-return below so idle / DP-idle batches also carry the
+        # contract flag. No-op on non-unified pools.
+        apply_unified_kv_loc_rebind(ret, model_runner)
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             hashed = _hash_rids_to_tensor(
