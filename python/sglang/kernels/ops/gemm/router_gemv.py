@@ -6,7 +6,7 @@ solutions for M<=8, N=128 run at ~0.1 TB/s on gfx950 (~12us for 1.6MB). This
 split-K kernel reads the gate weight once at near-roofline. The split-K
 reduction runs in the same kernel via a last-CTA fixup with a self-cleaning
 counter (reset to 0 by the reducing CTA), so no separate zero-init or reduce
-launch is needed — at this size every extra launch costs ~4us.
+launch is needed — every extra launch costs ~2us on gfx950.
 """
 
 from __future__ import annotations
@@ -19,9 +19,7 @@ import triton.language as tl
 
 _MAX_M = 64
 
-# (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps) per M bucket. BLOCK_M == 1 is
-# the GEMV formulation (weight re-read per row); above it the rows share one
-# weight read through an MFMA tile, which is what a decode batch needs.
+# (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps) per M bucket.
 _CONFIGS = (
     (8, (1, 16, 512, 4, 16)),
     (16, (16, 16, 512, 8, 4)),
@@ -165,17 +163,3 @@ def router_gemv(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         num_warps=num_warps,
     )
     return out
-
-
-if __name__ == "__main__":
-    # ponytail: self-check instead of a CI test file; needs a GPU.
-    torch.manual_seed(0)
-    for m in (1, 2, 8, 16, 17, 32, 64):
-        x = torch.randn(m, 6144, dtype=torch.bfloat16, device="cuda")
-        w = torch.randn(128, 6144, dtype=torch.bfloat16, device="cuda")
-        assert router_gemv_supported(x, w)
-        got = router_gemv(x, w)
-        ref = torch.mm(x, w.t(), out_dtype=torch.float32)
-        err = (got - ref).abs().max().item() / ref.abs().max().item()
-        assert err < 2e-2, (m, err)
-        print(f"m={m:3d} rel_err={err:.2e} ok")

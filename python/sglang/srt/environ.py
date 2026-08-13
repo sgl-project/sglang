@@ -715,7 +715,7 @@ class Envs:
     SGLANG_OPT_GATE_APPEND_SHARED = EnvBool(False)
     # Patch aiter so decode-sized MoE sorting (+ the stage1 mxfp8 activation
     # quant) runs as one sglang Triton launch instead of the opus sorting and
-    # separate quant kernels. See kernels/ops/moe/aiter_moe_sorting_small.py.
+    # separate quant kernels. See kernels/ops/moe/moe_sorting_small.py.
     SGLANG_OPT_AITER_SMALL_MOE_SORT = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
@@ -1312,9 +1312,6 @@ class Envs:
     # forces the pre-fp8 behavior (bf16 indexer + widening sparse path, bf16 q)
     # even when kv_cache_dtype fp8_e4m3 + trtllm_mha + SM100 would activate it.
     SGLANG_DISABLE_M3_FP8_ATTN_GEMM = EnvBool(False)
-
-    # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
-    SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
 
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
     # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.

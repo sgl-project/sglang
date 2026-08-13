@@ -151,7 +151,7 @@ class AiterRunnerCore(MoeRunnerCore):
         from sglang.srt.environ import envs
 
         if envs.SGLANG_OPT_AITER_SMALL_MOE_SORT.get():
-            from sglang.kernels.ops.moe.aiter_moe_sorting_small import (
+            from sglang.kernels.ops.moe.moe_sorting_small import (
                 apply_aiter_small_moe_sort_patch,
             )
 

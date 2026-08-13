@@ -6,7 +6,6 @@ import torch
 from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx import (
     flash_decode_with_topk_idx,
 )
-from sglang.srt.environ import envs
 
 DEVICE = "cuda"
 RTOL_VS_REF = 5e-3
@@ -372,21 +371,20 @@ def test_flash_decode_jit_topk_trivial_rows_skip_score_writes():
         max_kv_len=mkl,
     )
 
-    with envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.override(True):
-        o_new, topk_new, real_seq_lens = flash_decode_with_topk_idx(
-            q,
-            sink,
-            k_cache,
-            v_cache,
-            req_to_token,
-            seq_lens_t,
-            mkl,
-            slot_ids,
-            blk,
-            tk,
-            0,
-            0,
-        )
+    o_new, topk_new, real_seq_lens = flash_decode_with_topk_idx(
+        q,
+        sink,
+        k_cache,
+        v_cache,
+        req_to_token,
+        seq_lens_t,
+        mkl,
+        slot_ids,
+        blk,
+        tk,
+        0,
+        0,
+    )
     o_ref, topk_ref = pytorch_reference(
         q,
         sink,

@@ -35,10 +35,6 @@ struct TopKTrait {
   static constexpr uint32_t kMaxTopK = 64;
   static constexpr uint32_t kCTASize = 512;
   static constexpr uint32_t kNumWarps = kCTASize / device::kWarpThreads;
-  // Bounds the register-cached radix path: kIters = kMaxNumBlocks / kCTASize
-  // must stay <= 32 (liveness bitmask). 16384 covers a 2M-token context at
-  // block_size 128; the scan is clamped to the live seq_len, so graph-static
-  // score widths sized for max context stay cheap at short contexts.
   static constexpr uint32_t kMaxNumBlocks = 16384;  // block topk
   static constexpr uint32_t kSmallThreshold = 8 * kNumWarps;
   static constexpr uint32_t kRadixBits = 8;
