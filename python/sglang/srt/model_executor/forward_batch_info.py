@@ -1230,6 +1230,59 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dim=0,
             )
 
+    def target_verify_q_cap(self) -> int:
+        if not self.forward_mode.is_target_verify() or self.spec_info is None:
+            raise RuntimeError(
+                "TARGET_VERIFY geometry requires target-verify mode and spec_info."
+            )
+
+        q_cap = getattr(self.spec_info, "draft_token_num", None)
+        if q_cap is None or int(q_cap) <= 0:
+            q_cap = getattr(self.spec_info, "num_tokens_for_logprob_per_req", None)
+        if q_cap is None or int(q_cap) <= 0:
+            q_cap = getattr(self.spec_info, "num_tokens_per_req", None)
+        if q_cap is None or int(q_cap) <= 0:
+            raise RuntimeError(
+                "TARGET_VERIFY geometry requires a positive per-request token cap."
+            )
+        return int(q_cap)
+
+    def build_uniform_target_verify_layout(self, graph_num_tokens: int):
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+        bs = int(self.seq_lens.shape[0])
+        verify_len = self.target_verify_q_cap()
+        expected_num_tokens = bs * verify_len
+        if bs <= 0 or graph_num_tokens != expected_num_tokens:
+            raise RuntimeError(
+                "Uniform TARGET_VERIFY layout does not match the graph shape: "
+                f"graph_num_tokens={graph_num_tokens}, bs={bs}, "
+                f"verify_cap={verify_len}, expected={expected_num_tokens}."
+            )
+
+        verify_lens_cpu = [verify_len] * bs
+        verify_lens = torch.full(
+            (bs,),
+            verify_len,
+            dtype=torch.int32,
+            device=self.seq_lens.device,
+        )
+        qo_indptr = torch.arange(
+            0,
+            graph_num_tokens + 1,
+            verify_len,
+            dtype=torch.int32,
+            device=self.seq_lens.device,
+        )
+        return RaggedVerifyLayout(
+            verify_lens=verify_lens,
+            graph_num_tokens=graph_num_tokens,
+            extend_start_loc=qo_indptr[:-1],
+            qo_indptr_device=qo_indptr,
+            verify_lens_cpu=verify_lens_cpu,
+            total_verify_tokens=graph_num_tokens,
+        )
+
     def _prepare_ragged_target_verify_mlp_sync(self, num_tokens: int) -> Optional[int]:
         spec_info = self.spec_info
         layout = (
@@ -1300,9 +1353,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         self.seq_lens_cpu, self.extend_seq_lens_cpu
                     )
                 ]
-                self.extend_logprob_start_lens_cpu = (
-                    self.extend_prefix_lens_cpu
-                )
+                self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
                 self.extend_prefix_lens_cpu = None
                 self.extend_logprob_start_lens_cpu = None
@@ -1742,9 +1793,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
-                ragged_layout = getattr(
-                    self.spec_info, "ragged_verify_layout", None
-                )
+                ragged_layout = getattr(self.spec_info, "ragged_verify_layout", None)
                 if ragged_layout is not None:
                     num_tokens = (
                         int(ragged_layout.total_verify_tokens)
