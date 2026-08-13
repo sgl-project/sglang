@@ -448,6 +448,20 @@ Several limitations currently affect offline quantized model loading in sglang, 
 
     SGlang API Usage only supports `auto-round-int8` quantization method now, more quantization methods are on the way.
 
+- CPU serving
+
+    AutoRound INT4 checkpoints (both `auto_round:auto_gptq` and `auto_round:auto_awq` packing formats) can be served on Intel CPUs with AMX support:
+
+    ```bash
+    SGLANG_USE_CPU_ENGINE=1 python3 -m sglang.launch_server \
+        --model-path OPEA/Qwen2.5-0.5B-Instruct-int4-sym-inc \
+        --quantization auto-round \
+        --device cpu --trust-remote-code
+    ```
+
+    The current SGLang CPU backend supports only 4-bit AutoRound checkpoints on Intel AMX. Other AutoRound bit-widths and non-AMX CPU backends are not supported by this path.
+
+
 #### Using [GPTQModel](https://github.com/ModelCloud/GPTQModel)
 
 ```bash Command
