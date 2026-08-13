@@ -77,7 +77,14 @@ def _ensure_npu_subscribe_report(stream) -> None:
         return
     import torch_npu
 
-    torch_npu.npu._subscribe_report(stream)
+    try:
+        torch_npu.npu._subscribe_report(stream)
+    except RuntimeError as e:
+        # torch_npu >= 2.10 pre-subscribes capture streams inside NPUGraph, so a
+        # second AclrtSubscribeReport on the same stream fails with error 107011.
+        # The stream IS subscribed in that case; only swallow that specific error.
+        if "107011" not in str(e):
+            raise
     _npu_report_subscribed.add(key)
 
 
