@@ -1,8 +1,8 @@
 import unittest
 
 from sglang.test.ascend.test_ascend_utils import (
-    run_bench_serving,
     LLaDA2_0_MINI_WEIGHTS_PATH,
+    run_bench_serving,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
