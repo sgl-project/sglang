@@ -814,6 +814,7 @@ class FlashInferAttnBackend(AttentionBackend):
             and forward_mode.is_target_verify()
             and spec_info is not None
             and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+            and getattr(spec_info, "custom_mask", None) is None
             and self.prefill_backend == "fa2"
             # Host-rebuilt layout only matches full attention (single wrapper);
             # SWA/cross-attn keep the plain plan().
