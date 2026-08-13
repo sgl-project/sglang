@@ -1,52 +1,26 @@
 """Per-scheduler load reporting for load-aware routers.
 
-Independent of KV-cache events: each scheduler publishes a periodic
-[`LoadStat`] gauge on its own ZMQ PUB socket (a dedicated port range,
-packed after the KV-event publisher's) so load-aware routers —
-e.g. the experimental sgl-router `cache_aware_zmq` policy — can route on
-the engine's true queue depth / KV occupancy instead of inferring load
-from a router-side in-flight counter.
+Each scheduler publishes a periodic `LoadStat` gauge on its own ZMQ PUB
+socket so out-of-process load-aware routers (e.g. sgl-router's
+`cache_aware_zmq` policy) can route on real queue depth instead of a
+router-side in-flight counter. The in-deployment counterpart lives in
+`sglang.srt.managers.load_snapshot` (SHM / PUSH to node 0), which a router
+that only knows the worker URL cannot subscribe to; the port is instead
+advertised via `/server_info` (`ServerArgs.describe_kv_events_publisher`).
+The payload is a compact tagged subset of `LoadSnapshot` so the wire
+contract stays fixed as the snapshot grows.
 
-This is the *external* counterpart of `sglang.srt.managers.load_snapshot`:
-that module fans per-rank `LoadSnapshot`s into shared memory (or a zmq
-PUSH to node 0) for consumers inside the deployment — the
-DataParallelController's dispatch and `/v1/loads`. Neither transport is
-subscribable by an out-of-process router that only knows the worker's URL,
-so load-aware routers get their own per-rank PUB socket instead, on a port
-advertised via `/server_info` (see
-`ServerArgs.describe_kv_events_publisher`). The payload is a compact,
-tagged subset of the snapshot rather than the full `LoadSnapshot`, so the
-router-facing wire contract stays fixed while the internal snapshot keeps
-growing fields.
+Framing is the KV-event socket's, so one subscriber loop handles both:
+``[b"load", big-endian i64 seq, msgpack LoadStat]``. The transport is a
+plain synchronous PUB socket (a send just enqueues to ZMQ's IO thread) —
+no background thread or replay buffer, which a gauge does not need.
 
-Wire framing — three frames, matching the KV-event socket's layout so one
-subscriber loop handles both: ``[topic b"load", big-endian i64 seq,
-msgpack LoadStat]``. The transport is a plain synchronous PUB socket owned
-here: a PUB send is an enqueue to ZMQ's IO thread, so unlike the KV-event
-path there is no background thread or replay buffer — a gauge needs
-neither, and a small send HWM sheds backlog toward a stalled subscriber
-instead of queueing stale readings.
-
-The port comes from `resolve_load_pub_range` in
-`sglang.srt.disaggregation.kv_events` — the same function `/server_info`
-advertises with — which packs the load range after the KV-event range,
-bumping past the replay ROUTER range when the two overlap (with the
-conventional replay = kv + 1 they always do); `--load-publish-endpoint`
-moves the range outright. Operators must leave the resolved range free on
-the host: with the default packing a worker's ZMQ footprint spans
-`[kv_base, load_base + dp_size)` — `2 * dp_size` ports without a replay
-endpoint, `2 * dp_size + 1` with the conventional adjacent one — so
-co-hosted workers need their KV port bases spaced at least that far
-apart, or one worker's load socket lands on the other's KV-event port.
-
-Other prior art, considered and not reused: `/v1/loads` serves the same
-snapshot over HTTP, but polling it routes through the HTTP-plane event
-loop, which lags exactly when the server is overloaded — the moment the
-signal matters; `KvMetrics` (kv_events_publisher.py) pushes similar
-counts, but over a point-to-point IPC socket gated on --enable-metrics
-with a Dynamo-pinned schema; forward-pass metrics publish per-iteration
-on a host-local, operator-configured endpoint. None is per-worker
-subscribable via /server_info.
+The port comes from `resolve_load_pub_range` (the same function
+`/server_info` advertises with, so the two cannot drift). A worker's ZMQ
+footprint is `2 * dp_size` ports after its KV base (`2 * dp_size + 1` with
+the conventional adjacent replay), so co-hosted workers must space their
+KV bases at least that far apart or one's load socket lands on another's
+KV-event port; `--load-publish-endpoint` moves the range off a conflict.
 """
 
 from __future__ import annotations
@@ -75,33 +49,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Publish a load snapshot at most once every this many `publish_load_stat`
-# calls, unless `force=True` (extend/prefill batches, where load changes
-# most). Load is a gauge consumed for routing, so per-decode-step publishing
-# is wasteful.
+# Publish at most once per this many calls unless force=True.
 LOAD_PUBLISH_INTERVAL = 5
 
-# Re-send an *unchanged* stat at most once per this many seconds. A changed
-# stat always publishes immediately — busy->idle and idle->busy transitions
-# are never delayed — while the heartbeat keeps the gauge fresh for
-# subscribers with staleness windows and bounds the send rate on paths that
-# force-publish an unchanged gauge in a tight loop (`on_idle` fires every
-# event-loop iteration, which busy-spins when --sleep-on-idle is off).
+# An unchanged stat is re-sent at most this often; a changed one always goes
+# out immediately, so transitions are never delayed. Bounds the send rate on
+# the idle spin loop (on_idle force-publishes every iteration).
 LOAD_PUBLISH_HEARTBEAT_S = 1.0
 
-# After the first report, re-warn about publish failures at most this often.
-# Wall-clock rather than a count: a permanently broken socket fails once per
-# publish attempt and attempts are driven by the scheduler loop, so a
-# count-based bound would still emit at a rate proportional to that loop.
+# Re-warn about publish failures at most this often. Wall-clock, not a count:
+# failures are driven by the scheduler loop, so a count bound would still
+# flood at loop rate.
 FAIL_WARN_PERIOD_S = 60.0
 
-# Send high-water mark. Small on purpose: load is a gauge, so once a
-# subscriber's pipe is full, shedding sends (PUB drops per-subscriber inside
-# ZMQ, silently) loses readings that the next heartbeat supersedes anyway —
-# better than queueing a backlog of stale ones for it to drain later. ZMQ's
-# true newest-wins primitive (ZMQ_CONFLATE) is unavailable here: it keeps a
-# single *frame* and would corrupt the three-frame KV-compatible framing,
-# so a small bounded backlog is the closest achievable semantics.
+# Small HWM: load is a gauge, so shedding at a full pipe loses readings the
+# next heartbeat supersedes. ZMQ_CONFLATE (true newest-wins) is unusable — it
+# keeps a single frame, breaking the 3-frame framing — so a bounded backlog
+# is the closest fit.
 LOAD_PUB_HWM = 8
 
 _encoder = msgspec.msgpack.Encoder()
@@ -117,24 +81,17 @@ class LoadStat(
     """Per-scheduler runtime load snapshot.
 
     Wire shape (tag + array_like): ``["LoadStat", num_running_reqs,
-    num_waiting_reqs, num_tokens, max_total_num_tokens, attn_dp_rank]`` —
-    the router decoder reads the four counts and ignores the rest. The
-    trailing field is always emitted (array_like structs do not trim it;
-    the publisher stamps its rank, and a decoder must also tolerate null
-    there). The router keys load by the subscriber's socket rank, not this
-    field — it is informational.
+    num_waiting_reqs, num_tokens, max_total_num_tokens, attn_dp_rank]``. The
+    router reads the four counts; array_like always emits the trailing field
+    (null when unset), so a decoder must tolerate it.
     """
 
     num_running_reqs: int
     num_waiting_reqs: int
-    # KV tokens currently in use, from the engine's KV pool.
-    num_tokens: int
-    # KV-cache token capacity; 0 when unknown.
-    max_total_num_tokens: int
-    # Stamped with select_kv_publisher_dp_rank(...): the attention-DP rank
-    # under DP attention, but the plain data-parallel rank in pure DP. The
-    # name follows the EventBatch.attn_dp_rank precedent on the KV-event
-    # socket; either way it is informational only.
+    num_tokens: int  # KV tokens in use
+    max_total_num_tokens: int  # KV capacity; 0 when unknown
+    # attn_dp_rank under DP attention, else the plain dp_rank; informational
+    # only (the router keys by socket rank). Name follows EventBatch's.
     attn_dp_rank: Optional[int] = None
 
 
@@ -149,8 +106,7 @@ def _open_pub_socket(endpoint: str) -> zmq.Socket:
             sock.setsockopt(zmq.IPV6, 1)
         sock.bind(endpoint)
     except Exception:
-        # Release the handle on the shared context rather than leaking it.
-        sock.close()
+        sock.close()  # don't leak the handle on the shared context
         raise
     return sock
 
@@ -160,11 +116,9 @@ class SchedulerLoadPublisher:
     best-effort `publish_load_stat` path.
 
     Enabled on the same condition as KV-event publishing
-    (`is_kv_publisher_rank`), on the port range `resolve_load_pub_range`
-    derives; within the range, the per-rank offset follows
-    `select_kv_publisher_dp_rank`, exactly like the KV-event publisher, so
-    pure-DP replicas don't collide on one port. Stays a no-op
-    (`_socket is None`) when disabled or when no load range is resolvable.
+    (`is_kv_publisher_rank`), keyed per rank like it
+    (`select_kv_publisher_dp_rank`) so pure-DP replicas don't collide. Stays
+    a no-op (`_socket is None`) when disabled or no range is resolvable.
     """
 
     def __init__(
@@ -175,18 +129,15 @@ class SchedulerLoadPublisher:
         dp_size: int,
         load_publish_endpoint: Optional[str] = None,
     ) -> None:
-        # `_socket is None` means "no PUB socket is bound"; every early
-        # return below leaves it None so `publish_load_stat` skips the
-        # snapshot computation entirely.
+        # _socket is None == disabled: every early return below leaves it so,
+        # and publish_load_stat then skips the snapshot entirely.
         self._socket: Optional[zmq.Socket] = None
         self._rank = 0
         self._seq = count()
         self._publish_counter = 0
-        # The four counts of the last stat actually sent, and when — drives
-        # the changed-immediately / unchanged-on-heartbeat dedup.
+        # Last sent counts + timestamp, driving the dedup/heartbeat.
         self._last_counts: Optional[tuple] = None
         self._last_publish_ts = 0.0
-        # Consecutive publish failures and when they were last reported.
         self._fail_count = 0
         self._last_fail_warn_ts = float("-inf")
         if not is_kv_publisher_rank(kv_events_config, ps):
@@ -194,16 +145,13 @@ class SchedulerLoadPublisher:
         try:
             cfg = KVEventsConfig.from_cli(kv_events_config)
         except Exception:
-            # Malformed config — the KV publisher init would have failed too;
-            # stay a no-op rather than raising at scheduler startup.
+            # Malformed config: the KV publisher would fail too; stay a no-op.
             return
         if cfg.publisher == "null" or not cfg.endpoint:
             return
-        # Shared with describe_kv_events_publisher, which advertises the
-        # same resolution (or omits the key) on /server_info — so a router
-        # never subscribes to a range this constructor declined. (A runtime
-        # bind failure below is the one case where the advertisement can
-        # outlive the socket; the router then sees silence and falls back.)
+        # Same resolver /server_info advertises with, so a router never
+        # subscribes to a range this declines — except a runtime bind failure
+        # below, which the advertisement can't retract (router sees silence).
         resolved, reason = resolve_load_pub_range(
             kv_endpoint=cfg.endpoint,
             replay_endpoint=cfg.replay_endpoint,
@@ -219,15 +167,13 @@ class SchedulerLoadPublisher:
             ps.attn_dp_size, ps.attn_dp_rank, ps.dp_rank
         )
         endpoint = NetworkAddress(host, base + self._rank).to_tcp()
-        # Best-effort: an unforeseen bind failure must not take down
-        # scheduler startup over a routing hint.
         try:
             self._socket = _open_pub_socket(endpoint)
-            # The scheduler has no shutdown hook to call close() from (the
-            # KV-event publisher cleans up the same way); LINGER=0 makes
-            # this safe even under a hard exit.
+            # No scheduler shutdown hook to close() from; LINGER=0 keeps a
+            # hard exit safe. (The KV-event publisher cleans up the same way.)
             atexit.register(self.close)
         except Exception:
+            # Best-effort: a bind failure must not take down startup.
             logger.warning(
                 "load-publisher disabled: failed to bind the load socket at "
                 "%r; /server_info advertises this range but nothing is "
@@ -249,21 +195,16 @@ class SchedulerLoadPublisher:
     ) -> None:
         """Publish a load snapshot, throttled to [`LOAD_PUBLISH_INTERVAL`]
         calls unless `force`; an unchanged stat is re-sent at most once per
-        [`LOAD_PUBLISH_HEARTBEAT_S`] while a changed one always goes out
-        immediately.
+        [`LOAD_PUBLISH_HEARTBEAT_S`], a changed one always immediately.
 
-        `load_provider` returns a live [`LoadSnapshot`] read directly from
-        scheduler state (`SchedulerLoadInquirer.get_loads`) — used instead of
-        metrics stats, whose values are only populated under
-        `--enable-metrics`. Invoked only after the counter throttle passes,
-        and not at all when the caller passes `snapshot` — a [`LoadSnapshot`]
-        it already computed for another sink this same cycle (the
-        DP-balancing writer), so the queues are never walked twice and a
-        disabled publisher costs the caller nothing but this call.
+        `load_provider` reads live scheduler state
+        (`SchedulerLoadInquirer.get_loads`), used over metrics stats which
+        are only populated under `--enable-metrics`. Skipped entirely when
+        the caller passes `snapshot` (one it already computed for the
+        DP-balancing sink this cycle), so the queues are never walked twice.
 
-        Best-effort: a failure here must never crash the scheduler loop —
-        routers fall back to their own in-flight counter. Failures re-warn
-        at most once per [`FAIL_WARN_PERIOD_S`].
+        Best-effort: never crashes the loop (routers fall back to their own
+        counter); failures re-warn at most once per [`FAIL_WARN_PERIOD_S`].
         """
         if self._socket is None:
             return
@@ -271,10 +212,9 @@ class SchedulerLoadPublisher:
         self._publish_counter += 1
         if not force and self._publish_counter < LOAD_PUBLISH_INTERVAL:
             return
-        # Reset where the throttle passes, not where a send happens: resetting
-        # only on the send path lets one dedup hit (or provider failure) leave
-        # the counter saturated, silently disengaging the throttle — every
-        # subsequent decode step would then run the O(queue) provider.
+        # Reset where the throttle passes, not on send: a dedup hit or
+        # provider failure would otherwise leave it saturated, silently
+        # disengaging the throttle onto the O(queue) provider every step.
         self._publish_counter = 0
 
         try:
@@ -306,16 +246,11 @@ class SchedulerLoadPublisher:
                     (LOAD_TOPIC.encode(), seq, payload), zmq.NOBLOCK
                 )
             except zmq.Again:
-                # Belt-and-braces: a PUB send never blocks — at HWM, ZMQ
-                # sheds per-subscriber silently, one layer down — so this
-                # branch is unreachable under PUB's documented contract.
-                # Kept in case the socket type or contract ever changes:
-                # leaving the dedup state untouched makes the next call
-                # retry the reading instead of deduping away a send nobody
-                # got.
+                # Unreachable under PUB (it sheds at HWM, never blocks); kept
+                # so a socket-type change still retries rather than deduping
+                # away a send nobody got.
                 return
-            # Recorded only after a successful hand-off so a failed publish
-            # retries instead of being deduped away.
+            # Record only after a successful hand-off so a failure retries.
             self._last_counts = counts
             self._last_publish_ts = now
             self._fail_count = 0

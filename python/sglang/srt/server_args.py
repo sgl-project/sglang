@@ -9490,27 +9490,15 @@ class ServerArgs:
                 "dp_size": <dp_size>,             # number of SUB sockets
                                                   # to open
                 "load_endpoint_port_base": <resolved>,
-                                                  # base TCP port of the
-                                                  # dedicated load-snapshot
-                                                  # range (load rank r =
-                                                  # base + r). Normally kv
-                                                  # base + dp_size, bumped
-                                                  # past an overlapping
-                                                  # replay range; moved
-                                                  # outright by
-                                                  # --load-publish-endpoint.
-                                                  # Consumers MUST read this
-                                                  # key, not re-derive it;
-                                                  # omitted when no bindable
-                                                  # range exists (e.g. a
-                                                  # concrete-host kv
-                                                  # endpoint, or u16
-                                                  # overflow)
-                "load_topic": "load",             # ZMQ topic prefix on the
-                                                  # load-socket SUB filter;
-                                                  # present iff
-                                                  # load_endpoint_port_base
-                                                  # is present
+                                                  # base TCP port of the load
+                                                  # range (load rank r = base
+                                                  # + r). Consumers MUST read
+                                                  # this key, not re-derive
+                                                  # it; omitted when no
+                                                  # bindable range exists
+                "load_topic": "load",             # SUB filter for the load
+                                                  # socket; present iff
+                                                  # load_endpoint_port_base is
             }
 
         Returns None (i.e. "no publisher to describe") when any of:
@@ -9525,19 +9513,15 @@ class ServerArgs:
           1..65535, or a bare unbracketed IPv6 host, which is
           ambiguous).
 
-        NOTE for load-socket consumers: the load keys are only emitted
-        when a wildcard-host bind resolves, so whenever
-        load_endpoint_port_base is present, endpoint_host is a wildcard
-        ("*", "0.0.0.0", "::") — never a dialable address. Pair the load
-        port with the worker's own URL host (exactly as the KV SUB
-        endpoints require); splicing endpoint_host with the load port
-        yields tcp://*:PORT and connects to nothing.
+        NOTE for load-socket consumers: when load_endpoint_port_base is
+        present, endpoint_host is a wildcard ("*", "0.0.0.0", "::") — never
+        dialable. Pair the load port with the worker's own URL host (as the
+        KV SUB endpoints require); splicing endpoint_host yields tcp://*:PORT
+        and connects to nothing.
 
-        Reuses KVEventsConfig.from_cli for JSON parsing,
-        parse_advertisable_tcp for the endpoint split, and
-        resolve_load_pub_range for the load range — the same helpers the
-        scheduler binds through, so the advertisement cannot drift from
-        the sockets.
+        Reuses parse_advertisable_tcp and resolve_load_pub_range — the same
+        helpers the scheduler binds through — so the advertisement cannot
+        drift from the sockets.
         """
         # Lazy import so loading server_args doesn't pull in
         # disaggregation / msgspec / zmq at module top level.
@@ -9574,15 +9558,9 @@ class ServerArgs:
             "block_size": page_size,
             "dp_size": self.dp_size,
         }
-        # Dedicated port range for runtime load snapshots (load rank r binds
-        # load_endpoint_port_base + r). Load-aware routers connect there to
-        # read the engine's true queue depth / KV occupancy. Resolved by the
-        # same resolve_load_pub_range call SchedulerLoadPublisher binds with,
-        # so the advertisement and the bound socket cannot drift. Absent =>
-        # the worker predates load publishing, or no bindable range exists;
-        # the router then falls back to its own in-flight counter. The
-        # decline reason (if any) is logged once at scheduler startup, not
-        # here — this runs per /server_info request.
+        # Load range, from the same resolver SchedulerLoadPublisher binds
+        # with (so the two can't drift). The decline reason is logged once at
+        # startup, not here — this runs per /server_info request.
         resolved, _reason = resolve_load_pub_range(
             kv_endpoint=cfg.endpoint,
             replay_endpoint=cfg.replay_endpoint,

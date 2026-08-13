@@ -2107,9 +2107,8 @@ class Scheduler(
         )
 
     def init_load_publisher(self) -> None:
-        # Load reporting for load-aware routers — a separate publisher on its
-        # own port range, independent of KV-cache events (rank gating and the
-        # no-op fallback live inside the component).
+        # Router-facing load reporting; rank gating and no-op fallback live
+        # inside the component.
         self.load_publisher = SchedulerLoadPublisher(
             kv_events_config=get_observability().kv_events_config,
             ps=self.ps,
@@ -3933,13 +3932,8 @@ class Scheduler(
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
         snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
-        # Router-facing load gauge on the dedicated load PUB socket, for
-        # cache-aware-zmq load-aware selection. Independent of the
-        # DP-balancing snapshot above so it works for single workers too.
-        # Sourced from the load inquirer (live scheduler counts, not the
-        # metrics-gated stats); reuses the snapshot the DP-balancing
-        # publisher just computed instead of walking the queues a second
-        # time, and dedups unchanged gauges internally.
+        # Router-facing gauge on the dedicated PUB socket, reusing the
+        # snapshot above rather than walking the queues again.
         self.load_publisher.publish_load_stat(
             self.load_inquirer.get_loads,
             force=batch.forward_mode.is_extend(),
@@ -4060,19 +4054,14 @@ class Scheduler(
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
-        # Publish load BEFORE the fully-idle gate below. A no-batch iteration
-        # that is not fully idle — waiting requests unschedulable under KV
-        # pressure, disagg requests parked in bootstrap/prealloc/transfer
-        # queues — is exactly when the gauge is changing (queues growing)
-        # with no process_batch_result running to publish it; gating this
-        # behind is_fully_idle froze /get_loads, DP balancing, and the
-        # router-facing LoadStat at their last busy values for the whole
-        # stall. Force only when fully idle: the stalled path spins without
-        # ever reaching maybe_sleep_on_idle (it returns at the gate) and
-        # get_loads is O(parked queue) there, so it must ride the normal
-        # interval throttles — freshness bounded by a few spin iterations —
-        # while the truly idle path keeps its immediate force=True publish
-        # over O(empty) queues, with --sleep-on-idle as its escape hatch.
+        # Publish before the fully-idle gate: a no-batch-but-not-idle stall
+        # (queues parked under KV pressure / disagg transfer) has no
+        # process_batch_result to publish the growing gauge, and gating here
+        # froze /get_loads, DP balancing, and the LoadStat for the stall.
+        # Force only when fully idle — the stalled path returns at the gate
+        # without sleeping and get_loads is O(parked queue), so it rides the
+        # normal throttles; the idle path keeps immediate force over empty
+        # queues, with --sleep-on-idle as its escape hatch.
         fully_idle = self.is_fully_idle()
         snapshot = self.publish_load_snapshot(force=fully_idle)
         self.load_publisher.publish_load_stat(
