@@ -252,6 +252,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             queue=[], retracted_queue=[object()]
         )
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_decode_prebuilt_queue = []
         scheduler.decode_offload_manager = None
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False
