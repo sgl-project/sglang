@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.mem_cache.index_alias_guard import aliases_req_to_token
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
@@ -71,7 +73,13 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     @staticmethod
     def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
-        """Take ownership before a caller can mutate a deferred tensor view."""
+        """Take ownership before a caller can mutate a deferred tensor view.
+
+        Only req_to_token rows are mutated under a pending free group; tree node
+        values (and their slices) already own their data, so they are queued as-is.
+        """
+        if not aliases_req_to_token(free_index):
+            return free_index
         return free_index.clone()
 
     def merge_and_sort_free(self):

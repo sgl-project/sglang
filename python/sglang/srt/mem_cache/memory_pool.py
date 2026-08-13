@@ -58,7 +58,12 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
-from sglang.srt.mem_cache.index_alias_guard import arm as arm_index_alias_guard
+from sglang.srt.mem_cache.index_alias_guard import (
+    install_debug_hooks as install_index_alias_hooks,
+)
+from sglang.srt.mem_cache.index_alias_guard import (
+    register_req_to_token,
+)
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.page_major import (
@@ -283,8 +288,11 @@ class ReqToTokenPool:
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
 
+        # The allocators consult this to skip taking ownership of already-owned
+        # deferred frees, so it is registered unconditionally.
+        register_req_to_token(self.req_to_token)
         if envs.SGLANG_DEBUG_MEMORY_POOL.get():
-            arm_index_alias_guard(self.req_to_token)
+            install_index_alias_hooks()
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
