@@ -2799,7 +2799,7 @@ def _looks_like_safetensors_payload(data: bytes) -> bool:
     return data[8] == 0x7B  # '{'
 
 
-def deserialize_tensor_payload(data) -> Dict[str, "torch.Tensor"]:
+def deserialize_tensor_payload(data) -> Dict[str, torch.Tensor]:
     """Deserialize a serialized tensor payload sent over the wire.
 
     Prefers the safetensors format (no code-execution semantics); falls back to
