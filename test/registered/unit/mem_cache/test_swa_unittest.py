@@ -224,6 +224,41 @@ class TestSWA(unittest.TestCase):
         allocator.free_swa(full_indices[1:2])
         self.assertEqual(allocator.swa_available_size(), 16)
 
+    def test_free_swa_group_owns_deferred_indices(self):
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            kv_size=32,
+            kv_size_swa=32,
+        )
+        index_batches = []
+        for size in (2, 3, 1, 4):
+            indices = _swa_alloc(allocator, size)
+            assert indices is not None
+            index_batches.append(indices)
+        original_indices = torch.cat([indices.clone() for indices in index_batches])
+
+        available_before_free = allocator.swa_available_size()
+        allocator.free_group_begin()
+        for indices in index_batches:
+            allocator.free_swa(indices)
+
+        self.assertEqual(len(allocator.swa_free_group), len(index_batches))
+        self.assertEqual(allocator.swa_available_size(), available_before_free)
+        for indices in index_batches:
+            indices.zero_()
+        allocator.free_group_end()
+
+        self.assertTrue(
+            torch.equal(
+                allocator.full_to_swa_index_mapping[original_indices.to(torch.int64)],
+                torch.zeros_like(original_indices),
+            )
+        )
+        self.assertEqual(
+            allocator.swa_available_size(),
+            available_before_free + original_indices.numel(),
+        )
+
     def test_swa_radix_cache_1(self):
         # args
         req_size = 10
@@ -572,6 +607,7 @@ class TestSWA(unittest.TestCase):
             (req.req_pool_idx, slice(0, req._kv_committed_len)), kv_indices
         )
         req.extra_key = None
+        req.cache_salt = None
         req.last_node = tree.root_node
         req.swa_uuid_for_lock = None
         req.kv.swa_evicted_seqlen = 0
@@ -609,6 +645,7 @@ class TestSWA(unittest.TestCase):
             (req2.req_pool_idx, slice(0, req2._kv_committed_len)), kv_indices2
         )
         req2.extra_key = None
+        req2.cache_salt = None
         req2.last_node = tree.root_node
         req2.swa_uuid_for_lock = None
         req2.kv.swa_evicted_seqlen = 0
