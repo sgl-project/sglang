@@ -14,7 +14,7 @@ context window.
 This document demonstrates the deployment of Kimi-K3 on Ascend NPUs using SGLang, including multi-node PD mixed mode with
 **DSPARK** speculative decoding.
 
-This document is validated and written based on the **SGLang daily build** (Docker image tag `cann9.0.0-a3-main`).
+This document is validated and written based on the **SGLang daily build** (Docker image tag `main-cann9.0.0-a3`).
 Performance and feature coverage will continue to be optimized in subsequent releases.
 
 ## Supported features
@@ -86,7 +86,7 @@ For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/fa
   <Tab title="Atlas 800I A3">
 
 ```bash Command
-docker pull quay.io/ascend/sglang:cann9.0.0-a3-main
+docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
 
 docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
@@ -114,7 +114,7 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:cann9.0.0-a3-main
+quay.io/ascend/sglang:main-cann9.0.0-a3
 ```
   </Tab>
 </Tabs>
