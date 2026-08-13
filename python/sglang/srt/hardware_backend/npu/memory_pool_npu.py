@@ -139,9 +139,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 # Each layer view: [P*ps, 1, H, D], sharing the contiguous
                 # storage allocated above.
                 self.k_buffer = [
-                    self._hicache_k_buffer[i].view(
-                        -1, 1, self.head_num, self.head_dim
-                    )
+                    self._hicache_k_buffer[i].view(-1, 1, self.head_num, self.head_dim)
                     for i in range(self.layer_num)
                 ]
                 self.v_buffer = [

@@ -316,9 +316,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             # FIA exposes lists here; these must not be sent to the operator.
             k_buffer=[device_k[layer].reshape(-1, 1, 1, 1) for layer in range(2)],
             v_buffer=[device_v[layer].reshape(-1, 1, 1, 1) for layer in range(2)],
-            get_hicache_transfer_buffers=mock.Mock(
-                return_value=(device_k, device_v)
-            ),
+            get_hicache_transfer_buffers=mock.Mock(return_value=(device_k, device_v)),
         )
         host_indices = _indices(0, 2)
         device_indices = _indices(2, 4)

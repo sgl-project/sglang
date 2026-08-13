@@ -47,8 +47,6 @@ if _is_cuda or _is_hip:
         transfer_kv_mamba_pf_lf,
     )
 if _is_npu:
-    from sgl_kernel_npu.kvcacheio import transfer_kv_dim_exchange
-
     try:
         from sgl_kernel_npu.kvcacheio import (
             transfer_state_all_layer_direct_lf_pf,
@@ -187,9 +185,7 @@ class MambaPoolHost(HostKVCache):
     def _configure_npu_mamba_io(self) -> None:
         mode = _npu_hicache_mamba_io_mode()
         if mode == "sync":
-            logger.info(
-                "NPU HiCache Mamba state transfer mode: sync torch fallback."
-            )
+            logger.info("NPU HiCache Mamba state transfer mode: sync torch fallback.")
             return
 
         required_ops = (
@@ -445,9 +441,7 @@ class MambaPoolHost(HostKVCache):
                 device_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
                 # Host: [slot, layer, 1, *state]; device: [slot, *state].
                 values = (
-                    src.select(1, layer_id)
-                    .index_select(0, host_indices)
-                    .select(1, 0)
+                    src.select(1, layer_id).index_select(0, host_indices).select(1, 0)
                 )
                 dst.index_copy_(0, device_indices, values.to(device=dst.device))
         else:

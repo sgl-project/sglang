@@ -10,6 +10,9 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MambaPoolHost,
     _npu_hicache_mamba_io_mode,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestNPUMambaAsyncConfig(unittest.TestCase):
@@ -32,12 +35,8 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
         "_npu_hicache_mamba_io_mode",
         return_value="async",
     )
-    @patch.object(
-        memory_pool_host, "transfer_state_per_layer_direct_pf_lf", None
-    )
-    @patch.object(
-        memory_pool_host, "transfer_state_all_layer_direct_lf_pf", None
-    )
+    @patch.object(memory_pool_host, "transfer_state_per_layer_direct_pf_lf", None)
+    @patch.object(memory_pool_host, "transfer_state_all_layer_direct_lf_pf", None)
     def test_async_requires_native_operator(self, _mock_mode):
         pool = MambaPoolHost.__new__(MambaPoolHost)
 
@@ -73,13 +72,13 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
                 io_backend="kernel_ascend",
             )
 
-        transfer_op.assert_called_once_with(
-            src=host,
-            dst=device_layers[2],
-            src_indices=host_indices,
-            dst_indices=device_indices,
-            layer_id=2,
-        )
+        transfer_op.assert_called_once()
+        call = transfer_op.call_args.kwargs
+        self.assertIs(call["src"], host)
+        self.assertEqual(call["dst"].data_ptr(), device_layers[2].data_ptr())
+        self.assertIs(call["src_indices"], host_indices)
+        self.assertIs(call["dst_indices"], device_indices)
+        self.assertEqual(call["layer_id"], 2)
 
     def test_async_d2h_is_dispatched_per_component_from_copy_helper(self):
         pool = MambaPoolHost.__new__(MambaPoolHost)
@@ -176,7 +175,9 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
         pool._copy_tensor_pf_lf.assert_called_once()
         call = pool._copy_tensor_pf_lf.call_args.kwargs
         self.assertIs(call["src"], pool.conv_buffer[0])
-        self.assertIs(call["dst"], device_pool.mamba_cache.conv[0][1])
+        self.assertEqual(
+            call["dst"].data_ptr(), device_pool.mamba_cache.conv[0][1].data_ptr()
+        )
 
 
 if __name__ == "__main__":
