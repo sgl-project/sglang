@@ -336,7 +336,9 @@ def _assert_tied_distributed_topk(test, full_logits, target_ids, result):
         test.assertEqual(len(values), 5)
         test.assertEqual(len(indices), 5)
         test.assertEqual(len(set(indices)), 5, "Top-N IDs must be distinct")
-        test.assertTrue(all(0 <= token_id < full_logits.shape[1] for token_id in indices))
+        test.assertTrue(
+            all(0 <= token_id < full_logits.shape[1] for token_id in indices)
+        )
         test.assertTrue(
             all(values[pos] >= values[pos + 1] for pos in range(len(values) - 1)),
             "Top-N values must remain rank-descending",

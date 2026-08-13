@@ -210,9 +210,7 @@ def get_distributed_topk(
     if max_k < 0:
         raise ValueError(f"max_k must be non-negative, got {max_k}")
     if max_k > vocab_size:
-        raise ValueError(
-            f"max_k={max_k} exceeds global vocabulary size {vocab_size}"
-        )
+        raise ValueError(f"max_k={max_k} exceeds global vocabulary size {vocab_size}")
     if not 0 <= valid_vocab_size <= local_logits.shape[1]:
         raise ValueError(
             f"valid_vocab_size={valid_vocab_size} is incompatible with "
