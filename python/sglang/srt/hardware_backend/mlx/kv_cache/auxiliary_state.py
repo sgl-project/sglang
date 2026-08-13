@@ -335,13 +335,9 @@ class MlxAuxiliaryStateComponent(MambaComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> int | None:
-        cache_len = getattr(req, "mamba_last_track_seqlen", None)
+        cache_len = req.mamba_last_track_seqlen
         if cache_len is None:
-            cache_len = (
-                getattr(req, "kv_committed_len", token_ids_len)
-                if is_finished
-                else token_ids_len
-            )
+            cache_len = req.kv_committed_len if is_finished else token_ids_len
         if not self._can_attach_checkpoint(cache_len, token_ids_len):
             if is_finished:
                 return None

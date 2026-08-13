@@ -1620,8 +1620,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertEqual(declared["mamba_radix_cache_strategy"], "no_buffer")
         self.assertIs(declared["disable_overlap_schedule"], True)
-        # DCP widens an otherwise unpaged tree, so auto must not select
-        # no_buffer even when overlap scheduling is disabled.
         declared = _mamba_radix_cache_resolution(
             _view(
                 "Qwen3NextForCausalLM",

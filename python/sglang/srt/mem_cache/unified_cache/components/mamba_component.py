@@ -543,11 +543,6 @@ class MambaComponent(TreeComponent):
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.mamba_last_track_seqlen
         else:
-            # Without a snapshot buffer, the request slot represents the live
-            # committed state, which may be ahead of token_ids_len when a cache
-            # policy deliberately shortens a finished key (for example
-            # strip-thinking). Use the state's actual semantic length and let
-            # the exact-boundary gate below reject an incompatible donation.
             cache_len = req.kv_committed_len if is_finished else token_ids_len
             # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by the
             # slot's unflushed ring depth (`write_pos`), so on request finish cap
@@ -568,19 +563,9 @@ class MambaComponent(TreeComponent):
                 return 0
             cache_len = 0
 
-        # A recurrent state H(S) is a point checkpoint and can only be attached
-        # to the radix node whose cumulative key depth is exactly S. DCP widens
-        # cache.page_size, so a checkpoint tracked on the pre-DCP grid may not
-        # be a legal tree boundary. Also reject states ahead of a shortened key
-        # (for example strip-thinking cache insertion). Do this before cloning,
-        # quantizing, or donating a slot so ownership remains with the request.
         if not self._can_attach_checkpoint(cache_len, token_ids_len):
             if is_finished:
                 return None
-            # cache_unfinished_req transfers inserted KV ownership to the tree
-            # only after rematching and locking the new node. A Full-only node
-            # cannot win Mamba consensus, so inserting one here would leave the
-            # request and an unlocked tree node sharing the same KV slots.
             return 0
 
         insert_params.mamba_state_seqlen = cache_len
