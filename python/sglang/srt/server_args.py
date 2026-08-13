@@ -1163,6 +1163,16 @@ class ServerArgs:
         "Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
         NS("parallel"),
     ] = False
+    k3_shared_experts_attn_tp: A[
+        bool,
+        "Keep Kimi-K3 shared experts sharded over attention TP when using an expert-parallel all-to-all backend.",
+        NS("parallel"),
+    ] = False
+    k3_dense_mlp_attn_tp: A[
+        bool,
+        "Keep Kimi-K3 dense MLPs sharded over attention TP under DP attention.",
+        NS("parallel"),
+    ] = False
     disable_attn_tp_gather: A[
         bool,
         "Disable scheduler-side attn_tp_gather (the upstream SP path "

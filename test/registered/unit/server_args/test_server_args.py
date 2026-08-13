@@ -43,6 +43,25 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_k3_attn_tp_flags(self):
+        disabled = ServerArgs(model_path="dummy")
+        self.assertFalse(disabled.k3_shared_experts_attn_tp)
+        self.assertFalse(disabled.k3_dense_mlp_attn_tp)
+
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(
+            [
+                "--model",
+                "dummy",
+                "--k3-shared-experts-attn-tp",
+                "--k3-dense-mlp-attn-tp",
+            ]
+        )
+        enabled = ServerArgs.from_cli_args(parsed)
+        self.assertTrue(enabled.k3_shared_experts_attn_tp)
+        self.assertTrue(enabled.k3_dense_mlp_attn_tp)
+
     def test_return_hidden_states_mode_configuration(self):
         disabled = ServerArgs(model_path="dummy")
         self.assertFalse(disabled.enable_return_hidden_states)
