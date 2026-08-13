@@ -302,6 +302,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         value = value.unflatten(-1, (self.local_heads, -1))
 
         cos_sin_cache = None
+        complex_freqs = None
         if freqs_cis is not None:
             cos, sin = freqs_cis
             cos_sin_cache = torch.cat(
@@ -311,6 +312,12 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 ],
                 dim=-1,
             )
+            # is_neox=False here, so this can hit the NPU
+            # _apply_rotary_emb_complex fast path in RotaryEmbedding instead
+            # of the interleaved fallback (no fused NPU kernel for it).
+            complex_freqs = torch.complex(
+                cos.to(torch.float32), sin.to(torch.float32)
+            )
 
         if self.added_kv_proj_dim is not None:
             encoder_query = encoder_query.unflatten(-1, (self.local_heads, -1))
@@ -318,6 +325,13 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             encoder_value = encoder_value.unflatten(-1, (self.local_heads, -1))
 
             text_seq_len = encoder_query.shape[1]
+            # complex_freqs covers [text, image] positions in order (same
+            # table cos_sin_cache/positions index into); slice per call the
+            # same way position_offset selects rows below — the class's
+            # complex_freqs path does not do positional indexing itself.
+            text_freqs_complex = (
+                complex_freqs[:text_seq_len] if complex_freqs is not None else None
+            )
             encoder_query, encoder_key = apply_qk_norm_with_optional_rope(
                 q=encoder_query,
                 k=encoder_key,
@@ -325,8 +339,15 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 k_norm=self.norm_added_k,
                 head_dim=self.head_dim,
                 cos_sin_cache=cos_sin_cache,
+                freqs_complex=text_freqs_complex,
                 is_neox=False,
                 allow_inplace=True,
+            )
+            img_seq_len = query.shape[1]
+            img_freqs_complex = (
+                complex_freqs[text_seq_len : text_seq_len + img_seq_len]
+                if complex_freqs is not None
+                else None
             )
             query, key = apply_qk_norm_with_optional_rope(
                 q=query,
@@ -335,6 +356,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 k_norm=self.norm_k,
                 head_dim=self.head_dim,
                 cos_sin_cache=cos_sin_cache,
+                freqs_complex=img_freqs_complex,
                 is_neox=False,
                 position_offset=text_seq_len,
                 allow_inplace=True,
@@ -347,6 +369,10 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             key = join_seqs(encoder_key, key, sp_txt_pad)
             value = join_seqs(encoder_value, value, sp_txt_pad)
         else:
+            seq_len = query.shape[1]
+            joint_freqs_complex = (
+                complex_freqs[:seq_len] if complex_freqs is not None else None
+            )
             query, key = apply_qk_norm_with_optional_rope(
                 q=query,
                 k=key,
@@ -354,6 +380,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 k_norm=self.norm_k,
                 head_dim=self.head_dim,
                 cos_sin_cache=cos_sin_cache,
+                freqs_complex=joint_freqs_complex,
                 is_neox=False,
                 allow_inplace=True,
             )
@@ -526,6 +553,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         value = value.unflatten(-1, (self.local_heads, -1))
 
         cos_sin_cache = None
+        complex_freqs = None
         if freqs_cis is not None:
             cos, sin = freqs_cis
             cos_sin_cache = torch.cat(
@@ -535,6 +563,13 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
                 ],
                 dim=-1,
             )
+            # is_neox=False here, so this can hit the NPU
+            # _apply_rotary_emb_complex fast path in RotaryEmbedding instead
+            # of the interleaved fallback (no fused NPU kernel for it).
+            complex_freqs = torch.complex(
+                cos.to(torch.float32), sin.to(torch.float32)
+            )
+            complex_freqs = complex_freqs[: query.shape[1]]
 
         # QK-norm (+ RoPE) via the shared helper so the fused kernel path is used
         # here too — the single-stream block previously ran norm and RoPE as separate ops.
@@ -545,6 +580,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             k_norm=self.norm_k,
             head_dim=self.head_dim,
             cos_sin_cache=cos_sin_cache,
+            freqs_complex=complex_freqs,
             is_neox=False,
             allow_inplace=True,
         )
