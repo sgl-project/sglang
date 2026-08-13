@@ -213,13 +213,14 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 seq_len = forward_batch.num_token_non_padded_cpu
 
             batch_size = cache_indices.shape[0]
-            draft_token_num = forward_batch.spec_info.draft_token_num
-            # The ascendc conv op reads the pre-verify window at offset
-            # (num_accepted_tokens - 1). Passing the full draft count would read
-            # the stale draft-slot region instead of the committed window and
-            # corrupt every verify output; num_accepted_tokens=1 reads the base
-            # window and leaves [P1, P2, x0..x_{D-1}] in the slot so the commit
-            # (`_commit_conv_windows`) can slice out the accepted step's window.
+            # The ascendc conv op reads the base window at slot offset
+            # (num_accepted_tokens - 1), clamped to [0, stateLen - (width-1)]
+            # (sgl-kernel-npu causal_conv1d ProcessDefaultByWindowMode). Passing
+            # the full draft count would read the draft-slot region instead of
+            # the committed FRONT window; num_accepted_tokens=1 reads the base
+            # window at offset 0 and leaves the sliding buffer
+            # [P1, P2, x0, ..., x_{D-1}] in the slot (P = pre-verify window) so
+            # `_commit_conv_windows` can slice out the accepted step's window.
             num_accepted_tokens = torch.ones(
                 batch_size,
                 dtype=torch.int32,
@@ -244,8 +245,16 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     mixed_qkv_to_track
                 )
             kernel_size = layer.conv_weights.shape[-1]
+            # The ascendc conv op reads the base window from the FRONT of the
+            # passed conv_states tensor (offset = num_accepted-1 for the verify
+            # path, 0 otherwise; see sgl-kernel-npu causal_conv1d InitRing).
+            # With speculative decoding the per-slot buffer is widened to
+            # [W + D - 1] (memory_pool._init_npu_conv_state), so the window
+            # must live in the FRONT [0:W) region for the first decode/verify
+            # after prefill to see it. Slicing [-(W):] (the END) leaves FRONT
+            # unwritten and corrupts the first post-prefill forward.
             conv_states_for_prefill = conv_states[
-                :, -(kernel_size - 1) :, :
+                :, 0 : (kernel_size - 1), :
             ].contiguous()
             mixed_qkv = torch.ops.npu.causal_conv1d(
                 mixed_qkv,
@@ -259,7 +268,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 pad_slot_id=-1,
                 run_mode=0,
             )
-            conv_states[:, -(kernel_size - 1) :, :] = conv_states_for_prefill
+            conv_states[:, 0 : (kernel_size - 1), :] = conv_states_for_prefill
         if is_target_verify:
             g, beta = fused_gdn_gating_kernel_without_sigmoid(
                 layer.A_log, a, b, layer.dt_bias
@@ -372,12 +381,16 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
         # The NPU verify op (recurrent_gated_delta_rule) is natively V-major:
         # it reads/writes the recurrent state at flat V-major offsets [.., V, K]
-        # and IGNORES tensor strides. The temporal pool is K-major [.., K, V] to
-        # match the triton decode kernel, so we must hand the op a physically
-        # contiguous transposed copy — a mere strided view would make it read the
-        # pool as its own transpose. The commit side mirrors this with a
+        # and IGNORES tensor strides. The temporal pool is physically K-major
+        # [.., K, V] to match the triton decode kernel, but on NPU+spec it is
+        # exposed as a V-major VIEW [.., V, K] (memory_pool.py transpose). A
+        # plain .contiguous() therefore materializes exactly the V-major
+        # physical copy the op wants — an extra .transpose(-1,-2) would fold the
+        # view back to K-major bytes and hand the op the TRANSPOSED state
+        # (verified: only the V-major materialization reproduces the decode
+        # kernel's single-step output). The commit side mirrors this with a
         # transposing load in move_intermediate_cache.
-        recurrent_state = recurrent_state.transpose(-1, -2).contiguous()
+        recurrent_state = recurrent_state.contiguous()
 
         attn_core_out = torch.ops.npu.recurrent_gated_delta_rule(
             mix_qkv,
