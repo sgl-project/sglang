@@ -20,10 +20,29 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.mem_cache.index_ownership import aliases_req_to_token
-
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+
+# A `req_to_token` row is rewritten by the radix caches during rematch, so a view
+# of one that outlives the current call can change value before it is read. Below
+# are the (start, end, device) ranges of every live req_to_token buffer.
+_rows: list[tuple[int, int, torch.device]] = []
+
+
+def register_req_to_token(req_to_token: torch.Tensor) -> None:
+    # Never unregistered: a stale range only over-reports, costing a spare copy.
+    start = req_to_token.data_ptr()
+    end = start + req_to_token.numel() * req_to_token.element_size()
+    _rows.append((start, end, req_to_token.device))
+
+
+def aliases_req_to_token(value: torch.Tensor) -> bool:
+    # Address range, not `_base`: a slice of a tree node value is a view yet owned.
+    if not _rows or value.numel() == 0:
+        return False
+    ptr = value.data_ptr()
+    return any(start <= ptr < end and value.device == dev for start, end, dev in _rows)
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
