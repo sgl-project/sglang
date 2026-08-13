@@ -1707,6 +1707,20 @@ class DeepseekV2MoE(nn.Module):
         state.hidden_states_mlp_output = final_hidden_states
 
 
+def _has_rope_scaling(rope_scaling) -> bool:
+    """True only when RoPE scaling is actually configured.
+
+    transformers v5 exposes config.rope_scaling as an alias of rope_parameters,
+    which is always populated (rope_type="default" when unscaled). Plain
+    truthiness therefore no longer distinguishes scaled from unscaled configs,
+    and using it as such coerces unscaled MLA models onto the deepseek_yarn path.
+    """
+    if not rope_scaling:
+        return False
+    rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
+    return rope_type not in (None, "default")
+
+
 class DeepseekV2AttentionMLA(
     nn.Module,
     DeepseekMHAForwardMixin,
@@ -1772,7 +1786,7 @@ class DeepseekV2AttentionMLA(
         self.kv_cache_dtype = get_model().kv_cache_dtype
 
         # NOTE modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
-        if rope_scaling:
+        if _has_rope_scaling(rope_scaling):
             rope_scaling["rope_type"] = "deepseek_yarn"
 
         # For tensor parallel attention
@@ -1884,11 +1898,13 @@ class DeepseekV2AttentionMLA(
                 device=get_device().device,
             )
 
-            if rope_scaling and rope_scaling.get("apply_yarn_scaling", True):
+            if _has_rope_scaling(rope_scaling) and rope_scaling.get(
+                "apply_yarn_scaling", True
+            ):
                 self.scaling = compute_mla_mscale_scaling(rope_scaling, self.scaling)
         else:
             self.rotary_emb = None
-        self.use_deepseek_yarn_rope = rope_scaling is not None
+        self.use_deepseek_yarn_rope = _has_rope_scaling(rope_scaling)
 
         self.attn_mqa = RadixAttention(
             self.num_local_heads,
