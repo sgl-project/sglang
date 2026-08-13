@@ -71,9 +71,8 @@ on:
           # 8-GPU Kimi-K2.6 (MI30x + MI35x)
           - nightly-8-gpu-kimi-k26-rocm720
           - nightly-8-gpu-mi35x-kimi-k26-rocm720
-          # 8-GPU Qwen3-235B (MI30x + MI35x MXFP4)
+          # 8-GPU Qwen3-235B (MI30x)
           - nightly-8-gpu-qwen3-235b-rocm720
-          - nightly-8-gpu-mi35x-qwen3-235b-mxfp4-rocm720
           # 8-GPU Qwen 3.5 (MI30x + MI35x)
           - nightly-8-gpu-qwen35-rocm720
           - nightly-8-gpu-mi35x-qwen35-rocm720
@@ -1451,7 +1450,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 8-GPU Qwen3-235B (MI30x + MI35x MXFP4)
+  # 8-GPU Qwen3-235B (MI30x)
   # ==============================================================================
 
   nightly-8-gpu-qwen3-235b-rocm720:
@@ -1485,41 +1484,6 @@ jobs:
             -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-8-gpu-qwen3-235b --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
-  nightly-8-gpu-mi35x-qwen3-235b-mxfp4-rocm720:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen3-235b-mxfp4-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Setup docker (ROCm 7.2)
-        run: |
-          touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
-          # Install tabulate for run_suite.py (missing in MI35x container)
-          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
-
-      - name: Accuracy Test + Performance Test MI35x ROCm 7.2 (8-GPU Qwen3-235B-MXFP4)
-        timeout-minutes: 120
-        run: |
-          > github_summary.md  # Clear summary file
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-8-gpu-mi35x-qwen3-235b-mxfp4 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -2017,9 +1981,8 @@ jobs:
       # 8-GPU Kimi-K2.6 (MI30x + MI35x)
       - nightly-8-gpu-kimi-k26-rocm720
       - nightly-8-gpu-mi35x-kimi-k26-rocm720
-      # 8-GPU Qwen3-235B (MI30x + MI35x MXFP4)
+      # 8-GPU Qwen3-235B (MI30x)
       - nightly-8-gpu-qwen3-235b-rocm720
-      - nightly-8-gpu-mi35x-qwen3-235b-mxfp4-rocm720
       # 8-GPU Qwen 3.5 (MI30x + MI35x)
       - nightly-8-gpu-qwen35-rocm720
       - nightly-8-gpu-mi35x-qwen35-rocm720
