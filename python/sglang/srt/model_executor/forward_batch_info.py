@@ -479,6 +479,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     can_run_dp_breakable_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 
+    # Request/token boundary of the prefill-first segment in a mixed batch.
+    mixed_num_prefill_reqs: Optional[int] = None
+    mixed_num_prefill_tokens: Optional[int] = None
+
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
 
@@ -821,6 +825,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
+            mixed_num_prefill_reqs=batch.mixed_num_prefill_reqs,
+            mixed_num_prefill_tokens=batch.mixed_num_prefill_tokens,
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,

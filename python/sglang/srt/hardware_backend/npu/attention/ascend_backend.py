@@ -12,6 +12,7 @@ from sgl_kernel_npu.attention.sinks_attention import (
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
@@ -19,6 +20,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.utils import supports_fia_mixed_split
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
@@ -33,6 +35,7 @@ from sglang.srt.utils import (
     get_current_device_stream_fast,
     next_power_of_2,
 )
+from sglang.srt.utils.nvtx_utils import profile_range
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -90,6 +93,10 @@ class ForwardMetadata:
     actual_seq_lengths_q: Optional[torch.Tensor] = None
     actual_seq_lengths_q_pa: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
+
+    # Boundary of the prefill-first portion in an NPU mixed chunk batch.
+    mixed_num_prefill_reqs: Optional[int] = None
+    mixed_num_prefill_tokens: Optional[int] = None
 
     # swa attention mask for graph mode decode
     swa_mask: Optional[torch.Tensor] = None
@@ -339,6 +346,22 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        fia_mixed_split_requested = envs.SGLANG_NPU_FIA_MIXED_SPLIT.get()
+        self.enable_fia_mixed_split = (
+            self.use_fia
+            and fia_mixed_split_requested
+            and not self.use_mla
+            and supports_fia_mixed_split()
+        )
+        if speculative_step_id == 0:
+            logger.info(
+                "Ascend FIA mixed split is %s (ASCEND_USE_FIA=%s, "
+                "SGLANG_NPU_FIA_MIXED_SPLIT=%s, use_mla=%s)",
+                "enabled" if self.enable_fia_mixed_split else "disabled",
+                self.use_fia,
+                fia_mixed_split_requested,
+                self.use_mla,
+            )
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
@@ -407,6 +430,40 @@ class AscendAttnBackend(AttentionBackend):
         d = layer.qk_head_dim
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
+
+    def _set_fia_mixed_split_metadata(self, forward_batch: ForwardBatch) -> None:
+        if forward_batch.forward_mode != ForwardMode.MIXED:
+            return
+
+        num_prefill_reqs = forward_batch.mixed_num_prefill_reqs
+        num_prefill_tokens = forward_batch.mixed_num_prefill_tokens
+        if num_prefill_reqs is None and num_prefill_tokens is None:
+            return
+        if num_prefill_reqs is None or num_prefill_tokens is None:
+            raise RuntimeError(
+                "Incomplete FIA mixed-split boundary metadata: both request and "
+                "token counts are required."
+            )
+
+        total_reqs = forward_batch.batch_size
+        total_tokens = forward_batch.extend_num_tokens
+        q_cumulative = self.forward_metadata.seq_lens_list_cumsum
+        if (
+            total_tokens is None
+            or q_cumulative is None
+            or not 0 < num_prefill_reqs < total_reqs
+            or not 0 < num_prefill_tokens < total_tokens
+            or int(q_cumulative[num_prefill_reqs - 1]) != num_prefill_tokens
+        ):
+            raise RuntimeError(
+                "Invalid FIA mixed-split boundary: "
+                f"prefill_reqs={num_prefill_reqs}, "
+                f"prefill_tokens={num_prefill_tokens}, total_reqs={total_reqs}, "
+                f"total_tokens={total_tokens}, q_cumulative={q_cumulative}."
+            )
+
+        self.forward_metadata.mixed_num_prefill_reqs = num_prefill_reqs
+        self.forward_metadata.mixed_num_prefill_tokens = num_prefill_tokens
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
@@ -498,6 +555,7 @@ class AscendAttnBackend(AttentionBackend):
         ):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
+        self._set_fia_mixed_split_metadata(forward_batch)
 
         if forward_batch.forward_mode.is_target_verify() and not _is_dflash_verify(
             forward_batch.spec_info
@@ -2873,6 +2931,123 @@ class AscendAttnBackend(AttentionBackend):
                 )
             return attn_output.view(num_tokens, layer.tp_q_head_num * self.kv_lora_rank)
 
+    def _should_split_fia_mixed(
+        self,
+        layer: RadixAttention,
+        topk_indices: Optional[torch.Tensor],
+    ) -> bool:
+        metadata = self.forward_metadata
+        return (
+            self.enable_fia_mixed_split
+            and self.use_fia
+            and not self.use_mla
+            and topk_indices is None
+            and layer.attn_type == AttentionType.DECODER
+            and not layer.is_cross_attention
+            and (
+                layer.sliding_window_size is None
+                or layer.sliding_window_size <= -1
+            )
+            and layer.tp_k_head_num > 0
+            and layer.tp_q_head_num % layer.tp_k_head_num == 0
+            and metadata.mixed_num_prefill_reqs is not None
+            and metadata.mixed_num_prefill_tokens is not None
+        )
+
+    def _run_fia_mixed(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        layer: RadixAttention,
+        block_size: int,
+        block_table: torch.Tensor,
+        actual_seq_lengths,
+        actual_seq_lengths_kv: torch.Tensor,
+    ) -> torch.Tensor:
+        attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            query,
+            key,
+            value,
+            num_heads=layer.tp_q_head_num,
+            num_key_value_heads=layer.tp_k_head_num,
+            input_layout="TND",
+            block_size=block_size,
+            block_table=block_table,
+            atten_mask=self.mix_mask,
+            sparse_mode=3,
+            actual_seq_lengths=actual_seq_lengths,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            scale=layer.scaling,
+        )
+        return attn_output
+
+    def _forward_fia_mixed_split(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        layer: RadixAttention,
+        block_size: int,
+    ) -> torch.Tensor:
+        metadata = self.forward_metadata
+        num_prefill_reqs = metadata.mixed_num_prefill_reqs
+        num_prefill_tokens = metadata.mixed_num_prefill_tokens
+        assert num_prefill_reqs is not None
+        assert num_prefill_tokens is not None
+        num_tokens = query.shape[0]
+
+        output = query.new_empty(
+            (num_tokens, layer.tp_q_head_num, layer.v_head_dim)
+        )
+
+        with profile_range("ascend.fia_mixed.prefill"):
+            prefill_output = self._run_fia_mixed(
+                query[:num_prefill_tokens],
+                key,
+                value,
+                layer=layer,
+                block_size=block_size,
+                block_table=metadata.block_tables[:num_prefill_reqs],
+                actual_seq_lengths=metadata.seq_lens_list_cumsum[
+                    :num_prefill_reqs
+                ],
+                actual_seq_lengths_kv=metadata.seq_lens_cpu_int[
+                    :num_prefill_reqs
+                ],
+            )
+        output[:num_prefill_tokens].copy_(
+            prefill_output.view(
+                num_prefill_tokens, layer.tp_q_head_num, layer.v_head_dim
+            )
+        )
+
+        decode_seq_lens = [
+            int(length) - num_prefill_tokens
+            for length in metadata.seq_lens_list_cumsum[num_prefill_reqs:]
+        ]
+        num_decode_tokens = num_tokens - num_prefill_tokens
+        with profile_range("ascend.fia_mixed.decode"):
+            decode_output = self._run_fia_mixed(
+                query[num_prefill_tokens:],
+                key,
+                value,
+                layer=layer,
+                block_size=block_size,
+                block_table=metadata.block_tables[num_prefill_reqs:],
+                actual_seq_lengths=decode_seq_lens,
+                actual_seq_lengths_kv=metadata.seq_lens_cpu_int[
+                    num_prefill_reqs:
+                ],
+            )
+        output[num_prefill_tokens:].copy_(
+            decode_output.view(
+                num_decode_tokens, layer.tp_q_head_num, layer.v_head_dim
+            )
+        )
+        return output
+
     def forward_mixed(
         self,
         q: torch.Tensor,
@@ -2908,27 +3083,33 @@ class AscendAttnBackend(AttentionBackend):
             )
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        num_block, block_size, _, _ = k_cache.shape
-        key = k_cache.view(num_block, block_size, -1)
-        value = v_cache.view(num_block, block_size, -1)
+        # FIA's paged-KV contract is [num_blocks, block_size, heads * head_dim]
+        # with block_size == page_size (the kernel rejects anything that is not
+        # a multiple of 128). The pool buffer's own second dim is not the page
+        # dimension, so re-split it the way forward_extend does.
+        block_size = self.page_size
+        key = k_cache.view(-1, block_size, layer.tp_k_head_num * layer.qk_head_dim)
+        value = v_cache.view(-1, block_size, layer.tp_v_head_num * layer.v_head_dim)
 
         query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-        attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-            query,
-            key,
-            value,
-            num_heads=layer.tp_q_head_num,
-            num_key_value_heads=layer.tp_k_head_num,
-            input_layout="TND",
-            block_size=block_size,
-            block_table=self.forward_metadata.block_tables,
-            atten_mask=self.mix_mask,
-            sparse_mode=3,
-            actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
-            actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
-            scale=layer.scaling,
-        )
+        if self._should_split_fia_mixed(layer, topk_indices):
+            with profile_range("ascend.fia_mixed.split"):
+                attn_output = self._forward_fia_mixed_split(
+                    query, key, value, layer, block_size
+                )
+        else:
+            with profile_range("ascend.fia_mixed.single"):
+                attn_output = self._run_fia_mixed(
+                    query,
+                    key,
+                    value,
+                    layer=layer,
+                    block_size=block_size,
+                    block_table=self.forward_metadata.block_tables,
+                    actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
+                    actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+                )
 
         return attn_output.view(
             attn_output.shape[0], layer.tp_q_head_num * layer.v_head_dim

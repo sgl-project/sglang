@@ -32,6 +32,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
@@ -969,6 +970,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
+        # The NPU mixed-chunk FIA split gate lives on the full-attn child, but
+        # ModelRunner holds this wrapper — mirror it so dispatch sites read the
+        # real value.
+        self.enable_fia_mixed_split = full_attn_backend.enable_fia_mixed_split
 
     @property
     def data_type(self):
@@ -1139,6 +1144,39 @@ class HybridLinearAttnBackend(AttentionBackend):
             **kwargs,
         )
 
+    def forward_mixed(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        q: Optional[torch.Tensor] = None,  # For full attention
+        k: Optional[torch.Tensor] = None,  # For full attention
+        v: Optional[torch.Tensor] = None,  # For full attention
+        mixed_qkv: Optional[torch.Tensor] = None,  # For linear attention
+        a: Optional[torch.Tensor] = None,  # For GDN linear attention
+        b: Optional[torch.Tensor] = None,  # For GDN linear attention
+        **kwargs,
+    ):
+        if self._is_full_attn(layer, kwargs.get("layer_id")):
+            return self.full_attn_backend.forward_mixed(
+                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+            )
+        # The linear/GDN side has no prefill-vs-decode split to exploit: a mixed
+        # chunk is just an extend for it, which is what it already received
+        # before MIXED was dispatched separately.
+        return self.linear_attn_backend.forward_extend(
+            q=q,
+            k=k,
+            v=v,
+            layer=layer,
+            forward_batch=forward_batch,
+            save_kv_cache=save_kv_cache,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            **kwargs,
+        )
+
     def forward(
         self,
         q: Optional[torch.Tensor] = None,  # For full attention
@@ -1162,6 +1200,22 @@ class HybridLinearAttnBackend(AttentionBackend):
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_decode():
             return self.forward_decode(
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q,
+                k,
+                v,
+                mixed_qkv,
+                a,
+                b,
+                **kwargs,
+            )
+        elif forward_batch.forward_mode.is_mixed() and is_npu():
+            # Mirror AttentionBackend.forward: MIXED is a distinct dispatch on
+            # NPU. Without this branch the wrapper folds it into forward_extend
+            # and the full-attn child's forward_mixed never runs.
+            return self.forward_mixed(
                 layer,
                 forward_batch,
                 save_kv_cache,

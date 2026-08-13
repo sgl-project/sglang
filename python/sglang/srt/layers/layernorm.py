@@ -174,6 +174,19 @@ if _is_npu:
     import torch_npu
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
 
+    try:
+        from sgl_kernel_npu.norm.gemma_rmsnorm import npu_gemma_rms_norm
+    except ImportError:
+        # sgl-kernel-npu wheels built before the target-specific Gemma provider
+        # landed expose only the torch_npu operator, which is exactly what that
+        # provider binds to on A2/A3 — so those deployments keep working
+        # unchanged. On A5 the operator is unregistered and the first Gemma
+        # forward fails loudly, same as before this indirection existed. The
+        # kernels registry (sglang/kernels/ops/layernorm) deliberately does not
+        # fall back: a backend selected by name there must not silently run a
+        # different provenance.
+        npu_gemma_rms_norm = torch_npu.npu_gemma_rms_norm
+
 
 @lru_cache(maxsize=1)
 def _get_aiter_per_group_quant():
@@ -1148,7 +1161,7 @@ class GemmaRMSNorm(BaseFusedOp):
             )
             return norm_out, residual
 
-        x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
+        x, _ = npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
         return x
 
     def forward_xpu(
@@ -1257,7 +1270,7 @@ class Gemma3RMSNorm(BaseFusedOp):
     def forward_npu(self, x, residual: Optional[torch.Tensor] = None):
         if residual is not None:
             return self.forward_native(x, residual)
-        output, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.eps)
+        output, _ = npu_gemma_rms_norm(x, self.weight, self.eps)
         return output
 
     def extra_repr(self):

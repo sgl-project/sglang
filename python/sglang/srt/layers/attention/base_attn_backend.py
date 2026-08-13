@@ -59,6 +59,11 @@ class AttentionBackend(ABC):
 
     supports_ragged_verify_graph: bool = False
 
+    # Set by AscendAttnBackend when the NPU mixed-chunk FIA split is active, and
+    # mirrored by wrappers that hold it as a child. Dispatch sites read it to
+    # decide whether ForwardMode.MIXED must survive until forward_mixed().
+    enable_fia_mixed_split: bool = False
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 

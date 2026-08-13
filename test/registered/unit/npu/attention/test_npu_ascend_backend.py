@@ -6,8 +6,9 @@ import sys
 import unittest
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
@@ -36,6 +37,9 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
+from sglang.srt.hardware_backend.npu.utils import supports_fia_mixed_split
+from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
@@ -154,11 +158,299 @@ class TestForwardMetadata(unittest.TestCase):
             "actual_seq_lengths_q",
             "actual_seq_lengths_q_pa",
             "actual_seq_lengths_kv",
+            "mixed_num_prefill_reqs",
+            "mixed_num_prefill_tokens",
             "swa_mask",
             "prefix_lens",
             "flatten_prefix_block_tables",
         }
         self.assertEqual(names, expected)
+
+
+class TestSupportsFiaMixedSplit(unittest.TestCase):
+    def setUp(self):
+        supports_fia_mixed_split.cache_clear()
+        # The module-level torch_npu stub is installed with setdefault, so on a
+        # host that really has torch_npu this is the genuine module and its
+        # get_soc_version is a plain function. Patch it either way.
+        patcher = patch.object(sys.modules["torch_npu"].npu, "get_soc_version")
+        self.get_soc_version = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(supports_fia_mixed_split.cache_clear)
+
+    def test_a5_is_supported(self):
+        self.get_soc_version.return_value = 260
+        self.assertTrue(supports_fia_mixed_split())
+
+    def test_non_a5_is_not_supported(self):
+        self.get_soc_version.return_value = 220
+        self.assertFalse(supports_fia_mixed_split())
+
+    def test_query_failure_disables_split(self):
+        self.get_soc_version.side_effect = RuntimeError("SoC query failed")
+        self.assertFalse(supports_fia_mixed_split())
+
+
+class TestFiaMixedSplitMetadata(unittest.TestCase):
+    def setUp(self):
+        self.backend = object.__new__(AscendAttnBackend)
+        self.backend.forward_metadata = ForwardMetadata(
+            seq_lens_list_cumsum=np.array([2, 3, 4], dtype=np.int64)
+        )
+
+    @staticmethod
+    def _forward_batch(**overrides):
+        values = {
+            "forward_mode": ForwardMode.MIXED,
+            "mixed_num_prefill_reqs": 2,
+            "mixed_num_prefill_tokens": 3,
+            "batch_size": 3,
+            "extend_num_tokens": 4,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_sets_prefill_first_boundary_with_one_token_last_chunk(self):
+        self.backend._set_fia_mixed_split_metadata(self._forward_batch())
+        self.assertEqual(self.backend.forward_metadata.mixed_num_prefill_reqs, 2)
+        self.assertEqual(self.backend.forward_metadata.mixed_num_prefill_tokens, 3)
+
+    def test_missing_boundary_keeps_single_call_metadata(self):
+        self.backend._set_fia_mixed_split_metadata(
+            self._forward_batch(
+                mixed_num_prefill_reqs=None,
+                mixed_num_prefill_tokens=None,
+            )
+        )
+        self.assertIsNone(self.backend.forward_metadata.mixed_num_prefill_reqs)
+        self.assertIsNone(self.backend.forward_metadata.mixed_num_prefill_tokens)
+
+    def test_partial_boundary_raises(self):
+        with self.assertRaisesRegex(RuntimeError, "Incomplete"):
+            self.backend._set_fia_mixed_split_metadata(
+                self._forward_batch(mixed_num_prefill_tokens=None)
+            )
+
+    def test_inconsistent_q_boundary_raises(self):
+        with self.assertRaisesRegex(RuntimeError, "Invalid"):
+            self.backend._set_fia_mixed_split_metadata(
+                self._forward_batch(mixed_num_prefill_tokens=2)
+            )
+
+
+def _make_mixed_layer(**overrides):
+    values = {
+        "attn_type": AttentionType.DECODER,
+        "is_cross_attention": False,
+        "sliding_window_size": -1,
+        "tp_q_head_num": 4,
+        "tp_k_head_num": 2,
+        "tp_v_head_num": 2,
+        "qk_head_dim": 2,
+        "v_head_dim": 2,
+        "scaling": 0.5,
+        "layer_id": 0,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+class TestFiaMixedSplitGate(unittest.TestCase):
+    def setUp(self):
+        self.backend = object.__new__(AscendAttnBackend)
+        self.backend.enable_fia_mixed_split = True
+        self.backend.use_fia = True
+        self.backend.use_mla = False
+        self.backend.is_hybrid_swa = False
+        self.backend.forward_metadata = ForwardMetadata(
+            mixed_num_prefill_reqs=2,
+            mixed_num_prefill_tokens=3,
+        )
+
+    def test_causal_gqa_mixed_batch_is_enabled(self):
+        self.assertTrue(
+            self.backend._should_split_fia_mixed(_make_mixed_layer(), None)
+        )
+
+    def test_causal_mha_mixed_batch_is_enabled(self):
+        self.assertTrue(
+            self.backend._should_split_fia_mixed(
+                _make_mixed_layer(tp_k_head_num=4), None
+            )
+        )
+
+    def test_unsupported_paths_stay_single_call(self):
+        cases = [
+            ("feature disabled", {"enable_fia_mixed_split": False}, {}, None),
+            ("FIA disabled", {"use_fia": False}, {}, None),
+            ("MLA", {"use_mla": True}, {}, None),
+            ("cross attention", {}, {"is_cross_attention": True}, None),
+            (
+                "bidirectional",
+                {},
+                {"attn_type": AttentionType.DECODER_BIDIRECTIONAL},
+                None,
+            ),
+            ("non GQA heads", {}, {"tp_q_head_num": 3}, None),
+            ("DSA topk", {}, {}, torch.tensor([0])),
+        ]
+        for name, backend_values, layer_values, topk_indices in cases:
+            with self.subTest(name=name):
+                backend = object.__new__(AscendAttnBackend)
+                backend.enable_fia_mixed_split = backend_values.get(
+                    "enable_fia_mixed_split", True
+                )
+                backend.use_fia = backend_values.get("use_fia", True)
+                backend.use_mla = backend_values.get("use_mla", False)
+                backend.is_hybrid_swa = False
+                backend.forward_metadata = self.backend.forward_metadata
+                self.assertFalse(
+                    backend._should_split_fia_mixed(
+                        _make_mixed_layer(**layer_values), topk_indices
+                    )
+                )
+
+    def test_swa_and_missing_boundary_stay_single_call(self):
+        self.assertFalse(
+            self.backend._should_split_fia_mixed(
+                _make_mixed_layer(sliding_window_size=128), None
+            )
+        )
+        self.backend.forward_metadata = ForwardMetadata()
+        self.assertFalse(
+            self.backend._should_split_fia_mixed(_make_mixed_layer(), None)
+        )
+
+
+class TestFiaMixedSplitForward(unittest.TestCase):
+    def setUp(self):
+        self.backend = object.__new__(AscendAttnBackend)
+        self.backend.mix_mask = torch.zeros((8, 8), dtype=torch.int8)
+        # forward_mixed re-splits the KV pool buffer by page_size; the real
+        # __init__ copies it off the ModelRunner, which object.__new__ skips.
+        self.backend.page_size = 8
+        self.backend.forward_metadata = ForwardMetadata(
+            block_tables=torch.tensor([[10], [20], [30], [40]]),
+            seq_lens_list_cumsum=np.array([2, 3, 4, 5], dtype=np.int64),
+            seq_lens_cpu_int=torch.tensor([11, 12, 13, 14], dtype=torch.int32),
+            mixed_num_prefill_reqs=2,
+            mixed_num_prefill_tokens=3,
+        )
+        self.layer = _make_mixed_layer()
+
+    def test_split_slices_and_rebases_prefill_first_metadata(self):
+        query = torch.arange(5 * 4 * 2, dtype=torch.float32).view(5, 4, 2)
+        key = torch.zeros((4, 8, 4))
+        value = torch.ones((4, 8, 4))
+        prefill_output = torch.full((3, 4, 2), 11.0)
+        decode_output = torch.full((2, 4, 2), 22.0)
+        self.backend._run_fia_mixed = MagicMock(
+            side_effect=[prefill_output, decode_output]
+        )
+
+        output = self.backend._forward_fia_mixed_split(
+            query, key, value, self.layer, block_size=8
+        )
+
+        self.assertTrue(torch.equal(output[:3], prefill_output))
+        self.assertTrue(torch.equal(output[3:], decode_output))
+        self.assertEqual(self.backend._run_fia_mixed.call_count, 2)
+
+        prefill_call, decode_call = self.backend._run_fia_mixed.call_args_list
+        self.assertTrue(torch.equal(prefill_call.args[0], query[:3]))
+        self.assertTrue(
+            torch.equal(
+                prefill_call.kwargs["block_table"],
+                self.backend.forward_metadata.block_tables[:2],
+            )
+        )
+        np.testing.assert_array_equal(
+            prefill_call.kwargs["actual_seq_lengths"], np.array([2, 3])
+        )
+        self.assertTrue(
+            torch.equal(
+                prefill_call.kwargs["actual_seq_lengths_kv"],
+                torch.tensor([11, 12], dtype=torch.int32),
+            )
+        )
+
+        self.assertTrue(torch.equal(decode_call.args[0], query[3:]))
+        self.assertTrue(
+            torch.equal(
+                decode_call.kwargs["block_table"],
+                self.backend.forward_metadata.block_tables[2:],
+            )
+        )
+        self.assertEqual(decode_call.kwargs["actual_seq_lengths"], [1, 2])
+        self.assertTrue(
+            torch.equal(
+                decode_call.kwargs["actual_seq_lengths_kv"],
+                torch.tensor([13, 14], dtype=torch.int32),
+            )
+        )
+
+    def test_forward_writes_kv_once_and_preserves_output_order(self):
+        self.backend.use_mla = False
+        self.backend.use_fia = True
+        self.backend.token_to_kv_pool = MagicMock()
+        self.backend.token_to_kv_pool.get_key_buffer.return_value = torch.zeros(
+            (4, 8, 1, 4)
+        )
+        self.backend.token_to_kv_pool.get_value_buffer.return_value = torch.zeros(
+            (4, 8, 1, 4)
+        )
+        self.backend._should_split_fia_mixed = MagicMock(return_value=True)
+        split_output = torch.arange(5 * 4 * 2, dtype=torch.float32).view(5, 4, 2)
+        self.backend._forward_fia_mixed_split = MagicMock(return_value=split_output)
+        forward_batch = SimpleNamespace(
+            out_cache_loc=torch.arange(5, dtype=torch.int64)
+        )
+        q = torch.zeros((5, 8))
+        k = torch.zeros((5, 4))
+        v = torch.zeros((5, 4))
+
+        output = self.backend.forward_mixed(q, k, v, self.layer, forward_batch)
+
+        self.backend.token_to_kv_pool.set_kv_buffer.assert_called_once()
+        self.backend._forward_fia_mixed_split.assert_called_once()
+        self.assertTrue(torch.equal(output, split_output.view(5, 8)))
+
+    def test_single_call_fallback_keeps_full_metadata(self):
+        self.backend.use_mla = False
+        self.backend.use_fia = True
+        self.backend.token_to_kv_pool = MagicMock()
+        self.backend.token_to_kv_pool.get_key_buffer.return_value = torch.zeros(
+            (4, 8, 1, 4)
+        )
+        self.backend.token_to_kv_pool.get_value_buffer.return_value = torch.zeros(
+            (4, 8, 1, 4)
+        )
+        self.backend._should_split_fia_mixed = MagicMock(return_value=False)
+        single_output = torch.ones((5, 4, 2))
+        self.backend._run_fia_mixed = MagicMock(return_value=single_output)
+        forward_batch = SimpleNamespace(
+            out_cache_loc=torch.arange(5, dtype=torch.int64)
+        )
+
+        output = self.backend.forward_mixed(
+            torch.zeros((5, 8)),
+            torch.zeros((5, 4)),
+            torch.zeros((5, 4)),
+            self.layer,
+            forward_batch,
+            save_kv_cache=False,
+        )
+
+        self.backend._run_fia_mixed.assert_called_once()
+        call = self.backend._run_fia_mixed.call_args
+        self.assertTrue(torch.equal(call.args[0], torch.zeros((5, 4, 2))))
+        self.assertIs(
+            call.kwargs["block_table"], self.backend.forward_metadata.block_tables
+        )
+        np.testing.assert_array_equal(
+            call.kwargs["actual_seq_lengths"], np.array([2, 3, 4, 5])
+        )
+        self.assertTrue(torch.equal(output, single_output.view(5, 8)))
 
 
 class TestGenerateMaskFlag(unittest.TestCase):
