@@ -1148,6 +1148,10 @@ class Envs:
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
     SGLANG_OPT_USE_JIT_NORM = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
+    # Force delay_sample_func for all overlap decode (not just grammar mode),
+    # allowing CPU result processing to overlap with subsequent forward computation
+    # and reducing the impact of sampling overhead on the critical path.
+    SGLANG_ENABLE_DELAY_SAMPLE = EnvBool(False)
 
     # CUDA graph
     SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
