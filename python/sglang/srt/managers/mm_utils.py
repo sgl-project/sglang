@@ -488,7 +488,20 @@ def embed_mm_inputs(
     # 4. scatter embeddings into input embedding
     # masked_scatter_ avoids the cudaStreamSynchronize that torch.where triggers.
     def _scatter(dest, mask, src):
-        dest.masked_scatter_(mask.expand_as(dest), src.to(dest.device, dest.dtype))
+        src = src.to(dest.device, dest.dtype)
+        if dest.device.type == "xpu":
+            # torch-xpu-ops masked_scatter_ enforces its `totalElements <= srcSize_`
+            # size check with SYCL_KERNEL_ASSERT (Indexing.cpp:436), which aborts
+            # the process uncatchably instead of raising RuntimeError like the
+            # CUDA kernel does. dest is [N, H], mask is [N, 1] bool, src is [K, H].
+            # Move mask -> long index list on CPU and use index_copy_, which is a
+            # well-behaved XPU op. The D2H sync introduced by materializing the
+            # index list is already paid upstream in _adjust_embedding_length.
+            idx = torch.nonzero(mask.squeeze(-1).cpu(), as_tuple=False).squeeze(-1)
+            idx = idx.to(dest.device)
+            dest.index_copy_(0, idx, src)
+            return
+        dest.masked_scatter_(mask.expand_as(dest), src)
 
     for i, modality, embedding, mask in zip(
         range(len(embeddings)), modalities, embeddings, masks
