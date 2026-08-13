@@ -1,18 +1,25 @@
 """Correctness tests for grouped-head target-verify attention."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
 from sglang.kernels.ops.attention.verify_mla import verify_mla_fwd
+from sglang.srt.layers.attention.triton_backend import (
+    _should_use_grouped_head_verify,
+)
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
-ATOL = 8e-2
-RTOL = 2e-2
+BF16_ATOL = 2e-2
+BF16_RTOL = 1e-2
+FP8_ATOL = 8e-2
+FP8_RTOL = 2e-2
 
 
 def _build_inputs(
@@ -25,20 +32,20 @@ def _build_inputs(
 ):
     device = "cuda"
     dtype = torch.bfloat16
+    generator = torch.Generator(device=device).manual_seed(0)
     prefix_lens_t = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
     total_prefix = sum(prefix_lens)
     batch_size = len(prefix_lens)
     num_extend_tokens = batch_size * l_ext
 
-    q = torch.randn(num_extend_tokens, h_q, head_dim, dtype=dtype, device=device)
-    k = torch.randn(num_extend_tokens, 1, head_dim, dtype=dtype, device=device)
-    v = torch.randn(num_extend_tokens, 1, v_head_dim, dtype=dtype, device=device)
-    k_buffer = torch.randn(total_prefix, 1, head_dim, dtype=dtype, device=device).to(
-        cache_dtype
-    )
-    v_buffer = torch.randn(total_prefix, 1, v_head_dim, dtype=dtype, device=device).to(
-        cache_dtype
-    )
+    def randn(*shape):
+        return torch.randn(*shape, dtype=dtype, device=device, generator=generator)
+
+    q = randn(num_extend_tokens, h_q, head_dim)
+    k = randn(num_extend_tokens, 1, head_dim)
+    v = randn(num_extend_tokens, 1, v_head_dim)
+    k_buffer = randn(total_prefix, 1, head_dim).to(cache_dtype)
+    v_buffer = randn(total_prefix, 1, v_head_dim).to(cache_dtype)
     qo_indptr = torch.arange(
         0, num_extend_tokens + 1, l_ext, dtype=torch.int32, device=device
     )
@@ -59,6 +66,8 @@ class TestVerifySharedKV(CustomTestCase):
         k_scale=1.0,
         v_scale=1.0,
         l_ext=4,
+        atol=BF16_ATOL,
+        rtol=BF16_RTOL,
     ):
         inputs = _build_inputs(
             prefix_lens=[512, 2048],
@@ -113,7 +122,7 @@ class TestVerifySharedKV(CustomTestCase):
         )
 
         self.assertTrue(ran)
-        torch.testing.assert_close(actual, reference, atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(actual, reference, atol=atol, rtol=rtol)
 
     def test_qwen3_5_tp_shapes(self):
         # Qwen3.5 has 32 global query heads. TP8, TP4, and InferenceX's TP2
@@ -136,6 +145,8 @@ class TestVerifySharedKV(CustomTestCase):
             cache_dtype=torch.float8_e4m3fn,
             k_scale=0.5,
             v_scale=0.25,
+            atol=FP8_ATOL,
+            rtol=FP8_RTOL,
         )
 
     def test_kimi_k3_absorbed_mla_shape(self):
@@ -174,6 +185,50 @@ class TestVerifySharedKV(CustomTestCase):
                 1.0,
             )
         )
+
+    @patch(
+        "sglang.srt.layers.attention.triton_backend.is_gfx95_supported",
+        return_value=True,
+    )
+    @patch("sglang.srt.layers.attention.triton_backend.get_parallel")
+    def test_backend_dispatch_gate(self, get_parallel_mock, _is_gfx95_mock):
+        get_parallel_mock.return_value = SimpleNamespace(
+            attn_tp_size=8, attn_dcp_size=1
+        )
+
+        def model_config(architecture, local_kv_heads=1):
+            return SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=[architecture]),
+                get_num_kv_heads=lambda _tp, _dcp: local_kv_heads,
+            )
+
+        qwen = model_config("Qwen3_5MoeForCausalLM")
+        self.assertTrue(_should_use_grouped_head_verify(qwen, 1, False, True))
+        self.assertFalse(_should_use_grouped_head_verify(qwen, 2, False, True))
+        self.assertFalse(_should_use_grouped_head_verify(qwen, 1, False, False))
+        self.assertFalse(
+            _should_use_grouped_head_verify(
+                model_config("Qwen3_5MoeForCausalLM", local_kv_heads=2),
+                1,
+                False,
+                True,
+            )
+        )
+        self.assertFalse(
+            _should_use_grouped_head_verify(
+                model_config("LlamaForCausalLM"), 1, False, True
+            )
+        )
+        self.assertTrue(
+            _should_use_grouped_head_verify(
+                model_config("KimiK3ForConditionalGeneration"), 1, True, False
+            )
+        )
+        with patch(
+            "sglang.srt.layers.attention.triton_backend.is_gfx95_supported",
+            return_value=False,
+        ):
+            self.assertFalse(_should_use_grouped_head_verify(qwen, 1, False, True))
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ DEFAULT_BLOCK_N = 64
 DEFAULT_NUM_WARPS = 8
 _BLOCK_CONFIG = {
     # head_dim: (BLOCK_H, BLOCK_N, num_warps)
-    256: (4, 64, 8),  # Qwen3.5 TP4 / TP8
+    256: (4, 64, 8),  # Qwen3.5 TP2 / TP4 / TP8
     576: (4, 64, 8),  # K3 MLA (kv_lora_rank 512 + qk_rope 64)
 }
 
@@ -582,9 +582,10 @@ def can_handle(
     logit_cap=0.0,
     xai_temperature_len=-1,
 ):
-    """Return True iff the MLA split-KV verify path can serve this exact problem
-    with the same result as extend_attention_fwd. Conservative: anything not
-    explicitly handled -> False -> caller falls back to the baseline.
+    """Return True iff the grouped-head split-KV verify path can serve this
+    exact problem with the same result as extend_attention_fwd. Conservative:
+    anything not explicitly handled -> False -> caller falls back to the
+    baseline.
 
     IMPORTANT: ``custom_mask`` is intentionally NOT inspected (its values can't
     be read inside a captured HIP graph without a host sync). The kernel always

@@ -76,6 +76,21 @@ def _mla_decode_kv_splits_cap(
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
+def _should_use_grouped_head_verify(model_config, topk, use_mla, use_verify_splitkv):
+    if not is_gfx95_supported() or topk != 1:
+        return False
+    if use_mla:
+        return is_kimi_k3(model_config.hf_config)
+    return (
+        use_verify_splitkv
+        and is_qwen3_5(model_config.hf_config)
+        and model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        == 1
+    )
+
+
 def logit_capping_mod(logit_capping_method, logit_cap):
     # positive logit_cap -> tanh cap
     if logit_capping_method == "tanh":
@@ -186,21 +201,11 @@ class TritonAttnBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5
         # GQA with exactly one TP-local KV head.
-        self.use_verify_mla = (
-            is_gfx95_supported()
-            and self.topk == 1
-            and (
-                (self.use_mla and is_kimi_k3(model_runner.model_config.hf_config))
-                or (
-                    self.use_verify_splitkv
-                    and not self.use_mla
-                    and is_qwen3_5(model_runner.model_config.hf_config)
-                    and model_runner.model_config.get_num_kv_heads(
-                        get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-                    )
-                    == 1
-                )
-            )
+        self.use_verify_mla = _should_use_grouped_head_verify(
+            model_runner.model_config,
+            self.topk,
+            self.use_mla,
+            self.use_verify_splitkv,
         )
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
