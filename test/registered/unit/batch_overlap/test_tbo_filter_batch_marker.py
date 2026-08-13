@@ -77,6 +77,14 @@ class TestTboFilterBatchMarker(CustomTestCase):
         self.assertFalse(child.forward_metadata_ready)
         self.assertFalse(child.forward_metadata_replan_equivalent)
 
+    def test_filter_batch_clears_mixed_fia_boundary(self):
+        parent = _make_target_verify_batch(8)
+        parent.mixed_num_prefill_reqs = 4
+        parent.mixed_num_prefill_tokens = 4
+        child = _filter(parent, lo=0, hi=4)
+        self.assertIsNone(child.mixed_num_prefill_reqs)
+        self.assertIsNone(child.mixed_num_prefill_tokens)
+
 
 def _make_valued_batch(bs: int) -> ForwardBatch:
     # Distinct per-position values so a filtered slice is unambiguous.

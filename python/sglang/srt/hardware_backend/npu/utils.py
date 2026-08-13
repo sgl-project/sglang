@@ -24,6 +24,19 @@ class NPUACLFormat(IntEnum):
     ACL_FORMAT_FRACTAL_NZ = 29
 
 
+@functools.cache
+def supports_fia_mixed_split() -> bool:
+    """Return whether the current NPU supports split mixed-batch FIA calls."""
+    try:
+        import torch_npu
+
+        # torch_npu reports Ascend 950 / A5 as SoC version 260.
+        return torch_npu.npu.get_soc_version() == 260
+    except (ImportError, AttributeError, RuntimeError) as error:
+        logger.warning("Failed to query NPU FIA mixed-split capability: %s", error)
+        return False
+
+
 def _call_once(fn: Callable):
 
     @functools.wraps(fn)

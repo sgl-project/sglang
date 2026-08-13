@@ -1079,6 +1079,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        # The NPU mixed FIA split needs ForwardMode.MIXED to survive until
+        # attention dispatch, but graph replay rewrites it to EXTEND to match a
+        # graph captured with EXTEND -- which bypasses forward_mixed() and
+        # collapses the split back into a single FIA call. Send only these mixed
+        # batches to the eager runner; pure prefill batches, and configs with
+        # the split disabled, keep using the graph.
+        if (
+            forward_batch.forward_mode == ForwardMode.MIXED
+            and self.model_runner.attn_backend.enable_fia_mixed_split
+        ):
+            return False
+
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (

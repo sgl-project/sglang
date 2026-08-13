@@ -2115,6 +2115,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     forward_mode: ForwardMode = None
     global_forward_mode: Optional[ForwardMode] = None
 
+    # Boundary of the prefill-first portion in an NPU mixed chunk batch.
+    # Unlike mix_running_indices, these scalars survive overlap input resolution
+    # and are forwarded to the attention backend.
+    mixed_num_prefill_reqs: Optional[int] = None
+    mixed_num_prefill_tokens: Optional[int] = None
+
     # For DP attention
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
@@ -2737,6 +2743,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.SPLIT_PREFILL
 
     def mix_with_running(self, running_batch: ScheduleBatch):
+        # SGLang orders mixed batches as [prefill, decode]. Capture the boundary
+        # before merge_batch appends the running decode requests.
+        self.mixed_num_prefill_reqs = self.batch_size()
+        self.mixed_num_prefill_tokens = self.extend_num_tokens
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
 
