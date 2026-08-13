@@ -3,8 +3,10 @@
 The fast path (SGLANG_ENABLE_FAST_INPUT_LOGPROBS) computes token / top-k /
 token-ids logprobs directly from logits with a per-row logsumexp normalizer,
 never materializing the full-vocab log-softmax. Same math, so results must
-agree with the reference path to floating-point tolerance, with identical
-top-k indices, across chunk splits and heterogeneous per-sequence params.
+agree with the reference path to floating-point tolerance across chunk splits
+and heterogeneous per-sequence params. For distributed Top-N, cross-shard
+ties intentionally accept any valid equal-cutoff token IDs because
+``torch.topk`` does not promise a monolithic tie order.
 """
 
 import itertools
@@ -20,6 +22,7 @@ from sglang.srt.layers.logprob_processor import (
     DistributedLogprobContext,
     InputLogprobProcessor,
     compute_row_log_normalizer,
+    get_distributed_topk,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.logprob_test_utils import coverage_cases
@@ -177,6 +180,48 @@ def _distributed_input_logprob_worker(rank, world_size, init_file):
         )
         assert result.top_logprobs_idx == expected_top_idx
         assert result.top_logprobs_idx[0][0][0] == 10
+
+        # Cross-shard Nth-boundary ties are not required to select the same
+        # IDs as one monolithic torch.topk. They must, however, retain the
+        # exact target entry, N ranked scores, all strictly-above-cutoff IDs,
+        # and only distinct equal-cutoff alternatives for the remainder.
+        tie_full_logits = torch.tensor(
+            [
+                [10.0, 9.0, 8.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, -5.0, -6.0],
+                [9.0, 8.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, -4.0, -5.0, -6.0],
+            ]
+        )
+        if rank == 0:
+            tie_local_logits = tie_full_logits[:, :shard_width].clone()
+        else:
+            tie_padding = torch.full((2, 1), 1e4)
+            tie_local_logits = torch.cat((tie_full_logits[:, 6:], tie_padding), dim=1)
+
+        tie_metadata = SimpleNamespace(
+            extend_return_top_logprob=True,
+            extend_token_ids_logprob=False,
+            top_logprobs_nums=[5],
+            extend_logprob_pruned_lens_cpu=[2],
+            extend_input_logprob_token_ids_gpu=torch.tensor([8, 3]),
+        )
+        tie_proc = InputLogprobProcessor()
+        tie_proc.enable_fast_input_logprobs = True
+        tie_proc.enable_logprobs_chunk = True
+        tie_proc.logprobs_chunk_size = 1
+        tie_result, tie_sampled_logits = tie_proc.forward(
+            pruned_states=tie_local_logits,
+            sample_indices=torch.empty(0, dtype=torch.long),
+            input_logprob_indices=torch.arange(2, dtype=torch.long),
+            token_to_seq_idx=[0, 0],
+            lm_head=None,
+            get_logits_fn=unused_gathered_logits,
+            logits_metadata=tie_metadata,
+            distributed_context=context,
+        )
+        assert tie_sampled_logits.shape == (0, vocab)
+        _assert_tied_distributed_topk(
+            unittest.TestCase(), tie_full_logits, torch.tensor([8, 3]), tie_result
+        )
     finally:
         dist.destroy_process_group()
 
@@ -269,7 +314,63 @@ def _shape_of(nested):
     return None
 
 
+def _assert_tied_distributed_topk(test, full_logits, target_ids, result):
+    """Check the public distributed tie contract without assuming tie IDs."""
+    reference = torch.log_softmax(full_logits, dim=-1)
+    row_ids = torch.arange(full_logits.shape[0])
+    torch.testing.assert_close(
+        result.token_logprobs,
+        reference[row_ids, target_ids],
+        rtol=1e-6,
+        atol=1e-6,
+        msg="target-token logprobs remain exact across the tied cutoff",
+    )
+
+    test.assertEqual(len(result.top_logprobs_val), 1)
+    test.assertEqual(len(result.top_logprobs_idx), 1)
+    test.assertEqual(len(result.top_logprobs_val[0]), full_logits.shape[0])
+    test.assertEqual(len(result.top_logprobs_idx[0]), full_logits.shape[0])
+    for row, (values, indices) in enumerate(
+        zip(result.top_logprobs_val[0], result.top_logprobs_idx[0])
+    ):
+        test.assertEqual(len(values), 5)
+        test.assertEqual(len(indices), 5)
+        test.assertEqual(len(set(indices)), 5, "Top-N IDs must be distinct")
+        test.assertTrue(all(0 <= token_id < full_logits.shape[1] for token_id in indices))
+        test.assertTrue(
+            all(values[pos] >= values[pos + 1] for pos in range(len(values) - 1)),
+            "Top-N values must remain rank-descending",
+        )
+
+        returned = set(indices)
+        expected_values = reference[row, torch.tensor(indices)]
+        torch.testing.assert_close(
+            torch.tensor(values), expected_values, rtol=1e-6, atol=1e-6
+        )
+        cutoff = torch.topk(full_logits[row], 5).values[-1]
+        strictly_above = set(
+            torch.nonzero(full_logits[row] > cutoff, as_tuple=False).flatten().tolist()
+        )
+        equal_cutoff = set(
+            torch.nonzero(full_logits[row] == cutoff, as_tuple=False).flatten().tolist()
+        )
+        test.assertTrue(strictly_above <= returned)
+        test.assertTrue(returned - strictly_above <= equal_cutoff)
+        test.assertEqual(len(returned & equal_cutoff), 5 - len(strictly_above))
+
+
 class TestFastInputLogprobs(CustomTestCase):
+    def test_distributed_topk_rejects_over_vocab_k(self):
+        with self.assertRaisesRegex(ValueError, "exceeds global vocabulary size"):
+            get_distributed_topk(
+                torch.empty((1, 3)),
+                valid_vocab_size=3,
+                max_k=4,
+                vocab_start_index=0,
+                vocab_size=3,
+                tp_group=None,
+            )
+
     def test_distributed_exact_input_logprobs_cpu(self):
         # Real collectives, but Gloo/CPU only: validates TP=2 normalization,
         # padding exclusion, local/remote token ownership, heterogeneous
