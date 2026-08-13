@@ -9509,7 +9509,8 @@ class ServerArgs:
                 "load_topic": "load",             # ZMQ topic prefix on the
                                                   # load-socket SUB filter;
                                                   # present iff
-                                                  # load_endpoint_port_base is
+                                                  # load_endpoint_port_base
+                                                  # is present
             }
 
         Returns None (i.e. "no publisher to describe") when any of:

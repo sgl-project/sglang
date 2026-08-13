@@ -51,6 +51,7 @@ subscribable via /server_info.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import time
 from itertools import count
@@ -127,6 +128,10 @@ class LoadStat(
     num_tokens: int
     # KV-cache token capacity; 0 when unknown.
     max_total_num_tokens: int
+    # Stamped with select_kv_publisher_dp_rank(...): the attention-DP rank
+    # under DP attention, but the plain data-parallel rank in pure DP. The
+    # name follows the EventBatch.attn_dp_rank precedent on the KV-event
+    # socket; either way it is informational only.
     attn_dp_rank: Optional[int] = None
 
 
@@ -215,6 +220,10 @@ class SchedulerLoadPublisher:
         # scheduler startup over a routing hint.
         try:
             self._socket = _open_pub_socket(endpoint)
+            # The scheduler has no shutdown hook to call close() from (the
+            # KV-event publisher cleans up the same way); LINGER=0 makes
+            # this safe even under a hard exit.
+            atexit.register(self.close)
         except Exception:
             logger.warning(
                 "load-publisher disabled: failed to bind the load socket at "
@@ -294,9 +303,11 @@ class SchedulerLoadPublisher:
                     (LOAD_TOPIC.encode(), seq, payload), zmq.NOBLOCK
                 )
             except zmq.Again:
-                # A stalled subscriber pipe: the gauge is superseded by the
-                # next send, so dropping beats blocking the scheduler loop.
-                pass
+                # A stalled pipe: drop this reading (blocking the scheduler
+                # loop would be worse) and leave the dedup state untouched
+                # so the next call retries it instead of deduping away a
+                # send nobody got.
+                return
             # Recorded only after a successful hand-off so a failed publish
             # retries instead of being deduped away.
             self._last_counts = counts

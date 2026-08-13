@@ -110,7 +110,7 @@ def parse_tcp_port(endpoint: Optional[str]) -> Optional[int]:
     return port if 0 < port <= 65535 else None
 
 
-def parse_bindable_tcp(endpoint: Optional[str]) -> Optional[tuple]:
+def parse_bindable_tcp(endpoint: Optional[str]) -> Optional[tuple[str, int]]:
     """``(host, port)`` if this is a tcp:// endpoint a PUB socket can BIND,
     else None.
 
@@ -136,7 +136,7 @@ def resolve_load_pub_range(
     replay_endpoint: Optional[str],
     dp_size: int,
     load_publish_endpoint: Optional[str] = None,
-) -> tuple:
+) -> tuple[Optional[tuple[str, int]], Optional[str]]:
     """``((host, base), reason)`` for the router-facing load PUB range —
     exactly one of the two is None.
 

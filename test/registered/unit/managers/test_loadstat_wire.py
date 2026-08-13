@@ -335,6 +335,22 @@ class TestLoadPublisherGating(CustomTestCase):
             pub.publish_load_stat(provider, force=True)
             self.assertEqual(pub._socket.send_multipart.call_count, 2)
 
+    def test_hwm_dropped_send_is_retried_not_deduped(self):
+        # zmq.Again means nobody got the reading: the dedup state must stay
+        # untouched so the next call retries it instead of suppressing an
+        # unchanged gauge until the heartbeat.
+        import zmq
+
+        pub, _ = self._build()
+        provider = self._provider(running=1)
+        pub._socket.send_multipart.side_effect = zmq.Again()
+        pub.publish_load_stat(provider, force=True)
+        self.assertIsNone(pub._last_counts)
+        pub._socket.send_multipart.side_effect = None
+        pub.publish_load_stat(provider, force=True)
+        self.assertEqual(pub._last_counts, (1, 2, 3, 4))
+        self.assertEqual(pub._socket.send_multipart.call_count, 2)
+
     def test_call_throttle_stays_engaged_across_dedup_hits(self):
         # Regression: the counter must reset when the throttle PASSES, not
         # when a send happens. Resetting only on the send path let one dedup

@@ -113,8 +113,8 @@ class TestServerInfoKvEventsField(CustomTestCase):
     def test_load_port_skips_an_overlapping_replay_range(self):
         # Conventional replay = kv + 1: the load range must be advertised
         # past the replay ROUTER range (5558 + dp_size), matching where
-        # SchedulerLoadPublisher actually binds — both sides derive it via
-        # derive_load_port_base.
+        # SchedulerLoadPublisher actually binds — both sides resolve it via
+        # resolve_load_pub_range.
         args = ServerArgs(
             model_path="dummy",
             kv_events_config=(
