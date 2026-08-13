@@ -243,11 +243,25 @@ class PrefillBootstrapQueue:
             and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
             else []
         )
+        enable_kv_reshard = bool(
+            getattr(self.scheduler.server_args, "enable_mooncake_kv_reshard", False)
+        )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
                 self.scheduler.model_config.get_total_num_kv_heads()
             )
+            if enable_kv_reshard:
+                kv_args.kv_head_dim = self.token_to_kv_pool.head_dim
+                kv_args.kv_value_head_dim = self.token_to_kv_pool.v_head_dim
+                kv_args.kv_itemsize = self.token_to_kv_pool.store_dtype.itemsize
+                kv_args.kv_storage_dtype_str = str(
+                    self.token_to_kv_pool.store_dtype
+                ).removeprefix("torch.")
+                kv_args.kv_cache_layout = self.token_to_kv_pool.kv_cache_layout
+                kv_args.kv_is_quantized = self.token_to_kv_pool.is_quantized_kv_cache
+        if enable_kv_reshard:
+            kv_args.total_kv_layers = self.scheduler.model_config.num_hidden_layers
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (

@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -195,6 +196,43 @@ class CommonKVManager(BaseKVManager):
             or cp_sharded_prefill
             or hybrid_decode_pulls_all_ranks
         )
+        self.enable_kv_reshard = bool(
+            getattr(server_args, "enable_mooncake_kv_reshard", False)
+        )
+        self.kv_reshard = None
+        if self.enable_kv_reshard:
+            if (
+                self.is_mla_backend
+                or self.is_hybrid_mla_backend
+                or self.attn_cp_size != 1
+                or self.dcp_size != 1
+                or self.attn_dp_size != 1
+                or self.system_dp_size != 1
+                or bool(self.kv_args.state_types)
+            ):
+                raise RuntimeError(
+                    "Mooncake KV reshard V1 supports only non-hybrid MHA/GQA "
+                    "with DP=CP=DCP=1 and no auxiliary state pools"
+                )
+            if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+                raise RuntimeError(
+                    "Mooncake KV reshard V1 is mutually exclusive with staging"
+                )
+            from sglang.srt.disaggregation.mooncake.kv_reshard import (
+                KVReshardRuntime,
+            )
+
+            self.kv_reshard = KVReshardRuntime(
+                kv_args=self.kv_args,
+                server_args=server_args,
+                role=disaggregation_mode.value,
+                dp_rank=self.system_dp_rank,
+                dp_size=self.system_dp_size,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+            )
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
@@ -238,6 +276,10 @@ class CommonKVManager(BaseKVManager):
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.enable_staging: bool = False
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
+            if self.enable_kv_reshard:
+                self.kv_reshard_connection_pool: Dict[
+                    Tuple[str, int], List[Dict[str, Any]]
+                ] = {}
             self.connection_lock = threading.Lock()
             self.required_prefill_response_num_table: Dict[int, int] = {}
             self.prefill_info_table: Dict[str, PrefillServerInfo] = {}
@@ -246,6 +288,8 @@ class CommonKVManager(BaseKVManager):
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
             self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
+            if self.enable_kv_reshard:
+                self.required_prefill_writer_ids_table: Dict[int, Set[str]] = {}
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
@@ -505,6 +549,8 @@ class CommonKVManager(BaseKVManager):
         if bootstrap_addr in self.prefill_info_table:
             return True
 
+        kv_reshard_capability = False
+        kv_reshard_schema_version = 0
         info: PrefillServerInfo = None
         try:
             url = (
@@ -515,6 +561,10 @@ class CommonKVManager(BaseKVManager):
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
+                kv_reshard_capability = bool(data.pop("kv_reshard_capability", False))
+                kv_reshard_schema_version = int(
+                    data.pop("kv_reshard_schema_version", 0)
+                )
                 info = PrefillServerInfo(**data)
             else:
                 logger.error(
@@ -554,7 +604,16 @@ class CommonKVManager(BaseKVManager):
                     f"got {info.attn_cp_size}."
                 )
 
-        self._resolve_rank_mapping(info)
+        if self.enable_kv_reshard:
+            if not kv_reshard_capability or kv_reshard_schema_version != 1:
+                raise RuntimeError(
+                    "Prefill does not advertise a compatible KV_RESHARD_V1 "
+                    "manifest capability"
+                )
+            if info.attn_cp_size != 1:
+                raise RuntimeError("KV_RESHARD_V1 does not support prefill CP")
+        else:
+            self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
@@ -711,6 +770,14 @@ class CommonKVManager(BaseKVManager):
             # router-injected pd_rebootstrap_prefill_url.
             "prefill_http_port": get_serving().port,
         }
+        if getattr(self, "enable_kv_reshard", False):
+            payload.update(
+                {
+                    "kv_reshard_capability": True,
+                    "kv_reshard_schema_version": 1,
+                    "kv_reshard_placement_part": self.kv_reshard.local_part.to_dict(),
+                }
+            )
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
         for attempt in range(max_retries):
@@ -1018,19 +1085,33 @@ class CommonKVManager(BaseKVManager):
         """Handle failure of a prefill node."""
         with self.connection_lock:
             keys_to_remove = [
-                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
+                key
+                for key in self.connection_pool
+                if key.startswith(failed_bootstrap_addr)
             ]
             # Collect TCP endpoints from cached bootstrap_infos before deletion
             stale_endpoints = set()
-            for k in keys_to_remove:
-                for info in self.connection_pool[k]:
+            for key in keys_to_remove:
+                for info in self.connection_pool[key]:
                     ip = info.get("rank_ip")
                     port = info.get("rank_port")
                     if ip and port:
                         na = NetworkAddress(ip, int(port))
                         stale_endpoints.add(na.to_tcp())
-            for k in keys_to_remove:
-                del self.connection_pool[k]
+            for key in keys_to_remove:
+                del self.connection_pool[key]
+            if getattr(self, "enable_kv_reshard", False):
+                reshard_keys = [
+                    key
+                    for key in self.kv_reshard_connection_pool
+                    if key[0] == failed_bootstrap_addr
+                ]
+                for key in reshard_keys:
+                    for info in self.kv_reshard_connection_pool.pop(key):
+                        ip = info.get("rank_ip")
+                        port = info.get("rank_port")
+                        if ip and port:
+                            stale_endpoints.add(NetworkAddress(ip, int(port)).to_tcp())
             self.prefill_info_table.pop(failed_bootstrap_addr, None)
 
             possible_affected_rooms = self.addr_to_rooms_tracker.get(
@@ -1274,6 +1355,24 @@ class CommonKVReceiver(BaseKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
 
+        if self.kv_mgr.enable_kv_reshard:
+            self.prefill_info = self.kv_mgr.prefill_info_table[self.bootstrap_addr]
+            self.prefill_dp_rank = prefill_dp_rank
+            self._setup_bootstrap_infos()
+            if self.conclude_state == KVPoll.Failed:
+                return
+            self.required_prefill_response_num = len(self.expected_writer_ids)
+            self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
+                self.required_prefill_response_num
+            )
+            self.kv_mgr.required_prefill_writer_ids_table[self.bootstrap_room] = set(
+                self.expected_writer_ids
+            )
+            if self.kv_mgr.enable_staging:
+                raise RuntimeError("KV_RESHARD_V1 cannot use staging")
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+            return
+
         # Read pre-computed rank mapping from prefill_info (computed in try_ensure_parallel_info)
         self.prefill_info = self.kv_mgr.prefill_info_table[self.bootstrap_addr]
         self.target_tp_rank = self.prefill_info.target_tp_rank
@@ -1485,6 +1584,8 @@ class CommonKVReceiver(BaseKVReceiver):
     def clear(self) -> None:
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
+        if getattr(self.kv_mgr, "enable_kv_reshard", False):
+            self.kv_mgr.required_prefill_writer_ids_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
 
     def abort(self):
@@ -1543,6 +1644,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
+        self.kv_reshard_capability: Optional[bool] = None
+        self.kv_reshard_schema_version: int = 0
+        self.kv_reshard_parts: Dict[int, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+        self.kv_reshard_routes: Dict[int, Dict[str, Dict[str, Union[str, int]]]] = (
+            defaultdict(dict)
+        )
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1578,6 +1685,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
         self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
         self.app.router.add_get("/health", self._handle_health_check)
+        self.app.router.add_get(
+            "/kv_reshard/placement", self._handle_kv_reshard_placement
+        )
 
     async def _handle_health_check(self, request):
         return web.Response(text="OK", status=200)
@@ -1610,6 +1720,23 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
+        kv_reshard_capability = bool(data.get("kv_reshard_capability", False))
+        kv_reshard_schema_version = int(data.get("kv_reshard_schema_version", 0))
+        kv_reshard_part = data.get("kv_reshard_placement_part")
+
+        if kv_reshard_capability and not isinstance(kv_reshard_part, dict):
+            return web.Response(text="Missing KV placement part", status=400)
+        if self.kv_reshard_capability is None:
+            self.kv_reshard_capability = kv_reshard_capability
+            self.kv_reshard_schema_version = kv_reshard_schema_version
+        elif (
+            self.kv_reshard_capability != kv_reshard_capability
+            or self.kv_reshard_schema_version != kv_reshard_schema_version
+        ):
+            return web.Response(
+                text="Mixed KV reshard capabilities in one prefill instance",
+                status=409,
+            )
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1654,10 +1781,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             cp_group_table = dp_group_table.setdefault(attn_cp_rank, {})
             tp_group_table = cp_group_table.setdefault(attn_tp_rank, {})
 
-            tp_group_table[pp_rank] = PrefillRankInfo(
-                rank_ip=rank_ip,
-                rank_port=rank_port,
-            )
+            tp_group_table[pp_rank] = PrefillRankInfo(rank_ip, rank_port)
+            if kv_reshard_capability:
+                participant_id = kv_reshard_part["participant_id"]
+                self.kv_reshard_parts[dp_group][participant_id] = kv_reshard_part
+                self.kv_reshard_routes[dp_group][participant_id] = {
+                    "rank_ip": rank_ip,
+                    "rank_port": rank_port,
+                }
 
             self._registered_count += 1
 
@@ -1709,7 +1840,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            payload = dataclasses.asdict(info)
+            if self.kv_reshard_capability:
+                payload.update(
+                    kv_reshard_capability=True,
+                    kv_reshard_schema_version=self.kv_reshard_schema_version,
+                )
+            return web.json_response(payload, status=200)
 
         if not self._is_ready():
             return web.Response(
@@ -1732,6 +1869,42 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
 
         return web.json_response(dataclasses.asdict(bootstrap_info), status=200)
+
+    async def _handle_kv_reshard_placement(self, request: web.Request):
+        if not self._is_ready():
+            return web.Response(
+                text="Prefill server is not fully registered", status=503
+            )
+        if not self.kv_reshard_capability or self.kv_reshard_schema_version != 1:
+            return web.Response(text="KV_RESHARD_V1 is not enabled", status=409)
+        raw_dp_rank = request.query.get("prefill_dp_rank")
+        if raw_dp_rank is None:
+            return web.Response(text="Missing prefill_dp_rank", status=400)
+        dp_rank = int(raw_dp_rank)
+        async with self.lock:
+            part_values = list(self.kv_reshard_parts.get(dp_rank, {}).values())
+            routes = dict(self.kv_reshard_routes.get(dp_rank, {}))
+        try:
+            from sglang.srt.disaggregation.mooncake.kv_reshard import (
+                KV_RESHARD_PROTOCOL,
+                KVReshardRuntime,
+            )
+
+            placement = KVReshardRuntime.assemble_placement(part_values)
+        except Exception as error:
+            logger.exception("Invalid KV reshard source placement")
+            return web.Response(
+                text=f"Invalid KV reshard source placement: {error}", status=409
+            )
+        return web.json_response(
+            {
+                "protocol": KV_RESHARD_PROTOCOL,
+                "schema_version": 1,
+                "placement": json.loads(placement.to_json()),
+                "routes": routes,
+            },
+            status=200,
+        )
 
     async def _handle_register_dp_rank(self, request: web.Request):
         data = await request.json()

@@ -424,6 +424,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
+        enable_kv_reshard = bool(
+            getattr(self.scheduler.server_args, "enable_mooncake_kv_reshard", False)
+        )
 
         attn_tp_size = get_parallel().attn_tp_size
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
@@ -441,6 +444,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             transfer_kv_pool.get_contiguous_buf_infos()
         )
+        if enable_kv_reshard:
+            kv_args.prefill_start_layer = getattr(transfer_kv_pool, "start_layer", 0)
+            kv_args.prefill_end_layer = getattr(
+                transfer_kv_pool,
+                "end_layer",
+                kv_args.prefill_start_layer + len(kv_data_ptrs) // 2,
+            )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
             if self.scheduler.enable_hisparse
@@ -471,12 +481,30 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
-            self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
-            else []
-        )
+        if enable_kv_reshard:
+            kv_args.kv_layer_ids = (
+                self.token_to_kv_pool.get_kv_layer_ids()
+                if self.draft_token_to_kv_pool is None
+                and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
+                else []
+            )
+            kv_pool_for_heads = self.token_to_kv_pool
+            if hasattr(kv_pool_for_heads, "full_kv_pool"):
+                kv_pool_for_heads = kv_pool_for_heads.full_kv_pool
+            if not self.is_mla_backend:
+                kv_args.kv_head_num = kv_pool_for_heads.head_num
+                kv_args.total_kv_head_num = (
+                    self.scheduler.model_config.get_total_num_kv_heads()
+                )
+                kv_args.kv_head_dim = kv_pool_for_heads.head_dim
+                kv_args.kv_value_head_dim = kv_pool_for_heads.v_head_dim
+                kv_args.kv_itemsize = kv_pool_for_heads.store_dtype.itemsize
+                kv_args.kv_storage_dtype_str = str(
+                    kv_pool_for_heads.store_dtype
+                ).removeprefix("torch.")
+                kv_args.kv_cache_layout = kv_pool_for_heads.kv_cache_layout
+                kv_args.kv_is_quantized = kv_pool_for_heads.is_quantized_kv_cache
+            kv_args.total_kv_layers = self.scheduler.model_config.num_hidden_layers
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size

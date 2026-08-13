@@ -64,6 +64,12 @@ class KVArgs:
     gpu_id: int
     kv_head_num: int
     total_kv_head_num: int
+    kv_head_dim: int
+    kv_value_head_dim: int
+    kv_itemsize: int
+    kv_storage_dtype_str: str
+    kv_cache_layout: str
+    kv_is_quantized: bool
     page_size: int
     # for system dp
     system_dp_rank: int

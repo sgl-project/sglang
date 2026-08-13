@@ -3045,6 +3045,11 @@ class ServerArgs:
         'The InfiniBand devices for disaggregation transfer. Supports a single device (e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list (e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping (e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), or a path to a JSON file containing that mapping. Default is None, which triggers automatic device detection when mooncake backend is enabled.',
         NS("disagg"),
     ] = None
+    enable_mooncake_kv_reshard: A[
+        bool,
+        "Enable the versioned Mooncake KV-cache manifest planner for heterogeneous TP/PP PD transfer. Disabled by default.",
+        NS("disagg"),
+    ] = False
     disaggregation_decode_enable_radix_cache: A[
         bool,
         "Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, speculative decoding, and --disaggregation-transfer-backend fake.",
@@ -7472,6 +7477,21 @@ class ServerArgs:
                 "expected to register dynamically via the "
                 "EncoderBootstrapServer."
             )
+
+        if self.enable_mooncake_kv_reshard:
+            if self.disaggregation_mode not in ("prefill", "decode"):
+                raise ValueError(
+                    "--enable-mooncake-kv-reshard requires PD prefill/decode mode"
+                )
+            if self.disaggregation_transfer_backend != "mooncake":
+                raise ValueError(
+                    "--enable-mooncake-kv-reshard requires the mooncake transfer backend"
+                )
+            if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+                raise ValueError(
+                    "--enable-mooncake-kv-reshard is mutually exclusive with "
+                    "SGLANG_DISAGG_STAGING_BUFFER=1 in V1"
+                )
 
         # Validate IB devices when mooncake backend is used
         if (

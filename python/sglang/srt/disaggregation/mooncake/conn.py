@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import os
 import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Set, Tuple, Union
+from typing import Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+import requests
 import zmq
 from prometheus_client import Counter
 
@@ -37,6 +39,14 @@ from sglang.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
+)
+from sglang.srt.disaggregation.mooncake.kv_reshard import (
+    KV_RESHARD_PROTOCOL,
+    KV_RESHARD_SCHEMA_VERSION,
+    KVReshardCompatibilityError,
+    decode_wire_json,
+    encode_wire_json,
+    record_writer_completion,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
@@ -120,6 +130,27 @@ class TransferInfo:
             ),
         )
 
+    @classmethod
+    def from_kv_reshard_zmq(cls, msg: List[bytes]):
+        header = decode_wire_json(msg[1])
+        if (
+            header.get("protocol") != KV_RESHARD_PROTOCOL
+            or int(header.get("schema_version", 0)) != KV_RESHARD_SCHEMA_VERSION
+        ):
+            raise ValueError("invalid KV reshard request protocol")
+        return cls(
+            room=int(header["room"]),
+            endpoint=str(header["endpoint"]),
+            dst_port=int(header["dst_port"]),
+            mooncake_session_id=str(header["mooncake_session_id"]),
+            dst_kv_indices=np.frombuffer(msg[2], dtype=np.int32),
+            dst_aux_index=int(msg[3].decode("ascii")),
+            dst_state_indices=[],
+            required_dst_info_num=int(header["required_dst_info_num"]),
+            is_dummy=False,
+            decode_prefix_len=int(header.get("decode_prefix_len", 0)),
+        )
+
 
 # decode
 @dataclasses.dataclass
@@ -192,6 +223,30 @@ class KVArgsRegisterInfo:
         )
 
 
+@dataclasses.dataclass
+class KVReshardRegisterInfo:
+    mooncake_session_id: str
+    dst_aux_ptrs: List[int]
+    prepared_plan: Any
+
+    @classmethod
+    def from_zmq(cls, msg: List[bytes], runtime: Any):
+        header = decode_wire_json(msg[1])
+        if (
+            header.get("protocol") != KV_RESHARD_PROTOCOL
+            or int(header.get("schema_version", 0)) != KV_RESHARD_SCHEMA_VERSION
+        ):
+            raise ValueError("invalid KV reshard registration protocol")
+        return cls(
+            mooncake_session_id=str(header["mooncake_session_id"]),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[2]) // 8}Q", msg[2])),
+            prepared_plan=runtime.prepare_transfer(
+                logical_plan=header["logical_plan"],
+                target_binding=header["target_binding"],
+            ),
+        )
+
+
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
 
@@ -205,6 +260,12 @@ class MooncakeKVManager(CommonKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
+        if self.enable_kv_reshard:
+            self.kv_reshard.bind_runtime(
+                session_id=self.engine.get_session_id(),
+                transfer_engine=self.engine,
+            )
+            self._kv_reshard_chunk_state = {}
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1599,7 +1660,12 @@ class MooncakeKVManager(CommonKVManager):
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
     def sync_status_to_decode_endpoint(
-        self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
+        self,
+        remote: str,
+        dst_port: int,
+        room: int,
+        status: int,
+        prefill_rank: Union[int, str],
     ):
         na = NetworkAddress(remote, dst_port)
         self._send_multipart_locked(
@@ -1673,9 +1739,13 @@ class MooncakeKVManager(CommonKVManager):
                 dst_ranks_infos = []
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
                 prefill_unique_rank = (
-                    self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
-                    + self.pp_rank * self.attn_cp_size
-                    + self.attn_cp_rank
+                    self.kv_reshard.participant_id
+                    if self.enable_kv_reshard
+                    else (
+                        self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+                        + self.pp_rank * self.attn_cp_size
+                        + self.attn_cp_rank
+                    )
                 )
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
@@ -1703,7 +1773,7 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-                        is_dcp_transfer = (
+                        is_dcp_transfer = not self.enable_kv_reshard and (
                             target_rank_registration_info.requires_dcp_relayout
                         )
                         chunked_dst_device_kv_indice = None
@@ -1752,6 +1822,41 @@ class MooncakeKVManager(CommonKVManager):
                             or skip_kv
                         ):
                             ret = 0
+                        elif self.enable_kv_reshard:
+                            if not isinstance(
+                                target_rank_registration_info,
+                                KVReshardRegisterInfo,
+                            ):
+                                raise KVReshardCompatibilityError(
+                                    "KV_RESHARD_V1 request has no versioned registration"
+                                )
+                            token_count = int(kv_chunk.num_kv_tokens or 0)
+                            state_key = (kv_chunk.room, req.mooncake_session_id)
+                            chunk_state = self._kv_reshard_chunk_state.setdefault(
+                                state_key,
+                                {
+                                    "token_start": int(req.decode_prefix_len or 0),
+                                },
+                            )
+                            try:
+                                batches = self.kv_reshard.lower_chunk(
+                                    prepared_plan=(
+                                        target_rank_registration_info.prepared_plan
+                                    ),
+                                    source_page_ids=kv_chunk.prefill_kv_indices,
+                                    target_page_ids=chunked_dst_kv_indice,
+                                    token_start=chunk_state["token_start"],
+                                    token_count=token_count,
+                                )
+                                ret = self.kv_reshard.submit_chunk(batches)
+                                if ret == 0:
+                                    chunk_state["token_start"] += token_count
+                            except Exception:
+                                logger.exception(
+                                    "KV_RESHARD_V1 transfer failed for room=%s",
+                                    kv_chunk.room,
+                                )
+                                ret = -1
                         elif is_dcp_transfer:
                             dcp_token_item_lens = (
                                 target_rank_registration_info.dcp_token_item_lens
@@ -1939,6 +2044,10 @@ class MooncakeKVManager(CommonKVManager):
                     )
                 ):
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                    if self.enable_kv_reshard:
+                        for state_key in list(self._kv_reshard_chunk_state):
+                            if state_key[0] == kv_chunk.room:
+                                self._kv_reshard_chunk_state.pop(state_key, None)
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
@@ -2018,6 +2127,41 @@ class MooncakeKVManager(CommonKVManager):
                         logger.debug(
                             f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
                         )
+                    continue
+                if room == KV_RESHARD_PROTOCOL + "_REGISTER":
+                    decode_kv_args = KVReshardRegisterInfo.from_zmq(
+                        waiting_req_bytes, self.kv_reshard
+                    )
+                    self.decode_kv_args_table[decode_kv_args.mooncake_session_id] = (
+                        decode_kv_args
+                    )
+                    with self.session_lock:
+                        self.failed_sessions.discard(decode_kv_args.mooncake_session_id)
+                        self.session_failures.pop(
+                            decode_kv_args.mooncake_session_id, None
+                        )
+                    logger.debug(
+                        "Registered KV_RESHARD_V1 binding from %s edges=%s",
+                        decode_kv_args.mooncake_session_id,
+                        len(decode_kv_args.prepared_plan.edges),
+                    )
+                    continue
+                if room == KV_RESHARD_PROTOCOL + "_REQUEST":
+                    transfer_info = TransferInfo.from_kv_reshard_zmq(waiting_req_bytes)
+                    request_room = transfer_info.room
+                    if request_room not in self.transfer_infos:
+                        self.transfer_infos[request_room] = {}
+                    self.transfer_infos[request_room][
+                        transfer_info.mooncake_session_id
+                    ] = transfer_info
+                    if (
+                        len(self.transfer_infos[request_room])
+                        == transfer_info.required_dst_info_num
+                    ):
+                        self.req_to_decode_prefix_len[request_room] = (
+                            transfer_info.decode_prefix_len or 0
+                        )
+                        self.update_status(request_room, KVPoll.WaitingForInput)
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
@@ -2110,18 +2254,40 @@ class MooncakeKVManager(CommonKVManager):
                 bootstrap_room, status, prefill_rank = msg
                 status = int(status.decode("ascii"))
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
-                prefill_rank = int(prefill_rank.decode("ascii"))
+                prefill_rank_text = prefill_rank.decode("ascii")
 
                 if status == KVPoll.Success:
                     if bootstrap_room in self.request_status:
-                        self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
-                        expected_response_num = (
-                            self.required_prefill_response_num_table[bootstrap_room]
+                        expected_writer_ids = (
+                            self.required_prefill_writer_ids_table.get(bootstrap_room)
+                            if self.enable_kv_reshard
+                            else None
                         )
-                        arrived_response_num = len(
-                            self.prefill_response_tracker[bootstrap_room]
-                        )
-                        if arrived_response_num == expected_response_num:
+                        if expected_writer_ids is not None:
+                            arrived = self.prefill_response_tracker[bootstrap_room]
+                            accepted, complete = record_writer_completion(
+                                expected_writer_ids, arrived, prefill_rank_text
+                            )
+                            if not accepted:
+                                logger.warning(
+                                    "Ignoring unexpected KV_RESHARD_V1 completion "
+                                    "for room=%s from participant=%s",
+                                    bootstrap_room,
+                                    prefill_rank_text,
+                                )
+                                continue
+                        else:
+                            prefill_rank = int(prefill_rank_text)
+                            self.prefill_response_tracker[bootstrap_room].add(
+                                prefill_rank
+                            )
+                            complete = (
+                                len(self.prefill_response_tracker[bootstrap_room])
+                                == self.required_prefill_response_num_table[
+                                    bootstrap_room
+                                ]
+                            )
+                        if complete:
                             if self.enable_staging:
                                 handler = self._staging_handler
                                 if handler.is_staging_room(bootstrap_room):
@@ -2365,7 +2531,83 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
+    def _setup_bootstrap_infos(self):
+        if not self.kv_mgr.enable_kv_reshard:
+            return super()._setup_bootstrap_infos()
+        try:
+            cache_key = (self.bootstrap_addr, self.prefill_dp_rank)
+            with self.kv_mgr.connection_lock:
+                cache = self.kv_mgr.kv_reshard_connection_pool
+                cached = cache.get(cache_key)
+                if cached is not None:
+                    logger.debug(
+                        "KV_RESHARD_V1_CACHE_HIT bootstrap=%s prefill_dp_rank=%s",
+                        self.bootstrap_addr,
+                        self.prefill_dp_rank,
+                    )
+                    self.bootstrap_infos = cached
+                    self.expected_writer_ids = tuple(
+                        info["participant_id"] for info in self.bootstrap_infos
+                    )
+                    return
+
+                response = requests.get(
+                    f"http://{self.bootstrap_addr}/kv_reshard/placement",
+                    params={"prefill_dp_rank": self.prefill_dp_rank},
+                    timeout=5,
+                )
+                if response.status_code != 200:
+                    raise KVReshardCompatibilityError(
+                        "bootstrap placement query failed: "
+                        f"{response.status_code} {response.text}"
+                    )
+                payload = response.json()
+                if (
+                    payload.get("protocol") != KV_RESHARD_PROTOCOL
+                    or int(payload.get("schema_version", 0))
+                    != KV_RESHARD_SCHEMA_VERSION
+                ):
+                    raise KVReshardCompatibilityError(
+                        "bootstrap returned an incompatible KV reshard protocol"
+                    )
+                source_digest = payload.get("placement", {}).get("placement_digest")
+                if not isinstance(source_digest, str) or not source_digest:
+                    raise KVReshardCompatibilityError(
+                        "bootstrap placement is missing its canonical digest"
+                    )
+                route_plan = self.kv_mgr.kv_reshard.plan_decode_routes(
+                    source_placement_json=json.dumps(payload["placement"]),
+                    routes=payload["routes"],
+                )
+                self.bootstrap_infos = list(route_plan.bootstrap_infos)
+                self.expected_writer_ids = route_plan.expected_writer_ids
+                logger.info(
+                    "KV_RESHARD_V1_PLAN room=%s source_digest=%s "
+                    "target_digest=%s writers=%s edges=%s",
+                    self.bootstrap_room,
+                    source_digest,
+                    self.kv_mgr.kv_reshard.local_part.digest,
+                    list(route_plan.expected_writer_ids),
+                    sum(
+                        len(info["kv_reshard_plan"]["edges"])
+                        for info in self.bootstrap_infos
+                    ),
+                )
+                if not self._register_kv_args():
+                    return
+                cache[cache_key] = self.bootstrap_infos
+        except Exception as error:
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                f"KV_RESHARD_V1 bootstrap failed: {error}",
+            )
+            self.conclude_state = KVPoll.Failed
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.bootstrap_infos = None
+
     def _register_kv_args(self) -> bool:
+        if self.kv_mgr.enable_kv_reshard:
+            return self._register_kv_reshard_args()
         for bootstrap_info in self.bootstrap_infos:
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
@@ -2449,6 +2691,42 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 return False
         return True
 
+    def _register_kv_reshard_args(self) -> bool:
+        binding = self.kv_mgr.kv_reshard.binding
+        if binding is None:
+            raise RuntimeError("decode KV reshard binding is unavailable")
+        packed_aux_data_ptrs = b"".join(
+            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+        )
+        for bootstrap_info in self.bootstrap_infos:
+            header = {
+                "protocol": KV_RESHARD_PROTOCOL,
+                "schema_version": KV_RESHARD_SCHEMA_VERSION,
+                "mooncake_session_id": self.session_id,
+                "target_binding": binding.to_dict(),
+                "logical_plan": bootstrap_info["kv_reshard_plan"],
+            }
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            try:
+                with lock:
+                    sock.send_multipart(
+                        [
+                            f"{KV_RESHARD_PROTOCOL}_REGISTER".encode("ascii"),
+                            encode_wire_json(header),
+                            packed_aux_data_ptrs,
+                        ]
+                    )
+            except zmq.ZMQError:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    "KV_RESHARD_V1 registration failed for participant "
+                    f"{bootstrap_info['participant_id']}",
+                )
+                self.conclude_state = KVPoll.Failed
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return False
+        return True
+
     def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
@@ -2457,6 +2735,14 @@ class MooncakeKVReceiver(CommonKVReceiver):
         decode_prefix_len: Optional[int] = None,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
+        if self.kv_mgr.enable_kv_reshard:
+            return self._send_kv_reshard_metadata(
+                kv_indices=kv_indices,
+                aux_index=aux_index,
+                state_indices=state_indices,
+                decode_prefix_len=decode_prefix_len,
+                device_kv_indices=device_kv_indices,
+            )
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
@@ -2505,6 +2791,66 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
                     f"send_metadata to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
+                )
+                self.conclude_state = KVPoll.Failed
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return
+        self.init_time = time.time()
+
+    def _send_kv_reshard_metadata(
+        self,
+        *,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int],
+        state_indices: Optional[List],
+        decode_prefix_len: Optional[int],
+        device_kv_indices: Optional[npt.NDArray[np.int32]],
+    ) -> None:
+        if device_kv_indices is not None:
+            raise KVReshardCompatibilityError(
+                "KV_RESHARD_V1 does not support HiSparse device page maps"
+            )
+        if state_indices:
+            raise KVReshardCompatibilityError(
+                "KV_RESHARD_V1 does not support auxiliary state page maps"
+            )
+        if aux_index is None:
+            raise KVReshardCompatibilityError(
+                "KV_RESHARD_V1 requires a Decode auxiliary-data slot"
+            )
+        if self.bootstrap_infos is None:
+            self.kv_mgr.record_failure(
+                self.bootstrap_room, "KV_RESHARD_V1 bootstrap infos are unavailable"
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return
+        for bootstrap_info in self.bootstrap_infos:
+            header = {
+                "protocol": KV_RESHARD_PROTOCOL,
+                "schema_version": KV_RESHARD_SCHEMA_VERSION,
+                "room": self.bootstrap_room,
+                "endpoint": self.kv_mgr.local_ip,
+                "dst_port": self.kv_mgr.rank_port,
+                "mooncake_session_id": self.session_id,
+                "required_dst_info_num": bootstrap_info["required_dst_info_num"],
+                "decode_prefix_len": int(decode_prefix_len or 0),
+            }
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            try:
+                with lock:
+                    sock.send_multipart(
+                        [
+                            f"{KV_RESHARD_PROTOCOL}_REQUEST".encode("ascii"),
+                            encode_wire_json(header),
+                            np.asarray(kv_indices, dtype=np.int32).tobytes(),
+                            str(aux_index).encode("ascii"),
+                        ]
+                    )
+            except zmq.ZMQError:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    "KV_RESHARD_V1 request failed for participant "
+                    f"{bootstrap_info['participant_id']}",
                 )
                 self.conclude_state = KVPoll.Failed
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
