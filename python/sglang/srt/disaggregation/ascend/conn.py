@@ -125,9 +125,7 @@ class AscendKVManager(MooncakeKVManager):
         src_layer_ids = (
             self.kv_args.kv_layer_ids if self.is_hybrid_mla_backend else None
         )
-        mapped_dst_layer_ids = (
-            dst_layer_ids if self.is_hybrid_mla_backend else None
-        )
+        mapped_dst_layer_ids = dst_layer_ids if self.is_hybrid_mla_backend else None
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs,
