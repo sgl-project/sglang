@@ -61,6 +61,7 @@ def run_single_daemon(
         model_path=model_path,
         tp_size=tp_size,
         pp_size=pp_size,
+        dp_size=1,
         load_format=load_format,
         dtype=dtype,
         quantization=quantization,
