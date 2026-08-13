@@ -12,9 +12,9 @@ Each class below reproduces a specific merged regression when its fix is
 reverted; the measured pre-fix divergence is recorded in the class docstring so a
 later threshold change has to argue with a number.
 
-These classes do not use UnifiedRadixTreeTestMixin: it bundles gsm8k and mmlu,
-which an undertrained checkpoint cannot gate on, and each class here runs the
-harness its regression was actually reproduced with.
+These classes do not use UnifiedRadixTreeTestMixin: it bundles a gsm8k case an
+undertrained checkpoint cannot gate on, and each class here runs the harness its
+regression was actually reproduced with.
 
 The imported `test_`-prefixed helpers are aliased so pytest does not collect them
 as tests.
