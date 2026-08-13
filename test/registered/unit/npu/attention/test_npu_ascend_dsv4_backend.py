@@ -61,6 +61,8 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     _apply_hadamard,
     _get_kv_indices,
     _overlap_transform,
+    _sparse_attn_kv_quant_kwargs,
+    _sparse_attn_ops,
     _walsh_hadamard_matrix,
 )
 
@@ -181,6 +183,37 @@ class TestApplyHadamard(unittest.TestCase):
         expected = inp.matmul(H).to(torch.bfloat16)
         out = _apply_hadamard(inp, H)
         self.assertTrue(torch.equal(out, expected))
+
+
+class TestAtlasA5SparseAttentionDispatch(unittest.TestCase):
+    _A5_PATCH_TARGET = (
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_atlas_a5"
+    )
+
+    @patch(_A5_PATCH_TARGET, return_value=True)
+    def test_a5_uses_kv_quant_ops_and_layout_kwargs(self, _):
+        with patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
+            metadata_op, attention_op = _sparse_attn_ops()
+            kwargs = _sparse_attn_kv_quant_kwargs()
+
+        self.assertIs(
+            metadata_op, custom_ops.npu_kv_quant_sparse_attn_sharedkv_metadata
+        )
+        self.assertIs(attention_op, custom_ops.npu_kv_quant_sparse_attn_sharedkv)
+        self.assertEqual(
+            kwargs,
+            {"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": 64},
+        )
+
+    @patch(_A5_PATCH_TARGET, return_value=False)
+    def test_pre_a5_keeps_legacy_ops_without_quant_kwargs(self, _):
+        with patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
+            metadata_op, attention_op = _sparse_attn_ops()
+            kwargs = _sparse_attn_kv_quant_kwargs()
+
+        self.assertIs(metadata_op, custom_ops.npu_sparse_attn_sharedkv_metadata)
+        self.assertIs(attention_op, custom_ops.npu_sparse_attn_sharedkv)
+        self.assertEqual(kwargs, {})
 
 
 class TestOverlapTransform(unittest.TestCase):

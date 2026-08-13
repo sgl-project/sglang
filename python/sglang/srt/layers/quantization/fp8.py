@@ -762,8 +762,8 @@ class Fp8LinearMethod(LinearMethodBase):
     @staticmethod
     def _batch_npu_a5_wo_a_weights(layer: Module) -> None:
         """Reshape DSV4's ``wo_a`` into the per-group batched layout that
-        ``npu_transpose_quant_batchmatmul`` expects (matching vllm-ascend):
-        weight ``[D, G*R] -> [G, D, R]``, scale ``[D/64, G*R, 2] -> [G, D/64, R, 2]``.
+        ``npu_transpose_quant_batchmatmul`` expects weight
+        ``[D, G*R] -> [G, D, R]``, scale ``[D/64, G*R, 2] -> [G, D/64, R, 2]``.
         """
         num_groups = layer._dsv4_num_groups
         rank = layer._dsv4_o_lora_rank
