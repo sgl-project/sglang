@@ -174,17 +174,17 @@ class RustMmProcessor:
         )
         if family is None:
             return None
-        ip = getattr(self._processor, "image_processor", None)
-        resample = family.image_processors.get(type(ip).__name__)
+        image_processor = getattr(self._processor, "image_processor", None)
+        resample = family.image_processors.get(type(image_processor).__name__)
         if resample is None:
             return None
         # The Rust pipeline always resizes, rescales by 1/255 and normalizes;
         # Rust's fused normalize constants assume that factor. Anything else
         # would silently produce different features.
         stages = ("do_resize", "do_rescale", "do_normalize")
-        if not all(getattr(ip, stage, True) for stage in stages):
+        if not all(getattr(image_processor, stage, True) for stage in stages):
             return None
-        if getattr(ip, "rescale_factor", None) != 1 / 255:
+        if getattr(image_processor, "rescale_factor", None) != 1 / 255:
             return None
 
         # `--mm-process-config {"image": {...}}`: only pixel-limit overrides are
@@ -193,25 +193,27 @@ class RustMmProcessor:
         if not set(image_overrides) <= {"min_pixels", "max_pixels"}:
             return None
 
-        size = getattr(ip, "size", None) or {}
+        size = getattr(image_processor, "size", None) or {}
         min_pixels = image_overrides.get(
-            "min_pixels", getattr(ip, "min_pixels", None) or size.get("shortest_edge")
+            "min_pixels",
+            getattr(image_processor, "min_pixels", None) or size.get("shortest_edge"),
         )
         max_pixels = image_overrides.get(
-            "max_pixels", getattr(ip, "max_pixels", None) or size.get("longest_edge")
+            "max_pixels",
+            getattr(image_processor, "max_pixels", None) or size.get("longest_edge"),
         )
         try:
             spec = RustMmSpec(
                 family=family.name,
                 feature_shm=self._use_feature_shm(),
                 image_token_id=hf_config.image_token_id,
-                patch_size=ip.patch_size,
-                merge_size=ip.merge_size,
-                temporal_patch_size=ip.temporal_patch_size,
+                patch_size=image_processor.patch_size,
+                merge_size=image_processor.merge_size,
+                temporal_patch_size=image_processor.temporal_patch_size,
                 min_pixels=int(min_pixels),
                 max_pixels=int(max_pixels),
-                image_mean=tuple(float(x) for x in ip.image_mean),
-                image_std=tuple(float(x) for x in ip.image_std),
+                image_mean=tuple(float(x) for x in image_processor.image_mean),
+                image_std=tuple(float(x) for x in image_processor.image_std),
                 resample=resample,
                 vision_start_token_id=getattr(hf_config, "vision_start_token_id", None),
                 vision_end_token_id=getattr(hf_config, "vision_end_token_id", None),

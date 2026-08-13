@@ -199,14 +199,9 @@ impl Server {
     /// in Rust and parked for [`Server::take_mm_result`]; anything the pipeline
     /// cannot serve is rejected back to the client — there is no Python fallback.
     fn start_mm_workers(&self, spec: MmSpec, workers: usize) -> PyResult<()> {
-        let ctx = multi_modality::worker::MmContext::new(
-            spec,
-            self.rt.tokenizer.clone(),
-            self.rt.mm_results.clone(),
-        )
-        .map_err(|e| value_error("mm spec", e))?;
-        self.rt.spawn_mm_pool(workers, std::sync::Arc::new(ctx));
-        Ok(())
+        self.rt
+            .start_mm_workers(spec, workers)
+            .map_err(|e| value_error("mm spec", e))
     }
 
     /// Pop the MM result for `rid` — parked strictly before the request reached
