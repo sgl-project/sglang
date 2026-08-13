@@ -569,6 +569,79 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
     assert one.tolist() == [[1.0, 0.0]]
 
 
+def test_kimi_k3_deferred_config_satisfies_the_model_contract():
+    """The tokenizer-side deferred config must carry every key the model's
+    deferred materialization reads. A config built without ``backend`` raised
+    ``KeyError`` in ``get_image_feature`` for every deferred image, which is
+    the default path on a single-node CUDA server (cpu feature transport),
+    including the server's own VLM startup warmup request.
+
+    This drives the real producer into the real consumer: the other deferred
+    tests either mock ``prepare_deferred`` or hand-write the config, so both
+    sides can drift apart while staying green.
+    """
+    from unittest.mock import patch as mock_patch
+
+    from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+    from sglang.srt.multimodal.processors.kimi_k3 import (
+        KimiK3GPUProcessorWrapper,
+        KimiK3ImageProcessor,
+    )
+
+    image_token_id = 99
+
+    wrapper = object.__new__(KimiK3GPUProcessorWrapper)
+    wrapper._hf_processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda text, allowed_special=None: [7])
+    )
+    wrapper._image_token_id = image_token_id
+    wrapper._patch_size = 2
+    wrapper._merge_kernel_size = 2
+    wrapper._in_patch_limit = 65536
+    wrapper._patch_limit_on_one_side = 512
+    wrapper._fixed_output_tokens = None
+    wrapper._image_mean = [0.5, 0.5, 0.5]
+    wrapper._image_std = [0.5, 0.5, 0.5]
+    wrapper._transparent_bg_config = None
+
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor._processor = wrapper
+    processor.mm_tokens = SimpleNamespace(image_token_id=image_token_id)
+    processor.mm_feature_transport = "cpu"
+    processor.use_cuda_ipc = False
+
+    output = processor._build_deferred_output(
+        SimpleNamespace(
+            input_text="prompt",
+            images=[torch.zeros((3, 4, 4), dtype=torch.uint8)],
+            input_ids=[1, image_token_id, 2],
+        )
+    )
+
+    model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.use_data_parallel = True
+    model.vision_tower = _K3TowerStub()
+    model.mm_projector = lambda image_embeds: image_embeds
+
+    with mock_patch(
+        "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
+        return_value=torch.zeros(1, 2),
+    ) as run_dp, get_context().override_server_args(tp_size=1), get_parallel().override(
+        tp_size=1, attn_tp_size=1
+    ), mock_patch(
+        "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
+        return_value=(torch.zeros(1, 2), torch.tensor([[1, 1, 1]])),
+    ) as gpu_preprocess:
+        model.get_image_feature(output.mm_items)
+        pixel_values = run_dp.call_args.kwargs["load_local_pixel_values"]([0])
+
+    # The GPU backend branch ran (rather than the cpu one, which would need the
+    # EPD-only encoder image processor) and returned tower-dtype features.
+    assert gpu_preprocess.called
+    assert pixel_values.dtype == torch.float32
+
+
 def test_kimi_k3_scheduler_leaves_feature_placement_to_dp_owner():
     from sglang.srt.managers.mm_schedule import _can_skip_pre_embed_feature_move
     from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration

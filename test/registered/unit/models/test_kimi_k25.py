@@ -718,6 +718,10 @@ def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
                     },
                 ],
                 {
+                    # Keep in sync with KimiK3GPUProcessorWrapper.prepare_deferred;
+                    # test_kimi_k3_deferred_config_satisfies_the_model_contract
+                    # guards the real producer against the model's reads.
+                    "backend": "gpu",
                     "image_mean": [0.5, 0.5, 0.5],
                     "image_std": [0.5, 0.5, 0.5],
                     "transparent_bg_config": None,
