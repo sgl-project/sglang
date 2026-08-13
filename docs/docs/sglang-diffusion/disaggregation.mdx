@@ -153,12 +153,11 @@ sglang serve --model-path ... --disagg-role server \
     --decoder-urls  "tcp://10.0.0.5:35000"
 ```
 
-### GLM-Image AR-to-DiT fan-out
+### GLM-Image distributed mode
 
-GLM-Image can batch AR generation in the head and fan the resulting prior
-tokens out to distributed denoiser workers. Each worker runs prompt/glyph
-preparation, DiT, and VAE decoding locally; no latent or embedding tensors are
-transferred.
+GLM-Image can batch AR generation in the head and dispatch the resulting prior
+tokens to distributed denoiser workers. Each worker runs prompt/glyph preparation,
+DiT, and VAE decoding locally; no latent or embedding tensors are transferred.
 
 The following 16-device deployment uses devices 0-1 for the external AR server
 and devices 2-15 for 14 independent batch-1 Cache-DiT denoisers.
@@ -292,8 +291,8 @@ Tensor data between roles (encoder→denoiser, denoiser→decoder) is transferre
 
 **mooncake-transfer-engine** is required for disaggregated diffusion. It provides RDMA for direct GPU-to-GPU data movement.
 
-The GLM-Image AR-to-DiT fan-out mode is an exception: it relays only prior
-token IDs and request metadata over ZMQ and does not require Mooncake.
+The GLM-Image distributed mode is an exception: it relays only prior token IDs
+and request metadata over ZMQ and does not require Mooncake.
 
 ```bash
 pip install mooncake-transfer-engine
