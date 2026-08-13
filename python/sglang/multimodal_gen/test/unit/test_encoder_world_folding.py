@@ -136,10 +136,14 @@ def test_all_encoders_get_the_same_proposed_mode():
     assert img.parallel_folding_mode == "world"
 
 
-def test_adjust_proposes_regardless_of_policy():
-    # adjust reads the parallelism only; finalize owns the policy decision.
-    for policy in ("auto", "fold", "dp", "replicate"):
+def test_adjust_proposal_policy_dependence():
+    # adjust reads the parallelism only for auto/dp/replicate; finalize owns
+    # those policy decisions. An explicit fold is the one exception: it widens
+    # the proposal to the whole replica, because finalize cannot conjure a
+    # group that was never proposed (pure-TP replicas had none at all).
+    for policy in ("auto", "dp", "replicate"):
         assert _proposed_mode(tp=1, sp=2, cfg=1, policy=policy) == "world", policy
+    assert _proposed_mode(tp=1, sp=2, cfg=1, policy="fold") == "replica"
 
 
 def test_no_policy_touches_batching_max_size():
