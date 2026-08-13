@@ -17,7 +17,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dsa.triton_sparse_mla import _row_strides
+from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+    _no_async_copy,
+    _row_strides,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 _IS_FNUZ = is_fp8_fnuz()
@@ -589,29 +592,30 @@ def triton_sparse_mla_decode_splitk(
 
     if kv_splits == 1:
         out = torch.empty(bs, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
-        _sparse_mla_decode_fused_kernel[(bs, n_head_blocks)](
-            q_nope,
-            q_rope,
-            kv,
-            idx_flat,
-            out,
-            qk_scale,
-            _FP8_MAX,
-            topk=topk,
-            H=H,
-            KV_DIM=kv_dim,
-            D_V=d_v,
-            D_TAIL=d_tail,
-            NUM_GROUPS=num_groups,
-            STRIDE_QN_T=stride_qn_t,
-            STRIDE_QN_H=stride_qn_h,
-            STRIDE_QR_T=stride_qr_t,
-            STRIDE_QR_H=stride_qr_h,
-            BLOCK_H=BLOCK_H,
-            BLOCK_K=BLOCK_K,
-            num_warps=4,
-            num_stages=2,
-        )
+        with _no_async_copy():
+            _sparse_mla_decode_fused_kernel[(bs, n_head_blocks)](
+                q_nope,
+                q_rope,
+                kv,
+                idx_flat,
+                out,
+                qk_scale,
+                _FP8_MAX,
+                topk=topk,
+                H=H,
+                KV_DIM=kv_dim,
+                D_V=d_v,
+                D_TAIL=d_tail,
+                NUM_GROUPS=num_groups,
+                STRIDE_QN_T=stride_qn_t,
+                STRIDE_QN_H=stride_qn_h,
+                STRIDE_QR_T=stride_qr_t,
+                STRIDE_QR_H=stride_qr_h,
+                BLOCK_H=BLOCK_H,
+                BLOCK_K=BLOCK_K,
+                num_warps=4,
+                num_stages=2,
+            )
         return out.unsqueeze(0)
 
     tiles_per_split = (topk + kv_splits * BLOCK_K - 1) // (kv_splits * BLOCK_K)
@@ -626,31 +630,32 @@ def triton_sparse_mla_decode_splitk(
     out = torch.empty(bs, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
 
     grid_split = (bs, n_head_blocks, kv_splits)
-    _sparse_mla_decode_split_kernel[grid_split](
-        q_nope,
-        q_rope,
-        kv,
-        idx_flat,
-        lse_partial,
-        acc_partial,
-        qk_scale,
-        _FP8_MAX,
-        topk=topk,
-        H=H,
-        KV_DIM=kv_dim,
-        D_V=d_v,
-        D_TAIL=d_tail,
-        NUM_GROUPS=num_groups,
-        STRIDE_QN_T=stride_qn_t,
-        STRIDE_QN_H=stride_qn_h,
-        STRIDE_QR_T=stride_qr_t,
-        STRIDE_QR_H=stride_qr_h,
-        KV_SPLITS=kv_splits,
-        BLOCK_H=BLOCK_H,
-        BLOCK_K=BLOCK_K,
-        num_warps=4,
-        num_stages=2,
-    )
+    with _no_async_copy():
+        _sparse_mla_decode_split_kernel[grid_split](
+            q_nope,
+            q_rope,
+            kv,
+            idx_flat,
+            lse_partial,
+            acc_partial,
+            qk_scale,
+            _FP8_MAX,
+            topk=topk,
+            H=H,
+            KV_DIM=kv_dim,
+            D_V=d_v,
+            D_TAIL=d_tail,
+            NUM_GROUPS=num_groups,
+            STRIDE_QN_T=stride_qn_t,
+            STRIDE_QN_H=stride_qn_h,
+            STRIDE_QR_T=stride_qr_t,
+            STRIDE_QR_H=stride_qr_h,
+            KV_SPLITS=kv_splits,
+            BLOCK_H=BLOCK_H,
+            BLOCK_K=BLOCK_K,
+            num_warps=4,
+            num_stages=2,
+        )
 
     D_CHUNK = 64
     grid_reduce = (bs, H, (d_v + D_CHUNK - 1) // D_CHUNK)
