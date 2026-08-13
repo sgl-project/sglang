@@ -267,11 +267,12 @@ def collect_suite_files(
     ci_register = _load_ci_register(repo_root)
     backend = getattr(ci_register.HWBackend, backend_name.upper())
 
-    registered_root = os.path.join(repo_root, "test", "registered")
     files = sorted(
         f
-        for f in glob.glob(os.path.join(registered_root, "**", "*.py"), recursive=True)
-        if ci_register.is_registered_test_file(os.path.relpath(f, registered_root))
+        for f in glob.glob(
+            os.path.join(repo_root, "test", "registered", "**", "*.py"), recursive=True
+        )
+        if ci_register.is_registered_test_file(f)
     )
 
     suite_files: Dict[str, List[str]] = {}

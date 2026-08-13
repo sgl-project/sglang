@@ -80,11 +80,10 @@ def main() -> int:
     spec.loader.exec_module(ci_register)
     cuda = ci_register.HWBackend.CUDA
 
-    is_registered_test_file = ci_register.is_registered_test_file
     files = sorted(
         f
         for f in glob.glob("test/registered/**/*.py", recursive=True)
-        if is_registered_test_file(os.path.relpath(f, "test/registered"))
+        if ci_register.is_registered_test_file(f)
     )
     if not files:
         return 0

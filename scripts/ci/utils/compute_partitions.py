@@ -84,11 +84,12 @@ def per_shard_target_seconds(suite: str, run_timeouts: dict) -> float:
 
 def discover_files(repo_root: str) -> list[str]:
     test_dir = os.path.join(repo_root, "test")
-    registered_dir = os.path.join(test_dir, "registered")
     files = [
         f
-        for f in glob.glob(os.path.join(registered_dir, "**", "*.py"), recursive=True)
-        if is_registered_test_file(os.path.relpath(f, registered_dir))
+        for f in glob.glob(
+            os.path.join(test_dir, "registered", "**", "*.py"), recursive=True
+        )
+        if is_registered_test_file(f)
     ]
     jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
     files += glob.glob(

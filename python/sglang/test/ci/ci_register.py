@@ -1,4 +1,5 @@
 import ast
+import os
 import warnings
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -8,7 +9,6 @@ __all__ = [
     "HWBackend",
     "CIRegistry",
     "collect_tests",
-    "is_registered_test_file",
     "auto_partition",
     "register_cpu_ci",
     "register_cuda_ci",
@@ -30,13 +30,12 @@ _ALL_PARAMS = _PARAM_ORDER + _KWARG_ONLY
 _UNSET = object()
 
 
-def is_registered_test_file(relative_path: str) -> bool:
-    """Whether a path under test/registered/ must carry a CI registration.
+def is_registered_test_file(path: str) -> bool:
+    """Whether a file under test/registered/ must carry a CI registration.
 
     No helper exemptions: shared helpers live in python/sglang/test/.
     """
-    basename = relative_path.replace("\\", "/").rsplit("/", 1)[-1]
-    return basename not in {"conftest.py", "__init__.py"}
+    return os.path.basename(path) not in {"conftest.py", "__init__.py"}
 
 
 class HWBackend(Enum):

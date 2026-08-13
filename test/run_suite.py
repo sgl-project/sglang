@@ -312,13 +312,14 @@ def run_a_suite(args):
     # Use absolute paths so the script works from any working directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.dirname(script_dir)
-    registered_dir = os.path.join(script_dir, "registered")
 
     # Registered tests under test/registered/
     files = [
         f
-        for f in glob.glob(os.path.join(registered_dir, "**", "*.py"), recursive=True)
-        if is_registered_test_file(os.path.relpath(f, registered_dir))
+        for f in glob.glob(
+            os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
+        )
+        if is_registered_test_file(f)
     ]
 
     # Strict: all discovered files must have proper registration
