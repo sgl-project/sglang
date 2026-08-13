@@ -114,6 +114,11 @@ class MambaAttnBackendBase(AttentionBackend):
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
 
+        # Build the metadata from the logical mode. This handles the case where
+        # DP may treat a decode batch as a 1-token extend batch but linear
+        # attention still needs to handle it as decode.
+        logical_mode = forward_batch.logical_forward_mode
+
         retrieve_next_token = None
         retrieve_next_sibling = None
         retrieve_parent_token = None
@@ -145,7 +150,7 @@ class MambaAttnBackendBase(AttentionBackend):
 
         replayssm_write_pos = None
         replayssm_force_flush = None
-        if forward_batch.forward_mode.is_decode_or_idle():
+        if logical_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
                 0, bs + 1, dtype=torch.int32, device=self.device
             )
@@ -206,7 +211,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     )
                     new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
                     write_pos_buf[uniq_slots] = new_vals
-        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+        elif logical_mode.is_extend(include_draft_extend_v2=True):
             if forward_batch.forward_mode.is_draft_extend_v2():
                 # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model;
                 # skip mamba metadata.
@@ -1200,13 +1205,21 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         is_linear_attn = not self._is_full_attn(layer, kwargs.get("layer_id"))
 
+        # For linear attention, dispatch on the logical mode to match the
+        # built metadata.
+        dispatch_mode = (
+            forward_batch.logical_forward_mode
+            if is_linear_attn
+            else forward_batch.forward_mode
+        )
+
         if forward_batch.forward_mode.is_idle():
             if is_linear_attn:
                 return mixed_qkv.new_empty(
                     mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
                 )
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-        elif forward_batch.forward_mode.is_decode():
+        elif dispatch_mode.is_decode():
             return self.forward_decode(
                 layer,
                 forward_batch,

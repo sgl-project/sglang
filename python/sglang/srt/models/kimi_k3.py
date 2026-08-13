@@ -1916,7 +1916,10 @@ class KimiK3DeltaAttention(nn.Module):
                 hidden_states
             )
 
-        if not forward_batch.forward_mode.is_decode():
+        # Read through the logical mode to handle the case where DP may treat a
+        # decode batch as a 1-token extend batch but linear attention still needs
+        # to handle it as decode.
+        if not forward_batch.logical_forward_mode.is_decode():
             forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
             if not forward_batch.forward_mode.is_target_verify():
                 # Only chunk_kda (extend) wants pre-activated beta; the verify
