@@ -1,3 +1,5 @@
+import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -10,6 +12,40 @@ from sglang.srt.utils import get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+
+# ---------------------------------------------------------------------------
+# Triton availability probe (single-card NPU + KT downstream patch)
+# ---------------------------------------------------------------------------
+# Upstream `sgl_kernel_npu.mem_cache.allocator.alloc_extend_kernel` is a ``@triton.jit`` kernel and
+# needs the triton-ascend backend registered with ``triton.runtime.driver``. When ``triton 3.7`` and
+# ``triton-ascend 3.2`` are mismatched (ascend/compiler.py references ``AttrsDescriptor``, which
+# upstream removed), backend registration fails and any call raises
+# ``RuntimeError: 0 active drivers ([])``. This file already carries ``alloc_extend_naive``, a pure
+# PyTorch equivalent whose performance difference is negligible at small batch sizes. So the driver
+# is probed once at import time and, if it is unusable, every later prefill takes the naive branch.
+# A triton/ascend version mismatch is common, and detecting it automatically avoids needing a
+# switch for it.
+def _detect_triton_driver_available() -> bool:
+    try:
+        # triton ships no type stubs; this is the availability probe whose failure falls back to the
+        # torch-equivalent path when triton x ascend is unusable, hence the type: ignore.
+        from triton.runtime.driver import driver as _triton_driver  # type: ignore
+
+        _ = _triton_driver.active  # triggers _create_driver()
+        return True
+    except Exception as e:  # ImportError / RuntimeError("0 active drivers") / etc.
+        logger.warning(
+            "[allocator_npu] Triton driver unavailable (%s: %s); falling back to "
+            "alloc_extend_naive for KV slot allocation. This is a pure-PyTorch path "
+            "and does not affect forward numerics.",
+            type(e).__name__,
+            e,
+        )
+        return False
+
+
+_TRITON_DRIVER_AVAILABLE = _detect_triton_driver_available()
 
 
 class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
@@ -54,7 +90,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if num_new_pages_item > len(self.free_pages):
             return None
 
-        if num_new_pages_item < 200:
+        if num_new_pages_item < 200 and _TRITON_DRIVER_AVAILABLE:
             from sgl_kernel_npu.mem_cache.allocator import alloc_extend_kernel
 
             out_indices = torch.empty(

@@ -1004,8 +1004,12 @@ class FusedMoE(torch.nn.Module):
             KTEPWrapperMethod,
         ):
             if self.quant_method.num_gpu_experts != -1:
-                if expert_id >= self.quant_method.num_gpu_experts:
+                gpu_slot = self.quant_method.map_logical_expert_id_for_gpu_load(
+                    expert_id
+                )
+                if gpu_slot < 0:
                     return
+                expert_id = gpu_slot
 
         self._weight_loader_impl(
             param=param,
@@ -1469,6 +1473,45 @@ class FusedMoE(torch.nn.Module):
             dwdp_mgr = get_global_dwdp_manager()
             dwdp_mgr.wait_prefetch(self.layer_id)
 
+        # KT hybrid CPU+GPU MoE on the AscendTP dispatch path: the dispatcher
+        # permutes/quantizes tokens, so the CPU submission and the CPU-expert
+        # mask must run on the raw tensors BEFORE dispatch, and the CPU result
+        # joins token-major AFTER combine (see kt_ep_wrapper seam methods).
+        kt_ascend_join_state = None
+        if (
+            isinstance(self.quant_method, KTEPWrapperMethod)
+            and self.dispatcher.__class__.__name__ == "AscendTPDispatcher"
+        ):
+            kt = self.quant_method
+            bypass, masked_topk_output, join_state = kt.kt_ascend_pre_dispatch(
+                self, hidden_states, topk_output
+            )
+            if bypass is not None or kt.num_gpu_experts == 0:
+                if bypass is not None:
+                    final_hidden_states = bypass
+                else:
+                    cpu_out = kt.kt_ascend_join(hidden_states, join_state)
+                    final_hidden_states = (
+                        cpu_out
+                        if cpu_out is not None
+                        else torch.zeros_like(hidden_states)
+                    )
+                final_hidden_states = final_hidden_states[
+                    ..., :origin_hidden_states_dim
+                ].contiguous()
+                if self.reduce_results and (
+                    self.moe_tp_size > 1 or self.moe_ep_size > 1
+                ):
+                    final_hidden_states = tensor_model_parallel_all_reduce(
+                        final_hidden_states
+                    )
+                return final_hidden_states
+            # group_list handed to npu_grouped_matmul must match the resident
+            # GPU expert slots, not the global logical expert count.
+            self.dispatcher.num_experts = kt.num_gpu_experts
+            topk_output = masked_topk_output
+            kt_ascend_join_state = join_state
+
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
@@ -1501,6 +1544,13 @@ class FusedMoE(torch.nn.Module):
             final_hidden_states = final_hidden_states[
                 ..., :origin_hidden_states_dim
             ].contiguous()
+
+        if kt_ascend_join_state is not None:
+            cpu_out = self.quant_method.kt_ascend_join(
+                hidden_states, kt_ascend_join_state
+            )
+            if cpu_out is not None:
+                final_hidden_states = final_hidden_states + cpu_out
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

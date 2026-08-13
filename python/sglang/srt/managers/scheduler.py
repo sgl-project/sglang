@@ -24,6 +24,7 @@ from array import array
 from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
+from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
@@ -335,6 +336,121 @@ else:
 
 
 logger = logging.getLogger(__name__)
+_is_npu = is_npu()
+_npu_decode_profile_logged = False
+
+
+def _should_npu_profile_batch(batch: ScheduleBatch) -> bool:
+    """Profile exactly one decode step when enabled via SGLANG_NPU_PROFILE_* env vars."""
+    global _npu_decode_profile_logged
+    if not _is_npu or not envs.SGLANG_NPU_PROFILE_ENABLE.get():
+        return False
+    if batch is None or batch.forward_mode is None:
+        return False
+    if not batch.forward_mode.is_decode():
+        return False
+    target_decode_token = envs.SGLANG_NPU_PROFILE_DECODE_TOKEN.get()
+    if not batch.reqs:
+        return False
+    if not all(req.decode_batch_idx == target_decode_token for req in batch.reqs):
+        return False
+    if not _npu_decode_profile_logged:
+        logger.info(
+            "NPU profiling enabled: capturing decode step %d "
+            "(decode_batch_idx, i.e. the %d-th generated token after prefill) -> %s",
+            target_decode_token,
+            target_decode_token,
+            envs.SGLANG_NPU_PROFILE_DIR.get(),
+        )
+        _npu_decode_profile_logged = True
+    return True
+
+
+def _npu_profiler_level():
+    import torch_npu
+
+    level = envs.SGLANG_NPU_PROFILE_LEVEL.get()
+    return {
+        0: torch_npu.profiler.ProfilerLevel.Level0,
+        1: torch_npu.profiler.ProfilerLevel.Level1,
+        2: torch_npu.profiler.ProfilerLevel.Level2,
+    }.get(level, torch_npu.profiler.ProfilerLevel.Level0)
+
+
+@contextmanager
+def _npu_profile_force_eager_context(scheduler: "Scheduler"):
+    """NPUGraph replay + KT host callbacks are incompatible with inline torch_npu.profiler."""
+    if not envs.SGLANG_NPU_PROFILE_DISABLE_GRAPH.get():
+        yield
+        return
+    model_runner = scheduler.tp_worker.model_runner
+    graph_runner = model_runner.graph_runner
+    if graph_runner is None:
+        yield
+        return
+    orig_can_run = graph_runner.can_run
+
+    def _can_run_no_graph(forward_batch):
+        return False
+
+    graph_runner.can_run = _can_run_no_graph
+    logger.info(
+        "NPU profiler: forcing eager decode (NPUGraph replay disabled for this step)"
+    )
+    try:
+        yield
+    finally:
+        keep_eager = (
+            envs.SGLANG_NPU_PROFILE_ENABLE.get()
+            and envs.SGLANG_NPU_PROFILE_KEEP_EAGER_AFTER.get()
+        )
+        if keep_eager:
+            logger.info(
+                "NPU profiler: keeping eager decode for remaining server lifetime "
+                "(do not mix profiler eager step with NPUGraph replay on the same request)"
+            )
+        else:
+            graph_runner.can_run = orig_can_run
+
+
+@contextmanager
+def _npu_profiler_context():
+    import torch_npu
+
+    output_dir = envs.SGLANG_NPU_PROFILE_DIR.get()
+    analyse_flag = envs.SGLANG_NPU_PROFILE_ANALYSE.get()
+    profiler_level = _npu_profiler_level()
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        profiler_level=profiler_level,
+        export_type=[torch_npu.profiler.ExportType.Text],
+    )
+    trace_handler = torch_npu.profiler.tensorboard_trace_handler(
+        output_dir, analyse_flag=analyse_flag, async_mode=True
+    )
+    logger.info(
+        "NPU profiler starting (level=%s, analyse_flag=%s, dir=%s)",
+        envs.SGLANG_NPU_PROFILE_LEVEL.get(),
+        analyse_flag,
+        output_dir,
+    )
+    with torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU,
+        ],
+        schedule=torch_npu.profiler.schedule(
+            wait=0, warmup=0, active=1, repeat=1, skip_first=0
+        ),
+        experimental_config=experimental_config,
+        on_trace_ready=trace_handler,
+    ) as prof:
+        yield prof
+    torch_npu.npu.synchronize()
+    logger.info(
+        "NPU profiler finished export to %s (analyse_flag=%s)",
+        output_dir,
+        analyse_flag,
+    )
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -1704,6 +1820,28 @@ class Scheduler(
             self.schedule_stream.wait_event(ev)
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
+    def _run_batch_with_optional_npu_profile(
+        self,
+        batch: ScheduleBatch,
+        *,
+        process_result: bool = True,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+        def _execute():
+            result = self.run_batch(batch)
+            if process_result:
+                self.process_batch_result(batch, result)
+            return result
+
+        if _should_npu_profile_batch(batch):
+            logger.info(
+                "NPU profiler: running decode batch (export blocks scheduler until done)"
+            )
+            with _npu_profile_force_eager_context(self), _npu_profiler_context() as prof:
+                result = _execute()
+                prof.step()
+            logger.info("NPU profiler: decode batch done, scheduler resuming")
+            return result
+        return _execute()
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1728,8 +1866,7 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                self._run_batch_with_optional_npu_profile(batch)
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
@@ -1788,7 +1925,9 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                batch_result = self.run_batch(batch)
+                batch_result = self._run_batch_with_optional_npu_profile(
+                    batch, process_result=False
+                )
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
