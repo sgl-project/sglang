@@ -327,7 +327,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.free(free_index)
             self.free_swa(free_index)
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(self._copy_for_free_group(free_index))
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
@@ -352,7 +352,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if not self.is_not_in_free_group:
-            self.swa_free_group.append(free_index)
+            self.swa_free_group.append(self._copy_for_free_group(free_index))
             return
 
         if self.page_size == 1:
@@ -557,7 +557,7 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         if self.is_not_in_free_group:
             self.swa_attn_allocator.free(free_index[free_index > 0])
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(self._copy_for_free_group(free_index))
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def free_swa(self, free_index: torch.Tensor):
@@ -566,7 +566,7 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         if self.is_not_in_free_group:
             self.swa_attn_allocator.free(free_index[free_index > 0])
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(self._copy_for_free_group(free_index))
 
     def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """full == swa and the mapping is a constant identity table: a slot is its

@@ -265,7 +265,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.is_not_in_free_group:
             self._release_page_ids(torch.unique(free_index // self.page_size))
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(self._copy_for_free_group(free_index))
 
         if self.debug_mode:
             self._debug_check_no_duplicate_pages()
@@ -296,8 +296,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_page_reps(*pieces)
 
     def free_page_reps(self, *page_reps: torch.Tensor):
-        """Fixed-shape page release; contract see base. Group-deferred reps stay
-        raw (per-call 0 kernel), the floor-divide happens once at group end."""
+        """Fixed-shape page release; contract see base. Group-deferred reps are
+        copied (the caller may rewrite its row before the group closes) and the
+        floor-divide happens once at group end."""
         if not page_reps:
             return
 
@@ -306,7 +307,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             if self.debug_mode:
                 self._debug_check_no_duplicate_pages()
         else:
-            self.free_page_reps_group.extend(page_reps)
+            self.free_page_reps_group.extend(
+                self._copy_for_free_group(rep) for rep in page_reps
+            )
 
     def _debug_check_no_duplicate_pages(self):
         # span both containers: need_sort (PD disagg) routes frees into release_pages
