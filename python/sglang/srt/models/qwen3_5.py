@@ -134,6 +134,9 @@ _gdn_use_alt_stream = _is_cuda or (
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
+_gdn_decode_fused_proj_conv = _is_cuda and get_bool_env_var(
+    "SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV", "True"
+)
 _is_amx_available = cpu_has_amx_support()
 
 cached_get_processor = lru_cache(get_processor)
@@ -636,7 +639,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_npu:
+        use_fused_decode_proj_conv = (
+            _gdn_decode_fused_proj_conv
+            and forward_batch.forward_mode.is_decode()
+            and isinstance(projected_states_qkvz, torch.Tensor)
+            and isinstance(projected_states_ba, torch.Tensor)
+        )
+        value_to_key_head_ratio = self.num_v_heads // self.num_k_heads
+        use_fused_contiguous_unpack = value_to_key_head_ratio in [1, 2, 4, 8]
+        if use_fused_decode_proj_conv:
+            # The GDN backend owns the indexed Conv1D state and therefore owns
+            # the safe unpack+Conv fusion boundary. B/A are passed as temporary
+            # placeholders and replaced by the backend before recurrent GDN.
+            mixed_qkv = (projected_states_qkvz, projected_states_ba)
+            z = None
+            b = projected_states_ba
+            a = projected_states_ba
+        elif use_fused_contiguous_unpack and not _is_npu:
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
                 num_v_heads_tp = self.num_v_heads // self.attn_tp_size
@@ -663,12 +682,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
-        core_attn_out = self.attn(
+        attn_result = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
         )
+        if use_fused_decode_proj_conv:
+            if not isinstance(attn_result, tuple) or len(attn_result) != 2:
+                raise RuntimeError(
+                    "Fused GDN decode projection/Conv1D backend must return "
+                    "(core_attn_out, z)"
+                )
+            core_attn_out, z = attn_result
+        else:
+            core_attn_out = attn_result
+        assert z is not None
 
         z_shape_og = z.shape
         # reshape input data into 2D tensor
