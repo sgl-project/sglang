@@ -580,7 +580,11 @@ def run_npu_e2e_test_case(
     # run_label is derived from the persistence directory (first two segments:
     # {branch_label}-{create_date}-{run_id}-{run_attempt}/{workflow_name}) and is injected into the
     # pod as RUN_LABEL env var to build the pod log directory prefix
-    parts = metrics_data_file.split("/output/")[-1] if "/output/" in metrics_data_file else ""
+    parts = (
+        metrics_data_file.split("/output/")[-1]
+        if "/output/" in metrics_data_file
+        else ""
+    )
     if parts:
         run_label = "/".join(parts.split("/")[:2])
     else:

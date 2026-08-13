@@ -108,7 +108,7 @@ jobs:
           else
             echo "skip_install_flag=${{ inputs.skip_install_flag }}" >> $GITHUB_OUTPUT
           fi
-          # If the nightly pipeline is triggered by a PR, this variable takes the source branch label of the PR; 
+          # If the nightly pipeline is triggered by a PR, this variable takes the source branch label of the PR;
           # otherwise, it uses the branch or tag name of the current ref.
           BRANCH_LABEL="$HEAD_LABEL"
           if [ -z "${BRANCH_LABEL}" ]; then
@@ -121,7 +121,7 @@ jobs:
           RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_time':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "$(date -u -d '+8 hours' +%Y%m%d-%H%M)")"
           # Write to GITHUB_OUTPUT and print to the log in one command.
           echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
-  
+
   nightly-mix-single-node-a2-tests:
     name: single-node-mix-a2
     if: ${{ !cancelled() }}
@@ -320,7 +320,7 @@ jobs:
       prefill_decode_deployment: 'mix'
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-  
+
   check-all-jobs:
     if: ${{ !cancelled() }}
     needs:

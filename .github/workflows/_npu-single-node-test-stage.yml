@@ -226,17 +226,17 @@ jobs:
           echo "Test mode: suite (${test_suite})"
           tc_name="${test_suite}"
 
-          # The ID is used to locate the current job instance, 
+          # The ID is used to locate the current job instance,
           # size determines whether parallel execution is enabled.
           PARTITION_ID=${{ matrix.partition }}
           PARTITION_SIZE=${{ fromJson(inputs.partitions).size }}
-          # Append directory suffixes when there are parallel partition jobs 
+          # Append directory suffixes when there are parallel partition jobs
           # within the test suite to prevent collision of result artifact directories.
           if [ "${PARTITION_SIZE}" -gt 1 ]; then
             tc_name="${test_suite}-p${PARTITION_ID}"
           fi
 
-          # Provided automatically by the GitHub server. 
+          # Provided automatically by the GitHub server.
           # run_id is the unique identifier for the workflow run,
           # attempt represents the re‑run attempt count of the job.
           run_id=${{ github.run_id }}
@@ -248,10 +248,10 @@ jobs:
           workflow_name=$(echo "${{ fromJson(inputs.run_start_metadata).workflow_name }}" | tr ' ' '_' | tr -d '()')
           create_time="${{ fromJson(inputs.run_start_metadata).create_time }}"
           if [ -z "${create_time}" ]; then create_time=$(date -u -d '+8 hours' +%Y%m%d-%H%M); fi
-          
+
           # Print persistence‑directory‑prefix variables
           echo "Persistence prefix: run_id=${run_id} run_attempt=${run_attempt} branch_label=${branch_label} workflow_name=${workflow_name} create_time=${create_time}"
-          
+
           if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
             test_data_output_path=/root/.cache/tests/output/${branch_label}-${create_time}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}
             mkdir -p ${test_data_output_path}
@@ -317,7 +317,7 @@ jobs:
           test_exit_code=0
           cd test
 
-          # Install python requirements 
+          # Install python requirements
           ${PYTHON_FOR_SGLANG} -m pip install tabulate
 
           # Append `--nightly` and `--continue-on-error` arguments when the job belongs to the nightly pipeline.
