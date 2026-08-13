@@ -452,6 +452,47 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
         self.assertEqual(result.shape, (B, H_per_rank, D))
         self.assertFalse(torch.isnan(result).any())
 
+    def test_pack_matches_the_copy_formulation_it_replaces(self):
+        from sglang.kernels.ops.attention.dcp_kernels import (
+            _lse_pack_dim,
+            dcp_pack_a2a_send,
+        )
+
+        for N, B, H_per_rank, D, dtype in (
+            (2, 4, 8, 128, torch.bfloat16),
+            (4, 3, 2, 64, torch.float16),
+            (8, 1, 12, 512, torch.bfloat16),
+        ):
+            with self.subTest(N=N, B=B, H_per_rank=H_per_rank, D=D, dtype=dtype):
+                H = H_per_rank * N
+                lpd = _lse_pack_dim(dtype)
+                max_bs = B + 5
+                out = torch.randn(B, H, D, device=self.device, dtype=dtype)
+                lse = torch.randn(B, H, device=self.device, dtype=torch.float32)
+
+                got = torch.zeros(
+                    N, max_bs, H_per_rank, D + lpd, dtype=dtype, device=self.device
+                )
+                dcp_pack_a2a_send(out, lse, got)
+
+                want = torch.zeros_like(got)
+                want[:, :B, :, :D] = out.view(B, N, H_per_rank, D).permute(1, 0, 2, 3)
+                want[:, :B, :, D:] = (
+                    lse.view(B, N, H_per_rank)
+                    .permute(1, 0, 2)
+                    .contiguous()
+                    .view(dtype)
+                    .view(N, B, H_per_rank, lpd)
+                )
+                self.assertTrue(
+                    torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+                )
+
+                lane = got.view(torch.float32)[:, :B, :, D // lpd]
+                self.assertTrue(
+                    torch.equal(lane, lse.view(B, N, H_per_rank).permute(1, 0, 2))
+                )
+
     def test_buffers_have_fixed_data_ptrs(self):
         """Pre-allocated buffer data_ptr must not change -- required for graph replay."""
         from sglang.srt.layers.dcp import dcp_a2a_lse_reduce

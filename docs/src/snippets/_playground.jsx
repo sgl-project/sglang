@@ -629,7 +629,7 @@ export const Playground = ({ config }) => {
             "--moe-a2a-backend", "--moe-runner-backend",
           ]);
           // Backend options may carry their own env (e.g. the FlashInfer MXFP4
-          // cubin-pool path): strip every backend option's env keys, then
+          // backend-specific path): strip every backend option's env keys, then
           // re-add the selected option's.
           const backendEnvKeys = [];
           for (const o of (fc.backend?.options || [])) {
@@ -926,6 +926,20 @@ export const Playground = ({ config }) => {
           if (value.ibDevice && value.ibDevice !== "auto") {
             adds.push(`--disaggregation-ib-device ${value.ibDevice}`);
           }
+          // A `modes[]` entry may declare `flags` / `env` that only the PD role
+          // it names needs (the prefill worker's balance policy, the decode
+          // worker's polling interval, ...). Strip the same heads first so the
+          // role's value wins over a base cell that sets one for its own
+          // reasons, instead of emitting the flag twice. This runs only inside
+          // the role branch: applyAllDeltas re-seeds from the base cell on every
+          // render, so a base flag is never left over from an earlier selection
+          // and must not be stripped when the role is Off.
+          const modeMeta = (fc.modes || []).find((m) => m.id === mode);
+          if (modeMeta && modeMeta.flags && modeMeta.flags.length) {
+            flags = h.stripFlagsByFirstToken(
+              flags, modeMeta.flags.map((f) => f.split(/[\s=]/)[0]));
+            adds.push(...modeMeta.flags);
+          }
           // Single-host needs no --dist-init-addr: prefill/decode derive their
           // ZMQ/dist ports from the role-specific --port (spaced 100 apart, see
           // PD_PORTS), so the ranges don't overlap. Multi-node still gets a
@@ -949,6 +963,10 @@ export const Playground = ({ config }) => {
             const ok = !gate || Object.keys(gate).every(
               (k) => (gate[k] || []).includes(sel[k]));
             if (ok) env = [...env, ...meta.env.filter((e) => !env.includes(e))];
+          }
+          // Same for env declared on the selected role.
+          if (modeMeta && modeMeta.env && modeMeta.env.length) {
+            env = [...env, ...modeMeta.env.filter((e) => !env.includes(e))];
           }
         }
         return { flags, env };
