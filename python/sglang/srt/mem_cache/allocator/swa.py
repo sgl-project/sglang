@@ -365,21 +365,38 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[mapping_indices] = 0
 
-    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
+    def free_swa_segment(
+        self, free_index: torch.Tensor, *, start_pos: int, swa_alive_from: int
+    ):
         """Fixed-shape counterpart of free_swa(): no output shape depends on
         device data, so the call stays a pure async launch.
 
-        Contract beyond base: ``start_pos`` is page aligned and every page the
-        slice touches still has a live SWA mapping (the caller owns the range and
-        has not freed it) -- ranges that may be dead keep using ``free_swa``. A
-        free group queues owned values, not the caller's view, so the row may be
-        rewritten before the group closes.
+        ``swa_alive_from`` is the row position from which this request's SWA
+        mapping is still live -- host knowledge (e.g. ``swa_evicted_seqlen``),
+        so the liveness precondition is checked without touching the device. It
+        is required rather than optional: a caller that cannot state where its
+        mapping becomes live must use ``free_swa``, whose device-side filter
+        tolerates dead entries at the cost of a sync.
+
+        Reading the mapping at a dead page yields 0, which releases page 0 (the
+        reserved padding slot) and leaks the page the range actually holds --
+        silently, since a device-side check would reintroduce the sync this
+        method exists to avoid.
+
+        Also contract: ``start_pos`` is page aligned. A free group queues owned
+        values, not the caller's view, so the row may be rewritten before the
+        group closes.
         """
         if free_index.numel() == 0:
             return
 
         ps = self.page_size
         assert start_pos % ps == 0, f"{start_pos=} must be page aligned"
+        assert swa_alive_from <= start_pos, (
+            f"free_swa_segment covers [{start_pos}, ...) but this request's SWA "
+            f"mapping is only live from {swa_alive_from}; the dead prefix would "
+            f"release page 0 and leak its live pages. Use free_swa() instead."
+        )
 
         full_reps = free_index[::ps]
         swa_reps = self.full_to_swa_index_mapping[full_reps]
@@ -568,7 +585,9 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
 
-    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
+    def free_swa_segment(
+        self, free_index: torch.Tensor, *, start_pos: int, swa_alive_from: int
+    ):
         """full == swa and the mapping is a constant identity table: a slot is its
         own SWA rep and the table is never zeroed. With no gather to produce an
         owned value, a group snapshots rather than hold the caller's view."""

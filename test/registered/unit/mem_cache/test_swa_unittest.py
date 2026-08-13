@@ -268,7 +268,9 @@ class TestSWA(unittest.TestCase):
             fast, fast_row = self._alloc_extend_row(page_size, num_tokens)
             legacy, legacy_row = self._alloc_extend_row(page_size, num_tokens)
 
-            fast.free_swa_segment(fast_row[start:], start_pos=start)
+            fast.free_swa_segment(
+                fast_row[start:], start_pos=start, swa_alive_from=start
+            )
             legacy.free_swa(legacy_row[start:])
 
             self.assertEqual(

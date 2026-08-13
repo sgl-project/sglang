@@ -137,8 +137,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             return
         self.free(page_reps[0] if len(page_reps) == 1 else torch.cat(page_reps))
 
-    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
-        """SWA counterpart of free_segment(). Default: plain free_swa()."""
+    def free_swa_segment(
+        self, free_index: torch.Tensor, *, start_pos: int, swa_alive_from: int
+    ):
+        """SWA counterpart of free_segment(). Default: plain free_swa(), which
+        tolerates a dead mapping, so ``swa_alive_from`` is unused here."""
         self.free_swa(free_index)
 
     def free_segments(self, segments):

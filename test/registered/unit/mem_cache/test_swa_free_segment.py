@@ -83,7 +83,9 @@ class TestSWAFreeSegment(unittest.TestCase):
                                 row, start, end, ps, a.full_to_swa_index_mapping.clone()
                             )
                             before = _freed(a)
-                            a.free_swa_segment(row[start:end], start_pos=start)
+                            a.free_swa_segment(
+                                row[start:end], start_pos=start, swa_alive_from=start
+                            )
 
                             label = f"{ps=} {need_sort=} {n=} {start=} {end=}"
                             self.assertEqual(
@@ -99,7 +101,7 @@ class TestSWAFreeSegment(unittest.TestCase):
         for ps in (1, 4):
             fast, legacy = _alloc(ps), _alloc(ps)
             fast_row, legacy_row = _row(fast, 3 * ps), _row(legacy, 3 * ps)
-            fast.free_swa_segment(fast_row, start_pos=0)
+            fast.free_swa_segment(fast_row, start_pos=0, swa_alive_from=0)
             legacy.free_swa(legacy_row)
             self.assertEqual(_freed(fast), _freed(legacy), f"{ps=}")
             self.assertTrue(
@@ -121,7 +123,7 @@ class TestSWAFreeSegment(unittest.TestCase):
             before = _freed(a)
 
             a.free_group_begin()
-            a.free_swa_segment(row, start_pos=0)
+            a.free_swa_segment(row, start_pos=0, swa_alive_from=0)
             self.assertEqual(_freed(a), before, f"not deferred: {ps=}")
             row.fill_(1)  # stand in for the row being remapped mid-group
             a.free_group_end()
@@ -135,16 +137,31 @@ class TestSWAFreeSegment(unittest.TestCase):
         a.debug_mode = True
         row = _row(a, 8)
         with self.assertRaises(AssertionError):  # start_pos not page aligned
-            a.free_swa_segment(row[1:], start_pos=1)
-        a.free_swa_segment(row, start_pos=0)
+            a.free_swa_segment(row[1:], start_pos=1, swa_alive_from=1)
+        a.free_swa_segment(row, start_pos=0, swa_alive_from=0)
         with self.assertRaises(AssertionError):  # range already freed
-            a.free_swa_segment(row, start_pos=0)
+            a.free_swa_segment(row, start_pos=0, swa_alive_from=0)
+
+    def test_dead_prefix_is_rejected_without_debug_mode(self):
+        """The liveness precondition is host-side, so it holds without
+        debug_mode -- reading a dead page would release page 0 and leak."""
+        ps = 4
+        a = _alloc(ps)
+        a.debug_mode = False
+        row = _row(a, 3 * ps)
+        # Front page already evicted: the request is live only from ps onward.
+        a.free_swa_segment(row[:ps], start_pos=0, swa_alive_from=0)
+        with self.assertRaises(AssertionError):
+            a.free_swa_segment(row, start_pos=0, swa_alive_from=ps)
+        # Stating the frontier correctly frees only what is still mapped.
+        a.free_swa_segment(row[ps:], start_pos=ps, swa_alive_from=ps)
+        self.assertNotIn(0, _freed(a))
 
     def test_empty_segment_is_noop(self):
         a = _alloc(4)
         row = _row(a, 4)
         before = _freed(a)
-        a.free_swa_segment(row[:0], start_pos=0)
+        a.free_swa_segment(row[:0], start_pos=0, swa_alive_from=0)
         self.assertEqual(_freed(a), before)
 
 
@@ -161,7 +178,7 @@ class TestOptOuts(unittest.TestCase):
             need_sort=False,
         )
         before = a.full_to_swa_index_mapping.clone()
-        a.free_swa_segment(a.alloc(4), start_pos=0)
+        a.free_swa_segment(a.alloc(4), start_pos=0, swa_alive_from=0)
         self.assertTrue(torch.equal(a.full_to_swa_index_mapping, before))
 
     def test_unified_swa_does_not_inherit_the_fast_path(self):
