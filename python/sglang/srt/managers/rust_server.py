@@ -48,6 +48,29 @@ logger = logging.getLogger(__name__)
 AUTO_MM_WORKERS = 8
 
 
+# Where shm_open puts POSIX segments on Linux (the only supported platform).
+_SHM_DIR = "/dev/shm"
+
+
+def _shm_feature_view(name: str, shape: Tuple[int, int]):
+    """Zero-copy take of a feature segment: the tensor aliases the mapped
+    pages (``torch.frombuffer`` keeps the mmap alive). Unlinking under a live
+    mapping is ~0.01 ms — just a name removal; page teardown happens at
+    munmap, when the tensor dies. Caller must be the segment's sole owner."""
+    import mmap
+
+    import torch
+
+    path = os.path.join(_SHM_DIR, name)
+    fd = os.open(path, os.O_RDWR)
+    try:
+        mapped = mmap.mmap(fd, 0)
+    finally:
+        os.close(fd)
+    os.unlink(path)
+    return torch.frombuffer(memoryview(mapped), dtype=torch.float32).reshape(shape)
+
+
 class MmSpec(msgspec.Struct, frozen=True, kw_only=True):
     """Resolved parameters of the Rust MM pipeline for one model, consumed by
     the worker pool (:meth:`rust_json`) and the drain adapter
@@ -116,22 +139,27 @@ class MmSpec(msgspec.Struct, frozen=True, kw_only=True):
             zip(encoded.grids, encoded.hashes, encoded.offsets)
         ):
             n = t * h * w
-            # The item's buffer sits in a worker-written POSIX segment; build
-            # the stub in its post-`__setstate__` form (rank 0 never
-            # pickle-roundtrips its own copy). Unlink duty came with take_mm.
-            feature = ShmPointerMMData.__new__(ShmPointerMMData)
-            feature.__setstate__(
-                {
-                    "shm_name": encoded.shm_names[index],
-                    "shape": (n, self.feature_dim),
-                    "dtype": torch.float32,
-                    "precomputed_hash": item_hash,
-                }
-            )
-            if not self.stub_broadcast:
-                # No rank will unwrap the stub later, so rank 0 takes
-                # ownership now; any broadcast then carries plain tensors.
-                feature = feature.materialize()
+            # The item's buffer sits in a worker-written POSIX segment;
+            # unlink duty came with `take_mm`.
+            if self.stub_broadcast:
+                # Build the stub in its post-`__setstate__` form: rank 0
+                # never pickle-roundtrips its own copy.
+                feature = ShmPointerMMData.__new__(ShmPointerMMData)
+                feature.__setstate__(
+                    {
+                        "shm_name": encoded.shm_names[index],
+                        "shape": (n, self.feature_dim),
+                        "dtype": torch.float32,
+                        "precomputed_hash": item_hash,
+                    }
+                )
+            else:
+                # No rank will unwrap a stub later, so rank 0 takes ownership
+                # now — zero-copy: the tensor aliases the segment's pages.
+                # Any broadcast that follows then pickles plain tensor bytes.
+                feature = _shm_feature_view(
+                    encoded.shm_names[index], (n, self.feature_dim)
+                )
             items.append(
                 MultimodalDataItem(
                     modality=Modality.IMAGE,

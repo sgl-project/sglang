@@ -146,10 +146,9 @@ class TestWrapEncoded(CustomTestCase):
 
 
 class TestWrapEncodedMaterialized(TestWrapEncoded):
-    """``stub_broadcast=False`` (rank 1, multinode, skip_tokenizer_init): no
-    rank will unwrap a stub later, so the drain hands the scheduler plain
-    tensors and the segments are already unlinked — broadcast_pyobj would
-    carry the bytes remote nodes need."""
+    """``stub_broadcast=False`` (rank 1, multinode, skip_tokenizer_init): the
+    drain hands the scheduler plain tensors — zero-copy views over the
+    segments' pages, already unlinked."""
 
     stub_broadcast = False
 
@@ -163,10 +162,15 @@ class TestWrapEncodedMaterialized(TestWrapEncoded):
         expected = torch.from_numpy(features).reshape(-1, 6)
         self.assertTrue(torch.equal(output.mm_items[0].feature, expected[:4]))
         self.assertTrue(torch.equal(output.mm_items[1].feature, expected[4:]))
-        # Rank 0 took ownership: the segments must already be unlinked.
+        # Zero-copy: the feature aliases the segment's pages (write through
+        # the creator's still-open mapping, observe through the tensor).
+        self._segments[0].buf[:4] = np.float32(99).tobytes()
+        self.assertEqual(output.mm_items[0].feature[0, 0].item(), 99)
+        # Rank 0 took ownership: the names are gone while the mappings — and
+        # the pages — live on with the tensors.
         for shm in self._segments:
-            with self.assertRaises(FileNotFoundError):
-                shared_memory.SharedMemory(name=shm.name)
+            self.assertFalse(os.path.exists(os.path.join("/dev/shm", shm.name)))
+        self.assertEqual(output.mm_items[1].feature[0, 0].item(), 24)
 
 
 if __name__ == "__main__":
