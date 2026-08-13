@@ -259,6 +259,11 @@ class SchedulerLoadPublisher:
         self._publish_counter += 1
         if not force and self._publish_counter < LOAD_PUBLISH_INTERVAL:
             return
+        # Reset where the throttle passes, not where a send happens: resetting
+        # only on the send path lets one dedup hit (or provider failure) leave
+        # the counter saturated, silently disengaging the throttle — every
+        # subsequent decode step would then run the O(queue) provider.
+        self._publish_counter = 0
 
         try:
             load = snapshot if snapshot is not None else load_provider()
@@ -274,7 +279,6 @@ class SchedulerLoadPublisher:
                 and now - self._last_publish_ts < LOAD_PUBLISH_HEARTBEAT_S
             ):
                 return
-            self._publish_counter = 0
             payload = _encoder.encode(
                 LoadStat(
                     num_running_reqs=counts[0],

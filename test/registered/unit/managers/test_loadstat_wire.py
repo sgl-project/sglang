@@ -248,6 +248,19 @@ class TestLoadPublisherGating(CustomTestCase):
         self.assertFalse(pub.enable)
         open_sock.assert_not_called()
 
+    def test_explicit_endpoint_needs_an_advertisable_kv_endpoint(self):
+        # Discovery rides on /server_info's kv_events block, which is absent
+        # for non-tcp (or port-less) KV endpoints — binding the explicit
+        # range anyway would claim a port no router can ever find.
+        for kv_endpoint in ("ipc:///tmp/kv.sock", "inproc://kv", "tcp://0.0.0.0"):
+            with self.subTest(kv_endpoint=kv_endpoint):
+                pub, open_sock = self._build(
+                    config='{"publisher": "zmq", "endpoint": "%s"}' % kv_endpoint,
+                    explicit="tcp://*:7000",
+                )
+                self.assertFalse(pub.enable)
+                open_sock.assert_not_called()
+
     def test_explicit_endpoint_inside_the_kv_range_declines(self):
         # The KV publisher binds its own range later and unguarded, so taking
         # one of its ports would kill startup blaming the KV publisher.
@@ -321,6 +334,25 @@ class TestLoadPublisherGating(CustomTestCase):
             fake_time.monotonic.return_value = 101.5  # heartbeat elapsed
             pub.publish_load_stat(provider, force=True)
             self.assertEqual(pub._socket.send_multipart.call_count, 2)
+
+    def test_call_throttle_stays_engaged_across_dedup_hits(self):
+        # Regression: the counter must reset when the throttle PASSES, not
+        # when a send happens. Resetting only on the send path let one dedup
+        # hit leave the counter saturated, silently disengaging the throttle
+        # — every subsequent decode step then ran the O(queue) provider.
+        pub, _ = self._build()
+        provider = self._provider(running=1)
+        with patch(
+            "sglang.srt.managers.scheduler_components.load_publisher.time"
+        ) as fake_time:
+            fake_time.monotonic.return_value = 100.0
+            pub.publish_load_stat(provider, force=True)  # publishes, count=1
+            for _ in range(10):  # steady decode: unchanged gauge, no force
+                pub.publish_load_stat(provider)
+            # The provider may run once per LOAD_PUBLISH_INTERVAL (calls 5
+            # and 10), never per call; the deduped sends stay at 1.
+            self.assertEqual(provider.call_count, 3)
+            self.assertEqual(pub._socket.send_multipart.call_count, 1)
 
     def test_changed_stat_publishes_immediately(self):
         # The busy->idle (and idle->busy) transition must never be delayed:

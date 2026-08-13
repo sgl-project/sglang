@@ -165,6 +165,11 @@ def resolve_load_pub_range(
     publishing: an unadvertised range is a port claimed for nothing, and a
     range overlapping the KV publisher's own sockets would take a port whose
     later, unguarded bind kills scheduler startup.
+
+    Known limit: `describe_kv_events_publisher` additionally suppresses the
+    whole kv_events block when `page_size` is unset/non-positive — a
+    precondition this resolver cannot see — so that one configuration still
+    binds a range it never advertises.
     """
     if dp_size < 1:
         return None, None
@@ -175,6 +180,18 @@ def resolve_load_pub_range(
         if port is not None
     ]
     if load_publish_endpoint:
+        # Discovery rides on /server_info's kv_events block, which only
+        # exists for a routable tcp:// KV endpoint — an explicit load range
+        # anchored to anything else would be bound but never advertised: a
+        # port claimed for nothing, publishing to nobody.
+        if parse_tcp_port(kv_endpoint) is None:
+            return None, (
+                f"--load-publish-endpoint={load_publish_endpoint!r} needs a "
+                f"routable tcp:// --kv-events-config endpoint: routers "
+                f"discover the load range through /server_info's kv_events "
+                f"block, which is absent for {kv_endpoint!r}, so the socket "
+                f"would be bound but never advertised"
+            )
         resolved = parse_bindable_tcp(load_publish_endpoint)
         if resolved is None:
             return None, (
