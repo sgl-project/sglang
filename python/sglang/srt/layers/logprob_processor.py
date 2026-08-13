@@ -187,6 +187,101 @@ def get_distributed_token_scores(
     return tp_group.all_reduce(local_scores)
 
 
+def get_distributed_topk(
+    local_logits: torch.Tensor,
+    valid_vocab_size: int,
+    max_k: int,
+    vocab_start_index: int,
+    vocab_size: int,
+    tp_group: Any,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return global top-k raw logits from contiguous TP vocab shards.
+
+    Each rank first selects at most ``max_k`` of its *valid* local columns.
+    Values and absolute token ids are then all-gathered and reduced locally.
+    This exchanges ``O(rows * tp_size * max_k)`` candidates instead of a
+    full-vocabulary tensor.  Padding columns are represented by ``-inf`` and
+    an out-of-vocabulary sentinel, so they cannot win the final top-k.
+
+    Ties retain the backend's ``torch.topk`` behavior.  In particular, equal
+    logits that straddle shards are valid top-k members but their relative
+    order is not promised to match a monolithic full-vocab ``topk``.
+    """
+    if max_k < 0:
+        raise ValueError(f"max_k must be non-negative, got {max_k}")
+    if not 0 <= valid_vocab_size <= local_logits.shape[1]:
+        raise ValueError(
+            f"valid_vocab_size={valid_vocab_size} is incompatible with "
+            f"local logits width {local_logits.shape[1]}"
+        )
+
+    rows = local_logits.shape[0]
+    if max_k == 0:
+        return (
+            local_logits.new_empty((rows, 0), dtype=torch.float32),
+            torch.empty((rows, 0), dtype=torch.long, device=local_logits.device),
+        )
+
+    local_values = torch.full(
+        (rows, max_k),
+        float("-inf"),
+        dtype=torch.float32,
+        device=local_logits.device,
+    )
+    local_indices = torch.full(
+        (rows, max_k),
+        vocab_size,
+        dtype=torch.long,
+        device=local_logits.device,
+    )
+    local_k = min(max_k, valid_vocab_size)
+    if local_k:
+        values, indices = local_logits[:, :valid_vocab_size].topk(local_k, dim=-1)
+        local_values[:, :local_k] = values.float()
+        local_indices[:, :local_k] = indices + vocab_start_index
+
+    candidate_values = tp_group.all_gather(local_values, dim=1)
+    candidate_indices = tp_group.all_gather(local_indices, dim=1)
+    values, candidate_positions = candidate_values.topk(max_k, dim=-1)
+    indices = candidate_indices.gather(1, candidate_positions)
+    return values, indices
+
+
+def append_distributed_topk_chunk(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    top_k_nums: List[int],
+    pruned_lens: List[int],
+    top_logprobs_val: List,
+    top_logprobs_idx: List,
+    split_pruned_len: int,
+) -> int:
+    """Restore prompt top-k responses from row-major distributed results."""
+    pt = 0
+    next_split_pruned_len = 0
+    for n, (k, original_pruned_len) in enumerate(zip(top_k_nums, pruned_lens)):
+        current_split = split_pruned_len if n == 0 else 0
+        pruned_len = original_pruned_len - current_split
+        if pruned_len <= 0:
+            top_logprobs_val.append([])
+            top_logprobs_idx.append([])
+            continue
+
+        available_rows = min(pruned_len, max(values.shape[0] - pt, 0))
+        val = values[pt : pt + available_rows, :k].tolist()
+        idx = indices[pt : pt + available_rows, :k].tolist()
+        if current_split:
+            top_logprobs_val[-1].extend(val)
+            top_logprobs_idx[-1].extend(idx)
+        else:
+            top_logprobs_val.append(val)
+            top_logprobs_idx.append(idx)
+        if available_rows < pruned_len:
+            next_split_pruned_len = current_split + available_rows
+        pt += pruned_len
+    return next_split_pruned_len
+
+
 def _build_token_ids_chunk_plan(
     token_ids_logprobs: List[Optional[List[int]]],
     pruned_lens: List[int],
@@ -246,14 +341,19 @@ def _append_token_ids_chunk_from_flat_scores(
         token_ids = entry.token_ids
         width = len(token_ids) if token_ids else 0
         count = entry.num_rows * width
-        if width:
+        if token_ids is None:
+            val, idx = [], []
+        elif width:
             values = flat_scores[score_pt : score_pt + count].reshape(
                 entry.num_rows, width
             )
             val = values.tolist()
             idx = [token_ids for _ in range(entry.num_rows)]
         else:
-            val, idx = [], []
+            # [] requests a zero-width result for every prompt row; None is
+            # the opt-out sentinel and returns no rows at all.
+            val = [[] for _ in range(entry.num_rows)]
+            idx = [[] for _ in range(entry.num_rows)]
         score_pt += count
 
         if entry.continue_previous:
@@ -717,7 +817,6 @@ class InputLogprobProcessor:
         use_distributed_logprobs = (
             distributed_context is not None
             and self.enable_fast_input_logprobs
-            and not logits_metadata.extend_return_top_logprob
         )
 
         for i in range(num_chunks):
@@ -846,6 +945,31 @@ class InputLogprobProcessor:
                     num_targets = target_rows.numel()
                     token_logprobs.append(normalized_scores[:num_targets])
 
+                    if logits_metadata.extend_return_top_logprob:
+                        top_k_nums = logits_metadata.top_logprobs_nums[chunk_slice]
+                        top_values, top_indices = get_distributed_topk(
+                            chunk_logprobs,
+                            valid_vocab_size,
+                            max(top_k_nums),
+                            distributed_context.vocab_start_index,
+                            distributed_context.vocab_size,
+                            distributed_context.tp_group,
+                        )
+                        top_values = (
+                            top_values - row_max[:, None]
+                        ) - row_log_sum[:, None]
+                        split_len_topk = append_distributed_topk_chunk(
+                            top_values,
+                            top_indices,
+                            top_k_nums,
+                            logits_metadata.extend_logprob_pruned_lens_cpu[
+                                chunk_slice
+                            ],
+                            top_logprobs_val,
+                            top_logprobs_idx,
+                            split_len_topk,
+                        )
+
                     if explicit_plan is not None:
                         _append_token_ids_chunk_from_flat_scores(
                             explicit_plan,
@@ -858,6 +982,27 @@ class InputLogprobProcessor:
                     token_logprobs.append(
                         chunk_logprobs.new_empty(0, dtype=torch.float32)
                     )
+                    if logits_metadata.extend_return_top_logprob:
+                        top_k_nums = logits_metadata.top_logprobs_nums[chunk_slice]
+                        empty_values = chunk_logprobs.new_empty(
+                            (0, max(top_k_nums)), dtype=torch.float32
+                        )
+                        empty_indices = torch.empty(
+                            (0, max(top_k_nums)),
+                            dtype=torch.long,
+                            device=chunk_logprobs.device,
+                        )
+                        split_len_topk = append_distributed_topk_chunk(
+                            empty_values,
+                            empty_indices,
+                            top_k_nums,
+                            logits_metadata.extend_logprob_pruned_lens_cpu[
+                                chunk_slice
+                            ],
+                            top_logprobs_val,
+                            top_logprobs_idx,
+                            split_len_topk,
+                        )
                     if logits_metadata.extend_token_ids_logprob:
                         explicit_plan = _build_token_ids_chunk_plan(
                             logits_metadata.token_ids_logprobs[chunk_slice],

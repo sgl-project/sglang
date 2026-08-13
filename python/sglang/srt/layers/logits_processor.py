@@ -705,7 +705,6 @@ class LogitsProcessor(nn.Module):
             or not self.input_logprob_processor.enable_distributed_input_logprobs
             or not self.do_tensor_parallel_all_gather
             or self.do_tensor_parallel_all_gather_dp_attn
-            or logits_metadata.extend_return_top_logprob
             or not isinstance(lm_head, VocabParallelEmbedding)
             or not lm_head.enable_tp
             or lm_head.num_added_embeddings != 0
