@@ -225,14 +225,9 @@ impl Server {
     /// [`Server::take_mm`]; anything the pipeline cannot serve is rejected back to
     /// the client — there is no Python fallback.
     fn start_mm_workers(&self, spec_json: &str, workers: usize) -> PyResult<()> {
-        let ctx = mm::MmContext::new(
-            spec_json,
-            self.rt.tokenizer.clone(),
-            self.rt.mm_results.clone(),
-        )
-        .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
-        self.rt.spawn_mm_pool(workers, std::sync::Arc::new(ctx));
-        Ok(())
+        self.rt
+            .start_mm_workers(spec_json, workers)
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)
     }
 
     /// Pop the MM result for `rid` — parked strictly before the request reached
