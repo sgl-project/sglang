@@ -1170,6 +1170,9 @@ class _RecordBatch:
     def fits(self, size_bytes: int):
         return self._buffer.available() >= size_bytes
 
+    def is_empty(self):
+        return len(self._records) == 0
+
     def append(
         self, record: Dict[str, Any], staged_tensors: List[_StagedTensor]
     ):
@@ -1195,29 +1198,58 @@ class _RecordBatch:
 class _StagingRecordCollection(_RecordCollection):
     def __init__(self, num_batches: int, batch_size: int):
         self._ring = [_RecordBatch(batch_size) for _ in range(num_batches)]
-        self._current_batch = self._ring[0]
+        self._num_batches = num_batches
+        self._batch_size = batch_size
+        self._current_idx = 0
+        # Serializes append (forward pass) and get_records/reset (dump).
+        self._lock = threading.Lock()
+
+    @property
+    def _current_batch(self) -> _RecordBatch:
+        return self._ring[self._current_idx]
 
     def append(self, record: Dict[str, Any]) -> bool:
-        # TODO: check ring buffer status
-        processed, record_staged_tensors, record_tensor_size = (
-            self._prepare_record(record)
-        )
-
-        if not self._current_batch.fits(record_tensor_size):
-            return False    # TODO: find next empty batch
-
-        self._current_batch.append(processed, record_staged_tensors)
-        return True
+        # A dump is in progress: drop this record instead of blocking the forward pass.
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            processed, record_staged_tensors, record_tensor_size = (
+                self._prepare_record(record)
+            )
+            if record_tensor_size > self._batch_size:
+                return False  # Record cannot fit in any batch.
+            if not self._current_batch.fits(record_tensor_size):
+                if not self._rotate_to_next_empty_batch():
+                    return False  # Ring is full of not-yet-dumped records.
+            self._current_batch.append(processed, record_staged_tensors)
+            return True
+        finally:
+            self._lock.release()
 
     def get_records(self):
-        # TODO: collect from all batches, start from current batch
-        # TODO: block new records
-        return self._current_batch.get()
+        # Collect records from every batch in chronological order (oldest first),
+        # starting the traversal at the current append position. Holding the lock
+        # for the whole collection blocks new records during the dump.
+        with self._lock:
+            records = []
+            for offset in range(self._num_batches):
+                batch = self._ring[(self._current_idx + 1 + offset) % self._num_batches]
+                records.extend(batch.get())
+            return records
 
     def reset(self):
-        # TODO: unblock new records
-        for batch in self._ring:
-            batch.reset()
+        with self._lock:
+            self._current_idx = 0
+            for batch in self._ring:
+                batch.reset()
+
+    def _rotate_to_next_empty_batch(self) -> bool:
+        for offset in range(1, self._num_batches):
+            candidate_idx = (self._current_idx + offset) % self._num_batches
+            if self._ring[candidate_idx].is_empty():
+                self._current_idx = candidate_idx
+                return True
+        return False
 
     def _prepare_record(self, record: Dict[str, Any]):
         processed: Dict[str, Any] = {}
