@@ -978,6 +978,14 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+
+    # Gated DeltaNet: chunked state-recurrence kernel (chunk_delta_h)
+    # V-tile of the state kernel. None = pick per launch from the grid shape on
+    # gfx95, else the upstream 32; set an int to pin one tile for every shape.
+    SGLANG_GDN_CHUNK_H_BV = EnvInt(None)
+    SGLANG_GDN_CHUNK_H_NUM_WARPS = EnvInt(4)
+    SGLANG_GDN_CHUNK_H_NUM_STAGES = EnvInt(2)
+
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
     # Registered TreeCore backend serving the unified radix cache.
