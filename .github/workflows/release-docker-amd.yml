@@ -26,7 +26,7 @@ jobs:
     environment: 'prod'
     strategy:
       matrix:
-        rocm_version: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.rocm_version != 'all' && inputs.rocm_version != '') && format('["{0}"]', inputs.rocm_version) || '["rocm700", "rocm724"]') }}
+        rocm_version: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.rocm_version != 'all' && inputs.rocm_version != '') && format('["{0}"]', inputs.rocm_version) || '["rocm700", "rocm720", "rocm724"]') }}
         gpu_arch: ['gfx942', 'gfx950']
         build_type: ['all']
     steps:
