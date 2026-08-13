@@ -795,6 +795,8 @@ class Fp8LinearMethod(LinearMethodBase):
             aligned_n = round_up(orig_n, FLASHINFER_MXFP8_SF_TILE_N)
             layer.mxfp8_orig_n = orig_n
             if aligned_n != orig_n:
+                # Qwen3.5 GDN in_proj_ba has N=64 at TP=1 and narrower TP
+                # shards, while FlashInfer CUTLASS tiles the N dimension by 128.
                 weight = F.pad(weight, (0, 0, 0, aligned_n - orig_n))
                 scale_u8 = F.pad(scale_u8, (0, 0, 0, aligned_n - orig_n))
             copy_or_rebind_param(layer, "weight_mxfp8_cutlass", weight.contiguous())

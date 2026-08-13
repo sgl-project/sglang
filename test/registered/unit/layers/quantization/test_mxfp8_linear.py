@@ -93,14 +93,14 @@ class TestMxfp8LinearMethod(CustomTestCase):
     def test_cutlass_processing_preserves_canonical_weight(self):
         method = self._make_method()
         weight = torch.nn.Parameter(
-            torch.empty((17, 160), dtype=torch.float8_e4m3fn), requires_grad=False
+            torch.empty((64, 160), dtype=torch.float8_e4m3fn), requires_grad=False
         )
         layer = torch.nn.Module()
         layer.register_parameter("weight", weight)
         layer.register_parameter(
             "weight_scale_inv",
             torch.nn.Parameter(
-                torch.empty((17, 5), dtype=torch.uint8), requires_grad=False
+                torch.empty((64, 5), dtype=torch.uint8), requires_grad=False
             ),
         )
 
@@ -108,7 +108,7 @@ class TestMxfp8LinearMethod(CustomTestCase):
 
         self.assertIs(layer.weight, weight)
         self.assertEqual(layer.weight_mxfp8_cutlass.shape, (128, 160))
-        self.assertEqual(layer.mxfp8_orig_n, 17)
+        self.assertEqual(layer.mxfp8_orig_n, 64)
 
     def test_cutlass_apply_slices_before_bias(self):
         method = self._make_method()
@@ -118,16 +118,16 @@ class TestMxfp8LinearMethod(CustomTestCase):
         layer = SimpleNamespace(
             weight_mxfp8_cutlass=torch.empty((128, 160)),
             weight_scale_inv_swizzled=torch.empty(0),
-            mxfp8_orig_n=17,
+            mxfp8_orig_n=64,
         )
-        bias = torch.arange(17, dtype=torch.float32)
+        bias = torch.arange(64, dtype=torch.float32)
 
         output = method.apply(layer, torch.zeros((3, 160)), bias=bias)
 
         expected = (
-            torch.arange(3 * 128, dtype=torch.float32).reshape(3, 128)[:, :17] + bias
+            torch.arange(3 * 128, dtype=torch.float32).reshape(3, 128)[:, :64] + bias
         )
-        self.assertEqual(output.shape, (3, 17))
+        self.assertEqual(output.shape, (3, 64))
         self.assertTrue(output.is_contiguous())
         torch.testing.assert_close(output, expected)
 
