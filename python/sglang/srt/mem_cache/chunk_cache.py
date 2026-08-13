@@ -84,9 +84,8 @@ class ChunkCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
         ]
-        # cache_protected_len is page aligned and the SWA prefix below
-        # swa_evicted_seqlen was already released by out-of-window eviction, so
-        # both sides are page-run knowledge the host already has.
+        # The SWA prefix below swa_evicted_seqlen was already released by
+        # out-of-window eviction.
         self.token_to_kv_pool_allocator.free_segment(
             kv_indices,
             start_pos=req.cache_protected_len,

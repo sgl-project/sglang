@@ -383,10 +383,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.full_attn_allocator.free_segment(free_index, start_pos=start_pos)
 
-        # The full side tolerates an unaligned start (it emits the partial head
-        # page as its own rep); the SWA side cannot, since a page's mapping is
-        # read at its first token. Fall back rather than assert -- callers get
-        # cache_protected_len from prefix matching, which is not page aligned.
+        # The SWA side needs a page-aligned start (a page's mapping is read at
+        # its first token); cache_protected_len comes from prefix matching and
+        # is not, so fall back rather than assert.
         alive = max(start_pos, swa_alive_from) if swa_alive_from is not None else None
         if alive is None or alive % self.page_size != 0:
             self.free_swa(free_index)
@@ -399,24 +398,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_swa_segment(
         self, free_index: torch.Tensor, *, start_pos: int, swa_alive_from: int
     ):
-        """Fixed-shape counterpart of free_swa(): no output shape depends on
-        device data, so the call stays a pure async launch.
+        """Fixed-shape counterpart of free_swa(): a pure async launch.
 
-        ``swa_alive_from`` is the row position from which this request's SWA
-        mapping is still live -- host knowledge (e.g. ``swa_evicted_seqlen``),
-        so the liveness precondition is checked without touching the device. It
-        is required rather than optional: a caller that cannot state where its
-        mapping becomes live must use ``free_swa``, whose device-side filter
-        tolerates dead entries at the cost of a sync.
-
-        Reading the mapping at a dead page yields 0, which releases page 0 (the
-        reserved padding slot) and leaks the page the range actually holds --
-        silently, since a device-side check would reintroduce the sync this
-        method exists to avoid.
-
-        Also contract: ``start_pos`` is page aligned. A free group queues owned
-        values, not the caller's view, so the row may be rewritten before the
-        group closes.
+        ``start_pos`` must be page aligned and every page in the slice still
+        SWA-mapped (``swa_alive_from`` states where that starts). A dead page
+        reads back 0, which releases the reserved page 0 and leaks the page the
+        range holds -- silently, since checking on device would cost the sync
+        this method avoids. A free group queues owned values, so the caller may
+        rewrite its row before the group closes.
         """
         if free_index.numel() == 0:
             return
