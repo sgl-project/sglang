@@ -7,7 +7,6 @@ it is a fall back to NCCL, which looks exactly like the kernels being slow.
 """
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -86,9 +85,7 @@ class TestWorkspaceSizing(CustomTestCase):
         comm = _make_comm()
         with patch.object(pcie_ipc_ar, "_decode_width", return_value=None):
             comm._ensure_workspace(torch.empty(1, HIDDEN))
-        self.assertEqual(
-            comm.max_numel, pcie_ipc_ar._FALLBACK_DECODE_WIDTH * HIDDEN
-        )
+        self.assertEqual(comm.max_numel, pcie_ipc_ar._FALLBACK_DECODE_WIDTH * HIDDEN)
 
     def test_env_override_wins(self):
         comm = _make_comm()
