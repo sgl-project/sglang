@@ -28,18 +28,15 @@ _PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
 _KWARG_ONLY = ("stage", "runner_config")
 _ALL_PARAMS = _PARAM_ORDER + _KWARG_ONLY
 _UNSET = object()
-# New shared helpers belong in python/sglang/test/, not in this set.
-_REGISTERED_NON_TEST_FILES = frozenset({"cpu/utils.py"})
 
 
 def is_registered_test_file(relative_path: str) -> bool:
-    """Whether a path under test/registered/ must carry a CI registration."""
-    relative_path = relative_path.replace("\\", "/")
-    basename = relative_path.rsplit("/", 1)[-1]
-    return (
-        basename not in {"conftest.py", "__init__.py"}
-        and relative_path not in _REGISTERED_NON_TEST_FILES
-    )
+    """Whether a path under test/registered/ must carry a CI registration.
+
+    No helper exemptions: shared helpers live in python/sglang/test/.
+    """
+    basename = relative_path.replace("\\", "/").rsplit("/", 1)[-1]
+    return basename not in {"conftest.py", "__init__.py"}
 
 
 class HWBackend(Enum):

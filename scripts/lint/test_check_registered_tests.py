@@ -12,12 +12,12 @@ _SPEC.loader.exec_module(ci_register)
 
 class TestRegisteredTestFileFilter(unittest.TestCase):
     def test_registered_utils_file_remains_collectable(self):
+        # utils.py gets no basename exemption; helpers live in sglang.test.
         self.assertTrue(
             ci_register.is_registered_test_file("unit/entrypoints/openai/utils.py")
         )
 
-    def test_non_test_helpers_are_excluded(self):
-        self.assertFalse(ci_register.is_registered_test_file("cpu/utils.py"))
+    def test_non_test_files_are_excluded(self):
         self.assertFalse(ci_register.is_registered_test_file("unit/conftest.py"))
         self.assertFalse(ci_register.is_registered_test_file("unit/__init__.py"))
 
