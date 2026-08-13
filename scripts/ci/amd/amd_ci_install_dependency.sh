@@ -45,14 +45,17 @@ fi
 docker exec ci_sglang chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
 
-# Helper function to install with retries and fallback PyPI mirror
+# Helper function to install with retries and fallback PyPI mirror.
+# Executes the argument vector as-is (no eval): flattening into a string and
+# re-parsing dropped the caller's quoting, so "sgl-eval @ git+..." reached pip
+# as three requirements and 'httpx>=0.25.0' turned its > into a redirection.
 install_with_retry() {
   local max_attempts=3
-  local cmd="$@"
+  local -a cmd=("$@")
 
   for attempt in $(seq 1 $max_attempts); do
-    echo "Attempt $attempt/$max_attempts: $cmd"
-    if eval "$cmd"; then
+    echo "Attempt $attempt/$max_attempts: ${cmd[*]}"
+    if "${cmd[@]}"; then
       echo "Success!"
       return 0
     fi
@@ -61,9 +64,9 @@ install_with_retry() {
       echo "Failed, retrying in 5 seconds..."
       sleep 5
       # Try with alternative PyPI index on retry
-      if [[ "$cmd" =~ "pip install" ]] && [ $attempt -eq 2 ]; then
-        cmd="$cmd --index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com"
-        echo "Using fallback PyPI mirror: $cmd"
+      if [[ "${cmd[*]}" =~ "pip install" ]] && [ $attempt -eq 2 ]; then
+        cmd+=(--index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com)
+        echo "Using fallback PyPI mirror: ${cmd[*]}"
       fi
     fi
   done
