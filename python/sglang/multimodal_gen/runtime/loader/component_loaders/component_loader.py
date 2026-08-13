@@ -25,14 +25,18 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     component_name_to_loader_cls,
     get_memory_usage_of_component,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    COMPONENT_OFFLOAD_STRATEGY,
-    LAYERWISE_OFFLOAD_STRATEGY,
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
     is_layerwise_offloaded_module,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    LAYERWISE_OFFLOAD_ALL_COMPONENTS,
+    LAYERWISE_OFFLOAD_DIT_GROUP,
+    layerwise_component_matches_any_selection,
+    normalize_layerwise_offload_components,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -123,37 +127,61 @@ class ComponentLoader(ABC):
         )
         return component_name in native_only_components
 
-    def _apply_startup_residency(
+    @staticmethod
+    def _is_component_set_as_layerwise_load(
+        server_args: ServerArgs, component_name: str
+    ) -> bool:
+        """if a component should be loaded in a layerwise-fashion"""
+        selected_component_names = normalize_layerwise_offload_components(
+            server_args.layerwise_offload_components
+        )
+        if selected_component_names is None:
+            return False
+        selected_component_names = set(selected_component_names)
+        if LAYERWISE_OFFLOAD_ALL_COMPONENTS in selected_component_names:
+            return True
+        explicit_component_names = selected_component_names - {
+            LAYERWISE_OFFLOAD_DIT_GROUP
+        }
+        return layerwise_component_matches_any_selection(
+            component_name, explicit_component_names
+        )
+
+    def _maybe_configure_layerwise_after_startup_cpu_staging(
         self,
         component: AutoModel,
         server_args: ServerArgs,
         component_name: str,
+        load_kwargs: dict[str, Any],
     ) -> AutoModel:
+        if not load_kwargs.get("cpu_offload_flag"):
+            return component
         if not isinstance(component, nn.Module):
             return component
-        if is_fsdp_managed_module(component):
-            return component
 
-        strategy_name = server_args.residency_strategy_name(component_name)
-        if strategy_name == COMPONENT_OFFLOAD_STRATEGY:
-            return component.to("cpu")
-        if strategy_name != LAYERWISE_OFFLOAD_STRATEGY:
-            return component.to(get_local_torch_device())
-
-        component = component.to("cpu")
-
-        configure_layerwise_offload_modules(
+        # try to configure layerwise-offload with the component
+        configured_components = configure_layerwise_offload_modules(
             {component_name: component},
             server_args,
             component_names=server_args.layerwise_offload_components,
             warn_missing=False,
         )
         if is_layerwise_offloaded_module(component):
+            logger.info(
+                "Configured layerwise offload for %s immediately after startup CPU staging",
+                component_name,
+            )
             return component
-        raise ValueError(
-            f"Component {component_name!r} selected layerwise-offload but did not "
-            "configure any layerwise-offloadable layers"
+
+        logger.warning(
+            "Layerwise startup CPU staging was requested for %s, but the loaded "
+            "module did not enable layerwise offload. Moving it to GPU.",
+            component_name,
         )
+        # ensures the module is on GPU
+        if component_name in configured_components:
+            return component
+        return component.to(get_local_torch_device())
 
     def _load_customized_with_context(
         self,
@@ -172,7 +200,9 @@ class ComponentLoader(ABC):
             component = self.load_customized(
                 component_model_path, server_args, component_name, **load_kwargs
             )
-            return component
+            return self._maybe_configure_layerwise_after_startup_cpu_staging(
+                component, server_args, component_name, load_kwargs
+            )
 
     def _load_native_with_context(
         self,
@@ -192,7 +222,9 @@ class ComponentLoader(ABC):
                 transformers_or_diffusers,
                 component_name,
             )
-        return component
+        should_offload = self.should_offload(server_args, component_name=component_name)
+        target_device = self.target_device(should_offload)
+        return component.to(device=target_device)
 
     def load(
         self,
@@ -270,16 +302,18 @@ class ComponentLoader(ABC):
                 component.__class__.__name__,
             )
 
-        component = self._apply_startup_residency(
-            component, server_args, component_name
-        )
-
         if component is None:
             logger.error("Load %s failed", component_name)
             consumed = 0.0
         else:
             if isinstance(component, nn.Module):
                 component = component.eval()
+                if (
+                    server_args.cpu_offload_components is not None
+                    and server_args.should_cpu_offload_component(component_name)
+                    and not is_fsdp_managed_module(component)
+                ):
+                    component = component.to("cpu")
             current_gpu_mem = current_platform.get_available_gpu_memory()
             model_size = get_memory_usage_of_component(component) or "NA"
             consumed = gpu_mem_before_loading - current_gpu_mem

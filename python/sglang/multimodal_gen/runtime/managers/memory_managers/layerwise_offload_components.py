@@ -28,40 +28,10 @@ DIT_COMPONENT_NAMES = frozenset(
         "video_dit",
         "video_dit_2",
         "audio_dit",
-        "hy3dshape_model",
-        "unconditional_transformer",
-    }
-)
-VAE_COMPONENT_NAMES = frozenset(
-    {
-        "vae",
-        "video_vae",
-        "audio_vae",
-        "hy3dshape_vae",
-    }
-)
-LEGACY_DIT_CPU_OFFLOAD_COMPONENT_NAMES = DIT_COMPONENT_NAMES | {
-    "connectors",
-    "dual_tower_bridge",
-    "vision_language_encoder",
-}
-LEGACY_VAE_CPU_OFFLOAD_COMPONENT_NAMES = VAE_COMPONENT_NAMES | {
-    "condition_image_encoder",
-    "sound_tokenizer",
-    "spatial_upsampler",
-    "vocoder",
-}
-LEGACY_CPU_OFFLOAD_DIT_GROUP_COMPONENT_NAMES = frozenset(
-    {
-        "transformer",
-        "transformer_2",
-        "video_dit",
-        "video_dit_2",
-        "audio_dit",
         "dual_tower_bridge",
     }
 )
-LEGACY_CPU_OFFLOAD_VAE_GROUP_COMPONENT_NAMES = frozenset(
+VAE_COMPONENT_NAMES = frozenset(
     {
         "vae",
         "video_vae",
@@ -88,7 +58,7 @@ CPU_OFFLOAD_ALL_COMPONENTS = "all"
 
 
 def is_dit_component_name(component_name: str) -> bool:
-    return component_base_name(component_name) in DIT_COMPONENT_NAMES
+    return component_name in DIT_COMPONENT_NAMES
 
 
 def normalize_cpu_offload_components(
@@ -130,19 +100,13 @@ def cpu_offload_component_matches(
     if component_name in selected_component_names:
         return True
     if LAYERWISE_OFFLOAD_DIT_GROUP in selected_component_names:
-        return (
-            component_base_name(component_name)
-            in LEGACY_CPU_OFFLOAD_DIT_GROUP_COMPONENT_NAMES
-        )
+        return is_dit_component_name(component_name)
     if LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP in selected_component_names:
         return is_text_encoder_component_name(component_name)
     if LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP in selected_component_names:
-        return is_image_encoder_component_name(component_name)
+        return component_name in ("image_encoder", "condition_image_encoder")
     if LAYERWISE_OFFLOAD_VAE_GROUP in selected_component_names:
-        return (
-            component_base_name(component_name)
-            in LEGACY_CPU_OFFLOAD_VAE_GROUP_COMPONENT_NAMES
-        )
+        return is_vae_component_name(component_name)
     return False
 
 
@@ -153,30 +117,11 @@ def is_text_encoder_component_name(component_name: str) -> bool:
 
 
 def is_image_encoder_component_name(component_name: str) -> bool:
-    base_name = component_base_name(component_name)
-    return base_name in {
-        "image_encoder",
-        "hy3dshape_conditioner",
-    } or base_name.endswith("_image_encoder")
+    return component_name == "image_encoder"
 
 
 def is_vae_component_name(component_name: str) -> bool:
-    return component_base_name(component_name) in VAE_COMPONENT_NAMES
-
-
-def legacy_dit_cpu_offload_component_matches(component_name: str) -> bool:
-    return component_base_name(component_name) in LEGACY_DIT_CPU_OFFLOAD_COMPONENT_NAMES
-
-
-def legacy_vae_cpu_offload_component_matches(component_name: str) -> bool:
-    return component_base_name(component_name) in LEGACY_VAE_CPU_OFFLOAD_COMPONENT_NAMES
-
-
-def component_base_name(component_name: str) -> str:
-    prefix, separator, suffix = component_name.rpartition("_")
-    if separator and suffix.isdigit():
-        return prefix
-    return component_name
+    return component_name in VAE_COMPONENT_NAMES
 
 
 def layerwise_component_matches_selection(
@@ -215,11 +160,6 @@ def cpu_offload_flags_for_layerwise_components(
 
     for component_name in component_names:
         if component_name == LAYERWISE_OFFLOAD_DIT_GROUP:
-            continue
-        if component_name == "condition_image_encoder":
-            for flag_name in ("image_encoder_cpu_offload", "vae_cpu_offload"):
-                if flag_name not in flag_names:
-                    flag_names.append(flag_name)
             continue
         if is_dit_component_name(component_name):
             flag_name = "dit_cpu_offload"

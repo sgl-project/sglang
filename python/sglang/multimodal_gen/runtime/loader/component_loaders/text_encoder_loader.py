@@ -41,9 +41,6 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    RESIDENT_STRATEGY,
-)
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     TextEncoder,
     finalize_encoder_folding,
@@ -109,12 +106,12 @@ class TextEncoderLoader(ComponentLoader):
     def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str
     ) -> dict[str, bool]:
-        strategy_name = server_args.residency_strategy_name(component_name)
-        if strategy_name != RESIDENT_STRATEGY:
+        if ComponentLoader._is_component_set_as_layerwise_load(
+            server_args, component_name
+        ):
             logger.info(
-                "Loading %s on CPU first for the %s residency strategy",
+                "Loading %s on CPU first because it is selected for layerwise offload",
                 component_name,
-                strategy_name,
             )
             return {"cpu_offload_flag": True}
         return {}
@@ -430,16 +427,12 @@ class TextEncoderLoader(ComponentLoader):
             fsdp_cpu_offload = False
             should_offload = False
 
-        requires_gpu_residency = getattr(
-            model_config.arch_config, "requires_gpu_resident_text_encoder", False
-        )
-        requested_offload = (
-            server_args.residency_strategy_name(component_name) != RESIDENT_STRATEGY
-        )
-        if requires_gpu_residency and requested_offload:
-            server_args.set_residency_strategy_override(
-                component_name, RESIDENT_STRATEGY
+        if (
+            getattr(
+                model_config.arch_config, "requires_gpu_resident_text_encoder", False
             )
+            and should_offload
+        ):
             logger.warning(
                 "Keeping bitsandbytes 4-bit text encoder GPU-resident; CUDA "
                 "weights and quant states are required for this checkpoint."

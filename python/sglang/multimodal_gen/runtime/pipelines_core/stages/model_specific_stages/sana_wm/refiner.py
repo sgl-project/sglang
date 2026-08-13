@@ -59,9 +59,23 @@ class _OfficialLayerwiseModule(nn.Module, LayerwiseOffloadableModuleMixin):
     def __init__(self, module: nn.Module) -> None:
         super().__init__()
         self.module = module
+        self.layerwise_offload_managers = []
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError as exc:
+            wrapped = self.__dict__.get("module")
+            if wrapped is not None:
+                return getattr(wrapped, name)
+            modules = self.__dict__.get("_modules", {})
+            wrapped = modules.get("module")
+            if wrapped is not None:
+                return getattr(wrapped, name)
+            raise exc
 
 
 class OfficialDiffusersLTX2RefinerModule(_OfficialLayerwiseModule):
@@ -76,15 +90,6 @@ class OfficialGemma3TextEncoderModule(_OfficialLayerwiseModule):
     layer_names = [
         "module.language_model.layers",
         "module.model.language_model.layers",
-    ]
-
-
-class OfficialDiffusersLTX2ConnectorsModule(_OfficialLayerwiseModule):
-    """Layerwise wrapper around Diffusers' official LTX-2 connectors."""
-
-    layer_names = [
-        "module.video_connector.transformer_blocks",
-        "module.audio_connector.transformer_blocks",
     ]
 
 
@@ -434,7 +439,11 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         ):
             return []
 
-        # The tokenizer stays on CPU; all forwarded modules declare residency uses
+        # Declare every component this stage forwards through so
+        # ComponentResidencyManager moves them onto GPU before the stage runs.
+        # Without this, `dit_cpu_offload=True` keeps refiner sub-modules on CPU
+        # and the first matmul fails with "mat2 is on cpu" vs cuda inputs.
+        # The tokenizer stays on CPU (no nn.Module weights to ferry).
         stage_name = self._component_stage_name(stage_name)
         return [
             ComponentUse(
@@ -500,11 +509,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         with self.use_declared_component(
             component_name="text_encoder_2", module=self.text_encoder
         ):
-            text_backbone = (
-                self.text_encoder.module.model
-                if isinstance(self.text_encoder, OfficialGemma3TextEncoderModule)
-                else self.text_encoder
-            )
+            text_backbone = getattr(self.text_encoder, "model", self.text_encoder)
             outputs = text_backbone(
                 input_ids=input_ids,
                 attention_mask=attention_mask,

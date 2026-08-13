@@ -325,9 +325,7 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 )
                 shard_model(
                     model,
-                    cpu_offload=server_args.should_load_component_on_cpu(
-                        "transformer", can_configure_layerwise_after_load=True
-                    ),
+                    cpu_offload=server_args.dit_cpu_offload,
                     reshard_after_forward=True,
                     mp_policy=mp_policy,
                     mesh=device_mesh,
@@ -357,9 +355,7 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 get_local_torch_device(),
                 default_dtype,
                 strict=True,
-                cpu_offload=server_args.should_load_component_on_cpu(
-                    "transformer", can_configure_layerwise_after_load=True
-                ),
+                cpu_offload=server_args.dit_cpu_offload,
                 param_names_mapping=param_names_mapping_fn,
             )
 

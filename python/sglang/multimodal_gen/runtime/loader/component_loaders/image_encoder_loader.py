@@ -72,9 +72,7 @@ class ImageEncoderLoader(TextEncoderLoader):
             cpu_offload_flag=(
                 cpu_offload_flag
                 if cpu_offload_flag is not None
-                else server_args.should_load_component_on_cpu(
-                    component_name, can_configure_layerwise_after_load=True
-                )
+                else server_args.should_cpu_offload_component(component_name)
             ),
             component_name=component_name,
         )

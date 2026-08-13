@@ -25,7 +25,8 @@ sglang serve \
   --pipeline-class-name LingBotWorldCausalDMDPipeline \
   --num-gpus 8 \
   --ulysses-degree 8 \
-  --component-residency dit=resident text_encoder=resident \
+  --dit-cpu-offload false \
+  --text-encoder-cpu-offload false \
   --vae-config.use-parallel-decode true \
   --vae-config.parallel-decode-mode spatial \
   --enable-torch-compile false

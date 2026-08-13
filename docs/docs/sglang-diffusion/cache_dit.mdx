@@ -257,7 +257,8 @@ sglang generate \
   --warmup-mode request \
   --cache-dit-config quantize.yaml \
   --enable-torch-compile \
-  --component-residency dit=resident text_encoder=resident \
+  --dit-cpu-offload false \
+  --text-encoder-cpu-offload false \
   --prompt "A beautiful sunset over the mountains"
 ```
 

@@ -13,9 +13,6 @@ from typing import TYPE_CHECKING, Any, Callable, List
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_world_rank
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    COMPONENT_OFFLOAD_STRATEGY,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -190,9 +187,30 @@ class PipelineExecutor(ABC):
 
         stage_name = stage._active_component_stage_name()
         for use in stage.component_uses(server_args, stage_name):
-            if (
-                server_args.residency_strategy_name(use.component_name)
-                == COMPONENT_OFFLOAD_STRATEGY
+            component_name = use.component_name
+            if server_args.dit_cpu_offload and component_name in (
+                "transformer",
+                "transformer_2",
+                "video_dit",
+                "audio_dit",
+            ):
+                return True
+            if server_args.text_encoder_cpu_offload and component_name.startswith(
+                "text_encoder"
+            ):
+                return True
+            if server_args.image_encoder_cpu_offload and component_name in (
+                "image_encoder",
+                "condition_image_encoder",
+            ):
+                return True
+            if server_args.vae_cpu_offload and component_name in (
+                "vae",
+                "video_vae",
+                "audio_vae",
+                "vocoder",
+                "spatial_upsampler",
+                "condition_image_encoder",
             ):
                 return True
         return False

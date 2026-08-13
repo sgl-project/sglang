@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req

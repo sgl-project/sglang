@@ -19,7 +19,7 @@ Launch the server using the `sglang serve` command.
 SERVER_ARGS=(
   --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers
   --served-model-name wan-t2v
-  --component-residency text_encoder=component-offload
+  --text-encoder-cpu-offload
   --pin-cpu-memory
   --num-gpus 4
   --ulysses-degree=2

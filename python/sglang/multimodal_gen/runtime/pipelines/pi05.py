@@ -52,11 +52,11 @@ class Pi05Pipeline(ComposedPipelineBase):
         pipeline_config: Pi05PipelineConfig = server_args.pipeline_config
         pipeline_config.offload_prefix_image_encoder = (
             pipeline_config.offload_prefix_image_encoder
-            or server_args.should_cpu_offload_component("image_encoder")
+            or bool(server_args.image_encoder_cpu_offload)
         )
         pipeline_config.offload_prefix_token_embedding = (
             pipeline_config.offload_prefix_token_embedding
-            or server_args.should_cpu_offload_component("text_encoder")
+            or bool(server_args.text_encoder_cpu_offload)
         )
         logger.info(
             "Pi05 memory config: prefix_cache=%s/%s, cuda_graph=%s/%s/%s, "

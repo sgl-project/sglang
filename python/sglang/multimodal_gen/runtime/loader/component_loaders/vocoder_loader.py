@@ -49,10 +49,8 @@ class VocoderLoader(ComponentLoader):
             else PRECISION_TO_TYPE["fp32"]
         )
 
-        stage_on_cpu = server_args.should_load_component_on_cpu(
-            component_name, can_configure_layerwise_after_load=True
-        )
-        target_device = self.target_device(stage_on_cpu)
+        should_offload = server_args.should_cpu_offload_component(component_name)
+        target_device = self.target_device(should_offload)
 
         with set_default_torch_dtype(vocoder_dtype), skip_init_modules():
             vocoder_cls, _ = ModelRegistry.resolve_model_cls(class_name)

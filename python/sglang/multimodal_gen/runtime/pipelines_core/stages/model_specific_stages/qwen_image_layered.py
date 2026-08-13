@@ -12,9 +12,6 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.models.encoders.hf_qwen2_5vl import (
-    LayerwiseQwen2_5VLForConditionalGeneration,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -176,20 +173,14 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
         self.vae_dtype = vae_dtype
         self.text_encoder_dtype = text_encoder_dtype
         if text_encoder is None:
-            stage_on_cpu = self.server_args.should_load_component_on_cpu(
-                "text_encoder", can_configure_layerwise_after_load=True
+            from transformers import Qwen2_5_VLForConditionalGeneration
+
+            text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_path, subfolder="text_encoder"
             )
-            init_device = (
-                torch.device("cpu") if stage_on_cpu else get_local_torch_device()
-            )
-            text_encoder = (
-                LayerwiseQwen2_5VLForConditionalGeneration.from_pretrained(
-                    model_path, subfolder="text_encoder"
-                )
-                .to(init_device)
-                .to(dtype=self.text_encoder_dtype)
-            )
-        self.text_encoder = text_encoder.to(dtype=self.text_encoder_dtype)
+        self.text_encoder = text_encoder.to(
+            device=get_local_torch_device(), dtype=self.text_encoder_dtype
+        )
         self.tokenizer = tokenizer
         self.processor = processor
         self.transformer = transformer

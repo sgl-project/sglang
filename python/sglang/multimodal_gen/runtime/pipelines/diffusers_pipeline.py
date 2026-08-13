@@ -21,7 +21,7 @@ from PIL import Image
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ResidencyStrategy,
+    ComponentResidencyStrategy,
     get_global_component_residency_manager,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -374,7 +374,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         self._stage_name_mapping: dict[str, PipelineStage] = {}
         self.modules: dict[str, Any] = {}
         self.memory_usages: dict[str, float] = {}
-        self.custom_residency_strategies: dict[str, ResidencyStrategy] = {}
+        self.component_residency_strategies: dict[str, ComponentResidencyStrategy] = {}
         self.component_residency_manager = None
         self.post_init_called = False
         self.executor = executor or SyncExecutor(server_args=server_args)
@@ -454,15 +454,12 @@ class DiffusersPipeline(ComposedPipelineBase):
             else:
                 raise
 
-        # diffusers exposes one pipeline-wide offload switch
-        any_offload = any(
-            server_args.should_cpu_offload_component(component_name)
-            for component_name in (
-                "transformer",
-                "text_encoder",
-                "image_encoder",
-                "vae",
-            )
+        # Use CPU offload (all-or-nothing in diffusers) if any component offload is requested.
+        any_offload = (
+            server_args.dit_cpu_offload
+            or server_args.text_encoder_cpu_offload
+            or server_args.image_encoder_cpu_offload
+            or server_args.vae_cpu_offload
         )
         if any_offload:
             device = get_local_torch_device()

@@ -4,13 +4,9 @@ Prompt enhancement stage for ErnieImage pipeline.
 """
 
 import json
-from contextlib import nullcontext
 
 import torch
 
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ComponentUse,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -25,13 +21,6 @@ class PromptEnhancementStage(PipelineStage):
         super().__init__()
         self.pe_model = pe_model
         self.pe_tokenizer = pe_tokenizer
-
-    def component_uses(
-        self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        if not isinstance(self.pe_model, torch.nn.Module):
-            return []
-        return [ComponentUse(self._component_stage_name(stage_name), "pe")]
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -59,27 +48,19 @@ class PromptEnhancementStage(PipelineStage):
         height = getattr(batch, "height", 1024)
         width = getattr(batch, "width", 1024)
 
-        component_context = (
-            self.use_declared_component(component_name="pe", module=self.pe_model)
-            if isinstance(self.pe_model, torch.nn.Module)
-            else nullcontext(self.pe_model)
-        )
-        with component_context as pe_model:
-            assert pe_model is not None
-            self.pe_model = pe_model
-            enhanced = []
-            for p in prompts:
-                enhanced_p = self._enhance_single_prompt(
-                    p, width, height, max_new_tokens=max_new_tokens
-                )
-                enhanced.append(enhanced_p)
+        enhanced = []
+        for p in prompts:
+            enhanced_p = self._enhance_single_prompt(
+                p, width, height, max_new_tokens=max_new_tokens
+            )
+            enhanced.append(enhanced_p)
 
         if isinstance(batch.prompt, str):
             batch.prompt = enhanced[0]
         else:
             batch.prompt = enhanced
 
-        logger.debug("PE enhanced prompt: %s", batch.prompt)
+        logger.info("PE enhanced prompt: %s", batch.prompt)
         return batch
 
     def _enhance_single_prompt(

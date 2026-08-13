@@ -1209,11 +1209,6 @@ class TestIdeogram4(unittest.TestCase):
         self.assertFalse(config.arch_config.ideogram_bnb_4bit_weight_only)
         self.assertFalse(config.arch_config.requires_gpu_resident_text_encoder)
 
-    def test_ideogram_text_encoder_declares_layerwise_layers(self):
-        self.assertEqual(
-            IdeogramQwen3VLTextEncoder.layer_names, ["language_model.layers"]
-        )
-
     def test_ideogram_text_encoder_post_config_hook_uses_bnb_for_nf4(self):
         config = Ideogram4TextEncoderConfig()
         config.update_model_arch(

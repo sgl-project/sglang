@@ -13,7 +13,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup-mode server --component-residency dit=resident --tp-size 2",
+                    "serve_args": "--warmup-mode server --dit-layerwise-offload false --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -29,7 +29,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup-mode server --component-residency dit=resident --tp-size 2",
+                    "serve_args": "--warmup-mode server --dit-layerwise-offload false --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -95,7 +95,7 @@
             "num_gpus": 4,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup-mode server --enable-cfg-parallel --ulysses-degree 2 --component-residency text_encoder=component-offload --pin-cpu-memory",
+                    "serve_args": "--warmup-mode server --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
                     "extra_env": {}
                 }
             }
@@ -182,7 +182,7 @@
             "num_gpus": 4,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup-mode server --enable-cfg-parallel --ulysses-degree 2 --component-residency text_encoder=component-offload --pin-cpu-memory",
+                    "serve_args": "--warmup-mode server --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
                     "extra_env": {}
                 }
             }

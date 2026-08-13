@@ -30,7 +30,7 @@ The transition point — how many steps to run at each resolution — is compute
 | `progressive_levels` | `--progressive-levels` | `1` | Number of resolution halvings. `1` = one coarse stage (64×64 latent → 128×128). `2` = two coarse stages (32×32 → 64×64 → 128×128). |
 | `progressive_delta` | `--progressive-delta` | `0.01` | Noise-dominated tolerance δ. Controls how many steps run at coarse resolution. Higher δ = more coarse steps = more speedup. |
 
-> **Tip:** Add `--component-residency dit=resident` to keep the transformer GPU-resident. With CPU offload each step pays a fixed PCIe transfer cost regardless of sequence length, which dilutes the speedup.
+> **Tip:** Add `--dit-cpu-offload false` to keep the transformer GPU-resident. With CPU offload each step pays a fixed PCIe transfer cost regardless of sequence length, which dilutes the speedup.
 
 ---
 
@@ -43,7 +43,7 @@ sglang generate \
     --model-path black-forest-labs/FLUX.1-dev \
     --prompt "A serene mountain lake at golden hour, photorealistic" \
     --num-inference-steps 50 \
-    --component-residency dit=resident \
+    --dit-cpu-offload false \
     --progressive-mode dct_rewind \
     --progressive-levels 1 \
     --progressive-delta 0.05
@@ -60,7 +60,7 @@ For most prompts `0.05` is recommended — it gives the largest speedup with no 
 
 ### Benchmark
 
-Hardware: RTX A6000 48 GB, `--component-residency dit=resident`. Timing = denoising loop only.
+Hardware: RTX A6000 48 GB, `--dit-cpu-offload false`. Timing = denoising loop only.
 
 | Config | Stage split | Denoise | Speedup |
 |--------|-------------|---------|---------|
@@ -76,7 +76,7 @@ from sglang.multimodal_gen import DiffGenerator
 
 gen = DiffGenerator.from_pretrained(
     model_path="black-forest-labs/FLUX.1-dev",
-    component_residency={"dit": "resident"},
+    dit_cpu_offload=False,
 )
 result = gen.generate(sampling_params_kwargs={
     "prompt": "A serene mountain lake at golden hour, photorealistic",
@@ -102,7 +102,7 @@ sglang generate \
     --model-path black-forest-labs/FLUX.2-klein-4B \
     --prompt "A serene mountain lake at golden hour, photorealistic" \
     --num-inference-steps 30 \
-    --component-residency dit=resident \
+    --dit-cpu-offload false \
     --progressive-mode dct_rewind \
     --progressive-levels 1 \
     --progressive-delta 0.10
@@ -110,7 +110,7 @@ sglang generate \
 
 ### Benchmark
 
-Hardware: RTX A6000 48 GB, `--component-residency dit=resident`. Model: FLUX.2-klein-4B, 30 steps, 1024×1024.
+Hardware: RTX A6000 48 GB, `--dit-cpu-offload false`. Model: FLUX.2-klein-4B, 30 steps, 1024×1024.
 Timing = denoising loop only, averaged across 10 diverse prompts.
 
 | Config | Stage split | Denoise | Speedup |
@@ -126,7 +126,7 @@ from sglang.multimodal_gen import DiffGenerator
 
 gen = DiffGenerator.from_pretrained(
     model_path="black-forest-labs/FLUX.2-klein-4B",
-    component_residency={"dit": "resident"},
+    dit_cpu_offload=False,
 )
 result = gen.generate(sampling_params_kwargs={
     "prompt": "A serene mountain lake at golden hour, photorealistic",
@@ -157,7 +157,7 @@ sglang generate \
     --width 832 \
     --guidance-scale 5.0 \
     --flow-shift 5.0 \
-    --component-residency dit=resident \
+    --dit-cpu-offload false \
     --progressive-mode dct_rewind \
     --progressive-levels 1 \
     --progressive-delta 0.05
@@ -181,7 +181,7 @@ from sglang.multimodal_gen import DiffGenerator
 
 gen = DiffGenerator.from_pretrained(
     model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-    component_residency={"dit": "resident"},
+    dit_cpu_offload=False,
     flow_shift=5.0,
 )
 result = gen.generate(sampling_params_kwargs={
@@ -218,7 +218,7 @@ sglang generate --model-path Tongyi-MAI/Z-Image \
     --prompt "A serene mountain lake at golden hour, photorealistic" \
     --height 1024 --width 1024 \
     --num-inference-steps 50 \
-    --component-residency dit=resident \
+    --dit-cpu-offload false \
     --progressive-mode dct_rewind \
     --progressive-levels 1 \
     --progressive-delta 0.10
@@ -241,7 +241,7 @@ from sglang.multimodal_gen import DiffGenerator
 
 gen = DiffGenerator.from_pretrained(
     model_path="Tongyi-MAI/Z-Image",
-    component_residency={"dit": "resident"},
+    dit_cpu_offload=False,
 )
 result = gen.generate(sampling_params_kwargs={
     "prompt": "A serene mountain lake at golden hour, photorealistic",
@@ -269,10 +269,10 @@ sglang generate --model-path Qwen/Qwen-Image \
 sglang generate --model-path Qwen/Qwen-Image \
     --prompt "A serene mountain lake at golden hour" \
     --progressive-mode dct_rewind --progressive-levels 1 --progressive-delta 0.20 \
-    --num-inference-steps 30 --component-residency dit=resident
+    --num-inference-steps 30 --dit-cpu-offload false
 ```
 
-Hardware: RTX A6000 48 GB, `--component-residency dit=resident`. Timing = denoising loop only.
+Hardware: RTX A6000 48 GB, `--dit-cpu-offload false`. Timing = denoising loop only.
 
 | Config | Stage split | Denoise | Speedup |
 |--------|-------------|---------|---------|
@@ -297,7 +297,7 @@ sglang generate \
     --prompt "A serene mountain lake at golden hour, photorealistic" \
     --height 1024 --width 1024 \
     --num-inference-steps 20 \
-    --component-residency dit=resident \
+    --dit-cpu-offload false \
     --progressive-mode dct_rewind \
     --progressive-levels 1 \
     --progressive-delta 0.05
@@ -311,7 +311,7 @@ sglang generate \
     --prompt "A serene mountain lake at golden hour, photorealistic" \
     --height 1024 --width 1024 \
     --num-inference-steps 48 \
-    --component-residency dit=resident \
+    --dit-cpu-offload false \
     --progressive-mode dct_rewind \
     --progressive-levels 1 \
     --progressive-delta 0.05
@@ -319,7 +319,7 @@ sglang generate \
 
 ### Benchmark
 
-Hardware: RTX A6000 48 GB, `torch_sdpa`, `--component-residency dit=resident`. Timing = denoising loop only.
+Hardware: RTX A6000 48 GB, `torch_sdpa`, `--dit-cpu-offload false`. Timing = denoising loop only.
 
 **20-step (V4_DEFAULT_20)**
 
@@ -346,7 +346,7 @@ from sglang.multimodal_gen import DiffGenerator
 
 gen = DiffGenerator.from_pretrained(
     model_path="ideogram-ai/ideogram-4",
-    component_residency={"dit": "resident"},
+    dit_cpu_offload=False,
 )
 result = gen.generate(sampling_params_kwargs={
     "prompt": "A serene mountain lake at golden hour, photorealistic",

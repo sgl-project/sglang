@@ -23,7 +23,8 @@ sglang serve \
   --pipeline-class-name LingBotWorldCausalDMDPipeline \
   --num-gpus 4 \
   --ulysses-degree 4 \
-  --component-residency dit=resident text_encoder=resident
+  --dit-cpu-offload false \
+  --text-encoder-cpu-offload false
 ```
 
 ### Optional KV-Cache Compression

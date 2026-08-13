@@ -9,7 +9,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
     PipelineExecutor,
 )
 from sglang.multimodal_gen.runtime.platforms.npu import NPUPlatformBase
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class _RecordingExecutor(PipelineExecutor):
@@ -35,20 +34,8 @@ def _batch():
     return SimpleNamespace(profile=False, is_warmup=False)
 
 
-class _TestServerArgs(SimpleNamespace):
-    explicit_residency_strategy_name = ServerArgs.explicit_residency_strategy_name
-    _legacy_should_cpu_offload_component = (
-        ServerArgs._legacy_should_cpu_offload_component
-    )
-    _legacy_layerwise_offload_matches = ServerArgs._legacy_layerwise_offload_matches
-    residency_strategy_name = ServerArgs.residency_strategy_name
-
-
 def _server_args(**overrides):
     values = {
-        "component_residency": None,
-        "_residency_strategy_overrides": {},
-        "cpu_offload_components": None,
         "use_fsdp_inference": False,
         "dit_cpu_offload": False,
         "text_encoder_cpu_offload": False,
@@ -58,9 +45,7 @@ def _server_args(**overrides):
         "layerwise_offload_components": (),
     }
     values.update(overrides)
-    if values["dit_layerwise_offload"] and not values["layerwise_offload_components"]:
-        values["layerwise_offload_components"] = ("dit",)
-    return _TestServerArgs(**values)
+    return SimpleNamespace(**values)
 
 
 class _NoGradPlatform:
@@ -133,10 +118,6 @@ def test_execute_group_with_profiling_uses_platform_inference_mode(monkeypatch):
         (_server_args(text_encoder_cpu_offload=True), ("text_encoder",)),
         (_server_args(image_encoder_cpu_offload=True), ("image_encoder",)),
         (_server_args(vae_cpu_offload=True), ("vae",)),
-        (
-            _server_args(component_residency={"connectors": "component-offload"}),
-            ("connectors",),
-        ),
     ],
 )
 def test_stage_context_preserves_version_counters_when_needed(

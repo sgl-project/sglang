@@ -1,9 +1,6 @@
 import torch
 
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ComponentUse,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -18,11 +15,6 @@ class LTX2TextConnectorStage(PipelineStage):
     def __init__(self, connectors):
         super().__init__()
         self.connectors = connectors
-
-    def component_uses(
-        self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        return [ComponentUse(self._component_stage_name(stage_name), "connectors")]
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         # Input: batch.prompt_embeds (from Gemma, [B, S, D])
@@ -59,59 +51,55 @@ class LTX2TextConnectorStage(PipelineStage):
                 "attention mask."
             )
 
-        with self.use_declared_component(
-            component_name="connectors", module=self.connectors
-        ) as connectors:
-            assert connectors is not None
-            self.connectors = connectors
-            if batch.do_classifier_free_guidance:
-                if neg_prompt_embeds is None or neg_prompt_attention_mask is None:
-                    raise ValueError(
-                        "LTX2TextConnectorStage requires negative prompt embeddings "
-                        "and attention mask when classifier-free guidance is enabled."
-                    )
+        if batch.do_classifier_free_guidance:
+            if neg_prompt_embeds is None or neg_prompt_attention_mask is None:
+                raise ValueError(
+                    "LTX2TextConnectorStage requires negative prompt embeddings "
+                    "and attention mask when classifier-free guidance is enabled."
+                )
 
-                # Official LTX-2.3 processes positive and negative prompts through
-                # the connector independently; batching shifts output numerics.
-                dtype = prompt_embeds.dtype
-                pos_additive_mask = (prompt_attention_mask.to(torch.int64) - 1).to(
-                    dtype
-                ) * torch.finfo(dtype).max
-                neg_additive_mask = (neg_prompt_attention_mask.to(torch.int64) - 1).to(
-                    dtype
-                ) * torch.finfo(dtype).max
+            # Official LTX-2.3 processes positive and negative prompts through
+            # the connector independently; batching shifts output numerics.
+            dtype = prompt_embeds.dtype
+            pos_additive_mask = (prompt_attention_mask.to(torch.int64) - 1).to(
+                dtype
+            ) * torch.finfo(dtype).max
+            neg_additive_mask = (neg_prompt_attention_mask.to(torch.int64) - 1).to(
+                dtype
+            ) * torch.finfo(dtype).max
 
-                with set_forward_context(current_timestep=None, attn_metadata=None):
-                    pos_embeds, pos_audio_embeds, pos_mask = connectors(
-                        prompt_embeds, pos_additive_mask, additive_mask=True
-                    )
-                    neg_embeds, neg_audio_embeds, neg_mask = connectors(
-                        neg_prompt_embeds, neg_additive_mask, additive_mask=True
-                    )
+            with set_forward_context(current_timestep=None, attn_metadata=None):
+                pos_embeds, pos_audio_embeds, pos_mask = self.connectors(
+                    prompt_embeds, pos_additive_mask, additive_mask=True
+                )
+                neg_embeds, neg_audio_embeds, neg_mask = self.connectors(
+                    neg_prompt_embeds, neg_additive_mask, additive_mask=True
+                )
 
-                batch.prompt_embeds = [pos_embeds]
-                batch.audio_prompt_embeds = [pos_audio_embeds]
-                batch.prompt_attention_mask = pos_mask
-                batch.negative_prompt_embeds = [neg_embeds]
-                batch.negative_audio_prompt_embeds = [neg_audio_embeds]
-                batch.negative_attention_mask = neg_mask
-            else:
-                dtype = prompt_embeds.dtype
-                additive_attention_mask = (
-                    prompt_attention_mask.to(torch.int64) - 1
-                ).to(dtype) * torch.finfo(dtype).max
+            batch.prompt_embeds = [pos_embeds]
+            batch.audio_prompt_embeds = [pos_audio_embeds]
+            batch.prompt_attention_mask = pos_mask
+            batch.negative_prompt_embeds = [neg_embeds]
+            batch.negative_audio_prompt_embeds = [neg_audio_embeds]
+            batch.negative_attention_mask = neg_mask
+        else:
+            # Prepare additive mask for connectors (as per diffusers implementation)
+            dtype = prompt_embeds.dtype
+            additive_attention_mask = (prompt_attention_mask.to(torch.int64) - 1).to(
+                dtype
+            ) * torch.finfo(dtype).max
 
-                with set_forward_context(current_timestep=None, attn_metadata=None):
-                    (
-                        connector_prompt_embeds,
-                        connector_audio_prompt_embeds,
-                        connector_mask,
-                    ) = connectors(
-                        prompt_embeds, additive_attention_mask, additive_mask=True
-                    )
+            with set_forward_context(current_timestep=None, attn_metadata=None):
+                (
+                    connector_prompt_embeds,
+                    connector_audio_prompt_embeds,
+                    connector_mask,
+                ) = self.connectors(
+                    prompt_embeds, additive_attention_mask, additive_mask=True
+                )
 
-                batch.prompt_embeds = [connector_prompt_embeds]
-                batch.audio_prompt_embeds = [connector_audio_prompt_embeds]
-                batch.prompt_attention_mask = connector_mask
+            batch.prompt_embeds = [connector_prompt_embeds]
+            batch.audio_prompt_embeds = [connector_audio_prompt_embeds]
+            batch.prompt_attention_mask = connector_mask
 
         return batch

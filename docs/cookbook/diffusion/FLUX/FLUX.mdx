@@ -199,11 +199,11 @@ SGLANG_CACHE_DIT_TS_ORDER=2 \
 sglang serve --model-path black-forest-labs/FLUX.1-dev
 ```
 
-#### 4.2.2 Component Residency
+#### 4.2.2 CPU Offload
 
-- `--component-residency dit=component-offload`: Move the complete DiT to CPU between uses.
-- `--component-residency text_encoder=component-offload`: Move the text encoder to CPU between uses.
-- `--component-residency vae=component-offload`: Move the VAE to CPU between uses.
+- `--dit-cpu-offload`: Use CPU offload for DiT inference. Enable if run out of memory.
+- `--text-encoder-cpu-offload`: Use CPU offload for text encoder inference.
+- `--vae-cpu-offload`: Use CPU offload for VAE.
 - `--pin-cpu-memory`: Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument".
 
 ## 5. Benchmark

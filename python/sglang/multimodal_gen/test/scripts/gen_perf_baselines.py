@@ -61,15 +61,12 @@ def _build_server_extra_args(case: DiffusionTestCase) -> str:
         a += f" --tp-size {server_args.tp_size}"
     if server_args.ulysses_degree is not None:
         a += f" --ulysses-degree {server_args.ulysses_degree}"
-    residency = []
     if server_args.dit_layerwise_offload:
-        residency.append("dit=layerwise-offload")
+        a += " --dit-layerwise-offload true"
     if server_args.dit_offload_prefetch_size:
         a += f" --dit-offload-prefetch-size {server_args.dit_offload_prefetch_size}"
     if server_args.text_encoder_cpu_offload:
-        residency.append("text_encoder=component-offload")
-    if residency:
-        a += " --component-residency " + " ".join(residency)
+        a += " --text-encoder-cpu-offload"
     if server_args.ring_degree is not None:
         a += f" --ring-degree {server_args.ring_degree}"
     if server_args.lora_path:

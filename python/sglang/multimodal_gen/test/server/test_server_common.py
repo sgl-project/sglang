@@ -133,9 +133,8 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.ulysses_degree is not None:
         extra_args += f" --ulysses-degree {server_args.ulysses_degree}"
 
-    residency = []
     if server_args.dit_layerwise_offload:
-        residency.append("dit=layerwise-offload")
+        extra_args += " --dit-layerwise-offload true"
 
     if server_args.dit_offload_prefetch_size:
         extra_args += (
@@ -143,10 +142,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         )
 
     if server_args.text_encoder_cpu_offload:
-        residency.append("text_encoder=component-offload")
-
-    if residency:
-        extra_args += " --component-residency " + " ".join(residency)
+        extra_args += " --text-encoder-cpu-offload"
 
     if server_args.ring_degree is not None:
         extra_args += f" --ring-degree {server_args.ring_degree}"

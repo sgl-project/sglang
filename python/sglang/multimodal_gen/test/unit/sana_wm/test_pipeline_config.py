@@ -46,7 +46,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     sana_wm_action_to_camera_to_world,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.refiner import (
-    OfficialDiffusersLTX2ConnectorsModule,
     OfficialDiffusersLTX2RefinerModule,
     OfficialGemma3TextEncoderModule,
     SanaWMLTX2RefinerStage,
@@ -1283,13 +1282,6 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertIn(
             "module.model.language_model.layers",
             OfficialGemma3TextEncoderModule.layer_names,
-        )
-        self.assertEqual(
-            OfficialDiffusersLTX2ConnectorsModule.layer_names,
-            [
-                "module.video_connector.transformer_blocks",
-                "module.audio_connector.transformer_blocks",
-            ],
         )
 
     def test_refiner_component_uses_follow_execution_order(self) -> None:

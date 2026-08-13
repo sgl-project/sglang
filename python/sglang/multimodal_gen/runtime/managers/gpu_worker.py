@@ -48,9 +48,6 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     save_outputs,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    LAYERWISE_OFFLOAD_STRATEGY,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
 )
@@ -292,16 +289,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
-        if self.server_args.any_component_uses_residency_strategy(
-            LAYERWISE_OFFLOAD_STRATEGY
-        ):
+        if self.server_args.layerwise_offload_components:
             configure_layerwise_offload_modules(
                 self.pipeline.modules,
                 self.server_args,
                 component_names=self.server_args.layerwise_offload_components,
                 warn_missing=(
-                    self.server_args.component_residency is not None
-                    or self.server_args.is_arg_explicitly_set(
+                    self.server_args.is_arg_explicitly_set(
                         "layerwise_offload_components"
                     )
                     or self.server_args.is_arg_explicitly_set("dit_layerwise_offload")
@@ -338,7 +332,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         logger.debug(
             "GPU memory: peak=%.2f GB, allocated=%.2f GB, pool=%.2f GB (%.1f%%), "
             "headroom=%.2f GB. Components that can remain on GPU: %s. "
-            "Adjust --component-residency to change placement.",
+            "Adjust --cpu-offload-components or --layerwise-offload-components "
+            "to change residency.",
             peak_reserved_gb,
             peak_allocated_gb,
             pool_overhead_gb,
@@ -1081,8 +1076,8 @@ OOM detected. Possible solutions:
   - If the OOM occurs during loading:
     1. Check available memory on every selected GPU, not only total capacity.
        In multi-GPU runs, the least-free selected GPU is the bottleneck.
-    2. For single-GPU deployment, use `--performance-mode memory` or
-       `--component-residency` to select component/layerwise offload.
+    2. For single-GPU deployment, use `--performance-mode memory`, component CPU offload,
+       or `--dit-layerwise-offload` for supported Wan/MOVA DiTs.
     3. For multi-GPU deployment, keep the default `--performance-mode auto` or set
        `--use-fsdp-inference true` to shard DiT weights with FSDP. FSDP is not a
        single-GPU substitute for CPU offload.

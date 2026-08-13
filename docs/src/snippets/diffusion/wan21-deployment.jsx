@@ -217,7 +217,7 @@ export const Wan21Deployment = () => {
       return command;
     }
 
-    let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --component-residency dit=layerwise-offload`;
+    let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --dit-layerwise-offload true`;
 
     if (bestPractice === 'on') {
       command += ` \\\n  --num-gpus 4 \\\n  --ulysses-degree 2 \\\n  --enable-cfg-parallel`;

@@ -17,9 +17,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ComponentUse,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
@@ -145,17 +142,6 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
         self.latent_shape = latent_shape
         self.guidance_embed = guidance_embed
 
-    def component_uses(
-        self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        return [
-            ComponentUse(
-                self._component_stage_name(stage_name),
-                "hy3dshape_conditioner",
-                memory_intensive=True,
-            )
-        ]
-
     def _validate_input(self, batch: Req, server_args: ServerArgs) -> None:
         if batch.image_path is None:
             raise ValueError("Hunyuan3D requires 'image_path' input.")
@@ -228,26 +214,21 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
         # 3. Conditioning with CFG
         do_cfg = batch.guidance_scale >= 0 and not self.guidance_embed
 
-        with self.use_declared_component(
-            component_name="hy3dshape_conditioner", module=self.conditioner
-        ) as conditioner:
-            assert conditioner is not None
-            self.conditioner = conditioner
-            cond = conditioner(image=image, **cond_inputs)
-            if do_cfg:
-                un_cond = conditioner.unconditional_embedding(
-                    image.shape[0], **cond_inputs
-                )
+        cond = self.conditioner(image=image, **cond_inputs)
+        if do_cfg:
+            un_cond = self.conditioner.unconditional_embedding(
+                image.shape[0], **cond_inputs
+            )
 
-                def cat_recursive(a, b):
-                    if isinstance(a, torch.Tensor):
-                        return torch.cat([a, b], dim=0).to(dtype)
-                    out = {}
-                    for key in a.keys():
-                        out[key] = cat_recursive(a[key], b[key])
-                    return out
+            def cat_recursive(a, b):
+                if isinstance(a, torch.Tensor):
+                    return torch.cat([a, b], dim=0).to(dtype)
+                out = {}
+                for key in a.keys():
+                    out[key] = cat_recursive(a[key], b[key])
+                return out
 
-                cond = cat_recursive(cond, un_cond)
+            cond = cat_recursive(cond, un_cond)
 
         # 4. Latent and timestep preparation
         scheduler = self.scheduler
@@ -303,19 +284,6 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
 
     def __init__(self, transformer: Any, scheduler: Any, **kwargs) -> None:
         super().__init__(transformer=transformer, scheduler=scheduler, **kwargs)
-
-    def component_uses(
-        self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        return [
-            ComponentUse(
-                self._component_stage_name(stage_name),
-                "hy3dshape_model",
-                phase="hy3dshape_model",
-                preferred_ready_after_request=False,
-                memory_intensive=True,
-            )
-        ]
 
     def _prepare_denoising_loop(self, batch: Req, server_args: ServerArgs):
         """Prepare Hunyuan3D-specific variables for the base denoising loop."""
@@ -488,48 +456,38 @@ class Hunyuan3DShapeExportStage(PipelineStage):
 
         return RoleType.DECODER
 
-    def component_uses(
-        self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        return [ComponentUse(self._component_stage_name(stage_name), "hy3dshape_vae")]
-
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        with self.use_declared_component(
-            component_name="hy3dshape_vae", module=self.vae
-        ) as vae:
-            assert vae is not None
-            self.vae = vae
-            if self.config.shape_mc_algo is not None:
-                try:
-                    from sglang.multimodal_gen.runtime.models.vaes.hunyuan3d_vae import (
-                        SurfaceExtractors,
-                    )
-
-                    vae.surface_extractor = SurfaceExtractors[
-                        self.config.shape_mc_algo
-                    ]()
-                except ImportError:
-                    logger.warning(
-                        f"Could not load SurfaceExtractors for mc_algo={self.config.shape_mc_algo}"
-                    )
-
-            latents = batch.latents
-
-            if self.config.shape_output_type != "latent":
-                latents = 1.0 / vae.scale_factor * latents
-                latents = vae(latents)
-
-                outputs = vae.latents2mesh(
-                    latents,
-                    bounds=self.config.shape_box_v,
-                    mc_level=self.config.shape_mc_level,
-                    num_chunks=self.config.shape_num_chunks,
-                    octree_resolution=self.config.shape_octree_resolution,
-                    mc_algo=self.config.shape_mc_algo,
-                    enable_pbar=False,
+        if self.config.shape_mc_algo is not None:
+            try:
+                from sglang.multimodal_gen.runtime.models.vaes.hunyuan3d_vae import (
+                    SurfaceExtractors,
                 )
-            else:
-                outputs = latents
+
+                self.vae.surface_extractor = SurfaceExtractors[
+                    self.config.shape_mc_algo
+                ]()
+            except ImportError:
+                logger.warning(
+                    f"Could not load SurfaceExtractors for mc_algo={self.config.shape_mc_algo}"
+                )
+
+        latents = batch.latents
+
+        if self.config.shape_output_type != "latent":
+            latents = 1.0 / self.vae.scale_factor * latents
+            latents = self.vae(latents)
+
+            outputs = self.vae.latents2mesh(
+                latents,
+                bounds=self.config.shape_box_v,
+                mc_level=self.config.shape_mc_level,
+                num_chunks=self.config.shape_num_chunks,
+                octree_resolution=self.config.shape_octree_resolution,
+                mc_algo=self.config.shape_mc_algo,
+                enable_pbar=False,
+            )
+        else:
+            outputs = latents
 
         if self.config.shape_output_type == "trimesh":
             outputs = export_to_trimesh(outputs)

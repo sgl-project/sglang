@@ -6,19 +6,12 @@ from typing import Any, Dict, List, Set, Tuple
 import torch
 from torch.distributed.tensor import DTensor
 
-from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    COMPONENT_RESIDENCY_GROUPS,
-    LAYERWISE_OFFLOAD_STRATEGY,
-    is_fsdp_managed_module,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
     RESIDENCY_POLICIES,
     RESIDENCY_POLICY_LEADING,
     RESIDENCY_POLICY_STRIDED,
-    is_dit_component_name,
     layerwise_component_matches_any_selection,
     normalize_layerwise_offload_components,
 )
@@ -335,16 +328,14 @@ class LayerwiseOffloadManager:
 
         self.register_forward_hooks()
         self._configured = True
-        logger.debug(
-            "Initialized layerwise offload manager: prefetch=%d, resident=%d, "
-            "layers=%d, layer_selection=%s",
-            self.prefetch_size,
-            self.resident_layers,
-            self.num_layers,
-            self.residency_policy,
+        logger.info(
+            f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, num resident layers: {self.resident_layers}, total num layers: {self.num_layers}, residency policy: {self.residency_policy}"
         )
         if self.residency_policy == RESIDENCY_POLICY_STRIDED and self._streamed_order:
-            logger.debug(
+            # Printed because the layout is the whole point of the policy, and
+            # "did it actually stride?" is otherwise only answerable from a
+            # profile.
+            logger.info(
                 "Strided residency streams layers %s (%d of %d)",
                 list(self._streamed_order),
                 len(self._streamed_order),
@@ -595,7 +586,7 @@ class LayerwiseOffloadManager:
     ) -> Set[str] | None:
         """Update consolidated CPU buffers with new weights.
 
-        When DiT layerwise offload is enabled, the
+        When layerwise offload (--dit-layerwise-offload) is enabled, the
         offload manager replaces GPU parameters with small torch.empty((1,))
         placeholders while real weights live in consolidated pinned CPU
         buffers.
@@ -809,13 +800,13 @@ class LayerwiseOffloadableModuleMixin:
             configured_layer_names.append(layer_name)
 
         if configured_layer_names:
-            logger.debug(
+            logger.info(
                 "Enabled layerwise offload for %s on modules: %s",
                 self.__class__.__name__,
                 configured_layer_names,
             )
         else:
-            logger.debug(
+            logger.info(
                 "No layerwise-offloadable ModuleList found for %s. Candidates: %s",
                 self.__class__.__name__,
                 self.layer_names,
@@ -908,8 +899,7 @@ def get_layerwise_offload_component_names_for_pipeline(
 ) -> list[str]:
     """Resolve layerwise selectors against the current pipeline modules.
 
-    Explicit selectors are resolved by component identity so capability checks
-    happen in one place after selection.
+    Explicit unsupported component names are kept so callers can report them.
     """
     normalized_component_names = normalize_layerwise_offload_components(component_names)
     selected_component_names = (
@@ -930,7 +920,7 @@ def get_layerwise_offload_component_names_for_pipeline(
         return [
             component_name
             for component_name, module in modules.items()
-            if isinstance(module, torch.nn.Module)
+            if isinstance(module, LayerwiseOffloadableModuleMixin)
         ]
 
     explicit_component_names = selected_component_names - {LAYERWISE_OFFLOAD_DIT_GROUP}
@@ -942,7 +932,11 @@ def get_layerwise_offload_component_names_for_pipeline(
         ):
             selected_pipeline_component_names.append(component_name)
             continue
-        if select_dit_group and is_dit_component_name(component_name):
+        if (
+            select_dit_group
+            and isinstance(module, LayerwiseOffloadableModuleMixin)
+            and module.layerwise_offload_dit_group_enabled
+        ):
             selected_pipeline_component_names.append(component_name)
     return selected_pipeline_component_names
 
@@ -953,12 +947,16 @@ def configure_layerwise_offload_modules(
     component_names: Sequence[str] | None = None,
     warn_missing: bool = True,
 ) -> list[str]:
-    """Configure selected pipeline modules for layerwise offload.
+    """Configure layerwise offload for the given modules, from the given component_names
 
-    An explicitly selected component must support layerwise offload and expose at
-    least one usable layer list. Automatic selection considers capable modules only.
+    Args:
+        modules: the dict of {component_name: component}, containing the components to be chosen from
+        component_names: list of component names. component with names not in this list shouldn't be configured
+
+    Returns a list of component names of modules configured to be layerwise-offload
     """
 
+    # components which has already been configured to be layerwise-offload
     configured_component_names: list[str] = []
     configured_module_ids: set[int] = set()
     normalized_component_names = normalize_layerwise_offload_components(component_names)
@@ -971,43 +969,14 @@ def configure_layerwise_offload_modules(
         selected_component_names is not None
         and LAYERWISE_OFFLOAD_ALL_COMPONENTS in selected_component_names
     )
-    if server_args.component_residency is not None:
-        selected_pipeline_component_names = [
-            component_name
-            for component_name, module in modules.items()
-            if isinstance(module, torch.nn.Module)
-            if server_args.residency_strategy_name(component_name)
-            == LAYERWISE_OFFLOAD_STRATEGY
-        ]
-    else:
-        selected_pipeline_component_names = (
-            get_layerwise_offload_component_names_for_pipeline(
-                modules,
-                normalized_component_names,
-            )
+    selected_pipeline_component_names = (
+        get_layerwise_offload_component_names_for_pipeline(
+            modules,
+            normalized_component_names,
         )
+    )
 
-    if server_args.component_residency is not None:
-        if warn_missing and server_args.disagg_role == RoleType.MONOLITHIC:
-            explicit_component_names = {
-                selector
-                for selector, strategy_name in server_args.component_residency.items()
-                if strategy_name == LAYERWISE_OFFLOAD_STRATEGY
-                and selector not in COMPONENT_RESIDENCY_GROUPS
-            }
-            missing_component_names = sorted(
-                component_name
-                for component_name in explicit_component_names - modules.keys()
-                if component_name != "condition_image_encoder"
-            )
-            if missing_component_names:
-                logger.warning(
-                    "Layerwise offload components are not currently loaded: %s. "
-                    "Available pipeline components: %s",
-                    missing_component_names,
-                    sorted(modules),
-                )
-    elif warn_missing and selected_component_names is not None and not select_all:
+    if warn_missing and selected_component_names is not None and not select_all:
         explicit_component_names = selected_component_names - {
             LAYERWISE_OFFLOAD_DIT_GROUP
         }
@@ -1029,49 +998,32 @@ def configure_layerwise_offload_modules(
                 sorted(modules),
             )
 
-    fsdp_managed_components = sorted(
-        component_name
-        for component_name in selected_pipeline_component_names
-        if is_fsdp_managed_module(modules[component_name])
-    )
-    if fsdp_managed_components:
-        raise ValueError(
-            "Layerwise offload cannot manage components already managed by FSDP: "
-            f"{fsdp_managed_components}"
-        )
+        unsupported_component_names = [
+            component_name
+            for component_name in selected_pipeline_component_names
+            if not isinstance(modules[component_name], LayerwiseOffloadableModuleMixin)
+        ]
+        if unsupported_component_names:
+            logger.warning(
+                "Layerwise offload components do not support layerwise offload: %s",
+                sorted(unsupported_component_names),
+            )
 
-    unsupported_component_names = sorted(
-        component_name
-        for component_name in selected_pipeline_component_names
-        if not isinstance(modules[component_name], LayerwiseOffloadableModuleMixin)
-    )
-    if unsupported_component_names:
-        raise ValueError(
-            "Layerwise offload was selected for components that do not implement "
-            f"LayerwiseOffloadableModuleMixin: {unsupported_component_names}"
-        )
-
-    unconfigured_component_names: list[str] = []
     for component_name in selected_pipeline_component_names:
         module = modules[component_name]
-        assert isinstance(module, LayerwiseOffloadableModuleMixin)
+        if not isinstance(module, LayerwiseOffloadableModuleMixin):
+            continue
         module_id = id(module)
         if module_id in configured_module_ids:
+            # avoid duplicated configures on a same module
             continue
 
         configured_module_ids.add(module_id)
+
         if not is_layerwise_offloaded_module(module):
             module.configure_layerwise_offload(server_args)
         if is_layerwise_offloaded_module(module):
             configured_component_names.append(component_name)
-            continue
-        unconfigured_component_names.append(component_name)
-
-    if unconfigured_component_names:
-        raise ValueError(
-            "Layerwise offload was selected but no usable layers were configured "
-            f"for components: {sorted(unconfigured_component_names)}"
-        )
 
     if configured_component_names:
         logger.info(
@@ -1079,5 +1031,5 @@ def configure_layerwise_offload_modules(
             configured_component_names,
         )
     else:
-        logger.debug("No pipeline component supports layerwise offload.")
+        logger.info("No pipeline component supports layerwise offload.")
     return configured_component_names

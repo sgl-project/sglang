@@ -235,19 +235,6 @@ class GlmImageAR(PipelineStage):
         self.processor = processor
         self.vision_language_encoder = vision_language_encoder
 
-    def component_uses(
-        self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        if server_args.srt_encoder_url is not None:
-            return []
-        return [
-            ComponentUse(
-                self._component_stage_name(stage_name),
-                "vision_language_encoder",
-                memory_intensive=True,
-            )
-        ]
-
     @property
     def parallelism_type(self) -> StageParallelismType:
         return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
@@ -675,14 +662,6 @@ class GlmImageAR(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        if (
-            server_args.srt_encoder_url is None
-            and self._component_residency_manager is not None
-        ):
-            self._component_residency_manager.begin_use(
-                self._declared_component_use(component_name="vision_language_encoder"),
-                module=self.vision_language_encoder,
-            )
 
         prompt = batch.prompt
         height = batch.height
