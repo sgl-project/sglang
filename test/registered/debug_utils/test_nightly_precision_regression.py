@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -641,6 +642,16 @@ def _run_server_and_dump(
 def _run_comparator(
     *, baseline: Path, target: Path, threshold: float
 ) -> subprocess.CompletedProcess[str]:
+    baseline_layouts = _detect_tp_layouts(baseline)
+    target_layouts = _detect_tp_layouts(target)
+    print(
+        f"Comparator TP layouts: baseline={baseline_layouts}, target={target_layouts}",
+        flush=True,
+    )
+    layout_dims = {
+        "partial": "bs h[tp:partial]",
+        "replicated": "bs h # tp:replicated",
+    }
     cmd: list[str] = [
         sys.executable,
         "-m",
@@ -655,14 +666,67 @@ def _run_comparator(
         "json",
         "--allow-skipped-pattern",
         "input_ids|positions|seq_lens|req_pool_indices|rids",
-        # inputs.1 is hidden_states entering the layer (inputs.0 = positions).
-        # LayerCommunicator defers the cross-layer allreduce, so layer N sees
-        # per-tp partial sums; bs h[tp:partial] sums across tp on the h axis
-        # before diffing.
-        "--override-dims",
-        r"^non_intrusive__model\.layers\.\d+\.inputs\.1$:bs h[tp:partial]",
     ]
+    for option, layouts in (
+        ("--override-baseline-dims", baseline_layouts),
+        ("--override-target-dims", target_layouts),
+    ):
+        for name, layout in sorted(layouts.items()):
+            cmd.extend([option, f"^{re.escape(name)}$:{layout_dims[layout]}"])
     return subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+
+_RANK_TAG_RE = re.compile(r"___rank=\d+___")
+_NAME_TAG_RE = re.compile(r"(?:^|___)name=(.*?)(?:___|$)")
+
+
+def _detect_tp_layouts(dump_dir: Path) -> dict[str, str]:
+    reference_by_bundle: dict[str, Any] = {}
+    layouts: dict[str, str] = {}
+    compared_names: set[str] = set()
+    for path in sorted(dump_dir.glob("*.pt")):
+        match = _NAME_TAG_RE.search(path.stem)
+        if match is None:
+            continue
+        name = match.group(1)
+        bundle = _RANK_TAG_RE.sub("___rank=*___", path.name)
+        raw = torch.load(path, weights_only=False, map_location="cpu")
+        value = raw.get("value") if isinstance(raw, dict) else raw
+        reference = reference_by_bundle.get(bundle)
+        if reference is None:
+            reference_by_bundle[bundle] = value
+            layouts.setdefault(name, "replicated")
+            continue
+        compared_names.add(name)
+        if not torch.equal(reference, value):
+            layouts[name] = "partial"
+    missing = layouts.keys() - compared_names
+    if missing:
+        raise RuntimeError(
+            f"could not compare TP ranks for {sorted(missing)} in {dump_dir}"
+        )
+    if not layouts:
+        raise RuntimeError(f"no named tensor dumps found in {dump_dir}")
+    return layouts
+
+
+class TestTpLayoutDetection(unittest.TestCase):
+    def test_mixed_layouts(self):
+        with tempfile.TemporaryDirectory() as td:
+            dump_dir = Path(td)
+            for rank in (0, 1):
+                torch.save(
+                    {"value": torch.tensor([[1.0, 2.0]])},
+                    dump_dir / f"step=0___rank={rank}___name=replicated.pt",
+                )
+                torch.save(
+                    {"value": torch.tensor([[float(rank), 2.0]])},
+                    dump_dir / f"step=0___rank={rank}___name=partial.pt",
+                )
+            self.assertEqual(
+                _detect_tp_layouts(dump_dir),
+                {"partial": "partial", "replicated": "replicated"},
+            )
 
 
 def _update_baseline(model_baseline_dir: Path, today_exp_dir: Path):
