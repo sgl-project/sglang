@@ -1005,6 +1005,10 @@ class Envs:
     # materializing the full-vocab log-softmax. Escape hatch only; the two
     # paths are mathematically identical.
     SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
+    # Compute prompt/input logprobs directly from TP-sharded vocabulary logits.
+    # Set to false to retain the gathered fast-input-logprob path for rollout
+    # comparison or as an operational escape hatch.
+    SGLANG_ENABLE_DISTRIBUTED_INPUT_LOGPROBS = EnvBool(True)
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
