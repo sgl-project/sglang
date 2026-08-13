@@ -802,9 +802,9 @@ def run_single(
         wait_for_health(base_url, framework)
 
         # No client-side warmup: each framework relies on its own server-side
-        # warmup before traffic. sglang's serve_args pass --warmup, which `serve`
-        # resolves to server-based (synthetic) warmup that primes kernels at
-        # startup, before the health check passes. This goes through the internal
+        # warmup before traffic. sglang's serve_args pass --warmup-mode server,
+        # which primes kernels with a synthetic request at startup, before the
+        # health check passes. This goes through the internal
         # warmup path that bypasses sampling-param preset validation (e.g.
         # Ideogram-4's preset-locked num_inference_steps), so no per-case warmup
         # special-casing is needed here.
