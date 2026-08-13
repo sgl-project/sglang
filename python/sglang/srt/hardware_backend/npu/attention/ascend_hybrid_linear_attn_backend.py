@@ -167,14 +167,6 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 device=mamba_indices.device,
             )
             self.state_indices_list_gdn[bs - 1].copy_(ssm_state_indices)
-            logger.debug(
-                f"[CAPTURE] bs={bs}, draft_token_num={spec_info.draft_token_num}, "
-                f"mamba_indices.shape={mamba_indices.shape}, "
-                f"ssm_state_indices.shape={ssm_state_indices.shape}, "
-                f"buffer_size={self.state_indices_list_gdn[bs-1].shape[0]}, "
-                f"ssm_state_indices[:5]={ssm_state_indices[:5].tolist()}, "
-                f"ssm_state_indices[-5:]={ssm_state_indices[-5:].tolist()}"
-            )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
@@ -244,12 +236,6 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 device=mamba_indices.device,
             )
             self.state_indices_list_gdn[bs - 1].copy_(ssm_state_indices)
-            logger.debug(
-                f"[REPLAY] bs={bs}, draft_token_num={spec_info.draft_token_num}, "
-                f"num_padding={num_padding}, "
-                f"ssm_state_indices.shape={ssm_state_indices.shape}, "
-                f"buffer_size={self.state_indices_list_gdn[bs-1].shape[0]}"
-            )
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
@@ -346,15 +332,6 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             dtype=torch.int64,
         )
         last_steps = last_correct_step_indices.to(torch.int64)  # [N]
-
-        logger.debug(
-            f"[UPDATE_MAMBA] request_number={request_number}, "
-            f"state_indices_tensor.shape={state_indices_tensor.shape}, "
-            f"dst_indices_tensor[:5]={dst_indices_tensor[:5].tolist() if dst_indices_tensor.numel() > 0 else []}, "
-            f"src_indices_tensor[:5]={src_indices_tensor[:5].tolist() if src_indices_tensor.numel() > 0 else []}, "
-            f"last_steps={last_steps.tolist()}, "
-            f"intermediate_cache.shape={intermediate_state_cache.shape}"
-        )
 
         h_block_size = _mamba_scatter_h_block_size(intermediate_state_cache)
 
