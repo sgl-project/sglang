@@ -38,6 +38,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
+    get_device_sm,
     get_hip_version,
     is_blackwell_supported,
     is_cuda,
@@ -283,6 +284,7 @@ class Fp8GemmRunnerBackend(Enum):
     AUTO = "auto"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
+    FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_DEEPGEMM = "flashinfer_deepgemm"
     CUTLASS = "cutlass"
     DEEP_GEMM = "deep_gemm"
@@ -297,6 +299,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_flashinfer_cutlass(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
+
+    def is_flashinfer_cutedsl(self) -> bool:
+        return self == Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL
 
     def is_flashinfer_deepgemm(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_DEEPGEMM
@@ -319,6 +324,7 @@ class Mxfp8DenseGemmBackend(Enum):
     `Fp8GemmRunnerBackend`."""
 
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
+    FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     DEEP_GEMM = "deep_gemm"
     GFX95_DOT_SCALED = "gfx95_dot_scaled"
@@ -327,8 +333,14 @@ class Mxfp8DenseGemmBackend(Enum):
     def is_flashinfer_cutlass(self) -> bool:
         return self == Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
 
+    def is_flashinfer_cutedsl(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+
     def is_flashinfer_trtllm(self) -> bool:
         return self == Mxfp8DenseGemmBackend.FLASHINFER_TRTLLM
+
+    def is_flashinfer(self) -> bool:
+        return self.value.startswith("flashinfer_")
 
     def is_deep_gemm(self) -> bool:
         return self == Mxfp8DenseGemmBackend.DEEP_GEMM
@@ -540,6 +552,28 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
             )
         return Mxfp8DenseGemmBackend.FLASHINFER_TRTLLM
 
+    if backend.is_flashinfer_cutedsl():
+        if not (
+            is_blackwell_supported()
+            and is_flashinfer_available()
+            and _raw_flashinfer_mm_mxfp8.is_backend_supported(
+                "cute-dsl", get_device_sm()
+            )
+        ):
+            raise RuntimeError(
+                "MXFP8 dense GEMM requested via --fp8-gemm-backend=flashinfer_cutedsl, "
+                "but that kernel requires an SM100/SM103 GPU and FlashInfer."
+            )
+        return Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+
+    if backend.is_flashinfer_cutlass():
+        if not (is_blackwell_supported() and is_flashinfer_available()):
+            raise RuntimeError(
+                "MXFP8 dense GEMM requested via --fp8-gemm-backend=flashinfer_cutlass, "
+                "but that kernel requires Blackwell GPUs and FlashInfer."
+            )
+        return Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
+
     if backend.is_deep_gemm():
         if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             raise RuntimeError(
@@ -553,6 +587,8 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
         return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
 
     if is_blackwell_supported() and is_flashinfer_available():
+        if _raw_flashinfer_mm_mxfp8.is_backend_supported("cute-dsl", get_device_sm()):
+            return Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
         return Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
@@ -577,6 +613,8 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="trtllm")
     elif backend.is_flashinfer_cutlass():
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cutlass")
+    elif backend.is_flashinfer_cutedsl():
+        return partial(flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl")
     elif backend.is_unsupported():
         return _unsupported_mxfp8_linear
 
@@ -735,14 +773,6 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
         backend = "cutlass"
 
     backend = Fp8GemmRunnerBackend(backend)
-
-    if (
-        backend.is_auto()
-        and server_args.quantization == "mxfp8"
-        and _is_sm100_supported
-        and is_flashinfer_available()
-    ):
-        backend = Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
 
     FP8_GEMM_RUNNER_BACKEND = backend
 

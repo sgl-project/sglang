@@ -48,11 +48,18 @@ _is_musa = is_musa()
 _is_gfx1250 = is_gfx1250_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_cuda or _is_musa:
+if _is_cuda:
     from sglang.kernels.ops.quantization import (
         per_token_group_quant,
         sgl_per_token_quant_fp8,
     )
+    from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
+        per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
+    )
+
+if _is_musa:
+    from sgl_kernel import sgl_per_token_quant_fp8
+
     from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
@@ -2300,10 +2307,3 @@ def triton_scaled_mm(
     )
 
     return result.to(out_dtype)
-
-
-if _is_cuda:
-
-    @register_fake_if_exists("sgl_kernel::sgl_per_token_quant_fp8")
-    def _(input, output_q, output_s):
-        return

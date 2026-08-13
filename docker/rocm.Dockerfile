@@ -53,7 +53,7 @@ RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 # Version pins — override with --build-arg to update
 ARG ROCM_VERSION="7.15.0a20260712"
 ARG INDEX_URL="https://rocm.nightlies.amd.com/whl-multi-arch/"
-ARG PIP_EXTRA_INDEX_URL="https://rocm.prereleases.amd.com/whl-multi-arch/"
+ARG PIP_EXTRA_INDEX_URL="https://rocm.devreleases.amd.com/whl-multi-arch/"
 ARG TORCH_VERSION="2.11.0"
 ARG TORCHVISION_VERSION="0.26.0"
 ARG TRITON_VERSION="3.7.1+git0263a6a6"
@@ -61,7 +61,7 @@ ARG TRITON_VERSION="3.7.1+git0263a6a6"
 # ROCm SDK + PyTorch stack — single pip install, single index.
 RUN python3 -m pip install --no-cache-dir --pre \
     --index-url ${INDEX_URL} \
-    --extra-index-url https://rocm.devreleases.amd.com/whl-multi-arch \
+    --extra-index-url ${PIP_EXTRA_INDEX_URL} \
     "rocm[libraries,devel,device-gfx1250]==${ROCM_VERSION}" \
     "torch[device-gfx1250]==${TORCH_VERSION}+rocm${ROCM_VERSION}" \
     "torchvision[device-gfx1250]==${TORCHVISION_VERSION}+rocm${ROCM_VERSION}" \
@@ -91,8 +91,8 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
-ENV TRITON_COMMIT_DEFAULT="c57bbbd8c1d83a8388baa508cf1286bfdad1695d"
+ENV AITER_COMMIT_DEFAULT="aa30480f3bcda73da17a44339a3d05beedf83f2c"
+ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
 
 # ===============================
 # Base image 942 with rocm700 and args
@@ -164,6 +164,14 @@ ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
 ENV TRITON_COMMIT="${TRITON_COMMIT:-${TRITON_COMMIT_DEFAULT}}"
+
+# ROCm 7.2 Triton (BUILD_TRITON=1 stages only). Both wheels are the same
+# upstream revision, triton-lang/triton@89002410. AITER only requires
+# triton>=3.6.0 and treats the base image as the owner of the version, so the
+# choice is ours; bump these together after checking the index.
+ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release/rocm-7.2.0/simple/"
+ARG TRITON_VERSION="3.7.0+amd.rocm7.2.0.git89002410"
+ARG TRITON_KERNELS_VERSION="1.0.0+amd.rocm7.2.0.git89002410"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
@@ -301,8 +309,8 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # from AITER_COMMIT rather than SGLang's nightly version.
 
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
-# Keep the base image's Torch-compatible Triton by default. Override with
-# AITER_USE_SYSTEM_TRITON=0 when intentionally testing aiter-managed Triton.
+# Compile AITER against the base image's Triton; the Triton step at the end of
+# this file installs the pinned one afterwards.
 ENV AITER_USE_SYSTEM_TRITON=1
 RUN pip uninstall -y aiter
 # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
@@ -670,110 +678,39 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 
 # -----------------------
 # Hot patch: torch-ROCm
-# The artifact hardcoded the supported triton version to be 3.5.1.
-# Rewrite the restriction directly.
-ARG TORCH_ROCM_FILE="torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl"
-RUN mkdir /tmp/whl && cd /tmp/whl \
-     && export TORCH_ROCM_FILE="${TORCH_ROCM_FILE}" \
-     && cat > hack.py <<"PY"
-import zipfile, csv, os, re
+# Torch wheels may hardcode a pinned triton version (e.g. triton==3.5.1).
+# Patch the installed METADATA in-place to relax "==" pins to ">=", so a
+# newer triton can satisfy the requirement without pip pulling CUDA torch.
+# Works regardless of how torch was installed (local .whl or remote index).
+RUN python3 - <<'PY'
+import csv, re, sys
 from pathlib import Path
+from importlib.metadata import Distribution
 
-fname = os.environ["TORCH_ROCM_FILE"]
-in_whl  = Path("/")   / fname
-out_whl = Path("/tmp")/ fname
-work = Path("/tmp/whl")
+dist = Distribution.from_name("torch")
+meta_path = Path(dist._path) / "METADATA"
+record_path = Path(dist._path) / "RECORD"
 
-# 1) Extract
-with zipfile.ZipFile(in_whl, "r") as z:
-    z.extractall(work)
+txt = meta_path.read_text(encoding="utf-8")
+# Match both "Requires-Dist: triton==..." and bare "triton==..." (continuation line)
+pat = r"^((?:Requires-Dist:\s*)?triton)==(\S+)"
+txt2, n = re.subn(pat, r"\1>=\2", txt, flags=re.MULTILINE)
+if n == 0:
+    print("No triton==... pin found in torch METADATA; nothing to patch")
+    sys.exit(0)
 
-# 2) Locate dist-info and patch METADATA (edit this logic to match your exact line)
-dist_info = next(work.glob("*.dist-info"))
-meta = dist_info / "METADATA"
-txt = meta.read_text(encoding="utf-8")
+meta_path.write_text(txt2, encoding="utf-8")
+print(f"Relaxed {n} triton pin(s) from == to >= in {meta_path}")
 
-# Example: replace one exact requirement form.
-# Adjust the string to match what you actually see.
-pat = r"^Requires-Dist:\s*triton==3.5.1[^\s]*;"
-txt2, n = re.subn(pat, r"triton>=3.5.1;", txt, flags=re.MULTILINE)
-if txt2 == txt:
-    raise SystemExit("Did not find expected Requires-Dist line to replace in METADATA")
-meta.write_text(txt2, encoding="utf-8")
-
-# 3) Hacky step: blank hash/size columns in RECORD
-record = dist_info / "RECORD"
+# Blank hash/size columns in RECORD so pip doesn't complain about mismatch
 rows = []
-with record.open(newline="", encoding="utf-8") as f:
+with record_path.open(newline="", encoding="utf-8") as f:
     for r in csv.reader(f):
-        if not r:
-            continue
-        # keep filename, blank out hash and size
-        rows.append([r[0], "", ""])
-with record.open("w", newline="", encoding="utf-8") as f:
+        if r:
+            rows.append([r[0], "", ""])
+with record_path.open("w", newline="", encoding="utf-8") as f:
     csv.writer(f).writerows(rows)
-
-# 4) Re-zip as a wheel
-with zipfile.ZipFile(out_whl, "w", compression=zipfile.ZIP_DEFLATED) as z:
-    for p in work.rglob("*"):
-        if p.is_file():
-            z.write(p, p.relative_to(work).as_posix())
-
-print("Wrote", out_whl)
 PY
-
-RUN cd /tmp/whl \
-    && case "${GPU_ARCH}" in \
-      *rocm720*) \
-        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
-        python hack.py \
-        && rm -fr /tmp/whl /tmp/${TORCH_ROCM_FILE} \
-        ;; \
-      *) \
-        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
-        ;; \
-    esac
-
-
-# -----------------------
-# Hot patch: Triton
-# For ROCm 7.2, this custom build breaks pip dependency management,
-# so future `pip install` will break the ROCm stack.
-# A workaround for this is to reinstall the default triton
-# wheel with the `rocm/pytorch` image in the root directory.
-# For ROCm 7.15, it is a different story:
-# https://github.com/ROCm/rocm-systems/issues/7643
-# Rebuilding tag 3.7.0 seems to workaround this issue without
-# sacrificing accuracy. The previous section to rewrite the metadata
-# of the wheel becomes unnecessary once we apply the trick to fake
-# the version string as we do here.
-RUN if [ "$BUILD_TRITON" = "1" ]; then \
-        TRITON_INSTALLED_VERSION=$(pip show triton 2>/dev/null | grep '^Version:' | cut -d' ' -f2 || echo "") \
-     && TRITON_BASE_VERSION=$(echo "$TRITON_INSTALLED_VERSION" | cut -d'+' -f1) \
-     && TRITON_VERSION_SUFFIX=$(echo "$TRITON_INSTALLED_VERSION" | grep -o '+.*' || echo "") \
-     && echo "Captured Triton version: $TRITON_INSTALLED_VERSION (base: $TRITON_BASE_VERSION, suffix: $TRITON_VERSION_SUFFIX)" \
-     && pip uninstall -y triton \
-     && apt install -y cmake \
-     && git clone ${TRITON_REPO} triton-custom \
-     && cd triton-custom \
-     && git checkout ${TRITON_COMMIT} \
-     && if [ -n "$TRITON_BASE_VERSION" ]; then \
-            TRITON_SOURCE_VERSION=$(grep -oP 'TRITON_VERSION = "\K[^"]+' setup.py || echo "") \
-         && if [ -n "$TRITON_SOURCE_VERSION" ]; then \
-                sed -i "s/TRITON_VERSION = \"$TRITON_SOURCE_VERSION\"/TRITON_VERSION = \"$TRITON_BASE_VERSION\"/" setup.py \
-             && sed -i "s/__version__ = '$TRITON_SOURCE_VERSION'/__version__ = '$TRITON_BASE_VERSION'/" python/triton/__init__.py; \
-            fi \
-         && sed -i '/^def get_git_version_suffix():/,/^def get_triton_version_suffix():/{ /^def get_triton_version_suffix():/!{ /^def get_git_version_suffix():/!d; }; }' setup.py \
-         && sed -i '/^def get_git_version_suffix():/a\    return ""' setup.py; \
-        fi \
-     && pip install -r python/requirements.txt \
-     && if [ -n "$TRITON_VERSION_SUFFIX" ]; then \
-            TRITON_WHEEL_VERSION_SUFFIX="$TRITON_VERSION_SUFFIX" pip install -e .; \
-        else \
-            pip install -e .; \
-        fi \
-     && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
-    fi
 
 # -----------------------
 # Hot patch: transformers dynamic_module_utils symlink bug (v5.12.1).
@@ -804,6 +741,37 @@ else:
     path.write_text(patched)
     print("patched transformers dynamic_module_utils.py (symlink hash fix)")
 PY
+
+# -----------------------
+# Install AMD's ROCm Triton, replacing the base image's.
+# - ROCm 7.2: pinned wheels from pypi.amd.com (TRITON_VERSION / TRITON_KERNELS_VERSION).
+#   The local version is part of the pin so pip doesn't silently swap revisions.
+# - ROCm 7.15: build from source at TRITON_COMMIT (set by the gfx1250 stage).
+#
+# Keep this last. Base ROCm Torch pins triton==3.5.1 and the torch patch above
+# is what drops that pin, so installing Triton any earlier lets the next pip
+# install pull CUDA torch instead. The hip check below is the tripwire.
+RUN if [ "$BUILD_TRITON" = "1" ]; then \
+        case "${GPU_ARCH}" in \
+          *rocm7_15*) \
+            echo "[Triton] ROCm 7.15: building from source (${TRITON_COMMIT})"; \
+            pip uninstall -y triton \
+            && apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/* \
+            && git clone ${TRITON_REPO} triton-custom \
+            && cd triton-custom \
+            && git checkout ${TRITON_COMMIT} \
+            && pip install -r python/requirements.txt \
+            && pip install -e . \
+            && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
+            ;; \
+          *) \
+            echo "[Triton] ROCm 7.2: installing pinned wheels from ${TRITON_INDEX_URL}"; \
+            PIP_NO_CACHE_DIR=1 pip install --extra-index-url ${TRITON_INDEX_URL} \
+                "triton==${TRITON_VERSION}" "triton-kernels==${TRITON_KERNELS_VERSION}"; \
+            ;; \
+        esac \
+     && python3 -c "import torch; from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); assert torch.version.hip is not None, torch.__version__; print(f'[Triton] ROCm Torch {torch.__version__}, Triton {v}, triton-kernels {k}')"; \
+    fi
 
 # -----------------------
 # Performance environment variable.
