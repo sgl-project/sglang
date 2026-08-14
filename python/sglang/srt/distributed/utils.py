@@ -121,6 +121,19 @@ def get_pp_indices(
             raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
         start_layer = sum(partitions[:pp_rank])
         end_layer = start_layer + partitions[pp_rank]
+        return (start_layer, end_layer)
+
+    from sglang.srt.distributed.pp_partition import get_auto_pp_partition
+
+    auto_partition = get_auto_pp_partition()
+    # Same pp_size==1 trap as the env var: the draft worker must not read the
+    # target's partition.
+    if auto_partition is not None and pp_size > 1:
+        assert len(auto_partition) == pp_size and sum(auto_partition) == (
+            num_hidden_layers
+        ), f"auto PP partition {auto_partition} does not cover {num_hidden_layers} layers at pp_size={pp_size}"
+        start_layer = sum(auto_partition[:pp_rank])
+        end_layer = start_layer + auto_partition[pp_rank]
     else:
         base_layers = num_hidden_layers // pp_size
         remainder = num_hidden_layers % pp_size
