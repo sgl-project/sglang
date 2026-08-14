@@ -7,7 +7,6 @@ python3 -m unittest test_xpu_decoder_rerank.TestXPUDecoderRerank
 import math
 import multiprocessing as mp
 import unittest
-from pathlib import Path
 
 import torch
 from jinja2.sandbox import ImmutableSandboxedEnvironment
@@ -24,11 +23,15 @@ TP_SIZE = 1
 SCORE_TOLERANCE = 1e-2
 ATTENTION_BACKEND = "intel_xpu"
 TORCH_DTYPE = torch.bfloat16
-CHAT_TEMPLATE_PATH = (
-    Path(__file__).resolve().parents[3] / "examples/chat_template/qwen3_reranker.jinja"
-)
-with CHAT_TEMPLATE_PATH.open("r", encoding="utf-8") as f:
-    QWEN3_RERANKER_TEMPLATE = f.read()
+# Source template: examples/chat_template/qwen3_reranker.jinja
+QWEN3_RERANKER_TEMPLATE = r"""<|im_start|>system
+Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>
+<|im_start|>user
+<Instruct>: {{ instruct | default("Given a web search query, retrieve relevant passages that answer the query.") }}
+<Query>: {{ messages[0]["content"] }}
+<Document>: {{ messages[1]["content"] }}<|im_end|>
+<|im_start|>assistant{{ '\\n' }}
+"""
 
 JINJA_ENV = ImmutableSandboxedEnvironment(autoescape=False)
 QWEN3_RERANKER_JINJA = JINJA_ENV.from_string(QWEN3_RERANKER_TEMPLATE)
