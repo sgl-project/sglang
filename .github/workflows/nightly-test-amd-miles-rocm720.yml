@@ -80,7 +80,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Run miles CI suite ${{ matrix.suite }}
-        timeout-minutes: 360
+        timeout-minutes: 240
         run: |
           touch "${GITHUB_WORKSPACE}/github_summary.md"
           TEST_EXIT_CODE=0
