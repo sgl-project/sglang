@@ -36,6 +36,7 @@ if is_cuda() or is_hip():
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
 
+causal_conv1d_update_triton = causal_conv1d_update
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn as causal_conv1d_fn_cuda,
@@ -557,7 +558,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
+            # sgl_kernel variants don't support intermediate_* / retrieve_* args; fallback to Triton.
+            mixed_qkv_processed = causal_conv1d_update_triton(
                 mixed_qkv_reshaped,
                 conv_states,
                 layer.conv_weights,
