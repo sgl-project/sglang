@@ -26,6 +26,7 @@ flex_attention = torch.compile(
 import torch.distributed as dist
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_world_size,
@@ -439,9 +440,8 @@ class CausalWanTransformerBlock(nn.Module):
 
 
 class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = WanVideoConfig()._compile_conditions
-    _supported_attention_backends = WanVideoConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = WanVideoConfig().param_names_mapping
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
