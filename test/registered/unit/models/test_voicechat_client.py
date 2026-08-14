@@ -4,10 +4,10 @@ from array import array
 from examples.voicechat import client
 
 
-def _write_wav(path, rate, samples):
+def _write_wav(path, rate, samples, channels=1):
     pcm = array("h", samples)
     with wave.open(str(path), "wb") as output:
-        output.setnchannels(1)
+        output.setnchannels(channels)
         output.setsampwidth(2)
         output.setframerate(rate)
         output.writeframes(pcm.tobytes())
@@ -19,6 +19,16 @@ def test_read_wav_preserves_16khz_pcm(tmp_path):
     _write_wav(path, client.INPUT_RATE, samples)
 
     assert client.read_wav(path) == array("h", samples).tobytes()
+
+
+def test_read_wav_downmixes_stereo_pcm(tmp_path):
+    path = tmp_path / "stereo.wav"
+    _write_wav(path, client.INPUT_RATE, [100, -100, 300, 100], channels=2)
+
+    output = array("h")
+    output.frombytes(client.read_wav(path))
+
+    assert list(output) == [0, 200]
 
 
 def test_read_wav_resamples_24khz_to_16khz(tmp_path):
@@ -44,10 +54,10 @@ def test_resample_pcm16_uses_exact_80ms_device_frame_sizes():
 
 def test_complete_frames_pads_only_the_final_frame():
     complete = bytes(client.FRAME_BYTES)
-    assert client._complete_frames(complete) is complete
+    assert client.complete_frames(complete) is complete
 
     partial = bytes(client.FRAME_BYTES + 2)
-    padded = client._complete_frames(partial)
+    padded = client.complete_frames(partial)
     assert len(padded) == client.FRAME_BYTES * 2
     assert padded.startswith(partial)
 

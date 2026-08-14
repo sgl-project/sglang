@@ -1,9 +1,9 @@
-# NVIDIA NemotronLabs VoiceChat realtime inference with SGLang
+# NVIDIA NemotronLabs VoiceChat inference with SGLang
 
-This directory contains the SGLang deployment and client instructions for
-[NVIDIA NemotronLabs VoiceChat 11B](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B).
-The deployment exposes a bidirectional WebSocket for low-latency, full-duplex
-speech conversations on one 80 GB NVIDIA GPU.
+This directory contains direct offline inference and realtime deployment
+instructions for [NVIDIA NemotronLabs VoiceChat 11B](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B).
+Both paths run the Duplex and EarTTS autoregressive stages with SGLang on one
+80 GB NVIDIA GPU.
 
 The runtime follows NVIDIA's online architecture while replacing the two
 autoregressive vLLM stages with persistent SGLang streaming sessions:
@@ -30,12 +30,13 @@ not implemented.
 | --- | --- |
 | [Prerequisites](prerequisites.md) | GPU, software, checkpoint, image, and networking requirements |
 | [Generate SGLang stages](generate-model-repo.md) | Download and convert the unified Hugging Face checkpoint |
+| [Offline WAV inference](offline-inference.md) | Run a prerecorded WAV through direct SGLang engine sessions |
 | [Deploy and run](deploy.md) | Start both services and use microphone or WAV clients |
 | [API reference](api-reference.md) | HTTP/WebSocket endpoints, events, audio formats, errors, and limits |
 
-Start with [Prerequisites](prerequisites.md). If the checkpoint is already
-converted into `duplex/` and `eartts/`, continue with
-[Deploy and run](deploy.md).
+Start with [Prerequisites](prerequisites.md). After converting the checkpoint
+into `duplex/` and `eartts/`, choose [Offline WAV inference](offline-inference.md)
+for a bounded file or [Deploy and run](deploy.md) for a realtime WebSocket.
 
 ## Programmatic integration
 

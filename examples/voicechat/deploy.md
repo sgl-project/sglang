@@ -116,8 +116,8 @@ microphone and background noise can degrade a full-duplex model.
 
 ## WAV conversation
 
-WAV input must be mono PCM16. The client resamples it to 16 kHz, streams fixed
-80 ms frames, and writes 22.05 kHz PCM16 output.
+WAV input must be PCM16. The client downmixes multichannel input to mono, resamples
+it to 16 kHz, streams fixed 80 ms frames, and writes 22.05 kHz PCM16 output.
 
 ```bash
 python examples/voicechat/client.py \
