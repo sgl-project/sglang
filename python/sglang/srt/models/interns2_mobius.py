@@ -199,6 +199,7 @@ def _load_mobius_weights_strict(
     expected_slots = _expected_mobius_load_slots(params_dict, config.num_experts)
     loaded_slots: set[tuple[str, object, int | None]] = set()
     loaded_sources: set[str] = set()
+    skip_visual_sources = owner.visual is None
 
     def record_slot(name, shard_id=None, expert_id=None):
         slot = (name, shard_id, expert_id)
@@ -207,6 +208,8 @@ def _load_mobius_weights_strict(
         loaded_slots.add(slot)
 
     for source_name, loaded_weight in weights:
+        if skip_visual_sources and source_name.startswith(("model.visual.", "visual.")):
+            continue
         if _is_intentional_mobius_skip(source_name, config.tie_word_embeddings):
             continue
         if source_name in loaded_sources:
