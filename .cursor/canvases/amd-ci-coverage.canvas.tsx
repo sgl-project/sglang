@@ -258,6 +258,10 @@ function Funnel() {
           ];
         })}
       />
+      <Text size="small" tone="tertiary">
+        Outcome of the AMD PR gate on each PR&rsquo;s merge commit &middot; GitHub Actions API joined
+        by merge-commit SHA &middot; 423 PRs merged 2026-08-07 to 2026-08-14 18:39 UTC
+      </Text>
 
       <Text tone="secondary">
         Of the 346 PRs that should have run AMD GPU jobs, 273 reached a GPU but only{" "}
@@ -282,16 +286,23 @@ function WhyRunsDie() {
         had passed.
       </Text>
 
-      <Grid columns={2} gap={16}>
+      <Stack gap={16}>
         <Card>
-          <CardHeader>Median minutes</CardHeader>
+          <CardHeader>AMD run wall time vs time to merge</CardHeader>
           <CardBody>
             <BarChart
-              categories={["AMD run to finish", "Run start to merge"]}
-              series={[{ name: "Minutes", data: [389, 210] }]}
+              categories={["AMD run", "To merge"]}
+              series={[{ name: "Median elapsed (minutes)", data: [389, 210], tone: "danger" }]}
               valueSuffix=" min"
-              height={170}
+              horizontal
+              height={150}
             />
+            <Text size="small" tone="tertiary">
+              Median elapsed minutes &middot; x-axis: minutes, y-axis: interval measured &middot;
+              &ldquo;AMD run&rdquo; = wall time of runs that ran to completion (n=77);
+              &ldquo;To merge&rdquo; = run start to PR merge, for runs that reached a GPU (n=273)
+              &middot; GitHub Actions API, 2026-08-07 to 2026-08-14
+            </Text>
             <Text size="small" tone="secondary">
               The AMD suite needs roughly twice the time it is allowed to exist. The merge routinely
               wins the race.
@@ -299,24 +310,26 @@ function WhyRunsDie() {
           </CardBody>
         </Card>
         <Card>
-          <CardHeader>6,110 GPU jobs executed this week</CardHeader>
+          <CardHeader>GPU job outcomes across the week</CardHeader>
           <CardBody>
             <BarChart
               categories={["Passed", "Cancelled", "Failed"]}
-              series={[
-                {
-                  name: "Jobs",
-                  data: [3225, 1962, 923],
-                },
-              ]}
-              height={170}
+              series={[{ name: "GPU jobs (count)", data: [3225, 1962, 923] }]}
+              valueSuffix=" jobs"
+              horizontal
+              height={180}
             />
+            <Text size="small" tone="tertiary">
+              Job count &middot; y-axis: job conclusion, x-axis: number of GPU jobs &middot; all
+              6,110 AMD GPU jobs dispatched by the 273 PRs that reached a GPU &middot; GitHub
+              Actions API, 2026-08-07 to 2026-08-14
+            </Text>
             <Text size="small" tone="secondary">
               Roughly a third of all AMD GPU time this week produced a result that was thrown away.
             </Text>
           </CardBody>
         </Card>
-      </Grid>
+      </Stack>
 
       <Callout tone="danger" title="The loop">
         <Text>
@@ -358,6 +371,11 @@ function Capacity() {
           <Text tone="secondary">{wait}</Text>,
         ])}
       />
+      <Text size="small" tone="tertiary">
+        Effective runner counts and mean queue wait per pool &middot; source:{" "}
+        <Code>scripts/ci/utils/runner_utilization_report.py</Code> &middot; 12-hour window ending
+        2026-08-14 05:02 UTC
+      </Text>
       <Text tone="secondary">
         The binding constraint is <Code>linux-mi35x-gpu-8.fabric</Code>: one runner, one
         disaggregation job per <Code>main_package</Code> PR, a 60-minute timeout. It can serve at
