@@ -34,7 +34,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
     KimiK3DeferredPreprocessing,
 )
 from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
-    KimiK3ImageArtifact,
+    KimiK3ImagePreprocessArtifact,
     KimiK3PreprocessConfig,
     KimiK3ResizeConfig,
 )
@@ -730,7 +730,7 @@ def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
 
 
 def _cached_k3_artifact(content_digest, artifact_key, value=1):
-    return KimiK3ImageArtifact(
+    return KimiK3ImagePreprocessArtifact(
         content_digest=content_digest,
         artifact_key=artifact_key,
         feature_hash=123,

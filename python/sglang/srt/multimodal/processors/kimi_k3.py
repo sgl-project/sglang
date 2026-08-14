@@ -39,7 +39,7 @@ from sglang.srt.multimodal.media_artifacts import (
     MediaArtifactInput,
 )
 from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
-    KimiK3ImageArtifact,
+    KimiK3ImagePreprocessArtifact,
     KimiK3PreprocessConfig,
     KimiK3ResizeConfig,
 )
@@ -365,7 +365,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
 
 class KimiK3ImageProcessor(
     KimiGridMMDataMixin,
-    MediaArtifactCacheMixin[KimiK3ImageArtifact],
+    MediaArtifactCacheMixin[KimiK3ImagePreprocessArtifact],
     SGLangBaseProcessor,
 ):
     models = [KimiK3ForConditionalGeneration]
@@ -501,13 +501,13 @@ class KimiK3ImageProcessor(
         grid_thw: tuple[int, int, int],
         feature: torch.Tensor,
         deferred: Optional[KimiK3DeferredPreprocessing] = None,
-    ) -> KimiK3ImageArtifact:
+    ) -> KimiK3ImagePreprocessArtifact:
         item = MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
         item.set_pad_value()
         feature_hash = build_feature_hash(artifact_key, item.hash)
         if not self.keep_mm_features_on_device and feature.device.type != "cpu":
             feature = feature.cpu()
-        return KimiK3ImageArtifact(
+        return KimiK3ImagePreprocessArtifact(
             content_digest=content_digest,
             artifact_key=artifact_key,
             feature_hash=feature_hash,
@@ -523,10 +523,10 @@ class KimiK3ImageProcessor(
         entries: list[MediaArtifactInput],
         *,
         processor=None,
-    ) -> list[KimiK3ImageArtifact]:
+    ) -> list[KimiK3ImagePreprocessArtifact]:
         """Process cache misses as one batch while preserving image order."""
         processor = processor or self._processor
-        artifacts: list[Optional[KimiK3ImageArtifact]] = [None] * len(entries)
+        artifacts: list[Optional[KimiK3ImagePreprocessArtifact]] = [None] * len(entries)
         eager_indices = []
         eager_images = []
 
@@ -590,7 +590,7 @@ class KimiK3ImageProcessor(
     def compose_request(
         self,
         input_text,
-        artifacts: list[KimiK3ImageArtifact],
+        artifacts: list[KimiK3ImagePreprocessArtifact],
     ) -> MultimodalProcessorOutput:
         original_ids = (
             input_text

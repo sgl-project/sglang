@@ -1,4 +1,9 @@
-"""Shared contracts and coordination for reusable multimodal artifacts."""
+"""Shared contracts and coordination for reusable multimodal artifacts.
+
+An artifact is the prompt-independent result of preprocessing one media item.
+It is reused by the current request and is the logical item stored in the
+multimodal preprocess cache.
+"""
 
 from __future__ import annotations
 
@@ -26,7 +31,7 @@ from sglang.srt.utils import load_image
 
 @runtime_checkable
 class MediaArtifact(Protocol):
-    """Minimum contract required by the shared artifact cache path."""
+    """A reusable per-media preprocess result and logical cache item."""
 
     content_digest: str
     artifact_key: str
@@ -45,7 +50,13 @@ ArtifactT = TypeVar("ArtifactT", bound=MediaArtifact)
 
 @dataclass(frozen=True)
 class MediaArtifactInput:
-    """One decoded cache miss with its already-validated identity."""
+    """One decoded raw multimodal input that missed the preprocess cache.
+
+    The shared cache layer has already validated its content digest, derived
+    its artifact key, and reserved the cache miss. The model-specific artifact
+    builder can therefore preprocess ``media`` without loading or hashing it
+    again.
+    """
 
     content_digest: str
     artifact_key: str
@@ -133,6 +144,14 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
     def prepare_artifact_batch(
         self, entries: Sequence[MediaArtifactInput]
     ) -> list[ArtifactT]:
+        """Preprocess raw multimodal inputs that missed the preprocess cache.
+
+        Each entry is one unique, decoded cache miss. Implementations must
+        return one reusable artifact (the preprocess-cache item) per entry, in
+        the same order, while preserving its content digest and artifact key.
+        The shared layer uses the artifact for the current request and stores
+        ``artifact.cache_value()`` for reuse.
+        """
         raise NotImplementedError
 
     def artifact_usable(self, artifact: ArtifactT, *, allow_featureless: bool) -> bool:

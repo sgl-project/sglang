@@ -83,8 +83,8 @@ class KimiK3ResizeConfig:
 
 
 @dataclass(frozen=True)
-class KimiK3ImageArtifact:
-    """One image's reusable metadata and, when already on CPU, its feature."""
+class KimiK3ImagePreprocessArtifact:
+    """K3's preprocess-cache item for one image, reusable across prompts."""
 
     content_digest: str
     artifact_key: str
@@ -103,7 +103,7 @@ class KimiK3ImageArtifact:
     def is_cpu_cacheable(self) -> bool:
         return self.feature is None or self.feature.device.type == "cpu"
 
-    def cache_value(self) -> KimiK3ImageArtifact:
+    def cache_value(self) -> KimiK3ImagePreprocessArtifact:
         """Never retain a CUDA tensor in the preprocess cache."""
         if self.feature is None or self.feature.device.type == "cpu":
             return self
