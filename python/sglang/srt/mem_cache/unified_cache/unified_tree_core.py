@@ -426,10 +426,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.components_by_type.values()
         )
 
-        # Per-component (FULL/SWA/MAMBA) placement events only matter on a
-        # multi-component tree with the feature on; otherwise KV events keep the
-        # legacy whole-block payload. Settled before the recorder is built, as
-        # the placement hook it receives reads this.
+        # Per-component placement events: feature on + a multi-component tree.
         self._emit_component_placement = (
             params.enable_kv_cache_events
             and params.enable_kv_events_component_types
@@ -1090,9 +1087,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 self._build_backup_kv_action(state.target_node)
             )
 
-        # Flush deferred REPLACE GPU stores now: the COMMIT step's aux component
-        # actions have been applied at the barrier before this step, so each
-        # node's snapshot reflects its final SWA/Mamba placement.
+        # Deferred REPLACE GPU stores: aux components have committed by now.
         self._flush_insert_store_events(state)
 
     def _split_node(
@@ -1148,11 +1143,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_duplicate_tracking(new_node)
         return new_node, action
 
-    # ---- Component-placement KV events ----
+    # ==== Component-placement KV events ====
 
-    # Maps the internal component enum to the canonical on-wire names
-    # (kv_events.KV_COMPONENT_*), so the event schema stays the single source of
-    # truth for the component vocabulary rather than ComponentType's ``__str__``.
+    # Internal component enum -> canonical on-wire names, so the event schema
+    # (kv_events.KV_COMPONENT_*) owns the vocabulary, not ComponentType.__str__.
     _COMPONENT_TYPE_TO_WIRE = {
         ComponentType.FULL: KV_COMPONENT_FULL,
         ComponentType.SWA: KV_COMPONENT_SWA,
@@ -1166,17 +1160,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         page_index: int,
         num_pages: int,
     ) -> Optional[list[str]]:
-        """Report which KV components are resident on ``node`` at ``medium`` for
-        the page at ``page_index`` (REPLACE-semantics snapshot).
+        """Components resident on ``node`` at ``medium`` for page ``page_index``
+        (REPLACE snapshot), or ``None`` when component placement is off.
 
-        - Returns ``None`` unless ``_emit_component_placement`` (feature on +
-          multi-component tree), keeping the component dimension off the wire by
-          default and for full-only trees.
-        - Presence is read straight off live tree state: device ==
-          ``value is not None``, host == ``host_value is not None``. SWA
-          tombstones (both ``None``) and absent host pools stay unreported.
-        - Mamba is a single per-leaf state, so it is anchored to the leaf's last
-          page and reported once.
+        Presence is read live: device == ``value``, host == ``host_value``, so
+        tombstones stay unreported. Mamba is one per-leaf state, anchored to the
+        last page.
         """
         if not self._emit_component_placement:
             return None
@@ -1194,13 +1183,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return names
 
     def _note_insert_store_node(self, node: UnifiedTreeNode) -> None:
-        """Register a node that gained a component during the current insert so a
-        single REPLACE GPU store is (re)emitted for it at the TAIL flush, once all
-        components have committed. No-op in legacy mode or outside an insert.
+        """Register a node that gained a component this insert for a single
+        REPLACE GPU store at the TAIL flush, once all components committed.
+        No-op in legacy mode or outside an insert.
 
-        Gains defer because the component set is not final until every commit
-        action has applied; losses (``_restate_component_placement``) are final
-        the moment the component is evicted and emit immediately.
+        Gains defer (the set is not final until commits apply); losses restate
+        immediately via ``_restate_component_placement``.
         """
         if not self._emit_component_placement:
             return
@@ -1209,19 +1197,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             ws.pending_store_event_nodes.append(node)
 
     def _flush_insert_store_events(self, state: _InsertWalkState) -> None:
-        """Emit the deferred REPLACE GPU store snapshots for one insert.
+        """Emit the deferred REPLACE GPU stores for one insert, in the TAIL step.
 
-        Runs in the TAIL step -- AFTER the COMMIT step's aux component actions
-        (SWARebuild / RecoverSWAWithLockedFull / MambaEvictExcessPathStates) have
-        been applied by the orchestrator. That ordering is guaranteed because none
-        of those actions is in ``_is_deferrable_action``, so each forces a barrier
-        suspend -> apply -> resume before TAIL; thus each node's snapshot reflects
-        its final SWA/Mamba placement (see test_aux_commit_actions_are_not_deferrable).
-
-        Covers (a) nodes noted during the walk/commit and (b) the new-suffix chain
-        from the leaf up to the insert parent (leaf + any SWA-split tombstone
-        parents). Prefix-split re-partitioned nodes are intentionally NOT
-        re-emitted -- their per-page component presence is unchanged.
+        Aux commit actions (SWARebuild / RecoverSWAWithLockedFull /
+        MambaEvictExcessPathStates) run before TAIL -- none is deferrable, so each
+        forces a barrier first -- hence every snapshot is final here (see
+        test_aux_commit_actions_are_not_deferrable). Covers walk/commit-noted
+        nodes plus the new-suffix chain (leaf + SWA-split tombstone parents);
+        prefix-split nodes are unchanged and skipped.
         """
         if not self._emit_component_placement:
             return
@@ -1244,12 +1227,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> None:
         """Record a ``BlockStored`` for each of ``node_ids``, parents first.
 
-        Every id must sit on the root -> ``tail`` path, so walking up from the
-        tail and reversing orders them by depth. Order is load-bearing:
-        ``record_store`` seeds a node's lazily computed hash chain -- and its
-        ``parent_block_hash`` -- off its parent's hash, which only exists once
-        the parent itself has been recorded. Announcing a child first publishes
-        it as a root block under a hash no other code path reproduces.
+        All ids sit on the root -> ``tail`` path, so walk up and reverse for
+        depth order. Load-bearing: ``record_store`` seeds a node's hash chain
+        (and ``parent_block_hash``) off its parent's, so a child recorded first
+        would publish under a hash nothing else reproduces.
         """
         chain: list[UnifiedTreeNode] = []
         node = tail
@@ -1267,20 +1248,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _restate_component_placement(
         self, node: UnifiedTreeNode, medium: StorageMedium
     ) -> None:
-        """Re-emit a REPLACE store snapshot after an auxiliary component (SWA/
-        Mamba) is tombstoned on ``node`` while its base (FULL) component is still
-        resident at ``medium``.
+        """Re-emit a REPLACE snapshot after an aux component (SWA/Mamba) is
+        tombstoned on ``node`` while its base (FULL) still lives at ``medium``.
 
-        This keeps stored/removed symmetric without ever emitting a
-        ``BlockRemoved`` for a partial eviction: the block is still present at the
-        tier (its base remains), we just restate the now-smaller component set. If
-        FULL is gone the whole block has left the tier and the caller emits a
-        ``BlockRemoved`` instead, so this is a no-op.
-
-        Gated off in legacy mode, which never restated. Callers invoke it only in
-        partial-tombstone branches, after ``_cascade_evict`` (so lower-priority
-        components are already gone from the snapshot) and never during a
-        whole-block teardown (where FULL is being freed too).
+        Avoids a ``BlockRemoved`` for a partial eviction: the block is still at
+        the tier, just with a smaller component set. No-op when FULL is gone (the
+        caller emits ``BlockRemoved``) or in legacy mode. Callers invoke it only
+        in partial-tombstone branches, after ``_cascade_evict``.
         """
         if not self._emit_component_placement:
             return
@@ -1311,9 +1285,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
-        # Component-placement mode defers this store to the TAIL flush (aux
-        # SWA/Mamba commit after this node, so emitting now would miss them);
-        # legacy mode keeps the original immediate emit.
+        # Component-placement mode defers to the TAIL flush (aux SWA/Mamba
+        # commit later); legacy mode emits immediately.
         if self._emit_component_placement:
             self._note_insert_store_node(new_node)
         else:
@@ -1336,9 +1309,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_duplicate_tracking(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
-        # Component-placement mode defers: SWA recover_after_unevict may still add
-        # SWA here, so the snapshot is emitted at the TAIL flush; legacy mode
-        # emits immediately.
+        # Component-placement mode defers to the TAIL flush (SWA recover may
+        # still add SWA here); legacy mode emits immediately.
         if self._emit_component_placement:
             self._note_insert_store_node(node)
         else:
@@ -2191,10 +2163,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 cache_actions=cache_actions,
             )
 
-        # Emit REPLACE GPU stores AFTER every component restored its device value,
-        # unioning the nodes each component loaded so the snapshot reflects FULL
-        # plus any SWA/Mamba from the same load. Emitting before the aux commits
-        # (as the legacy FULL-only emit did) would report a FULL-only placement.
+        # Emit REPLACE GPU stores AFTER every component restored its device
+        # value, unioning each component's loaded nodes so the snapshot reflects
+        # FULL plus any SWA/Mamba from the same load (emitting earlier would
+        # report FULL-only).
         if self._emit_component_placement:
             restored_ids = set(kv_xfer.nodes_to_load or ())
             for xfers in comp_xfers.values():

@@ -499,12 +499,7 @@ class UnifiedTreeCoreInterface(ABC):
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor
     ) -> None:
-        """Store an auxiliary (non-Full) component's device value onto a node.
-
-        This is the single point where an aux component gains a device value, so
-        an implementation emitting component-placement KV events must record the
-        node here; otherwise those events silently go missing.
-        """
+        """Store an auxiliary (non-Full) component's device value onto a node."""
         ...
 
     @abstractmethod

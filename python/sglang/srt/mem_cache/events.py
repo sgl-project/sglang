@@ -205,9 +205,6 @@ class KVCacheEventRecorder:
         # One BlockRemoved per radix node.
         # ``medium`` defaults to StorageMedium.GPU but callers may override for
         # lower-tier removals (e.g. StorageMedium.CPU when evicting from host).
-        # A removal always means the whole block left ``medium`` (its base
-        # component is gone), so removals stay whole-block with no component
-        # dimension.
         if not self.enabled:
             return
         if medium is None:
