@@ -253,8 +253,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     ):
         if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
-        # The translation is layer-independent, so a layer loop should hoist it
-        # (dcp_localize_indices) instead of paying it on every layer.
         if not dcp_localized:
             host_indices, device_indices = self.dcp_localize_indices(
                 host_indices, device_indices
@@ -421,8 +419,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
-        # Once per write-back, not once per layer: the per-layer helper below
-        # takes indices that are already localized.
         host_indices, device_indices = self.dcp_localize_indices(
             host_indices, device_indices
         )

@@ -429,7 +429,6 @@ class HiSparseCoordinator:
         host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
         device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
 
-        # Translate once for the whole layer loop, not per layer.
         host_indices, device_locs = self.mem_pool_host.dcp_localize_indices(
             host_indices, device_locs
         )

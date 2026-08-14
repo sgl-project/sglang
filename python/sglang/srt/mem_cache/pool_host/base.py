@@ -255,10 +255,8 @@ class HostKVCache(abc.ABC):
         """
         Load KV data from the host memory pool to the device memory pool for a specific layer.
 
-        ``dcp_localized`` states that the caller already mapped the widened DCP
-        logical slots onto this rank's physical rows with
-        :meth:`dcp_localize_indices`. A loop over layers should localize once up
-        front and set it; pools that are not DCP-sharded ignore it.
+        ``dcp_localized``: the indices are already this rank's physical rows
+        (see ``dcp_localize_indices``), so skip the translation.
         """
         raise NotImplementedError()
 
@@ -365,15 +363,11 @@ class HostKVCache(abc.ABC):
     def dcp_localize_indices(
         self, host_indices: torch.Tensor, device_indices: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Translate one transfer's index pair, ahead of a per-layer loop.
+        """Translate a transfer's index pair once, ahead of a per-layer loop.
 
-        The translation only depends on the indices, so it is identical for
-        every layer of a transfer. Callers that loop over layers localize once
-        here and pass ``dcp_localized=True`` to ``load_to_device_per_layer``,
-        which turns a 24-layer MLA load from 48 boolean ``aten::index`` calls
-        into 2. That CPU launch cost sits on the load stream's critical path,
-        so paying it per layer is what keeps the transfer from overlapping
-        compute.
+        The result is the same for every layer, so a layer loop localizes here
+        and passes ``dcp_localized=True`` instead of paying two boolean-index
+        launches per layer on the transfer stream's critical path.
         """
         return (
             self.dcp_kernel_indices(host_indices),

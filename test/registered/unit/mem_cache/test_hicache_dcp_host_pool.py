@@ -233,9 +233,7 @@ class TestTransferEntryPointsTranslate(CustomTestCase):
         torch.testing.assert_close(kwargs["dst_indices"], expected)
 
     def test_load_trusts_already_localized_indices(self):
-        # A layer loop localizes once up front (dcp_localize_indices) and says
-        # so; translating again here would filter the physical rows a second
-        # time and load the wrong slots.
+        # Translating again would filter the physical rows a second time.
         pool = _make_host_pool(dcp_rank=5)
         logical = torch.arange(2 * WIDENED_PAGE)
         localized = pool.dcp_localize_indices(logical, logical.clone())
@@ -297,11 +295,10 @@ class _CountingHostPool:
 
 
 class TestLoadLoopLocalizesOnce(CustomTestCase):
-    """The DCP translation is layer-independent, so the load loop must hoist it.
+    """The load loop must hoist the DCP translation out of the layer loop.
 
-    Running it inside the loop costs 2 * layer_num boolean-index launches per
-    transfer (48 on a 24-layer MLA model) on the load stream's critical path,
-    which is enough CPU time to stop the transfer from overlapping compute.
+    Per-layer translation costs 2 * layer_num index launches per transfer on
+    the load stream's critical path.
     """
 
     def setUp(self):
