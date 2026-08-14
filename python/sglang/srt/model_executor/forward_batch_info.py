@@ -492,6 +492,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
+    # Opaque per-request metadata for model-specific forward methods.
+    custom_inputs: Optional[List[Optional[Dict[str, Any]]]] = None
 
     # Encoder-decoder host fields
     encoder_cached: Optional[List[bool]] = None
@@ -830,6 +832,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             mm_inputs=batch.multimodal_inputs,
+            custom_inputs=[req.custom_inputs for req in batch.reqs],
             encoder_cached=batch.encoder_cached,
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],

@@ -258,6 +258,10 @@ class GenerateReqInput:
     # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
     # Typed as Any to avoid Pydantic/FastAPI schema errors (PositionalEmbeds contains torch.Tensor).
     positional_embed_overrides: Any = None
+    # Model-specific, per-turn inputs. These are deliberately separate from
+    # multimodal inputs: they are consumed directly by a model implementation
+    # and are never cached or inherited by a session.
+    custom_inputs: Any = None
 
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[Optional[str]], str]] = None
@@ -439,7 +443,14 @@ class GenerateReqInput:
             self.input_embeds = None
         elif self.input_ids is not None:
             if len(self.input_ids) == 0:
-                raise ValueError("input_ids cannot be empty.")
+                if self.session_params is None:
+                    raise ValueError(
+                        "input_ids cannot be empty outside a session continuation."
+                    )
+                self.is_single = True
+                self.batch_size = 1
+                self.input_embeds = None
+                return
             if isinstance(self.input_ids[0], int):
                 self.is_single = True
                 self.batch_size = 1
@@ -483,6 +494,8 @@ class GenerateReqInput:
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
+        if self.custom_inputs is not None and not isinstance(self.custom_inputs, dict):
+            raise ValueError("custom_inputs should be a dict for a single request.")
         if self.sampling_params is None:
             self.sampling_params = {}
         if self.rid is None:
@@ -527,6 +540,7 @@ class GenerateReqInput:
         self._normalize_logprob_params(num)
         self._normalize_return_hidden_states(num)
         self._normalize_custom_logit_processor(num)
+        self._normalize_custom_inputs(num)
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
         self._normalize_bootstrap_params(num)
@@ -752,6 +766,26 @@ class GenerateReqInput:
                 "Cannot use list custom_logit_processor with parallel_sample_num > 1"
             )
 
+    def _normalize_custom_inputs(self, num):
+        """Normalize opaque model inputs without interpreting their contents."""
+        if self.custom_inputs is None:
+            self.custom_inputs = [None] * num
+        elif isinstance(self.custom_inputs, dict):
+            self.custom_inputs = [self.custom_inputs] * num
+        elif isinstance(self.custom_inputs, list):
+            if len(self.custom_inputs) != self.batch_size:
+                raise ValueError(
+                    "The length of custom_inputs should be equal to the batch size."
+                )
+            if any(
+                item is not None and not isinstance(item, dict)
+                for item in self.custom_inputs
+            ):
+                raise ValueError("Every custom_inputs item should be a dict or None.")
+            self.custom_inputs = self.custom_inputs * self.parallel_sample_num
+        else:
+            raise ValueError("custom_inputs should be a dict or a list of dicts.")
+
     def _normalize_extra_key(self, num):
         """Normalize extra_key for batch processing."""
         if self.extra_key is None:
@@ -894,6 +928,9 @@ class GenerateReqInput:
                 else None
             ),
             positional_embed_overrides=self._get_positional_embed_overrides_item(i),
+            custom_inputs=(
+                self.custom_inputs[i] if self.custom_inputs is not None else None
+            ),
             # If `__getitem__` is called, these bootstrap fields must be lists.
             bootstrap_host=(
                 self.bootstrap_host[i] if self.bootstrap_host is not None else None
@@ -988,6 +1025,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     custom_logit_processor: Optional[str] = None
     # Embedding overrides to place at specific token positions.
     positional_embed_overrides: Optional[PositionalEmbeds] = None
+    # Pickled opaque inputs for model-specific online inference steps.
+    custom_inputs: Optional[PickleWrapper] = None
 
     # For disaggregated inference
     bootstrap_host: Optional[str] = None
@@ -1043,11 +1082,13 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_as_pickle(self.mm_inputs)
+        self.custom_inputs = wrap_as_pickle(self.custom_inputs)
         self.mm_data_mooncake = wrap_as_pickle(self.mm_data_mooncake)
         self.time_stats = wrap_as_pickle(self.time_stats)
 
     def unwrap_pickle_fields(self):
         self.mm_inputs = unwrap_from_pickle(self.mm_inputs)
+        self.custom_inputs = unwrap_from_pickle(self.custom_inputs)
         self.mm_data_mooncake = unwrap_from_pickle(self.mm_data_mooncake)
         self.time_stats = unwrap_from_pickle(self.time_stats)
 

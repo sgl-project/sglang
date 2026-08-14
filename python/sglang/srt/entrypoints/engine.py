@@ -380,6 +380,7 @@ class Engine(EngineScoreMixin, EngineBase):
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        custom_inputs: Any = None,
         require_reasoning: bool = False,
         return_hidden_states: Union[
             ReturnHiddenStatesMode, List[ReturnHiddenStatesMode]
@@ -426,6 +427,7 @@ class Engine(EngineScoreMixin, EngineBase):
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
             custom_logit_processor=custom_logit_processor,
+            custom_inputs=custom_inputs,
             require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
@@ -493,6 +495,7 @@ class Engine(EngineScoreMixin, EngineBase):
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        custom_inputs: Any = None,
         require_reasoning: bool = False,
         return_hidden_states: Union[
             ReturnHiddenStatesMode, List[ReturnHiddenStatesMode]
@@ -544,6 +547,7 @@ class Engine(EngineScoreMixin, EngineBase):
             routed_experts_start_len=routed_experts_start_len,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
+            custom_inputs=custom_inputs,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
@@ -1315,6 +1319,22 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.open_session(obj, None)
         )
 
+    async def async_open_session(
+        self,
+        capacity_of_str_len: int,
+        session_id: Optional[str] = None,
+        streaming: bool = False,
+        timeout: Optional[float] = None,
+    ) -> str:
+        """Asynchronously open a session without nesting an event loop."""
+        obj = OpenSessionReqInput(
+            capacity_of_str_len=capacity_of_str_len,
+            session_id=session_id,
+            streaming=streaming,
+            timeout=timeout,
+        )
+        return await self.tokenizer_manager.open_session(obj, None)
+
     def close_session(self, session_id: str) -> None:
         """Close a session and release its resources.
 
@@ -1323,6 +1343,11 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         obj = CloseSessionReqInput(session_id=session_id)
         self.loop.run_until_complete(self.tokenizer_manager.close_session(obj, None))
+
+    async def async_close_session(self, session_id: str) -> None:
+        """Asynchronously close a session without nesting an event loop."""
+        obj = CloseSessionReqInput(session_id=session_id)
+        await self.tokenizer_manager.close_session(obj, None)
 
     def start_profile(self, **kwargs):
         req = ProfileReq(req_type=ProfileReqType.START_PROFILE, **kwargs)

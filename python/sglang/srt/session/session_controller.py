@@ -288,6 +288,11 @@ class Session:
         else:
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
+            if len(input_ids) == 0:
+                abort = True
+                abort_message = (
+                    "An empty session continuation requires a completed prior request."
+                )
 
         new_req = Req(
             rid=req.rid,
@@ -298,6 +303,7 @@ class Session:
             lora_id=req.lora_id,
             session=self,
             custom_logit_processor=req.custom_logit_processor,
+            custom_inputs=req.custom_inputs,
             stream=req.stream,
             return_logprob=req.return_logprob,
             top_logprobs_num=req.top_logprobs_num,

@@ -828,6 +828,7 @@ class Req(ReqDllmMixin):
         lora_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         positional_embed_overrides: Optional[PositionalEmbeds] = None,
+        custom_inputs: Optional[Dict[str, Any]] = None,
         token_type_ids: List[int] = None,
         session: Optional[Session] = None,
         custom_logit_processor: Optional[str] = None,
@@ -884,6 +885,7 @@ class Req(ReqDllmMixin):
         self.session_generation: Optional[int] = None
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
+        self.custom_inputs = custom_inputs
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
 
         # For req-level memory management
