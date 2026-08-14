@@ -378,7 +378,7 @@ ONE thread — do not design for TBO threads that don't exist.
    resolved config with `get_context().override`; hand a per-runner value to its
    runner as a constructor argument. Projected bags are sealed the same way (leaf
    assignment raises).
-2. **Mutation ratchet** (`scripts/lint/check_server_args_mutation_ratchet.py`, exact pin 0 over the whole
+2. **Mutation guard** (`scripts/lint/check_server_args_mutation_ratchet.py`, pinned at 0 over the whole
    package minus the pipeline / multimodal_gen): textual scan for assignment forms. Never
    raise the baseline.
 3. **No-copy contract** (`test_server_args_no_instance_mutation_entry.py`): neither

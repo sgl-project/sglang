@@ -1,18 +1,7 @@
-"""Guard: no server_args mutation outside the resolution pipeline.
+"""Guard: no server_args mutation outside the resolution pipeline, pinned at 0.
 
-After ``ServerArgs.__post_init__`` returns, the instance carries the resolved
-configuration; the resolution pipeline (``server_args.py`` and
-``arg_groups/``) is the only place that computes it. Every assignment to a
-``server_args`` field elsewhere weakens that contract. The migration is done,
-so this is a flat ban rather than a decreasing count.
-
-There is no post-resolution mutation entry point on the instance any more:
-resolved config changes go to the context bags via
-``get_context().override(source, **fields)``, and a value that differs for one
-runner or worker travels as a constructor argument to it. The baseline is
-therefore zero. ``ServerArgs.__setattr__`` raises
-on a bare assignment after resolution; this ratchet catches the sites the tests
-never execute.
+``ServerArgs.__setattr__`` already raises on a bare assignment after
+resolution; this static scan is what reaches the sites tests never execute.
 """
 
 import re
