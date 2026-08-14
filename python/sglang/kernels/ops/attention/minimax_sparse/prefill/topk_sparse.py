@@ -1,12 +1,25 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
+import os
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
-from ..common.utils import check_sparse_kv_fp8, get_cu_seqblocks, robust_allocator
+from ..common.utils import (
+    SPARSE_KV_FP8_DTYPES,
+    check_sparse_kv_fp8,
+    get_cu_seqblocks,
+    robust_allocator,
+)
+
+# Prefill M-bucket split for per-length autotune pinning (SILOTIGER-762). The
+# observed prefill passes cluster into a small partial-chunk tail and a large
+# ~16k chunk; the threshold sits in the empty gap between them so the autotuner
+# caches/pins one winning occupancy config per prefill-length bucket instead of
+# reusing one winner across all M.
+_PREFILL_M_BUCKET_THRESHOLD = 2048
 
 
 @triton.heuristics(
@@ -25,12 +38,16 @@ from ..common.utils import check_sparse_kv_fp8, get_cu_seqblocks, robust_allocat
     }
 )
 @triton.autotune(
-    # Configs that fail to compile on the target arch are skipped, so widening
-    # the num_warps x num_stages grid only adds candidates, never a bad kernel.
+    # num_stages is capped at 3. With the bq8 prefill tile, num_stages=4 drives the
+    # ROCm `tritonamdgpu-block-pingpong` pass to crash the compiler HARD on gfx950
+    # (RuntimeError: PassManager::run failed) instead of being pruned -- that
+    # exception is not caught by the autotuner and takes the whole scheduler down.
+    # ns 2/3 are verified to compile and cover the useful pipeline depth for this
+    # gather-bound sparse kernel; deeper stages don't help here (SILOTIGER-762).
     configs=[
         triton.Config({}, num_warps=nw, num_stages=ns)
         for nw in (2, 4, 8)
-        for ns in (2, 3, 4)
+        for ns in (2, 3)
     ],
     key=[
         "BLOCK_SIZE_Q",
@@ -38,6 +55,10 @@ from ..common.utils import check_sparse_kv_fp8, get_cu_seqblocks, robust_allocat
         "qk_head_dim",
         "v_head_dim",
         "gqa_group_size",
+        # M-bucket (0=small tail, 1=large ~16k chunk): the best occupancy config
+        # differs by prefill-pass length, so cache/pin the autotune winner per
+        # bucket instead of reusing one winner across all M (SILOTIGER-762).
+        "m_bucket",
     ],
 )
 @triton.jit
@@ -64,6 +85,9 @@ def _gqa_share_sparse_fwd_kernel(
     max_topk,
     # q loop num
     num_q_loop,
+    # M-bucket id: unused in the kernel body, present only so @triton.autotune
+    # keys on it and caches the best config per prefill-length bucket.
+    m_bucket,
     # sm_scale
     sm_scale,
     # stride
@@ -97,8 +121,15 @@ def _gqa_share_sparse_fwd_kernel(
     HAS_SINK: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_FP8: tl.constexpr,
+    FP8_PV: tl.constexpr,
+    FP8_QK: tl.constexpr,
+    Q_IS_FP8: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
+    # bf16/fp16 compute dtype for internal casts (e.g. widening the fp8 K/V
+    # cache). Taken from the OUTPUT element type rather than q.dtype so the "Q
+    # arrives as fp8" fast path (Q_IS_FP8) still widens K/V to bf16, not fp8.
+    compute_dtype = o_ptr.dtype.element_ty
     # get batch id and head id
     pid_q = tl.program_id(0)
     pid_kh = tl.program_id(1)
@@ -177,6 +208,27 @@ def _gqa_share_sparse_fwd_kernel(
             lse_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
         acc_o = tl.full((BLOCK_SIZE_QH, BLOCK_SIZE_VD), 0, dtype=tl.float32)
         q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_KD)
+        # Select the Q operand + score scale for the Q@K dot (SILOTIGER-762):
+        #   Q_IS_FP8 -- Q already fp8 (unit-scaled like the fp8 K cache): consume
+        #     it natively, no in-kernel rounding (the lossless "no upcast" path).
+        #   FP8_QK   -- Q arrives bf16: per-tensor quantize it so amax(|Q|) maps
+        #     to the e4m3 finite max (448), then fold the inverse scale into
+        #     qk_scale. Overflow-safe (max->448, no NaN); the amax+cast run once
+        #     per q-block (not per K tile), so the cost is negligible.
+        #   else     -- keep Q at the bf16 compute dtype (K is widened to match).
+        # q_qk is kept separate from `q` so the sink dot still uses bf16.
+        qk_scale = sm_scale_log2e
+        if Q_IS_FP8:
+            if IS_FP8:
+                q_qk = q  # fp8 Q x fp8 K -> native fp8 MFMA, lossless in-kernel
+            else:
+                q_qk = q.to(compute_dtype)  # fp8 Q, bf16 K -> widen Q to match
+        elif FP8_QK and IS_FP8:
+            q_scale = 448.0 / tl.maximum(tl.max(tl.abs(q)), 1e-9)
+            q_qk = (q * q_scale).to(tl.float8e4nv)
+            qk_scale = sm_scale_log2e / q_scale
+        else:
+            q_qk = q
         # sparse attention
         for i in range(real_topk):
             # get current block start index (absolute K position)
@@ -201,26 +253,27 @@ def _gqa_share_sparse_fwd_kernel(
                 other=0.0,
             )
             if IS_FP8:
-                # fp8 main K cache is unit-scaled; widen to the Q compute dtype
-                # before the tl.dot (compiled out when the cache is bf16).
-                k = k.to(q.dtype)
+                if Q_IS_FP8:
+                    # Q already fp8 -> native fp8 Q@K, keep K fp8 (no widen).
+                    pass
+                elif FP8_QK:
+                    # in-kernel fp8 Q@K -> keep K fp8 (drops the widen cvt).
+                    pass
+                else:
+                    # fp8 main K cache is unit-scaled; widen to the compute dtype
+                    # before the tl.dot (compiled out when the cache is bf16).
+                    k = k.to(compute_dtype)
             # compute qk
             qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
             # causal mask
             qk += tl.where(off_q_k[:, None, :] >= c, 0, float("-inf"))
             qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
             # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, BLOCK_SIZE_K]
-            #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]
-            qk += tl.dot(q, k) * sm_scale_log2e
+            #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]. qk_scale folds the FP8_QK
+            # Q-scale inverse into sm_scale (== sm_scale_log2e when FP8_QK is off).
+            qk += tl.dot(q_qk, k) * qk_scale
             # K boundary mask: positions beyond seq_len contribute -inf
             qk += tl.where(pos_mask[None, :], 0, float("-inf"))
-            # compute m_ij and l_ij
-            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-            p = tl.exp2(qk - m_ij[:, None])
-            l_ij = tl.sum(p, axis=1)
-            # scale acc_o
-            acc_o_scale = tl.exp2(m_i - m_ij)
-            acc_o = acc_o * acc_o_scale[:, None]
             # paged load V
             v = tl.load(
                 v_cache_ptr
@@ -231,11 +284,26 @@ def _gqa_share_sparse_fwd_kernel(
                 other=0.0,
             )
             if IS_FP8:
-                # Widen V so `p.to(v.dtype)` casts P to the compute dtype rather
-                # than to fp8 (which would wreck attention-weight precision).
-                v = v.to(q.dtype)
-            p = p.to(v.dtype)
-            acc_o += tl.dot(p, v)
+                if FP8_PV:
+                    # keep V in fp8 for a fp8 P@V MFMA (drops the widen cvt).
+                    pass
+                else:
+                    # Widen V so `p.to(v.dtype)` casts P to the compute dtype
+                    # rather than fp8 (which would wreck attn-weight precision).
+                    v = v.to(compute_dtype)
+            # online softmax: running max + per-tile acc_o rescale.
+            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+            p = tl.exp2(qk - m_ij[:, None])
+            l_ij = tl.sum(p, axis=1)
+            acc_o_scale = tl.exp2(m_i - m_ij)
+            acc_o = acc_o * acc_o_scale[:, None]
+            if FP8_PV and IS_FP8:
+                # cast P to fp8 for the P@V MFMA (V kept fp8 above). P in [0, 1]
+                # here, so the clamp only guards a stray rounding overflow.
+                p_cast = tl.minimum(p, 448.0).to(v.dtype)
+            else:
+                p_cast = p.to(v.dtype)
+            acc_o += tl.dot(p_cast, v)
             # update statistics
             m_i = m_ij
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
@@ -276,6 +344,11 @@ def flash_prefill_with_gqa_share_sparse(
 ) -> torch.Tensor:
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="prefill")
+    # SILOTIGER-762: Q normally arrives bf16/fp16 (enforced by check_sparse_kv_fp8),
+    # so this is False today and the native-fp8-Q "no rounding" path stays dormant
+    # (Q_IS_FP8 is compiled out). Detect it anyway so a future pre-quantized-Q
+    # caller lights up the lossless path without another kernel change.
+    q_is_fp8 = q.dtype in SPARSE_KV_FP8_DTYPES
     assert block_size_q in {1, 2, 4, 8, 16, 32, 64}
     assert block_size_k in {16, 32, 64, 128}
     # shape
@@ -296,14 +369,29 @@ def flash_prefill_with_gqa_share_sparse(
         cu_seqblocks_q, max_seqblock_q, _, _, _, _ = get_cu_seqblocks(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k
         )
-    # output tensor
-    o = torch.empty(total_q, num_q_heads, v_head_dim, device=q.device, dtype=q.dtype)
+    # output tensor. Output stays a real compute dtype even when Q is fp8-storage.
+    out_dtype = (
+        q.dtype if q.dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
+    )
+    o = torch.empty(
+        total_q, num_q_heads, v_head_dim, device=q.device, dtype=out_dtype
+    )
     # launch kernel
     num_q_loop = (
         max_seqblock_q // 131072 + 1
     )  # calculate multiple queries in one kernel if seqlence length is too long
     BLOCK_SIZE_Q = triton.next_power_of_2(block_size_q)
     BLOCK_SIZE_K = triton.next_power_of_2(block_size_k)
+    # M-bucket for per-length autotune pinning (SILOTIGER-762): the best occupancy
+    # config differs between the small partial-chunk tail and the large ~16k
+    # prefill chunk. Two buckets; the threshold sits in the gap between them.
+    m_bucket = 0 if max_seqlen_q <= _PREFILL_M_BUCKET_THRESHOLD else 1
+    # SILOTIGER-762 fp8 attention datapath. Both flags consume the already-fp8 KV
+    # cache natively instead of upcasting it to bf16, and default ON; disable
+    # either with SGLANG_MINIMAX_SPARSE_FP8_PV=0 / SGLANG_MINIMAX_SPARSE_FP8_QK=0.
+    # Both are no-ops unless the KV cache is fp8.
+    fp8_pv = os.environ.get("SGLANG_MINIMAX_SPARSE_FP8_PV", "1") == "1"
+    fp8_qk = os.environ.get("SGLANG_MINIMAX_SPARSE_FP8_QK", "1") == "1"
     grid = (
         triton.cdiv(triton.cdiv(max_seqlen_q, block_size_q), num_q_loop),
         num_k_heads,
@@ -329,6 +417,7 @@ def flash_prefill_with_gqa_share_sparse(
         v_head_dim,
         topk,
         num_q_loop,
+        m_bucket,
         sm_scale,
         q.stride(0),
         q.stride(1),
@@ -352,5 +441,8 @@ def flash_prefill_with_gqa_share_sparse(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         USE_TMA=use_tma,
         IS_FP8=is_fp8,
+        FP8_PV=fp8_pv,
+        FP8_QK=fp8_qk,
+        Q_IS_FP8=q_is_fp8,
     )
     return o

@@ -63,6 +63,60 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self.local_blocks = (
                 local_tokens + self.block_size_k - 1
             ) // self.block_size_k + 1
+
+        # Prefill-only tile overrides (SILOTIGER-762). These affect ONLY the
+        # sparse prefill path (the fwd kernel _gqa_share_sparse_fwd_kernel + the
+        # prefill indexer, both fanned out from minimax_sparse_prefill); decode is
+        # deliberately left untouched (its call passes block_size_q=1 and the
+        # checkpoint block_size_k / init_blocks / local_blocks), so tuning prefill
+        # never changes decode behavior or timing. The forced-include init/local
+        # windows are re-blocked to the prefill granularity from the checkpoint
+        # token counts. Any change alters prefill outputs -> gate on GSM8K.
+        from sglang.srt.environ import envs as _envs
+
+        self.block_size_q_prefill = self.block_size_q
+        self.block_size_k_prefill = self.block_size_k
+        self.init_blocks_prefill = self.init_blocks
+        self.local_blocks_prefill = self.local_blocks
+        _bq_override = _envs.SGLANG_MINIMAX_SPARSE_BLOCK_SIZE_Q.get()
+        if _bq_override and _bq_override > 0:
+            assert _bq_override in {1, 2, 4, 8, 16, 32, 64}, (
+                f"SGLANG_MINIMAX_SPARSE_BLOCK_SIZE_Q must be in "
+                f"{{1,2,4,8,16,32,64}}, got {_bq_override}"
+            )
+            logger.warning(
+                "[MiniMaxSparse] Prefill block_size_q %d -> %d "
+                "(SGLANG_MINIMAX_SPARSE_BLOCK_SIZE_Q, prefill-only); "
+                "accuracy-gate this change.",
+                self.block_size_q_prefill,
+                _bq_override,
+            )
+            self.block_size_q_prefill = _bq_override
+        _bk_override = _envs.SGLANG_MINIMAX_SPARSE_BLOCK_SIZE_K.get()
+        if _bk_override and _bk_override > 0:
+            assert _bk_override in {16, 32, 64, 128}, (
+                f"SGLANG_MINIMAX_SPARSE_BLOCK_SIZE_K must be in "
+                f"{{16,32,64,128}}, got {_bk_override}"
+            )
+            logger.warning(
+                "[MiniMaxSparse] Prefill block_size_k %d -> %d "
+                "(SGLANG_MINIMAX_SPARSE_BLOCK_SIZE_K, prefill-only); "
+                "accuracy-gate this change.",
+                self.block_size_k_prefill,
+                _bk_override,
+            )
+            self.block_size_k_prefill = _bk_override
+            # Re-block the forced-include init/local windows at the prefill
+            # granularity, from the checkpoint token counts, so they cover the
+            # same token span as decode's stock windows.
+            init_tokens = self.init_blocks * self.block_size_k
+            local_tokens = max(0, self.local_blocks - 1) * self.block_size_k
+            self.init_blocks_prefill = (
+                init_tokens + self.block_size_k_prefill - 1
+            ) // self.block_size_k_prefill
+            self.local_blocks_prefill = (
+                local_tokens + self.block_size_k_prefill - 1
+            ) // self.block_size_k_prefill + 1
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
 
         # MSA (fmha_sm100) is SM100-only; fall back to the Triton sparse path when
@@ -337,11 +391,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             prefix_lens,
             self._max_seqlen_q,
             self._max_seqlen_k,
-            self.block_size_q,
-            self.block_size_k,
+            self.block_size_q_prefill,
+            self.block_size_k_prefill,
             self.topk_blocks,
-            self.init_blocks,
-            self.local_blocks,
+            self.init_blocks_prefill,
+            self.local_blocks_prefill,
             score_type=self.score_type,
             disable_index_value=disable_value,
             use_msa=self.use_msa,

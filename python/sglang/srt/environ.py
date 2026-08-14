@@ -1075,6 +1075,18 @@ class Envs:
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
 
+    # MiniMax-M3 sparse prefill tile overrides (SILOTIGER-762). PREFILL-ONLY tile
+    # sizes for the sparse fwd kernel + prefill indexer; decode is untouched (it
+    # keeps block_size_q=1 and the checkpoint block_size_k / init / local blocks).
+    # 0 = derived default (block_size_q=1; block_size_k=sparse_block_size).
+    #   block_size_q in {1,2,4,8,16,32,64}; queries sharing one top-k selection.
+    #     Larger amortizes the paged K/V gather (~linear) but coarsens selection.
+    #     Constraint: gqa_group_size * block_size_q <= 128.
+    #   block_size_k in {16,32,64,128}; tokens attended/query = topk*block_size_k.
+    # Both change model outputs -> accuracy-gate (GSM8K) before committing.
+    SGLANG_MINIMAX_SPARSE_BLOCK_SIZE_Q = EnvInt(0)
+    SGLANG_MINIMAX_SPARSE_BLOCK_SIZE_K = EnvInt(0)
+
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
