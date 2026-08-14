@@ -1178,7 +1178,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         if self.attn_output_gate:
             if not _is_npu:
-                attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+                fused_sigmoid_mul(attn_output, gate)
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output.mul_(torch.sigmoid(gate_val))

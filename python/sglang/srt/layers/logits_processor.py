@@ -219,7 +219,6 @@ class LogitsMetadata:
             draft_extend_select_index = forward_batch.spec_info.select_index
         else:
             draft_extend_select_index = None
-
         return cls(
             forward_mode=forward_batch.forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
@@ -229,7 +228,11 @@ class LogitsMetadata:
             extend_token_ids_logprob=extend_token_ids_logprob,
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
+            extend_logprob_start_lens_cpu=(
+                forward_batch.extend_logprob_start_lens_cpu
+                if extend_return_logprob
+                else None
+            ),
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
             token_ids_logprobs=forward_batch.token_ids_logprobs,

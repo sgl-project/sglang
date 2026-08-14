@@ -5,7 +5,11 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 )
 from sglang.srt.utils import is_cpu, is_npu, is_xpu
 
-if not is_cpu():
+_is_cpu = is_cpu()
+_is_npu = is_npu()
+_is_xpu = is_xpu()
+
+if not _is_cpu:
     from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
         fused_recurrent_gated_delta_rule_packed_decode,
@@ -17,7 +21,7 @@ if not is_cpu():
         fused_sigmoid_gating_delta_rule_update,
     )
 
-if is_npu():
+if _is_npu:
     from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
     from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update_npu,
@@ -25,14 +29,14 @@ if is_npu():
 
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
-elif is_cpu():
+elif _is_cpu:
     from sgl_kernel.mamba import chunk_gated_delta_rule_cpu
 
     chunk_gated_delta_rule = chunk_gated_delta_rule_cpu
     fused_sigmoid_gating_delta_rule_update = (
         torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu
     )
-elif is_xpu():
+elif _is_xpu:
     from sglang.srt.hardware_backend.xpu.kernels.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
@@ -41,7 +45,7 @@ elif is_xpu():
 class TritonGDNKernel(LinearAttnKernelBase):
     """Triton-based kernel for GDN (Gated Delta Network) linear attention."""
 
-    supports_packed_decode: bool = not is_cpu() and not is_npu()
+    supports_packed_decode: bool = not _is_cpu and not _is_npu
 
     def packed_decode(
         self,
@@ -181,7 +185,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
     ) -> tuple:
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-        if is_npu():
+        if _is_npu:
             recurrent_state = ssm_states[cache_indices]
             recurrent_state_indices_args = {}
 

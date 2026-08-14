@@ -58,16 +58,9 @@ def test_fused_sigmoid_mul(m, num_heads, head_dim, dtype, gate_3d):
         gate = torch.randn_like(x)
 
     gate_ref = gate.reshape(m, -1) if gate_3d else gate
-    _assert_close(
-        x * torch.sigmoid(gate_ref),
-        torch.ops.sgl_kernel.fused_sigmoid_mul_cpu(x, gate, False),
-    )
-
-    x_inplace = x.clone()
-    ref_inplace = x_inplace * torch.sigmoid(gate_ref)
-    out_inplace = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu(x_inplace, gate, True)
-    assert out_inplace.data_ptr() == x_inplace.data_ptr()
-    _assert_close(ref_inplace, x_inplace)
+    expected = x * torch.sigmoid(gate_ref)
+    torch.ops.sgl_kernel.fused_sigmoid_mul_cpu(x, gate)
+    _assert_close(expected, x)
 
 
 if __name__ == "__main__":
