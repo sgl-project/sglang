@@ -282,6 +282,44 @@ class TestCodePatcher:
 
         assert obj.greet("world") == "hello world"
 
+    def test_rolls_back_when_later_patch_raises_base_exception(
+        self, sample_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cls = sample_module.SampleClass
+        obj = cls()
+
+        patches = [
+            PatchSpec(
+                target=f"{SAMPLE_MODULE_NAME}.SampleClass.greet",
+                edits=[
+                    EditSpec(
+                        match='greeting = f"hello {name}"',
+                        replacement='greeting = f"partial_patched {name}"',
+                    )
+                ],
+            ),
+            PatchSpec(
+                target=f"{SAMPLE_MODULE_NAME}.SampleClass.compute",
+                edits=[],
+            ),
+        ]
+
+        def resolve_target(target: str):
+            if target.endswith(".compute"):
+                raise KeyboardInterrupt
+            return _resolve_target(target)
+
+        monkeypatch.setattr(
+            "sglang.srt.debug_utils.source_patcher.code_patcher._resolve_target",
+            resolve_target,
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            with CodePatcher(patches=patches):
+                pass
+
+        assert obj.greet("world") == "hello world"
+
 
 if __name__ == "__main__":
     import sys

@@ -115,7 +115,7 @@ def _apply_specs(specs: list[PatchSpec]) -> list[PatchState]:
                 target=target_fn, edits=spec.edits, preamble=spec.preamble
             )
             states.append(state)
-    except Exception:
+    except BaseException:
         for state in reversed(states):
             state.restore()
         raise
