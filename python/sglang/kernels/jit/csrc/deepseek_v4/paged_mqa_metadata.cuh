@@ -77,10 +77,15 @@ __global__ __launch_bounds__(kTinyBlock, 1)  //
   const uint32_t global_sum = s_global_sum;
   const uint32_t avg = global_sum / num_sm;
   const uint32_t ret = global_sum % num_sm;
+  const uint32_t pivot = num_sm - ret;
 
   // Stride loop so num_sm > blockDim.x - 1 is fully written.
   for (uint32_t i = tx; i <= num_sm; i += blockDim.x) {
-    const uint32_t target = i * avg + ::min(i, ret);
+    // Match DeepGEMM's reversed remainder allocation: leading SMs get
+    // `avg` work and the final `ret` SMs get `avg + 1`. When global_sum is
+    // smaller than num_sm, empty SMs stay at the valid (q=0, offset=0)
+    // boundary instead of starting at q=batch_size.
+    const uint32_t target = i * avg + (i > pivot ? i - pivot : 0);
 
     uint32_t lo = 0;
     uint32_t hi = bs;
@@ -143,10 +148,11 @@ __global__ __launch_bounds__(kSmallBlock, 1)  //
   const uint32_t global_sum = s_global_sum;
   const uint32_t avg = global_sum / num_sm;
   const uint32_t ret = global_sum % num_sm;
+  const uint32_t pivot = num_sm - ret;
 
   // Stride loop so num_sm > blockDim.x - 1 is fully written.
   for (uint32_t i = tx; i <= num_sm; i += blockDim.x) {
-    const uint32_t target = i * avg + ::min(i, ret);
+    const uint32_t target = i * avg + (i > pivot ? i - pivot : 0);
 
     uint32_t lo = 0;
     uint32_t hi = bs;
@@ -244,12 +250,13 @@ __global__ __launch_bounds__(kKernelBThreads, 1)  //
   const uint32_t global_sum = s_global_sum;
   const uint32_t avg = global_sum / num_sm;
   const uint32_t ret = global_sum % num_sm;
+  const uint32_t pivot = num_sm - ret;
 
   // Stride loop so num_sm > blockDim.x - 1 is fully written. `continue`
   // replaces the original early-out `return` so later strided targets
   // still get processed.
   for (uint32_t i = tx; i <= num_sm; i += blockDim.x) {
-    const uint32_t target = i * avg + ::min(i, ret);
+    const uint32_t target = i * avg + (i > pivot ? i - pivot : 0);
 
     uint32_t t_lo = 0;
     uint32_t t_hi = num_tiles;

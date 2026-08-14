@@ -72,13 +72,17 @@ def paged_mqa_metadata_ref(
     global_sum = int(work_per_batch.sum().item())
     avg = global_sum // num_sm
     ret = global_sum % num_sm
+    pivot = num_sm - ret
 
     schedule_metadata = torch.empty((num_sm + 1, 2), dtype=torch.int32, device=device)
     work = work_per_batch.tolist()
     q = 0
     sum_work = work[0] if batch_size > 0 else 0
     for i in range(num_sm + 1):
-        target = i * avg + min(i, ret)
+        # Match DeepGEMM's reversed allocation: the final ``ret`` SMs get
+        # one extra unit of work. This keeps leading empty SMs at q=0 when
+        # there is less total work than available SMs.
+        target = i * avg + max(i - pivot, 0)
         while sum_work <= target:
             q += 1
             if q >= batch_size:
