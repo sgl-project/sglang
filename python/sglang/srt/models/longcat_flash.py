@@ -328,7 +328,8 @@ class LongcatFlashMoE(nn.Module):
             correction_bias=self.router.e_score_correction_bias.data,
             layer_id=layer_id,
         )
-        self.topk.forward = self.topk.forward_native
+        if not _is_npu:
+            self.topk.forward = self.topk.forward_native
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=self.num_experts,
