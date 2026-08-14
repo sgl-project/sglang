@@ -941,10 +941,12 @@ class TestUnifiedRadixCacheComponentPlacementEvents(
     def test_swa_fresh_insert_reports_swa_on_gpu(self):
         tokens = [1, 2, 3, 4]
         stored = self._insert_and_collect(self._SWA_CFG, tokens)
-        self.assertEqual(len(stored), len(tokens))
-        for event in stored:
-            self.assertIn(KV_COMPONENT_FULL, event.component_types)
-            self.assertIn(KV_COMPONENT_SWA, event.component_types)
+        # Every page carries the same [full, swa] set and chains onto the
+        # previous block, so coalescing folds them into one spanning event.
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(len(stored[0].block_hashes), len(tokens))
+        self.assertIn(KV_COMPONENT_FULL, stored[0].component_types)
+        self.assertIn(KV_COMPONENT_SWA, stored[0].component_types)
 
     def _insert_and_collect(self, cfg, tokens, *, component_types=True):
         """Insert one fresh key; return its GPU BlockStored events in emit order."""
@@ -964,36 +966,29 @@ class TestUnifiedRadixCacheComponentPlacementEvents(
         # apply) SWA would be missing; running it at TAIL captures it.
         tokens = [1, 2, 3, 4]
         stored = self._insert_and_collect(self._SWA_SPLIT_CFG, tokens)
-        # page_size=1, so one event per token, in token order. Nothing has aged
-        # out of the window yet, so every page carries both components.
-        self.assertEqual([e.token_ids for e in stored], [[t] for t in tokens])
+        # Nothing has aged out of the window yet, so every page carries both
+        # components and coalesces into one event spanning all tokens.
+        self.assertEqual([e.token_ids for e in stored], [tokens])
         self.assertEqual(
             [e.component_types for e in stored],
-            [[KV_COMPONENT_FULL, KV_COMPONENT_SWA]] * len(tokens),
+            [[KV_COMPONENT_FULL, KV_COMPONENT_SWA]],
         )
 
     def test_insert_emits_parents_before_children(self):
         # The SWA commit-time leaf split makes the tail node younger than its own
-        # parents, so the flush must re-derive root-first order. A child announced
-        # first would carry parent_block_hash=None and -- because the hash chain is
-        # computed lazily off the parent's hash -- a block hash nothing else
-        # reproduces.
+        # parents, so the flush must re-derive root-first order. Emitted in that
+        # order every page shares [full, swa] and chains onto the previous block,
+        # so coalescing folds all of them into one event. A child emitted before
+        # its parent would carry the wrong (parentless) hash, break the chain, and
+        # prevent that merge -- so the single spanning event proves the ordering.
         tokens = [1, 2, 3, 4, 5, 6, 7, 8]
         stored = self._insert_and_collect(self._SWA_SPLIT_CFG, tokens)
 
-        self.assertEqual([e.token_ids for e in stored], [[t] for t in tokens])
-        announced = set()
-        for event in stored:
-            if event.parent_block_hash is not None:
-                self.assertIn(
-                    event.parent_block_hash,
-                    announced,
-                    f"block {event.block_hashes[0]} announced before its parent",
-                )
-            announced.add(event.block_hashes[0])
-        # Only the very first block is parentless.
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0].token_ids, tokens)
+        self.assertEqual(len(stored[0].block_hashes), len(tokens))
+        # Only the head of the chain is parentless.
         self.assertIsNone(stored[0].parent_block_hash)
-        self.assertTrue(all(e.parent_block_hash is not None for e in stored[1:]))
 
     def test_component_mode_block_hashes_match_legacy(self):
         # Block hashes are position-aware and must not depend on whether the
@@ -1024,13 +1019,15 @@ class TestUnifiedRadixCacheComponentPlacementEvents(
             )
         )
         stored = self._stored(cache, StorageMedium.GPU)
-        self.assertEqual(len(stored), len(tokens))
-        for event in stored:
-            self.assertIn(KV_COMPONENT_FULL, event.component_types)
-        # Mamba is anchored to the leaf's last page only.
-        self.assertNotIn(KV_COMPONENT_MAMBA, stored[0].component_types)
-        self.assertNotIn(KV_COMPONENT_MAMBA, stored[1].component_types)
-        self.assertIn(KV_COMPONENT_MAMBA, stored[2].component_types)
+        # Pages 0-1 are FULL-only and coalesce; the last page adds MAMBA, so its
+        # different component set keeps it a separate event.
+        self.assertEqual(len(stored), 2)
+        self.assertEqual(stored[0].component_types, [KV_COMPONENT_FULL])
+        self.assertEqual(stored[0].token_ids, [1, 2])
+        self.assertEqual(
+            stored[1].component_types, [KV_COMPONENT_FULL, KV_COMPONENT_MAMBA]
+        )
+        self.assertEqual(stored[1].token_ids, [3])
 
     def test_load_back_unions_component_nodes(self):
         # commit_load_back must emit after every component restored, unioning each
@@ -1074,10 +1071,10 @@ class TestUnifiedRadixCacheComponentPlacementEvents(
         node.component_data[ComponentType.SWA].value = None
         cache.tree_core._restate_component_placement(node, StorageMedium.GPU)
         stored = [e for e in cache.take_events() if isinstance(e, BlockStored)]
-        self.assertEqual(len(stored), 2)
-        for event in stored:
-            self.assertEqual(event.component_types, [KV_COMPONENT_FULL])
-            self.assertEqual(event.medium, StorageMedium.GPU)
+        # Both pages restate to FULL-only and coalesce into one event.
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0].component_types, [KV_COMPONENT_FULL])
+        self.assertEqual(stored[0].medium, StorageMedium.GPU)
 
     def test_restate_is_noop_when_base_component_gone(self):
         cache, _, _ = self._build(self._SWA_CFG)
@@ -1124,10 +1121,10 @@ class TestUnifiedRadixCacheComponentPlacementEvents(
         node.component_data[ComponentType.MAMBA].host_value = None
         cache.tree_core._restate_component_placement(node, StorageMedium.CPU)
         stored = [e for e in cache.take_events() if isinstance(e, BlockStored)]
-        self.assertEqual(len(stored), 2)
-        for event in stored:
-            self.assertEqual(event.component_types, [KV_COMPONENT_FULL])
-            self.assertEqual(event.medium, StorageMedium.CPU)
+        # Both pages restate to FULL-only and coalesce into one event.
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0].component_types, [KV_COMPONENT_FULL])
+        self.assertEqual(stored[0].medium, StorageMedium.CPU)
 
     # ---- Deferral ordering invariant (see _flush_insert_store_events) ----
 
@@ -1209,9 +1206,10 @@ class TestUnifiedRadixCacheComponentPlacementEvents(
     def test_flag_off_fresh_insert_omits_component_types(self):
         tokens = [1, 2, 3, 4]
         stored = self._insert_and_collect(self._SWA_CFG, tokens, component_types=False)
-        self.assertEqual(len(stored), len(tokens))
-        for event in stored:
-            self.assertIsNone(event.component_types)
+        # Flag off -> no component dimension; legacy coalescing (None == None)
+        # merges every page into one event.
+        self.assertEqual(len(stored), 1)
+        self.assertIsNone(stored[0].component_types)
 
 
 class UnifiedRadixCacheSuite:
