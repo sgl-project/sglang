@@ -63,6 +63,8 @@ def _make_model_runner(
     disaggregation_mode="null",
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
+    kv_lora_rank=512,
+    qk_rope_head_dim=64,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -81,6 +83,8 @@ def _make_model_runner(
     mc = SimpleNamespace()
     mc.head_dim = head_dim
     mc.v_head_dim = v_head_dim
+    mc.kv_lora_rank = kv_lora_rank
+    mc.qk_rope_head_dim = qk_rope_head_dim
     mc.is_hybrid_swa = is_hybrid_swa
     mc.full_attention_layer_ids = (
         full_attention_layer_ids
@@ -92,16 +96,17 @@ def _make_model_runner(
     )
     mc.swa_head_dim = swa_head_dim or head_dim
     mc.swa_v_head_dim = swa_v_head_dim or v_head_dim
-    mc.get_num_kv_heads = lambda tp_size: num_kv_heads
+    mc.get_num_kv_heads = lambda tp_size, dcp_size=1: num_kv_heads
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     mc.hf_config.get_text_config = lambda: mc.hf_config
     mc.linear_attn_registry_result = None
+    mc.context_len = 8192
     mr.model_config = mc
-
     mr.kv_cache_dtype = "fake_bf16"
 
     sa = SimpleNamespace()
+    sa.max_total_tokens = None
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
     sa.page_size = page_size
     sa.disable_radix_cache = disable_radix_cache
@@ -117,6 +122,7 @@ def _make_model_runner(
     sa.disaggregation_mode = disaggregation_mode
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
+    sa.enable_hisparse = False
     sa.enable_dsa_cache_layer_split = False
     sa.kv_cache_dtype = "auto"
     mr.server_args = sa
@@ -214,6 +220,44 @@ class TestDefaultConfigurator(unittest.TestCase):
         _, _, config = self._run(10_000_000)
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
+
+    @patch(
+        "sglang.srt.model_executor.pool_configurator.get_dsa_index_head_dim",
+        return_value=128,
+    )
+    @patch(
+        "sglang.srt.model_executor.pool_configurator.is_deepseek_dsa",
+        return_value=True,
+    )
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        side_effect=(576, 656),
+    )
+    def test_dsa_mla_cell_size_uses_backend_kv_layout(
+        self, mock_calculate_mla_kv_cache_dim, _mock_is_dsa, _mock_index_head_dim
+    ):
+        num_layers = 2
+        raw = _make_model_runner(
+            num_layers=num_layers,
+            use_mla_backend=True,
+        )
+        packed = _make_model_runner(
+            num_layers=num_layers,
+            use_mla_backend=True,
+        )
+
+        with mock_cpu_env(kv_size=1):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            raw_configurator = DefaultPoolConfigurator(raw)
+            packed_configurator = DefaultPoolConfigurator(packed)
+
+        # The DSA indexer adds 128 FP8 values and one FP32 scale (4 bytes).
+        self.assertEqual(raw_configurator._cell_size, (576 + 132) * num_layers)
+        self.assertEqual(packed_configurator._cell_size, (656 + 132) * num_layers)
+        self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
 
 
 class TestHybridSWAConfigurator(unittest.TestCase):
@@ -599,6 +643,99 @@ class TestFactory(unittest.TestCase):
 
         self.assertIsInstance(_cfg(2), SWAChunkCapPoolConfigurator)
         self.assertNotIsInstance(_cfg(None), SWAChunkCapPoolConfigurator)
+
+
+class TestDflashDraftKvBudget(unittest.TestCase):
+    """DFLASH draft KV pool as a flat bytes/token term on the target's budget."""
+
+    def test_bytes_per_token_from_draft_geometry(self):
+        import torch
+
+        from sglang.srt.speculative.dflash_utils import (
+            dflash_draft_cell_size_per_token,
+        )
+
+        draft = SimpleNamespace(
+            get_num_kv_heads=lambda tp: 4, head_dim=128, v_head_dim=128
+        )
+        # 4 kv heads * (128 + 128) dims * 5 layers * 2 bytes
+        self.assertEqual(
+            dflash_draft_cell_size_per_token(
+                draft_model_config=draft,
+                draft_num_layers=5,
+                draft_kv_cache_dtype=torch.bfloat16,
+                tp_size=1,
+            ),
+            10240,
+        )
+        self.assertEqual(
+            dflash_draft_cell_size_per_token(
+                draft_model_config=draft,
+                draft_num_layers=0,
+                draft_kv_cache_dtype=torch.bfloat16,
+                tp_size=1,
+            ),
+            0,
+        )
+
+    def test_dcp_replication_scales_draft_budget(self):
+        """The replicated draft pool spans every DCP virtual location."""
+        draft_kv_per_token = 10_240
+        mr = _make_model_runner()
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_aux_config = SimpleNamespace(
+            eagle_draft_num_layers=None,
+            dflash_draft_num_layers=5,
+            dflash_draft_cell_size_per_token=draft_kv_per_token,
+        )
+
+        target_kv_per_token = 4 * (64 + 64) * 32 * KV_SIZE
+        for dcp_size in (1, 8):
+            with self.subTest(dcp_size=dcp_size):
+                # TP=8 makes both topologies valid. The mock deliberately keeps
+                # target geometry fixed so this assertion isolates the draft term.
+                with (
+                    mock_cpu_env(tp_size=8),
+                    get_parallel().override(attn_dcp_size=dcp_size),
+                ):
+                    from sglang.srt.model_executor.pool_configurator import (
+                        create_memory_pool_configurator,
+                    )
+
+                    cfg = create_memory_pool_configurator(mr)
+
+                self.assertEqual(
+                    cfg._cell_size,
+                    target_kv_per_token + draft_kv_per_token * dcp_size,
+                )
+
+    def test_hybrid_swa_budget_shrinks_by_draft_pool(self):
+        """HybridSWA carried no draft term, so the draft pool fell outside the budget."""
+        available = 10_000_000
+
+        def _tokens(draft_kv_per_token):
+            mr = _make_model_runner(
+                is_hybrid_swa=True,
+                full_attention_layer_ids=list(range(16)),
+                swa_attention_layer_ids=list(range(16, 32)),
+                swa_num_kv_heads=4,
+            )
+            mr.spec_algorithm.is_dflash_family.return_value = True
+            mr.spec_aux_config = SimpleNamespace(
+                eagle_draft_num_layers=None,
+                dflash_draft_num_layers=5,
+                dflash_draft_cell_size_per_token=draft_kv_per_token,
+            )
+            with mock_cpu_env():
+                from sglang.srt.model_executor.pool_configurator import (
+                    create_memory_pool_configurator,
+                )
+
+                cfg = create_memory_pool_configurator(mr)
+                config = cfg.calculate_pool_sizes(available, mr.server_args.page_size)
+            return config.full_max_total_num_tokens
+
+        self.assertLess(_tokens(10240), _tokens(None))
 
 
 if __name__ == "__main__":

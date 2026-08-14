@@ -26,11 +26,11 @@ import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.jit_kernel.all_reduce import (
+from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.ops.communication.all_reduce import (
     fused_parallel_qknorm,
     get_fused_parallel_qknorm_max_occupancy,
 )
-from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_pp_group,
@@ -80,7 +80,13 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
     narrow_padded_param_and_loaded_weight,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_schedule,
+    process_model_config,
+)
 
 # get_bool_env_var is defined in sglang.srt.utils.common, not sglang.srt.distributed.
 # Importing from the wrong module causes this file to fail import, which prevents the
@@ -425,11 +431,10 @@ class MiniMaxM2QKRMSNorm:
 
         props = torch.cuda.get_device_properties(device)
         # probe the maximum tokens for one prefill
-        server_args = get_server_args()
-        max_tokens = server_args.chunked_prefill_size
+        max_tokens = get_schedule().chunked_prefill_size
         if max_tokens is None:
-            max_tokens = server_args.model_config.context_len
-        max_tokens = max(max_tokens, server_args.max_prefill_tokens)
+            max_tokens = process_model_config().context_len
+        max_tokens = max(max_tokens, get_schedule().max_prefill_tokens)
         logger.info(f"[AR] Using CustomAllReduceV2 for MiniMaxM2 with {max_tokens = }")
         ALIGN = 512
         # typically, this should not exceed 1M, since max_tokens is usually less than 16384
@@ -477,10 +482,26 @@ class MiniMaxM2QKRMSNorm:
         return q, k
 
     def _forward_cpu(self, q: torch.Tensor, k: torch.Tensor):
-        # TODO: add c++ kernel for cpu
-        q = self._q_norm(q.contiguous())
-        k = self._k_norm(k.contiguous())
-        return q, k
+        if self._world_size > 1:
+            sum_sq = torch.ops.sgl_kernel.fused_qk_rmsnorm_sumsq_cpu(q, k)
+            sum_sq = attn_tp_all_reduce(sum_sq)
+            return torch.ops.sgl_kernel.fused_qk_rmsnorm_apply_from_stats_cpu(
+                q,
+                k,
+                self._q_norm.weight,
+                self._k_norm.weight,
+                sum_sq,
+                self._world_size,
+                self._eps,
+            )
+
+        return torch.ops.sgl_kernel.fused_qk_rmsnorm_cpu(
+            q,
+            k,
+            self._q_norm.weight,
+            self._k_norm.weight,
+            self._eps,
+        )
 
 
 class MiniMaxM2MoE(nn.Module):
@@ -513,7 +534,7 @@ class MiniMaxM2MoE(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_local_experts
-            + get_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,

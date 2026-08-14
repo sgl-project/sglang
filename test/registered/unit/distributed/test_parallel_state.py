@@ -41,10 +41,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 # Import the actual parallel_state module
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
@@ -268,6 +267,74 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             parallel_state.destroy_model_parallel()
 
 
+def _read_group_descs(group_name):
+    """Build a real ``GroupCoordinator`` over a single-rank gloo world and read the
+    ``group_desc`` back off the live ProcessGroup objects it created.
+
+    Returns ``(device_group.group_desc, cpu_group.group_desc)``.
+
+    Unlike a mocked ``new_group``, this drives the *actual*
+    ``torch.distributed.new_group`` in the normal (NCCL/Gloo) branch, so:
+
+    * it fails if the installed PyTorch does not accept the ``group_desc`` kwarg
+      -- the only real risk of this change; and
+    * it asserts on the value read back from the constructed ProcessGroup, not on
+      the string handed to a patched ``new_group`` (which would just mirror the
+      implementation).
+
+    gloo + ``world_size=1`` needs no GPU/NCCL and no extra process, so this stays
+    in the CPU suite. The mooncake branch is structurally identical but needs a
+    built ``mooncake`` backend that the CPU runner does not have, so it is not
+    exercised separately here.
+    """
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        backend="gloo", store=dist.HashStore(), rank=0, world_size=1
+    )
+    try:
+        coord = parallel_state.GroupCoordinator(
+            group_ranks=[[0]],
+            local_rank=0,
+            torch_distributed_backend="gloo",
+            use_pynccl=False,
+            use_pymscclpp=False,
+            use_custom_allreduce=False,
+            use_torch_symm_mem_all_reduce=False,
+            use_hpu_communicator=False,
+            use_xpu_communicator=False,
+            use_npu_communicator=False,
+            use_message_queue_broadcaster=False,
+            group_name=group_name,
+        )
+        return coord.device_group.group_desc, coord.cpu_group.group_desc
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("group_name", ["tp", "pp"])
+def test_group_desc_propagated_via_real_new_group(group_name):
+    """Regression guard: ``GroupCoordinator`` must tag the ProcessGroups it creates
+    with ``group_desc=f"{group_name}:{device|cpu}"``.
+
+    This is the metadata NCCL Inspector reads to distinguish TP/PP communicators;
+    dropping it in the ``new_group`` calls reintroduces the PP-misclassified-as-TP
+    bug. Read back from the real ProcessGroups so a real ``new_group`` actually
+    accepts and stores the kwarg.
+    """
+    assert _read_group_descs(group_name) == (
+        f"{group_name}:device",
+        f"{group_name}:cpu",
+    )
+
+
+def test_group_desc_none_normalized_to_anonymous():
+    """group_name=None keeps the existing "anonymous" normalization, so the
+    emitted descs must be anonymous:device / anonymous:cpu (not None:device)."""
+    assert _read_group_descs(None) == ("anonymous:device", "anonymous:cpu")
+
+
 if __name__ == "__main__":
     # Run tests without requiring GPUs
     import sys
@@ -275,6 +342,9 @@ if __name__ == "__main__":
     try:
         test_parallel_group_construction_tp8_attn_cp2()
         test_parallel_group_construction_tp8_moe_ep4_cp2()
+        test_group_desc_propagated_via_real_new_group("tp")
+        test_group_desc_propagated_via_real_new_group("pp")
+        test_group_desc_none_normalized_to_anonymous()
 
         sys.exit(0)
     except AssertionError as e:

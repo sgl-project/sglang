@@ -26,7 +26,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
-    cp_split_before_forward,
+    cp_shard_model_inputs,
     is_cp_v2_active,
     prepare_cp_forward,
 )
@@ -50,7 +50,12 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     set_tc_piecewise_forward_context,
 )
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import ceil_align, require_mlp_sync
+from sglang.srt.utils.common import (
+    ceil_align,
+    get_eager_max_batch_size,
+    require_mlp_sync,
+)
+from sglang.srt.utils.device_timer import device_timer_ctx
 
 logger = logging.getLogger(__name__)
 
@@ -101,14 +106,12 @@ class EagerRunner(BaseRunner):
             # (expand_for_topk_draft) before the eager fallback.
             max_bs *= sa.speculative_eagle_topk
         # Mirror prepare_mlp_sync_batch padding so the registry holds what load_batch copies.
-        if require_mlp_sync(sa):
-            from sglang.srt.layers.cp.padding import get_cp_padding_align_size
-
-            max_bs = ceil_align(max_bs, self.attn_tp_size)
-            max_bs = ceil_align(max_bs, get_cp_padding_align_size())
+        max_bs = get_eager_max_batch_size(sa, max_bs)
         prefill_ceiling = max(mr.max_total_num_tokens, sa.max_prefill_buffer_tokens())
         max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_req)
         if require_mlp_sync(sa):
+            from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+
             max_num_token = ceil_align(max_num_token, self.attn_tp_size)
             max_num_token = ceil_align(max_num_token, get_cp_padding_align_size())
         self._eager_max_bs = max_bs
@@ -235,11 +238,7 @@ class EagerRunner(BaseRunner):
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
 
-        ctx = (
-            model_runner.device_timer.wrap(metadata={"category": "decode"})
-            if model_runner.device_timer
-            else contextlib.nullcontext()
-        )
+        ctx = device_timer_ctx(model_runner.device_timer, "decode")
 
         with ctx, pdmux_ctx:
             return model_runner.model.forward(
@@ -260,8 +259,24 @@ class EagerRunner(BaseRunner):
         if not self.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
-        if forward_batch.needs_forward_metadata_init():
-            if hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp"):
+        cp_v2_active = is_cp_v2_active(forward_batch)
+        if cp_v2_active:
+            prepare_cp_forward(forward_batch)
+
+        # Target verify can arrive with ``forward_metadata_ready`` set by an
+        # upstream/speculative planning step.  That mark does not initialize
+        # the final target hybrid backend, and unlike a graph replay eager has
+        # no static metadata load to fill the gap.  Re-plan target verify from
+        # the final batch every time; eager metadata is intentionally derived
+        # directly from the live ``spec_info`` tensors.
+        if (
+            forward_batch.needs_forward_metadata_init()
+            or cp_v2_active
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            if model_runner.ps.attn_dcp_size > 1 and hasattr(
+                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+            ):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (
                     model_runner.model.prepare_context_parallel_metadata_for_dcp(
@@ -284,7 +299,6 @@ class EagerRunner(BaseRunner):
                 model_runner.model.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
 
-        cp_v2_active = is_cp_v2_active(forward_batch)
         if not cp_v2_active:
             forward_batch.attn_cp_metadata = None
 
@@ -293,12 +307,7 @@ class EagerRunner(BaseRunner):
             if forward_batch.forward_mode.is_target_verify()
             else "extend"
         )
-        ctx = (
-            model_runner.device_timer.wrap(metadata={"category": category})
-            if model_runner.device_timer
-            else contextlib.nullcontext()
-        )
-        with ctx:
+        with device_timer_ctx(model_runner.device_timer, category):
             pcg_runner = model_runner.prefill_cuda_graph_runner
             if (
                 _is_hip
@@ -345,21 +354,21 @@ class EagerRunner(BaseRunner):
         """
         model = self.model_runner.model
 
-        prepare_cp_forward(forward_batch)
         input_embeds = kwargs.get("input_embeds")
         if input_embeds is None:
             input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
-        input_embeds, positions = cp_split_before_forward(
+        with cp_shard_model_inputs(
             input_embeds, forward_batch.positions, forward_batch
-        )
-
-        hidden_states = model.model(
-            forward_batch.input_ids,
-            positions,
-            forward_batch,
-            input_embeds=input_embeds,
-            pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
-        )
+        ) as (sharded_input_embeds, sharded_positions):
+            model_kwargs = {"input_embeds": sharded_input_embeds}
+            if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
+                model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+            hidden_states = model.model(
+                forward_batch.input_ids,
+                sharded_positions,
+                forward_batch,
+                **model_kwargs,
+            )
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
         aux_hidden_states = None
         if capture_aux_hidden_states:
@@ -372,15 +381,34 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
-        hidden_states = cp_gather_after_forward(
-            hidden_states, forward_batch, torch.cuda.current_stream()
-        )
+        stream = torch.cuda.current_stream()
+        hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
+        # DSpark aux tensors ride the same CP token split; gather them the same way.
+        if aux_hidden_states is not None:
+            if isinstance(aux_hidden_states, torch.Tensor):
+                aux_hidden_states = cp_gather_after_forward(
+                    aux_hidden_states, forward_batch, stream
+                )
+            else:
+                aux_hidden_states = [
+                    cp_gather_after_forward(aux, forward_batch, stream)
+                    for aux in aux_hidden_states
+                ]
+        logits_kwargs = {}
+        # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_before_norm = hidden_states
+            # Mirror DeepseekV4ForCausalLM.forward: drop pre_hc_head when
+            # DSpark aux capture is on, else it overrides the packed aux.
+            if aux_hidden_states is None:
+                logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
         return model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
             model.lm_head,
             forward_batch,
             aux_hidden_states,
+            **logits_kwargs,
         )
 
     def _execute_idle(
@@ -397,12 +425,7 @@ class EagerRunner(BaseRunner):
             model_runner.attn_backend.forward_metadata = None
 
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
-        ctx = (
-            model_runner.device_timer.wrap(metadata={"category": "idle"})
-            if model_runner.device_timer
-            else contextlib.nullcontext()
-        )
-        with ctx:
+        with device_timer_ctx(model_runner.device_timer, "idle"):
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,

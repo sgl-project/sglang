@@ -80,7 +80,9 @@ def _common_import_stubs():
         ),
         "sglang.srt.environ": _module(
             "sglang.srt.environ",
-            envs=_Dummy(),
+            envs=SimpleNamespace(
+                SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS=SimpleNamespace(get=lambda: 16384)
+            ),
         ),
         "sglang.srt.layers.dp_attention": _module(
             "sglang.srt.layers.dp_attention",
@@ -89,7 +91,18 @@ def _common_import_stubs():
         ),
         "sglang.srt.runtime_context": _module(
             "sglang.srt.runtime_context",
-            get_parallel=lambda: None,
+            get_memory=lambda: SimpleNamespace(enable_unified_memory=False),
+            get_parallel=lambda: SimpleNamespace(
+                attn_dcp_rank=0,
+                attn_dcp_size=1,
+                enable_dp_attention=False,
+                enable_dsa_cache_layer_split=False,
+                load_balance_method="round_robin",
+                nnodes=1,
+                dp_size=1,
+            ),
+            get_schedule=lambda: SimpleNamespace(chunked_prefill_size=None),
+            get_serving=lambda: SimpleNamespace(port=0),
         ),
         "sglang.srt.server_args": _module(
             "sglang.srt.server_args",
@@ -153,6 +166,7 @@ def _load_mooncake_conn(common_conn):
         AuxDataCodec=_Dummy,
         FastQueue=_Dummy,
         TransferKVChunk=_Dummy,
+        build_dcp_token_transfer_plan=lambda *args, **kwargs: None,
         group_concurrent_contiguous=lambda *args, **kwargs: [],
         pack_int_lists=lambda *args, **kwargs: b"",
         unpack_int_lists=lambda *args, **kwargs: [],
@@ -162,9 +176,9 @@ def _load_mooncake_conn(common_conn):
         "sglang.srt.disaggregation.common.conn": common_conn,
         "sglang.srt.disaggregation.common.staging_handler": _module(
             "sglang.srt.disaggregation.common.staging_handler",
+            STAGING_WATERMARK_WAIT_S=0.01,
             DecodeStagingContext=_Dummy,
             PrefillStagingContext=_Dummy,
-            StagingRegisterInfo=_Dummy,
             StagingTransferInfo=_Dummy,
         ),
         "sglang.srt.disaggregation.common.utils": common_utils,
@@ -175,7 +189,9 @@ def _load_mooncake_conn(common_conn):
         "sglang.srt.disaggregation.utils": _module(
             "sglang.srt.disaggregation.utils",
             DisaggregationMode=_DisaggregationMode,
-            compute_mamba_state_slice_blocks=lambda *args, **kwargs: [],
+            build_transfer_entry_pairs=lambda *args, **kwargs: [],
+            compute_mamba_state_slice_byte_blocks=lambda *args, **kwargs: [],
+            resolve_dcp_dst_entry_indices=lambda *args, **kwargs: [],
         ),
         "sglang.srt.distributed.parallel_state": _module(
             "sglang.srt.distributed.parallel_state",
@@ -264,19 +280,25 @@ class _StopAfterServerSocket(Exception):
 class _InitOrderContext:
     def __init__(self, events):
         self.events = events
+        self.max_sockets = 1
+        self.cache_initialized = False
         self.events.append("context created")
 
     def get(self, option):
         if option == zmq.SOCKET_LIMIT:
             return 100
         if option == zmq.MAX_SOCKETS:
-            return 1
+            if self.max_sockets == 5 and not self.cache_initialized:
+                self.cache_initialized = True
+                self.events.append("cache initialized")
+            return self.max_sockets
         raise AssertionError(f"unexpected context option: {option}")
 
     def set(self, option, value):
         if option != zmq.MAX_SOCKETS or value != 5:
             raise AssertionError(f"unexpected context configuration: {option}={value}")
-        self.events.append("cache capacity/MAX_SOCKETS configured")
+        self.max_sockets = value
+        self.events.append("ZMQ_MAX_SOCKETS configured")
 
     def socket(self, socket_type):
         if socket_type != zmq.PULL:
@@ -532,6 +554,7 @@ class TestCommonKVManagerSocketCache(unittest.TestCase):
         args = SimpleNamespace(
             kv_item_lens=[],
             state_item_lens=[],
+            kv_cache_dtype_str="auto",
             is_hybrid_mla_backend=False,
             system_dp_rank=0,
             pp_rank=0,
@@ -550,6 +573,11 @@ class TestCommonKVManagerSocketCache(unittest.TestCase):
             attn_tp_rank=0,
             attn_cp_size=1,
             attn_cp_rank=0,
+            attn_dcp_size=1,
+            attn_dcp_rank=0,
+            enable_dp_attention=False,
+            enable_dsa_cache_layer_split=False,
+            dp_size=1,
         )
 
         def create_first_server_socket(zmq_context, socket_type, host):
@@ -577,6 +605,12 @@ class TestCommonKVManagerSocketCache(unittest.TestCase):
                 SimpleNamespace(get=lambda: 2),
                 create=True,
             ),
+            patch.object(
+                self.common_conn.envs,
+                "SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS",
+                SimpleNamespace(get=lambda: 5),
+                create=True,
+            ),
             self.assertRaises(_StopAfterServerSocket),
         ):
             self.common_conn.CommonKVManager(
@@ -589,10 +623,33 @@ class TestCommonKVManagerSocketCache(unittest.TestCase):
             events,
             [
                 "context created",
-                "cache capacity/MAX_SOCKETS configured",
+                "ZMQ_MAX_SOCKETS configured",
+                "cache initialized",
                 "first server socket created",
             ],
         )
+
+    def test_explicit_capacity_exceeding_configured_max_fails_before_socket(self):
+        context = _CountingContext()
+        try:
+            context.set(zmq.MAX_SOCKETS, 4)
+            manager = self.common_conn.CommonKVManager.__new__(
+                self.common_conn.CommonKVManager
+            )
+            manager._zmq_ctx = context
+
+            with self.assertRaises(ValueError) as caught:
+                manager._init_socket_cache(capacity=2)
+
+            message = str(caught.exception)
+            self.assertIn("SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS", message)
+            self.assertIn(
+                "lower SGLANG_DISAGGREGATION_MAX_CACHED_ZMQ_ENDPOINTS", message
+            )
+            self.assertEqual(context.socket_calls[zmq.PUSH], 0)
+            self.assertEqual(context.socket_calls[zmq.PAIR], 0)
+        finally:
+            context.term()
 
     def test_real_context_honors_raised_pre_socket_limit(self):
         context = zmq.Context()
@@ -983,6 +1040,8 @@ class TestCommonKVManagerSocketCache(unittest.TestCase):
         manager = self.common_conn.CommonKVManager.__new__(
             self.common_conn.CommonKVManager
         )
+        configured_max_sockets = min(16384, context.get(zmq.SOCKET_LIMIT))
+        context.set(zmq.MAX_SOCKETS, configured_max_sockets)
         manager._zmq_ctx = context
         field_stub = SimpleNamespace(get=lambda: None)
         soft_limit = 65535
@@ -1007,7 +1066,7 @@ class TestCommonKVManagerSocketCache(unittest.TestCase):
                 * self.common_conn._ESTIMATED_FDS_PER_CACHE_ENTRY
             ),
             (
-                context.get(zmq.SOCKET_LIMIT)
+                min(context.get(zmq.MAX_SOCKETS), context.get(zmq.SOCKET_LIMIT))
                 - self.common_conn._RESERVED_MANAGER_CONTEXT_SOCKETS
             )
             // (
@@ -1016,11 +1075,7 @@ class TestCommonKVManagerSocketCache(unittest.TestCase):
             ),
         )
         self.assertEqual(manager._socket_cache_capacity, expected)
-        self.assertGreaterEqual(expected, 2 * (4 + 1) * 64)
-        self.assertGreaterEqual(
-            context.get(zmq.MAX_SOCKETS),
-            expected * self.common_conn._ZMQ_SOCKETS_PER_CACHE_ENTRY + 1,
-        )
+        self.assertEqual(context.get(zmq.MAX_SOCKETS), configured_max_sockets)
         context.term()
 
         for value in (0, -1):
@@ -1059,6 +1114,7 @@ class TestMooncakeCapacityRecovery(unittest.TestCase):
                     dst_port=9000 + room,
                     mooncake_session_id=f"session-{room}",
                     dst_kv_indices=[],
+                    dst_device_kv_indices=None,
                     required_dst_info_num=1,
                     is_dummy=False,
                 )
@@ -1067,9 +1123,15 @@ class TestMooncakeCapacityRecovery(unittest.TestCase):
         }
         manager.req_to_decode_prefix_len = {1: 0, 2: 0}
         manager.decode_kv_args_table = {
-            f"session-{room}": SimpleNamespace(dst_attn_tp_size=1, dst_aux_ptrs=[])
+            f"session-{room}": SimpleNamespace(
+                requires_dcp_relayout=False,
+                dst_attn_tp_size=1,
+                dst_aux_ptrs=[],
+            )
             for room in statuses
         }
+        manager.kv_args = SimpleNamespace(kv_data_ptrs=[])
+        manager._staging_outstanding = defaultdict(int)
         manager.enable_trace = False
         manager.enable_staging = False
         manager.is_mla_backend = False
@@ -1100,6 +1162,7 @@ class TestMooncakeCapacityRecovery(unittest.TestCase):
                 is_last_chunk=True,
                 prefill_aux_index=0,
                 state_indices=[],
+                staging_counted=False,
             )
             for room in statuses
         ]

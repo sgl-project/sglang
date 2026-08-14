@@ -7,8 +7,12 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
+    ScheduleVerifyLensTopk,
+    compute_sort_survival,
+)
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.environ import envs
+from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import (
     CONFIDENCE_RELAY_RING_LAG,
@@ -16,7 +20,7 @@ from sglang.srt.managers.overlap_utils import (
     ResolvedConfidence,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
@@ -31,23 +35,30 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
 from sglang.srt.speculative.dspark_components.dspark_sts import (
     load_sts_calibration_from_path,
 )
-from sglang.srt.speculative.dspark_components.kernels.dspark_schedule import (
-    ScheduleVerifyLensTopk,
-    compute_sort_survival,
-)
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     RaggedVerifyMode,
     read_ragged_verify_mode,
     round_up_grid,
 )
-from sglang.srt.utils.async_probe import (
-    maybe_assert_async,
-    maybe_detect_in_closed_range,
-)
 from sglang.srt.utils.common import require_mlp_tp_gather
+from sglang.srt.utils.invariants import (
+    Bucket,
+    InClosedRange,
+    Invariant,
+    IsTrue,
+    expect,
+    resolve_level,
+)
 
 logger = logging.getLogger(__name__)
+
+# DSpark confidence is a per-token score that must stay in [0, 1].
+_CONFIDENCE = Invariant(
+    "dspark.planner.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
+)
+# Scheduled verify lengths must not exceed the per-step token budget.
+_VERIFY_LEN_BUDGET = Invariant("dspark.verify_len_budget", Bucket.GUARD, IsTrue())
 
 
 class VerifyWindow(msgspec.Struct, frozen=True):
@@ -147,7 +158,7 @@ class DSparkVerifyPlanner:
             )
             relay_lag_steps = (
                 0
-                if self.server_args.disable_overlap_schedule
+                if get_schedule().disable_overlap_schedule
                 else CONFIDENCE_RELAY_RING_LAG
             )
             self._budget_planner = HostConfidenceBudgetPlanner(
@@ -163,16 +174,15 @@ class DSparkVerifyPlanner:
                 and get_parallel().attn_tp_size == 1
                 and get_parallel().attn_cp_size == 1
                 and require_mlp_tp_gather(self.server_args)
-                and not self.server_args.disable_overlap_schedule
-                and not self.server_args.speculative_skip_dp_mlp_sync
-                and self.server_args.disaggregation_mode == "null"
-                and self.server_args.pp_size == 1
+                and not get_schedule().disable_overlap_schedule
+                and not get_spec().speculative_skip_dp_mlp_sync
+                and get_disagg().disaggregation_mode == "null"
+                and get_parallel().pp_size == 1
                 and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
             )
             if tp_rank == 0:
                 sps_table_source = (
-                    self.server_args.speculative_dspark_sps_table_path
-                    or "uninitialized"
+                    get_spec().speculative_dspark_sps_table_path or "uninitialized"
                 )
                 logger.info(
                     "DSpark ragged-verify scheduler enabled (mode=%s, lag=%d, "
@@ -371,7 +381,7 @@ class DSparkVerifyPlanner:
         the draft input by prepare_verify_budget; otherwise compute it now."""
         if not self.schedules_verify_budget or confidence is None:
             return None
-        if not self.server_args.disable_overlap_schedule:
+        if not get_schedule().disable_overlap_schedule:
             return draft_input.verify_token_budget
         return self.compute_budget_sync(
             confidence=confidence,
@@ -580,12 +590,13 @@ class DSparkVerifyPlanner:
             cfg=self._schedule_cfg,
         ).to(device=device, dtype=torch.int32)
 
-        if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+        if resolve_level() >= InvariantCheckLevel.WARN:
             verify_lens_64 = verify_lens.to(torch.int64)
             effective_floor = max(self._schedule_cfg.min_verify_len, 1)
-            maybe_assert_async(
+            expect(
+                _VERIFY_LEN_BUDGET,
                 (verify_lens_64 - effective_floor).sum() <= budget,
-                f"DSpark verify-len budget violated (budget={budget})",
+                msg=f"budget={budget}",
             )
 
         if envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get():
@@ -598,7 +609,7 @@ class DSparkVerifyPlanner:
             )
 
         broadcast_group, group_size = verify_lens_broadcast_group(
-            tp_size=self.server_args.tp_size
+            tp_size=get_parallel().tp_size
         )
         if group_size > 1:
             broadcast_group.broadcast(verify_lens, src=0)
@@ -907,7 +918,7 @@ def compute_confidence(
         markov_embed_stack = None
     confidence_raw = confidence_head(draft_hidden, markov_embed_stack)
     confidence = confidence_head.apply_sts(confidence_raw)
-    maybe_detect_in_closed_range(confidence, 0.0, 1.0, "DSpark confidence")
+    expect(_CONFIDENCE, confidence)
     return confidence
 
 

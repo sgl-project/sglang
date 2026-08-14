@@ -137,6 +137,7 @@ def _generate(
     return_logprob=False,
     logprob_start_len=-1,
     temperature=0.0,
+    routed_dp_rank=None,
 ):
     """Send generate request and return results."""
     json_data = {
@@ -155,11 +156,19 @@ def _generate(
                 "logprob_start_len": logprob_start_len,
             }
         )
+    if routed_dp_rank is not None:
+        json_data["routed_dp_rank"] = routed_dp_rank
     response = requests.post(base_url + "/generate", json=json_data)
     return response.json()
 
 
-def _get_input_logprobs(base_url, new_input_ids, output_logprobs, temperature=0.0):
+def _get_input_logprobs(
+    base_url,
+    new_input_ids,
+    output_logprobs,
+    temperature=0.0,
+    routed_dp_rank=None,
+):
     """Run prefill to get input logprobs matching output logprobs."""
     _flush_cache(base_url)
     results = _generate(
@@ -169,6 +178,7 @@ def _get_input_logprobs(base_url, new_input_ids, output_logprobs, temperature=0.
         return_logprob=True,
         logprob_start_len=0,
         temperature=temperature,
+        routed_dp_rank=routed_dp_rank,
     )
     assert len(results) == len(new_input_ids)
 
@@ -298,6 +308,7 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
     max_samples=None,
     max_new_tokens=8192,
     trust_remote_code=False,
+    min_cache_hit_ratio=0.5,
 ):
     server_info = requests.get(base_url + "/server_info").json()
     if server_info["disable_radix_cache"]:
@@ -353,7 +364,10 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
         output_logprobs.append(_extract_output_logprobs(result))
 
     if not os.environ.get("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"):
-        assert len(new_input_ids) > 0.5 * len(
+        # Page-aligned SWA retention decides which prompts hit at all, so the default
+        # only screens out a vacuous run. A caller whose checkpoint interval makes
+        # every prompt hit raises this to pin that down.
+        assert len(new_input_ids) > min_cache_hit_ratio * len(
             second_turn_input_ids
         ), f"Too few decode cache hits: {len(new_input_ids)}/{len(second_turn_input_ids)}"
 

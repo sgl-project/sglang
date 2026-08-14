@@ -2,7 +2,7 @@ import dataclasses
 import glob
 import os
 import re
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from contextlib import nullcontext
 from typing import cast
 
@@ -27,7 +27,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
-from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
+from sglang.multimodal_gen.runtime.loader.fsdp_load import (
+    register_fsdp_entrypoints,
+    shard_model,
+)
 from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
     skip_init_modules,
@@ -39,6 +42,7 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
+    TextEncoder,
     finalize_encoder_folding,
     get_folding_tp_group,
 )
@@ -79,8 +83,14 @@ class TextEncoderLoader(ComponentLoader):
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
 
-    def should_offload(self, server_args, model_config: ModelConfig | None = None):
-        should_offload = server_args.text_encoder_cpu_offload
+    def should_offload(
+        self,
+        server_args,
+        model_config: ModelConfig | None = None,
+        component_name: str | None = None,
+    ):
+        component_name = component_name or "text_encoder"
+        should_offload = server_args.should_cpu_offload_component(component_name)
         if not should_offload:
             return False
         # _fsdp_shard_conditions is in arch_config, not directly on model_config
@@ -184,6 +194,7 @@ class TextEncoderLoader(ComponentLoader):
         model_name_or_path: str,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
+        key_filter: Callable[[str], bool] | None = None,
     ) -> tuple[str, list[str], bool]:
         """Prepare weights for the model.
 
@@ -216,7 +227,10 @@ class TextEncoderLoader(ComponentLoader):
 
         if use_safetensors:
             hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files, hf_folder, index_file
+                hf_weights_files,
+                hf_folder,
+                index_file,
+                key_filter=key_filter,
             )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
@@ -237,20 +251,39 @@ class TextEncoderLoader(ComponentLoader):
         self,
         source: "Source",
         to_cpu: bool,
+        key_filter: Callable[[str], bool] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """get an iterator for the model weights based on the load format."""
+        source_key_filter: Callable[[str], bool] | None
+        if key_filter is None:
+            source_key_filter = None
+        else:
+
+            def include_source_weight(name: str) -> bool:
+                return key_filter(source.prefix + name)
+
+            source_key_filter = include_source_weight
+
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
+            key_filter=source_key_filter,
         )
         if use_safetensors:
             weights_iterator = safetensors_weights_iterator(
                 hf_weights_files,
                 to_cpu=to_cpu,
+                key_filter=source_key_filter,
             )
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files, to_cpu=to_cpu)
+            if source_key_filter is not None:
+                weights_iterator = (
+                    (name, tensor)
+                    for name, tensor in weights_iterator
+                    if source_key_filter(name)
+                )
 
         # apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
@@ -261,6 +294,10 @@ class TextEncoderLoader(ComponentLoader):
         model_path: str,
         to_cpu: bool,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        key_filter = cast(
+            Callable[[str], bool] | None,
+            getattr(model, "should_materialize_checkpoint_weight", None),
+        )
         primary_weights = TextEncoderLoader.Source(
             model_path,
             prefix="",
@@ -270,6 +307,7 @@ class TextEncoderLoader(ComponentLoader):
         yield from self._get_weights_iterator(
             primary_weights,
             to_cpu,
+            key_filter,
         )
 
         secondary_weights = cast(
@@ -280,6 +318,7 @@ class TextEncoderLoader(ComponentLoader):
             yield from self._get_weights_iterator(
                 source,
                 to_cpu,
+                key_filter,
             )
 
     def load_customized(
@@ -314,9 +353,21 @@ class TextEncoderLoader(ComponentLoader):
         )
         if post_diffusers_config_update is not None:
             post_diffusers_config_update()
-        # Real dims are populated now; keep the proposed fold group only if this
-        # encoder is actually wide enough to benefit at its real size.
-        finalize_encoder_folding(encoder_config)
+        model_cls, _ = ModelRegistry.resolve_model_cls(
+            getattr(encoder_config, "architectures", [])
+        )
+        # real dims are populated now; resolve fold vs replicate
+        finalize_encoder_folding(
+            encoder_config,
+            server_args.encoder_parallel,
+            prefer_dp=(
+                server_args.batching_max_size > 1
+                and (server_args.tp_size or 1) == 1
+                and (server_args.dp_size or 1) == 1
+                and issubclass(model_cls, TextEncoder)
+                and model_cls.supports_dp_encode
+            ),
+        )
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
             encoder_index
         ]
@@ -327,6 +378,7 @@ class TextEncoderLoader(ComponentLoader):
             server_args,
             encoder_dtype,
             cpu_offload_flag=cpu_offload_flag,
+            component_name=component_name,
         )
 
     @staticmethod
@@ -358,13 +410,16 @@ class TextEncoderLoader(ComponentLoader):
         server_args: ServerArgs,
         dtype: str = "fp16",
         cpu_offload_flag: bool | None = None,
+        component_name: str = "text_encoder",
     ):
         # Determine CPU offload behavior and target device
 
         local_torch_device = get_local_torch_device()
 
         if not current_platform.is_cpu():
-            fsdp_cpu_offload = self.should_offload(server_args, model_config)
+            fsdp_cpu_offload = self.should_offload(
+                server_args, model_config, component_name
+            )
             should_offload = (
                 cpu_offload_flag if cpu_offload_flag is not None else fsdp_cpu_offload
             )
@@ -447,6 +502,7 @@ class TextEncoderLoader(ComponentLoader):
                         or getattr(model, "_fsdp_shard_conditions", None),
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )
+                    register_fsdp_entrypoints(model)
                 else:
                     model = model.to("cpu")
             else:

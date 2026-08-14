@@ -14,6 +14,7 @@ from einops import rearrange
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.configs.models.dits.mova_video import MOVAVideoConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 
@@ -80,15 +81,6 @@ def precompute_freqs_cis(
     freqs = torch.outer(pos, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
-
-
-def rope_apply(x, freqs, num_heads):
-    x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
-    x_out = torch.view_as_complex(
-        x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2)
-    )
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
-    return x_out.to(x.dtype)
 
 
 def rope_apply_head_dim(x, freqs, head_dim):
@@ -426,9 +418,8 @@ class Conv3dLocalIsland(nn.Conv3d):
 
 
 class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = MOVAVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = MOVAVideoConfig()._compile_conditions
-    _supported_attention_backends = MOVAVideoConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = MOVAVideoConfig().param_names_mapping
     reverse_param_names_mapping = MOVAVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = MOVAVideoConfig().lora_param_names_mapping
