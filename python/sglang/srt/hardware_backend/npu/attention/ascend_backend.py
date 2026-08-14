@@ -443,24 +443,14 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        spec_tokens_per_req = int(
-            getattr(
-                forward_batch.spec_info,
-                "draft_token_num",
-                self.speculative_num_draft_tokens,
-            )
-            or 1
-        )
         seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
+            spec_tokens_per_req = int(forward_batch.spec_info.draft_token_num)
             # Overlap scheduling can publish the CPU sequence length one step
             # ahead of the device tensor. FIA consumes seq_lens_cpu below, so
             # derive the block-table width from the same source. Otherwise a
             # page-aligned request can expose KV_S=N while asking FIA for N+1.
-            seq_lens_max = (
-                forward_batch.seq_lens_cpu.max().item()
-                + spec_tokens_per_req
-            )
+            seq_lens_max = forward_batch.seq_lens_cpu.max().item() + spec_tokens_per_req
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
@@ -528,11 +518,16 @@ class AscendAttnBackend(AttentionBackend):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
+            spec_tokens_per_req = (
+                int(forward_batch.spec_info.draft_token_num)
+                if forward_batch.forward_mode.is_target_verify()
+                else self.speculative_num_draft_tokens
+            )
             self.forward_metadata.actual_seq_lengths_q = torch.arange(
-                self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens
-                + forward_batch.seq_lens.shape[0] * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
+                spec_tokens_per_req,
+                spec_tokens_per_req
+                + forward_batch.seq_lens.shape[0] * spec_tokens_per_req,
+                spec_tokens_per_req,
                 dtype=torch.int32,
                 device=self.device,
             )

@@ -17,7 +17,7 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 
@@ -135,7 +135,7 @@ class DSV4NPUReqToTokenPool(DSV4ReqToTokenTablesMixin, ReqToTokenPool):
             max_context_len,
             device,
             enable_memory_saver,
-            get_server_args().c128_page_size,
+            get_schedule().c128_page_size,
         )
 
     def free(self, req):
@@ -169,7 +169,7 @@ class DSV4NPUDecodeReqToTokenPool(DSV4ReqToTokenTablesMixin, DecodeReqToTokenPoo
             max_context_len,
             device,
             enable_memory_saver,
-            get_server_args().c128_page_size,
+            get_schedule().c128_page_size,
         )
 
     def free(self, req):

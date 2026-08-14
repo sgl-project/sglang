@@ -107,20 +107,6 @@ class CompressorAscendBackendMixin:
             values = values.cpu().tolist()
         return [int(v) for v in values]
 
-    def _draft_token_num_from_spec_info(self, spec_info) -> int:
-        """Resolve the uniform verify width declared by the current forward.
-
-        ``self.speculative_num_draft_tokens`` is only the server-wide default.
-        Capture/replay and speculative algorithms may attach a different width
-        to the current ``spec_info``, so forward-specific metadata must prefer
-        that value.
-        """
-        n_draft = getattr(spec_info, "draft_token_num", None)
-        if n_draft is None:
-            n_draft = self.speculative_num_draft_tokens
-        n_draft = int(n_draft or 1)
-        return n_draft
-
     def _extend_prefix_lens_cpu(
         self, forward_batch: ForwardBatch
     ) -> Optional[list[int]]:
@@ -150,9 +136,7 @@ class CompressorAscendBackendMixin:
         _verify_compress = is_verify and bool(self._dsv4_compress_ratios)
         _seq_lens = forward_batch.seq_lens.to(torch.int32)
         if _verify_compress:
-            n_draft = self._draft_token_num_from_spec_info(
-                getattr(forward_batch, "spec_info", None)
-            )
+            n_draft = int(forward_batch.spec_info.draft_token_num)
             _seq_lens = _seq_lens + n_draft
         result = self._compute_compress_locs(
             pool=self.token_to_kv_pool,
@@ -865,7 +849,7 @@ class DeepseekV4AscendAttnBackend(
         if not self._is_dspark_draft_block(forward_batch):
             return
 
-        block_size = self._draft_token_num_from_spec_info(forward_batch.spec_info)
+        block_size = int(forward_batch.spec_info.draft_token_num)
         out_cache_loc = forward_batch.out_cache_loc
 
         ori_sparse_indices = self._build_dspark_sparse_indices(
@@ -1461,7 +1445,11 @@ class DeepseekV4AscendAttnBackend(
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             B = forward_batch.batch_size
-            n_draft = self._draft_token_num_from_spec_info(forward_batch.spec_info)
+            n_draft = (
+                int(forward_batch.spec_info.draft_token_num)
+                if forward_batch.forward_mode.is_target_verify()
+                else self.speculative_num_draft_tokens
+            )
             actual_q = torch.arange(
                 n_draft, B * n_draft + 1, n_draft, dtype=torch.int32, device=device
             )
@@ -1498,7 +1486,11 @@ class DeepseekV4AscendAttnBackend(
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            max_seqlen_q = self._draft_token_num_from_spec_info(forward_batch.spec_info)
+            max_seqlen_q = (
+                int(forward_batch.spec_info.draft_token_num)
+                if forward_batch.forward_mode.is_target_verify()
+                else self.speculative_num_draft_tokens
+            )
         else:
             max_seqlen_q = 1
         return self._kernel_metadata_from_parts(
@@ -1786,9 +1778,7 @@ class DeepseekV4AscendAttnBackend(
         positions = forward_batch.positions
         t = positions.shape[0]
         bs = forward_batch.batch_size
-        n_draft = self._draft_token_num_from_spec_info(
-            getattr(forward_batch, "spec_info", None)
-        )
+        n_draft = int(forward_batch.spec_info.draft_token_num)
         # The parent backend normalizes this to final KV lengths for every
         # algorithm: it adds n_draft for EAGLE/NGRAM, while DSpark/DFLASH
         # already pass expanded lengths and are not incremented again.
@@ -1872,7 +1862,7 @@ class DeepseekV4AscendAttnBackend(
         if c4_positions is None or c128_positions is None:
             return
 
-        n_draft = self._draft_token_num_from_spec_info(spec_info)
+        n_draft = int(spec_info.draft_token_num)
         seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
         if seq_lens_cpu is None:
             seq_lens_cpu = getattr(spec_info, "seq_lens_cpu", None)

@@ -27,7 +27,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_schedule
 
 
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
@@ -237,7 +237,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     """
 
     def __init__(self, *args, **kwargs):
-        c128_page_size = get_server_args().c128_page_size
+        c128_page_size = get_schedule().c128_page_size
         if c128_page_size <= 0 or c128_page_size % 16 != 0:
             raise ValueError(
                 "c128_page_size must be a positive multiple of 16 for the NPU "
