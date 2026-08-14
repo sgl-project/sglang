@@ -2611,7 +2611,10 @@ class ServerArgs:
         "baseline (the per-K g_cache is K x larger and the reconstruction "
         "refolds the per-K decay every step), so it is not recommended for KDA "
         "models. Requires the Triton linear-attn decode backend and "
-        "--mamba-radix-cache-strategy no_buffer (the default).",
+        "--mamba-radix-cache-strategy no_buffer, which must be set "
+        "explicitly: the flag default 'auto' resolves to extra_buffer when "
+        "overlap scheduling is on (the common case), and the extra_buffer "
+        "donation path is not yet supported.",
         NS("exec.mamba"),
     ] = False
     linear_replayssm_cache_len: A[
@@ -6277,8 +6280,10 @@ class ServerArgs:
             if mamba_extra_buffer_of(resolved_view(self)):
                 raise ValueError(
                     "--enable-linear-replayssm requires --mamba-radix-cache-strategy "
-                    "no_buffer (the default); the extra_buffer ping-pong "
-                    "donation path is not yet supported (follow-up). Got "
+                    "no_buffer set explicitly; the flag default 'auto' resolves "
+                    "to extra_buffer when overlap scheduling is on, and the "
+                    "extra_buffer ping-pong donation path is not yet supported "
+                    "(follow-up). Got "
                     f"--mamba-radix-cache-strategy={self.mamba_radix_cache_strategy!r}."
                 )
             if self.disaggregation_mode != "null":
