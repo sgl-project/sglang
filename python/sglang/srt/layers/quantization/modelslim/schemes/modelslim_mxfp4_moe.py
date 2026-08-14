@@ -16,6 +16,10 @@ from sglang.srt.utils import set_weight_attrs
 MXFP_BLOCK_SIZE = 32
 MXFP_SCALE_PAIR_SIZE = 2
 MXFP4_PACK_FACTOR = 2
+# OCP E8M0 reserves 0xFF for NaN.  A valid ModelSlim UE8M0 scale must never
+# contain it, so filling the parameter with this byte makes partial/missing
+# checkpoint loads observable before the NPU kernel can consume garbage.
+MXFP_E8M0_NOT_LOADED = 0xFF
 
 
 def _mxfp4_moe_weight_shapes(
@@ -32,9 +36,7 @@ def _mxfp4_moe_weight_shapes(
         output_size = hidden_size
         input_size = intermediate_size_per_partition
     else:
-        raise ValueError(
-            f"weight_prefix must be 'w13' or 'w2', got {weight_prefix!r}."
-        )
+        raise ValueError(f"weight_prefix must be 'w13' or 'w2', got {weight_prefix!r}.")
 
     if input_size % MXFP4_PACK_FACTOR != 0:
         raise ValueError(f"MXFP4 input size must be even, got {input_size}.")
@@ -95,7 +97,12 @@ class _ModelSlimMXFP4MoESchemeBase(ModelSlimMoEScheme):
         set_weight_attrs(weight, extra_weight_attrs)
 
         weight_scale = torch.nn.Parameter(
-            torch.empty(scale_shape, dtype=torch.uint8), requires_grad=False
+            torch.full(
+                scale_shape,
+                MXFP_E8M0_NOT_LOADED,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
         )
         layer.register_parameter(f"{self.weight_prefix}_weight_scale", weight_scale)
         set_weight_attrs(weight_scale, extra_weight_attrs)

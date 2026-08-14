@@ -82,6 +82,39 @@ def _reshape_kv_for_fia_nz(
     )
 
 
+def _create_mla_decode_head_padding(
+    *,
+    batch_size: int,
+    padding_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    device: torch.device,
+    nope_dtype: torch.dtype,
+    rope_dtype: torch.dtype,
+    with_fp8_scale: bool,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Allocate static graph buffers for FIA power-of-two head padding."""
+
+    nope_padding = torch.zeros(
+        [batch_size, 1, padding_heads, kv_lora_rank],
+        dtype=nope_dtype,
+        device=device,
+    )
+    rope_padding = torch.zeros(
+        [batch_size, 1, padding_heads, qk_rope_head_dim],
+        dtype=rope_dtype,
+        device=device,
+    )
+    scale_padding = None
+    if with_fp8_scale:
+        scale_padding = torch.ones(
+            [batch_size, 1, padding_heads],
+            dtype=torch.float32,
+            device=device,
+        )
+    return nope_padding, rope_padding, scale_padding
+
+
 @dataclass
 class ForwardMetadata:
 
@@ -113,6 +146,11 @@ class ForwardMetadata:
     prefix_block_tables: Optional[torch.Tensor] = None
     prefix_seq_lens_npu: Optional[torch.Tensor] = None
     prefix_seq_starts: Optional[torch.Tensor] = None
+
+    # Static CUDA-graph padding for FIA power-of-two query-head requirements.
+    nope_padding: Optional[torch.Tensor] = None
+    rope_padding: Optional[torch.Tensor] = None
+    nope_scale_padding: Optional[torch.Tensor] = None
 
 
 class AscendAttnMaskBuilder:
@@ -317,6 +355,11 @@ class AscendAttnBackend(AttentionBackend):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
+        # Generic direct-cast FP8 KV caches have an explicit unit-scale ABI.
+        # ModelSlim paths pass their checkpoint-derived scale on every call.
+        self.fp8_kv_direct_scale = torch.ones(
+            1, dtype=torch.float32, device=self.device
+        )
         self.speculative_step_id = speculative_step_id
         self.speculative_step_offset_npu = torch.tensor(
             speculative_step_id + 1, device="npu"
@@ -417,6 +460,8 @@ class AscendAttnBackend(AttentionBackend):
         *,
         device: torch.device,
     ) -> torch.Tensor:
+        if fp8_kv_scale is None:
+            fp8_kv_scale = self.fp8_kv_direct_scale
         return normalize_required_fp8_scale(
             fp8_kv_scale,
             name="fak_descale_float",
@@ -438,9 +483,7 @@ class AscendAttnBackend(AttentionBackend):
         ):
             raise RuntimeError("A5 prefix attention metadata is incomplete.")
 
-        ckv_cache, k_rope_cache = self.token_to_kv_pool.get_kv_buffer(
-            layer.layer_id
-        )
+        ckv_cache, k_rope_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         total_prefix_tokens = int(metadata.prefix_lens.sum().item())
         kv_cached = torch.empty(
             (
@@ -501,9 +544,7 @@ class AscendAttnBackend(AttentionBackend):
             dim=-1,
         )
         num_tokens = q_nope.shape[0]
-        actual_seq_lengths = np.cumsum(
-            forward_batch.extend_seq_lens_cpu
-        ).tolist()
+        actual_seq_lengths = np.cumsum(forward_batch.extend_seq_lens_cpu).tolist()
         common_kwargs = {
             "query_rope": q_rope,
             "key_rope": k_rope,
@@ -557,12 +598,8 @@ class AscendAttnBackend(AttentionBackend):
 
         merged_output, _ = torch_npu.npu_attention_update(
             (
-                current_lse.to(torch.float32).reshape(
-                    num_tokens * layer.tp_q_head_num
-                ),
-                prefix_lse.to(torch.float32).reshape(
-                    num_tokens * layer.tp_q_head_num
-                ),
+                current_lse.to(torch.float32).reshape(num_tokens * layer.tp_q_head_num),
+                prefix_lse.to(torch.float32).reshape(num_tokens * layer.tp_q_head_num),
             ),
             (
                 current_output.reshape(
@@ -779,9 +816,9 @@ class AscendAttnBackend(AttentionBackend):
             )
             for row, table in enumerate(prefix_block_tables):
                 if table.numel() > 0:
-                    self.forward_metadata.prefix_block_tables[
-                        row, : table.numel()
-                    ] = table.to(device=self.device, dtype=torch.int32)
+                    self.forward_metadata.prefix_block_tables[row, : table.numel()] = (
+                        table.to(device=self.device, dtype=torch.int32)
+                    )
             self.forward_metadata.prefix_seq_lens_npu = (
                 self.forward_metadata.prefix_lens.to(device=self.device).int()
             )
@@ -895,25 +932,20 @@ class AscendAttnBackend(AttentionBackend):
             and self.q_head_num_padding > self.tp_q_head_num
         ):
             dtype = self.model_dtype if self.model_dtype is not None else torch.bfloat16
-            metadata.nope_padding = torch.empty(
-                [
-                    bs,
-                    1,
-                    self.q_head_num_padding - self.tp_q_head_num,
-                    self.kv_lora_rank,
-                ],
-                dtype=dtype,
+            is_fp8_kv = self.kv_cache_dtype == torch.float8_e4m3fn
+            (
+                metadata.nope_padding,
+                metadata.rope_padding,
+                metadata.nope_scale_padding,
+            ) = _create_mla_decode_head_padding(
+                batch_size=bs,
+                padding_heads=self.q_head_num_padding - self.tp_q_head_num,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
                 device=seq_lens.device,
-            )
-            metadata.rope_padding = torch.empty(
-                [
-                    bs,
-                    1,
-                    self.q_head_num_padding - self.tp_q_head_num,
-                    self.qk_rope_head_dim,
-                ],
-                dtype=dtype,
-                device=seq_lens.device,
+                nope_dtype=torch.float8_e4m3fn if is_fp8_kv else dtype,
+                rope_dtype=dtype,
+                with_fp8_scale=is_fp8_kv,
             )
         self.graph_metadata[bs] = metadata
         return metadata
@@ -1325,8 +1357,7 @@ class AscendAttnBackend(AttentionBackend):
             )
             num_query_tokens = min(
                 num_token_padding,
-                self.forward_metadata.block_tables.shape[0]
-                * query_tokens_per_req,
+                self.forward_metadata.block_tables.shape[0] * query_tokens_per_req,
             )
             q_nope = q_nope[:num_query_tokens]
             q_pe = q_pe[:num_query_tokens]
@@ -2881,10 +2912,16 @@ class AscendAttnBackend(AttentionBackend):
 
             if self.kv_cache_dtype == torch.float8_e4m3fn:
                 if dequant_scale_q_nope is None:
-                    raise RuntimeError(
-                        "FP8 MLA graph decode requires query descales."
-                    )
+                    raise RuntimeError("FP8 MLA graph decode requires query descales.")
                 dequant_scale_query = dequant_scale_q_nope.transpose(-1, -2)
+                if self.forward_metadata.nope_scale_padding is not None:
+                    dequant_scale_query = torch.cat(
+                        [
+                            dequant_scale_query,
+                            self.forward_metadata.nope_scale_padding,
+                        ],
+                        dim=2,
+                    ).contiguous()
                 kv_scale = self._resolve_fp8_kv_scale(
                     fp8_kv_scale,
                     device=q_nope.device,
@@ -3296,9 +3333,7 @@ class AscendAttnBackend(AttentionBackend):
                         actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                     else:
                         actual_seq_len_kv = (
-                            self.forward_metadata.seq_lens_cpu_int.cpu()
-                            .int()
-                            .tolist()
+                            self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                         )
                     dequant_scale_query = dequant_scale_q_nope.transpose(-1, -2)
                     kv_scale = self._resolve_fp8_kv_scale(

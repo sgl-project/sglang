@@ -15,6 +15,9 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 MXFP8_BLOCK_SIZE = 32
+# OCP UE8M0 reserves 0xFF for NaN, so it is an unambiguous not-loaded
+# sentinel for ModelSlim block scales.
+MXFP_E8M0_NOT_LOADED = 0xFF
 # W4A8_MXFP block (group) size — fixed at 32 by the msmodelslim export format.
 MXFP4_BLOCK_SIZE = 32
 
@@ -166,6 +169,15 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
     MXFP8 matmul (block_size=32).
     """
 
+    def __init__(
+        self,
+        quant_config=None,
+        *,
+        preserve_mlaprolog_source: bool = False,
+    ) -> None:
+        self.quant_config = quant_config
+        self.preserve_mlaprolog_source = preserve_mlaprolog_source
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -202,11 +214,31 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight.data
         if weight.dtype == torch.float8_e4m3fn:
+            weight_scale_param = layer._parameters.get("weight_scale")
+            if weight_scale_param is None:
+                raise RuntimeError(
+                    "weight_scale is required for ModelSlim MXFP8 linear; "
+                    "unit-scale fallback is not allowed."
+                )
+            weight_scale = weight_scale_param.data
+            if (weight_scale == MXFP_E8M0_NOT_LOADED).any():
+                raise RuntimeError(
+                    "ModelSlim MXFP8 weight_scale was not fully loaded "
+                    "(found the UE8M0 NaN sentinel 0xFF)."
+                )
+            if self.preserve_mlaprolog_source:
+                # MLAProlog consumes the checkpoint's [out, in] payload and
+                # flat [out, in/32] scale, while the ordinary linear path below
+                # consumes transposed views.  Keep plain Tensor views so both
+                # paths share storage; registering cloned Parameters here would
+                # duplicate several giant attention projections per layer.
+                layer.mlaprolog_weight_source = weight
+                layer.mlaprolog_weight_scale_source = weight_scale
             # Offline (ModelSlim) path: weight is already MXFP8-quantised and
             # layer.weight_scale holds the uint8 block scales [out, in/32]. Only
             # re-layout to [in, out] / [in//64, out, 2] strided views below.
-            n_dim, k_dim = layer.weight_scale.data.shape
-            scale = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
+            n_dim, k_dim = weight_scale.shape
+            scale = weight_scale.reshape(n_dim, k_dim // 2, 2)
             layer.weight = Parameter(weight.transpose(0, 1), requires_grad=False)
             layer.weight_scale_inv = Parameter(
                 scale.transpose(0, 1), requires_grad=False

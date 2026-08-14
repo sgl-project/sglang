@@ -307,6 +307,8 @@ def _unified_attention_with_output_impl(
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    dequant_scale_q_nope: Optional[torch.Tensor] = None,
+    fp8_kv_scale: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
@@ -349,6 +351,10 @@ def _unified_attention_with_output_impl(
         kwargs["llama_4_scaling"] = llama_4_scaling
     if topk_indices is not None:
         kwargs["topk_indices"] = topk_indices[:real_query_num_tokens]
+    if dequant_scale_q_nope is not None:
+        kwargs["dequant_scale_q_nope"] = dequant_scale_q_nope[:real_query_num_tokens]
+    if fp8_kv_scale is not None:
+        kwargs["fp8_kv_scale"] = fp8_kv_scale
 
     original_out_cache_loc = forward_batch.out_cache_loc
     original_positions = forward_batch.positions
@@ -419,6 +425,8 @@ def unified_attention_with_output(
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    dequant_scale_q_nope: Optional[torch.Tensor] = None,
+    fp8_kv_scale: Optional[torch.Tensor] = None,
 ) -> None:
     _unified_attention_with_output_impl(
         query,
@@ -437,6 +445,8 @@ def unified_attention_with_output(
         is_neox=is_neox,
         llama_4_scaling=llama_4_scaling,
         topk_indices=topk_indices,
+        dequant_scale_q_nope=dequant_scale_q_nope,
+        fp8_kv_scale=fp8_kv_scale,
     )
 
 
@@ -467,6 +477,8 @@ def unified_attention_with_output_and_lse(
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    dequant_scale_q_nope: Optional[torch.Tensor] = None,
+    fp8_kv_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     lse = _unified_attention_with_output_impl(
         query,
@@ -485,6 +497,8 @@ def unified_attention_with_output_and_lse(
         is_neox=is_neox,
         llama_4_scaling=llama_4_scaling,
         topk_indices=topk_indices,
+        dequant_scale_q_nope=dequant_scale_q_nope,
+        fp8_kv_scale=fp8_kv_scale,
     )
     assert lse is not None
     return lse

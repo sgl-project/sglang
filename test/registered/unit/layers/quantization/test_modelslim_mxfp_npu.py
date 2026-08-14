@@ -7,6 +7,10 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.hardware_backend.npu.moe import finalize_routing
+from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+    MXFP_E8M0_NOT_LOADED as MXFP8_E8M0_NOT_LOADED,
+    NPUMXFP8LinearMethod,
+)
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A4MXFP4MoEMethod,
     _normalize_mxfp_input_scale,
@@ -22,11 +26,13 @@ from sglang.srt.layers.quantization.modelslim.modelslim import (
 from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimMXFP4MoEScheme,
     ModelSlimMXFP4W4A8MoEScheme,
+    ModelSlimMXFP8Scheme,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import (
     modelslim_q_fp8_dynamic_kv_fp8 as kv_scheme,
 )
 from sglang.srt.layers.quantization.modelslim.schemes.modelslim_mxfp4_moe import (
+    MXFP_E8M0_NOT_LOADED,
     _mxfp4_moe_weight_shapes,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -36,6 +42,91 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestModelSlimMXFP4MoE(CustomTestCase):
+    def test_mlaprolog_source_is_preserved_only_for_required_linears(self):
+        qkv_scheme = ModelSlimMXFP8Scheme(
+            {}, "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa"
+        )
+        q_b_scheme = ModelSlimMXFP8Scheme({}, "model.layers.0.self_attn.q_b_proj")
+        o_proj_scheme = ModelSlimMXFP8Scheme({}, "model.layers.0.self_attn.o_proj")
+
+        self.assertTrue(qkv_scheme.kernel.preserve_mlaprolog_source)
+        self.assertTrue(q_b_scheme.kernel.preserve_mlaprolog_source)
+        self.assertFalse(o_proj_scheme.kernel.preserve_mlaprolog_source)
+
+    def test_fused_checkpoint_prefix_does_not_hide_mlaprolog_source(self):
+        runtime_prefix = "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa"
+        checkpoint_prefix = "model.layers.0.self_attn.q_a_proj"
+        config = ModelSlimConfig(
+            {
+                f"{checkpoint_prefix}.weight": "W8A8_MXFP8",
+                "packed_modules_mapping": {
+                    "model": {
+                        "fused_qkv_a_proj_with_mqa": [
+                            "q_a_proj",
+                            "kv_a_proj_with_mqa",
+                        ]
+                    }
+                },
+            }
+        )
+        layer = SimpleNamespace()
+
+        # Exercise the same post-selection hook used by get_quant_method
+        # without constructing a device-specific LinearBase in a CPU test.
+        scheme = config.get_linear_scheme(layer, checkpoint_prefix)
+        scheme.configure_runtime_prefix(runtime_prefix)
+
+        self.assertTrue(scheme.kernel.preserve_mlaprolog_source)
+
+    def test_mlaprolog_source_views_share_checkpoint_storage(self):
+        layer = torch.nn.Module()
+        weight = torch.nn.Parameter(
+            torch.empty((8, 16), dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        scale = torch.nn.Parameter(
+            torch.zeros((8, 4), dtype=torch.uint8),
+            requires_grad=False,
+        )
+        layer.register_parameter("weight", weight)
+        layer.register_parameter("weight_scale", scale)
+
+        method = NPUMXFP8LinearMethod(preserve_mlaprolog_source=True)
+        method.process_weights_after_loading(layer)
+
+        self.assertEqual(layer.mlaprolog_weight_source.data_ptr(), weight.data_ptr())
+        self.assertEqual(
+            layer.mlaprolog_weight_scale_source.data_ptr(), scale.data_ptr()
+        )
+        self.assertEqual(layer.weight.data_ptr(), weight.data_ptr())
+        self.assertEqual(layer.weight_scale_inv.data_ptr(), scale.data_ptr())
+
+    def test_mxfp8_missing_scale_fails_before_mlaprolog_preservation(self):
+        layer = torch.nn.Module()
+        layer.register_parameter(
+            "weight",
+            torch.nn.Parameter(
+                torch.empty((8, 16), dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            ),
+        )
+        layer.register_parameter(
+            "weight_scale",
+            torch.nn.Parameter(
+                torch.full(
+                    (8, 4),
+                    MXFP8_E8M0_NOT_LOADED,
+                    dtype=torch.uint8,
+                ),
+                requires_grad=False,
+            ),
+        )
+
+        method = NPUMXFP8LinearMethod(preserve_mlaprolog_source=True)
+        with self.assertRaisesRegex(RuntimeError, "not fully loaded"):
+            method.process_weights_after_loading(layer)
+        self.assertNotIn("mlaprolog_weight_scale_source", vars(layer))
+
     def test_checkpoint_shapes_are_derived_per_projection(self):
         self.assertEqual(
             _mxfp4_moe_weight_shapes("w13", 4, 128, 256),
@@ -68,13 +159,15 @@ class TestModelSlimMXFP4MoE(CustomTestCase):
         self.assertEqual(layer.w2_weight_scale.shape, (4, 128, 8))
         self.assertEqual(layer.w13_weight.dtype, torch.uint8)
         self.assertEqual(layer.w13_weight_scale.dtype, torch.uint8)
+        self.assertTrue(torch.all(layer.w13_weight_scale == MXFP_E8M0_NOT_LOADED))
         self.assertIsNone(layer.w13_weight_offset)
         self.assertIsNone(layer.w2_weight_offset)
 
+        with self.assertRaisesRegex(RuntimeError, "not fully loaded"):
+            w13_scheme.process_weights_after_loading(layer)
+
     def test_selector_resolves_language_model_and_moe_aliases(self):
-        checkpoint_prefix = (
-            "language_model.model.layers.0.block_sparse_moe.experts"
-        )
+        checkpoint_prefix = "language_model.model.layers.0.block_sparse_moe.experts"
         runtime_prefix = "model.layers.0.mlp.experts"
         description = {
             f"{checkpoint_prefix}.0.gate_proj.weight": "W4A4_MXFP4",
@@ -170,28 +263,45 @@ class TestModelSlimKVScales(CustomTestCase):
         self.assertIsInstance(method, ModelSlimQFP8DynamicKVFP8Method)
         method.create_weights(layer)
 
-        self.assertEqual(layer.fa_q.scale.shape, (4, 1))
+        self.assertNotIn("fa_q", layer._modules)
         self.assertEqual(layer.fa_k.scale.shape, (2, 1))
-        self.assertTrue(torch.isnan(layer.fa_q.scale).all())
+        self.assertTrue(torch.isnan(layer.fa_k.scale).all())
         with self.assertRaisesRegex(RuntimeError, "unit-scale fallback"):
             method.process_weights_after_loading(layer)
 
         loaded_scales = {
-            "fa_q": torch.tensor([[0.5], [0.25], [0.125], [0.0625]]),
             "fa_k": torch.tensor([[0.5], [0.25]]),
-            "fa_v": torch.tensor([[0.125], [0.0625]]),
+            "fa_v": torch.tensor([[0.5], [0.25]]),
         }
         for name, value in loaded_scales.items():
-            scale = getattr(layer, name).scale
+            scale = layer._modules[name]._parameters["scale"]
             scale.weight_loader(scale, value)
 
         method.process_weights_after_loading(layer)
-        torch.testing.assert_close(
-            layer.fak_descale_float, torch.tensor([[0.5, 0.25]])
-        )
+        self.assertTrue(layer._modelslim_fp8_kv_scale_ready)
+        torch.testing.assert_close(layer.fak_descale_float, torch.tensor([[0.5, 0.25]]))
         torch.testing.assert_close(
             layer.fak_descale_reciprocal, torch.tensor([[2.0, 4.0]])
         )
+
+    def test_kv_scale_contract_rejects_distinct_k_v_or_nonzero_offset(self):
+        layer = torch.nn.Module()
+        method = ModelSlimQFP8DynamicKVFP8Method(
+            kv_scheme.ModelSlimQFP8DynamicKVFP8Scheme({}, "self_attn")
+        )
+        method.create_weights(layer, num_heads=4, num_kv_heads=1)
+
+        layer.fa_k.scale.data.fill_(0.5)
+        layer.fa_v.scale.data.fill_(0.25)
+        with self.assertRaisesRegex(ValueError, "must be identical"):
+            method.process_weights_after_loading(layer)
+        self.assertFalse(layer._modelslim_fp8_kv_scale_ready)
+
+        layer.fa_v.scale.data.copy_(layer.fa_k.scale)
+        layer.fa_v.offset.data.fill_(1.0)
+        with self.assertRaisesRegex(ValueError, "must be zero"):
+            method.process_weights_after_loading(layer)
+        self.assertFalse(layer._modelslim_fp8_kv_scale_ready)
 
     def test_kv_loader_shards_full_head_tensor_on_dim_zero(self):
         param = torch.nn.Parameter(torch.empty((2, 1)), requires_grad=False)

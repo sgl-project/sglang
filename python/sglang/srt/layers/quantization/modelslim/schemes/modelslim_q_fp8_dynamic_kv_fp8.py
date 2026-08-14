@@ -48,7 +48,7 @@ def _modelslim_kv_weight_loader(
 
 
 class ModelSlimQFP8DynamicKVFP8Scheme(ModelSlimKVSchemeBase):
-    """Register checkpoint Q/K/V scales and derived K descales for NPU MLA."""
+    """Register checkpoint K/V scales and derive the shared NPU MLA descale."""
 
     def __init__(self, quant_config, prefix: str) -> None:
         self.quant_config = quant_config
@@ -66,8 +66,10 @@ class ModelSlimQFP8DynamicKVFP8Scheme(ModelSlimKVSchemeBase):
                 f"num_heads={num_heads}, num_kv_heads={num_kv_heads}."
             )
 
+        # ``Q_FP8_DYNAMIC_KV_FP8`` quantizes Q per token at runtime, so a
+        # conforming ModelSlim checkpoint has no ``fa_q.scale`` or
+        # ``fa_q.offset``.  Only K/V are statically quantized per head.
         head_counts = {
-            "fa_q": num_heads,
             "fa_k": num_kv_heads,
             "fa_v": num_kv_heads,
         }
@@ -113,7 +115,8 @@ class ModelSlimQFP8DynamicKVFP8Scheme(ModelSlimKVSchemeBase):
                 layer.register_parameter(
                     name,
                     nn.Parameter(
-                        torch.empty(shape, dtype=torch.float32), requires_grad=False
+                        torch.full(shape, torch.nan, dtype=torch.float32),
+                        requires_grad=False,
                     ),
                 )
             elif layer._parameters[name].shape != shape:
@@ -121,9 +124,11 @@ class ModelSlimQFP8DynamicKVFP8Scheme(ModelSlimKVSchemeBase):
                     f"Existing {name} has shape "
                     f"{tuple(layer._parameters[name].shape)}, expected {shape}."
                 )
+        layer._requires_modelslim_fp8_kv_scale = True
+        layer._modelslim_fp8_kv_scale_ready = False
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        for name in ("fa_q", "fa_k", "fa_v"):
+        for name in ("fa_k", "fa_v"):
             scale = layer._modules[name]._parameters["scale"]
             if not torch.isfinite(scale).all():
                 raise RuntimeError(
@@ -135,6 +140,24 @@ class ModelSlimQFP8DynamicKVFP8Scheme(ModelSlimKVSchemeBase):
                     f"ModelSlim {name}.scale for {self.prefix} must be positive."
                 )
 
+            offset = layer._modules[name]._parameters["offset"]
+            if not torch.isfinite(offset).all():
+                raise RuntimeError(
+                    f"ModelSlim {name}.offset for {self.prefix} must be finite."
+                )
+            if torch.count_nonzero(offset).item() != 0:
+                raise ValueError(
+                    f"ModelSlim {name}.offset for {self.prefix} must be zero; "
+                    "the Ascend MLA FP8 path does not consume quant offsets."
+                )
+
+        if not torch.equal(layer.fa_k.scale, layer.fa_v.scale):
+            raise ValueError(
+                f"ModelSlim K/V scales for {self.prefix} must be identical; "
+                "the absorbed MLA cache has one shared K/V descale."
+            )
+
         fa_k_scale = layer.fa_k.scale.reshape(1, -1).to(torch.float32)
         layer.fak_descale_float.data.copy_(fa_k_scale)
         layer.fak_descale_reciprocal.data.copy_(torch.reciprocal(fa_k_scale))
+        layer._modelslim_fp8_kv_scale_ready = True

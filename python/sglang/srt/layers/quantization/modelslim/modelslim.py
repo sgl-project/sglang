@@ -248,6 +248,7 @@ class ModelSlimConfig(QuantizationConfig):
             return kv_method
 
         if isinstance(layer, LinearBase):
+            runtime_prefix = prefix
             # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
             key = "model"
             if "vision_model" in prefix:
@@ -272,6 +273,8 @@ class ModelSlimConfig(QuantizationConfig):
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
             if layer.scheme is None:
                 return UnquantizedLinearMethod()
+            if isinstance(layer.scheme, ModelSlimMXFP8Scheme):
+                layer.scheme.configure_runtime_prefix(runtime_prefix)
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
             moe_schemes = self.get_moe_scheme(layer, prefix)

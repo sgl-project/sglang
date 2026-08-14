@@ -829,9 +829,17 @@ class _NPUPackedMXFP4MoEMethod(_NPUMoEMethodBase):
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
         self._validate_weight_prefix(layer, weight_prefix)
-        fp4_dtype = _require_fp4_dtype()
-        weight = getattr(layer, f"{weight_prefix}_weight").data
-        weight_scale = getattr(layer, f"{weight_prefix}_weight_scale").data
+        weight_name = f"{weight_prefix}_weight"
+        weight_scale_name = f"{weight_prefix}_weight_scale"
+        weight_param = layer._parameters[weight_name]
+        weight_scale_param = layer._parameters.get(weight_scale_name)
+        if weight_scale_param is None:
+            raise RuntimeError(
+                f"{weight_scale_name} is required for MXFP4 MoE; "
+                "unit-scale fallback is not allowed."
+            )
+        weight = weight_param.data
+        weight_scale = weight_scale_param.data
         expected_scale_blocks = (weight.shape[-1] * 2 + 31) // 32
         if weight_scale.shape[:2] != weight.shape[:2] or (
             weight_scale.shape[-1] != expected_scale_blocks
@@ -840,18 +848,18 @@ class _NPUPackedMXFP4MoEMethod(_NPUMoEMethodBase):
                 f"{weight_prefix} MXFP4 scale shape {tuple(weight_scale.shape)} "
                 f"does not match packed weight shape {tuple(weight.shape)}."
             )
+        if (weight_scale == 0xFF).any():
+            raise RuntimeError(
+                f"{weight_scale_name} was not fully loaded from the ModelSlim "
+                "checkpoint (found the UE8M0 NaN sentinel 0xFF)."
+            )
 
+        fp4_dtype = _require_fp4_dtype()
         weight = self._format_weight(weight, fp4_dtype).transpose(1, 2)
         weight_scale = _pack_mxfp_weight_scale(weight_scale)
-        setattr(
-            layer,
-            f"{weight_prefix}_weight",
-            Parameter(weight, requires_grad=False),
-        )
-        setattr(
-            layer,
-            f"{weight_prefix}_weight_scale",
-            Parameter(weight_scale, requires_grad=False),
+        layer._parameters[weight_name] = Parameter(weight, requires_grad=False)
+        layer._parameters[weight_scale_name] = Parameter(
+            weight_scale, requires_grad=False
         )
 
         if weight_prefix == "w13":
@@ -939,9 +947,7 @@ class _NPUPackedMXFP4MoEMethod(_NPUMoEMethodBase):
         group_list_type,
     ) -> torch.Tensor:
         weight_scale = self._weight_scale(quant_info, weight_prefix)
-        hidden_states, input_scale = self._quantize_input(
-            hidden_states, pertoken_scale
-        )
+        hidden_states, input_scale = self._quantize_input(hidden_states, pertoken_scale)
         return self.matmul.forward(
             quant_info,
             weight_prefix,

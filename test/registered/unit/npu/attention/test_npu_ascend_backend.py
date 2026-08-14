@@ -33,6 +33,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnMaskBuilder,
     AscendAttnMultiStepDraftBackend,
     ForwardMetadata,
+    _create_mla_decode_head_padding,
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
@@ -157,8 +158,48 @@ class TestForwardMetadata(unittest.TestCase):
             "swa_mask",
             "prefix_lens",
             "flatten_prefix_block_tables",
+            "prefix_block_tables",
+            "prefix_seq_lens_npu",
+            "prefix_seq_starts",
+            "nope_padding",
+            "rope_padding",
+            "nope_scale_padding",
         }
         self.assertEqual(names, expected)
+
+
+class TestMlaDecodeHeadPadding(unittest.TestCase):
+    def test_fp8_graph_padding_keeps_query_and_scale_abi_aligned(self):
+        nope, rope, scale = _create_mla_decode_head_padding(
+            batch_size=2,
+            padding_heads=1,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            device=torch.device("cpu"),
+            nope_dtype=torch.float8_e4m3fn,
+            rope_dtype=torch.bfloat16,
+            with_fp8_scale=True,
+        )
+
+        self.assertEqual(nope.shape, (2, 1, 1, 512))
+        self.assertEqual(nope.dtype, torch.float8_e4m3fn)
+        self.assertEqual(rope.shape, (2, 1, 1, 64))
+        self.assertEqual(rope.dtype, torch.bfloat16)
+        self.assertEqual(scale.shape, (2, 1, 1))
+        self.assertTrue(torch.all(scale == 1))
+
+
+class TestFp8KvScaleResolution(unittest.TestCase):
+    def test_generic_direct_fp8_cache_uses_explicit_unit_scale(self):
+        backend = object.__new__(AscendAttnBackend)
+        backend.fp8_kv_direct_scale = torch.ones(1, dtype=torch.float32)
+
+        resolved = backend._resolve_fp8_kv_scale(
+            None,
+            device=torch.device("cpu"),
+        )
+
+        torch.testing.assert_close(resolved, torch.ones(1, dtype=torch.float32))
 
 
 class TestGenerateMaskFlag(unittest.TestCase):

@@ -319,20 +319,18 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
 
     def mlaprolog_preprocess_weight(self):
-        q_b_proj_weight_original = self.q_b_proj._parameters.get("weight_original")
-        q_b_proj_scale_original = self.q_b_proj._parameters.get(
-            "weight_scale_original"
-        )
-        if (q_b_proj_weight_original is None) != (q_b_proj_scale_original is None):
+        q_b_proj_weight_source = vars(self.q_b_proj).get("mlaprolog_weight_source")
+        q_b_proj_scale_source = vars(self.q_b_proj).get("mlaprolog_weight_scale_source")
+        if (q_b_proj_weight_source is None) != (q_b_proj_scale_source is None):
             raise RuntimeError(
-                "MLAProlog requires q_b_proj original weight and scale to be "
+                "MLAProlog requires q_b_proj source weight and scale to be "
                 "preserved together."
             )
-        if q_b_proj_weight_original is not None:
+        if q_b_proj_weight_source is not None:
             self.q_b_proj_weight = npu_format_cast(
-                q_b_proj_weight_original.transpose(0, 1).contiguous()
+                q_b_proj_weight_source.transpose(0, 1).contiguous()
             )
-            self.q_b_proj_scale = q_b_proj_scale_original.contiguous().view(
+            self.q_b_proj_scale = q_b_proj_scale_source.contiguous().view(
                 torch.float8_e8m0fnu
             )
         else:
@@ -340,18 +338,18 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
                 self.q_b_proj.weight.data.transpose(0, 1).contiguous()
             )
 
-        qkv_weight_original = self.qkv_a_proj._parameters.get("weight_original")
-        qkv_scale_original = self.qkv_a_proj._parameters.get(
-            "weight_scale_original"
-        )
-        if (qkv_weight_original is None) != (qkv_scale_original is None):
+        qkv_weight_source = vars(self.qkv_a_proj).get("mlaprolog_weight_source")
+        qkv_scale_source = vars(self.qkv_a_proj).get("mlaprolog_weight_scale_source")
+        if (qkv_weight_source is None) != (qkv_scale_source is None):
             raise RuntimeError(
-                "MLAProlog requires fused QKV-A original weight and scale to be "
+                "MLAProlog requires fused QKV-A source weight and scale to be "
                 "preserved together."
             )
 
         qkv_weight = (
-            qkv_weight_original if qkv_weight_original is not None else self.qkv_a_proj.weight
+            qkv_weight_source
+            if qkv_weight_source is not None
+            else self.qkv_a_proj.weight
         )
         qkv_weight_t = qkv_weight.data.transpose(0, 1).contiguous()
         qkv_a_proj_weight_q = qkv_weight_t[:, : self.q_lora_rank].clone()
@@ -359,13 +357,17 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.q_a_proj_weight = npu_format_cast(qkv_a_proj_weight_q)
         self.kv_a_proj_weight = npu_format_cast(qkv_a_proj_weight_kv)
 
-        if qkv_scale_original is not None:
-            self.qkv_a_proj_scale_q = qkv_scale_original[
-                : self.q_lora_rank, :
-            ].contiguous().view(torch.float8_e8m0fnu)
-            self.qkv_a_proj_scale_kv = qkv_scale_original[
-                self.q_lora_rank :, :
-            ].contiguous().view(torch.float8_e8m0fnu)
+        if qkv_scale_source is not None:
+            self.qkv_a_proj_scale_q = (
+                qkv_scale_source[: self.q_lora_rank, :]
+                .contiguous()
+                .view(torch.float8_e8m0fnu)
+            )
+            self.qkv_a_proj_scale_kv = (
+                qkv_scale_source[self.q_lora_rank :, :]
+                .contiguous()
+                .view(torch.float8_e8m0fnu)
+            )
 
     def get_sin_cos(self, positions):
         cos_sin = self.rotary_emb.cos_sin_cache[positions]
@@ -617,9 +619,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
         k_cache, v_cache, _ = self.get_kv_cache_and_cache_idx(forward_batch)
 
-        qkv_weight_original = self.qkv_a_proj._parameters.get("weight_original")
-        q_b_weight_original = self.q_b_proj._parameters.get("weight_original")
-        is_mxfp8 = qkv_weight_original is not None and q_b_weight_original is not None
+        qkv_weight_source = vars(self.qkv_a_proj).get("mlaprolog_weight_source")
+        q_b_weight_source = vars(self.q_b_proj).get("mlaprolog_weight_source")
+        is_mxfp8 = qkv_weight_source is not None and q_b_weight_source is not None
 
         token_to_kv_pool = get_token_to_kv_pool()
         dsa_fp8_packed_cache = token_to_kv_pool.dsa_kv_cache_store_fp8
@@ -744,9 +746,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             "token_x": hidden_states,
             "weight_dq": self.q_a_proj_weight,
             "weight_uq_qr": (
-                self.q_b_proj.weight
-                if is_q_b_proj_quantized
-                else self.q_b_proj_weight
+                self.q_b_proj.weight if is_q_b_proj_quantized else self.q_b_proj_weight
             ),
             "weight_uk": self.w_kc,
             "weight_dkv_kr": self.kv_a_proj_weight,
@@ -768,9 +768,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             "query_quant_mode": 0,
         }
         if is_q_b_proj_quantized:
-            mla_prolog_input_args["dequant_scale_w_uq_qr"] = (
-                self.q_b_proj_weight_scale
-            )
+            mla_prolog_input_args["dequant_scale_w_uq_qr"] = self.q_b_proj_weight_scale
         q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = (
             torch_npu.npu_mla_prolog_v3(**mla_prolog_input_args)
         )

@@ -6,7 +6,6 @@ from typing import Optional
 
 import torch
 
-
 DSA_KV_QUANT_TILE_SIZE = 128
 
 
@@ -54,4 +53,13 @@ def normalize_required_fp8_scale(
             "Refusing to use an implicit unit scale because it changes model "
             "outputs silently."
         )
-    return scale.reshape(-1).to(device=device, dtype=torch.float32)
+    normalized = scale.reshape(-1).to(device=device, dtype=torch.float32)
+    if not torch.isfinite(normalized).all():
+        raise RuntimeError(
+            f"{name} contains a non-finite value. This normally means the "
+            "checkpoint scale was not loaded or post-load processing did not "
+            "run."
+        )
+    if (normalized <= 0).any():
+        raise ValueError(f"{name} must contain only positive FP8 scales.")
+    return normalized

@@ -28,9 +28,8 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 
 def _use_explicit_npu_interleaved_rope(m: "DeepseekV2AttentionMLA") -> bool:
-    return (
-        m.rotary_emb is not None
-        and vars(m).get("use_explicit_npu_interleaved_rope", False)
+    return m.rotary_emb is not None and vars(m).get(
+        "use_explicit_npu_interleaved_rope", False
     )
 
 
@@ -83,6 +82,25 @@ def _get_fp8_kv_runtime_scale(
     scale = m._buffers.get(attr_name)
     if scale is None:
         scale = m._parameters.get(attr_name)
+    if scale is None:
+        if vars(m).get("_requires_modelslim_fp8_kv_scale", False):
+            raise RuntimeError(
+                f"{attr_name} is required by the ModelSlim FP8 KV scheme, but "
+                "the checkpoint-derived runtime scale is missing."
+            )
+
+        # Generic ``--kv-cache-dtype fp8_e4m3`` stores a direct FP8 cast and
+        # therefore has an explicit unit-scale contract.  Keep one persistent
+        # per-layer tensor for graph capture instead of allocating per forward.
+        fallback_attr = f"_{attr_name}_direct_fp8_fallback"
+        scale = m._buffers.get(fallback_attr)
+        if scale is None:
+            scale = torch.ones(
+                (1, vars(m).get("num_local_kv_heads", 1)),
+                dtype=torch.float32,
+                device=device,
+            )
+            m.register_buffer(fallback_attr, scale, persistent=False)
     return normalize_required_fp8_scale(
         scale,
         name=attr_name,
@@ -389,22 +407,20 @@ def forward_mla_prepare_npu(
                 dst_type=torch.float8_e4m3fn,
             )
             q_nope_out = q_nope_out.view(q_nope_shape)
-            dequant_scale_q_nope = dequant_scale_q_nope.view(
-                q_nope_shape[:-1]
-            ).to(torch.float32)
+            dequant_scale_q_nope = dequant_scale_q_nope.view(q_nope_shape[:-1]).to(
+                torch.float32
+            )
 
             fp8_kv_scale = _get_fp8_kv_runtime_scale(
                 m,
                 "fak_descale_float",
                 q_pe.device,
             )
-            q_pe = (
-                q_pe / dequant_scale_q_nope.unsqueeze(-1) / fp8_kv_scale
-            ).to(torch.bfloat16)
-
-            ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(
-                m.layer_id
+            q_pe = (q_pe / dequant_scale_q_nope.unsqueeze(-1) / fp8_kv_scale).to(
+                torch.bfloat16
             )
+
+            ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
             c_kv_scale = _get_fp8_kv_runtime_scale(
                 m,
                 "fak_descale_reciprocal",
@@ -489,13 +505,10 @@ def forward_mla_core_npu(
             "fak_descale_float",
             q_pe.device,
         )
-        if (
-            m.kv_cache_dtype == "fp8_e4m3"
-            and (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            )
+        if m.kv_cache_dtype == "fp8_e4m3" and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             attention_kwargs["save_kv_cache"] = False
 
