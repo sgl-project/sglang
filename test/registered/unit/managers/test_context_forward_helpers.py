@@ -332,6 +332,7 @@ class TestContextForwardEnvelope(CustomTestCase):
         for name, value in overrides.items():
             setattr(server_args, name, value)
         model_config = SimpleNamespace(
+            context_len=8192,
             hidden_size=4,
             is_local_attention_model=False,
             is_hybrid_swa=False,
@@ -343,6 +344,7 @@ class TestContextForwardEnvelope(CustomTestCase):
         return SimpleNamespace(
             server_args=server_args,
             model_config=model_config,
+            context_len=model_config.context_len,
         )
 
     def _obj(self, **overrides):
@@ -445,6 +447,7 @@ class TestContextForwardEnvelope(CustomTestCase):
             [0.5],
             [True],
             [-1],
+            [2**63 - 1],
             [2**63],
             [[0], [2**63]],
             [[[0]]],
@@ -452,7 +455,17 @@ class TestContextForwardEnvelope(CustomTestCase):
             with self.subTest(positions=positions), self.assertRaises(ValueError):
                 self._validate(self._stub(), self._obj(token_positions=positions))
 
-        self._validate(self._stub(), self._obj(token_positions=[2**63 - 1]))
+    def test_token_positions_respect_active_context_length(self):
+        stub = self._stub(model_overrides={"context_len": 4})
+        self._validate(stub, self._obj(token_positions=[3]))
+        self._validate(stub, self._obj(token_positions=[[3], [0], [1]]))
+
+        for positions in ([4], [[3], [4], [0]]):
+            with (
+                self.subTest(positions=positions),
+                self.assertRaisesRegex(ValueError, "context length \\(4\\)"),
+            ):
+                self._validate(stub, self._obj(token_positions=positions))
 
     def test_split_prefill_backend_is_honored(self):
         # base backend non-fa is fine when the resolved prefill backend is fa3

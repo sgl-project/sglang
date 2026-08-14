@@ -1935,7 +1935,7 @@ def _compute_chunked_req_next_prompt_token(
 
 def _resolve_query_attention(reqs: List[Req]) -> Optional[str]:
     """All reqs in a batch must share one extend-span attention mode."""
-    modes = {req.query_attention for req in reqs}
+    modes = {getattr(req, "query_attention", None) for req in reqs}
     if len(modes) > 1:
         raise ValueError(f"Mixed query_attention modes in one batch: {modes}")
     return modes.pop() if modes else None

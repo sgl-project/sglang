@@ -1100,6 +1100,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"({len(dims[0])} positions, "
                     f"{embeds_shape[0]} embeds)"
                 )
+            if any(position >= self.context_len for dim in dims for position in dim):
+                raise ValueError(
+                    "token_positions values must be less than the model's "
+                    f"context length ({self.context_len})"
+                )
         return embeds_shape
 
     async def _tokenize_one_request(
