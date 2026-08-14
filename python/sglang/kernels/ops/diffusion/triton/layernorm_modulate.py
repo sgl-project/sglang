@@ -46,19 +46,13 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.kernels.jit.utils import get_jit_cuda_arch
+from sglang.kernels.ops.diffusion.triton.numerics import (
+    cuda_rsqrtf,
+    div_rn_f32,
+    round_bf16_to_fp32,
+)
 from sglang.srt.utils.custom_op import register_custom_op
-
-_FLT_MIN = tl.constexpr(1.1754943508222875e-38)
-
-
-@triton.jit
-def _round_bf16_to_fp32(value):
-    # RNE round of an fp32 value to bf16 precision, staying in fp32 registers
-    # (also blocks any fmul+fadd contraction across the boundary).
-    bits = value.to(tl.int32, bitcast=True)
-    rounding_bias = 0x7FFF + ((bits >> 16) & 1)
-    rounded_bits = (bits + rounding_bias) & -65536
-    return rounded_bits.to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -78,40 +72,6 @@ def _rcp4(x):
         is_pure=True,
         pack=1,
     )
-
-
-@triton.jit
-def _div_rn(x, y):
-    # IEEE correctly-rounded fp32 division.
-    return tl.inline_asm_elementwise(
-        asm="div.rn.f32 $0, $1, $2;",
-        constraints="=f,f,f",
-        args=[x, y],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def _rsqrt_approx(x):
-    return tl.inline_asm_elementwise(
-        asm="rsqrt.approx.f32 $0, $1;",
-        constraints="=f,f",
-        args=[x],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def _rsqrtf(x):
-    # CUDA rsqrtf: MUFU.RSQ with a 2^24 / 2^12 rescale for subnormal inputs.
-    p = tl.abs(x) < _FLT_MIN
-    xs = tl.where(p, x * 16777216.0, x)
-    r = _rsqrt_approx(xs)
-    return tl.where(p, r * 4096.0, r)
 
 
 @triton.jit
@@ -269,7 +229,7 @@ def _layernorm_modulate_kernel(
     mean, m2, cnt = _fold_halves(mean, m2, cnt, ROWS, 1)
 
     denom = tl.zeros((ROWS, 1), dtype=tl.float32) + D
-    rstd = _rsqrtf(_div_rn(m2, denom) + eps)  # (ROWS, 1)
+    rstd = cuda_rsqrtf(div_rn_f32(m2, denom) + eps)  # (ROWS, 1)
 
     batch = row_offs // seq_len
 
@@ -284,7 +244,7 @@ def _layernorm_modulate_kernel(
             mask=mask,
             other=0.0,
         ).to(tl.float32)
-        y = _round_bf16_to_fp32(rstd * (x - mean))
+        y = round_bf16_to_fp32(rstd * (x - mean))
         sc = tl.load(
             scale_ptr + batch[:, None] * scale_row_stride + cols[None, :],
             mask=mask,
@@ -295,8 +255,8 @@ def _layernorm_modulate_kernel(
             mask=mask,
             other=0.0,
         ).to(tl.float32)
-        one_plus = _round_bf16_to_fp32(1.0 + sc)
-        y = _round_bf16_to_fp32(y * one_plus) + sh
+        one_plus = round_bf16_to_fp32(1.0 + sc)
+        y = round_bf16_to_fp32(y * one_plus) + sh
         tl.store(y_ptr + row_base[:, None] + cols[None, :], y, mask=mask)
 
 
@@ -337,7 +297,7 @@ def _qk_ln_head_one(
     mean, m2, cnt = _welford_combine(mean, m2, cnt, zero, zero, zero)
 
     denom = tl.zeros((ROWS, 1), dtype=tl.float32) + D
-    rstd = _rsqrtf(_div_rn(m2, denom) + eps)
+    rstd = cuda_rsqrtf(div_rn_f32(m2, denom) + eps)
 
     cols2 = tl.arange(0, D_POW2)
     out_mask = row_mask[:, None] & (cols2 < D)[None, :]
@@ -379,6 +339,15 @@ def is_plain_layer_norm(norm: torch.nn.Module, hidden: int) -> bool:
 
 def _is_bf16_cuda(t: torch.Tensor) -> bool:
     return t.is_cuda and t.dtype is torch.bfloat16
+
+
+def _qk_head_launch_config() -> tuple[int, int]:
+    arch = get_jit_cuda_arch()
+    if arch.major == 10 and arch.minor == 3:
+        return 32, 1
+    if arch.major * 10 + arch.minor >= 120:
+        return 8, 4
+    return 64, 2
 
 
 def _mod_row_stride(t: torch.Tensor, batch: int, hidden: int) -> int | None:
@@ -495,7 +464,10 @@ def fused_qk_head_layernorm(
     launch, bit-exact vs the eager aten kernel."""
     head_dim = q.shape[-1]
     n_rows = q.numel() // head_dim
-    rows = 64
+    # Architecture sweeps at the production GLM shape select 32 rows / 1 warp
+    # on B300 (SM103) and 8 rows / 4 warps on RTX 5090 (SM120). Preserve the
+    # independently tuned H100/H200 launch on all other architectures.
+    rows, num_warps = _qk_head_launch_config()
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
     with torch.cuda.device(q.device):
@@ -511,6 +483,6 @@ def fused_qk_head_layernorm(
             ROWS=rows,
             # H200-tuned: 62us at (1, 4360, 32, 128) vs the 301us of the two
             # aten launches (one 128-thread block per head_dim-element row).
-            num_warps=2,
+            num_warps=num_warps,
         )
     return q_out, k_out

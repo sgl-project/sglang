@@ -697,7 +697,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 kv_indices = kv_indices[:effective_cache_len]
 
             radix_key = RadixKey(
-                token_ids, req.extra_key, is_bigram=self.tree_core.is_eagle
+                token_ids,
+                req.extra_key,
+                is_bigram=self.tree_core.is_eagle,
+                cache_salt=req.cache_salt,
             ).page_aligned(self.page_size)
             page_aligned_len = len(radix_key)
             values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
@@ -746,7 +749,7 @@ class UnifiedRadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(token_ids)
             ]
-            req.prefix_indices = kv_indices
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
@@ -770,7 +773,12 @@ class UnifiedRadixCache(BasePrefixCache):
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
 
-        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+        # swa_evicted_seqlen is a raw-token length, but under EAGLE the insert key is
+        # bigram-indexed, so SWA would carve tombstones at the wrong offset (#34653).
+        if (
+            envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
+            and not self.tree_core.is_eagle
+        ):
             for comp in self._components_tuple:
                 comp.free_out_of_window_slots(
                     req, effective_cache_len - 1, insert_params
@@ -790,6 +798,7 @@ class UnifiedRadixCache(BasePrefixCache):
             token_ids[:effective_cache_len],
             req.extra_key,
             is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
@@ -919,10 +928,11 @@ class UnifiedRadixCache(BasePrefixCache):
         """Run a backup action top-down, stopping at the first failed backup."""
         written = 0
         for node_id in action.node_ids:
-            # Overlapping chain actions: skip already-backed nodes.
-            if self.tree_core.is_backuped(node_id):
-                continue
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
+            # Overlapping chain actions may revisit nodes with Full KV already
+            # backed up. Skip only when no transfer remains.
+            if device_value.numel() == 0 and not comp_xfers:
+                continue
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
             host_indices = self._execute_kv_backup(
                 node_id, device_value, comp_xfers, sidecar_xfers
@@ -1218,11 +1228,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if not self.enable_storage or self.cache_controller is None:
             return
 
-        extra_key = self.tree_core.prefetch_anchor_info(last_host_node_id)
+        extra_key, cache_salt = self.tree_core.prefetch_anchor_info(last_host_node_id)
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=extra_key,
             is_bigram=self.tree_core.is_eagle,
+            cache_salt=cache_salt,
         ).page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
         if (

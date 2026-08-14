@@ -248,6 +248,7 @@ class FusedMoE(torch.nn.Module):
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
         gemm1_alpha: Optional[float] = None,
+        gemm1_beta: Optional[float] = None,
         gemm1_clamp_limit: Optional[float] = None,
         swiglu_limit: Optional[float] = None,
         use_weight_loader_fused: bool = False,
@@ -352,6 +353,7 @@ class FusedMoE(torch.nn.Module):
             no_combine=no_combine,
             routed_scaling_factor=routed_scaling_factor,
             gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
             gemm1_clamp_limit=gemm1_clamp_limit,
             swiglu_limit=swiglu_limit,
             is_gated=is_gated,
@@ -410,7 +412,19 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        # Dispatchers are not nn.Modules, so they cannot register their own
+        # buffers; the AITER expert mask would not survive a memory-saver resume.
+        expert_mask = getattr(self.dispatcher, "expert_mask_gpu", None)
+        if expert_mask is not None:
+            self.register_buffer("expert_mask_gpu", expert_mask, persistent=False)
         self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
+        # Expose swigluoai alpha/clamp on the layer so deepep's W8A8 apply
+        # (apply_without_routing_weights) picks swiglu_oai_quant instead of plain
+        # npu_swiglu. fuseep injects these via fuseep_activation (aclnnFusedDeepMoe
+        # internal); deepep reads them here via getattr(layer, "swiglu_alpha").
+        # Default None (no-op for non-swigluoai models).
+        self.swiglu_alpha = gemm1_alpha
+        self.swiglu_clamp_limit = gemm1_clamp_limit
 
         if (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
