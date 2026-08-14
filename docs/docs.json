@@ -1011,6 +1011,7 @@
             "pages": [
               "docs/developer_guide/overview",
               "docs/developer_guide/contribution_guide",
+              "docs/developer_guide/serve_backend_plugins",
               {
                 "group": "Development",
                 "pages": [
