@@ -320,6 +320,11 @@ class TestROPE(CustomTestCase):
             (32, 16, 128, torch.bfloat16, torch.float32),
             (2520, 12, 64, torch.bfloat16, torch.bfloat16),
             (2520, 12, 64, torch.bfloat16, torch.float32),
+            # head_dim 160 -> 40 elements per rotary half, so the 32-wide
+            # vector loop runs once and leaves an 8-element scalar tail
+            (17, 3, 160, torch.bfloat16, torch.bfloat16),
+            (17, 3, 160, torch.float16, torch.float32),
+            (32, 16, 128, torch.float16, torch.float16),
         ]
 
         for num_tokens, num_heads, head_dim, dtype, sincos_dtype in test_configs:
@@ -351,12 +356,12 @@ class TestROPE(CustomTestCase):
                     key.float(), cos.float(), sin.float()
                 ).to(dtype)
 
-                q_out, k_out = torch.ops.sgl_kernel.apply_multidimensional_rope_cpu(
+                torch.ops.sgl_kernel.apply_multidimensional_rope_cpu(
                     query, key, cos, sin
                 )
                 atol = rtol = precision[dtype]
-                torch.testing.assert_close(q_out, q_expected, atol=atol, rtol=rtol)
-                torch.testing.assert_close(k_out, k_expected, atol=atol, rtol=rtol)
+                torch.testing.assert_close(query, q_expected, atol=atol, rtol=rtol)
+                torch.testing.assert_close(key, k_expected, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":
