@@ -1,7 +1,8 @@
 import sys
 import types
 import unittest
-from unittest.mock import patch
+from types import ModuleType
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -75,6 +76,26 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
             self.resolve(AttentionBackendEnum.AITER),
             "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend",
         )
+
+    def test_direct_cube_sparse_selection(self):
+        self.assertEqual(
+            self.resolve(AttentionBackendEnum.CUBE_SPARSE_ATTN),
+            "sglang.multimodal_gen.runtime.layers.attention.backends."
+            "cube_sparse_attn.CubeSparseAttentionBackend",
+        )
+
+    def test_blackwell_cube_selection_initializes_fa4_for_token_refiner(self):
+        FakeCudaPlatform.is_blackwell_device = True
+        module_name = (
+            "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn"
+        )
+        fake_flash_attn = ModuleType(module_name)
+        fake_flash_attn.set_fa_ver = Mock()
+
+        with patch.dict("sys.modules", {module_name: fake_flash_attn}):
+            self.resolve(AttentionBackendEnum.CUBE_SPARSE_ATTN)
+
+        fake_flash_attn.set_fa_ver.assert_called_once_with(4)
 
     def test_default_backend_uses_torch_sdpa_on_sm120(self):
         FakeCudaPlatform.is_sm120_device = True

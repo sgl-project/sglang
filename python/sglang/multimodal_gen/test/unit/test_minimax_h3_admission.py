@@ -349,7 +349,7 @@ def test_validate_server_args_requires_packed_varlen_backend():
         _server_arg_value=MiniMaxH3PipelineConfig._server_arg_value,
     )
     server_args = SimpleNamespace(
-        component_attention_backends={}, attention_backend="sage_attn"
+        component_attention_backends={}, attention_backend="sage_attn", ring_degree=1
     )
     with patch(
         "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend"
@@ -367,3 +367,8 @@ def test_validate_server_args_requires_packed_varlen_backend():
     ):
         with pytest.raises(ValueError, match="does not implement packed varlen"):
             MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+    server_args.component_attention_backends = {"transformer": "cube_sparse_attn"}
+    server_args.ring_degree = 2
+    with pytest.raises(ValueError, match="ring parallelism requires"):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)

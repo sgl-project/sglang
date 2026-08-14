@@ -189,6 +189,13 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             if isinstance(attention_backend, AttentionBackendEnum)
             else AttentionBackendEnum[str(attention_backend).strip().upper()]
         )
+        if (
+            server_args.ring_degree > 1
+            and selected_backend is not AttentionBackendEnum.FA
+        ):
+            raise ValueError(
+                "MiniMax H3 ring parallelism requires transformer attention backend 'fa'"
+            )
         get_attn_backend(
             self.dit_config.arch_config.attention_head_dim,
             torch.bfloat16,
