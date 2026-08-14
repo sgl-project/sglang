@@ -194,10 +194,6 @@ The generator currently picks values on the **conservative** side (mirroring an 
 
 The original Flash and Pro recipes use EAGLE. Flash Official (0731) and Pro Official (0813) use the bundled DSpark draft head; see [DSpark](#3-4-dspark-speculative-decoding) for its launch and tuning notes.
 
-<Warning>
-  Do not use EAGLE on the checkpoints that bundle a DSpark head. On 0813, `--speculative-algorithm EAGLE` starts and serves without any error, but the draft head it binds accepts nothing — every decode batch logs `accept len: 1.00, accept rate: 0.00`, so you pay the draft cost for zero speedup. Output stays correct, which is what makes it easy to miss. Switch to `--speculative-algorithm DSPARK`; the startup log then reports `Draft checkpoint bundles a DSpark head`.
-</Warning>
-
 For the original Flash and Pro checkpoints:
 
 - `low-latency`: steps=3, draft-tokens=4 → largest win at bs=1.
@@ -577,8 +573,7 @@ Flash Official (0731) and Pro Official (0813) bundle a DSpark draft head in `dee
 Unlike the EAGLE recipes for the original Flash and Pro checkpoints, this recipe omits `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`. SGLang reads the DSpark shape from the checkpoint.
 
 <Note>
-  The Pro Official (0813) low-latency speed numbers in the Deploy panel were measured with `SGLANG_SIMULATE_ACC_LEN=4`, which pins the DSpark accept length at exactly 4.00. The recipe as shipped earns **4.678** on the same engine, so those rows read slightly conservative. The GSM8K figure for that cell is from the shipped command.
-</Note>
+  The Pro Official (0813) low-latency speed numbers in the Deploy panel were measured with `SGLANG_SIMULATE_ACC_LEN=4`, which pins the DSpark accept length at exactly 4.00.</Note>
 
 The verified 4×GB300 FP4 low-latency command is:
 
