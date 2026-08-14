@@ -69,7 +69,7 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     a13_scale: Optional[torch.Tensor] = None
     a2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
-    # w13 rows were permuted to interleave gate/up at load; the activation
+    # w13 rows were permuted to interleave gate/up at load, so the activation
     # must be applied by the fused up-GEMM epilogue (see fused_moe_kernel).
     fuse_swiglu_interleaved: bool = False
 

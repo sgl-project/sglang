@@ -671,7 +671,7 @@ def _fused_moe_kernel_sequence(
 
     # Activation function with multiplication
     if fuse_swiglu_interleaved:
-        # silu(gate) * up was already applied in the up-GEMM epilogue.
+        # silu(gate) * up was already applied by the up-GEMM epilogue.
         pass
     elif activation == "silu" and is_gated:
         # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)

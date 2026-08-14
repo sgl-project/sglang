@@ -31,7 +31,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang.srt.runtime_context import get_lora
+from sglang.srt.runtime_context import get_exec, get_lora
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -566,50 +566,61 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.w13_kernel.process_weights_after_loading(layer, "w13")
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
 
-        # Interleave gate/up rows of W13 so the triton up-GEMM epilogue can
-        # apply silu(gate) * up in-register and skip intermediate_cache1 and
-        # the standalone activation kernel (bf16 decode fast path). Each GEMM
-        # output column is an independent dot product, so per-column results
-        # are unchanged by the row reordering. Every consumer of this layout
-        # receives it via TritonMoeQuantInfo.fuse_swiglu_interleaved.
-        if (
+        self._maybe_interleave_w13_for_fused_swiglu(layer)
+        return
+
+    def _maybe_interleave_w13_for_fused_swiglu(self, layer: torch.nn.Module) -> None:
+        """Permute W13 rows so the triton up-GEMM epilogue can apply the SwiGLU.
+
+        Interleaving puts both operands of ``silu(gate) * up`` in adjacent
+        columns of one output tile, so the epilogue can apply the activation
+        in-register and store half width -- removing ``intermediate_cache1``
+        and the activation launch per MoE layer. Value-neutral: each output
+        column is an independent dot product.
+
+        The gate stays conservative because only the fused epilogue understands
+        the permuted layout -- every consumer reading W13 or the pre-activation
+        buffer in halves layout is excluded here rather than trapped later
+        (notably LoRA, whose gate_up delta targets the buffer this eliminates).
+        """
+        if not envs.SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED.get():
+            return
+
+        moe_runner_config = layer.moe_runner_config
+        if not (
             _is_cuda
-            and not _should_use_aiter_moe
             and self._aiter_runner is None
             and self.runner.runner_backend.is_triton()
             and get_moe_a2a_backend().is_none()
             and not self.with_bias
             and layer.w13_weight.dtype == torch.bfloat16
-            and layer.moe_runner_config.activation == "silu"
-            and layer.moe_runner_config.is_gated
-            and layer.moe_runner_config.gemm1_alpha is None
-            and layer.moe_runner_config.gemm1_clamp_limit is None
-            and layer.moe_runner_config.swiglu_limit is None
-            # Input-weighted routing (Llama4) scales the hidden states instead
-            # of the expert outputs, which the fused epilogue does not handle;
-            # fused_moe asserts against it. The interleaving below is permanent,
-            # so it has to be refused here rather than per call.
-            and not layer.moe_runner_config.apply_router_weight_on_input
-            # LoRA on the experts runs through FusedMoEWithLoRA, which reuses
-            # this method's quant info (so it inherits the interleaved flag)
-            # but drives its own MoeRunner with lora_enabled=True. That runner
-            # passes per-call LoRA hooks, which fused_moe also refuses. Whether
-            # hooks appear is a per-call property, so gate on the server flag
-            # here -- this is the load-time decision point and the interleaving
-            # is permanent.
+            and moe_runner_config.activation == "silu"
+            and moe_runner_config.is_gated
+            and moe_runner_config.gemm1_alpha is None
+            and moe_runner_config.gemm1_clamp_limit is None
+            and moe_runner_config.swiglu_limit is None
+            and not moe_runner_config.apply_router_weight_on_input
+            # The LoRA MoE hooks read and write the full-width pre-activation
+            # buffer in halves layout; both assumptions break here.
             and not get_lora().enable_lora
+            and not get_lora().lora_paths
+            # EPLB rearranges experts by copying checkpoint-layout weights in.
+            and not get_exec().moe.enable_eplb
         ):
-            w13 = layer.w13_weight.data
-            inter = w13.shape[1] // 2
-            idx = torch.empty(w13.shape[1], dtype=torch.long, device=w13.device)
-            idx[0::2] = torch.arange(0, inter, device=w13.device)
-            idx[1::2] = torch.arange(inter, 2 * inter, device=w13.device)
-            # Per-expert to cap the gather temp at one expert's slice.
-            for e in range(w13.shape[0]):
-                w13[e] = w13[e][idx]
-            self.w13_swiglu_interleaved = True
+            return
 
-        return
+        w13 = layer.w13_weight.data
+        inter = w13.shape[1] // 2
+        idx = torch.empty(w13.shape[1], dtype=torch.long, device=w13.device)
+        idx[0::2] = torch.arange(0, inter, device=w13.device)
+        idx[1::2] = torch.arange(inter, 2 * inter, device=w13.device)
+        # Per-expert, to cap the gather temporary at one expert's slice.
+        for e in range(w13.shape[0]):
+            w13[e] = w13[e][idx]
+        self.w13_swiglu_interleaved = True
+        logger.info_once(
+            "Interleaved w13 gate/up: the SwiGLU is applied by the MoE up-GEMM epilogue."
+        )
 
     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
         self,
