@@ -169,7 +169,7 @@ sgl-eval run aime25 \\
   defaultAccuracy: {
     flash: { gpqa_pct: 88.1, aime25_pct: 95,   gsm8k_pct: 96.13 },
     pro:   { gpqa_pct: 90.1, aime25_pct: 97.5, gsm8k_pct: 96.13 },
-    "pro-official": { aime25_pct: 98.1, gsm8k_pct: 96.13 },
+    "pro-official": { gpqa_pct: 89.7, aime25_pct: 98.1, gsm8k_pct: 96.13 },
   },
 
   // The eval set rendered in the benchmark card + "⚡ Reproduce" (the engine
