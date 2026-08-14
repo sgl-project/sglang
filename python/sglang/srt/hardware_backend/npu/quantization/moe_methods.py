@@ -105,15 +105,42 @@ def _pack_mxfp_weight_scale(scale: torch.Tensor) -> torch.Tensor:
     ).transpose(1, 2)
 
 
-def _normalize_mxfp_input_scale(scale: torch.Tensor) -> torch.Tensor:
-    if scale.ndim == 3:
-        return scale
-    if scale.ndim != 2 or scale.shape[-1] % 2 != 0:
+def _normalize_mxfp_input_scale(
+    scale: torch.Tensor,
+    hidden_states: torch.Tensor,
+    *,
+    activation_is_fp4: bool,
+) -> torch.Tensor:
+    """Normalize DeepEP's MX activation scale to the grouped-matmul ABI.
+
+    Ascend DeepEP normal dispatch returns the UE8M0 scale as one flat buffer,
+    while other dispatch paths may retain ``[tokens, K/32]`` or already expose
+    ``[tokens, K/64, 2]``.  The activation payload is physically K/2 wide for
+    packed FP4 and K wide for FP8, so derive one canonical shape from it rather
+    than guessing the token count from the flattened scale.
+    """
+    if hidden_states.ndim != 2:
         raise ValueError(
-            "MXFP activation scale must be [tokens, K/32] or "
-            f"[tokens, K/64, 2], got {scale.shape}."
+            "MXFP grouped-matmul activation payload must be 2D, got "
+            f"{tuple(hidden_states.shape)}."
         )
-    return scale.reshape(scale.shape[0], scale.shape[1] // 2, 2)
+
+    logical_k = hidden_states.shape[-1] * (2 if activation_is_fp4 else 1)
+    if logical_k % 64 != 0:
+        raise ValueError(
+            "MXFP activation width must contain a whole pair of 32-value "
+            f"blocks, got logical K={logical_k}."
+        )
+
+    expected_shape = (hidden_states.shape[0], logical_k // 64, 2)
+    expected_numel = expected_shape[0] * expected_shape[1] * expected_shape[2]
+    if scale.ndim not in (1, 2, 3) or scale.numel() != expected_numel:
+        raise ValueError(
+            "MXFP activation scale must be flat, [tokens, K/32], or "
+            f"[tokens, K/64, 2] with {expected_numel} values for payload "
+            f"{tuple(hidden_states.shape)}; got {tuple(scale.shape)}."
+        )
+    return scale.reshape(expected_shape)
 
 
 # DEPRECATED METHOD
@@ -1013,7 +1040,11 @@ class _NPUPackedMXFP4MoEMethod(_NPUMoEMethodBase):
                     f"{hidden_states.dtype}. Check the explicit DeepEP "
                     "dispatcher output dtype override."
                 )
-            return hidden_states, _normalize_mxfp_input_scale(input_scale)
+            return hidden_states, _normalize_mxfp_input_scale(
+                input_scale,
+                hidden_states,
+                activation_is_fp4=self.activation_is_fp4,
+            )
         if hidden_states.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(
                 "Pre-quantized MXFP MoE activations require their UE8M0 scale; "
@@ -1215,7 +1246,9 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
         else:
-            pertoken_scale = _normalize_mxfp_input_scale(pertoken_scale)
+            pertoken_scale = _normalize_mxfp_input_scale(
+                pertoken_scale, hidden_states, activation_is_fp4=False
+            )
 
         e8m0_dtype = _require_e8m0_dtype()
         return self.matmul.forward(

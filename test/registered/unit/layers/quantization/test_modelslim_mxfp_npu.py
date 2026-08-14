@@ -239,9 +239,38 @@ class TestModelSlimMXFP4MoE(CustomTestCase):
         torch.testing.assert_close(packed, expected)
 
         flat_input_scale = torch.arange(8, dtype=torch.uint8).reshape(2, 4)
-        normalized = _normalize_mxfp_input_scale(flat_input_scale)
+        payload = torch.zeros((2, 128), dtype=torch.float8_e4m3fn)
+        normalized = _normalize_mxfp_input_scale(
+            flat_input_scale, payload, activation_is_fp4=False
+        )
         self.assertEqual(normalized.shape, (2, 2, 2))
         torch.testing.assert_close(normalized.reshape(2, 4), flat_input_scale)
+
+    def test_flat_deepep_mxfp_scales_follow_payload_shape(self):
+        flat_scale = torch.arange(18 * 192, dtype=torch.int32).to(torch.uint8)
+
+        with patch.object(torch, "float4_e2m1fn_x2", torch.uint8, create=True):
+            fp4_payload = torch.zeros((18, 3072), dtype=torch.uint8)
+            actual_payload, fp4_scale = NPUW4A4MXFP4MoEMethod(
+                "w13"
+            )._quantize_input(fp4_payload, flat_scale)
+        self.assertIs(actual_payload, fp4_payload)
+        self.assertEqual(fp4_scale.shape, (18, 96, 2))
+        torch.testing.assert_close(fp4_scale.reshape(-1), flat_scale)
+
+        fp8_payload = torch.zeros((18, 6144), dtype=torch.float8_e4m3fn)
+        actual_payload, fp8_scale = NPUW4A8MXFPMoEMethod("w13")._quantize_input(
+            fp8_payload, flat_scale
+        )
+        self.assertIs(actual_payload, fp8_payload)
+        self.assertEqual(fp8_scale.shape, (18, 96, 2))
+        torch.testing.assert_close(fp8_scale.reshape(-1), flat_scale)
+
+        with patch.object(torch, "float4_e2m1fn_x2", torch.uint8, create=True):
+            with self.assertRaisesRegex(ValueError, "with 3456 values"):
+                NPUW4A4MXFP4MoEMethod("w13")._quantize_input(
+                    fp4_payload, flat_scale[:-1]
+                )
 
     def test_missing_moe_scale_never_falls_back_to_one(self):
         kernel = NPUW4A4MXFP4MoEMethod("w13")
@@ -253,7 +282,7 @@ class TestModelSlimMXFP4MoE(CustomTestCase):
     def test_prequantized_payload_dtype_must_match_mxfp_kernel(self):
         input_scale = torch.zeros((2, 2), dtype=torch.uint8)
         with patch.object(torch, "float4_e2m1fn_x2", torch.uint8, create=True):
-            fp4_payload = torch.zeros((2, 2), dtype=torch.uint8)
+            fp4_payload = torch.zeros((2, 32), dtype=torch.uint8)
             actual_payload, actual_scale = NPUW4A4MXFP4MoEMethod("w13")._quantize_input(
                 fp4_payload, input_scale
             )
@@ -262,7 +291,7 @@ class TestModelSlimMXFP4MoE(CustomTestCase):
 
             with self.assertRaisesRegex(RuntimeError, "payload dtype"):
                 NPUW4A4MXFP4MoEMethod("w13")._quantize_input(
-                    torch.zeros((2, 4), dtype=torch.float8_e4m3fn),
+                    torch.zeros((2, 64), dtype=torch.float8_e4m3fn),
                     input_scale,
                 )
 
@@ -272,7 +301,7 @@ class TestModelSlimMXFP4MoE(CustomTestCase):
                 input_scale,
             )
 
-        fp8_payload = torch.zeros((2, 4), dtype=torch.float8_e4m3fn)
+        fp8_payload = torch.zeros((2, 64), dtype=torch.float8_e4m3fn)
         actual_payload, actual_scale = NPUW4A8MXFPMoEMethod("w13")._quantize_input(
             fp8_payload, input_scale
         )
