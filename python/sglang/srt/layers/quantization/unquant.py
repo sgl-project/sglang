@@ -90,11 +90,18 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
 
     backend_str = server_args.bf16_gemm_backend
     if backend_str == "auto" and is_sm100_supported():
-        backend_str = "cutedsl"
+        backend_str = (
+            "torch" if server_args.enable_deterministic_inference else "cutedsl"
+        )
 
     backend = Bf16GemmBackend(backend_str)
 
     if backend.is_cutedsl():
+        if server_args.enable_deterministic_inference:
+            raise ValueError(
+                "--bf16-gemm-backend cutedsl is batch-size dependent and cannot "
+                "be combined with --enable-deterministic-inference"
+            )
         if not is_sm100_supported():
             raise ValueError("--bf16-gemm-backend cutedsl requires an SM10x GPU")
 
