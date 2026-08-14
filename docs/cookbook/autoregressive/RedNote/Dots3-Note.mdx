@@ -48,8 +48,6 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 Pick the hardware and the checkpoint precision. The recipe runs on a single 8-GPU Hopper node with DP8 attention × TP8 × EP8 and DeepEP as the MoE all-to-all transport. Blackwell is not supported yet.
 
-The H100 cells repeat the H200 flags verbatim and are unverified. H100 carries 80 GiB per GPU against H200's 141 GiB, so a single 8-GPU H100 node holds 640 GiB — at `--mem-fraction-static 0.87` that leaves about 557 GiB for the static pool. The BF16 checkpoint alone is 537 GiB of weights, so it does not leave a usable KV pool at `--context-length 524288`; start from the FP8 cell on H100, and see the CUDA graph note below.
-
 **Precision** — selects the MoE path, not just the weights. The BF16 cells pin `--moe-runner-backend deep_gemm` with BF16 DeepEP dispatch output (JIT DeepGEMM is enabled via `SGLANG_ENABLE_JIT_DEEPGEMM=1`). The FP8 cells leave both at `auto` and let SGLang resolve the runner from the checkpoint's quantization config.
 
 **Spec Decode** — NEXTN is on in every cell: 3 draft steps, 4 draft tokens per step, and the draft model path pointing at the target checkpoint itself. dots3's MTP layer is full-sharing — it carries the dots3 sliding-window attention geometry and reuses the target LM head — so no separate draft checkpoint is needed. Target verification and draft extension run on the paged, absorbed SWA-MLA FA3 path.
