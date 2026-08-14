@@ -2,10 +2,12 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
+    read_draft_checkpoint_config,
     resolve_runtime_config,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
@@ -72,6 +74,20 @@ def test_gamma_override_warning_names_resolved_config_gamma(caplog):
     assert "draft config block_size=7" not in caplog.text
 
 
+def test_bundled_draft_config_uses_server_args_model_config():
+    hf_config = _config(sample_from_anchor=False)
+    server_args = SimpleNamespace(
+        model_path="bundled-checkpoint",
+        speculative_draft_model_path="bundled-checkpoint",
+        get_model_config=lambda: SimpleNamespace(hf_config=hf_config),
+    )
+
+    parsed = read_draft_checkpoint_config(server_args=server_args)
+
+    assert parsed.gamma == 7
+    assert not parsed.sample_from_anchor
+
+
 def test_draft_graph_width_tracks_dspark_query_layout():
     def width(*, sample_from_anchor, is_draft_worker=True):
         server_args = SimpleNamespace(
@@ -103,6 +119,21 @@ def test_non_dspark_target_verify_width_is_unchanged():
         )
         == 8
     )
+
+
+def test_dspark_target_verify_width_requires_resolved_layout():
+    server_args = SimpleNamespace(
+        speculative_num_draft_tokens=8,
+        speculative_dspark_sample_from_anchor=None,
+    )
+
+    with pytest.raises(ValueError, match="sample_from_anchor must be resolved"):
+        resolve_num_tokens_per_req(
+            phase="target_verify",
+            server_args=server_args,
+            spec_algorithm=SpeculativeAlgorithm.DSPARK,
+            is_draft_worker=True,
+        )
 
 
 def test_bonus_anchor_eager_forward_uses_draft_embedding_and_counts_all_queries():

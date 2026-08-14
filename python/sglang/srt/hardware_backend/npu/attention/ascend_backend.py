@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_flags, get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
     get_bool_env_var,
     get_current_device_stream_fast,
@@ -345,10 +346,12 @@ class AscendAttnBackend(AttentionBackend):
             self.speculative_num_draft_tokens is not None
             and model_runner.is_draft_worker
         ):
-            self.speculative_num_draft_tokens = (
-                model_runner.spec_algorithm.get_num_tokens_per_req_for_target_verify(
-                    int(self.speculative_num_draft_tokens), is_draft_worker=True
-                )
+            self.speculative_num_draft_tokens = resolve_num_tokens_per_req(
+                phase="target_verify",
+                server_args=model_runner.server_args,
+                spec_algorithm=model_runner.spec_algorithm,
+                is_draft_worker=True,
+                num_draft_tokens=int(self.speculative_num_draft_tokens),
             )
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
             model_runner, self.device, self.use_fia, self.use_mla

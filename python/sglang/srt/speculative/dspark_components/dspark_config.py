@@ -136,8 +136,7 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
 
     draft_hf_config = None
     if server_args.speculative_draft_model_path == server_args.model_path:
-        model_config = getattr(server_args, "model_config", None)
-        draft_hf_config = getattr(model_config, "hf_config", None)
+        draft_hf_config = server_args.get_model_config().hf_config
     if draft_hf_config is None:
         draft_hf_config = get_config(
             server_args.speculative_draft_model_path,

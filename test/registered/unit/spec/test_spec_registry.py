@@ -12,6 +12,7 @@ from sglang.srt.speculative.spec_registry import (
     _assert_custom_spec_algo_conforms,
     _reserved_names,
 )
+from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -163,6 +164,18 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         # must answer it the same way the enum does (True iff not NONE).
         self.assertEqual(self.algo.is_some(), not self.algo.is_none())
         self.assertEqual(SpeculativeAlgorithm.EAGLE.is_some(), self.algo.is_some())
+
+    def test_target_verify_width_uses_explicit_non_dspark_layout(self):
+        server_args = SimpleNamespace(speculative_num_draft_tokens=8)
+        self.assertEqual(
+            resolve_num_tokens_per_req(
+                phase="target_verify",
+                server_args=server_args,
+                spec_algorithm=self.algo,
+                is_draft_worker=True,
+            ),
+            8,
+        )
 
     def test_supports_overlap_false_warns_deprecation(self):
         # supports_overlap=False plugins run the V2 schema synchronously; the
