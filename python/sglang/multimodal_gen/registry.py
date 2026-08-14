@@ -73,6 +73,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineCo
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
     LingBotVideoMoEPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
+    LongCatImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
@@ -144,6 +147,9 @@ from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
 )
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.longcat_image import (
+    LongCatImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
@@ -1208,6 +1214,18 @@ def _register_configs():
         pipeline_config_cls=LingBotVideoMoEPipelineConfig,
         model_detectors=[
             lambda hf_id: "lingbot-video-moe" in hf_id.lower(),
+        ],
+    )
+
+    # LongCat-Image
+    register_configs(
+        sampling_param_cls=LongCatImageSamplingParams,
+        pipeline_config_cls=LongCatImagePipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image",
+        ],
+        model_detectors=[
+            lambda hf_id: "longcat" in hf_id.lower() and "edit" not in hf_id.lower(),
         ],
     )
 
