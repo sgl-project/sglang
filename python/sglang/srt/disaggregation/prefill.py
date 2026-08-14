@@ -340,7 +340,6 @@ class PrefillBootstrapQueue:
         if not self.ensure_metadata_buffer(req):
             return False
 
-        req.time_stats.set_bootstrap_done_time()
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
         num_kv_indices = len(req.origin_input_ids)
         req.start_send_idx = decode_prefix_len
@@ -453,8 +452,16 @@ class PrefillBootstrapQueue:
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
-                elif not self.finalize_bootstrap(req):
-                    continue
+                else:
+                    # The rendezvous with the decode side is complete as of
+                    # now; everything after this point is local resource
+                    # acquisition. Mirrors the decode-side stamp in
+                    # DecodePreallocQueue. Not stamped on the forced-retry
+                    # path above, whose request goes on to a full optimistic
+                    # attempt and is stamped when it finalizes for real.
+                    req.time_stats.set_bootstrap_done_time()
+                    if not self.finalize_bootstrap(req):
+                        continue
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
                 req.time_stats.set_wait_queue_entry_time()
@@ -527,6 +534,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # Optimistic requests reserved a metadata buffer when popped, so
                 # finalize cannot fail here; if it ever does, the request stays
                 # pending and the post-forward check resolves it.
+                req.time_stats.set_bootstrap_done_time()
                 self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
         if failed:
             self.waiting_queue = [
@@ -1035,6 +1043,7 @@ class SchedulerDisaggregationPrefillMixin:
                 return False
             # Metadata buffer was allocated in pop_bootstrapped before
             # the request entered the waiting queue, so finalize should not fail.
+            req.time_stats.set_bootstrap_done_time()
             assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
             return True
         else:

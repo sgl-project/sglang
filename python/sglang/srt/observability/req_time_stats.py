@@ -1095,6 +1095,31 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 bootstrap_fields = (
                     f"bootstrap_duration={self.format_duration(bootstrap_duration)}, "
                 )
+                # Second sub-phase: local resource acquisition after the
+                # rendezvous (metadata buffer slot + sender init). Mirrors the
+                # decode-side alloc_wait_duration.
+                if self.wait_queue_entry_time >= self.bootstrap_done_time:
+                    alloc_wait_duration = self.duration_between(
+                        self.bootstrap_done_time, self.wait_queue_entry_time
+                    )
+                    if SGLANG_TEST_REQUEST_TIME_STATS:
+                        assert (
+                            alloc_wait_duration >= 0
+                        ), f"alloc_wait_duration={alloc_wait_duration} < 0"
+                    bootstrap_fields += (
+                        f"alloc_wait_duration="
+                        f"{self.format_duration(alloc_wait_duration)}, "
+                    )
+                else:
+                    # Stamps out of order: with optimistic prefill the request
+                    # leaves the bootstrap queue before the rendezvous, so this
+                    # interval is not an alloc wait. Report the stamp itself
+                    # instead of dropping the sub-phase silently, so the
+                    # inversion stays visible in the log line.
+                    bootstrap_fields += (
+                        f"bootstrap_done_time="
+                        f"{self.format_wallclock(self.bootstrap_done_time)}, "
+                    )
             elif self.bootstrap_done_time > 0:
                 bootstrap_fields = f"bootstrap_done_time={self.format_wallclock(self.bootstrap_done_time)}, "
             else:
