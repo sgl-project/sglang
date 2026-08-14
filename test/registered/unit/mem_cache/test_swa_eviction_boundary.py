@@ -21,6 +21,7 @@ import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
@@ -195,6 +196,146 @@ class TestSWAEvictionBoundary(unittest.TestCase):
                 req, is_insert=True, kv_len_to_handle=req._kv_committed_len
             )
             tree.sanity_check()
+
+    # -- Retention floor: never free past the last state checkpoint --
+
+    def test_retain_floor_clamps_eviction(self):
+        """A hybrid cache keeps SWA down to the last state checkpoint, not to the
+        window behind the tail, because that is where a prefix match lands. The
+        floor must clamp the frontier even though the tail has moved far past it."""
+        page_size, window = 8, 16
+        tree, allocator, pool = _build_swa_tree(
+            page_size=page_size, sliding_window_size=window
+        )
+        seq_len = 200
+        checkpoint = 96
+        kv = _swa_alloc(allocator, seq_len)
+        pool.write((0, slice(0, seq_len)), kv)
+        req = _make_req(0, list(range(seq_len)), 0, tree)
+        batch = _make_batch(tree, allocator, pool)
+
+        free_swa_out_of_window_slots(
+            req,
+            seq_len - 1,
+            sliding_window_size=window,
+            page_size=page_size,
+            req_to_token_pool=batch.req_to_token_pool,
+            token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
+            retain_floor=checkpoint - window,
+        )
+
+        # Without the floor this would reach page_floor(199 - 16) = 176.
+        self.assertLessEqual(req.kv.swa_evicted_seqlen, checkpoint - window)
+        self.assertEqual(req.kv.swa_evicted_seqlen % page_size, 0)
+
+    def test_retain_floor_ignored_for_chunk_cache(self):
+        """Chunk cache builds no tree, so a retained checkpoint could never be
+        matched. Holding it would cost SWA slots for nothing."""
+        page_size, window = 8, 16
+        seq_len = 200
+        tree, allocator, pool = _build_swa_tree(
+            page_size=page_size, sliding_window_size=window
+        )
+        kv = _swa_alloc(allocator, seq_len)
+        pool.write((0, slice(0, seq_len)), kv)
+        req = _make_req(0, list(range(seq_len)), 0, tree)
+        batch = _make_batch(tree, allocator, pool)
+
+        free_swa_out_of_window_slots(
+            req,
+            seq_len - 1,
+            sliding_window_size=window,
+            page_size=page_size,
+            req_to_token_pool=batch.req_to_token_pool,
+            token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
+            is_chunk_cache=True,
+            retain_floor=16,
+        )
+
+        expected = (seq_len - 1 - window) // page_size * page_size
+        self.assertEqual(req.kv.swa_evicted_seqlen, expected)
+
+    def test_retain_floor_none_matches_old_behaviour(self):
+        """retain_floor=None must reproduce the pre-change frontier exactly, so a
+        cache without a second state stream is unaffected."""
+        page_size, window = 8, 16
+        seq_len = 200
+        frontiers = []
+        for floor in (None, "absent"):
+            tree, allocator, pool = _build_swa_tree(
+                page_size=page_size, sliding_window_size=window
+            )
+            kv = _swa_alloc(allocator, seq_len)
+            pool.write((0, slice(0, seq_len)), kv)
+            req = _make_req(0, list(range(seq_len)), 0, tree)
+            batch = _make_batch(tree, allocator, pool)
+            kwargs = {} if floor == "absent" else {"retain_floor": None}
+            free_swa_out_of_window_slots(
+                req,
+                seq_len - 1,
+                sliding_window_size=window,
+                page_size=page_size,
+                req_to_token_pool=batch.req_to_token_pool,
+                token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
+                **kwargs,
+            )
+            frontiers.append(req.kv.swa_evicted_seqlen)
+
+        expected = (seq_len - 1 - max(window, page_size)) // page_size * page_size
+        self.assertEqual(frontiers[0], expected)
+        self.assertEqual(frontiers[1], expected)
+
+    def test_retain_floor_above_threshold_is_inert(self):
+        """The floor is a min(), so a checkpoint that is already inside the window
+        must not hold anything extra."""
+        page_size, window = 8, 16
+        seq_len = 200
+        tree, allocator, pool = _build_swa_tree(
+            page_size=page_size, sliding_window_size=window
+        )
+        kv = _swa_alloc(allocator, seq_len)
+        pool.write((0, slice(0, seq_len)), kv)
+        req = _make_req(0, list(range(seq_len)), 0, tree)
+        batch = _make_batch(tree, allocator, pool)
+
+        free_swa_out_of_window_slots(
+            req,
+            seq_len - 1,
+            sliding_window_size=window,
+            page_size=page_size,
+            req_to_token_pool=batch.req_to_token_pool,
+            token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
+            retain_floor=seq_len,
+        )
+
+        expected = (seq_len - 1 - max(window, page_size)) // page_size * page_size
+        self.assertEqual(req.kv.swa_evicted_seqlen, expected)
+
+    def test_retain_floor_does_not_unfree(self):
+        """The frontier only advances. A floor arriving after slots were already
+        freed must not claim them back, which would double-free on the next pass."""
+        page_size, window = 8, 16
+        tree, allocator, pool = _build_swa_tree(
+            page_size=page_size, sliding_window_size=window
+        )
+        seq_len = 200
+        kv = _swa_alloc(allocator, seq_len)
+        pool.write((0, slice(0, seq_len)), kv)
+        req = _make_req(0, list(range(seq_len)), 0, tree)
+        batch = _make_batch(tree, allocator, pool)
+        common_kwargs = dict(
+            sliding_window_size=window,
+            page_size=page_size,
+            req_to_token_pool=batch.req_to_token_pool,
+            token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
+        )
+
+        free_swa_out_of_window_slots(req, seq_len - 1, **common_kwargs)
+        advanced = req.kv.swa_evicted_seqlen
+        self.assertGreater(advanced, 0)
+
+        free_swa_out_of_window_slots(req, seq_len - 1, retain_floor=0, **common_kwargs)
+        self.assertEqual(req.kv.swa_evicted_seqlen, advanced)
 
     # -- Eviction formula: page_size == 1 --
 

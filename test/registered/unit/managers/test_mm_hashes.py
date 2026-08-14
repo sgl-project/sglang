@@ -43,6 +43,32 @@ class TestMmHashesContract(CustomTestCase):
         req = GenerateReqInput(text="hi")
         self.assertIsNone(req.mm_hashes)
 
+    def test_content_hashes_are_distinct_from_feature_hashes(self):
+        content_hash = "sha256:" + "ab" * 32
+        req = GenerateReqInput(
+            text="hi",
+            image_data=["http://example.com/img.png"],
+            mm_hashes=["deadbeef"],
+            mm_content_hashes=[content_hash],
+        )
+        self.assertEqual(req.mm_hashes, ["deadbeef"])
+        self.assertEqual(req.mm_content_hashes, [content_hash])
+
+    def test_batched_hashes_follow_each_request(self):
+        req = GenerateReqInput(
+            text=["one", "two"],
+            image_data=[["a"], ["b", "c"]],
+            mm_hashes=["01", ["02", "03"]],
+            mm_content_hashes=[
+                ["sha256:" + "11" * 32],
+                ["sha256:" + "22" * 32, "sha256:" + "33" * 32],
+            ],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].mm_hashes, ["01"])
+        self.assertEqual(req[1].mm_hashes, ["02", "03"])
+        self.assertEqual(len(req[1].mm_content_hashes), 2)
+
     def test_set_pad_value_honors_preset_hash(self):
         """set_pad_value() must use a pre-set hash without recomputing."""
         item = MultimodalDataItem(modality=Modality.IMAGE, hash=0xDEADBEEF)
