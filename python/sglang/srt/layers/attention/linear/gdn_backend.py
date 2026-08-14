@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.linear.utils import (
     build_verify_intermediate_state_indices,
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
+    get_linear_attn_verify_backend,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
@@ -225,6 +226,7 @@ class GDNKernelDispatcher:
         self,
         decode_backend: LinearAttnKernelBackend,
         prefill_backend: LinearAttnKernelBackend,
+        verify_backend: Optional[LinearAttnKernelBackend] = None,
     ):
         triton_kernel = TritonGDNKernel()
         self.tree_verify_kernel = triton_kernel
@@ -292,10 +294,15 @@ class GDNKernelDispatcher:
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Verify kernel: use FlashInfer when the selected FlashInfer kernel
-        # supports MTP verify. SM90 uses the fp32-state path; SM100 uses the
-        # bf16-state adapter in FlashInferGDNKernel.
-        if (
+        # Verify kernel. An explicitly configured verify backend wins; the
+        # historical auto rule (FlashInfer when the selected FlashInfer kernel
+        # supports MTP verify) only applies when no explicit choice was made.
+        # SM90 FlashInfer verify requires a fp32 SSM state, so e.g.
+        # --mamba-ssm-dtype bfloat16 setups must be able to force Triton here.
+        if verify_backend is not None and verify_backend.is_triton():
+            self.verify_kernel = triton_kernel
+            self.verify_kernel_is_flashinfer = False
+        elif (
             decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
         ) and flashinfer_kernel.supports_target_verify:
             self.verify_kernel = flashinfer_kernel
@@ -465,7 +472,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         validate_gdn_mis_backend(model_runner.server_args, prefill_backend)
-        self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        verify_backend = get_linear_attn_verify_backend()
+        self.kernel_dispatcher = GDNKernelDispatcher(
+            decode_backend, prefill_backend, verify_backend
+        )
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(

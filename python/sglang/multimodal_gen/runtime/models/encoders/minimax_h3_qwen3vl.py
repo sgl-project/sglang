@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
     MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
     MiniMaxH3Qwen3VLConfig,
 )
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLModel
@@ -39,6 +40,10 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
     TP group. A TP=1/SP=8 DiT deployment therefore shards the encoder over all
     eight otherwise-idle ranks during encoding.
     """
+
+    # encode_ids drives the forward pass; __call__ is never used, so FSDP2
+    # needs it registered or the root group (the vision tower) stays sharded.
+    _fsdp_forward_methods = ("encode_ids",)
 
     supports_dp_encode = True
 
@@ -68,7 +73,15 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
 
     @property
     def device(self) -> torch.device:
-        return next(self.parameters()).device
+        """Device this encoder's forward runs on.
+
+        Deliberately not `next(self.parameters()).device`. `--text-encoder-cpu-offload`
+        loads this component under an FSDP CPU offload policy, which keeps the sharded
+        parameters on CPU and all-gathers them to the accelerator for the forward. The
+        parameter device then names the storage side, not the compute side, so inputs
+        built from it stay on CPU while the forward runs on the accelerator.
+        """
+        return get_local_torch_device()
 
     @torch.no_grad()
     def forward(

@@ -161,6 +161,42 @@ export const config = {
   // cell is showing, so turning speculation on does not triple the cell count.
   overlayDims: [
     {
+      id: "mmTransport",
+      title: "VLM Transport",
+      default: "auto",
+      showWhen: (s) => s.pdMode !== "decode",
+      options: [
+        {
+          id: "auto",
+          label: "Auto (topology-aware)",
+          hints: (s) => {
+            if (s.pdMode !== "unified") {
+              return [
+                "VLM transport: Auto -> CPU for PD; KV/KDA transfer is separate.",
+              ];
+            }
+            if (s.hw === "b300") {
+              return [
+                "VLM transport: Auto -> CUDA IPC (up to 1 GiB HBM; CPU fallback when full).",
+              ];
+            }
+            if (["gb200", "gb300"].includes(s.hw)) {
+              return [
+                "VLM transport: Auto -> CUDA VMM with IMEX, otherwise CPU (up to 1 GiB HBM).",
+              ];
+            }
+            return ["VLM transport: Auto -> CPU on this topology."];
+          },
+        },
+        {
+          id: "cpu",
+          label: "CPU (save HBM)",
+          flags: ["--mm-feature-transport cpu"],
+          hints: ["VLM transport: CPU; no GPU feature pool."],
+        },
+      ],
+    },
+    {
       id: "spec",
       title: "Spec Decode",
       default: "dspark",
@@ -422,10 +458,8 @@ export const config = {
           // Blackwell-only kernel-fusion path; selecting it reveals the Quantization sub-select.
           { id: "megamoe",          label: "MegaMoE",           flags: ["--moe-a2a-backend megamoe"],
             requiresHw: ["b200", "b300", "gb200", "gb300"] },
-          // Blackwell-only: runs the prebuilt trtllm-gen SiTU cubins; needs the
-          // downloadable SiTU cubin pool unpacked and pointed to by the env var.
+          // Blackwell-only: runs FlashInfer's official trtllm-gen SiTU kernels.
           { id: "flashinfer_mxfp4", label: "FlashInfer (MXFP4)", flags: ["--moe-runner-backend flashinfer_mxfp4"],
-            env: ["SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/path/to/trtllm_gen_moe_cubin_pool"],
             requiresHw: ["b200", "b300", "gb200", "gb300"] },
           { id: "marlin",           label: "Marlin (W4A16)",    flags: ["--moe-runner-backend marlin"] },
         ],
@@ -895,10 +929,8 @@ export const config = {
         "--pp-size 2",
         "--dcp-size 8",
         "--ep-size 8",
-        // Both pinned to the brought-up shape rather than left to the auto
-        // resolution the rest of Blackwell uses. The MXFP4 runner needs the SiTU
-        // cubin pool the published image ships; drop it to get the Marlin
-        // fallback on an install without one.
+        // Both backends are pinned to the validated recipe even though automatic
+        // resolution selects them on Blackwell.
         "--moe-runner-backend flashinfer_mxfp4",
         "--decode-attention-backend cutedsl_mla",
         "--mem-fraction-static 0.85",
@@ -1195,7 +1227,6 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
-        "--enable-symm-mem",
         "--mem-fraction-static 0.85",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
@@ -1260,7 +1291,6 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 16",
-        "--enable-symm-mem",
         "--mem-fraction-static 0.85",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
@@ -1389,7 +1419,6 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
-        "--enable-symm-mem",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 16384",
         "--max-prefill-tokens 16384",
@@ -1970,7 +1999,6 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
-        "--enable-symm-mem",
         "--mem-fraction-static 0.85",
         "--disaggregation-decode-extra-slots 16",
         "--reasoning-parser kimi_k3",

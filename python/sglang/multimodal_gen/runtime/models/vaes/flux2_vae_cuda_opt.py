@@ -8,9 +8,8 @@ decoder module family (``ResnetBlock2D`` GroupNorm+SiLU chains,
 
 All rewrites are mathematically exact re-associations of the original
 operators. Wrappers are installed once at VAE load and dispatch on a
-request-scoped :class:`VaeFastPathGate` (published as
-``_sgl_vae_fast_path_gate``): ``quality == "high"`` runs the fast paths, the
-``"lossless"`` default runs the original module path bit-for-bit.
+decode-scoped :class:`VaeFastPathGate`: ``quality == "high"`` runs the fast
+paths, the ``"lossless"`` default runs the original module path bit-for-bit.
 
 - channels_last: run the decoder in NHWC so cuDNN convs skip the transpose
   kernels; parameter layout is swapped at decode entry to match the gate.
@@ -28,6 +27,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    VaeFastPathGate,
+    register_vae_fast_path_gate,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -41,19 +44,6 @@ try:
     _HAS_TRITON = True
 except ImportError:  # pragma: no cover
     _HAS_TRITON = False
-
-
-class VaeFastPathGate:
-    """Mutable fast-path flag shared by every wrapper of one VAE; enabled by
-    ``DecodingStage`` while decoding a ``quality == "high"`` request."""
-
-    __slots__ = ("enabled",)
-
-    def __init__(self) -> None:
-        self.enabled = False
-
-
-GATE_ATTR = "_sgl_vae_fast_path_gate"
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +320,7 @@ def _decoder_layout_forward(self, *args, **kwargs):
             memory_format=(torch.channels_last if want_cl else torch.contiguous_format)
         )
         self._sgl_channels_last = want_cl
-        logger.info(
+        logger.debug(
             "%s: decoder switched to %s layout.",
             self._sgl_label,
             "channels_last (NHWC)" if want_cl else "contiguous (NCHW)",
@@ -396,7 +386,7 @@ def _install_decoder_fast_paths(vae: nn.Module, label: str) -> nn.Module:
         m._sgl_folded_v = None
         m.forward = MethodType(_attn_fast_forward, m)
     n_norm = _install_norm_silu(decoder, ResnetBlock2D, gate)
-    setattr(vae, GATE_ATTR, gate)
+    register_vae_fast_path_gate(vae, gate)
     logger.info(
         "%s: installed quality-gated decoder fast paths "
         "(channels_last dispatch, %d fused upsamplers, %d fast attention "

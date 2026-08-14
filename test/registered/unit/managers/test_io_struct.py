@@ -1,7 +1,7 @@
 import copy
 import unittest
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -305,8 +305,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Modalities should be set for all 3 examples
         self.assertEqual(req.modalities, ["image", "image", "image"])
 
-    def test_parallel_sampling_keeps_one_logical_rid_per_prompt(self):
-        """Test logical RID and reasoning control preservation across parallel samples."""
+    def test_parallel_sampling_preserves_reasoning_controls(self):
         single = GenerateReqInput(
             text="Hello",
             rid="single",
@@ -316,8 +315,11 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         )
         single.normalize_batch_and_arguments()
 
-        self.assertEqual(single.rid, ["single"])
-        self.assertEqual([single[i].rid for i in range(3)], ["single"] * 3)
+        self.assertEqual(single.rid, ["single_0", "single_1", "single_2"])
+        self.assertEqual(
+            [single[i].rid for i in range(3)],
+            ["single_0", "single_1", "single_2"],
+        )
         self.assertTrue(all(single[i].require_reasoning for i in range(3)))
         self.assertEqual(
             [single[i].max_thinking_tokens for i in range(3)],
@@ -331,10 +333,10 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         )
         batch.normalize_batch_and_arguments()
 
-        self.assertEqual(batch.rid, ["batch_0", "batch_1"])
+        self.assertEqual(batch.rid, ["batch_0", "batch_1", "batch_2", "batch_3"])
         self.assertEqual(
             [batch[i].rid for i in range(4)],
-            ["batch_0", "batch_1", "batch_0", "batch_1"],
+            ["batch_0", "batch_1", "batch_2", "batch_3"],
         )
 
     def test_audio_data_handling(self):
@@ -517,6 +519,53 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.extra_key, "solo")
 
+    def test_cache_salt_normalization(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            cache_salt=["tenant-A", ""],
+            sampling_params=[{}, {}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.cache_salt, ["tenant-A", None])
+        self.assertEqual(req[0].cache_salt, "tenant-A")
+        self.assertIsNone(req[1].cache_salt)
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            cache_salt="shared",
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.cache_salt, ["shared", "shared"] * 2)
+
+        req = GenerateReqInput(text="Hello", cache_salt="")
+        req.normalize_batch_and_arguments()
+        self.assertIsNone(req.cache_salt)
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            cache_salt=["only-one"],
+            sampling_params=[{}, {}],
+        )
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            req.normalize_batch_and_arguments()
+
+    def test_cache_key_normalization_rejects_invalid_types(self):
+        for field_name in ("extra_key", "cache_salt"):
+            with self.subTest(field_name=field_name, mode="single"):
+                req = GenerateReqInput(text="Hello", **{field_name: ["value"]})
+                with self.assertRaisesRegex(ValueError, "single request"):
+                    req.normalize_batch_and_arguments()
+
+            with self.subTest(field_name=field_name, mode="batch"):
+                req = GenerateReqInput(
+                    text=["Hello", "World"],
+                    sampling_params=[{}, {}],
+                    **{field_name: ["value", 1]},
+                )
+                with self.assertRaisesRegex(ValueError, "should be a string"):
+                    req.normalize_batch_and_arguments()
+
     def test_logprob_parameters_normalization(self):
         """Test normalization of logprob-related parameters."""
         # Test single example
@@ -680,15 +729,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertNotEqual(original_rid, new_rid)
         self.assertEqual(req.rid, new_rid)
 
-    def test_regenerate_rid_with_parent_prefix(self):
-        """Test RID regeneration with a logical parent prefix."""
-        req = GenerateReqInput(text="Hello", rid="logical")
-        req.normalize_batch_and_arguments()
-
-        new_rid = req.regenerate_rid(prefix="logical")
-
-        self.assertTrue(new_rid.startswith("logical_"))
-
     def test_error_cases(self):
         """Test various error cases."""
         # Test when neither text, input_ids, nor input_embeds is provided
@@ -701,6 +741,83 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             req = GenerateReqInput(
                 text="Hello", input_ids=[1, 2, 3], input_embeds=[[0.1, 0.2]]
             )
+            req.normalize_batch_and_arguments()
+
+    def test_data_parallel_rank_alias_maps_to_routed_dp_rank(self):
+        req = GenerateReqInput(text="Hello", sampling_params={}, data_parallel_rank=2)
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.routed_dp_rank, 2)
+        self.assertIsNone(req.data_parallel_rank)
+
+    def test_data_parallel_rank_alias_does_not_override_routed_dp_rank(self):
+        req = GenerateReqInput(
+            text="Hello", sampling_params={}, data_parallel_rank=2, routed_dp_rank=1
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.routed_dp_rank, 1)
+
+    def test_data_parallel_rank_alias_propagates_to_batch_items(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            data_parallel_rank=3,
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].routed_dp_rank, 3)
+        self.assertEqual(req[1].routed_dp_rank, 3)
+
+
+class TestEmbeddingReqInputGetItem(CustomTestCase):
+    """Test EmbeddingReqInput.__getitem__."""
+
+    def test_priority_is_preserved(self):
+        """Priority must survive the batch split, in both __getitem__ branches."""
+        req = EmbeddingReqInput(text=["Hello", "World"], priority=7)
+        req.normalize_batch_and_arguments()
+        self.assertEqual([req[0].priority, req[1].priority], [7, 7])
+
+        cross_encoder_req = EmbeddingReqInput(
+            text=[["query 1", "doc 1"], ["query 2", "doc 2"]],
+            is_cross_encoder_request=True,
+            priority=3,
+        )
+        cross_encoder_req.normalize_batch_and_arguments()
+        self.assertEqual(
+            [cross_encoder_req[0].priority, cross_encoder_req[1].priority], [3, 3]
+        )
+
+    def test_lora_identity_survives_batch_split(self):
+        """Each embedding subrequest must retain its adapter path and resolved ID."""
+        cases = (
+            (["Hello", "World"], False),
+            (
+                [["query 1", "document 1"], ["query 2", "document 2"]],
+                True,
+            ),
+        )
+        for text, is_cross_encoder_request in cases:
+            with self.subTest(cross_encoder=is_cross_encoder_request):
+                req = EmbeddingReqInput(
+                    text=text,
+                    is_cross_encoder_request=is_cross_encoder_request,
+                    lora_path="adapter",
+                    lora_id=["id-0", "id-1"],
+                )
+                req.normalize_batch_and_arguments()
+
+                self.assertEqual(req.lora_path, ["adapter", "adapter"])
+                self.assertEqual(
+                    [(req[i].lora_path, req[i].lora_id) for i in range(2)],
+                    [("adapter", "id-0"), ("adapter", "id-1")],
+                )
+
+    def test_lora_path_count_must_match_embedding_batch(self):
+        """A partial adapter list must not silently route remaining items to base."""
+        req = EmbeddingReqInput(
+            text=["first", "second"], lora_path=["only-one-adapter"]
+        )
+        with self.assertRaisesRegex(ValueError, "must match batch size"):
             req.normalize_batch_and_arguments()
 
 
