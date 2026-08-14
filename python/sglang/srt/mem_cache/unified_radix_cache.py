@@ -23,6 +23,13 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.buffer_mode.pipeline import (
+    BufferModePipeline,
+    validate_buffer_only_stack,
+)
+from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
+    StorageExistenceCache,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -31,13 +38,6 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
-)
-from sglang.srt.mem_cache.buffer_mode.pipeline import (
-    BufferModePipeline,
-    validate_buffer_only_stack,
-)
-from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
-    StorageExistenceCache,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -1678,8 +1678,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
-        if self.buffer_pipeline is not None and self.buffer_pipeline.release_aborted_staged(
-            rid
+        if (
+            self.buffer_pipeline is not None
+            and self.buffer_pipeline.release_aborted_staged(rid)
         ):
             return
         if rid not in self.ongoing_prefetch:

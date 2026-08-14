@@ -56,7 +56,6 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.components import SWAComponent
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -241,7 +240,10 @@ class BufferModePipeline:
         """Only admit a node whose parent is stored/in-flight: writing above
         a dropped parent creates a permanent longest-prefix hole."""
         parent = node.parent
-        if parent is self._cache.root_node or parent.id in self.inflight_backup_node_ids:
+        if (
+            parent is self._cache.root_node
+            or parent.id in self.inflight_backup_node_ids
+        ):
             return True
         last_hash = parent.get_last_hash_value()
         return last_hash is not None and self._cache.storage_existence_cache.contains(
