@@ -99,10 +99,6 @@ class KVCacheEventRecorder:
                     and tail.lora_id == event.lora_id
                     and tail.block_size == event.block_size
                     and tail_metadata == event_metadata
-                    # Pages with different component placement must not merge, or
-                    # the coalesced event's component_types (the tail's) would
-                    # misrepresent the pages folded into it. None == None keeps
-                    # legacy (component dimension off) coalescing unchanged.
                     and tail.component_types == event.component_types
                     and tail.block_hashes
                     and event.parent_block_hash == tail.block_hashes[-1]
@@ -172,9 +168,6 @@ class KVCacheEventRecorder:
             component_types = self._component_types_for_page(
                 node, medium, page_index, num_pages
             )
-            # An empty (non-None) set means nothing is resident at this medium
-            # for this page -- do not claim placement. Still advance the
-            # parent-hash chain so later pages keep correct parentage.
             if component_types is not None and len(component_types) == 0:
                 parent_block_hash = block_hash
                 page_index += 1

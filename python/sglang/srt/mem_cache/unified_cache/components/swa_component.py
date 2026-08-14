@@ -576,8 +576,6 @@ class SWAComponent(TreeComponent):
             self.tree_core._cascade_evict(
                 x, self, tracker, device_frees=device_frees, host_frees=host_frees
             )
-            # Internal node: SWA tombstoned but FULL survives -- restate the
-            # (now SWA-less) GPU component set instead of a BlockRemoved.
             self.tree_core._restate_component_placement(x, StorageMedium.GPU)
             self._evict_device_cursor = lru.cursor_next() if enabled else x_next
         return None
@@ -734,8 +732,6 @@ class SWAComponent(TreeComponent):
                         device_frees=device_frees,
                         host_frees=host_frees,
                     )
-                    # SWA left this device leaf but FULL stays -- restate its
-                    # (now SWA-less) GPU component set.
                     self.tree_core._restate_component_placement(cur, StorageMedium.GPU)
 
             if swa_uuid_for_lock and cd.metadata.get("uuid") == swa_uuid_for_lock:
@@ -1117,8 +1113,6 @@ class SWAComponent(TreeComponent):
                     host_frees=host_frees,
                     target=EvictLayer.HOST,
                 )
-                # Internal node: SWA host tombstoned but FULL host survives --
-                # restate the reduced host component set.
                 self.tree_core._restate_component_placement(x, StorageMedium.CPU)
             if enabled:
                 x = host_lru.cursor_next(host_lock=True)

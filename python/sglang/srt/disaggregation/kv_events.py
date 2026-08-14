@@ -92,10 +92,7 @@ class BlockStoredMetadata(msgspec.Struct, omit_defaults=True, gc=False):
     cache_salt: str
 
 
-# Canonical on-wire names for ``BlockStored.component_types``: which KV
-# components (full attention / sliding window / mamba) are resident at a given
-# ``medium``. Plain strings (not the mem_cache ComponentType enum) to keep the
-# event schema free of a mem_cache import cycle.
+# Canonical on-wire component names for ``BlockStored.component_types``.
 KV_COMPONENT_FULL = "full"
 KV_COMPONENT_SWA = "swa"
 KV_COMPONENT_MAMBA = "mamba"

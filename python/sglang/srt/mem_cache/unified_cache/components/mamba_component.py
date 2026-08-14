@@ -243,9 +243,6 @@ class MambaComponent(TreeComponent):
                 params.mamba_value
             )
             node.last_access_time = get_and_increase_time_counter()
-            # Existing (non-new-leaf) node just gained Mamba on device: re-emit
-            # its REPLACE store snapshot at the insert's TAIL flush (after any
-            # path-cap eviction, so it reflects the components that stayed).
             self.tree_core._note_insert_store_node(node)
             self._emit_excess_path_states_eviction(node, cache_actions)
             return
@@ -309,10 +306,8 @@ class MambaComponent(TreeComponent):
                 tracker=tracker,
             )
             self.tree_core._cascade_evict(node, self, tracker, device_frees, host_frees)
-            # Interior Mamba checkpoint tombstoned but FULL survives -- restate
-            # its (now Mamba-less) GPU component set. Safe to emit mid-insert
-            # because the walk skips the tail and only visits Mamba holders, so
-            # the node always predates this insert and is already hashed.
+            # Safe mid-insert: this walk only visits Mamba holders (skips the
+            # tail), so the node predates this insert and is already hashed.
             self.tree_core._restate_component_placement(node, StorageMedium.GPU)
             excess -= 1
 
@@ -424,8 +419,6 @@ class MambaComponent(TreeComponent):
             self.tree_core._cascade_evict(
                 x, self, tracker, device_frees=device_frees, host_frees=host_frees
             )
-            # Internal node: Mamba tombstoned but FULL survives -- restate the
-            # (now Mamba-less) GPU component set.
             self.tree_core._restate_component_placement(x, StorageMedium.GPU)
             self._evict_device_cursor = lru.cursor_next() if enabled else x_next
         return None
@@ -899,8 +892,6 @@ class MambaComponent(TreeComponent):
                     target=EvictLayer.HOST,
                 )
                 self.tree_core._update_evictable_leaf_sets(x)
-                # Internal node: Mamba host tombstoned but FULL host survives --
-                # restate the reduced host component set.
                 self.tree_core._restate_component_placement(x, StorageMedium.CPU)
             if enabled:
                 x = host_lru.cursor_next(host_lock=True)
