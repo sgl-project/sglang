@@ -18,6 +18,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion.bitexact_gate import (
+    BitExactFusionGate,
+    tensors_equal,
+)
 from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     can_fuse_linear_gelu,
     fused_gelu_active,
@@ -73,10 +77,8 @@ logger = init_logger(__name__)
 
 _is_cuda = current_platform.is_cuda()
 
-_GLM_FUSED_LN_MOD_DISABLED = False
-_GLM_FUSED_LN_MOD_VERIFIED = False
-_GLM_FUSED_QK_LN_DISABLED = False
-_GLM_FUSED_QK_LN_VERIFIED = False
+_GLM_LN_MOD = BitExactFusionGate("GLM fused LN+modulate")
+_GLM_QK_LN = BitExactFusionGate("GLM fused qk-LayerNorm")
 
 
 def _eager_ln_modulate(
@@ -102,36 +104,31 @@ def _glm_ln_modulate(
     the first call verifies ``torch.equal`` against the eager chain and
     disables the fast path permanently on any mismatch.
     """
-    global _GLM_FUSED_LN_MOD_DISABLED, _GLM_FUSED_LN_MOD_VERIFIED
-
+    verified = _GLM_LN_MOD.verified
     if (
-        not _GLM_FUSED_LN_MOD_DISABLED
+        not _GLM_LN_MOD.disabled
         and _is_cuda
         and dtype is x.dtype
         and is_plain_layer_norm(norm, x.shape[-1])
         and can_use_fused_layernorm_modulate(x, scale, shift)
-        and (_GLM_FUSED_LN_MOD_VERIFIED or not torch.compiler.is_compiling())
+        and (verified or _GLM_LN_MOD.can_attempt_once())
     ):
         try:
             out = fused_layernorm_modulate(x, scale, shift, norm.eps)
         except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            logger.warning_once(f"Disabling GLM fused LN+modulate fast path: {exc}")
-            _GLM_FUSED_LN_MOD_DISABLED = True
+            _GLM_LN_MOD.on_exception(exc, logger=logger)
         else:
-            if _GLM_FUSED_LN_MOD_VERIFIED:
+            if verified:
                 return out
-            ref = _eager_ln_modulate(norm, x, scale, shift, dtype)
-            if torch.equal(out, ref):
-                _GLM_FUSED_LN_MOD_VERIFIED = True
-                return out
-            logger.warning_once(
-                "GLM fused LN+modulate fast path is not bit-exact against "
-                "this platform's LayerNorm dispatch; falling back to eager"
+            return _GLM_LN_MOD.accept_or_fallback(
+                out,
+                _eager_ln_modulate(norm, x, scale, shift, dtype),
+                logger=logger,
+                mismatch_msg=(
+                    "GLM fused LN+modulate fast path is not bit-exact against "
+                    "this platform's LayerNorm dispatch; falling back to eager"
+                ),
             )
-            _GLM_FUSED_LN_MOD_DISABLED = True
-            return ref
 
     return _eager_ln_modulate(norm, x, scale, shift, dtype)
 
@@ -148,10 +145,9 @@ def _glm_qk_layernorm(
     First call verifies ``torch.equal`` against the eager pair and falls
     back permanently on any mismatch.
     """
-    global _GLM_FUSED_QK_LN_DISABLED, _GLM_FUSED_QK_LN_VERIFIED
-
+    verified = _GLM_QK_LN.verified
     if (
-        not _GLM_FUSED_QK_LN_DISABLED
+        not _GLM_QK_LN.disabled
         and _is_cuda
         and dtype is query.dtype
         and dtype is key.dtype
@@ -159,29 +155,29 @@ def _glm_qk_layernorm(
         and is_plain_layer_norm(norm_k, key.shape[-1])
         and norm_q.eps == norm_k.eps
         and can_use_fused_qk_head_layernorm(query, key)
-        and (_GLM_FUSED_QK_LN_VERIFIED or not torch.compiler.is_compiling())
+        and (verified or _GLM_QK_LN.can_attempt_once())
     ):
         try:
-            q_out, k_out = fused_qk_head_layernorm(query, key, norm_q.eps)
+            out = fused_qk_head_layernorm(query, key, norm_q.eps)
         except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            logger.warning_once(f"Disabling GLM fused qk-LayerNorm fast path: {exc}")
-            _GLM_FUSED_QK_LN_DISABLED = True
+            _GLM_QK_LN.on_exception(exc, logger=logger)
         else:
-            if _GLM_FUSED_QK_LN_VERIFIED:
-                return q_out, k_out
-            q_ref = norm_q(query).to(dtype=dtype)
-            k_ref = norm_k(key).to(dtype=dtype)
-            if torch.equal(q_out, q_ref) and torch.equal(k_out, k_ref):
-                _GLM_FUSED_QK_LN_VERIFIED = True
-                return q_out, k_out
-            logger.warning_once(
-                "GLM fused qk-LayerNorm fast path is not bit-exact against "
-                "this platform's LayerNorm dispatch; falling back to eager"
+            if verified:
+                return out
+            ref = (
+                norm_q(query).to(dtype=dtype),
+                norm_k(key).to(dtype=dtype),
             )
-            _GLM_FUSED_QK_LN_DISABLED = True
-            return q_ref, k_ref
+            return _GLM_QK_LN.accept_or_fallback(
+                out,
+                ref,
+                equal=tensors_equal,
+                logger=logger,
+                mismatch_msg=(
+                    "GLM fused qk-LayerNorm fast path is not bit-exact against "
+                    "this platform's LayerNorm dispatch; falling back to eager"
+                ),
+            )
 
     return norm_q(query).to(dtype=dtype), norm_k(key).to(dtype=dtype)
 
@@ -945,8 +941,7 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     ):
         super().__init__(config=config, hf_config=hf_config)
 
-        self.config_data = config  # Store config
-        arch_config = config.arch_config
+        arch_config = self.config
 
         self.in_channels = arch_config.in_channels
         self.out_channels = arch_config.out_channels
@@ -992,7 +987,6 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         # 3. Transformer blocks
-        self._supported_attention_backends = arch_config._supported_attention_backends
         self.transformer_blocks = nn.ModuleList(
             [
                 GlmImageTransformerBlock(
