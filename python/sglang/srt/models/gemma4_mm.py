@@ -59,7 +59,11 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma4_audio import Gemma4AudioEncoder
-from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
+from sglang.srt.models.gemma4_causal import (
+    Gemma4TextModel,
+    load_tied_lm_head,
+    pp_filter_load_weight,
+)
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -244,13 +248,15 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         # while logits run on the last rank, so we can't reuse the embedding
         # module directly.  For PP=1 keep the original tying; for PP>1
         # materialize a real ParallelLMHead on the last rank and route the
-        # checkpoint embedding into it during load_weights.
+        # checkpoint embedding into it during load_weights.  CPU with AMX does
+        # the same: the packed head weights cannot alias the embedding table.
         text_tie = getattr(text_config, "tie_word_embeddings", True)
-        if (
+        self.lm_head_is_tied = (
             self.pp_group.world_size == 1
             and text_tie
             and not (_is_cpu and _is_cpu_amx_available)
-        ):
+        )
+        if self.lm_head_is_tied:
             self.lm_head = self.language_model.embed_tokens
         elif self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -675,14 +681,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        # PP=1 keeps the original tied-weight behavior of using embed_tokens
-        # directly; under PP we route through the dedicated lm_head module.
         head = (
-            self.language_model.embed_tokens
-            if self.pp_group.world_size == 1
-            and getattr(self.config.text_config, "tie_word_embeddings", True)
-            and not (_is_cpu and _is_cpu_amx_available)
-            else self.lm_head
+            self.language_model.embed_tokens if self.lm_head_is_tied else self.lm_head
         )
         return self.logits_processor(
             input_ids,
@@ -1025,16 +1025,15 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                         )
                         weight_loader(param, loaded_weight)
                         if (
-                            self.config.tie_word_embeddings
+                            text_tie
+                            and not self.lm_head_is_tied
                             and name == "language_model.embed_tokens.weight"
-                            and _is_cpu
-                            and _is_cpu_amx_available
                         ):
-                            param_lm_head = params_dict["lm_head.weight"]
-                            weight_loader = getattr(
-                                param_lm_head, "weight_loader", default_weight_loader
+                            load_tied_lm_head(
+                                loaded_weight,
+                                params_dict=params_dict,
+                                loaded_params=loaded_params,
                             )
-                            weight_loader(param_lm_head, loaded_weight)
                         loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
@@ -1114,7 +1113,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 "--pp-size 1 if you need this API."
             )
         embed = self.language_model.embed_tokens.weight
-        # Gemma4 ties word embeddings, so embed_tokens serves as lm_head
+        # a materialized lm_head is loaded from this very tensor, so it is exact
         return embed, embed
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
