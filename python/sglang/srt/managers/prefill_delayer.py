@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 class RecentPrefillBatchSizeTracker:
     """Track the largest of the latest non-empty prefill attempts.
 
-    The default window keeps 64 attempts. Successful admissions use their
+    The default window keeps 16 attempts. Successful admissions use their
     actual batch size; rejected attempts use a conservative local estimate.
     Decode-only and idle scheduler passes do not age the high-watermark.
     """
