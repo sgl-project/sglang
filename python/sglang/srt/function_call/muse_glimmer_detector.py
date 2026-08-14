@@ -252,15 +252,8 @@ class MuseGlimmerDetector(BaseFormatDetector):
         return False
 
     def parses_required_natively(self) -> bool:
-        """Muse Glimmer only ever emits ATEM tool calls.
-
-        For ``tool_choice="required"`` / a named tool the default path forces a
-        JSON-array grammar (via ``JsonArrayParser``) that the model does not emit
-        for tool calls; when it produces its native ATEM block instead, the JSON
-        parser cannot read it and the call leaks to the client as content with
-        zero tool calls. Returning True routes required/named through this
-        detector's native ATEM parsing, the same path ``auto`` already uses.
-        """
+        """The model only ever emits ATEM tool calls, so the JSON-array grammar
+        the default required/named path forces cannot parse its output."""
         return True
 
     def structure_info(self) -> _GetInfoFunc:
