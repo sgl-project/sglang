@@ -21,6 +21,7 @@ from sglang.kernels.ops.diffusion.qknorm_rope import (
     fused_inplace_qknorm_rope,
 )
 from sglang.kernels.ops.diffusion.triton.indexed_modulation import (
+    indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
 )
@@ -32,6 +33,7 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTArchConfig,
     MiniMaxH3DiTConfig,
 )
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     tensor_model_parallel_all_gather,
@@ -239,8 +241,9 @@ def _modulate_gate(
     indices: torch.Tensor,
     *,
     dtype: torch.dtype,
+    allow_inplace: bool = True,
 ) -> torch.Tensor:
-    """Apply indexed gated residual, reusing disposable CUDA BF16 input."""
+    """Apply an indexed gated residual, optionally reusing the input buffer."""
     # Apply the per-index gated residual: x + gate[idx] * other.
     if (
         x.is_cuda
@@ -251,7 +254,9 @@ def _modulate_gate(
         and x.is_contiguous()
         and other.is_contiguous()
     ):
-        return indexed_gate_bf16_(x, gate, other, indices)
+        if allow_inplace:
+            return indexed_gate_bf16_(x, gate, other, indices)
+        return indexed_gate_bf16(x, gate, other, indices)
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
@@ -527,6 +532,7 @@ class MiniMaxH3Attention(nn.Module):
         self.inner_dim = self.total_num_heads * self.head_dim
         self.local_inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
+        self.prefix = prefix
         self._attention_impl = None
         self._attention_backend_enum: AttentionBackendEnum | None = None
         # The checkpoint stores one fused qkv tensor. Each logical Q/K/V
@@ -576,6 +582,7 @@ class MiniMaxH3Attention(nn.Module):
             causal=False,
             softmax_scale=self.softmax_scale,
             num_kv_heads=self.num_heads,
+            prefix=self.prefix,
         )
         # Ring only supports FA (see _minimax_h3_attention_core_impl); keep
         # the resolved enum alongside the impl instance instead of a second
@@ -585,6 +592,14 @@ class MiniMaxH3Attention(nn.Module):
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
         weight = self.qkv_proj.weight
         base_loader = weight.weight_loader
+
+        def _reorder_checkpoint_weight(loaded_weight: torch.Tensor) -> torch.Tensor:
+            return _reorder_grouped_qkv_to_qkv(
+                loaded_weight,
+                num_query_groups=arch.num_attention_heads,
+                heads_per_group=1,
+                head_dim=arch.attention_head_dim,
+            )
 
         def _weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
             # The grouped checkpoint layout is
@@ -600,18 +615,14 @@ class MiniMaxH3Attention(nn.Module):
                 tp_size=self.tp_size,
             ):
                 return
-            reordered = _reorder_grouped_qkv_to_qkv(
-                loaded_weight,
-                num_query_groups=arch.num_attention_heads,
-                heads_per_group=1,
-                head_dim=arch.attention_head_dim,
-            )
-            base_loader(param, reordered)
+            base_loader(param, _reorder_checkpoint_weight(loaded_weight))
 
         if hasattr(weight, "_weight_loader"):
             weight._weight_loader = _weight_loader
         else:
             weight.weight_loader = _weight_loader
+        # rank-local FSDP must reorder grouped QKV before selecting each shard
+        weight.rank_local_weight_transform = _reorder_checkpoint_weight
 
     def forward(
         self,
@@ -897,6 +908,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             expand_ratio=6,
             modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
         )
+        self.preserve_input_for_cache_dit = False
 
     def forward(
         self,
@@ -922,7 +934,9 @@ class MiniMaxH3DiTBlock(nn.Module):
         if adaln_params is None:
             adaln_params = self.adaln_proj(adaln_input)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
-
+        # Cache-DiT retains the inputs to its Fn and Mn block ranges. Only the
+        # first gated residual writes to that tensor; the second one operates on
+        # a block-local buffer.
         residual = x
         h = self.norm1(x)
         h = _modulate_scale_shift(
@@ -937,7 +951,14 @@ class MiniMaxH3DiTBlock(nn.Module):
             ulysses_active=ulysses_active,
             ring_active=ring_active,
         )
-        x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16_DTYPE)
+        x = _modulate_gate(
+            residual,
+            gate_msa,
+            h,
+            combined_indices,
+            dtype=_BF16_DTYPE,
+            allow_inplace=not self.preserve_input_for_cache_dit,
+        )
 
         residual = x
         h = self.norm2(x)
@@ -945,8 +966,14 @@ class MiniMaxH3DiTBlock(nn.Module):
             h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
         )
         h = self.mlp(h)
+        # `residual` is block-local here (see above), so this stays in-place
+        # even while Cache-DiT is attached.
         return _modulate_gate(
-            residual, gate_mlp, h, combined_indices, dtype=_BF16_DTYPE
+            residual,
+            gate_mlp,
+            h,
+            combined_indices,
+            dtype=_BF16_DTYPE,
         )
 
 
@@ -1018,11 +1045,13 @@ class MiniMaxH3FinalLayer(nn.Module):
 
 
 class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = _ARCH_DEFAULTS._fsdp_shard_conditions
+    _fsdp_shard_conditions = [is_block]
+    # refine_prompt_embeds drives a forward pass outside __call__.
+    _fsdp_forward_methods = ("refine_prompt_embeds",)
     # parameters mix fp32 (patch projections, timestep embedder, and output
     # heads) with bf16 blocks; FSDP must gather in each parameter's own dtype
     _fsdp_mixed_dtype_params = True
-    _compile_conditions = _ARCH_DEFAULTS._compile_conditions
+    _compile_conditions = [is_block]
     param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
@@ -1107,7 +1136,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
-        arch = config.arch_config
+        arch = self.config
         self.arch = arch
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
@@ -1180,6 +1209,22 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         )
         self._resolved_attention_backend: AttentionBackendEnum | None = None
         self._mark_missing_params_required()
+
+    def set_cache_dit_input_preservation(self, enabled: bool) -> None:
+        """Stop the blocks from overwriting the input Cache-DiT holds by reference.
+
+        Cache-DiT snapshots the block-stack input to measure its residuals, so a
+        block that rewrites its own input in place makes that residual read as
+        zero. Only the first gated residual of a block writes the block input;
+        the second one operates on a buffer this block just allocated, so it is
+        left on the in-place fused path either way.
+
+        The caller owns the lifecycle. It has to be on before Cache-DiT mounts,
+        because mounting replaces `blocks` with a wrapper and the real blocks
+        stop being reachable by iterating it.
+        """
+        for block in self.blocks:
+            block.preserve_input_for_cache_dit = enabled
 
     def _resolve_attention_backend_once(self) -> None:
         if self._resolved_attention_backend is not None:
