@@ -862,6 +862,20 @@ def hash_feature(f):
     return data_hash(f)
 
 
+def hash_mm_item(feature_hash: int, modality: Modality, offsets: Optional[list]) -> int:
+    """Bind multimodal content identity to its encoder-token geometry."""
+    hasher = hashlib.sha256()
+    hasher.update(b"sglang-mm-item-v2\0")
+    hasher.update(modality.name.encode("ascii"))
+    hasher.update(feature_hash.to_bytes(8, byteorder="big", signed=False))
+    for start, end in offsets or ():
+        token_count = int(end) - int(start) + 1
+        if token_count <= 0:
+            raise ValueError(f"Invalid multimodal item offset: {(start, end)}")
+        hasher.update(token_count.to_bytes(8, byteorder="big", signed=False))
+    return int.from_bytes(hasher.digest()[:8], byteorder="big", signed=False)
+
+
 def extend_mrope_positions_for_retracted_request(
     mrope_positions: torch.Tensor, output_ids_len: int
 ) -> torch.Tensor:
