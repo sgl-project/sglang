@@ -5780,6 +5780,7 @@ class ServerArgs:
         # resolution pipeline (arg_groups/overrides.py), each invoked below at
         # its legacy slot; the interleaved non-attention adjustments stay.
         from sglang.srt.arg_groups.overrides import (
+            _aiter_workspace_reserve,
             _attention_backend_default,
             _attention_backend_dual_chunk,
             _attention_backend_fa3_fp8_fallback,
@@ -5861,9 +5862,7 @@ class ServerArgs:
         run_post_process_pass(self, _fa4_page_constraint)
 
         # AMD platforms backends
-        if resolved_view(self).attention_backend == "aiter":
-            if model_config.context_len > 8192:
-                self.mem_fraction_static *= 0.85
+        run_post_process_pass(self, _aiter_workspace_reserve)
 
         # Other platforms backends
         run_post_process_pass(self, _attention_backend_platform_fallbacks)

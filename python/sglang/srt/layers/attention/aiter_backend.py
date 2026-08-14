@@ -71,6 +71,12 @@ from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
 )
+from sglang.srt.layers.attention.aiter_workspace import (
+    AITER_PARTITION_SIZE_ROCM as _AITER_PARTITION_SIZE_ROCM,
+)
+from sglang.srt.layers.attention.aiter_workspace import (
+    aiter_attn_workspace_bytes,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
@@ -122,9 +128,6 @@ class ForwardMetadata:
     swa_page_table: Optional[torch.Tensor] = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
-
-
-_AITER_PARTITION_SIZE_ROCM = 256
 
 
 class AiterAttnBackend(AttentionBackend):
@@ -271,13 +274,14 @@ class AiterAttnBackend(AttentionBackend):
             self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
         ) // _AITER_PARTITION_SIZE_ROCM
 
-        nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
-
         if not (self.use_mla or self.use_triton_unified_attention):
             self.workspace_buffer = torch.empty(
-                (max_bs * self.num_head * self.max_num_partitions * self.head_dim)
-                * nbyes_per_qo_elem
-                + 2 * (max_bs * self.num_head * self.max_num_partitions) * 4,
+                aiter_attn_workspace_bytes(
+                    max_num_reqs=max_bs,
+                    num_head=self.num_head,
+                    head_dim=self.head_dim,
+                    context_len=self.max_context_len,
+                ),
                 dtype=torch.uint8,
                 device=self.device,
             )

@@ -36,10 +36,15 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups.arg_utils import resolvable_fields
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.aiter_workspace import (
+    AITER_MAX_AUTO_NUM_REQS,
+    aiter_attn_workspace_bytes,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_device_capability,
+    get_device_memory_capacity,
     get_device_name,
     get_device_sm,
     get_nvidia_driver_version,
@@ -2303,6 +2308,57 @@ def _fa4_page_constraint(view: Any) -> dict:
         )
         return {"page_size": 128}
     return {}
+
+
+@register_post_process
+def _aiter_workspace_reserve(view: Any) -> dict:
+    """Charge the AITER decode split workspace against mem_fraction_static.
+
+    ``AiterAttnBackend.workspace_buffer`` is allocated after the KV pool, and it
+    is fp32 and linear in context length -- multiple GB at long context, which
+    the generic reserve in ``_handle_gpu_memory_settings`` has no term for. Take
+    the backend's own sizing formula off the fraction.
+    """
+    if view.attention_backend != "aiter":
+        return {}
+    if view.use_mla_backend() or envs.SGLANG_USE_AITER_UNIFIED_ATTN.get():
+        return {}
+    gpu_mem = get_device_memory_capacity(view.device)
+    if gpu_mem is None:
+        return {}
+
+    model_config = view.get_model_config()
+    attn_dp_size = view.dp_size if view.enable_dp_attention else 1
+    attn_tp_size = max(view.tp_size // attn_dp_size // view.attn_cp_size, 1)
+    max_num_reqs = (
+        view.max_running_requests // attn_dp_size
+        if view.max_running_requests
+        else AITER_MAX_AUTO_NUM_REQS
+    )
+    workspace_mb = aiter_attn_workspace_bytes(
+        max_num_reqs=max_num_reqs,
+        num_head=model_config.num_attention_heads // attn_tp_size,
+        head_dim=model_config.head_dim,
+        context_len=model_config.context_len,
+    ) / (1 << 20)
+    reserved = round(view.mem_fraction_static - workspace_mb / gpu_mem, 3)
+    if reserved <= 0:
+        raise ValueError(
+            f"The aiter attention backend needs a {workspace_mb / 1024:.1f} GB decode "
+            f"workspace at context_len={model_config.context_len}, which does not fit "
+            f"in {gpu_mem / 1024:.1f} GB of GPU memory. Lower --context-length or "
+            f"--max-running-requests, or use --attention-backend triton."
+        )
+    logger.info(
+        "Reserving %.2f GB for the aiter decode workspace "
+        "(context_len=%d, max_running_requests=%d): --mem-fraction-static %.3f -> %.3f.",
+        workspace_mb / 1024,
+        model_config.context_len,
+        max_num_reqs,
+        view.mem_fraction_static,
+        reserved,
+    )
+    return {"mem_fraction_static": reserved}
 
 
 @register_post_process
