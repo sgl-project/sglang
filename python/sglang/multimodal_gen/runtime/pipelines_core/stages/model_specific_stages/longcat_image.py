@@ -206,7 +206,7 @@ class LongCatPromptRewriteStage(PipelineStage):
         self.text_encoder_dtype = text_encoder_dtype
         from transformers import Qwen2_5_VLForConditionalGeneration
 
-        cpu_offload = self.server_args.text_encoder_cpu_offload
+        cpu_offload = self.server_args.should_start_component_on_cpu("text_encoder")
         init_device = torch.device("cpu") if cpu_offload else get_local_torch_device()
         self.text_encoder = (
             Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -222,10 +222,6 @@ class LongCatPromptRewriteStage(PipelineStage):
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         stage_name = self._component_stage_name(stage_name)
-        # "text_encoder" matches is_text_encoder_component_name, so
-        # text_encoder_cpu_offload routes through VanillaD2HStrategy (the encoder
-        # is a plain HF nn.Module, not FSDP-sharded). memory_intensive triggers
-        # torch.cuda.empty_cache() after the encoder leaves CUDA.
         return [
             ComponentUse(
                 stage_name,
@@ -286,7 +282,7 @@ class LongCatPromptRewriteStage(PipelineStage):
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
-        logger.info("Rewritten prompts: %s", rewritten)
+        logger.debug("Rewritten prompts: %s", rewritten)
         return rewritten
 
     @torch.no_grad()

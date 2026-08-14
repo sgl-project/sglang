@@ -10,6 +10,9 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -33,9 +36,12 @@ def _read_model_max_length(model_path: str) -> int | None:
     return None
 
 
-class PEModelWrapper:
+class PEModelWrapper(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+    layerwise_offload_dit_group_enabled = False
+    layer_names = ["model.model.layers"]
 
     def __init__(self, model, tokenizer, device, model_max_length: int):
+        super().__init__()
         self.model = model
         self.pe_tokenizer = tokenizer
         self.device = device
@@ -71,12 +77,13 @@ class PEModelWrapper:
         return {"text": text}
 
     def to(self, *args, **kwargs):
-        """Move underlying model to device."""
-        self.model = self.model.to(*args, **kwargs)
+        super().to(*args, **kwargs)
         if args:
             device = args[0]
             if isinstance(device, (str, torch.device)):
                 self.device = torch.device(device)
+        elif "device" in kwargs:
+            self.device = torch.device(kwargs["device"])
         return self
 
 
@@ -176,7 +183,11 @@ class PELoader(ComponentLoader):
                 attn_implementation=attn_impl,
             )
 
-        device = get_local_torch_device()
+        device = (
+            torch.device("cpu")
+            if server_args.should_start_component_on_cpu(component_name)
+            else get_local_torch_device()
+        )
         model = model.to(device).eval()
 
         logger.info(

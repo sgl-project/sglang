@@ -528,7 +528,11 @@ class LTX2ImageEncodingStage(PipelineStage):
             configure_layerwise_offload_modules(
                 modules,
                 server_args,
-                component_names=server_args.layerwise_offload_components,
+                component_names=(
+                    None
+                    if server_args.component_residency is not None
+                    else server_args.layerwise_offload_components
+                ),
                 warn_missing=False,
             )
         return True

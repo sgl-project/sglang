@@ -1,5 +1,6 @@
 import contextlib
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -108,6 +109,19 @@ def test_execute_group_with_profiling_uses_platform_inference_mode(monkeypatch):
 
     assert executor.group_inference_mode is False
     assert executor.group_grad_enabled is False
+
+
+def test_group_payload_is_forwarded_to_component_residency_manager():
+    executor = _RecordingExecutor()
+    executor.component_residency_manager = Mock()
+    batches = [_batch(), _batch()]
+    server_args = _server_args()
+
+    executor.begin_component_residency_request([], batches, server_args)
+
+    executor.component_residency_manager.begin_request.assert_called_once_with(
+        [], batches, server_args
+    )
 
 
 @pytest.mark.parametrize(

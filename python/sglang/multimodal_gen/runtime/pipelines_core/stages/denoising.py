@@ -93,7 +93,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -1442,10 +1442,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 torch.mps.current_allocated_memory(),
             )
             if self._component_residency_manager is not None:
-                self._component_residency_manager.remove_nvtx_hooks_for_module(
-                    self.transformer
-                )
-                self._component_residency_manager.strategy_for.cache_clear()
+                self._component_residency_manager.finish_active_use(prefetch_next=False)
+                self._component_residency_manager.forget_module(self.transformer)
             del self.transformer
             if pipeline is not None and "transformer" in pipeline.modules:
                 del pipeline.modules["transformer"]
