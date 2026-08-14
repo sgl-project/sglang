@@ -177,6 +177,20 @@ export SGLANG_CACHE_DIT_TAYLORSEER=true
 export SGLANG_CACHE_DIT_TS_ORDER=2
 export SGLANG_CACHE_DIT_ENABLED=true
 
+worker_pids=()
+
+cleanup() {
+    trap - EXIT
+    if ((${#worker_pids[@]})); then
+        kill "${worker_pids[@]}" 2>/dev/null || true
+        wait "${worker_pids[@]}" 2>/dev/null || true
+    fi
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 for i in $(seq 2 15); do
     scheduler_port=$((19001 + i))
     master_port=$((BASE_MASTER_PORT + i))
@@ -194,9 +208,11 @@ for i in $(seq 2 15); do
         --cfg-parallel-size 1 \
         --batching-max-size 1 \
         --attention-backend fa &
+    worker_pids+=("$!")
 done
 
-wait
+# Stop all denoisers if any worker exits or fails during startup.
+wait -n "${worker_pids[@]}"
 ```
 
 Run the external AR server:

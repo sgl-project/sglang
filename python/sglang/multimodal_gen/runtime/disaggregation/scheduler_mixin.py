@@ -125,6 +125,9 @@ _SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
     }
 )
 
+# Receivers reconstruct base SamplingParams, so only base defaults can be omitted.
+_BASE_SAMPLING_PARAM_FIELDS = {f.name: f for f in dataclasses.fields(SamplingParams)}
+
 
 def _is_tensor_like(value) -> bool:
     if isinstance(value, torch.Tensor):
@@ -287,7 +290,8 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
             value = getattr(sp, name, None)
             if value is None:
                 continue
-            if _is_default(value, f):
+            base_field = _BASE_SAMPLING_PARAM_FIELDS.get(name)
+            if base_field is not None and _is_default(value, base_field):
                 continue
             try:
                 scalar_fields[name] = _to_json_serializable(value)
