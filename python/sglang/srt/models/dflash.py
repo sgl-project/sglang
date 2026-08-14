@@ -410,6 +410,7 @@ class DFlashDraftModel(nn.Module):
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.has_embed_tokens = bool(getattr(config, "has_embed_tokens", False))
+        self.embed_tokens: Optional[VocabParallelEmbedding] = None
         if self.has_embed_tokens:
             embed_prefix = f"{prefix}.embed_tokens" if prefix else "embed_tokens"
             self.embed_tokens = VocabParallelEmbedding(
@@ -466,7 +467,7 @@ class DFlashDraftModel(nn.Module):
         self.block_size = draft_config.resolve_block_size(default=16)
 
     def get_input_embeddings(self) -> Optional[VocabParallelEmbedding]:
-        return getattr(self, "embed_tokens", None)
+        return self.embed_tokens
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
@@ -714,7 +715,8 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         for i, norm in enumerate(self.aux_hidden_norms):
             normed[:, i, :] = norm(slices[:, i, :])
         fused = normed.reshape(target_hidden.shape[0], -1)
-        return self.hidden_norm(self.fc(fused))
+        projected, _ = self.fc(fused)
+        return self.hidden_norm(projected)
 
 
 class MuseGlimmerAssistantModel(DFlashDraftModel):

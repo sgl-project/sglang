@@ -48,6 +48,9 @@ class _FakeNorm(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
 
+    def forward(self, hidden_states):
+        return hidden_states
+
 
 class _FakeEmbedding(nn.Module):
     def __init__(self, *args, **kwargs):
@@ -72,6 +75,7 @@ class _FakeReplicatedLinear(nn.Module):
         self.input_size = input_size
         self.output_size = output_size
         self.in_features = input_size
+        self.weight = nn.Parameter(torch.empty(output_size, input_size))
         self.calls.append(
             {
                 "input_size": input_size,
@@ -81,6 +85,9 @@ class _FakeReplicatedLinear(nn.Module):
                 "prefix": prefix,
             }
         )
+
+    def forward(self, hidden_states):
+        return hidden_states[..., : self.output_size], None
 
 
 class _FakeColumnParallelLinear(_FakeReplicatedLinear):
@@ -384,7 +391,7 @@ class TestDFlashDecoderLayer(unittest.TestCase):
         self.assertIn(dflash.DFlashLagunaForCausalLM, dflash.EntryClass)
 
         with patch.object(dflash.DFlashAttention, "__init__", fake_attention_init):
-            dflash.DFlashLagunaForCausalLM(config, prefix="draft")
+            model = dflash.DFlashLagunaForCausalLM(config, prefix="draft")
 
         self.assertEqual(
             seen_prefixes,
@@ -398,6 +405,10 @@ class TestDFlashDecoderLayer(unittest.TestCase):
             ],
             [f"draft.layers.{i}.self_attn.g_proj" for i in range(6)],
         )
+        target_hidden = torch.arange(24, dtype=torch.float32).view(1, 24)
+        projected = model.project_target_hidden(target_hidden)
+        self.assertIsInstance(projected, torch.Tensor)
+        torch.testing.assert_close(projected, target_hidden[:, :4])
 
 
 class TestDFlashWeightValidation(unittest.TestCase):
