@@ -1602,13 +1602,15 @@ class KVWriteLoc:
       KERNEL-FACING on every pool: physical by allocation on non-unified
       pools, rebound at ForwardBatch construction (``rebind_write_loc``) on
       the unified pool.
-    - ``swa_loc``: the pre-resolved SWA-sub-pool location for hybrid SWA pools
-      (``None`` otherwise).
-    - ``full_loc``: the full-attention-sub-pool location for the unified
-      memory pool (``None`` otherwise), carried in attention metadata
-      (``ForwardMetadata.out_cache_loc_full_physical``). Since the
-      construction-time rebind it is the SAME id space as ``loc``; the shared
-      full pool writes it directly and never translates.
+    - ``swa_loc``: the SWA-sub-pool location for hybrid SWA pools (``None``
+      otherwise); under the unified pool this is the swa rail the choke
+      point resolves for the same rebound loc (``resolve_swa_write_loc``).
+    - ``full_loc``: OPTIONAL full-attention-sub-pool location. Since the
+      construction-time rebind it is the SAME id space as ``loc``, so pools
+      fall back to ``loc`` when it is ``None`` — only triton's captured path
+      still passes its capture-stable
+      ``ForwardMetadata.out_cache_loc_full_physical`` buffer here (a
+      same-space alias slated for collapse).
 
     ``swa_loc`` and ``full_loc`` are the parallel pair (each a pre-resolved
     loc into its sub-pool, mirroring ``swa_kv_pool`` / ``full_kv_pool``);
