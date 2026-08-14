@@ -2,6 +2,7 @@ from typing import Optional, Union
 
 import torch
 
+from .ascend import ascend_fused_infer_attention_varlen
 from .flash_attention_v3 import flash_attn_varlen_func as fa3_flash_attn_varlen_func
 from .flash_attention_v3 import flash_attn_with_kvcache as fa3_flash_attn_with_kvcache
 
@@ -257,6 +258,50 @@ def flash_attn_varlen_func(
     ver=3,
     out=None,
 ):
+    if q.device.type == "npu":
+        unsupported = []
+        for name, enabled in (
+            ("seqused_q", seqused_q is not None),
+            ("seqused_k", seqused_k is not None),
+            ("page_table", page_table is not None),
+            ("causal", causal),
+            ("qv", qv is not None),
+            ("q_descale", q_descale is not None),
+            ("k_descale", k_descale is not None),
+            ("v_descale", v_descale is not None),
+            ("window_size", window_size != (-1, -1)),
+            ("attention_chunk", attention_chunk != 0),
+            ("softcap", softcap != 0.0),
+            ("num_splits", num_splits != 1),
+            ("pack_gqa", pack_gqa is not None),
+            ("only_qv", only_qv),
+            ("sm_margin", sm_margin != 0),
+            ("sinks", sinks is not None),
+            ("score_mod", score_mod is not None),
+            ("aux_tensors", aux_tensors is not None),
+            ("sfq", sfq is not None),
+            ("sfk", sfk is not None),
+            ("sfv", sfv is not None),
+            ("rel_bias", rel_bias is not None),
+            ("rel_bias_prep_cache", rel_bias_prep_cache is not None),
+            ("out", out is not None),
+        ):
+            if enabled:
+                unsupported.append(name)
+        if unsupported:
+            raise NotImplementedError(
+                "NPU flash_attn_varlen_func does not support: "
+                + ", ".join(unsupported)
+            )
+        return ascend_fused_infer_attention_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            softmax_scale=softmax_scale,
+            return_softmax_lse=return_softmax_lse,
+        )
 
     if ver == 3:
         return fa3_flash_attn_varlen_func(

@@ -3,6 +3,9 @@ from typing import Any
 
 import torch
 
+from sglang.kernels.ops.attention.ascend import (
+    ascend_fused_infer_attention_varlen,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -108,3 +111,44 @@ class AscendFAImpl(AttentionImpl):
         if return_softmax_lse:
             return output, lse
         return output
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        del max_seqlen
+        if self.causal:
+            bounds = (
+                cu_seqlens_host
+                if cu_seqlens_host is not None
+                else tuple(int(item) for item in cu_seqlens.tolist())
+            )
+            output = torch.empty_like(query)
+            for start, stop in zip(bounds[:-1], bounds[1:]):
+                if start == stop:
+                    continue
+                segment = self.forward(
+                    query[start:stop].unsqueeze(0),
+                    key[start:stop].unsqueeze(0),
+                    value[start:stop].unsqueeze(0),
+                    None,
+                )
+                output[start:stop].copy_(segment[0])
+            return output
+
+        return ascend_fused_infer_attention_varlen(
+            query,
+            key,
+            value,
+            cu_seqlens,
+            cu_seqlens,
+            cu_seqlens_q_host=cu_seqlens_host,
+            cu_seqlens_k_host=cu_seqlens_host,
+            softmax_scale=self.softmax_scale,
+        )
