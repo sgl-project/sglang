@@ -675,6 +675,10 @@ class LogicalHostPool:
         self.release_slots = []
         self.num_release_slots = 0
 
+    def destroy(self) -> None:
+        """Logical anchors own no backing buffers or registrations to release."""
+        return None
+
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
 

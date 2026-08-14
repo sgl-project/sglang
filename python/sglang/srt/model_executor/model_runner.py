@@ -431,6 +431,11 @@ class ModelRunner:
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
 
+        # The native overlap path replaces this during load_model(). Keep the
+        # no-pending-work invariant for lightweight backends that override the
+        # base initialization and weight-loading flow.
+        self.startup_weight_load = None
+
         # Load model weights and configure
         self.initialize()
         self.check_quantized_moe_compatibility()
@@ -722,6 +727,11 @@ class ModelRunner:
             ElasticEPStateManager.init(self.server_args)
 
     def init_token_oracle(self):
+        # The oracle sampler is process-wide, so a draft would overwrite the
+        # target's with its own vocab -- which a DFlash draft does not have.
+        if self.is_draft_worker:
+            self._token_oracle_manager = None
+            return
         self._token_oracle_manager = install_token_oracle_from_env(
             server_args=self.server_args,
             vocab_size=self.model_config.vocab_size,
@@ -847,7 +857,10 @@ class ModelRunner:
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
             return
-        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from sglang.srt.managers.hisparse_coordinator import (
+            HiSparseCoordinator,
+            resolve_shared_index_layers,
+        )
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
         hisparse_cfg = parse_hisparse_config(self.server_args)
@@ -867,6 +880,11 @@ class ModelRunner:
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
+            shared_index_layers=resolve_shared_index_layers(
+                hf_text_config=self.model_config.hf_text_config,
+                pp_size=self.ps.pp_size,
+                is_speculative=self.spec_algorithm.is_speculative(),
+            ),
         )
 
     def post_capture_resize_kv_pool(self):
@@ -1102,6 +1120,7 @@ class ModelRunner:
             )
         self.loader = loaded.loader
         self.model = loaded.model
+        self.startup_weight_load = loaded.startup_weight_load
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (
                 loaded.remote_instance_weight_info
@@ -1145,14 +1164,15 @@ class ModelRunner:
         # This handles both config.json (standard) and hf_quant_config.json (ModelOpt)
         quant_str = self.model_config.get_quantization_config_log_str()
 
-        logger.info(
-            f"Load weight end. "
-            f"elapsed={self.weight_load_time:.2f} s, "
-            f"type={type(self.model).__name__}, "
-            f"{quant_str + ', ' if quant_str else ''}"
-            f"avail mem={after_avail_memory:.2f} GB, "
-            f"mem usage={self.weight_load_mem_usage:.2f} GB."
-        )
+        if self.startup_weight_load is None:
+            logger.info(
+                f"Load weight end. "
+                f"elapsed={self.weight_load_time:.2f} s, "
+                f"type={type(self.model).__name__}, "
+                f"{quant_str + ', ' if quant_str else ''}"
+                f"avail mem={after_avail_memory:.2f} GB, "
+                f"mem usage={self.weight_load_mem_usage:.2f} GB."
+            )
 
         report_online_quantization(model=self.model, server_args=self.server_args)
 
@@ -1178,11 +1198,36 @@ class ModelRunner:
             logger,
         )
 
+        if self.startup_weight_load is None:
+            dist_barrier_after_load(
+                elastic_ep_backend=get_exec().moe.elastic_ep_backend,
+                tp_rank=self.ps.tp_rank,
+                is_ep_joiner=self.server_args.is_ep_joiner,
+            )
+
+    def start_startup_weight_load(self) -> None:
+        assert self.startup_weight_load is not None
+        self.startup_weight_load.start_prefetch()
+
+    def finalize_startup_weight_load(self) -> None:
+        """Commit the real weights, then run the post-load barrier.
+
+        The barrier moves here because ``load_model`` returns with sentinel
+        values under overlap, so this is the first point at which "weights are
+        loaded" is true for this rank. It follows the commit and its validation
+        deliberately: a rank that fails to commit must not report readiness. A
+        commit failure is terminal for the process, so peer ranks observe it as
+        a barrier timeout rather than a clean collective abort, which matches
+        the existing startup contract for load failures.
+        """
+        assert self.startup_weight_load is not None
+        self.startup_weight_load.finalize()
         dist_barrier_after_load(
             elastic_ep_backend=get_exec().moe.elastic_ep_backend,
             tp_rank=self.ps.tp_rank,
             is_ep_joiner=is_ep_joiner(),
         )
+        self.startup_weight_load = None
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
@@ -1293,6 +1338,7 @@ class ModelRunner:
                     else False
                 ),
                 speculative_draft_attention_backend=self.draft_attention_backend,
+                speculative_draft_kv_cache_dtype=self.server_args.speculative_draft_kv_cache_dtype,
             )
         )
         # This runner's OWN resolved dtype string (target or draft). Attention

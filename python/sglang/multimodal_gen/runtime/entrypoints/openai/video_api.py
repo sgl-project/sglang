@@ -683,6 +683,15 @@ async def create_video(
             selected = value if value is not None else extra_from_form.get(name)
             return _parse_form_extra_value(selected)
 
+        def form_text_value(name: str, value: Any) -> Any:
+            """Resolve a text field without JSON-decoding it.
+
+            Some models take a serialized JSON object as the prompt text, which
+            ``_parse_form_extra_value`` would turn back into a dict and fail
+            request validation.
+            """
+            return value if value is not None else extra_from_form.get(name)
+
         request_field_names = set(VideoGenerationsRequest.model_fields)
         extra_request_fields = {
             key: value
@@ -708,7 +717,7 @@ async def create_video(
             num_frames=num_frames_val,
             seed=form_value("seed", seed),
             generator_device=form_value("generator_device", generator_device),
-            negative_prompt=form_value("negative_prompt", negative_prompt),
+            negative_prompt=form_text_value("negative_prompt", negative_prompt),
             num_inference_steps=form_value("num_inference_steps", num_inference_steps),
             guidance_scale=form_value("guidance_scale", guidance_scale),
             guidance_scale_2=form_value("guidance_scale_2", guidance_scale_2),
