@@ -1,4 +1,4 @@
-"""Reusable per-media artifact caching contract for multimodal processors."""
+"""Shared contracts and coordination for reusable multimodal artifacts."""
 
 from __future__ import annotations
 

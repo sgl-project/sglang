@@ -33,6 +33,11 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     KimiK3DeferredPreprocessing,
 )
+from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
+    KimiK3ImageArtifact,
+    KimiK3PreprocessConfig,
+    KimiK3ResizeConfig,
+)
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
@@ -41,11 +46,6 @@ from sglang.srt.multimodal.processors.kimi_k3 import (
     KimiK3ImageProcessor,
     _expand_k3_image_prompt_text,
     _expand_k3_image_prompt_token_ids,
-)
-from sglang.srt.multimodal.processors.kimi_k3_artifact import (
-    KimiK3ImageArtifact,
-    KimiK3PreprocessConfig,
-    KimiK3ResizeConfig,
 )
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
@@ -865,7 +865,7 @@ def test_kimi_k3_trusted_hot_hit_skips_media_read():
 
     try:
         with patch(
-            "sglang.srt.multimodal.processors.media_artifact.snapshot_media",
+            "sglang.srt.multimodal.media_artifacts.base.snapshot_media",
             side_effect=AssertionError("trusted cache hit must not read media"),
         ):
             result = asyncio.run(

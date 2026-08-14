@@ -6,7 +6,7 @@ from typing import Optional
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import MultimodalPreprocessCache, snapshot_media
-from sglang.srt.multimodal.processors.media_artifact import (
+from sglang.srt.multimodal.media_artifacts import (
     MediaArtifactCacheMixin,
     MediaArtifactInput,
 )

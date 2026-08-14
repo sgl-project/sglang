@@ -34,6 +34,15 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     to_chw_uint8,
 )
+from sglang.srt.multimodal.media_artifacts import (
+    MediaArtifactCacheMixin,
+    MediaArtifactInput,
+)
+from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
+    KimiK3ImageArtifact,
+    KimiK3PreprocessConfig,
+    KimiK3ResizeConfig,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -41,21 +50,12 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
-from sglang.srt.multimodal.processors.kimi_k3_artifact import (
-    KimiK3ImageArtifact,
-    KimiK3PreprocessConfig,
-    KimiK3ResizeConfig,
-)
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
     _get_image_dimensions,
     _gpu_preprocess_images,
     _grid_thw_from_resize_config,
     navit_resize_config,
-)
-from sglang.srt.multimodal.processors.media_artifact import (
-    MediaArtifactCacheMixin,
-    MediaArtifactInput,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
