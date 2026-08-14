@@ -155,7 +155,10 @@ def _patch_glm_moe_dsa_attribute_map():
         return
 
     attribute_map = getattr(GlmMoeDsaConfig, "attribute_map", None)
-    if not isinstance(attribute_map, dict) or "head_dim" not in attribute_map:
+    if (
+        not isinstance(attribute_map, dict)
+        or attribute_map.get("head_dim") != "qk_rope_head_dim"
+    ):
         return
 
     GlmMoeDsaConfig.attribute_map = dict(attribute_map)

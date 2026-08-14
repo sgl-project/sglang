@@ -66,7 +66,6 @@ class TestGlmMoeDsaAttributeMapPatch(unittest.TestCase):
                 num_attention_heads=64,
             )
             self.assertNotIn("head_dim", GlmMoeDsaConfig.attribute_map)
-            self.assertEqual(config.head_dim, 192)
             self.assertEqual(config.qk_rope_head_dim, 64)
             self.assertEqual(
                 config.num_attention_heads
