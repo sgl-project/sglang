@@ -161,9 +161,9 @@ checkpoint's calibration scales automatically.
   requires a FlashInfer build whose prefill `plan` accepts `uniform_q_len`
   (newer than 0.6.15.post1); otherwise run spec with `--attention-backend triton`.
   On DGX Spark the 128GB is unified memory shared with the host CPU, so all
-  three checkpoints fit; its cells use 8192-token prefill chunks and
-  `--mem-fraction-static 0.95`. The SM121 recipe is not yet validated on that
-  platform.
+  three checkpoints fit; its cells use 8192-token prefill chunks,
+  `--mem-fraction-static 0.95`, and `--disable-prefill-cuda-graph`. The SM121
+  recipe is not yet validated on that platform.
 - **H200 (SM90)**: BF16 and FP8 only — the card has no FP4 tensor cores, so the
   NVFP4 checkpoint's MLP would fall back to the Marlin W4A16 weight-only path
   and its cell is greyed out. The H200 recipes use 32768-token prefill chunks
