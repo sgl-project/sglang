@@ -27,6 +27,8 @@ from sglang.srt.entrypoints.openai.chat_encoding import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
+    ToolChoice,
+    ToolChoiceFuncName,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
@@ -1507,6 +1509,104 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(tool_calls[0].function.name, "get_weather")
             self.assertEqual(tool_calls[1].id, "functions.get_weather:2")
             self.assertEqual(tool_calls[1].function.name, "get_weather")
+
+    def test_required_tool_choice_skips_json_fallback_for_native_parser(self):
+        """A structural-tag parser owns the output format, so a missing tool
+        call must not be pushed through the json_schema array fallback."""
+        self.chat.tool_call_parser = "kimi_k3"
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        texts = {
+            "prose": "<|open|>response<|sep|>I'll check that.<|close|>response<|sep|>",
+            "empty": "",
+            "json_object": '{"name": "get_weather", "parameters": {"city": "Paris"}}',
+        }
+        for choice in (
+            "required",
+            ToolChoice(function=ToolChoiceFuncName(name="get_weather")),
+        ):
+            for label, text in texts.items():
+                with self.subTest(tool_choice=choice, payload=label):
+                    finish_reason = {"type": "stop", "matched": None}
+                    with self.assertLogs(
+                        "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+                    ) as logs:
+                        tool_calls, remaining, finish_reason = (
+                            self.chat._process_tool_calls(
+                                text=text,
+                                tools=tools,
+                                finish_reason=finish_reason,
+                                tool_choice=choice,
+                            )
+                        )
+                    self.assertIsNone(tool_calls)
+                    self.assertEqual(remaining, text)
+                    self.assertEqual(finish_reason["type"], "stop")
+                    self.assertNotIn("Tool call parsing error", "\n".join(logs.output))
+
+    def test_required_tool_choice_json_fallback_tolerates_odd_shapes(self):
+        """Parsers without a structural tag keep the JSON array fallback, but a
+        non-array payload degrades instead of raising an opaque TypeError."""
+        self.chat.tool_call_parser = "glm45"
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        cases = [
+            (
+                '[{"name": "get_weather", "parameters": {"city": "Paris"}}]',
+                '{"city": "Paris"}',
+            ),
+            (
+                '{"name": "get_weather", "parameters": {"city": "Paris"}}',
+                '{"city": "Paris"}',
+            ),
+            ('{"name": "get_weather"}', "{}"),
+        ]
+        for text, expected_args in cases:
+            with self.subTest(text=text):
+                tool_calls, _, finish_reason = self.chat._process_tool_calls(
+                    text=text,
+                    tools=tools,
+                    finish_reason={"type": "stop", "matched": None},
+                    tool_choice="required",
+                )
+                self.assertEqual(len(tool_calls), 1)
+                self.assertEqual(tool_calls[0].function.name, "get_weather")
+                self.assertEqual(tool_calls[0].function.arguments, expected_args)
+                self.assertEqual(finish_reason["type"], "tool_calls")
+
+        finish_reason = {"type": "stop", "matched": None}
+        with self.assertLogs(
+            "sglang.srt.entrypoints.openai.serving_chat", level="ERROR"
+        ):
+            tool_calls, remaining, finish_reason = self.chat._process_tool_calls(
+                text='["get_weather"]',
+                tools=tools,
+                finish_reason=finish_reason,
+                tool_choice="required",
+            )
+        self.assertIsNone(tool_calls)
+        self.assertEqual(remaining, '["get_weather"]')
+        self.assertEqual(finish_reason["type"], "stop")
 
     def test_kimi_k2_streaming_tool_call_id_with_history(self):
         """Ensure streaming first chunk tool_call.id increase with tool calls history for kimi_k2 parser."""
