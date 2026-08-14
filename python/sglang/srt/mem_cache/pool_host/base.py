@@ -10,11 +10,11 @@ import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.pool_host.coalesce_reload import take_contiguous_run
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
 )
-from sglang.srt.mem_cache.pool_host.coalesce_reload import take_contiguous_run
 from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
@@ -370,9 +370,7 @@ class HostKVCache(abc.ABC):
         if need_size > len(self.free_slots):
             self._merge_release_slots()
 
-        select_index, self.free_slots = take_contiguous_run(
-            self.free_slots, need_size
-        )
+        select_index, self.free_slots = take_contiguous_run(self.free_slots, need_size)
 
         assert not self.slot_used[select_index].any(), (
             f"Double-alloc detected: slots already allocated: "
