@@ -265,8 +265,9 @@ class CPUGPTQConfig(GPTQConfig):
 class GPTQXPUConfig(GPTQConfig):
     """Config class for GPTQ on Intel XPU.
 
-    Dense int4 GPTQ lowers to torch's native ``_weight_int4pack_mm`` op (no
-    Marlin on XPU). MoE is out of scope for the dense phase.
+    Dense int4 GPTQ lowers to torch's native
+    ``_weight_int4pack_mm_with_scales_and_zeros`` op (no Marlin on XPU). MoE is
+    out of scope for the dense phase.
     """
 
     @classmethod

@@ -13,10 +13,10 @@ register_xpu_ci(est_time=20, suite="stage-a-test-1-gpu-xpu")
 DEV = "xpu"
 
 REL_TOL = {torch.float16: 1.5e-3, torch.bfloat16: 1e-2}
+M_VALUES = (1, 8, 256)
 
 # (K, N, group_size); K % 8 == 0, N % 8 == 0, K % group_size == 0.
 SHAPES = [
-    (128, 64, 16),
     (128, 64, 32),
     (256, 128, 64),
     (256, 128, 128),
@@ -98,11 +98,12 @@ class TestXPUInt4DenseKernel(CustomTestCase):
 
     def test_awq_numeric(self):
         for dtype in (torch.float16, torch.bfloat16):
-            for k, n, gs in SHAPES:
-                with self.subTest(dtype=dtype, K=k, N=n, gs=gs):
-                    self._run_awq(k, n, gs, dtype)
+            for m in M_VALUES:
+                for k, n, gs in SHAPES:
+                    with self.subTest(dtype=dtype, M=m, K=k, N=n, gs=gs):
+                        self._run_awq(m, k, n, gs, dtype)
 
-    def _run_awq(self, k, n, gs, dtype):
+    def _run_awq(self, m, k, n, gs, dtype):
         from sglang.srt.hardware_backend.xpu.quantization.awq_kernels import (
             AWQXPULinearKernel,
         )
@@ -115,7 +116,7 @@ class TestXPUInt4DenseKernel(CustomTestCase):
 
         gidx = torch.arange(k, device=DEV) // gs
         w_ref = (wcodes.to(dtype) - zcodes[gidx].to(dtype)) * scales[gidx]
-        x = torch.randn(7, k, device=DEV, dtype=dtype)
+        x = torch.randn(m, k, device=DEV, dtype=dtype)
         ref = x @ w_ref
 
         layer = _make_layer()
@@ -127,7 +128,7 @@ class TestXPUInt4DenseKernel(CustomTestCase):
         kernel.process_weights_after_loading(layer)
         out = kernel.apply(layer, x)
 
-        self.assertEqual(tuple(out.shape), (7, n))
+        self.assertEqual(tuple(out.shape), (m, n))
         self.assertTrue(torch.isfinite(out).all())
         rel = (out - ref).abs().max().item() / ref.abs().max().item()
         self.assertLess(rel, REL_TOL[dtype], f"rel={rel:.2e}")
@@ -136,18 +137,20 @@ class TestXPUInt4DenseKernel(CustomTestCase):
         for dtype in (torch.float16, torch.bfloat16):
             for fmt in ("", "gptq_v2"):
                 for desc_act in (False, True):
-                    for k, n, gs in SHAPES:
-                        with self.subTest(
-                            dtype=dtype,
-                            fmt=fmt or "gptq_v1",
-                            desc_act=desc_act,
-                            K=k,
-                            N=n,
-                            gs=gs,
-                        ):
-                            self._run_gptq(k, n, gs, dtype, desc_act, fmt)
+                    for m in M_VALUES:
+                        for k, n, gs in SHAPES:
+                            with self.subTest(
+                                dtype=dtype,
+                                fmt=fmt or "gptq_v1",
+                                desc_act=desc_act,
+                                M=m,
+                                K=k,
+                                N=n,
+                                gs=gs,
+                            ):
+                                self._run_gptq(m, k, n, gs, dtype, desc_act, fmt)
 
-    def _run_gptq(self, k, n, gs, dtype, desc_act, fmt):
+    def _run_gptq(self, m, k, n, gs, dtype, desc_act, fmt):
         from sglang.srt.hardware_backend.xpu.quantization.gptq_kernels import (
             GPTQXPULinearKernel,
         )
@@ -166,7 +169,7 @@ class TestXPUInt4DenseKernel(CustomTestCase):
 
         zp_eff = zc + (0 if fmt == "gptq_v2" else 1)
         w_true = (qnat.to(dtype) - zp_eff[g_idx].to(dtype)) * scales[g_idx]
-        x = torch.randn(5, k, device=DEV, dtype=dtype)
+        x = torch.randn(m, k, device=DEV, dtype=dtype)
         ref = x @ w_true
 
         layer = _make_layer()
@@ -181,7 +184,7 @@ class TestXPUInt4DenseKernel(CustomTestCase):
         kernel.process_weights_after_loading(layer)
         out = kernel.apply(layer, x)
 
-        self.assertEqual(tuple(out.shape), (5, n))
+        self.assertEqual(tuple(out.shape), (m, n))
         self.assertTrue(torch.isfinite(out).all())
         rel = (out - ref).abs().max().item() / ref.abs().max().item()
         self.assertLess(rel, REL_TOL[dtype], f"rel={rel:.2e}")

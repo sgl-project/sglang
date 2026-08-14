@@ -217,8 +217,8 @@ class AWQCPUConfig(AWQConfig):
 class AWQXPUConfig(AWQConfig):
     """AWQ int4 dense linear on Intel XPU.
 
-    Lowers to torch's native ``_weight_int4pack_mm`` op. MoE is out of scope
-    for the dense phase (mirrors ``GPTQXPUConfig``).
+    Lowers to torch's native ``_weight_int4pack_mm_with_scales_and_zeros`` op.
+    MoE is out of scope for the dense phase (mirrors ``GPTQXPUConfig``).
     """
 
     def get_supported_act_dtypes(self) -> List[torch.dtype]:

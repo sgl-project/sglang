@@ -9,7 +9,6 @@ import torch
 
 from sglang.srt.hardware_backend.xpu.quantization.int4pack_utils import (
     SUPPORTED_GROUP_SIZES,
-    build_qscale_and_zeros,
     pack_int4_to_uint8,
     unpack_awq_to_codes,
     xpu_int4pack_mm,
@@ -29,7 +28,7 @@ class AWQXPULinearKernel:
         if group_size not in SUPPORTED_GROUP_SIZES:
             raise ValueError(
                 f"AWQ on XPU requires group_size in {SUPPORTED_GROUP_SIZES}, "
-                f"got {group_size}. torch _weight_int4pack_mm_xpu does not "
+                f"got {group_size}. The native XPU INT4 operator does not "
                 "support this group size (per-channel/-1 is out of scope)."
             )
 
@@ -43,19 +42,23 @@ class AWQXPULinearKernel:
         # qweight -> [N, K // 2] uint8 (torch int4pack B layout)
         codes = unpack_awq_to_codes(qweight, k)  # [K, N]
         codes = codes.t().contiguous()  # [N, K]
-        qweight_packed = pack_int4_to_uint8(codes)  # [N, K // 2]
+        qweight_uint8 = pack_int4_to_uint8(codes)  # [N, K // 2]
+        qweight_packed = torch.ops.aten._convert_weight_to_int4pack(
+            qweight_uint8, 8
+        )  # [N, K // 8] int32
 
-        # qzeros -> [K // gs, N] codes, then fold into float zero.
-        zp = unpack_awq_to_codes(qzeros, scales.shape[0])  # [K // gs, N]
-        qscale_and_zeros = build_qscale_and_zeros(scales, zp)  # [K // gs, N, 2]
+        # qzeros -> [K // gs, N] int8 zero-points expected by the native op.
+        zero_points = unpack_awq_to_codes(qzeros, scales.shape[0])
 
         replace_parameter(layer, "qweight", qweight_packed)
         layer.register_parameter(
-            "qscale_and_zeros",
-            torch.nn.Parameter(qscale_and_zeros, requires_grad=False),
+            "xpu_scales",
+            torch.nn.Parameter(scales.contiguous(), requires_grad=False),
         )
-        # scales/qzeros are now folded into qscale_and_zeros; drop them so they
-        # don't linger in state_dict / waste memory.
+        layer.register_parameter(
+            "xpu_zero_points",
+            torch.nn.Parameter(zero_points.to(torch.int8), requires_grad=False),
+        )
         del layer.qzeros
         del layer.scales
 
@@ -72,7 +75,8 @@ class AWQXPULinearKernel:
             x,
             layer.qweight,
             layer.xpu_group_size,
-            layer.qscale_and_zeros,
+            layer.xpu_scales,
+            layer.xpu_zero_points,
             layer.xpu_out_features,
             bias,
         )

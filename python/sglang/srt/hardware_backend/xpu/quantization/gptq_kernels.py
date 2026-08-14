@@ -9,7 +9,6 @@ import torch
 
 from sglang.srt.hardware_backend.xpu.quantization.int4pack_utils import (
     SUPPORTED_GROUP_SIZES,
-    build_qscale_and_zeros,
     pack_int4_to_uint8,
     unpack_gptq_qweight,
     unpack_gptq_qzeros,
@@ -31,7 +30,7 @@ class GPTQXPULinearKernel:
         if group_size not in SUPPORTED_GROUP_SIZES:
             raise ValueError(
                 f"GPTQ on XPU requires group_size in {SUPPORTED_GROUP_SIZES}, "
-                f"got {group_size}. torch _weight_int4pack_mm_xpu does not "
+                f"got {group_size}. The native XPU INT4 operator does not "
                 "support this group size (per-channel/-1 is out of scope)."
             )
 
@@ -69,7 +68,7 @@ class GPTQXPULinearKernel:
                     "GPTQ act_order on XPU requires every group_size block of "
                     "input channels to map to a single group. This shard splits "
                     "a group across the K (row-parallel) boundary, which the "
-                    "torch _weight_int4pack_mm path cannot represent."
+                    "native XPU INT4 packed-mm path cannot represent."
                 )
             # Reorder scales/zeros to follow the block group order.
             block_gid = blocks[:, 0]  # [num_blocks]
@@ -77,14 +76,19 @@ class GPTQXPULinearKernel:
             zp = zp[block_gid]
 
         codes = codes.t().contiguous()  # [N, K]
-        qweight_packed = pack_int4_to_uint8(codes)  # [N, K // 2]
-
-        qscale_and_zeros = build_qscale_and_zeros(scales, zp)  # [K // gs, N, 2]
+        qweight_uint8 = pack_int4_to_uint8(codes)  # [N, K // 2]
+        qweight_packed = torch.ops.aten._convert_weight_to_int4pack(
+            qweight_uint8, 8
+        )  # [N, K // 8] int32
 
         replace_parameter(layer, "qweight", qweight_packed)
         layer.register_parameter(
-            "qscale_and_zeros",
-            torch.nn.Parameter(qscale_and_zeros, requires_grad=False),
+            "xpu_scales",
+            torch.nn.Parameter(scales.contiguous(), requires_grad=False),
+        )
+        layer.register_parameter(
+            "xpu_zero_points",
+            torch.nn.Parameter(zp.to(torch.int8).contiguous(), requires_grad=False),
         )
         if act_perm is not None:
             layer.register_buffer(
@@ -92,7 +96,6 @@ class GPTQXPULinearKernel:
             )
         else:
             layer.xpu_act_perm = None
-        # scales/qzeros folded into qscale_and_zeros; g_idx folded into act_perm.
         del layer.qzeros
         del layer.scales
         if hasattr(layer, "g_idx"):
@@ -114,7 +117,8 @@ class GPTQXPULinearKernel:
             x,
             layer.qweight,
             layer.xpu_group_size,
-            layer.qscale_and_zeros,
+            layer.xpu_scales,
+            layer.xpu_zero_points,
             layer.xpu_out_features,
             bias,
         )
