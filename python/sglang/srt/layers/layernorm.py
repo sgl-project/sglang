@@ -1243,6 +1243,13 @@ class Gemma3RMSNorm(BaseFusedOp):
         return self.forward_native(x)
 
     def forward_cuda(self, x, residual: Optional[torch.Tensor] = None):
+        # sgl-kernel's Gemma RMSNorm CUDA operators currently dispatch only
+        # half and bfloat16. Keep float32 models (including VoiceChat EarTTS,
+        # whose audio quality requires float32) on the numerically equivalent
+        # PyTorch implementation without changing the fast path for existing
+        # Gemma deployments.
+        if x.dtype not in (torch.float16, torch.bfloat16):
+            return self.forward_native(x, residual)
         if residual is not None:
             # The decoder residual is token-major and contiguous. The fused
             # kernel updates both tensors in place: x becomes the normalized

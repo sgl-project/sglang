@@ -3761,6 +3761,42 @@ class ServerArgs:
         model_config = self.get_model_config()
         hf_config = model_config.hf_config
 
+        # VoiceChat's effective embeddings depend on per-turn acoustic,
+        # speaker, and codec data that are intentionally not part of token IDs.
+        # Replayed CUDA graphs would therefore reuse incorrect values across
+        # streams. The unified radix cache must remain enabled because its
+        # session-scoped StreamingSession owns the persistent KV slots; those
+        # slots are isolated by session rather than matched by token-only keys.
+        # Keep this adjustment architecture-scoped so no existing model's
+        # graph policy changes.
+        voicechat_architectures = {
+            "NemotronDuplexHForCausalLM",
+            "EarTTSForCausalLM",
+        }
+        model_architectures = getattr(hf_config, "architectures", None) or []
+        if voicechat_architectures.intersection(model_architectures):
+            self.disable_cuda_graph = True
+            self.disable_overlap_schedule = True
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            if "EarTTSForCausalLM" in model_architectures:
+                # speaker_latent spans the complete reference prompt.
+                self.chunked_prefill_size = -1
+                # NVIDIA requires float32 EarTTS inference for audio quality.
+                # Native PyTorch attention is the conservative default; an
+                # explicitly selected backend remains available for testing.
+                if self.attention_backend is None:
+                    self.attention_backend = "torch_native"
+                if self.prefill_attention_backend is None:
+                    self.prefill_attention_backend = self.attention_backend
+                if self.decode_attention_backend is None:
+                    self.decode_attention_backend = self.attention_backend
+            logger.warning(
+                "VoiceChat model detected: disabling CUDA graphs and overlap "
+                "scheduling because model inputs include per-turn non-token "
+                "data. Use streaming sessions to isolate and retain KV state."
+            )
+
         # HRM-Text needs bidirectional prompt attention (prefill), which only
         # the Triton backend honors at the kernel level. Radix/prefix reuse is
         # also unsafe: the recurrent forward writes direction-dependent KV
