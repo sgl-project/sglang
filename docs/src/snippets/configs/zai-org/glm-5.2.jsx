@@ -353,9 +353,8 @@ sgl-eval run aime25 \\
 
     // ====================================================================
     // GB300 + FP8 (Grace-Blackwell, 4-GPU single node) — TP4.
-    // Flags mirror the B200 (sm100) configs; all three strategies verified end-to-end on
-    // a single 4xGB300 node (v0.5.13.post1). GB300 leads B200 per-GPU in every regime.
-    // Stage the weights on node-local NVMe first — shared cluster-storage reads are slow.
+    // Flags mirror the B200 (sm100) configs; all three strategies verified on a single
+    // 4xGB300 node (v0.5.13.post1). GB300 leads B200 per-GPU in every regime.
     // ====================================================================
     {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
@@ -519,8 +518,8 @@ sgl-eval run aime25 \\
       ],
     },
     {
-      // Memory-bound (bf16). No max-running cap; CUDA-graph capture bounded (--cuda-graph-max-bs-decode 256).
-      // Throughput saturates at conc 256 — higher conc just queues.
+      // Memory-bound (bf16); CUDA-graph capture bounded (--cuda-graph-max-bs-decode 256).
+      // Throughput saturates at conc 256.
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
@@ -786,9 +785,8 @@ sgl-eval run aime25 \\
         "--speculative-num-steps 2",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 3",
-        // Two required flags for DP-Attention + MTP here: `decode`-mode spec attention
-        // avoids a CUDA-graph capture deadlock, and max-running 256 lifts the default
-        // ~48-request throttle so DP-Attention can fill all 8 ranks.
+        // Two required flags for DP-Attention + MTP: decode-mode spec attention (for
+        // CUDA-graph capture) and max-running 256 so DP-Attention can fill all 8 ranks.
         "--speculative-attention-mode decode",
         "--max-running-requests 256",
         "--chunked-prefill-size 8192",
@@ -879,20 +877,16 @@ sgl-eval run aime25 \\
     },
     // ====================================================================
     // AMD MI300X / MI325X / MI355X (ROCm) — TP8, DSA tilelang backend.
-    // No MTP: disabled in the Speculative card for AMD (the gfx950 spec-decode
-    // draft kernel is not yet validated, and num-steps>3 hits a separate build
-    // issue). Strategies differ only by batch-shaping levers
-    // (cuda-graph-max-bs-decode / max-running-requests / chunked-prefill):
+    // No MTP: speculative decoding is disabled for AMD. Strategies differ only by
+    // batch-shaping levers (cuda-graph-max-bs-decode / max-running-requests / chunked-prefill):
     //   low-latency      — large chunked-prefill, default bs.
     //   balanced         — chunked-prefill 32768 + bs128, max-running 80.
     //   high-throughput  — bs256, max-running 256.
-    // ACCURACY: the earlier gfx950 block-FP8 bpreshuffle miscompile (GSM8K ~0) is
-    // fixed as of the pinned mi355x image (...-20260618); MI355X FP8 was re-validated
-    // (GSM8K ~0.96, NIAH 15/15 to ~118K) and all three FP8 strategies are benchmarked
-    // + marked verified:true (see glm-5.2-benchmarks.jsx). All BF16 and all gfx942
-    // (MI325X/MI300X) cells stay verified:false (not yet benchmarked, but correct).
-    // BF16 (~1.51 TB) only fits single-node on MI325X (2 TB) / MI355X (2.3 TB);
-    // MI300X (1.5 TB) needs multi-node, so its BF16 cells are omitted.
+    // MI355X FP8 is benchmarked and verified (GSM8K ~0.96, NIAH 15/15 to ~118K); use the
+    // pinned mi355x image (...-20260618). All BF16 and all gfx942 (MI325X/MI300X) cells are
+    // verified:false (not yet benchmarked, but correct). BF16 (~1.51 TB) only fits single-node
+    // on MI325X (2 TB) / MI355X (2.3 TB); MI300X (1.5 TB) needs multi-node, so its BF16 cells
+    // are omitted.
     // ====================================================================
     {
       match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },

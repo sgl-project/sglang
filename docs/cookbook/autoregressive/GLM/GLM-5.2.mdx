@@ -57,7 +57,7 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.2-benchmarks.jsx
 </Warning>
 
 <Note>
-  Speed numbers are measured with `--random-range-ratio 1.0`, `--flush-cache`, on sglang v0.5.15 (each benchmark cell records its exact `sglang_version`). Spec cells use EAGLE MTP (draft triple: low-latency 5-1-6; balanced 1-1-2 for FP8/BF16 and 2-1-3 for NVFP4) with **real measured acceptance** — no `SGLANG_SIMULATE_ACC_LEN`; high-throughput has no spec.
+  Speed numbers are measured with `--random-range-ratio 1.0`, `--flush-cache` (each benchmark cell records its exact `sglang_version`). Spec cells use EAGLE MTP (draft triple: low-latency 5-1-6; balanced 1-1-2 for FP8/BF16 and 2-1-3 for NVFP4). Because acceptance length on the random dataset is unrealistic, the spec-decode cells pin it with `SGLANG_SIMULATE_ACC_LEN` (see the per-cell notes in `glm-5.2-benchmarks.jsx`); high-throughput has no spec.
 </Note>
 
 ## Playground
