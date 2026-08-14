@@ -290,7 +290,7 @@ def batch_matmul_transpose_npu(
         tensor_c.stride(2),
     )
     is_bf16 = a.dtype == torch.bfloat16
-    if batch == 1 and output_width % 128 == 0 and inner % 64 == 0:
+    if batch == 1 and output_width % 128 == 0 and inner % 128 == 0:
         _batch_matmul_transpose_b1_fast_kernel[grid](
             a,
             weight,

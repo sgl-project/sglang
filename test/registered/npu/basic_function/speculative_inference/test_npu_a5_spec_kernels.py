@@ -107,6 +107,18 @@ class TestNpuA5SpecKernels(CustomTestCase):
         expected = torch.einsum("bmk,mkn->bmn", lhs, rhs)
         torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=0.02, atol=0.02)
 
+    def test_batch_one_k64_uses_masked_generic_kernel(self):
+        lhs = torch.randn((1, 3, 64), device="npu", dtype=torch.bfloat16)
+        rhs = torch.randn((3, 64, 128), device="npu", dtype=torch.bfloat16)
+        actual = torch.empty((1, 3, 128), device="npu", dtype=torch.bfloat16)
+        batch_matmul_transpose_npu(
+            tensor_a=lhs,
+            tensor_b=rhs,
+            tensor_c=actual,
+        )
+        expected = torch.einsum("bmk,mkn->bmn", lhs, rhs)
+        torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=0.02, atol=0.02)
+
 
 if __name__ == "__main__":
     unittest.main()
