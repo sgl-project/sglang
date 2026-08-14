@@ -84,7 +84,13 @@ class KimiK3ResizeConfig:
 
 @dataclass(frozen=True)
 class KimiK3ImagePreprocessArtifact:
-    """K3's preprocess-cache item for one image, reusable across prompts."""
+    """K3's prompt-independent preprocess result for one image.
+
+    ``original_size`` and ``resize_config`` rebuild the K3 image tokens for
+    each prompt; ``grid_thw`` becomes encoder metadata; ``feature`` is either
+    the prepared encoder input or a raw tensor paired with deferred GPU
+    preprocessing. ``feature_hash`` links the artifact to the embedding cache.
+    """
 
     content_digest: str
     artifact_key: str
@@ -99,12 +105,8 @@ class KimiK3ImagePreprocessArtifact:
     def has_feature(self) -> bool:
         return self.feature is not None
 
-    @property
-    def is_cpu_cacheable(self) -> bool:
-        return self.feature is None or self.feature.device.type == "cpu"
-
     def cache_value(self) -> KimiK3ImagePreprocessArtifact:
-        """Never retain a CUDA tensor in the preprocess cache."""
+        """Return the CPU-cacheable copy; never retain a CUDA tensor."""
         if self.feature is None or self.feature.device.type == "cpu":
             return self
         return replace(self, feature=None)

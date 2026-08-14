@@ -1,8 +1,24 @@
 """Shared contracts and coordination for reusable multimodal artifacts.
 
-An artifact is the prompt-independent result of preprocessing one media item.
-It is reused by the current request and is the logical item stored in the
-multimodal preprocess cache.
+A media artifact is the model-specific, prompt-independent state produced from
+one media input. It keeps the metadata needed to rebuild a request (for example,
+image size, token count, and encoder grid) and, when cacheable on CPU, the
+processor feature itself. Prompt tokens and offsets are deliberately excluded.
+
+The artifact connects the media preprocessor to request composition::
+
+    raw media -> identity/cache lookup -> MediaArtifact
+      cache miss: MediaArtifactInput -> prepare_artifact_batch()
+      cache hit:  reuse the stored artifact
+    MediaArtifact + current prompt -> MultimodalDataItem -> encoder/ViT
+
+The current request uses the full artifact returned by preprocessing. The
+preprocess cache stores ``artifact.cache_value()``, which may omit a CUDA feature
+and retain only reusable metadata. Such a featureless artifact is usable only
+when the downstream embedding cache already contains the encoded feature.
+
+An artifact is therefore the logical preprocess-cache item. It is not the raw
+media, a prompt-specific ``MultimodalDataItem``, or a ViT embedding-cache entry.
 """
 
 from __future__ import annotations
@@ -10,7 +26,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Generic, Optional, Protocol, TypeVar, cast, runtime_checkable
+from typing import Any, Optional, Protocol, runtime_checkable
 
 import numpy as np
 import torch
@@ -31,7 +47,13 @@ from sglang.srt.utils import load_image
 
 @runtime_checkable
 class MediaArtifact(Protocol):
-    """A reusable per-media preprocess result and logical cache item."""
+    """Common contract implemented by each model's preprocess artifact.
+
+    ``content_digest`` identifies the media contents. ``artifact_key`` also
+    includes every preprocessing choice that can change the artifact.
+    ``feature_hash`` becomes ``MultimodalDataItem.hash`` and identifies the
+    corresponding encoder embedding.
+    """
 
     content_digest: str
     artifact_key: str
@@ -40,12 +62,13 @@ class MediaArtifact(Protocol):
     @property
     def has_feature(self) -> bool: ...
 
-    def cache_value(self) -> MediaArtifact: ...
+    def cache_value(self) -> MediaArtifact:
+        """Return the cache-safe representation, possibly without a feature."""
+        ...
 
-    def cache_size_items(self) -> Sequence[Any]: ...
-
-
-ArtifactT = TypeVar("ArtifactT", bound=MediaArtifact)
+    def cache_size_items(self) -> Sequence[Any]:
+        """Return owned values counted against the preprocess-cache budget."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -54,8 +77,9 @@ class MediaArtifactInput:
 
     The shared cache layer has already validated its content digest, derived
     its artifact key, and claimed the cache miss. The model-specific artifact
-    builder can therefore preprocess ``media`` without loading or hashing it
-    again.
+    builder preprocesses ``media`` into a reusable ``MediaArtifact`` without
+    loading or hashing the source again. This object is a transient handoff;
+    it is not itself stored in the cache.
     """
 
     content_digest: str
@@ -64,14 +88,15 @@ class MediaArtifactInput:
     media: Any
 
 
-class MediaArtifactCacheMixin(Generic[ArtifactT]):
-    """Identity, single-flight, partial-hit, and cache lifecycle by modality.
+class MediaArtifactCacheMixin:
+    """Turn media inputs into ordered artifacts, reusing cached work per item.
 
-    A model adapter only supplies the modality, batch artifact materialization,
-    and request composition. A multi-modal model can call the same coordinator
-    with different modalities and override snapshot/decode/key hooks without
-    copying the cache algorithm. Processor implementations must expose every
-    artifact-producing setting through ``preprocess_fingerprint_payload``.
+    The shared layer owns identity, cache lookup, single-flight, partial hits,
+    and result ordering. A model adapter implements ``prepare_artifact_batch``
+    and later composes the returned artifacts with the current prompt. Models
+    can override snapshot/decode/key hooks for each modality without copying the
+    cache algorithm. Every artifact-producing setting must be exposed through
+    ``preprocess_fingerprint_payload``.
     """
 
     artifact_modality: Optional[Modality] = None
@@ -80,6 +105,11 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
     def artifact_preprocess_kwargs(
         self, source: Any, modality: Modality
     ) -> Mapping[str, Any]:
+        """Return request options that can change this media's artifact.
+
+        These options become part of the artifact key. Model adapters can
+        override this hook when their request schema has additional knobs.
+        """
         return media_preprocess_kwargs(source, defaults=self.artifact_option_defaults)
 
     def _resolve_artifact_modality(self, modality: Optional[Modality]) -> Modality:
@@ -95,6 +125,7 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
         *,
         modality: Optional[Modality] = None,
     ) -> str:
+        """Identify one artifact by media content and all preprocess choices."""
         if self.processor_fingerprint is None:
             raise RuntimeError("Artifact caching requires a processor fingerprint")
         modality = self._resolve_artifact_modality(modality)
@@ -143,7 +174,7 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
 
     def prepare_artifact_batch(
         self, entries: Sequence[MediaArtifactInput]
-    ) -> list[ArtifactT]:
+    ) -> list[MediaArtifact]:
         """Preprocess raw multimodal inputs that missed the preprocess cache.
 
         Each entry is one unique, decoded cache miss. Implementations must
@@ -154,11 +185,18 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
         """
         raise NotImplementedError
 
-    def artifact_usable(self, artifact: ArtifactT, *, allow_featureless: bool) -> bool:
+    def artifact_usable(
+        self, artifact: MediaArtifact, *, allow_featureless: bool
+    ) -> bool:
+        """Whether this request can use an artifact that may omit its feature.
+
+        A metadata-only artifact is valid only after the scheduler has confirmed
+        that the corresponding encoder embedding is already cached.
+        """
         return artifact.has_feature or allow_featureless
 
     @staticmethod
-    def validate_artifact(artifact: ArtifactT, entry: MediaArtifactInput) -> None:
+    def validate_artifact(artifact: MediaArtifact, entry: MediaArtifactInput) -> None:
         """Enforce identity invariants shared by every model adapter."""
         if artifact.content_digest != entry.content_digest:
             raise ValueError("prepare_artifact_batch changed the media content digest")
@@ -175,7 +213,8 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
 
     async def _run_artifact_batch(
         self, entries: Sequence[MediaArtifactInput]
-    ) -> list[ArtifactT]:
+    ) -> list[MediaArtifact]:
+        """Run model preprocessing locally or on the processor worker pool."""
         if self.mm_processor_executor is None:
             return self.prepare_artifact_batch(entries)
         return await self.mm_processor_executor.run(
@@ -189,7 +228,13 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
         modality: Modality,
         *,
         allow_featureless: bool,
-    ) -> Optional[ArtifactT]:
+    ) -> Optional[MediaArtifact]:
+        """Return a compatible cached artifact without recording a cold miss.
+
+        Identity mismatches are corrupt entries and are evicted. A featureless
+        entry that this request cannot use is left for the miss path, which
+        removes it temporarily and verifies the recomputed feature hash.
+        """
         artifact = self.mm_preprocess_cache.get_if_present(
             key,
             lambda value: (
@@ -215,8 +260,13 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
         content_hashes: Optional[Sequence[Optional[str]]] = None,
         featureless_hit_mask: Optional[Sequence[bool]] = None,
         modality: Optional[Modality] = None,
-    ) -> list[ArtifactT]:
-        """Resolve identities and preprocess only per-media cache misses."""
+    ) -> list[MediaArtifact]:
+        """Return one reusable artifact per media item, in the same order.
+
+        Cache hits return their stored artifact. Misses are snapshotted,
+        decoded, and passed to ``prepare_artifact_batch``. This method does not
+        create prompt tokens, offsets, or ``MultimodalDataItem`` objects.
+        """
         modality = self._resolve_artifact_modality(modality)
         media_count = len(media_data)
         if content_hashes is None:
@@ -233,7 +283,9 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
         if len(featureless_hit_mask) != media_count:
             raise ValueError("featureless_hit_mask must align with media_data")
 
-        artifacts: list[Optional[ArtifactT]] = [None] * media_count
+        # Keep all per-input state index-aligned until the final result is rebuilt.
+        # This is what makes duplicate media and partial hit/miss batches safe.
+        artifacts: list[Optional[MediaArtifact]] = [None] * media_count
         snapshots: list[Optional[MediaSnapshot]] = [None] * media_count
         keys: list[Optional[str]] = [None] * media_count
 
@@ -256,6 +308,8 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
                     continue
             load_indices.append(index)
 
+        # Snapshot each remaining source once. The snapshot supplies both the
+        # verified content hash and the exact bytes/object decoded on a miss.
         snapshot_futures = {
             index: self.io_executor.submit(
                 self.snapshot_media_source, media_data[index], modality
@@ -282,9 +336,11 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
                 allow_featureless=featureless_hit_mask[index],
             )
 
-        # Deduplicate misses before decode and share their work across requests.
+        # Deduplicate misses before decode. A metadata-only entry may have been
+        # rejected above because this request still needs the feature; retain it
+        # only to verify that recomputation produces the same feature hash.
         first_index_by_key: dict[str, int] = {}
-        previous_metadata: dict[str, ArtifactT] = {}
+        previous_metadata: dict[str, MediaArtifact] = {}
         for index in load_indices:
             if artifacts[index] is not None:
                 continue
@@ -297,6 +353,8 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
                     previous_metadata[key] = previous
 
         unique_keys = list(first_index_by_key)
+        # Atomically claim new misses. Concurrent requests for the same key get
+        # a CacheMiss with should_compute=False and wait for this shared work.
         cache_results = self.mm_preprocess_cache.lookup_or_claim_many(
             unique_keys,
             predicate=lambda key, artifact: self.artifact_usable(
@@ -304,8 +362,8 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
                 allow_featureless=featureless_hit_mask[first_index_by_key[key]],
             ),
         )
-        resolved_by_key: dict[str, ArtifactT] = {}
-        misses_to_compute: list[CacheMiss[str, ArtifactT]] = []
+        resolved_by_key: dict[str, MediaArtifact] = {}
+        misses_to_compute: list[CacheMiss[str, MediaArtifact]] = []
         for key, result in zip(unique_keys, cache_results):
             if isinstance(result, CacheLookup):
                 resolved_by_key[key] = result.value
@@ -326,12 +384,15 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
             # Shared work outlives cancellation of the request doing the work.
             await asyncio.shield(miss_task)
 
+        # Requests that lost the single-flight race reuse the first request's
+        # artifact instead of decoding and preprocessing the media again.
         for key, result in zip(unique_keys, cache_results):
             if isinstance(result, CacheMiss) and not result.should_compute:
                 resolved_by_key[key] = await self.mm_preprocess_cache.wait_for_miss(
                     result
                 )
 
+        # Expand the per-key results back to the caller's original media order.
         for index, artifact in enumerate(artifacts):
             if artifact is None:
                 key = keys[index]
@@ -339,18 +400,23 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
                 artifacts[index] = resolved_by_key[key]
         if any(artifact is None for artifact in artifacts):
             raise RuntimeError("Artifact cache did not resolve every media item")
-        return cast(list[ArtifactT], artifacts)
+        return [artifact for artifact in artifacts if artifact is not None]
 
     async def _compute_cache_misses(
         self,
-        misses_to_compute: Sequence[CacheMiss[str, ArtifactT]],
+        misses_to_compute: Sequence[CacheMiss[str, MediaArtifact]],
         first_index_by_key: Mapping[str, int],
         snapshots: Sequence[Optional[MediaSnapshot]],
-        previous_metadata: Mapping[str, ArtifactT],
-        resolved_by_key: dict[str, ArtifactT],
+        previous_metadata: Mapping[str, MediaArtifact],
+        resolved_by_key: dict[str, MediaArtifact],
         modality: Modality,
     ) -> None:
-        """Preprocess misses claimed by this request and publish their results."""
+        """Decode and preprocess claimed misses, then wake concurrent waiters.
+
+        The full artifact is returned to requests waiting on the miss. A
+        possibly smaller ``artifact.cache_value()`` is retained in the bounded
+        CPU cache. The two values differ when a CUDA feature must not be cached.
+        """
         try:
             miss_entries = []
             for miss in misses_to_compute:
@@ -391,6 +457,8 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
                     )
                 cache_value = artifact.cache_value()
                 self.validate_artifact(cache_value, entry)
+                # Wake waiters with the full result, but retain only the
+                # cache-safe representation for future requests.
                 self.mm_preprocess_cache.complete_miss(
                     miss,
                     artifact,

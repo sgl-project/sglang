@@ -1,4 +1,9 @@
-"""Bounded CPU cache and single-flight coordination for MM preprocessing."""
+"""Bounded CPU storage and single-flight coordination for MM preprocessing.
+
+Model processors store prompt-independent ``MediaArtifact`` values here. This
+module knows nothing about a model or media format: it provides byte-accounted
+LRU storage and ensures concurrent misses for one key share one computation.
+"""
 
 from __future__ import annotations
 
@@ -31,6 +36,8 @@ _USE_RESULT = object()
 
 @dataclass(frozen=True)
 class CacheLookup(Generic[V]):
+    """A resolved value returned immediately or after shared computation."""
+
     value: V
     hit: bool
     joined: bool = False
@@ -38,7 +45,11 @@ class CacheLookup(Generic[V]):
 
 @dataclass(frozen=True)
 class CacheMiss(Generic[K, V]):
-    """One in-flight miss; one caller computes it while other callers wait."""
+    """Handle for one in-flight cache miss.
+
+    Exactly one handle has ``should_compute=True`` and must publish the result.
+    Other handles for the same key wait on the shared ``future``.
+    """
 
     key: K
     future: concurrent.futures.Future[V]
@@ -108,7 +119,13 @@ def estimate_cache_size_bytes(value: Any) -> Optional[int]:
 
 
 class MultimodalPreprocessCache(Generic[K, V]):
-    """Thread-safe byte-accounted LRU with per-key async single-flight."""
+    """Thread-safe CPU LRU with per-key async single-flight.
+
+    ``max_size_bytes`` and ``max_entries`` bound retained values. In-flight
+    computations are tracked separately and are not part of the LRU budget.
+    ``clear()`` invalidates cache writes from old computations so a flush cannot
+    be undone by work that started before it.
+    """
 
     def __init__(self, max_size_bytes: int, max_entries: int = 8192):
         if max_size_bytes < 0:
@@ -130,6 +147,7 @@ class MultimodalPreprocessCache(Generic[K, V]):
 
     @property
     def enabled(self) -> bool:
+        """Whether values can be retained; zero bytes is the cache kill switch."""
         return self.max_size_bytes > 0
 
     def __len__(self) -> int:
@@ -141,6 +159,7 @@ class MultimodalPreprocessCache(Generic[K, V]):
             return key in self._entries
 
     def get(self, key: K) -> Optional[V]:
+        """Read and touch an LRU entry, recording a hit or miss."""
         with self._lock:
             entry = self._entries.get(key)
             if entry is None:
@@ -157,7 +176,11 @@ class MultimodalPreprocessCache(Generic[K, V]):
         *,
         evict_on_reject: bool = False,
     ) -> Optional[V]:
-        """Atomically use a compatible entry without counting an absent miss."""
+        """Use a compatible entry without recording an absent speculative miss.
+
+        The predicate runs while holding the cache lock, so a caller cannot use
+        an entry that another thread replaces between validation and lookup.
+        """
         with self._lock:
             entry = self._entries.get(key)
             if entry is None:
@@ -179,6 +202,12 @@ class MultimodalPreprocessCache(Generic[K, V]):
         *,
         _generation: Optional[int] = None,
     ) -> bool:
+        """Insert a value if it is CPU-sizeable and fits the configured budget.
+
+        With automatic sizing, returns ``False`` when caching is disabled, the
+        value contains a GPU tensor, the value is too large, or its generation
+        predates ``clear()``.
+        """
         if not self.enabled:
             return False
         if size_bytes is None:
@@ -187,6 +216,8 @@ class MultimodalPreprocessCache(Generic[K, V]):
             return False
 
         with self._lock:
+            # A pre-flush computation may finish, but it must not repopulate the
+            # new cache generation.
             if _generation is not None and _generation != self._generation:
                 return False
             old = self._entries.pop(key, None)
@@ -204,6 +235,7 @@ class MultimodalPreprocessCache(Generic[K, V]):
             return True
 
     def pop(self, key: K) -> Optional[V]:
+        """Remove and return one entry without changing hit/miss counters."""
         with self._lock:
             entry = self._entries.pop(key, None)
             if entry is None:
@@ -212,6 +244,7 @@ class MultimodalPreprocessCache(Generic[K, V]):
             return entry.value
 
     def clear(self) -> None:
+        """Drop values and prevent older in-flight work from repopulating them."""
         with self._lock:
             self._entries.clear()
             self.current_size_bytes = 0
@@ -226,6 +259,11 @@ class MultimodalPreprocessCache(Generic[K, V]):
         *,
         size_bytes: Optional[Callable[[V], Optional[int]]] = None,
     ) -> CacheLookup[V]:
+        """Return a cached value or share one async computation for ``key``.
+
+        Cancellation affects only the caller that is awaiting the result. The
+        shared computation remains alive for other callers.
+        """
         if not self.enabled:
             return CacheLookup(await compute(), hit=False)
 
@@ -247,7 +285,7 @@ class MultimodalPreprocessCache(Generic[K, V]):
 
         if should_compute:
             self.create_background_task(
-                self._compute_owned_value(
+                self._compute_shared_value(
                     key, future, generation, compute, size_bytes=size_bytes
                 )
             )
@@ -257,7 +295,7 @@ class MultimodalPreprocessCache(Generic[K, V]):
         value = await asyncio.shield(asyncio.wrap_future(future))
         return CacheLookup(value, hit=False, joined=not should_compute)
 
-    async def _compute_owned_value(
+    async def _compute_shared_value(
         self,
         key: K,
         future: concurrent.futures.Future[V],
@@ -266,6 +304,7 @@ class MultimodalPreprocessCache(Generic[K, V]):
         *,
         size_bytes: Optional[Callable[[V], Optional[int]]],
     ) -> None:
+        """Compute once, cache the result, and wake every caller for this key."""
         try:
             value = await compute()
             measured = size_bytes(value) if size_bytes is not None else None
@@ -303,7 +342,12 @@ class MultimodalPreprocessCache(Generic[K, V]):
         *,
         predicate: Optional[Callable[[K, V], bool]] = None,
     ) -> list[CacheLookup[V] | CacheMiss[K, V]]:
-        """Return cache hits and single-flight misses for the requested keys."""
+        """Return hits and single-flight miss handles in input-key order.
+
+        For each missing key, one result has ``should_compute=True``. Repeated
+        keys or concurrent callers receive handles with ``should_compute=False``
+        and should call ``wait_for_miss`` instead of recomputing the value.
+        """
         results: list[CacheLookup[V] | CacheMiss[K, V]] = []
         with self._lock:
             for key in keys:
@@ -351,6 +395,11 @@ class MultimodalPreprocessCache(Generic[K, V]):
         cache_value: V | object = _USE_RESULT,
         size_bytes: Optional[int] = None,
     ) -> None:
+        """Publish a computed miss to waiters and optionally retain a copy.
+
+        ``value`` is returned to current waiters. ``cache_value`` may be a
+        smaller representation retained for future requests.
+        """
         if not miss.should_compute:
             raise ValueError("Only the caller computing a cache miss can complete it")
         self.put(
@@ -368,6 +417,7 @@ class MultimodalPreprocessCache(Generic[K, V]):
                 self._inflight.pop(miss.key, None)
 
     def fail_miss(self, miss: CacheMiss[K, V], error: BaseException) -> None:
+        """Publish a computation failure to every waiter for this miss."""
         if not miss.should_compute:
             raise ValueError("Only the caller computing a cache miss can fail it")
         miss.future.set_exception(error)
@@ -380,9 +430,11 @@ class MultimodalPreprocessCache(Generic[K, V]):
                 self._inflight.pop(miss.key, None)
 
     async def wait_for_miss(self, miss: CacheMiss[K, V]) -> V:
+        """Wait for another caller's computation without cancelling it."""
         return await asyncio.shield(asyncio.wrap_future(miss.future))
 
     def stats(self) -> dict[str, int]:
+        """Return a lock-consistent snapshot of cache and single-flight state."""
         with self._lock:
             return {
                 "entries": len(self._entries),

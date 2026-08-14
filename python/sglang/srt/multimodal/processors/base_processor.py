@@ -198,6 +198,8 @@ class BaseMultimodalProcessor(ABC):
     preserve_processor_input_ids = False
     auto_mm_processor_worker_num = 1
     auto_mm_io_worker_num = 4
+    # Models opt in by assigning a non-zero default. A user-provided server
+    # argument overrides this value; zero disables storage and cache-key work.
     auto_mm_preprocess_cache_size_mb = 0
     supports_mm_processor_concurrency = False
 
@@ -229,6 +231,9 @@ class BaseMultimodalProcessor(ABC):
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
 
+        # Each tokenizer worker is a separate process with its own CPU cache.
+        # Split the requested service-wide budget so increasing worker count
+        # does not silently multiply host-memory usage.
         requested_cache_mb = self.server_args.mm_preprocess_cache_size_mb
         total_cache_mb = (
             self.auto_mm_preprocess_cache_size_mb
@@ -242,6 +247,8 @@ class BaseMultimodalProcessor(ABC):
             max_entries=8192,
         )
         self.trust_mm_content_hashes = bool(self.server_args.trust_mm_content_hashes)
+        # The fingerprint is needed only to build artifact keys. Avoid inspecting
+        # processor state when this processor will never retain artifacts.
         self.processor_fingerprint = (
             build_processor_fingerprint(self, hf_config, server_args)
             if self.mm_preprocess_cache.enabled
@@ -412,10 +419,17 @@ class BaseMultimodalProcessor(ABC):
 
     @property
     def keep_mm_features_on_device(self) -> bool:
+        """Whether feature transport expects processor outputs to stay on GPU."""
         return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm")
 
     def preprocess_fingerprint_payload(self) -> dict[str, Any]:
-        """Stable processor choices that may change per-media artifacts."""
+        """Return every stable setting that can change a media artifact.
+
+        The payload is hashed once at startup and becomes part of every
+        artifact key. Model processors must extend this method when they add an
+        output-affecting option. The wrapped HF processor can expose its own
+        typed payload through ``PreprocessFingerprintProvider``.
+        """
         wrapped_processor = (
             self._processor.preprocess_fingerprint_payload()
             if isinstance(self._processor, PreprocessFingerprintProvider)
@@ -436,10 +450,15 @@ class BaseMultimodalProcessor(ABC):
         }
 
     def clear_preprocess_cache(self) -> None:
+        """Drop artifacts and reject cache writes from pre-flush work.
+
+        Active requests continue and still receive their preprocessing result;
+        they simply cannot repopulate the freshly cleared cache.
+        """
         self.mm_preprocess_cache.clear()
 
     def shutdown(self) -> None:
-        """Release executor resources and cached CPU artifacts."""
+        """Drop cached artifacts and stop every processor-side executor."""
         self.clear_preprocess_cache()
         self.io_executor.shutdown(wait=False, cancel_futures=True)
         self.cpu_executor.shutdown(wait=False, cancel_futures=True)

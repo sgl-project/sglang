@@ -45,7 +45,7 @@ class _FutureMediaInput:
     frame_sampling: int = 2
 
 
-class _Processor(MediaArtifactCacheMixin[_Artifact]):
+class _Processor(MediaArtifactCacheMixin):
     artifact_modality = Modality.IMAGE
     artifact_option_defaults = {"detail": "auto", "frame_sampling": 2}
 

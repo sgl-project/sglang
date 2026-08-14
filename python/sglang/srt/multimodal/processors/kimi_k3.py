@@ -365,7 +365,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
 
 class KimiK3ImageProcessor(
     KimiGridMMDataMixin,
-    MediaArtifactCacheMixin[KimiK3ImagePreprocessArtifact],
+    MediaArtifactCacheMixin,
     SGLangBaseProcessor,
 ):
     models = [KimiK3ForConditionalGeneration]
@@ -502,6 +502,7 @@ class KimiK3ImageProcessor(
         feature: torch.Tensor,
         deferred: Optional[KimiK3DeferredPreprocessing] = None,
     ) -> KimiK3ImagePreprocessArtifact:
+        """Freeze one image's prompt-independent preprocessing result."""
         feature_hash = resolve_multimodal_item_hash(
             feature=feature, namespace=artifact_key
         )
@@ -524,7 +525,7 @@ class KimiK3ImageProcessor(
         *,
         processor=None,
     ) -> list[KimiK3ImagePreprocessArtifact]:
-        """Process cache misses as one batch while preserving image order."""
+        """Preprocess cache-miss images into reusable per-image artifacts."""
         processor = processor or self._processor
         artifacts: list[Optional[KimiK3ImagePreprocessArtifact]] = [None] * len(entries)
         eager_indices = []
@@ -592,6 +593,7 @@ class KimiK3ImageProcessor(
         input_text,
         artifacts: list[KimiK3ImagePreprocessArtifact],
     ) -> MultimodalProcessorOutput:
+        """Combine reusable artifacts with this prompt's tokens and offsets."""
         original_ids = (
             input_text
             if isinstance(input_text, (list, torch.Tensor))
