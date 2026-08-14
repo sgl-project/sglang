@@ -130,6 +130,75 @@ class TestModelSlimMXFP4MoE(CustomTestCase):
             method.process_weights_after_loading(layer)
         self.assertNotIn("mlaprolog_weight_scale_source", vars(layer))
 
+    def test_mxfp8_linear_consumes_mlaprolog_prequantized_tuple(self):
+        layer = SimpleNamespace(
+            weight=torch.zeros((64, 8), dtype=torch.float8_e4m3fn),
+            weight_scale_inv=torch.zeros((1, 8, 2), dtype=torch.uint8),
+            bias=None,
+            bias_fp32=None,
+        )
+        qx = torch.zeros((2, 64), dtype=torch.float8_e4m3fn)
+        flat_scale = torch.arange(4, dtype=torch.uint8)
+        expected_output = torch.zeros((2, 8), dtype=torch.bfloat16)
+
+        with (
+            patch(
+                "sglang.srt.hardware_backend.npu.quantization.linear_method_npu."
+                "_get_float8_e8m0fnu_dtype",
+                return_value=torch.uint8,
+            ),
+            patch.object(
+                torch.ops.npu, "npu_dynamic_mx_quant", create=True
+            ) as dynamic_quant,
+            patch.object(
+                torch.ops.npu,
+                "npu_quant_matmul",
+                return_value=expected_output,
+                create=True,
+            ) as quant_matmul,
+        ):
+            output = NPUMXFP8LinearMethod().apply(layer, (qx, flat_scale))
+
+        dynamic_quant.assert_not_called()
+        torch.testing.assert_close(output, expected_output)
+        torch.testing.assert_close(
+            quant_matmul.call_args.kwargs["pertoken_scale"],
+            flat_scale.reshape(2, 1, 2),
+        )
+        self.assertEqual(
+            quant_matmul.call_args.kwargs["pertoken_scale_dtype"], torch.uint8
+        )
+
+    def test_mxfp8_linear_rejects_invalid_prequantized_tuple(self):
+        layer = SimpleNamespace(
+            weight=torch.zeros((64, 8), dtype=torch.float8_e4m3fn),
+            weight_scale_inv=torch.zeros((1, 8, 2), dtype=torch.uint8),
+            bias=None,
+            bias_fp32=None,
+        )
+        method = NPUMXFP8LinearMethod()
+        with patch(
+            "sglang.srt.hardware_backend.npu.quantization.linear_method_npu."
+            "_get_float8_e8m0fnu_dtype",
+            return_value=torch.uint8,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "must use torch.float8"):
+                method.apply(
+                    layer,
+                    (
+                        torch.zeros((2, 64), dtype=torch.bfloat16),
+                        torch.zeros(4, dtype=torch.uint8),
+                    ),
+                )
+            with self.assertRaisesRegex(RuntimeError, "scale shape"):
+                method.apply(
+                    layer,
+                    (
+                        torch.zeros((2, 64), dtype=torch.float8_e4m3fn),
+                        torch.zeros(3, dtype=torch.uint8),
+                    ),
+                )
+
     def test_checkpoint_shapes_are_derived_per_projection(self):
         self.assertEqual(
             _mxfp4_moe_weight_shapes("w13", 4, 128, 256),
