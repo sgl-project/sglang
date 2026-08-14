@@ -1009,7 +1009,11 @@ def build_kv_layer_ids(
     if not isinstance(token_to_kv_pool, HybridLinearKVPool):
         return []
     layer_ids = token_to_kv_pool.get_kv_layer_ids()
-    if draft_token_to_kv_pool is None:
+    if not layer_ids or draft_token_to_kv_pool is None:
+        # A whole-envelope pool (e.g. UnifiedHybridLinearKVPool) reports no
+        # per-layer ids; appending only the draft band would under-cover
+        # kv_data_ptrs and be rejected downstream, so stay on positional
+        # pairing entirely.
         return layer_ids
 
     draft_ids = _draft_entry_layer_ids(

@@ -194,7 +194,7 @@ class KVArgsRegisterInfo:
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
             ),
             dst_slot_layer_ids=(
-                list(struct.unpack(f"{len(msg[18]) // 8}Q", msg[18]))
+                list(struct.unpack(f"{len(msg[18]) // 4}I", msg[18]))
                 if len(msg) > 18 and msg[18] != b""
                 else []
             ),
@@ -2474,7 +2474,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 staging_total_size_str = b""
             staging_slots = getattr(self.kv_mgr, "kv_buffer_tensors", None) or {}
             packed_staging_slot_layer_ids = b"".join(
-                struct.pack("Q", layer_id)
+                struct.pack("I", layer_id)
                 for layer_id in (staging_slots.get("slot_layer_ids") or [])
             )
 

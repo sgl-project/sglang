@@ -1024,7 +1024,11 @@ class SchedulerPPMixin:
         # output: process_batch_result_disagg_prefill reads it off the relayed
         # result to fill the PD aux buffers.
         draft_input = result.next_draft_input
-        if draft_input is not None and draft_input.topk_p is not None:
+        if (
+            draft_input is not None
+            and draft_input.topk_p is not None
+            and draft_input.hidden_states is not None
+        ):
             tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
             tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
             tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
