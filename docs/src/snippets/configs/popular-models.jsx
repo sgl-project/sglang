@@ -13,6 +13,23 @@
 
 export const popularModels = [
   {
+    name: "Qwen3.8-27B",
+    vendor: "Qwen",
+    href: "/cookbook/autoregressive/Qwen/Qwen3.8-27B",
+    logo: "/cards/logos/qwen.png",
+    badge: "New",
+    tags: ["4 platforms", "Hybrid GDN", "BF16 / FP8 / NVFP4"],
+    hero: {
+      eyebrow: "Featured model \u00b7 New",
+      headline: "Meet Qwen3.8-27B on SGLang",
+      blurb:
+        "A dense hybrid Gated Delta Networks model \u2014 48 GDN linear-attention layers interleaved with 16 full-attention, an in-checkpoint MTP head, and a native 262,144-token context. The cookbook covers single-GPU serving on H200 and RTX PRO 6000 / 5090.",
+      tags: ["Dense 27B", "262K context", "Single-GPU"],
+      cta: "Open the Qwen3.8-27B cookbook",
+      caption: "Qwen3.8-27B deployment guide",
+    },
+  },
+  {
     name: "Kimi-K3",
     vendor: "Moonshot AI",
     href: "/cookbook/autoregressive/Moonshotai/Kimi-K3",
