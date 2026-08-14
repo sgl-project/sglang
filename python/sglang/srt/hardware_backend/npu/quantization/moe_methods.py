@@ -75,6 +75,17 @@ def _require_fp4_dtype():
     return fp4_dtype
 
 
+def _require_fp4_tensor_dtype():
+    """Return the torch dtype carried by an already-quantized FP4 tensor."""
+    fp4_tensor_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_tensor_dtype is None:
+        raise RuntimeError(
+            "torch.float4_e2m1fn_x2 is required for pre-quantized MXFP4 "
+            "DeepEP payloads on Ascend A5."
+        )
+    return fp4_tensor_dtype
+
+
 def _pack_mxfp_weight_scale(scale: torch.Tensor) -> torch.Tensor:
     """Convert checkpoint ``[E, N, K/32]`` scales to ``[E, K/64, N, 2]``."""
     if scale.ndim != 3:
@@ -897,6 +908,18 @@ class _NPUPackedMXFP4MoEMethod(_NPUMoEMethodBase):
         input_scale: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if input_scale is not None:
+            expected_dtype = (
+                _require_fp4_tensor_dtype()
+                if self.activation_is_fp4
+                else torch.float8_e4m3fn
+            )
+            if hidden_states.dtype != expected_dtype:
+                raise RuntimeError(
+                    "Pre-quantized MXFP MoE payload dtype does not match the "
+                    f"kernel contract: expected {expected_dtype}, got "
+                    f"{hidden_states.dtype}. Check the explicit DeepEP "
+                    "dispatcher output dtype override."
+                )
             return hidden_states, _normalize_mxfp_input_scale(input_scale)
         if hidden_states.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(

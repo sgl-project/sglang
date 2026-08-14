@@ -13,6 +13,7 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A4MXFP4MoEMethod,
+    NPUW4A8MXFPMoEMethod,
     _normalize_mxfp_input_scale,
     _pack_mxfp_weight_scale,
 )
@@ -246,6 +247,35 @@ class TestModelSlimMXFP4MoE(CustomTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "unit-scale fallback"):
             kernel._weight_scale(quant_info, "w13")
+
+    def test_prequantized_payload_dtype_must_match_mxfp_kernel(self):
+        input_scale = torch.zeros((2, 2), dtype=torch.uint8)
+        with patch.object(torch, "float4_e2m1fn_x2", torch.uint8, create=True):
+            fp4_payload = torch.zeros((2, 2), dtype=torch.uint8)
+            actual_payload, actual_scale = NPUW4A4MXFP4MoEMethod("w13")._quantize_input(
+                fp4_payload, input_scale
+            )
+            self.assertIs(actual_payload, fp4_payload)
+            self.assertEqual(actual_scale.shape, (2, 1, 2))
+
+            with self.assertRaisesRegex(RuntimeError, "payload dtype"):
+                NPUW4A4MXFP4MoEMethod("w13")._quantize_input(
+                    torch.zeros((2, 4), dtype=torch.float8_e4m3fn),
+                    input_scale,
+                )
+
+        with self.assertRaisesRegex(RuntimeError, "payload dtype"):
+            NPUW4A8MXFPMoEMethod("w13")._quantize_input(
+                torch.zeros((2, 4), dtype=torch.uint8),
+                input_scale,
+            )
+
+        fp8_payload = torch.zeros((2, 4), dtype=torch.float8_e4m3fn)
+        actual_payload, actual_scale = NPUW4A8MXFPMoEMethod("w13")._quantize_input(
+            fp8_payload, input_scale
+        )
+        self.assertIs(actual_payload, fp8_payload)
+        self.assertEqual(actual_scale.shape, (2, 1, 2))
 
 
 class TestModelSlimKVScales(CustomTestCase):

@@ -71,9 +71,7 @@ def _draft_replay_pack_fused_kernel(
                 mask = current < topk
                 tl.store(
                     dst_topk_p_ptr + topk_base + current,
-                    tl.load(
-                        src_topk_p_ptr + topk_base + current, mask=mask, other=0.0
-                    ),
+                    tl.load(src_topk_p_ptr + topk_base + current, mask=mask, other=0.0),
                     mask=mask,
                 )
                 tl.store(

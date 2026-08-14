@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_npu_memory_capacity, is_npu
+from sglang.srt.utils import get_npu_memory_capacity, is_npu, is_npu_atlas_a5
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -18,12 +18,18 @@ indexer_weight_stream = None
 gva_is_inited = False
 
 
-@functools.lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=None)
+def _is_ascend_a5_device(device_id: int) -> bool:
+    """Cache only after torch_npu reports an available, stable device."""
+    return is_npu_atlas_a5(device_id)
+
+
 def is_ascend_a5() -> bool:
-    """Return whether the active device is an Ascend A5 (Ascend 950 series)."""
-    if not _is_npu:
+    """Return whether the active device is an Atlas A5 without early caching."""
+    npu_module = vars(torch).get("npu")
+    if npu_module is None or not npu_module.is_available():
         return False
-    return torch.npu.get_device_name(torch.npu.current_device()).startswith("Ascend950")
+    return _is_ascend_a5_device(npu_module.current_device())
 
 
 class NPUACLFormat(IntEnum):

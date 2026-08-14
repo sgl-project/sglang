@@ -587,9 +587,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             copy_dsts.extend(
                 [
                     buffers.seq_lens[:raw_bs],
-                    buffers.out_cache_loc[
-                        : raw_num_token * self.speculative_num_steps
-                    ],
+                    buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
                     buffers.positions[:raw_num_token],
                     buffers.topk_p[:raw_bs],
                     buffers.topk_index[:raw_bs],

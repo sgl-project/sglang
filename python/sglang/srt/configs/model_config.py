@@ -258,6 +258,17 @@ def can_use_npu_quant_lightning_indexer(
     device_id: int = 0,
 ) -> bool:
     """Whether the A5 quantized Indexer and its scale cache are usable."""
+    if (
+        is_deepseek_dsa(config)
+        and kv_cache_dtype == torch.float8_e4m3fn
+        and server_args.enable_hierarchical_cache
+    ):
+        raise ValueError(
+            "Ascend DSA with an FP8 KV cache does not support hierarchical "
+            "cache yet: HiCache does not transfer the Indexer FP32 scale "
+            "buffer required by npu_quant_lightning_indexer. Use BF16 KV "
+            "cache or disable hierarchical cache."
+        )
     return (
         is_deepseek_dsa(config)
         and _hf_attr(config, "index_head_dim") == 128

@@ -2,7 +2,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.configs.model_config import resolve_dsa_indexer_layer_ids
+import torch
+
+from sglang.srt.configs.model_config import (
+    can_use_npu_quant_lightning_indexer,
+    resolve_dsa_indexer_layer_ids,
+)
+from sglang.srt.hardware_backend.npu import utils as npu_utils
 from sglang.srt.utils import common
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -76,6 +82,37 @@ class TestAtlasA5Detection(CustomTestCase):
             self.assertFalse(common.is_npu_atlas_a5())
         with patch.object(common, "torch", available_torch):
             self.assertTrue(common.is_npu_atlas_a5())
+
+    def test_npu_backend_helper_uses_canonical_active_device_probe(self):
+        unavailable_torch = SimpleNamespace()
+        active_npu = SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 7,
+        )
+        npu_utils._is_ascend_a5_device.cache_clear()
+        try:
+            with patch.object(npu_utils, "torch", unavailable_torch):
+                self.assertFalse(npu_utils.is_ascend_a5())
+            with (
+                patch.object(npu_utils, "torch", SimpleNamespace(npu=active_npu)),
+                patch.object(npu_utils, "is_npu_atlas_a5", return_value=True) as probe,
+            ):
+                self.assertTrue(npu_utils.is_ascend_a5())
+                self.assertTrue(npu_utils.is_ascend_a5())
+            probe.assert_called_once_with(7)
+        finally:
+            npu_utils._is_ascend_a5_device.cache_clear()
+
+    def test_fp8_dsa_hicache_is_rejected_before_pool_allocation(self):
+        server_args = SimpleNamespace(enable_hierarchical_cache=True)
+        config = _glm_dsa_config(index_head_dim=128)
+
+        with self.assertRaisesRegex(ValueError, "does not support hierarchical"):
+            can_use_npu_quant_lightning_indexer(
+                server_args,
+                config,
+                torch.float8_e4m3fn,
+            )
 
 
 if __name__ == "__main__":

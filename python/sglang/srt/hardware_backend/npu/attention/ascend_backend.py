@@ -115,6 +115,26 @@ def _create_mla_decode_head_padding(
     return nope_padding, rope_padding, scale_padding
 
 
+def _split_mha_prefix_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    *,
+    nope_head_dim: int,
+    rope_head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split the full Q/K tensors produced by the NPU MHA prepare path."""
+
+    expected_width = nope_head_dim + rope_head_dim
+    if q.shape[-1] != expected_width or k.shape[-1] != expected_width:
+        raise ValueError(
+            "NPU MHA prefix attention expects Q/K with concatenated NoPE and "
+            f"RoPE widths ({expected_width}), got {q.shape[-1]} and {k.shape[-1]}."
+        )
+    q_nope, q_rope = q.split([nope_head_dim, rope_head_dim], dim=-1)
+    k_nope, k_rope = k.split([nope_head_dim, rope_head_dim], dim=-1)
+    return q_nope, q_rope, k_nope, k_rope
+
+
 @dataclass
 class ForwardMetadata:
 
@@ -535,13 +555,11 @@ class AscendAttnBackend(AttentionBackend):
         num_token_padding = q.shape[0]
         num_real_tokens = forward_batch.num_token_non_padded_cpu
         q, k, v = (tensor[:num_real_tokens] for tensor in (q, k, v))
-        q_nope, q_rope = q.split(
-            [layer.v_head_dim, self.qk_rope_head_dim],
-            dim=-1,
-        )
-        k_nope, k_rope = k.split(
-            [layer.v_head_dim, self.qk_rope_head_dim],
-            dim=-1,
+        q_nope, q_rope, k_nope, k_rope = _split_mha_prefix_qk(
+            q,
+            k,
+            nope_head_dim=layer.v_head_dim,
+            rope_head_dim=self.qk_rope_head_dim,
         )
         num_tokens = q_nope.shape[0]
         actual_seq_lengths = np.cumsum(forward_batch.extend_seq_lens_cpu).tolist()
@@ -585,15 +603,18 @@ class AscendAttnBackend(AttentionBackend):
             dim=-1,
         )
         prefix_k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
-        common_kwargs["key_rope"] = prefix_k_rope
-        common_kwargs["actual_seq_lengths_kv"] = np.cumsum(
+        prefix_kwargs = common_kwargs.copy()
+        prefix_kwargs["key_rope"] = prefix_k_rope
+        prefix_kwargs["actual_seq_lengths_kv"] = np.cumsum(
             self.forward_metadata.prefix_lens.tolist()
         ).tolist()
+        prefix_kwargs["atten_mask"] = None
+        prefix_kwargs["sparse_mode"] = 0
         prefix_output, prefix_lse = torch_npu.npu_fused_infer_attention_score(
             q_nope,
             prefix_k_nope,
             prefix_v,
-            **common_kwargs,
+            **prefix_kwargs,
         )
 
         merged_output, _ = torch_npu.npu_attention_update(
@@ -2077,11 +2098,11 @@ class AscendAttnBackend(AttentionBackend):
                 q, k, v = [
                     data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
                 ]
-                q_nope, q_rope = q.split(
-                    [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
-                )
-                k_nope, k_rope = k.split(
-                    [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+                q_nope, q_rope, k_nope, k_rope = _split_mha_prefix_qk(
+                    q,
+                    k,
+                    nope_head_dim=layer.v_head_dim,
+                    rope_head_dim=self.qk_rope_head_dim,
                 )
 
                 # 1st, compute extend tokens to get attn_output and attn_lse

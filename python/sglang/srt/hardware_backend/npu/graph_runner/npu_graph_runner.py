@@ -112,7 +112,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         architectures = (
-            getattr(model_runner.model_config.hf_config, "architectures", None) or []
+            vars(model_runner.model_config.hf_config).get("architectures") or []
         )
         self.if_use_v2 = any(
             arch

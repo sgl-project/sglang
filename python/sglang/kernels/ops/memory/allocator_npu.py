@@ -48,9 +48,9 @@ def alloc_extend_npu_kernel(
     new_page_start = tl.sum(num_new_pages) - num_pages_for_row
 
     last_loc = tl.load(last_loc_ptr + pid).to(tl.int64)
-    num_part1 = min(
-        seq_len, (prefix_len + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
-    ) - prefix_len
+    num_part1 = (
+        min(seq_len, (prefix_len + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE) - prefix_len
+    )
     page_offsets = tl.arange(0, PAGE_SIZE)
     tl.store(
         out_indices + output_start + page_offsets,
@@ -60,9 +60,10 @@ def alloc_extend_npu_kernel(
     if prefix_len + num_part1 == seq_len:
         return
 
-    num_part2 = seq_len // PAGE_SIZE * PAGE_SIZE - (
-        prefix_len + PAGE_SIZE - 1
-    ) // PAGE_SIZE * PAGE_SIZE
+    num_part2 = (
+        seq_len // PAGE_SIZE * PAGE_SIZE
+        - (prefix_len + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
+    )
     block_offsets = tl.arange(0, BLOCK_SIZE)
     for block_idx in range(tl.cdiv(max_num_extend_tokens, BLOCK_SIZE)):
         current = block_offsets + block_idx * BLOCK_SIZE

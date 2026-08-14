@@ -1935,6 +1935,7 @@ class DeepseekV2AttentionMLA(
         self.w_scale = 1.0
         self.kv_quant_method = None
         self._init_kv_quant_weights(quant_config, prefix)
+        self._init_direct_fp8_kv_scale_buffers()
 
         # Full-head Q/absorb weights for --dcp-replicate-q-proj, gathered once
         # pre-CUDA-graph-capture by the model runner; None unless replicate is on.
@@ -1986,6 +1987,18 @@ class DeepseekV2AttentionMLA(
             num_heads=self.num_local_heads,
             num_kv_heads=1,
         )
+
+    def _init_direct_fp8_kv_scale_buffers(self) -> None:
+        """Pre-register generic FP8 unit scales before graph capture starts."""
+
+        if self.kv_cache_dtype != "fp8_e4m3" or self.kv_quant_method is not None:
+            return
+        for attr_name in ("fak_descale_float", "fak_descale_reciprocal"):
+            self.register_buffer(
+                f"_{attr_name}_direct_fp8_fallback",
+                torch.ones((1, 1), dtype=torch.float32),
+                persistent=False,
+            )
 
     def refresh_fa_k_scale_params(self) -> None:
         if self.kv_quant_method is not None:

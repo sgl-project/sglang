@@ -5,6 +5,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.speculative.npu_reference import (
+    build_full_tree_mask_reference,
     build_retrieval_links_reference,
     read_cache_locations_reference,
 )
@@ -22,6 +23,28 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestNpuA5SpecContracts(CustomTestCase):
+    def test_full_tree_mask_starts_after_prefix_columns(self):
+        tree_mask, positions = build_full_tree_mask_reference(
+            parent_list=torch.tensor([[0, 0]]),
+            selected_index=torch.tensor([[0, 1, 2]]),
+            verified_seq_len=torch.tensor([3]),
+            topk=2,
+            draft_token_num=4,
+        )
+        rows = tree_mask.view(4, 7)
+
+        self.assertTrue(torch.all(rows[:, :3]))
+        self.assertEqual(
+            rows[:, 3:].tolist(),
+            [
+                [True, False, False, False],
+                [True, True, False, False],
+                [True, False, True, False],
+                [True, True, False, True],
+            ],
+        )
+        self.assertEqual(positions.tolist(), [3, 4, 4, 5])
+
     def test_cache_location_reference_has_no_max_step(self):
         token_pool = torch.arange(3 * 512, dtype=torch.long).view(3, 512)
         req_pool_indices = torch.tensor([1, 0])

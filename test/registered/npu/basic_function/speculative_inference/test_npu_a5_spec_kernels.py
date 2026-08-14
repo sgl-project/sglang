@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.cache_locs_npu import (
     read_cache_locations_npu,
 )
 from sglang.kernels.ops.speculative.npu_reference import (
+    build_full_tree_mask_reference,
     build_retrieval_links_reference,
     read_cache_locations_reference,
 )
@@ -52,7 +53,7 @@ class TestNpuA5SpecKernels(CustomTestCase):
         selected_index = torch.tensor([[0, 1, 2]], device="npu")
         seq_lens = torch.tensor([5], device="npu", dtype=torch.long)
         draft_token_num = 4
-        tree_mask = torch.empty(
+        tree_mask = torch.ones(
             (int(seq_lens.sum()) * draft_token_num + draft_token_num**2,),
             device="npu",
             dtype=torch.bool,
@@ -83,6 +84,16 @@ class TestNpuA5SpecKernels(CustomTestCase):
 
         for actual, reference in zip(retrieve_buf, expected):
             self.assertTrue(torch.equal(actual.cpu(), reference.cpu()))
+
+        expected_mask, expected_positions = build_full_tree_mask_reference(
+            parent_list=parent_list,
+            selected_index=selected_index,
+            verified_seq_len=seq_lens,
+            topk=2,
+            draft_token_num=draft_token_num,
+        )
+        self.assertTrue(torch.equal(tree_mask.cpu(), expected_mask.cpu()))
+        self.assertTrue(torch.equal(positions.cpu(), expected_positions.cpu()))
 
     def test_batch_matmul_transpose_matches_torch(self):
         lhs = torch.randn((2, 3, 64), device="npu", dtype=torch.bfloat16)

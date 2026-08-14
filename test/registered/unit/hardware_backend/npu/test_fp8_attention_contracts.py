@@ -54,20 +54,6 @@ class TestAscendFP8AttentionContracts(CustomTestCase):
         self.assertEqual(normalized.dtype, torch.float32)
         self.assertEqual(normalized.item(), 0.5)
 
-    def test_runtime_scale_rejects_non_finite_or_non_positive_values(self):
-        for scale in (
-            torch.tensor([torch.nan]),
-            torch.tensor([torch.inf]),
-            torch.tensor([0.0]),
-            torch.tensor([-1.0]),
-        ):
-            with self.assertRaises((RuntimeError, ValueError)):
-                normalize_required_fp8_scale(
-                    scale,
-                    name="fak_descale_float",
-                    device=torch.device("cpu"),
-                )
-
 
 if __name__ == "__main__":
     unittest.main()

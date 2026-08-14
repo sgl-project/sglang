@@ -100,7 +100,9 @@ def _build_full_tree_kernel(
                     )
 
         for token_idx in range(DRAFT_TOKEN_NUM):
-            token_tree_base = tree_base + (seq_len + DRAFT_TOKEN_NUM) * token_idx
+            token_tree_base = (
+                tree_base + (seq_len + DRAFT_TOKEN_NUM) * token_idx + seq_len
+            )
             tl.store(
                 tree_mask_ptr + token_tree_base + offsets_i64,
                 offsets == 0,
@@ -115,7 +117,8 @@ def _build_full_tree_kernel(
                         position += 1
                         tl.store(tree_mask_ptr + token_tree_base + current + 1, True)
                         parent_tb_idx = (
-                            tl.load(selected_index_ptr + selected_base + current) // topk
+                            tl.load(selected_index_ptr + selected_base + current)
+                            // topk
                         )
                         if parent_tb_idx == 0:
                             active = 0
@@ -133,7 +136,10 @@ def _build_full_tree_kernel(
                                     and selected == parent_token_idx
                                 ):
                                     next_position = candidate_pos
-                            current = next_position
+                            if next_position == DRAFT_TOKEN_NUM - 1:
+                                active = 0
+                            else:
+                                current = next_position
                 tl.store(positions_ptr + token_base + token_idx, seq_len + position)
 
 

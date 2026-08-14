@@ -187,9 +187,7 @@ def _batch_matmul_transpose_fast_kernel(
                 + offs_n[None, :] * stride_cn
             )
             output = (
-                accumulator.to(tl.bfloat16)
-                if IS_BF16
-                else accumulator.to(tl.float16)
+                accumulator.to(tl.bfloat16) if IS_BF16 else accumulator.to(tl.float16)
             )
             tl.store(c_ptrs, output)
 
@@ -230,9 +228,7 @@ def _batch_matmul_transpose_b1_fast_kernel(
             accumulator = tl.zeros((1, BLOCK_N), dtype=tl.float32)
             for k_base in range(0, K, BLOCK_K):
                 offs_k = k_base + tl.arange(0, BLOCK_K)
-                a = tl.load(
-                    a_ptr + m_idx * stride_am + offs_k[None, :] * stride_ak
-                )
+                a = tl.load(a_ptr + m_idx * stride_am + offs_k[None, :] * stride_ak)
                 w = tl.load(
                     w_ptr
                     + m_idx * stride_wm
@@ -240,13 +236,9 @@ def _batch_matmul_transpose_b1_fast_kernel(
                     + (n_base + offs_n)[None, :] * stride_wn
                 )
                 accumulator += tl.dot(a, w)
-            c_ptrs = (
-                c_ptr + m_idx * stride_cm + (n_base + offs_n)[None, :] * stride_cn
-            )
+            c_ptrs = c_ptr + m_idx * stride_cm + (n_base + offs_n)[None, :] * stride_cn
             output = (
-                accumulator.to(tl.bfloat16)
-                if IS_BF16
-                else accumulator.to(tl.float16)
+                accumulator.to(tl.bfloat16) if IS_BF16 else accumulator.to(tl.float16)
             )
             tl.store(c_ptrs, output)
 

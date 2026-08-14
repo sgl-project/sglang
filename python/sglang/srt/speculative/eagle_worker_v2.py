@@ -1085,13 +1085,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     ) -> None:
         next_draft_input = batch_result.next_draft_input
         if self.speculative_num_steps == 1 or batch.forward_mode.is_idle():
-            next_draft_input.topk_p, next_draft_input.topk_index = (
-                pad_zero_bubble_seed(
-                    topk_p=next_draft_input.topk_p,
-                    topk_index=next_draft_input.topk_index,
-                    num_steps=self.speculative_num_steps,
-                    topk=self.topk,
-                )
+            next_draft_input.topk_p, next_draft_input.topk_index = pad_zero_bubble_seed(
+                topk_p=next_draft_input.topk_p,
+                topk_index=next_draft_input.topk_index,
+                num_steps=self.speculative_num_steps,
+                topk=self.topk,
             )
             next_draft_input.hidden_states = None
             return
@@ -1131,9 +1129,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 forward_batch.mark_forward_metadata_ready()
                 _, _, draft_tokens, _ = self.draft_forward(forward_batch)
             next_draft_input.topk_index = draft_tokens.clone()
-            next_draft_input.topk_p = torch.ones_like(
-                draft_tokens, dtype=torch.float32
-            )
+            next_draft_input.topk_p = torch.ones_like(draft_tokens, dtype=torch.float32)
             next_draft_input.hidden_states = None
         finally:
             batch.forward_mode = old_forward_mode

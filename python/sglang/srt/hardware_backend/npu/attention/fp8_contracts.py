@@ -53,13 +53,7 @@ def normalize_required_fp8_scale(
             "Refusing to use an implicit unit scale because it changes model "
             "outputs silently."
         )
-    normalized = scale.reshape(-1).to(device=device, dtype=torch.float32)
-    if not torch.isfinite(normalized).all():
-        raise RuntimeError(
-            f"{name} contains a non-finite value. This normally means the "
-            "checkpoint scale was not loaded or post-load processing did not "
-            "run."
-        )
-    if (normalized <= 0).any():
-        raise ValueError(f"{name} must contain only positive FP8 scales.")
-    return normalized
+    # Value-domain checks belong in checkpoint post-load processing.  Calling
+    # ``isfinite().all()`` or ``any()`` here would synchronize an NPU tensor to
+    # Python on every layer/step and is not graph-capture safe.
+    return scale.reshape(-1).to(device=device, dtype=torch.float32)

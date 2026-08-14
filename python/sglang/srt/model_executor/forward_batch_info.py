@@ -562,9 +562,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     npu_mlaprolog_runtime_cache: Optional[
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ] = None
-    npu_dsa_interleave_half_rope_cache: Optional[
-        Tuple[torch.Tensor, torch.Tensor]
-    ] = None
+    npu_dsa_interleave_half_rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = (
+        None
+    )
 
     # For logits and logprobs post processing
     next_token_logits_buffer: torch.Tensor = None

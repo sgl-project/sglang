@@ -58,7 +58,10 @@ def validate_npu_target_only_sampling(
             "NPU sampled-target logits must have one row per verify token; "
             f"got {logits_shape}"
         )
-    if max_tree_depth != num_draft_tokens or retrieve_index_shape != expected_tree_shape:
+    if (
+        max_tree_depth != num_draft_tokens
+        or retrieve_index_shape != expected_tree_shape
+    ):
         raise ValueError(
             "NPU sampled-target verification requires an untruncated linear "
             f"chain of shape {expected_tree_shape}"

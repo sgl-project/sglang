@@ -6,7 +6,7 @@ import sys
 import unittest
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -28,6 +28,7 @@ for _ in (
 ):
     sys.modules.setdefault(_, MagicMock())
 
+import sglang.srt.hardware_backend.npu.attention.ascend_backend as ascend_backend_module
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     AscendAttnMaskBuilder,
@@ -36,6 +37,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _create_mla_decode_head_padding,
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
+    _split_mha_prefix_qk,
 )
 
 
@@ -200,6 +202,89 @@ class TestFp8KvScaleResolution(unittest.TestCase):
         )
 
         torch.testing.assert_close(resolved, torch.ones(1, dtype=torch.float32))
+
+
+class TestMhaPrefixAbi(unittest.TestCase):
+    def test_full_qk_are_split_without_separate_rope_kwargs(self):
+        q = torch.arange(24, dtype=torch.float32).reshape(2, 2, 6)
+        k = torch.arange(24, 48, dtype=torch.float32).reshape(2, 2, 6)
+
+        q_nope, q_rope, k_nope, k_rope = _split_mha_prefix_qk(
+            q,
+            k,
+            nope_head_dim=4,
+            rope_head_dim=2,
+        )
+
+        self.assertEqual(q_nope.shape, (2, 2, 4))
+        self.assertEqual(q_rope.shape, (2, 2, 2))
+        self.assertEqual(k_nope.shape, (2, 2, 4))
+        self.assertEqual(k_rope.shape, (2, 2, 2))
+        torch.testing.assert_close(torch.cat((q_nope, q_rope), dim=-1), q)
+        torch.testing.assert_close(torch.cat((k_nope, k_rope), dim=-1), k)
+
+    def test_absorbed_q_without_rope_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "concatenated NoPE and RoPE"):
+            _split_mha_prefix_qk(
+                torch.zeros((1, 2, 4)),
+                torch.zeros((1, 2, 4)),
+                nope_head_dim=4,
+                rope_head_dim=2,
+            )
+
+    def test_cached_prefix_pass_is_non_causal(self):
+        backend = object.__new__(AscendAttnBackend)
+        backend.qk_rope_head_dim = 2
+        backend.qk_nope_head_dim = 4
+        backend.fia_mask = torch.ones((4, 4), dtype=torch.bool)
+        backend.forward_metadata = SimpleNamespace(prefix_lens=torch.tensor([3]))
+        backend._load_prefix_kv_cache_a5 = MagicMock(
+            return_value=(
+                torch.zeros((3, 1, 4)),
+                torch.zeros((3, 1, 2)),
+            )
+        )
+        layer = SimpleNamespace(
+            v_head_dim=4,
+            tp_q_head_num=2,
+            tp_k_head_num=1,
+            scaling=1.0,
+            kv_b_proj=lambda cached: (torch.zeros((cached.shape[0], 8)),),
+        )
+        forward_batch = SimpleNamespace(
+            num_token_non_padded_cpu=2,
+            extend_seq_lens_cpu=[2],
+        )
+
+        def fake_fia(query, _key, _value, **_kwargs):
+            return torch.zeros((query.shape[0], 2, 4)), torch.zeros((query.shape[0], 2))
+
+        with (
+            patch.object(
+                ascend_backend_module.torch_npu,
+                "npu_fused_infer_attention_score",
+                side_effect=fake_fia,
+            ) as fia,
+            patch.object(
+                ascend_backend_module.torch_npu,
+                "npu_attention_update",
+                return_value=(torch.zeros((4, 4)), None),
+            ),
+        ):
+            backend.forward_extend_prefix_a5(
+                q=torch.zeros((2, 2, 6)),
+                k=torch.zeros((2, 1, 6)),
+                v=torch.zeros((2, 1, 4)),
+                forward_batch=forward_batch,
+                layer=layer,
+                fp8_kv_scale=None,
+            )
+
+        self.assertEqual(fia.call_count, 2)
+        self.assertEqual(fia.call_args_list[0].kwargs["sparse_mode"], 3)
+        self.assertIs(fia.call_args_list[0].kwargs["atten_mask"], backend.fia_mask)
+        self.assertEqual(fia.call_args_list[1].kwargs["sparse_mode"], 0)
+        self.assertIsNone(fia.call_args_list[1].kwargs["atten_mask"])
 
 
 class TestGenerateMaskFlag(unittest.TestCase):

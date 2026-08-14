@@ -4,6 +4,9 @@ import torch
 import torch_npu
 from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
 
+from sglang.kernels.ops.gemm.batch_matmul_transpose_npu import (
+    batch_matmul_transpose_npu,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.fp8_contracts import (
     normalize_required_fp8_scale,
@@ -19,6 +22,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.utils import is_npu_before_atlas_a5
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -79,11 +83,20 @@ def _get_fp8_kv_runtime_scale(
     if m.kv_cache_dtype != "fp8_e4m3":
         return None
 
+    requires_modelslim_scale = vars(m).get("_requires_modelslim_fp8_kv_scale", False)
+    if requires_modelslim_scale and not vars(m).get(
+        "_modelslim_fp8_kv_scale_ready", False
+    ):
+        raise RuntimeError(
+            "ModelSlim FP8 MLA KV scales were not validated after checkpoint "
+            "loading; refusing to use uninitialized runtime descales."
+        )
+
     scale = m._buffers.get(attr_name)
     if scale is None:
         scale = m._parameters.get(attr_name)
     if scale is None:
-        if vars(m).get("_requires_modelslim_fp8_kv_scale", False):
+        if requires_modelslim_scale:
             raise RuntimeError(
                 f"{attr_name} is required by the ModelSlim FP8 KV scheme, but "
                 "the checkpoint-derived runtime scale is missing."
@@ -173,7 +186,6 @@ def forward_mha_prepare_npu(
                 positions,
                 hidden_states.dtype,
                 offsets=None,
-                layer_id=m.layer_id,
             )
         q_pe = torch_npu.npu_interleave_rope(
             q_pe.reshape(B, -1, S, m.qk_rope_head_dim),
@@ -386,7 +398,6 @@ def forward_mla_prepare_npu(
                 positions,
                 hidden_states.dtype,
                 offsets=None,
-                layer_id=m.layer_id,
             )
 
         if m.rotary_emb is not None:
@@ -525,15 +536,29 @@ def forward_mla_core_npu(
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
     attn_output = attn_output.contiguous()
-    # torch.ops.npu.batch_matmul_transpose is not numerically equivalent for
-    # Kimi-K3, so use the numerically validated torch_npu implementation.
-    attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
-        attn_output,
-        m.w_vc,
-        perm_x1=(1, 0, 2),
-        perm_x2=(0, 1, 2),
-        perm_y=(1, 0, 2),
-    )
+    if not is_npu_before_atlas_a5() and (
+        m.use_dsa or _use_explicit_npu_interleaved_rope(m)
+    ):
+        attn_bmm_output = torch.empty(
+            (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
+            dtype=attn_output.dtype,
+            device=attn_output.device,
+        )
+        batch_matmul_transpose_npu(
+            tensor_a=attn_output,
+            tensor_b=m.w_vc,
+            tensor_c=attn_bmm_output,
+        )
+    else:
+        # torch.ops.npu.batch_matmul_transpose is not numerically equivalent for
+        # Kimi-K3, so retain its numerically validated torch_npu implementation.
+        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
+            attn_output,
+            m.w_vc,
+            perm_x1=(1, 0, 2),
+            perm_x2=(0, 1, 2),
+            perm_y=(1, 0, 2),
+        )
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     output, _ = m.o_proj(attn_bmm_output)
@@ -742,7 +767,14 @@ def forward_dsa_core_npu(
         )
     else:
         attn_output = attn_output.contiguous()
-        torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+        if is_npu_before_atlas_a5():
+            torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+        else:
+            batch_matmul_transpose_npu(
+                tensor_a=attn_output,
+                tensor_b=m.w_vc,
+                tensor_c=attn_bmm_output,
+            )
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 

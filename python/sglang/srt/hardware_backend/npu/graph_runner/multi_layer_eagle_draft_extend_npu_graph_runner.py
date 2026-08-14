@@ -46,9 +46,7 @@ class MultiLayerEagleDraftExtendNpuGraphRunner(
         return self.backend.replay_with_input_update(
             shape_key,
             seq_lens=seq_lens,
-            attr_name=(
-                "actual_seq_kvlen" if use_fia_v2 else "actual_seq_lengths_kv"
-            ),
+            attr_name=("actual_seq_kvlen" if use_fia_v2 else "actual_seq_lengths_kv"),
             attr_type=[],
         )
 
