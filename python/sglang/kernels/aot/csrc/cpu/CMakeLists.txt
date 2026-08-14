@@ -31,7 +31,7 @@ include_directories(
 file(GLOB_RECURSE SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
 # Exclude all arch dependent files, then add back only files for this arch
-set(ARCH_DIRS "x86_64|aarch64|ppc64")
+set(ARCH_DIRS "x86_64|aarch64|ppc64le")
 list(FILTER SOURCES EXCLUDE REGEX "^${CMAKE_CURRENT_SOURCE_DIR}/(${ARCH_DIRS})/")
 
 # Platform-specific source and library directory
@@ -44,7 +44,7 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     set(MY_ARCH_DIR "aarch64")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le|ppc64")
     set(PLAT_LIB_DIR "/usr/lib/powerpc64le-linux-gnu")
-    set(MY_ARCH_DIR "ppc64")
+    set(MY_ARCH_DIR "ppc64le")
 else()
     set(PLAT_LIB_DIR "/usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu")
 endif()
@@ -102,9 +102,16 @@ set(SGLANG_CPU_X86_ONLY_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/mamba/conv.cpp
 )
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+# SHM-based AllReduce is not yet implemented for aarch64 or ppc64le.
+set(SGLANG_CPU_NO_SHM_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/shm.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/interface.cpp
+)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ppc64le|ppc64")
     add_compile_definitions(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
     list(REMOVE_ITEM SOURCES ${SGLANG_CPU_X86_ONLY_SOURCES})
+    list(REMOVE_ITEM SOURCES ${SGLANG_CPU_NO_SHM_SOURCES})
 endif()
 
 if(NOT DEFINED ENV{SGLANG_CPU_FP8_CVT_FTZ})
@@ -126,6 +133,15 @@ if(MY_ARCH_DIR STREQUAL "x86_64")
         -mamx-tile
         -mamx-bf16
         -mamx-int8
+        -fopenmp
+    )
+elseif(MY_ARCH_DIR STREQUAL "ppc64le")
+    add_compile_options(
+        -O3
+        -Wno-unknown-pragmas
+        -Wno-psabi
+        -mcpu=native
+        -mvsx
         -fopenmp
     )
 else()

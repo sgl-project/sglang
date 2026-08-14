@@ -2,48 +2,34 @@ from __future__ import annotations
 
 from enum import IntEnum
 
-import torch
-import triton
-import triton.language as tl
+from sglang.srt.utils.common import HAS_TRITON
 
-from sglang.srt.environ import envs
+if HAS_TRITON:
+    import triton
+    import triton.language as tl
 
-
-def _phase_repr(phase: int | IntEnum) -> str:
-    if isinstance(phase, IntEnum):
-        return f"{phase.name}({int(phase)})"
-    return str(int(phase))
-
-
-def _host_debug(msg: str) -> None:
-    if envs.SGLANG_PHASE_CHECKER_DEBUG.get():
-        print(msg, flush=True)
-
-
-# debug=True so tl.device_assert below actually raises. Without it the assert
-# is stripped at compile time and only tl.device_print fires (the assert is
-# gated on the TRITON_DEBUG env var by default — see tl.device_assert docstring).
-@triton.jit(debug=True)
-def _phase_check_kernel(
-    phase_ptr,
-    enable_assert_ptr,
-    EXPECT_PHASE: tl.constexpr,
-    NEXT_PHASE: tl.constexpr,
-    CALLER_TAG: tl.constexpr,
-):
-    cur = tl.load(phase_ptr)
-    enable_assert = tl.load(enable_assert_ptr)
-    if enable_assert != 0:
-        if cur != EXPECT_PHASE:
-            # constexpr values get baked into the prefix string at compile time;
-            # only `cur` is runtime.
-            tl.device_print(
-                f"[SimplePhaseChecker FAIL] caller_tag={CALLER_TAG} "
-                f"expect={EXPECT_PHASE} next={NEXT_PHASE} actual=",
-                cur,
-            )
-        tl.device_assert(cur == EXPECT_PHASE, "SimplePhaseChecker: phase mismatch")
-    tl.store(phase_ptr, NEXT_PHASE)
+    @triton.jit(debug=True)
+    def _phase_check_kernel(
+        phase_ptr,
+        enable_assert_ptr,
+        EXPECT_PHASE: tl.constexpr,
+        NEXT_PHASE: tl.constexpr,
+        CALLER_TAG: tl.constexpr,
+    ):
+        cur = tl.load(phase_ptr)
+        enable_assert = tl.load(enable_assert_ptr)
+        if enable_assert != 0:
+            if cur != EXPECT_PHASE:
+                tl.device_print(
+                    f"[SimplePhaseChecker FAIL] caller_tag={CALLER_TAG} "
+                    f"expect={EXPECT_PHASE} next={NEXT_PHASE} actual=",
+                    cur,
+                )
+            tl.device_assert(cur == EXPECT_PHASE, "SimplePhaseChecker: phase mismatch")
+        tl.store(phase_ptr, NEXT_PHASE)
+else:
+    triton = None
+    _phase_check_kernel = None
 
 
 class SimplePhaseChecker:

@@ -65,7 +65,7 @@ dependencies = [
   "torchvision==0.27.0",
   "tqdm",
   "transformers==5.12.1",
-  "triton==3.7.0",
+  "triton==3.7.0 ; platform_machine != 'ppc64le'",
   "uvicorn",
   "uvloop",
   "xxhash",

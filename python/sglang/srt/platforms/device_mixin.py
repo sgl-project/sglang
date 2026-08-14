@@ -59,6 +59,7 @@ class CpuArchEnum(enum.Enum):
 
     X86 = enum.auto()
     ARM = enum.auto()
+    POWERPC = enum.auto()  # ppc64le / POWER architecture
     UNSPECIFIED = enum.auto()
 
 
@@ -241,7 +242,12 @@ class DeviceMixin:
 
     @classmethod
     def get_cpu_architecture(cls) -> "CpuArchEnum":
-        """[Planned] Detect CPU architecture."""
+        """Detect CPU architecture.
+
+        Uses ``platform.machine()`` to classify the host CPU into X86, ARM,
+        or POWERPC (covers both ppc64le little-endian and ppc64 big-endian).
+        Returns UNSPECIFIED for anything else.
+        """
         import platform as _platform
 
         machine = _platform.machine().lower()
@@ -249,6 +255,8 @@ class DeviceMixin:
             return CpuArchEnum.X86
         elif machine in ("arm64", "aarch64"):
             return CpuArchEnum.ARM
+        elif machine.startswith("ppc"):  # ppc64le, ppc64
+            return CpuArchEnum.POWERPC
         return CpuArchEnum.UNSPECIFIED
 
     def get_torch_profiler_activity_str(self) -> str:

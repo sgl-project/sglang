@@ -82,6 +82,8 @@ class CpuDeviceMixin(DeviceMixin):
             return "cpu (aarch64)"
         if self.cpu_arch == CpuArchEnum.X86:
             return "cpu (x86_64)"
+        if self.cpu_arch == CpuArchEnum.POWERPC:
+            return "cpu (ppc64le)"
         return "cpu"
 
     def get_device_uuid(self, device_id: int = 0) -> str:

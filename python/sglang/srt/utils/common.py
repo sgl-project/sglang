@@ -84,7 +84,32 @@ import pybase64
 import requests
 import torch
 import torch.distributed as dist
-import triton
+try:
+    import triton
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+    import sys
+    from sglang.srt.utils.dummy_triton import TritonPlaceholder
+    
+    _triton_mock = TritonPlaceholder()
+
+    # Register in sys.modules so that any `import triton.something` resolves
+    # to our mock. TritonPlaceholder.__getattr__ handles arbitrary attribute
+    # chains (e.g. triton.backends.compiler.AttrsDescriptor) automatically.
+    sys.modules["triton"] = _triton_mock
+    sys.modules["triton.language"] = _triton_mock.language
+    sys.modules["triton.language.extra"] = _triton_mock.language
+    sys.modules["triton.language.extra.libdevice"] = _triton_mock.language
+    sys.modules["triton.backends"] = _triton_mock.backends
+    sys.modules["triton.backends.compiler"] = _triton_mock.backends.compiler
+    sys.modules["triton.compiler"] = _triton_mock.compiler
+    sys.modules["triton.compiler.compiler"] = _triton_mock.compiler.compiler
+    sys.modules["triton.runtime"] = _triton_mock.runtime
+    sys.modules["triton.runtime.autotuner"] = _triton_mock.runtime.autotuner
+    sys.modules["triton.runtime.jit"] = _triton_mock.runtime.jit
+
+    triton = _triton_mock
 from packaging import version as pkg_version
 from PIL import Image, UnidentifiedImageError
 from starlette.routing import Mount
@@ -205,9 +230,25 @@ def is_host_cpu_arm64() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_host_cpu_ppc64le() -> bool:
+    machine = platform.machine().lower()
+    return (
+        machine in ("ppc64le", "ppc64", "powerpc64le")
+        and hasattr(torch, "cpu")
+        and torch.cpu.is_available()
+    )
+
+
+@lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
+    is_host_cpu_supported = (
+        is_host_cpu_x86() or is_host_cpu_arm64() or is_host_cpu_ppc64le()
+    )
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
+
+
+def is_triton_available() -> bool:
+    return HAS_TRITON
 
 
 @lru_cache(maxsize=1)
@@ -3201,7 +3242,8 @@ def round_up(x: int, y: int) -> int:
     return ((x - 1) // y + 1) * y
 
 
-setattr(triton, "next_power_of_2", next_power_of_2)
+if triton is not None:
+    setattr(triton, "next_power_of_2", next_power_of_2)
 
 
 class EmptyContextManager:
@@ -4348,7 +4390,8 @@ class CachedKernel:
 
     def __init__(self, fn, key_fn=None):
         self.fn = fn
-        assert isinstance(fn, triton.runtime.jit.JITFunction)
+        if triton is not None:
+            assert isinstance(fn, triton.runtime.jit.JITFunction)
 
         original_fn = fn.fn
         self.signature = inspect.signature(original_fn)

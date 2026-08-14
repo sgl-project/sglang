@@ -279,6 +279,7 @@ at::Tensor convert_weight_packed(at::Tensor& weight);
 // scale prepack for mxfp4
 at::Tensor convert_scale_packed(at::Tensor& scale);
 
+#if defined(__x86_64__) || defined(__aarch64__)
 // quant
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
 
@@ -291,6 +292,7 @@ at::Tensor int8_scaled_mm_cpu(
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
     bool is_vnni);
+#endif
 
 // fp8 gemm
 at::Tensor fp8_scaled_mm_cpu(
@@ -306,6 +308,7 @@ at::Tensor fp8_scaled_mm_cpu(
 at::Tensor mxfp4_scaled_mm_cpu(
     at::Tensor& mat1, at::Tensor& mat2, at::Tensor& scales2, const std::optional<at::Tensor>& bias, bool is_vnni);
 
+#if defined(__x86_64__) || defined(__aarch64__)
 // quant + igemm
 at::Tensor int8_scaled_mm_with_quant(
     at::Tensor& mat1,
@@ -314,6 +317,7 @@ at::Tensor int8_scaled_mm_with_quant(
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
     bool is_vnni);
+#endif
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 // int4 gemm
@@ -343,6 +347,7 @@ at::Tensor fused_linear_sigmoid_mul(
 // bmm
 void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
 
+#if defined(__x86_64__) || defined(__aarch64__)
 // fused moe
 at::Tensor fused_experts_cpu(
     at::Tensor& hidden_states,
@@ -362,6 +367,7 @@ at::Tensor fused_experts_cpu(
     const std::optional<double>& alpha,
     const std::optional<double>& limit,
     bool is_vnni);
+#endif
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 at::Tensor shared_expert_cpu(
@@ -452,6 +458,7 @@ at::Tensor conv3d_embed_weight_pack(const at::Tensor& weight);
 
 at::Tensor conv3d_embed_cpu(const at::Tensor& input, const at::Tensor& weight, const at::Tensor& bias, bool is_vnni);
 
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 // shared memory init
 void initialize(int64_t size, int64_t rank);
 
@@ -466,6 +473,7 @@ void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data);
 
 // shared memory reduce_scatter_tensor
 void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op);
+#endif
 
 // rope
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
@@ -739,6 +747,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("convert_scale_packed(Tensor scale) -> Tensor");
   m.impl("convert_scale_packed", torch::kCPU, &convert_scale_packed);
 
+#if defined(__x86_64__) || defined(__aarch64__)
   // quant
   m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
@@ -748,6 +757,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int8_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales1, Tensor scales2, Tensor? bias, ScalarType "
       "out_dtype, bool is_vnni) -> Tensor");
   m.impl("int8_scaled_mm_cpu", torch::kCPU, &int8_scaled_mm_cpu);
+#endif
 
   // fp8 gemm
   m.def(
@@ -759,11 +769,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("mxfp4_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, bool is_vnni) -> Tensor");
   m.impl("mxfp4_scaled_mm_cpu", torch::kCPU, &mxfp4_scaled_mm_cpu);
 
+#if defined(__x86_64__) || defined(__aarch64__)
   // quant + igemm
   m.def(
       "int8_scaled_mm_with_quant(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, ScalarType out_dtype, bool "
       "is_vnni) -> Tensor");
   m.impl("int8_scaled_mm_with_quant", torch::kCPU, &int8_scaled_mm_with_quant);
+#endif
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // int4 gemm
@@ -790,6 +802,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("bmm_cpu(Tensor(a!) out, Tensor mat1, Tensor mat2, bool is_vnni, Tensor? scale) -> ()");
   m.impl("bmm_cpu", torch::kCPU, &bmm_cpu);
 
+#if defined(__x86_64__) || defined(__aarch64__)
   // moe
   m.def(
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
@@ -797,6 +810,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, Tensor? w1_bias, Tensor? w2_bias, float? alpha, float? "
       "limit, bool is_vnni) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
+#endif
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // weight absorption
@@ -845,6 +859,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("conv3d_embed_cpu(Tensor input, Tensor weight, Tensor bias, bool is_vnni) -> Tensor");
   m.impl("conv3d_embed_cpu", torch::kCPU, &conv3d_embed_cpu);
 
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // all reduce
   m.def("initialize(int size, int rank) -> ()");
   m.def("shm_allreduce(Tensor(a!) data, int reduce_op) -> ()");
@@ -855,6 +870,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("shm_allgather_into_tensor", torch::kCPU, &shm_allgather_into_tensor);
   m.def("shm_reduce_scatter_tensor(Tensor(a!) output_tensor, Tensor data, int reduce_op) -> ()");
   m.impl("shm_reduce_scatter_tensor", torch::kCPU, &shm_reduce_scatter_tensor);
+#endif
 
   // rope
   m.def(
@@ -921,7 +937,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
   m.impl("init_cpu_threads_env", init_cpu_threads_env);
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   m.impl("initialize", &initialize);
+#endif
 }
 
 REGISTER_EXTENSION(common_ops)

@@ -3,6 +3,8 @@
 #include "x86_64/shm.h"
 #elif defined(__aarch64__)
 #include "aarch64/shm.h"
+#elif defined(__powerpc__) || defined(__PPC64__) || defined(__ppc64__)
+#include "ppc64le/shm.h"
 #else
 #error "unsupported architecture"
 #endif
