@@ -15,6 +15,16 @@ on:
         required: false
         type: string
         default: ''
+      amd_ci_image:
+        description: 'Override the CI image on every runner (e.g. myuser/sglang-rocm-staging:tag)'
+        required: false
+        type: string
+        default: ''
+      amd_ci_image_mi35x:
+        description: 'Override the image on mi35x runners; wins over amd_ci_image there'
+        required: false
+        type: string
+        default: ''
       continue_on_error:
         description: 'Continue on error (do not fail the workflow on test failures)'
         required: false
@@ -111,6 +121,16 @@ on:
         required: false
         type: string
         default: ''
+      amd_ci_image:
+        description: 'Override the CI image on every runner (e.g. myuser/sglang-rocm-staging:tag)'
+        required: false
+        type: string
+        default: ''
+      amd_ci_image_mi35x:
+        description: 'Override the image on mi35x runners; wins over amd_ci_image there'
+        required: false
+        type: string
+        default: ''
       job_filter:
         description: 'Select which job to run (leave empty or "all" to run all jobs)'
         required: false
@@ -124,6 +144,10 @@ on:
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
+  AMD_CI_IMAGE: ${{ inputs.amd_ci_image }}
+  AMD_CI_IMAGE_MI35X: ${{ inputs.amd_ci_image_mi35x }}
+  AMD_CI_IMAGE_USERNAME: ${{ secrets.DOCKERHUB_AMD_TEST_USERNAME }}
+  AMD_CI_IMAGE_TOKEN: ${{ secrets.DOCKERHUB_AMD_TEST_TOKEN }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 

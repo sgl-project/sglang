@@ -70,6 +70,11 @@ on:
         required: false
         type: string
         default: ''
+      amd_ci_image_mi35x:
+        description: 'Override the image on the mi35x-pinned jobs; wins over amd_ci_image there'
+        required: false
+        type: string
+        default: ''
       continue_on_error:
         description: 'Continue on error (do not fail the workflow on test failures)'
         required: false
@@ -120,6 +125,11 @@ on:
         required: false
         type: string
         default: ''
+      amd_ci_image_mi35x:
+        description: 'Override the image on the mi35x-pinned jobs; wins over amd_ci_image there'
+        required: false
+        type: string
+        default: ''
       continue_on_error:
         description: 'Continue on error (do not fail the workflow on test failures)'
         required: false
@@ -140,6 +150,9 @@ permissions:
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   AMD_CI_IMAGE: ${{ inputs.amd_ci_image }}
+  AMD_CI_IMAGE_MI35X: ${{ inputs.amd_ci_image_mi35x }}
+  AMD_CI_IMAGE_USERNAME: ${{ secrets.DOCKERHUB_AMD_TEST_USERNAME }}
+  AMD_CI_IMAGE_TOKEN: ${{ secrets.DOCKERHUB_AMD_TEST_TOKEN }}
   ROCM_VERSION: ${{ inputs.rocm_version || 'rocm720' }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
@@ -253,6 +266,7 @@ jobs:
       rocm_version: ${{ inputs.rocm_version || 'rocm720' }}
       aiter_ref: ${{ inputs.aiter_ref }}
       amd_ci_image: ${{ inputs.amd_ci_image }}
+      amd_ci_image_mi35x: ${{ inputs.amd_ci_image_mi35x }}
       continue_on_error: true
     secrets: inherit
 

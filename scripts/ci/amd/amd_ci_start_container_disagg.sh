@@ -28,7 +28,7 @@ LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
-CUSTOM_IMAGE="${AMD_CI_IMAGE:-}"
+CUSTOM_IMAGE=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -78,6 +78,17 @@ case "${GPU_ARCH}" in
     ;;
 esac
 
+# A workflow run can span mi30x and mi35x runners, so a single AMD_CI_IMAGE
+# would hand the mi30x image to the mi35x jobs. Let the mi35x runners take a
+# dedicated value when one is provided.
+if [[ -z "${CUSTOM_IMAGE}" ]]; then
+  if [[ "${GPU_ARCH}" == "mi35x" ]]; then
+    CUSTOM_IMAGE="${AMD_CI_IMAGE_MI35X:-${AMD_CI_IMAGE:-}}"
+  else
+    CUSTOM_IMAGE="${AMD_CI_IMAGE:-}"
+  fi
+fi
+
 
 # Set up DEVICE_FLAG based on Kubernetes pod info
 if [[ -f /etc/podinfo/gha-render-devices ]]; then
@@ -118,6 +129,17 @@ if [[ -n "${DOCKERHUB_AMD_USERNAME:-}" && -n "${DOCKERHUB_AMD_TOKEN:-}" ]]; then
     echo "Docker Hub login successful"
   else
     echo "Warning: Docker Hub login failed after retries; continuing with unauthenticated pulls" >&2
+  fi
+fi
+
+# A custom image may live in a private repo the DOCKERHUB_AMD_* account cannot
+# read. Log in again with the dedicated credentials so this later login wins for
+# docker.io.
+if [[ -n "${CUSTOM_IMAGE}" && -n "${AMD_CI_IMAGE_USERNAME:-}" && -n "${AMD_CI_IMAGE_TOKEN:-}" ]]; then
+  echo "Logging in to Docker Hub as ${AMD_CI_IMAGE_USERNAME} for the custom image…"
+  if ! retry_with_backoff 3 sh -c 'echo "${AMD_CI_IMAGE_TOKEN}" | docker login -u "${AMD_CI_IMAGE_USERNAME}" --password-stdin >/dev/null 2>&1'; then
+    echo "Error: login for the custom image failed; a private ${CUSTOM_IMAGE} will not be pullable" >&2
+    exit 1
   fi
 fi
 
