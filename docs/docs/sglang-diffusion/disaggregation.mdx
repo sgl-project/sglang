@@ -207,6 +207,7 @@ for i in $(seq 2 15); do
         --denoiser-sp 1 \
         --cfg-parallel-size 1 \
         --batching-max-size 1 \
+        --dit-cpu-offload false \
         --attention-backend fa &
     worker_pids+=("$!")
 done
