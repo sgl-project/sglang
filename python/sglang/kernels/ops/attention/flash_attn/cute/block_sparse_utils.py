@@ -516,7 +516,10 @@ def consume_block_sparse_loads(
             if split_full_block_cnt == 0:
                 warp_scheduler_barrier_arrive()
 
-        if split_full_block_cnt > 0:
+        if (
+            const_expr(curr_full_block_idx is not None)
+            and split_full_block_cnt > 0
+        ):
             full_n_block = curr_full_block_idx[full_end - 1]
             if split_mask_block_cnt == 0:
                 warp_scheduler_barrier_sync()
@@ -589,7 +592,10 @@ def consume_block_sparse_loads(
                 )
                 O_should_accumulate = True
 
-        if split_full_block_cnt > 0:
+        if (
+            const_expr(curr_full_block_idx is not None)
+            and split_full_block_cnt > 0
+        ):
             full_n_block = curr_full_block_idx[full_end - 1]
             if split_mask_block_cnt == 0:
                 kv_consumer_state = process_first_half_block(
