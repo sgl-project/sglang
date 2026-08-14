@@ -133,14 +133,6 @@ def is_deepseek_v4(config) -> bool:
     )
 
 
-def is_nemotron_h(config) -> bool:
-    return _hf_arch(config) in (
-        "NemotronHForCausalLM",
-        "NemotronHPuzzleForCausalLM",
-        "NemotronHForCausalLMMTP",
-    )
-
-
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config) or is_deepseek_v4(config)
     return config.index_head_dim
@@ -264,6 +256,7 @@ class ModelConfig:
         is_multi_layer_eagle: bool = False,
         encoder_only: bool = False,
         language_only: bool = False,
+        language_model_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
@@ -450,10 +443,13 @@ class ModelConfig:
             self.hf_config.architectures
         )
         # TODO: requires further polishing
+        # Key on the tower, not the attribute: several config classes default
+        # vision_config to None, which presence alone would read as image-capable
+        # (MuseGlimmerConfig's text-only layouts are one such case).
         self.is_image_understandable_model = (
             enable_multimodal
             and not self.is_lm_only
-            and hasattr(self.hf_config, "vision_config")
+            and getattr(self.hf_config, "vision_config", None) is not None
         )
 
         # Models expose audio_config at different nesting levels:
@@ -505,9 +501,6 @@ class ModelConfig:
         self.is_multimodal_breakable_cuda_graph_supported = enable_multimodal and (
             is_multimodal_breakable_cuda_graph_supported(self.hf_config.architectures)
         )
-        self.is_mla_breakable_cuda_graph_supported = (
-            is_mla_breakable_cuda_graph_supported(self.hf_config.architectures)
-        )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes
@@ -535,6 +528,10 @@ class ModelConfig:
 
         self.hf_config.encoder_only = encoder_only
         self.hf_config.language_only = language_only
+        # Checkpoints declare this one themselves (hf_transformers/processor.py),
+        # so the flag may only turn it on: writing the default back would build a
+        # vision tower with no weights to fill.
+        self.hf_config.language_model_only = language_model_only or self.is_lm_only
 
         # matryoshka embeddings
         self.matryoshka_dimensions = getattr(
@@ -583,6 +580,7 @@ class ModelConfig:
             override_config_file=override_config_file,
             is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
             language_only=server_args.language_only,
+            language_model_only=server_args.language_model_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
             is_draft_quantization_explicit=(
@@ -1460,6 +1458,7 @@ class ModelConfig:
             "modelslim",
             "humming",
             "quark_mxfp4",
+            "auto-round",
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
@@ -1467,7 +1466,7 @@ class ModelConfig:
             # so eligible MoE experts are requantized online.
             "modelopt_fp4": ["modelopt", "fp8"],
             "modelopt_mixed": ["modelopt"],
-            "nvfp4_online": ["fp8"],
+            "nvfp4_online": ["fp8", "modelopt_fp8"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
@@ -1831,6 +1830,7 @@ multimodal_model_archs = [
     "MossVLForConditionalGeneration",
     "NemotronH_Nano_VL_V2",
     "NemotronH_Nano_Omni_Reasoning_V3",
+    "MuseGlimmerForConditionalGeneration",
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
@@ -1894,15 +1894,7 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "InternS2MobiusForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
-]
-
-# MLA archs validated to run breakable CUDA graph when it is explicitly
-# requested (--cuda-graph-backend-prefill=breakable bypasses the ServerArgs
-# disable rules). Dispatch pins the absorbed MLA path inside capture/replay
-# for these archs, so the prefill runner's MHA-companion prefix restrictions
-# do not apply (see PrefillCudaGraphRunner.mla_pinned_under_bcg).
-mla_breakable_cuda_graph_supported_model_archs = [
-    "KimiK3ForConditionalGeneration",
+    "MuseGlimmerForConditionalGeneration",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
@@ -1979,14 +1971,6 @@ def is_multimodal_breakable_cuda_graph_supported(model_architectures: List[str])
     )
 
 
-def is_mla_breakable_cuda_graph_supported(model_architectures: List[str]):
-    """Whether an MLA arch may keep prefill breakable CUDA graph enabled."""
-    return any(
-        arch in mla_breakable_cuda_graph_supported_model_archs
-        for arch in model_architectures
-    )
-
-
 # SequenceClassification models that use CrossEncodingPooler
 _cross_encoding_pooler_archs = [
     "BertForSequenceClassification",
@@ -2054,6 +2038,8 @@ def is_hybrid_swa_model(
         "Gemma4UnifiedForConditionalGeneration",
         "LagunaForCausalLM",
         "MellumForCausalLM",
+        "MuseGlimmerForCausalLM",
+        "MuseGlimmerForConditionalGeneration",
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
         "UnlimitedOCRForCausalLM",
@@ -2129,6 +2115,8 @@ def get_hybrid_layer_ids(
         or "Gemma4UnifiedForConditionalGeneration" in model_architectures
         or "LagunaForCausalLM" in model_architectures
         or "MellumForCausalLM" in model_architectures
+        or "MuseGlimmerForCausalLM" in model_architectures
+        or "MuseGlimmerForConditionalGeneration" in model_architectures
     ):
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
