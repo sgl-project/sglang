@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
@@ -8,7 +10,6 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
     mamba_cache_chunk_size,
-    mamba_checkpoint_grid,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
 )
@@ -2631,9 +2632,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
         chunk_size = mamba_cache_chunk_size()
-        # The donated depth has to be a radix node boundary, which DCP widens past
-        # chunk_size; the kernel still snapshots on the chunk_size grid.
-        checkpoint_grid = mamba_checkpoint_grid()
+        # The donated depth has to be a radix node boundary. Read the tree's own
+        # page rather than re-deriving how DCP widens it; the kernel still
+        # snapshots on the chunk_size grid.
+        checkpoint_grid = math.lcm(chunk_size, self.tree_cache.page_size)
 
         def _force_track_h(i: int) -> int:
             assert i % chunk_size == 0

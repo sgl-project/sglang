@@ -8985,15 +8985,6 @@ class ServerArgs:
             self._mamba_cache_chunk_size = max(chunk_size, page_size)
         return self._mamba_cache_chunk_size
 
-    @property
-    def mamba_checkpoint_grid(self) -> int:
-        # A donated mamba state is only reusable at a depth the tree can name. DCP
-        # widens the page past chunk_size, so a checkpoint picked on the finer grid
-        # gets attached to a shallower node than the tokens it already covers.
-        page_size = resolved_view(self).page_size
-        tree_page = page_size * self.dcp_size if self.dcp_size > 1 else page_size
-        return math.lcm(self.mamba_cache_chunk_size, tree_page)
-
     def _check_two_batch_overlap(self):
         # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
         # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with

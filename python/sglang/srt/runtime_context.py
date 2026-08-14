@@ -1435,13 +1435,6 @@ def mamba_cache_chunk_size() -> int:
     return get_server_args().mamba_cache_chunk_size
 
 
-def mamba_checkpoint_grid() -> int:
-    """The granularity a donated mamba checkpoint's depth must land on so the
-    radix tree can name it: ``lcm(mamba_cache_chunk_size, tree page)``. Equal to
-    ``mamba_cache_chunk_size`` unless DCP widens the tree page."""
-    return get_server_args().mamba_checkpoint_grid
-
-
 def max_speculative_num_draft_tokens() -> int | None:
     """The largest draft-token count speculative decoding may use.
 
