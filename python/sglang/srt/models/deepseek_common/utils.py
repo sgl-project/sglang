@@ -71,6 +71,23 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
 ]
 
 
+def _is_block_scale_fp8(proj: torch.nn.Module) -> bool:
+    """Return True if proj uses block-scale fp8 quantization.
+
+    Per-channel fp8 has weight_scale shape [N, 1] (one scale per output row).
+    Block-scale fp8 has weight_scale shape [N, K/block_size] (multiple columns).
+    The fused gfx95 kernels (fused_rms_fp8_group_quant, fused_flatten_fp8_group_quant)
+    are only compatible with block-scale layouts — per-channel layers must fall
+    through to the plain bf16 path instead.
+    """
+    if not hasattr(proj, "weight") or proj.weight.dtype != torch.float8_e4m3fn:
+        return False
+    weight_scale = getattr(proj, "weight_scale", None)
+    if weight_scale is None or weight_scale.dim() != 2:
+        return False
+    return weight_scale.shape[-1] > 1
+
+
 def awq_dequantize_func():
     """
     Get the AWQ dequantize function for the current device

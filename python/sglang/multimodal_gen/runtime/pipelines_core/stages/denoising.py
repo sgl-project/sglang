@@ -32,6 +32,10 @@ from sglang.kernels.ops.diffusion.fused_ln_modulate import (
     mount_fused_ln_modulate,
     unmount_fused_ln_modulate,
 )
+from sglang.kernels.ops.diffusion.hunyuan_qknorm import (
+    mount_hunyuan_qknorm,
+    unmount_hunyuan_qknorm,
+)
 from sglang.kernels.ops.diffusion.ltx2_rmsnorm_modulate import (
     mount_ltx2_rms_norm_modulate,
     unmount_ltx2_rms_norm_modulate,
@@ -85,9 +89,6 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
-from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
-    TransformerLoader,
-)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -125,6 +126,10 @@ from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import 
     RolloutDenoisingMixin,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.component_load import (
+    load_transformer_if_needed,
+    register_loaded_transformer,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -169,6 +174,11 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "fused gate RMSNorm (BF16-native Triton)",
         mount_fused_gate_rmsnorm,
         unmount_fused_gate_rmsnorm,
+    ),
+    (
+        "HunyuanVideo strided QK RMSNorm",
+        mount_hunyuan_qknorm,
+        unmount_hunyuan_qknorm,
     ),
 )
 
@@ -661,6 +671,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if self.server_args.enable_breakable_cuda_graph:
             # Cache-DiT wraps transformer.forward with step-skipping control
             # flow that must not be baked into a captured CUDA graph.
+            if self._cache_dit_requested():
+                logger.warning_once(
+                    "Cache-DiT was requested but is disabled because breakable "
+                    "CUDA graphs are enabled."
+                )
             return
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
@@ -886,22 +901,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         else:
             cache_dit_num_inference_steps = num_inference_steps
 
-        transformer_was_loaded = server_args.model_loaded["transformer"]
-        if not transformer_was_loaded:
-            # FIXME: reuse more code
-            loader = TransformerLoader()
-            self.transformer = loader.load(
-                server_args.model_paths["transformer"], server_args, "transformer"
-            )
+        freshly_loaded = load_transformer_if_needed(self, server_args)
 
         self._maybe_enable_cache_dit_and_torch_compile(
             cache_dit_num_inference_steps, batch
         )
 
-        if not transformer_was_loaded:
-            if pipeline:
-                pipeline.add_module("transformer", self.transformer)
-            server_args.model_loaded["transformer"] = True
+        if freshly_loaded:
+            register_loaded_transformer(self, server_args, pipeline)
 
         if batch.rollout:
             self._maybe_prepare_rollout(batch)
@@ -1538,12 +1545,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         batch: Req,
     ) -> None:
         """
-        manage dit's residency by reporting the active sequential use
-
-        only applicable for dual-dit architecture like Wan
+        manage dit residency by reporting the active sequential use
 
         Args:
-            current_model: the next active dit, transformer_1 or transformer_2
+            current_model: the next active dit
         """
         manager = self._component_residency_manager
 

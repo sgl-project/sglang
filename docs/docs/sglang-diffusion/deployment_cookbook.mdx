@@ -77,6 +77,22 @@ livenessProbe:
 See [Health endpoints](/docs/sglang-diffusion/api/cli#health-endpoints) for the
 status-code contract and warmup-mode behavior.
 
+## Stable Model Identity
+
+Use `--served-model-name` when the public model name must remain stable across replicas, hosts, or checkpoint mount paths:
+
+```bash
+sglang serve \
+  --model-path /mnt/checkpoints/Qwen-Image \
+  --model-id Qwen-Image \
+  --served-model-name image-production \
+  --port 30010
+```
+
+The resolved public name follows `--served-model-name`, then `--model-id`, then `--model-path`. `--model-id` remains an internal model registry and configuration-resolution hint; it is not a replacement for a deployment alias. The resolved name is exposed through `/server_info` and `/v1/models` and is used by video and action responses when a request does not supply its own model.
+
+See [OpenAI API: Served model name](/docs/sglang-diffusion/api/openai_api#served-model-name) for discovery and retrieval examples.
+
 ## Performance Modes
 
 `--performance-mode` applies safe presets without overriding explicit offload, FSDP, or parallelism flags. `auto` is the default. Use `manual` when you need to keep performance-related server args under explicit user control. `--mode` is a short alias.
@@ -112,7 +128,7 @@ status-code contract and warmup-mode behavior.
   </tbody>
 </table>
 
-`auto` checks selected GPU memory before applying FSDP. In multi-GPU runs it uses the least available memory across selected GPUs, and only turns on FSDP automatically when doing so can replace DiT offload. Text encoder, image encoder, and other component residency still follow the offload policy unless the model marks a high-memory resident path as safe. When the model default uses CFG and the user did not set a parallelism policy, `auto` may also enable CFG parallelism. `speed` intentionally does not check memory; it is the mode for users who prefer latency/throughput and accept OOM risk. It keeps `torch.compile` disabled by default because its effect varies by model and workload. A model-specific deployment config may enable a validated compile path, and `--enable-torch-compile true` always opts in explicitly.
+`auto` checks selected GPU memory before applying FSDP. In multi-GPU runs it uses the least available memory across selected GPUs, and only turns on FSDP automatically when doing so can replace DiT offload. For image workloads with at least 45 GiB available per selected GPU, it keeps the repeatedly reused DiT resident and uses layerwise offload for large auxiliary encoders; below that threshold it keeps the DiT offloaded. Video DiT residency remains model- and workload-specific because frame count and resolution change its peak memory substantially. When the model default uses CFG and the user did not set a parallelism policy, `auto` may also enable CFG parallelism. `speed` intentionally does not check memory; it is the mode for users who prefer latency/throughput and accept OOM risk. It keeps `torch.compile` disabled by default because its effect varies by model and workload. A model-specific deployment config may enable a validated compile path, and `--enable-torch-compile true` always opts in explicitly.
 
 The modes tune residency for native pipeline components declared to the component residency manager. Today this covers the major DiT, text/image encoder, VAE, vocoder, and upsampler components; DiT can use layerwise offload when supported, while text encoders use either resident execution or component CPU offload. Do not assume text-encoder layerwise offload unless a model implements and validates it.
 

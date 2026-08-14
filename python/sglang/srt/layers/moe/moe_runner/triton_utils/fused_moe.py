@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -92,6 +93,8 @@ if not _is_cuda and not _is_hip and not _is_xpu:
         _has_vllm_ops = False
 
 padding_size = get_moe_padding_size(_use_aiter)
+
+logger = logging.getLogger(__name__)
 
 
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
@@ -363,7 +366,7 @@ def swiglu_no_interleaved_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
 
 
 @functools.lru_cache()
-def _down_moe_use_tma():
+def _moe_support_tma():
     return support_tensor_descriptor()
 
 
@@ -409,11 +412,26 @@ def _prepare_fused_moe_run(
         per_channel_quant=per_channel_quant,
         return_down_config=True,
     )
-    down_moe_use_tma = (
-        _down_moe_use_tma()
-        and down_config is not None
-        and down_config.pop("USE_TMA", False)
-    )
+    # Copy config to avoid mutating the lru_cached dict returned by
+    # get_moe_configs; we pop USE_TMA below.
+    config = dict(config)
+    # Up-projection TMA is opt-in: only enabled when the up config file
+    # explicitly carries "USE_TMA": true (produced by tuning). By default the
+    # existing up config files do not contain this key, so existing users are
+    # unaffected unless they re-tune with the updated script.
+    up_tma_requested = config.pop("USE_TMA", False)
+    up_moe_use_tma = _moe_support_tma() and up_tma_requested
+    if up_moe_use_tma:
+        logger.warning_once(
+            "Up MoE TMA is enabled (USE_TMA=true in the up-projection config). "
+            "This requires a config produced by the updated tuning script. "
+        )
+    down_tma_requested = down_config is not None and down_config.pop("USE_TMA", False)
+    down_moe_use_tma = _moe_support_tma() and down_tma_requested
+    if down_moe_use_tma:
+        logger.warning_once(
+            "Down MoE TMA is enabled (USE_TMA=true in the down-projection config)."
+        )
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, config["BLOCK_SIZE_M"], E
@@ -423,6 +441,7 @@ def _prepare_fused_moe_run(
         config,
         down_config,
         down_moe_use_tma,
+        up_moe_use_tma,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -441,6 +460,7 @@ def _fused_moe_kernel_sequence(
     config: Dict[str, Any],
     down_config: Optional[Dict[str, Any]],
     down_moe_use_tma: bool,
+    up_moe_use_tma: bool,
     *,
     b1: Optional[torch.Tensor],
     b2: Optional[torch.Tensor],
@@ -568,6 +588,7 @@ def _fused_moe_kernel_sequence(
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
         c_sorted=down_moe_use_tma,
+        b_use_tma=up_moe_use_tma,
         filter_expert=filter_expert,
     )
 
@@ -927,6 +948,7 @@ def fused_experts_impl(
         config,
         down_config,
         down_moe_use_tma,
+        up_moe_use_tma,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -955,6 +977,7 @@ def fused_experts_impl(
         config,
         down_config,
         down_moe_use_tma,
+        up_moe_use_tma,
         b1=b1,
         b2=b2,
         use_fp8_w8a8=use_fp8_w8a8,
