@@ -556,6 +556,9 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "speculative decoding."
         )
 
+    if server_args.speculative_eagle_topk is None:
+        server_args.speculative_eagle_topk = 1
+
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
         logger.warning(
