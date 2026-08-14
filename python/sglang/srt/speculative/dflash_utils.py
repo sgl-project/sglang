@@ -11,6 +11,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.sampling import top_k_renorm_probs as top_k_renorm_prob
+from sglang.kernels.ops.sampling import top_p_renorm_probs as top_p_renorm_prob
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -38,31 +40,26 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 )
 
 
-if is_cuda() or is_musa():
+if is_hip():
     try:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
+        from sglang.kernels.ops.speculative.tree_sampling import (
+            tree_speculative_sampling_target_only_triton,
         )
+
+        tree_speculative_sampling_target_only = (
+            tree_speculative_sampling_target_only_triton
+        )
+        _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
+    except Exception:
+        tree_speculative_sampling_target_only = None
+elif is_cuda() or is_musa():
+    try:
+        from sgl_kernel import tree_speculative_sampling_target_only
 
         _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
     except Exception:
-        top_k_renorm_prob = None
-        top_p_renorm_prob = None
         tree_speculative_sampling_target_only = None
-elif is_hip():
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_k_renorm_probs_triton as top_k_renorm_prob,
-    )
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_p_renorm_probs_triton as top_p_renorm_prob,
-    )
-
-    tree_speculative_sampling_target_only = None
 else:
-    top_k_renorm_prob = None
-    top_p_renorm_prob = None
     tree_speculative_sampling_target_only = None
 
 

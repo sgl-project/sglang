@@ -274,6 +274,166 @@ class SetKAndS:
         )
 
 
+class MoveKAndS:
+    """Move logical DSA index-cache entries between physical token slots.
+
+    ``buf`` is page-major and stores all K bytes before all scale bytes in each
+    page.  On the ROCm AITer path, K is additionally preshuffled in 16x16 tiles.
+    The slot arrays must have equal length and unique destinations.  Source and
+    destination sets may overlap: gathering into ``scratch`` before scattering
+    preserves assignment semantics.
+    """
+
+    @classmethod
+    def execute(cls, pool, buf, tgt_loc, src_loc, scratch=None):
+        assert tgt_loc.numel() == src_loc.numel()
+        if tgt_loc.numel() == 0:
+            return
+
+        assert tgt_loc.device == src_loc.device == buf.device
+        assert tgt_loc.dtype in (torch.int32, torch.int64)
+        assert src_loc.dtype in (torch.int32, torch.int64)
+        assert buf.dtype == torch.uint8
+        assert buf.ndim == 2
+        assert buf.shape[1] == pool.page_size * (
+            pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4
+        )
+
+        tgt_loc = tgt_loc.reshape(-1).to(torch.int64).contiguous()
+        src_loc = src_loc.reshape(-1).to(torch.int64).contiguous()
+        num_tokens = src_loc.numel()
+        payload_bytes = pool.index_head_dim + 4
+        if scratch is None:
+            scratch = torch.empty(
+                (num_tokens, payload_bytes), dtype=torch.uint8, device=buf.device
+            )
+        else:
+            assert scratch.shape == (num_tokens, payload_bytes)
+            assert scratch.dtype == torch.uint8
+            assert scratch.device == buf.device
+            assert scratch.is_contiguous()
+
+        preshuffle_tile = (
+            INDEXER_K_CACHE_PRESHUFFLE_TILE if _use_aiter_preshuffle else 0
+        )
+        _gather_k_and_s_by_loc_kernel[(num_tokens,)](
+            buf,
+            src_loc,
+            scratch,
+            PAGE_SIZE=pool.page_size,
+            BUF_NUMEL_PER_PAGE=buf.shape[1],
+            NUM_K_ELEMS_PER_TOKEN=pool.index_head_dim,
+            PRESHUFFLE_TILE=preshuffle_tile,
+        )
+        _scatter_k_and_s_by_loc_kernel[(num_tokens,)](
+            buf,
+            tgt_loc,
+            scratch,
+            PAGE_SIZE=pool.page_size,
+            BUF_NUMEL_PER_PAGE=buf.shape[1],
+            NUM_K_ELEMS_PER_TOKEN=pool.index_head_dim,
+            PRESHUFFLE_TILE=preshuffle_tile,
+        )
+
+
+@triton.jit
+def _gather_k_and_s_by_loc_kernel(
+    buf_ptr,
+    src_loc_ptr,
+    scratch_ptr,
+    PAGE_SIZE: tl.constexpr,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    NUM_K_ELEMS_PER_TOKEN: tl.constexpr,
+    PRESHUFFLE_TILE: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    loc = tl.load(src_loc_ptr + token_id)
+    page = loc // PAGE_SIZE
+    token_in_page = loc % PAGE_SIZE
+
+    k_range = tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
+    if PRESHUFFLE_TILE:
+        tile = PRESHUFFLE_TILE
+        token_tile = token_in_page // tile
+        token_in_tile = token_in_page % tile
+        col_tile = k_range // tile
+        col_in_tile = k_range % tile
+        k_offsets = (
+            page * BUF_NUMEL_PER_PAGE
+            + token_tile * (tile * NUM_K_ELEMS_PER_TOKEN)
+            + col_tile * (tile * tile)
+            + token_in_tile * tile
+            + col_in_tile
+        )
+    else:
+        k_offsets = (
+            page * BUF_NUMEL_PER_PAGE + token_in_page * NUM_K_ELEMS_PER_TOKEN + k_range
+        )
+    payload_base = token_id * (NUM_K_ELEMS_PER_TOKEN + 4)
+    tl.store(scratch_ptr + payload_base + k_range, tl.load(buf_ptr + k_offsets))
+
+    scale_range = tl.arange(0, 4)
+    scale_offsets = (
+        page * BUF_NUMEL_PER_PAGE
+        + PAGE_SIZE * NUM_K_ELEMS_PER_TOKEN
+        + token_in_page * 4
+        + scale_range
+    )
+    tl.store(
+        scratch_ptr + payload_base + NUM_K_ELEMS_PER_TOKEN + scale_range,
+        tl.load(buf_ptr + scale_offsets),
+    )
+
+
+@triton.jit
+def _scatter_k_and_s_by_loc_kernel(
+    buf_ptr,
+    tgt_loc_ptr,
+    scratch_ptr,
+    PAGE_SIZE: tl.constexpr,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    NUM_K_ELEMS_PER_TOKEN: tl.constexpr,
+    PRESHUFFLE_TILE: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    loc = tl.load(tgt_loc_ptr + token_id)
+    page = loc // PAGE_SIZE
+    token_in_page = loc % PAGE_SIZE
+
+    k_range = tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
+    if PRESHUFFLE_TILE:
+        tile = PRESHUFFLE_TILE
+        token_tile = token_in_page // tile
+        token_in_tile = token_in_page % tile
+        col_tile = k_range // tile
+        col_in_tile = k_range % tile
+        k_offsets = (
+            page * BUF_NUMEL_PER_PAGE
+            + token_tile * (tile * NUM_K_ELEMS_PER_TOKEN)
+            + col_tile * (tile * tile)
+            + token_in_tile * tile
+            + col_in_tile
+        )
+    else:
+        k_offsets = (
+            page * BUF_NUMEL_PER_PAGE + token_in_page * NUM_K_ELEMS_PER_TOKEN + k_range
+        )
+    payload_base = token_id * (NUM_K_ELEMS_PER_TOKEN + 4)
+    tl.store(k_offsets + buf_ptr, tl.load(scratch_ptr + payload_base + k_range))
+
+    scale_range = tl.arange(0, 4)
+    scale_offsets = (
+        page * BUF_NUMEL_PER_PAGE
+        + PAGE_SIZE * NUM_K_ELEMS_PER_TOKEN
+        + token_in_page * 4
+        + scale_range
+    )
+    tl.store(
+        buf_ptr + scale_offsets,
+        tl.load(scratch_ptr + payload_base + NUM_K_ELEMS_PER_TOKEN + scale_range),
+    )
+
+
 def _set_k_and_s_triton(
     buf: torch.Tensor,
     loc: torch.Tensor,
