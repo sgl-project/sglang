@@ -62,6 +62,8 @@ class PoolName(str, Enum):
     MAMBA = "mamba"
     SWA = "swa"
     INDEXER = "indexer"
+    CANARY = "canary"
+    CANARY_SWA = "canary_swa"
     # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
     # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
     DEEPSEEK_V4_C4 = "deepseek_v4_c4"
@@ -359,7 +361,6 @@ class MetadataCache:
 
 
 class HiCacheFile(HiCacheStorage):
-
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
