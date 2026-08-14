@@ -87,8 +87,11 @@ fp8_macro = (
 # Dynamic shared-memory budget for the TopK kernels.
 # - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
 #   (leaves room for static shared allocations in the kernel).
-# - gfx95x (MI350) and gfx1250: LDS is larger -> allow the original 128KB dynamic smem.
-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024 * 4
+# - gfx95x (MI350) and gfx1250: LDS is larger (160KB/CU) but the tie-candidate
+#   buffer only needs ~length/256 entries, so a large dynamic budget just wastes
+#   LDS and pins occupancy to 1 block/CU. Keep it small (32KB) so the 512-thread
+#   block reaches the thread-limited 4 blocks/CU -> ~3x faster topk on gfx950.
+topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024
 
 hipcc_flags = [
     "-DNDEBUG",
