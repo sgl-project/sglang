@@ -20,6 +20,7 @@ namespace sglang {
 struct TopkSumParams {
   const bf16_t* __restrict__ in;  // [M, topk, K] contiguous
   bf16_t* __restrict__ out;       // [M, K] contiguous
+  uint32_t M;
   uint32_t K;
   uint32_t topk;
 };
@@ -31,7 +32,9 @@ __global__ void topk_sum_kernel(const TopkSumParams __grid_constant__ params) {
   constexpr int kVecN = 8;  // 8 bf16 = 128 bits
   using vec_bf16_t = AlignedVector<bf16_t, kVecN>;
 
-  const uint32_t m = blockIdx.y;
+  const uint32_t m = blockIdx.y + blockIdx.z * gridDim.y;
+  if (m >= params.M) return;
+
   const uint32_t v = blockIdx.x * kThreads + threadIdx.x;
   const uint32_t n_vecs = params.K / kVecN;
   if (v >= n_vecs) return;
@@ -90,12 +93,16 @@ struct TopkSumKernel {
     const auto params = TopkSumParams{
         .in = static_cast<const bf16_t*>(in.data_ptr()),
         .out = static_cast<bf16_t*>(out.data_ptr()),
+        .M = M,
         .K = K,
         .topk = topk,
     };
 
     const uint32_t n_vecs = K / 8;
-    dim3 grid((n_vecs + kThreads - 1) / kThreads, M);
+    constexpr uint32_t kMaxGridY = 65535;
+    const uint32_t grid_z = (M + kMaxGridY - 1) / kMaxGridY;
+    const uint32_t grid_y = (M + grid_z - 1) / grid_z;
+    dim3 grid((n_vecs + kThreads - 1) / kThreads, grid_y, grid_z);
     LaunchKernel(grid, kThreads, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
