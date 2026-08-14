@@ -408,6 +408,52 @@ def _topk_index_kernel(
 
 
 @torch.no_grad()
+def topk_index_from_block_score(
+    score: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    cu_seqblocks_q: torch.Tensor,
+    max_seqblock_q: int,
+    all_seqblock_q: int,
+    block_size_q: int,
+    block_size_k: int,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+):
+    num_heads = score.shape[0]
+    batch_size = cu_seqlens.shape[0] - 1
+    topk_idx = torch.full(
+        (num_heads, all_seqblock_q, topk),
+        fill_value=-1,
+        device=score.device,
+        dtype=torch.int32,
+    )
+    grid = (max_seqblock_q, batch_size, num_heads)
+    _topk_index_kernel[grid](
+        score,
+        topk_idx,
+        block_size_q,
+        block_size_k,
+        cu_seqlens,
+        cu_seqblocks_q,
+        prefix_lens,
+        topk,
+        init_blocks,
+        local_blocks,
+        score.stride(0),
+        score.stride(1),
+        score.stride(2),
+        topk_idx.stride(0),
+        topk_idx.stride(1),
+        topk_idx.stride(2),
+        MASK_INIT=False,
+        MASK_LOCAL=False,
+    )
+    return topk_idx
+
+
+@torch.no_grad()
 def flash_prefill_with_topk_index(
     q: torch.Tensor,
     k_cache: torch.Tensor,  # paged
@@ -557,33 +603,17 @@ def flash_prefill_with_topk_index(
         num_stages=num_stages,
     )
 
-    # topk extraction kernel
-    topk_idx = torch.full(
-        (num_heads, all_seqblock_q, topk),
-        fill_value=-1,
-        device=score.device,
-        dtype=torch.int32,
-    )
-    # launch kernel
-    grid = (max_seqblock_q, batch_size, num_heads)
-    _topk_index_kernel[grid](
+    topk_idx = topk_index_from_block_score(
         score,
-        topk_idx,
+        cu_seqlens,
+        prefix_lens,
+        cu_seqblocks_q,
+        max_seqblock_q,
+        all_seqblock_q,
         block_size_q,
         block_size_k,
-        cu_seqlens,
-        cu_seqblocks_q,
-        prefix_lens,
         topk,
         init_blocks,
         local_blocks,
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
-        topk_idx.stride(0),
-        topk_idx.stride(1),
-        topk_idx.stride(2),
-        MASK_INIT=False,
-        MASK_LOCAL=False,
     )
     return o, topk_idx
