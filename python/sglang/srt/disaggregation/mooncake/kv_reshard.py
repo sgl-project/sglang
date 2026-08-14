@@ -7,10 +7,10 @@ planning, request-time address binding, and TE submission.
 
 from __future__ import annotations
 
-import hashlib
 import json
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Mapping
+from typing import Any
 
 import numpy as np
 
@@ -20,11 +20,6 @@ KV_RESHARD_SCHEMA_VERSION = 1
 
 class KVReshardCompatibilityError(RuntimeError):
     pass
-
-
-def _weight_generation(weight_version: str) -> int:
-    digest = hashlib.sha256(weight_version.encode()).digest()
-    return int.from_bytes(digest[:8], byteorder="big", signed=False)
 
 
 def _head_placement(
@@ -76,7 +71,20 @@ class KVReshardRuntime:
         tp_rank: int,
         tp_size: int,
     ) -> None:
-        from mooncake.reshard.kv_cache import KVCachePlacementPart
+        from mooncake.reshard.contracts import (
+            ParticipantId,
+            PlacementSetId,
+            ResourceId,
+            RevisionId,
+        )
+        from mooncake.reshard.kv_cache import (
+            KVCacheDescriptor,
+            KVCacheLayout,
+            KVCachePlacementPart,
+            KVCacheRank,
+            KVCacheTopology,
+            KVCacheTopologyParticipant,
+        )
 
         if role not in ("prefill", "decode"):
             raise ValueError(f"invalid KV reshard role: {role}")
@@ -99,11 +107,44 @@ class KVReshardRuntime:
             f"{server_args.model_path}@{server_args.revision or 'default'}"
             f"#{server_args.weight_version}"
         )
-        self.weight_generation = _weight_generation(server_args.weight_version)
-        self.resource_id = f"kv:{server_args.model_path}"
-        self.instance_id = f"{role}:dp{dp_rank}"
-        self.participant_id = _participant_id(role, dp_rank, pp_rank, tp_rank)
+        self.resource_id = ResourceId(f"kv:{server_args.model_path}")
+        self.revision = RevisionId(self.revision)
+        self.placement_set_id = PlacementSetId(
+            f"{role}:dp{dp_rank}:{self.resource_id}:{self.revision}"
+        )
+        self.participant_id = ParticipantId(
+            _participant_id(role, dp_rank, pp_rank, tp_rank)
+        )
         self._validate_geometry()
+        self.descriptor = KVCacheDescriptor(
+            global_layer_ids=tuple(range(self.total_layers)),
+            dtype=self.dtype,
+            itemsize=self.itemsize,
+            page_size=self.page_size,
+            total_kv_heads=self.total_kv_heads,
+            key_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
+            layout=KVCacheLayout.NHD,
+        )
+        self.topology = KVCacheTopology(
+            dp_size=dp_size,
+            pp_size=pp_size,
+            tp_size=tp_size,
+            participants=tuple(
+                KVCacheTopologyParticipant(
+                    participant_id=ParticipantId(
+                        _participant_id(role, dp_rank, participant_pp, participant_tp)
+                    ),
+                    rank=KVCacheRank(
+                        dp=dp_rank,
+                        pp=participant_pp,
+                        tp=participant_tp,
+                    ),
+                )
+                for participant_pp in range(pp_size)
+                for participant_tp in range(tp_size)
+            ),
+        )
         head_start, head_count, replica_ordinal, replica_count = _head_placement(
             self.total_kv_heads, tp_rank, tp_size
         )
@@ -115,26 +156,16 @@ class KVReshardRuntime:
         self.local_part = KVCachePlacementPart(
             resource_id=self.resource_id,
             revision=self.revision,
-            weight_generation=self.weight_generation,
+            placement_set_id=self.placement_set_id,
+            topology_id=self.topology.topology_id,
             participant_id=self.participant_id,
-            instance_id=self.instance_id,
-            dp_rank=dp_rank,
-            dp_size=dp_size,
-            pp_rank=pp_rank,
-            pp_size=pp_size,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            rank=KVCacheRank(dp=dp_rank, pp=pp_rank, tp=tp_rank),
+            descriptor=self.descriptor,
             layer_ids=self.layer_ids,
-            total_kv_heads=self.total_kv_heads,
             head_start=head_start,
             head_count=head_count,
             replica_ordinal=replica_ordinal,
             replica_count=replica_count,
-            dtype=self.dtype,
-            itemsize=self.itemsize,
-            page_size=self.page_size,
-            key_head_dim=self.key_head_dim,
-            value_head_dim=self.value_head_dim,
         )
         self.binding = None
         self.transfer_engine = None
@@ -189,14 +220,21 @@ class KVReshardRuntime:
             )
 
     def bind_runtime(self, *, session_id: str, transfer_engine: Any) -> None:
-        from mooncake.reshard.contracts import RuntimeBindingFragment
+        from mooncake.reshard.contracts import (
+            LeaseId,
+            RuntimeFragmentId,
+            RuntimeInstanceId,
+        )
         from mooncake.reshard.kv_cache import (
             KVCacheBufferBinding,
             KVCacheComponent,
             KVCacheRuntimeBindingManifest,
+            KVCacheRuntimeBuffer,
             placement_fragment_id,
+            validate_runtime_binding,
         )
 
+        placement = self.complete_local_placement()
         layer_count = len(self.layer_ids)
         buffers = []
         for component, offset, head_dim in (
@@ -214,17 +252,20 @@ class KVReshardRuntime:
                     raise KVReshardCompatibilityError(
                         "SGLang KV buffer bytes differ from the NHD manifest geometry"
                     )
-                fragment = RuntimeBindingFragment(
+                fragment = KVCacheRuntimeBuffer(
                     placement_fragment_id=placement_fragment_id(
-                        self.participant_id, layer_id, component
+                        self.participant_id,
+                        layer_id,
+                        component,
+                        head_start=self.local_part.head_start,
+                        head_count=self.local_part.head_count,
                     ),
-                    fragment_id=(
+                    fragment_id=RuntimeFragmentId(
                         f"{self.participant_id}:{layer_id}:{component.value}:"
-                        f"{self.weight_generation}"
+                        f"{session_id}"
                     ),
                     address=address,
                     nbytes=nbytes,
-                    worker_id=self.participant_id,
                     endpoint=session_id,
                     device=f"cuda:{self.kv_args.gpu_id}",
                     itemsize=self.itemsize,
@@ -237,45 +278,62 @@ class KVReshardRuntime:
                 buffers.append(KVCacheBufferBinding(layer_id, component, fragment))
         self.binding = KVCacheRuntimeBindingManifest(
             resource_id=self.resource_id,
-            placement_id=self.local_part.placement_id,
-            placement_digest=self.local_part.digest,
-            instance_id=self.instance_id,
-            generation=self.weight_generation,
-            lease_id=f"static:{self.participant_id}:{session_id}",
+            placement_id=placement.placement_id,
+            placement_digest=placement.digest,
+            instance_id=RuntimeInstanceId(f"{self.participant_id}:{session_id}"),
+            generation=0,
+            lease_id=LeaseId(f"static:{self.participant_id}:{session_id}"),
             revision=self.revision,
-            weight_generation=self.weight_generation,
             participant_id=self.participant_id,
             buffers=tuple(buffers),
         )
+        validate_runtime_binding(placement, self.binding)
         self.transfer_engine = transfer_engine
 
     @staticmethod
-    def assemble_placement(parts: Iterable[Mapping[str, Any]]):
+    def assemble_placement(
+        parts: Iterable[str],
+        *,
+        dp_size: int,
+        pp_size: int,
+        tp_size: int,
+    ):
         from mooncake.reshard.kv_cache import (
-            KVCacheManifest,
             KVCachePlacementManifest,
-            KVCachePlacementPart,
+            KVCacheTopology,
+            KVCacheTopologyParticipant,
+            kv_cache_part_from_json,
         )
 
-        parsed = tuple(KVCachePlacementPart.from_dict(value) for value in parts)
+        parsed = tuple(kv_cache_part_from_json(value) for value in parts)
         if not parsed:
             raise KVReshardCompatibilityError("KV reshard placement has no parts")
         first = parsed[0]
-        manifest = KVCacheManifest(
+        topology = KVCacheTopology(
+            dp_size=dp_size,
+            pp_size=pp_size,
+            tp_size=tp_size,
+            participants=tuple(
+                KVCacheTopologyParticipant(part.participant_id, part.rank)
+                for part in parsed
+            ),
+        )
+        return KVCachePlacementManifest(
             resource_id=first.resource_id,
             revision=first.revision,
-            weight_generation=first.weight_generation,
-            global_layer_ids=tuple(
-                sorted({layer for part in parsed for layer in part.layer_ids})
-            ),
-            dtype=first.dtype,
-            itemsize=first.itemsize,
-            page_size=first.page_size,
-            total_kv_heads=first.total_kv_heads,
-            key_head_dim=first.key_head_dim,
-            value_head_dim=first.value_head_dim,
+            placement_set_id=first.placement_set_id,
+            topology=topology,
+            descriptor=first.descriptor,
+            parts=parsed,
         )
-        return KVCachePlacementManifest(manifest=manifest, parts=parsed)
+
+    @staticmethod
+    def placement_digest(placement_json: str) -> str:
+        from mooncake.reshard.kv_cache import (
+            kv_cache_placement_from_json,
+        )
+
+        return kv_cache_placement_from_json(placement_json).digest
 
     def complete_local_placement(self):
         if self._complete_placement is not None:
@@ -283,7 +341,11 @@ class KVReshardRuntime:
 
         from sglang.srt.distributed.utils import get_pp_indices
 
-        from mooncake.reshard.kv_cache import KVCachePlacementPart
+        from mooncake.reshard.kv_cache import (
+            KVCachePlacementManifest,
+            KVCachePlacementPart,
+            KVCacheRank,
+        )
 
         parts = []
         for pp_rank in range(self.pp_size):
@@ -296,33 +358,30 @@ class KVReshardRuntime:
                     KVCachePlacementPart(
                         resource_id=self.resource_id,
                         revision=self.revision,
-                        weight_generation=self.weight_generation,
+                        placement_set_id=self.placement_set_id,
+                        topology_id=self.topology.topology_id,
                         participant_id=_participant_id(
                             self.role, self.dp_rank, pp_rank, tp_rank
                         ),
-                        instance_id=self.instance_id,
-                        dp_rank=self.dp_rank,
-                        dp_size=self.dp_size,
-                        pp_rank=pp_rank,
-                        pp_size=self.pp_size,
-                        tp_rank=tp_rank,
-                        tp_size=self.tp_size,
+                        rank=KVCacheRank(dp=self.dp_rank, pp=pp_rank, tp=tp_rank),
+                        descriptor=self.descriptor,
                         layer_ids=tuple(range(start, end)),
-                        total_kv_heads=self.total_kv_heads,
                         head_start=head_start,
                         head_count=head_count,
                         replica_ordinal=replica_ordinal,
                         replica_count=replica_count,
-                        dtype=self.dtype,
-                        itemsize=self.itemsize,
-                        page_size=self.page_size,
-                        key_head_dim=self.key_head_dim,
-                        value_head_dim=self.value_head_dim,
                     )
                 )
-        placement = self.assemble_placement(part.to_dict() for part in parts)
+        placement = KVCachePlacementManifest(
+            resource_id=self.resource_id,
+            revision=self.revision,
+            placement_set_id=self.placement_set_id,
+            topology=self.topology,
+            descriptor=self.descriptor,
+            parts=tuple(parts),
+        )
         synthesized_local = placement.part(self.participant_id)
-        if synthesized_local.digest != self.local_part.digest:
+        if synthesized_local != self.local_part:
             raise KVReshardCompatibilityError(
                 "SGLang runtime PP layer IDs differ from the synthesized target "
                 "placement; check SGLANG_PP_LAYER_PARTITION on every rank"
@@ -337,15 +396,21 @@ class KVReshardRuntime:
         routes: Mapping[str, Mapping[str, Any]],
     ) -> KVReshardRoutePlan:
         from mooncake.reshard.kv_cache import (
-            KVCachePlacementManifest,
+            kv_cache_logical_plan_to_json,
+            kv_cache_placement_from_json,
             plan_kv_cache_transfer_to_local_target,
         )
 
-        source = KVCachePlacementManifest.from_json(source_placement_json)
-        fanout: Dict[str, int] = {part.participant_id: 0 for part in source.parts}
+        source = kv_cache_placement_from_json(source_placement_json)
+        target = self.complete_local_placement()
+        fanout: dict[str, int] = {part.participant_id: 0 for part in source.parts}
         local_plan = None
-        for target_part in self.complete_local_placement().parts:
-            plan = plan_kv_cache_transfer_to_local_target(source, target_part)
+        for target_part in target.parts:
+            plan = plan_kv_cache_transfer_to_local_target(
+                source,
+                target,
+                target_part.participant_id,
+            )
             if target_part.participant_id == self.participant_id:
                 local_plan = plan
             for writer in plan.source_participant_ids:
@@ -366,7 +431,12 @@ class KVReshardRuntime:
                     "participant_id": writer,
                     "is_dummy": False,
                     "required_dst_info_num": fanout[writer],
-                    "kv_reshard_plan": local_plan.for_source(writer).to_dict(),
+                    "kv_reshard_plan_json": kv_cache_logical_plan_to_json(
+                        local_plan.for_source(writer)
+                    ),
+                    "kv_reshard_edge_count": len(
+                        local_plan.for_source(writer).edges
+                    ),
                 }
             )
             infos.append(info)
@@ -375,19 +445,22 @@ class KVReshardRuntime:
             expected_writer_ids=local_plan.expected_writer_ids,
         )
 
-    def prepare_transfer(self, *, logical_plan: Any, target_binding: Any):
+    def prepare_transfer(
+        self,
+        *,
+        logical_plan_json: str,
+        target_binding_json: str,
+    ):
         from mooncake.reshard.kv_cache import (
-            KVCacheLogicalTransferPlan,
-            KVCacheRuntimeBindingManifest,
+            kv_cache_logical_plan_from_json,
+            kv_cache_runtime_binding_from_json,
             prepare_kv_cache_transfer,
         )
 
         if self.binding is None:
             raise RuntimeError("KV reshard runtime is not physically bound")
-        if isinstance(logical_plan, Mapping):
-            logical_plan = KVCacheLogicalTransferPlan.from_dict(logical_plan)
-        if isinstance(target_binding, Mapping):
-            target_binding = KVCacheRuntimeBindingManifest.from_dict(target_binding)
+        logical_plan = kv_cache_logical_plan_from_json(logical_plan_json)
+        target_binding = kv_cache_runtime_binding_from_json(target_binding_json)
         return prepare_kv_cache_transfer(logical_plan, self.binding, target_binding)
 
     @staticmethod
@@ -445,7 +518,7 @@ class KVReshardRuntime:
         max_source_slot = int(source_slots.max())
         max_target_slot = int(target_slots.max())
 
-        pending: Dict[
+        pending: dict[
             tuple[str, int | None], tuple[list[int], list[int], list[int]]
         ] = {}
         batches = []
@@ -575,7 +648,7 @@ def encode_wire_json(value: Mapping[str, Any]) -> bytes:
 def decode_wire_json(value: bytes) -> dict[str, Any]:
     payload = json.loads(value.decode())
     if not isinstance(payload, dict):
-        raise ValueError("KV_RESHARD_V1 payload must be an object")
+        raise TypeError("KV_RESHARD_V1 payload must be an object")
     return payload
 
 

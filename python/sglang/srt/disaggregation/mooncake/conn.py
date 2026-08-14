@@ -241,8 +241,8 @@ class KVReshardRegisterInfo:
             mooncake_session_id=str(header["mooncake_session_id"]),
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[2]) // 8}Q", msg[2])),
             prepared_plan=runtime.prepare_transfer(
-                logical_plan=header["logical_plan"],
-                target_binding=header["target_binding"],
+                logical_plan_json=str(header["logical_plan_json"]),
+                target_binding_json=str(header["target_binding_json"]),
             ),
         )
 
@@ -2570,13 +2570,16 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     raise KVReshardCompatibilityError(
                         "bootstrap returned an incompatible KV reshard protocol"
                     )
-                source_digest = payload.get("placement", {}).get("placement_digest")
-                if not isinstance(source_digest, str) or not source_digest:
+                source_placement_json = payload.get("placement_json")
+                if not isinstance(source_placement_json, str):
                     raise KVReshardCompatibilityError(
-                        "bootstrap placement is missing its canonical digest"
+                        "bootstrap placement is missing its canonical JSON"
                     )
+                source_digest = self.kv_mgr.kv_reshard.placement_digest(
+                    source_placement_json
+                )
                 route_plan = self.kv_mgr.kv_reshard.plan_decode_routes(
-                    source_placement_json=json.dumps(payload["placement"]),
+                    source_placement_json=source_placement_json,
                     routes=payload["routes"],
                 )
                 self.bootstrap_infos = list(route_plan.bootstrap_infos)
@@ -2586,10 +2589,10 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     "target_digest=%s writers=%s edges=%s",
                     self.bootstrap_room,
                     source_digest,
-                    self.kv_mgr.kv_reshard.local_part.digest,
+                    self.kv_mgr.kv_reshard.complete_local_placement().digest,
                     list(route_plan.expected_writer_ids),
                     sum(
-                        len(info["kv_reshard_plan"]["edges"])
+                        int(info["kv_reshard_edge_count"])
                         for info in self.bootstrap_infos
                     ),
                 )
@@ -2692,6 +2695,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
         return True
 
     def _register_kv_reshard_args(self) -> bool:
+        from mooncake.reshard.kv_cache import kv_cache_runtime_binding_to_json
+
         binding = self.kv_mgr.kv_reshard.binding
         if binding is None:
             raise RuntimeError("decode KV reshard binding is unavailable")
@@ -2703,8 +2708,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 "protocol": KV_RESHARD_PROTOCOL,
                 "schema_version": KV_RESHARD_SCHEMA_VERSION,
                 "mooncake_session_id": self.session_id,
-                "target_binding": binding.to_dict(),
-                "logical_plan": bootstrap_info["kv_reshard_plan"],
+                "target_binding_json": kv_cache_runtime_binding_to_json(binding),
+                "logical_plan_json": bootstrap_info["kv_reshard_plan_json"],
             }
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             try:

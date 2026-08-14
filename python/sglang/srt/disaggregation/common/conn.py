@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import dataclasses
-import json
 import logging
 import threading
 import time
@@ -605,13 +604,21 @@ class CommonKVManager(BaseKVManager):
                 )
 
         if self.enable_kv_reshard:
-            if not kv_reshard_capability or kv_reshard_schema_version != 1:
+            from sglang.srt.disaggregation.mooncake.kv_reshard import (
+                KV_RESHARD_PROTOCOL,
+                KV_RESHARD_SCHEMA_VERSION,
+            )
+
+            if (
+                not kv_reshard_capability
+                or kv_reshard_schema_version != KV_RESHARD_SCHEMA_VERSION
+            ):
                 raise RuntimeError(
-                    "Prefill does not advertise a compatible KV_RESHARD_V1 "
+                    f"Prefill does not advertise a compatible {KV_RESHARD_PROTOCOL} "
                     "manifest capability"
                 )
             if info.attn_cp_size != 1:
-                raise RuntimeError("KV_RESHARD_V1 does not support prefill CP")
+                raise RuntimeError(f"{KV_RESHARD_PROTOCOL} does not support prefill CP")
         else:
             self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
@@ -771,11 +778,19 @@ class CommonKVManager(BaseKVManager):
             "prefill_http_port": get_serving().port,
         }
         if getattr(self, "enable_kv_reshard", False):
+            from mooncake.reshard.kv_cache import kv_cache_part_to_json
+
+            from sglang.srt.disaggregation.mooncake.kv_reshard import (
+                KV_RESHARD_SCHEMA_VERSION,
+            )
+
             payload.update(
                 {
                     "kv_reshard_capability": True,
-                    "kv_reshard_schema_version": 1,
-                    "kv_reshard_placement_part": self.kv_reshard.local_part.to_dict(),
+                    "kv_reshard_schema_version": KV_RESHARD_SCHEMA_VERSION,
+                    "kv_reshard_placement_part_json": kv_cache_part_to_json(
+                        self.kv_reshard.local_part
+                    ),
                 }
             )
 
@@ -1646,7 +1661,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.prefill_http_port: Optional[int] = None
         self.kv_reshard_capability: Optional[bool] = None
         self.kv_reshard_schema_version: int = 0
-        self.kv_reshard_parts: Dict[int, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+        self.kv_reshard_parts: Dict[int, Dict[str, str]] = defaultdict(dict)
         self.kv_reshard_routes: Dict[int, Dict[str, Dict[str, Union[str, int]]]] = (
             defaultdict(dict)
         )
@@ -1722,9 +1737,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         prefill_http_port = data.get("prefill_http_port")
         kv_reshard_capability = bool(data.get("kv_reshard_capability", False))
         kv_reshard_schema_version = int(data.get("kv_reshard_schema_version", 0))
-        kv_reshard_part = data.get("kv_reshard_placement_part")
+        kv_reshard_part_json = data.get("kv_reshard_placement_part_json")
 
-        if kv_reshard_capability and not isinstance(kv_reshard_part, dict):
+        if kv_reshard_capability and not isinstance(kv_reshard_part_json, str):
             return web.Response(text="Missing KV placement part", status=400)
         if self.kv_reshard_capability is None:
             self.kv_reshard_capability = kv_reshard_capability
@@ -1783,8 +1798,18 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
             tp_group_table[pp_rank] = PrefillRankInfo(rank_ip, rank_port)
             if kv_reshard_capability:
-                participant_id = kv_reshard_part["participant_id"]
-                self.kv_reshard_parts[dp_group][participant_id] = kv_reshard_part
+                try:
+                    from mooncake.reshard.kv_cache import kv_cache_part_from_json
+
+                    kv_reshard_part = kv_cache_part_from_json(kv_reshard_part_json)
+                except (TypeError, ValueError) as error:
+                    return web.Response(
+                        text=f"Invalid KV placement part: {error}", status=400
+                    )
+                participant_id = kv_reshard_part.participant_id
+                self.kv_reshard_parts[dp_group][
+                    participant_id
+                ] = kv_reshard_part_json
                 self.kv_reshard_routes[dp_group][participant_id] = {
                     "rank_ip": rank_ip,
                     "rank_port": rank_port,
@@ -1875,8 +1900,18 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             return web.Response(
                 text="Prefill server is not fully registered", status=503
             )
-        if not self.kv_reshard_capability or self.kv_reshard_schema_version != 1:
-            return web.Response(text="KV_RESHARD_V1 is not enabled", status=409)
+        from sglang.srt.disaggregation.mooncake.kv_reshard import (
+            KV_RESHARD_PROTOCOL,
+            KV_RESHARD_SCHEMA_VERSION,
+        )
+
+        if (
+            not self.kv_reshard_capability
+            or self.kv_reshard_schema_version != KV_RESHARD_SCHEMA_VERSION
+        ):
+            return web.Response(
+                text=f"{KV_RESHARD_PROTOCOL} is not enabled", status=409
+            )
         raw_dp_rank = request.query.get("prefill_dp_rank")
         if raw_dp_rank is None:
             return web.Response(text="Missing prefill_dp_rank", status=400)
@@ -1886,11 +1921,16 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             routes = dict(self.kv_reshard_routes.get(dp_rank, {}))
         try:
             from sglang.srt.disaggregation.mooncake.kv_reshard import (
-                KV_RESHARD_PROTOCOL,
                 KVReshardRuntime,
             )
+            from mooncake.reshard.kv_cache import kv_cache_placement_to_json
 
-            placement = KVReshardRuntime.assemble_placement(part_values)
+            placement = KVReshardRuntime.assemble_placement(
+                part_values,
+                dp_size=self.dp_size,
+                pp_size=self.pp_size,
+                tp_size=self.attn_tp_size,
+            )
         except Exception as error:
             logger.exception("Invalid KV reshard source placement")
             return web.Response(
@@ -1899,8 +1939,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         return web.json_response(
             {
                 "protocol": KV_RESHARD_PROTOCOL,
-                "schema_version": 1,
-                "placement": json.loads(placement.to_json()),
+                "schema_version": KV_RESHARD_SCHEMA_VERSION,
+                "placement_json": kv_cache_placement_to_json(placement),
                 "routes": routes,
             },
             status=200,

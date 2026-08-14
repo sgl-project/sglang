@@ -10,6 +10,13 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+from mooncake.reshard.kv_cache import (
+    kv_cache_logical_plan_from_json,
+    kv_cache_part_to_json,
+    kv_cache_placement_from_json,
+    kv_cache_placement_to_json,
+    kv_cache_runtime_binding_to_json,
+)
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
@@ -138,7 +145,10 @@ def _source_placement(
         for tp_rank in range(tp_size)
     ]
     placement = KVReshardRuntime.assemble_placement(
-        runtime.local_part.to_dict() for runtime in runtimes
+        (kv_cache_part_to_json(runtime.local_part) for runtime in runtimes),
+        dp_size=1,
+        pp_size=pp_size,
+        tp_size=tp_size,
     )
     routes = {
         runtime.participant_id: {
@@ -163,7 +173,7 @@ def test_pp_2_to_3_and_tp_1_to_2_routes_come_only_from_planner() -> None:
     )
 
     route_plan = target.plan_decode_routes(
-        source_placement_json=source.to_json(), routes=routes
+        source_placement_json=kv_cache_placement_to_json(source), routes=routes
     )
 
     assert route_plan.expected_writer_ids == (
@@ -175,9 +185,11 @@ def test_pp_2_to_3_and_tp_1_to_2_routes_come_only_from_planner() -> None:
     )
     assert {info["required_dst_info_num"] for info in route_plan.bootstrap_infos} == {4}
     edge_layers = {
-        edge["global_layer_id"]
+        edge.global_layer_id
         for info in route_plan.bootstrap_infos
-        for edge in info["kv_reshard_plan"]["edges"]
+        for edge in kv_cache_logical_plan_from_json(
+            info["kv_reshard_plan_json"]
+        ).edges
     }
     assert edge_layers == {1, 2}
 
@@ -197,10 +209,22 @@ def test_gqa_replica_selects_exact_matching_writer() -> None:
     )
 
     route_plan = target.plan_decode_routes(
-        source_placement_json=source.to_json(), routes=routes
+        source_placement_json=kv_cache_placement_to_json(source), routes=routes
     )
 
     assert route_plan.expected_writer_ids == ("prefill:dp0:pp0:tp3",)
+
+
+def test_incomplete_source_collection_cannot_form_a_placement() -> None:
+    placement, _ = _source_placement(total_layers=2, pp_size=2, tp_size=2)
+
+    with pytest.raises(ValueError, match="topology_id differs"):
+        KVReshardRuntime.assemble_placement(
+            (kv_cache_part_to_json(part) for part in placement.parts[:-1]),
+            dp_size=1,
+            pp_size=2,
+            tp_size=2,
+        )
 
 
 class _FakeEngine:
@@ -283,12 +307,12 @@ def test_prepared_request_lowers_partial_page_ranges_to_native_batch() -> None:
         total_layers=1, pp_size=1, tp_size=1, total_heads=2
     )
     route_plan = target_runtime.plan_decode_routes(
-        source_placement_json=source.to_json(), routes=routes
+        source_placement_json=kv_cache_placement_to_json(source), routes=routes
     )
 
     prepared = source_runtime.prepare_transfer(
-        logical_plan=route_plan.bootstrap_infos[0]["kv_reshard_plan"],
-        target_binding=target_runtime.binding.to_dict(),
+        logical_plan_json=route_plan.bootstrap_infos[0]["kv_reshard_plan_json"],
+        target_binding_json=kv_cache_runtime_binding_to_json(target_runtime.binding),
     )
     batches = source_runtime.lower_chunk(
         prepared_plan=prepared,
@@ -347,11 +371,11 @@ def test_full_rows_coalesce_contiguous_source_and_target_slots(
         page_size=page_size,
     )
     route_plan = target_runtime.plan_decode_routes(
-        source_placement_json=source.to_json(), routes=routes
+        source_placement_json=kv_cache_placement_to_json(source), routes=routes
     )
     prepared = source_runtime.prepare_transfer(
-        logical_plan=route_plan.bootstrap_infos[0]["kv_reshard_plan"],
-        target_binding=target_runtime.binding,
+        logical_plan_json=route_plan.bootstrap_infos[0]["kv_reshard_plan_json"],
+        target_binding_json=kv_cache_runtime_binding_to_json(target_runtime.binding),
     )
     if page_size == 1:
         token_count = 1200
@@ -444,11 +468,11 @@ def test_tp_slice_vectorization_caps_native_batches_at_1024_operations() -> None
         total_layers=1, pp_size=1, tp_size=1, total_heads=2
     )
     route_plan = target_runtime.plan_decode_routes(
-        source_placement_json=source.to_json(), routes=routes
+        source_placement_json=kv_cache_placement_to_json(source), routes=routes
     )
     prepared = source_runtime.prepare_transfer(
-        logical_plan=route_plan.bootstrap_infos[0]["kv_reshard_plan"],
-        target_binding=target_runtime.binding,
+        logical_plan_json=route_plan.bootstrap_infos[0]["kv_reshard_plan_json"],
+        target_binding_json=kv_cache_runtime_binding_to_json(target_runtime.binding),
     )
     batches = source_runtime.lower_chunk(
         prepared_plan=prepared,
@@ -589,9 +613,15 @@ def test_bootstrap_aggregates_complete_source_placement() -> None:
     server = CommonKVBootstrapServer.__new__(CommonKVBootstrapServer)
     server._is_ready = lambda: True
     server.kv_reshard_capability = True
-    server.kv_reshard_schema_version = 1
+    server.kv_reshard_schema_version = KV_RESHARD_SCHEMA_VERSION
+    server.dp_size = 1
+    server.pp_size = 2
+    server.attn_tp_size = 2
     server.kv_reshard_parts = {
-        0: {part.participant_id: part.to_dict() for part in placement.parts}
+        0: {
+            part.participant_id: kv_cache_part_to_json(part)
+            for part in placement.parts
+        }
     }
     server.kv_reshard_routes = {
         0: {
@@ -611,7 +641,10 @@ def test_bootstrap_aggregates_complete_source_placement() -> None:
 
     assert response.status == 200
     assert payload["protocol"] == KV_RESHARD_PROTOCOL
-    assert payload["placement"]["placement_digest"] == placement.digest
+    assert (
+        kv_cache_placement_from_json(payload["placement_json"]).digest
+        == placement.digest
+    )
     assert set(payload["routes"]) == {part.participant_id for part in placement.parts}
     assert cached_response.body == response.body
 
@@ -637,7 +670,7 @@ def test_concurrent_connection_cache_miss_is_single_flight(
     response.json.return_value = {
         "protocol": KV_RESHARD_PROTOCOL,
         "schema_version": KV_RESHARD_SCHEMA_VERSION,
-        "placement": json.loads(source.to_json()),
+        "placement_json": kv_cache_placement_to_json(source),
         "routes": routes,
     }
 
