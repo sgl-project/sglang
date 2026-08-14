@@ -49,6 +49,14 @@ _DRAFT_PROBS = Invariant(
 )
 
 
+def _make_num_token_non_padded(
+    num_tokens: int, device: str | torch.device
+) -> Optional[torch.Tensor]:
+    if not enable_num_token_non_padded():
+        return None
+    return torch.tensor(num_tokens, dtype=torch.int32).to(device, non_blocking=True)
+
+
 class DraftBlockResult(msgspec.Struct, frozen=True):
     draft_tokens: torch.Tensor
     corrected_logits: Optional[torch.Tensor]
@@ -355,9 +363,7 @@ class DraftBlockProposer:
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            num_token_non_padded=torch.tensor(
-                draft_num_tokens, dtype=torch.int32, device=device
-            ),
+            num_token_non_padded=_make_num_token_non_padded(draft_num_tokens, device),
             num_token_non_padded_cpu=draft_num_tokens,
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
