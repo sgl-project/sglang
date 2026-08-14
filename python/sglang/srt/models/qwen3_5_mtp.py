@@ -193,6 +193,18 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if not forward_batch.forward_mode.is_idle():
                 input_embeds = self.pre_fc_norm_embedding(input_embeds)
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
+            # A captured prefill graph hands the model its static token slot, so
+            # input_embeds is the padded height while the target's hidden states
+            # arrive at this chunk's real height. Place the real rows into a slot
+            # of the same height; the padding rows are never read downstream.
+            if hidden_states.shape[0] != input_embeds.shape[0]:
+                rows = min(hidden_states.shape[0], input_embeds.shape[0])
+                slot = hidden_states.new_zeros(
+                    (input_embeds.shape[0], hidden_states.shape[1])
+                )
+                slot[:rows] = hidden_states[:rows]
+                hidden_states = slot
+
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
             hidden_states = self.fc(hidden_states)

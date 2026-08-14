@@ -40,6 +40,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     build_kv_layer_ids,
+    build_staging_slot_metadata,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -237,9 +238,7 @@ class PrefillBootstrapQueue:
             else getattr(self.token_to_kv_pool, "end_layer", None)
         )
 
-        draft_kv_pool = (
-            self.draft_token_to_kv_pool if transfer_draft_cache else None
-        )
+        draft_kv_pool = self.draft_token_to_kv_pool if transfer_draft_cache else None
         num_draft_entries = 0
         if draft_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
@@ -306,11 +305,19 @@ class PrefillBootstrapQueue:
             kv_pool = self.token_to_kv_pool
             if hasattr(kv_pool, "full_kv_pool"):
                 kv_pool = kv_pool.full_kv_pool
-            if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
+            staging_slots = build_staging_slot_metadata(
+                kv_layer_ids=kv_args.kv_layer_ids,
+                num_draft_entries=num_draft_entries,
+                kv_pool=kv_pool,
+                draft_kv_pool=draft_kv_pool,
+            )
+            if staging_slots is not None:
+                k_buffers, v_buffers, slot_layer_ids = staging_slots
                 kv_manager.set_kv_buffer_tensors(
-                    kv_pool.k_buffer,
-                    kv_pool.v_buffer,
+                    k_buffers,
+                    v_buffers,
                     kv_pool.page_size,
+                    slot_layer_ids=slot_layer_ids,
                 )
         return kv_manager
 

@@ -272,11 +272,11 @@ class TestDraftBandPairsAcrossPipelineStages(CustomTestCase):
             pairs,
             # K block, then V block, then the two draft entries at the tail.
             [(i, k_offset + i) for i in range(len(stage1))]
+            + [(len(stage1) + i, len(full) + k_offset + i) for i in range(len(stage1))]
             + [
-                (len(stage1) + i, len(full) + k_offset + i)
-                for i in range(len(stage1))
-            ]
-            + [(2 * len(stage1), 2 * len(full)), (2 * len(stage1) + 1, 2 * len(full) + 1)],
+                (2 * len(stage1), 2 * len(full)),
+                (2 * len(stage1) + 1, 2 * len(full) + 1),
+            ],
         )
 
 

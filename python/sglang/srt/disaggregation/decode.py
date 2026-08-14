@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     _is_fake_transfer,
     build_kv_layer_ids,
+    build_staging_slot_metadata,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_dsv4_c128_online_enabled,
@@ -509,9 +510,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 kv_args.total_kv_head_num = per_rank_kv_heads * attn_tp_size
             if hasattr(kv_manager, "set_kv_buffer_tensors"):
                 kv_pool = kv_pool_for_heads
-                if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
+                staging_slots = build_staging_slot_metadata(
+                    kv_layer_ids=kv_args.kv_layer_ids,
+                    num_draft_entries=num_draft_entries,
+                    kv_pool=kv_pool,
+                    draft_kv_pool=self.draft_token_to_kv_pool,
+                )
+                if staging_slots is not None:
+                    k_buffers, v_buffers, slot_layer_ids = staging_slots
                     kv_manager.set_kv_buffer_tensors(
-                        kv_pool.k_buffer, kv_pool.v_buffer, kv_pool.page_size
+                        k_buffers,
+                        v_buffers,
+                        kv_pool.page_size,
+                        slot_layer_ids=slot_layer_ids,
                     )
         return kv_manager
 

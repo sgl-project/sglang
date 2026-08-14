@@ -1018,6 +1018,52 @@ def resolve_dcp_dst_entry_indices(
     ]
 
 
+def build_staging_slot_metadata(
+    *,
+    kv_layer_ids: List[int],
+    num_draft_entries: int,
+    kv_pool,
+    draft_kv_pool,
+):
+    """Buffers and per-slot layer ids for the staging gather.
+
+    The gather writes every k_buffer and then every v_buffer, while kv_layer_ids
+    follows kv_data_ptrs ([K target, V target, K draft, V draft]), so the two
+    orders diverge as soon as a draft pool is registered.
+
+    Returns (k_buffers, v_buffers, slot_layer_ids), or None for a pool that has
+    no contiguous K/V tensors to stage.
+    """
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+
+    # A hybrid pool keeps its contiguous K/V tensors on the inner full-attention
+    # pool, and the draft pool is wrapped the same way.
+    if isinstance(kv_pool, HybridLinearKVPool):
+        kv_pool = kv_pool.full_kv_pool
+    if isinstance(draft_kv_pool, HybridLinearKVPool):
+        draft_kv_pool = draft_kv_pool.full_kv_pool
+    if not isinstance(kv_pool, MHATokenToKVPool):
+        return None
+
+    ids = list(kv_layer_ids or [])
+    num_target = len(ids) - num_draft_entries
+    half = num_target // 2
+    k_buffers, k_ids = list(kv_pool.k_buffer), ids[:half]
+    v_buffers, v_ids = list(kv_pool.v_buffer), ids[half:num_target]
+
+    draft_half = num_draft_entries // 2
+    if draft_half:
+        if not isinstance(draft_kv_pool, MHATokenToKVPool):
+            # An empty id list puts the sender back on kv_data_ptrs order, which
+            # is what staging did before draft KV existed.
+            return k_buffers, v_buffers, []
+        k_buffers += list(draft_kv_pool.k_buffer)
+        v_buffers += list(draft_kv_pool.v_buffer)
+        k_ids += ids[num_target : num_target + draft_half]
+        v_ids += ids[num_target + draft_half :]
+    return k_buffers, v_buffers, k_ids + v_ids
+
+
 def append_state_component(
     kv_args: KVArgs,
     state_type: StateType,

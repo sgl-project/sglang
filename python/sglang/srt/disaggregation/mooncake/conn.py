@@ -178,7 +178,7 @@ class KVArgsRegisterInfo:
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
             ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
         )
 
 
@@ -312,11 +312,20 @@ class MooncakeKVManager(CommonKVManager):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
         self._staging_ctx.room_receivers[room] = receiver
 
-    def set_kv_buffer_tensors(self, k_buffers: list, v_buffers: list, page_size: int):
+    def set_kv_buffer_tensors(
+        self,
+        k_buffers: list,
+        v_buffers: list,
+        page_size: int,
+        slot_layer_ids: Optional[List[int]] = None,
+    ):
+        # slot_layer_ids follows the staging slot order (every k_buffer, then
+        # every v_buffer), which is not kv_args.kv_layer_ids once a draft exists.
         self.kv_buffer_tensors = {
             "k_buffers": k_buffers,
             "v_buffers": v_buffers,
             "page_size": page_size,
+            "slot_layer_ids": list(slot_layer_ids or []),
         }
 
     def _init_staging_buffers(self, count: int):
@@ -513,7 +522,9 @@ class MooncakeKVManager(CommonKVManager):
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
+        dst_layer_ids: Optional[List[int]] = None,
         staging_buffer=None,
+        dst_slot_layer_ids: Optional[List[int]] = None,
     ) -> int:
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
         from sglang.srt.disaggregation.common.staging_buffer import (
@@ -547,6 +558,26 @@ class MooncakeKVManager(CommonKVManager):
         per_layer_bytes = num_tokens * num_heads_to_send * head_dim * dtype_size
         per_rank_bytes = per_layer_bytes * num_layers * 2
 
+        if self.pp_size > 1:
+            # Pair staging slots, not kv_data_ptrs entries: the gather lays out
+            # [every k_buffer, every v_buffer], which stops matching kv_layer_ids
+            # once draft KV buffers are appended.
+            src_slot_ids = (
+                self.kv_buffer_tensors.get("slot_layer_ids")
+                or self.kv_args.kv_layer_ids
+            )
+            dst_slot_ids = dst_slot_layer_ids or dst_layer_ids or []
+            pairs = build_transfer_entry_pairs(
+                src_slot_ids,
+                dst_slot_ids,
+                num_layers * 2,
+                len(dst_slot_ids),
+            )
+            dst_num_layers = len(dst_slot_ids) // 2
+        else:
+            pairs = None
+            dst_num_layers = num_layers
+
         num_writers, writer_rank_bytes, total_staging_needed = compute_staging_layout(
             self.attn_tp_size,
             dst_attn_tp_size,
@@ -554,7 +585,7 @@ class MooncakeKVManager(CommonKVManager):
             total_kv_heads,
             num_tokens,
             head_dim * dtype_size,
-            num_layers,
+            dst_num_layers,
         )
         writer_idx = local_tp_rank % num_writers if num_writers > 1 else 0
         rank_offset = sum(writer_rank_bytes[:writer_idx])
@@ -588,10 +619,20 @@ class MooncakeKVManager(CommonKVManager):
         )
 
         dst_write_ptr = dst_staging_ptr + rank_offset
-        ret = self._transfer_data(
-            mooncake_session_id,
-            [(staging_buffer.get_ptr(), dst_write_ptr, per_rank_bytes)],
-        )
+        if pairs is None:
+            transfer_blocks = [
+                (staging_buffer.get_ptr(), dst_write_ptr, per_rank_bytes)
+            ]
+        else:
+            transfer_blocks = [
+                (
+                    staging_buffer.get_ptr() + src_idx * per_layer_bytes,
+                    dst_write_ptr + dst_idx * per_layer_bytes,
+                    per_layer_bytes,
+                )
+                for src_idx, dst_idx in pairs
+            ]
+        ret = self._transfer_data(mooncake_session_id, transfer_blocks)
         if ret != 0:
             raise RuntimeError(
                 f"[Staging] Bulk RDMA transfer failed with ret={ret}. "
@@ -963,9 +1004,7 @@ class MooncakeKVManager(CommonKVManager):
             )
             layer_ptr_pairs = [
                 (src_k_ptrs[i], dst_k_ptrs[i]) for i in range(layers_current_pp_stage)
-            ] + [
-                (src_v_ptrs[i], dst_v_ptrs[i]) for i in range(layers_current_pp_stage)
-            ]
+            ] + [(src_v_ptrs[i], dst_v_ptrs[i]) for i in range(layers_current_pp_stage)]
 
         # Calculate precise byte offset and length for the sub-slice within the token
         src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
@@ -2236,6 +2275,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
             else:
                 packed_staging_base_ptr = b""
                 staging_total_size_str = b""
+            staging_slots = getattr(self.kv_mgr, "kv_buffer_tensors", None) or {}
+            packed_staging_slot_layer_ids = b"".join(
+                struct.pack("Q", layer_id)
+                for layer_id in (staging_slots.get("slot_layer_ids") or [])
+            )
 
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             try:
@@ -2260,6 +2304,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             staging_total_size_str,
                             dst_dcp_size,
                             dst_dcp_rank,
+                            packed_staging_slot_layer_ids,
                         ]
                     )
             except zmq.ZMQError:

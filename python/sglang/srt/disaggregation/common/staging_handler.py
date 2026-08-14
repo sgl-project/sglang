@@ -515,10 +515,14 @@ class StagingRegisterInfo:
 
     base_ptr: int = 0
     total_size: int = 0
+    # Staging slot order is [all K layers, all V layers], which differs from the
+    # kv_data_ptrs order once draft KV buffers are appended. Empty when the peer
+    # predates this field; callers then fall back to kv_layer_ids.
+    slot_layer_ids: List[int] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_zmq_fields(
-        cls, msg: list, msg_start_offset: int
+        cls, msg: list, msg_start_offset: int, slot_ids_index: Optional[int] = None
     ) -> Optional[StagingRegisterInfo]:
         i = msg_start_offset
         base_ptr = (
@@ -531,7 +535,17 @@ class StagingRegisterInfo:
         )
         if base_ptr == 0 and total_size == 0:
             return None
-        return cls(base_ptr=base_ptr, total_size=total_size)
+        slot_layer_ids: List[int] = []
+        if (
+            slot_ids_index is not None
+            and len(msg) > slot_ids_index
+            and len(msg[slot_ids_index]) > 0
+        ):
+            raw = msg[slot_ids_index]
+            slot_layer_ids = list(struct.unpack(f"{len(raw) // 8}Q", raw))
+        return cls(
+            base_ptr=base_ptr, total_size=total_size, slot_layer_ids=slot_layer_ids
+        )
 
 
 class PrefillStagingStrategy:
@@ -617,7 +631,13 @@ class PrefillStagingStrategy:
                 target_info.dst_tp_rank,
                 target_info.dst_attn_tp_size,
                 target_info.dst_kv_item_len,
+                target_info.dst_kv_layer_ids,
                 staging_buffer=self.staging_buffer,
+                dst_slot_layer_ids=(
+                    target_info.staging.slot_layer_ids
+                    if target_info.staging is not None
+                    else None
+                ),
             )
         except Exception as e:
             raise RuntimeError(
