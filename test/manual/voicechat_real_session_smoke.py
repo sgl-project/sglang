@@ -24,7 +24,7 @@ def _load_speaker(model_dir: Path, speaker_latent_path: str | None):
 
 
 def main(duplex_model: str, eartts_model: str, speaker_latent_path: str | None):
-    duplex_config = AutoConfig.from_pretrained(duplex_model, trust_remote_code=True)
+    duplex_config = AutoConfig.from_pretrained(duplex_model, trust_remote_code=False)
     speaker = _load_speaker(Path(eartts_model), speaker_latent_path)
     common = {
         "max_running_requests": 2,
@@ -49,11 +49,13 @@ def main(duplex_model: str, eartts_model: str, speaker_latent_path: str | None):
     try:
         with SGLangVoiceChatSession(duplex, eartts, capacity=2048) as session:
             session.start(
-                [duplex_config.bos_token_id, duplex_config.pad_token_id], speaker
+                [duplex_config.bos_token_id, duplex_config.pad_token_id],
+                speaker,
+                duplex_config.pad_token_id,
             )
             result = session.step(torch.randn(1, duplex_config.hidden_size))
             assert 0 <= result.text_token < duplex_config.vocab_size
-            assert 0 <= result.asr_token < duplex_config.vocab_size
+            assert 0 <= result.function_token < duplex_config.vocab_size
             assert len(result.audio_codes) == 31
             print("real VoiceChat session smoke passed", result, flush=True)
     finally:

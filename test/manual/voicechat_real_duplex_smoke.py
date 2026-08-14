@@ -9,7 +9,7 @@ from sglang import Engine
 
 
 def main(model_path: str):
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=False)
     engine = Engine(
         model_path=model_path,
         dtype="bfloat16",
@@ -26,21 +26,17 @@ def main(model_path: str):
         "session_params": {"id": session_id, "rid": None},
     }
     try:
-        prefill = engine.generate(
-            input_ids=[config.bos_token_id, config.pad_token_id],
-            custom_inputs={"is_system_prompt": True},
-            **params,
-        )
         result = engine.generate(
-            input_ids=[],
+            input_ids=[config.bos_token_id, config.pad_token_id],
             custom_inputs={
+                "is_initial_prefill": True,
+                "prompt_length": 1,
                 "acoustic_embedding": torch.randn(1, config.hidden_size),
-                "input_asr_ids": [prefill["meta_info"]["asr_tokens"][-1]],
             },
             **params,
         )
         assert len(result["output_ids"]) == 1
-        assert len(result["meta_info"]["asr_tokens"]) == 1
+        assert len(result["meta_info"]["function_tokens"]) == 1
         print("real Duplex smoke passed", result, flush=True)
     finally:
         engine.close_session(session_id)

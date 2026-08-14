@@ -98,10 +98,10 @@ class VoiceChatRuntime:
         self.sidecar = AudioSidecarClient(args.audio_sidecar)
         self.sidecar.health()
         self.tokenizer = AutoTokenizer.from_pretrained(
-            args.duplex_model, trust_remote_code=True
+            args.duplex_model, trust_remote_code=False
         )
         self.config = AutoConfig.from_pretrained(
-            args.duplex_model, trust_remote_code=True
+            args.duplex_model, trust_remote_code=False
         )
         self.speaker = _load_speaker(Path(args.eartts_model), args.speaker_latent)
         common = {
@@ -164,7 +164,9 @@ class VoiceChatRuntime:
                 self.duplex, self.eartts, capacity=8192
             )
             await model_session.start(
-                self.prompt_ids(DEFAULT_SYSTEM_PROMPT), self.speaker
+                self.prompt_ids(DEFAULT_SYSTEM_PROMPT),
+                self.speaker,
+                self.config.pad_token_id,
             )
             for _ in range(self.warmup_frames):
                 embedding = await asyncio.to_thread(
@@ -282,7 +284,9 @@ def create_app(runtime: VoiceChatRuntime) -> FastAPI:
                     nonlocal started
                     if not started:
                         await model_session.start(
-                            runtime.prompt_ids(prompt), runtime.speaker
+                            runtime.prompt_ids(prompt),
+                            runtime.speaker,
+                            runtime.config.pad_token_id,
                         )
                         started = True
 
@@ -315,7 +319,7 @@ def create_app(runtime: VoiceChatRuntime) -> FastAPI:
                                 if kind == "stop":
                                     return
                                 continue
-                            text_token, asr_token, duplex_ms = (
+                            text_token, function_token, duplex_ms = (
                                 await model_session.duplex_step(payload)
                             )
                             timing["duplex"] = duplex_ms
@@ -324,7 +328,7 @@ def create_app(runtime: VoiceChatRuntime) -> FastAPI:
                                     kind,
                                     {
                                         "text_token": text_token,
-                                        "asr_token": asr_token,
+                                        "function_token": function_token,
                                     },
                                     timing,
                                 )
@@ -438,7 +442,7 @@ def create_app(runtime: VoiceChatRuntime) -> FastAPI:
                                     "sample_rate": decoded["sample_rate"],
                                     "samples": decoded["samples"],
                                     "text_token": payload["text_token"],
-                                    "asr_token": payload["asr_token"],
+                                    "function_token": payload["function_token"],
                                     "timing_ms": result_timing,
                                 }
                             )

@@ -37,9 +37,10 @@ class FakeModelSession:
     def __init__(self, events):
         self.events = events
 
-    async def start(self, prompt_ids, speaker):
+    async def start(self, prompt_ids, speaker, pad_token_id):
         assert prompt_ids == [10, 11]
         assert speaker.shape == (4, 1152)
+        assert pad_token_id == 12
         self.events.append("model.start")
 
     async def step(self, embedding):
@@ -57,6 +58,7 @@ def make_runtime(events, frames=2, fail_encode=False):
     runtime.duplex = object()
     runtime.eartts = object()
     runtime.speaker = SimpleNamespace(shape=(4, 1152))
+    runtime.config = SimpleNamespace(pad_token_id=12)
     runtime.prompt_ids = lambda _prompt: [10, 11]
     runtime.warmup_frames = frames
     runtime.warmup_duration_ms = None

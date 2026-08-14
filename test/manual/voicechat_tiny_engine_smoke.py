@@ -38,6 +38,12 @@ def _write_configs(root: Path):
         ssm_state_size=4,
         mamba_d_conv=2,
         max_position_embeddings=128,
+        pad_token_id=2,
+        predict_user_text=False,
+        use_function_head=True,
+        duplex_text_channel_weight=1.0,
+        duplex_user_channel_weight=1.0,
+        duplex_function_channel_weight=2.0,
     ).save_pretrained(duplex)
     EarTTSConfig(
         architectures=["EarTTSForCausalLM"],
@@ -95,18 +101,18 @@ def main():
         try:
             with SGLangVoiceChatSession(duplex, eartts, capacity=256) as session:
                 print("sessions open", flush=True)
-                session.start([1, 3, 2], torch.randn(3, 32))
+                session.start([1, 3, 2], torch.randn(3, 32), pad_token_id=2)
                 print("prefills complete", flush=True)
                 result = session.step(torch.randn(1, 32))
                 print("frame complete", flush=True)
                 assert 0 <= result.text_token < 32
-                assert 0 <= result.asr_token < 32
+                assert 0 <= result.function_token < 32
                 assert len(result.audio_codes) == 3
                 assert all(0 <= code < 4 for code in result.audio_codes)
                 print(
                     "voicechat tiny-engine smoke passed:",
                     result.text_token,
-                    result.asr_token,
+                    result.function_token,
                     result.audio_codes,
                 )
         finally:

@@ -46,7 +46,7 @@ Applications that already provide NeMo perception and codec steps can use
 from examples.voicechat.online_session import SGLangVoiceChatSession
 
 session = SGLangVoiceChatSession(duplex_engine, eartts_engine)
-session.start(system_prompt_ids, speaker_latent)
+session.start(system_prompt_ids, speaker_latent, duplex_config.pad_token_id)
 for microphone_frame in microphone_frames:
     acoustic_embedding = nemo_perception_step(microphone_frame)
     result = session.step(acoustic_embedding)

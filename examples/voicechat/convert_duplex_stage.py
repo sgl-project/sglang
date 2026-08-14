@@ -18,8 +18,7 @@ from transformers import AutoConfig, AutoTokenizer
 PREFIXES = (
     "stt_model.llm.",
     "stt_model.lm_head.",
-    "stt_model.asr_head.",
-    "stt_model.embed_asr_tokens.",
+    "stt_model.function_head.",
     "stt_model.embed_tokens.",
 )
 
@@ -41,6 +40,14 @@ def _resolve_base_model(config_path: Path, base_model: str | None) -> str:
         ) from error
 
 
+def _stt_config(config_path: Path) -> dict:
+    config = json.loads(config_path.read_text())
+    try:
+        return config["model"]["stt"]["model"]
+    except KeyError as error:
+        raise ValueError("Could not find model.stt.model in --config.") from error
+
+
 def convert(
     checkpoint: Path,
     output: Path,
@@ -50,17 +57,45 @@ def convert(
     source = _model_file(checkpoint)
     output.mkdir(parents=True, exist_ok=True)
     base_model = _resolve_base_model(config_path, base_model)
-    config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
+    stt_config = _stt_config(config_path)
+    if bool(stt_config.get("predict_user_text", False)):
+        raise ValueError("The converter does not support predict_user_text=True.")
+    if not bool(stt_config.get("use_function_head", False)):
+        raise ValueError("The published checkpoint requires use_function_head=True.")
+    if (stt_config.get("fuse_method", "add") or "add") != "add":
+        raise ValueError("The converter only supports fuse_method='add'.")
+
+    config = AutoConfig.from_pretrained(base_model, trust_remote_code=False)
     config.architectures = ["NemotronDuplexHForCausalLM"]
-    config.save_pretrained(output)
-    AutoTokenizer.from_pretrained(base_model, trust_remote_code=True).save_pretrained(
-        output
+    config.predict_user_text = False
+    config.use_function_head = True
+    config.duplex_text_channel_weight = float(
+        stt_config.get("duplex_text_channel_weight", 1.0)
     )
+    config.duplex_user_channel_weight = float(
+        stt_config.get("duplex_user_channel_weight", 1.0)
+    )
+    config.duplex_function_channel_weight = float(
+        stt_config.get("duplex_function_channel_weight", 1.0)
+    )
+    config.fuse_method = "add"
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=False)
+    pad_token = stt_config.get("pad_token", "<SPECIAL_12>")
+    pad_token_id = tokenizer.convert_tokens_to_ids(pad_token)
+    if pad_token_id is None or pad_token_id < 0:
+        raise ValueError(f"Could not resolve VoiceChat pad token {pad_token!r}.")
+    config.pad_token_id = pad_token_id
+    config.save_pretrained(output)
+    tokenizer.save_pretrained(output)
 
     with safe_open(source, framework="pt", device="cpu") as handle:
         keys = [key for key in handle.keys() if key.startswith(PREFIXES)]
         if not keys:
             raise ValueError(f"No Duplex tensors found in {source}")
+        if "stt_model.function_head.weight" not in keys:
+            raise ValueError(
+                f"Checkpoint {source} is missing stt_model.function_head.weight"
+            )
         weight_map, total_size = {}, 0
         total = len(keys)
         for index, key in enumerate(keys, 1):

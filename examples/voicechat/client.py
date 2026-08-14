@@ -306,7 +306,8 @@ async def run(args):
                         timing = event.get("timing_ms", {})
                         print(
                             f"frame {received_frames:04d}: "
-                            f"text={event['text_token']} asr={event['asr_token']} "
+                            f"text={event['text_token']} "
+                            f"function={event['function_token']} "
                             f"audio_samples={event['samples']} "
                             f"server_ms={timing.get('total', 0):.1f} "
                             f"queue_ms={timing.get('queue', 0):.1f}"

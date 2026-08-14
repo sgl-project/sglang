@@ -132,7 +132,7 @@ Returns one decoded audio frame and diagnostic model state:
   "sample_rate": 22050,
   "samples": 1764,
   "text_token": 123,
-  "asr_token": 456,
+  "function_token": 456,
   "timing_ms": {
     "queue": 0.02,
     "perception": 8.0,

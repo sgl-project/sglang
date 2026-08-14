@@ -72,4 +72,4 @@ def test_duplex_unified_checkpoint_name_mapping():
     mapper = NemotronDuplexHForCausalLM._map_voicechat_weight_name
     assert mapper("stt_model.llm.backbone.layers.0.weight") == ("model.layers.0.weight")
     assert mapper("stt_model.llm.layers.0.weight") == "model.layers.0.weight"
-    assert mapper("stt_model.embed_asr_tokens.weight") == ("embed_asr_tokens.weight")
+    assert mapper("stt_model.function_head.weight") == "function_head.weight"
