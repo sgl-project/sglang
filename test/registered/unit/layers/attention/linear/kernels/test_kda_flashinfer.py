@@ -279,7 +279,7 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
             )
 
         self.assertIs(result, sentinel)
-        self.assertTrue(torch.equal(extend.call_args.args[5], torch.sigmoid(raw_beta)))
+        self.assertTrue(torch.equal(extend.call_args.args[4], torch.sigmoid(raw_beta)))
         self.assertEqual(extend.call_args.kwargs["marker"], "fallback")
 
     @staticmethod
@@ -306,7 +306,7 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
 
         def fake_recurrent_kda(**kwargs):
             cake_calls.append(kwargs)
-            return torch.empty_like(kwargs["v"]), kwargs["initial_state"]
+            return torch.zeros_like(kwargs["v"]), kwargs["initial_state"]
 
         inputs = self._prefill_inputs()
         state_false = torch.randn(4, 12, 128, 128, dtype=torch.bfloat16)
