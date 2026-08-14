@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
@@ -177,7 +178,9 @@ class _LayerwiseComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
 class _TestServerArgs(SimpleNamespace):
     canonical_residency_mode = ServerArgs.canonical_residency_mode
     explicit_residency_mode = ServerArgs.explicit_residency_mode
-    _legacy_component_offload_flag = ServerArgs._legacy_component_offload_flag
+    _legacy_component_offload_flag = staticmethod(
+        ServerArgs._legacy_component_offload_flag
+    )
     residency_mode = ServerArgs.residency_mode
     is_arg_explicitly_set = ServerArgs.is_arg_explicitly_set
     is_explicit_layerwise_offload_component = (
@@ -192,6 +195,7 @@ class _TestServerArgs(SimpleNamespace):
 def _server_args(**kwargs):
     defaults = dict(
         component_residency=None,
+        disagg_role=RoleType.MONOLITHIC,
         _required_resident_components=set(),
         _component_layerwise_capabilities={},
         _explicit_arg_names=set(),
