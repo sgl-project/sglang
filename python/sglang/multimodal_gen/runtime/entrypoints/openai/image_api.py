@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.managers.job_registry import (
     JobStatusReq,
     RequestCancelledError,
     RequestConflictError,
+    RequestOverloadedError,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
@@ -59,6 +60,15 @@ def _request_fingerprint(request: ImageGenerationsRequest) -> str:
     payload = request.model_dump(mode="json", exclude={"request_id"})
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+async def _process_image_batch(batch):
+    try:
+        return await process_generation_batch(async_scheduler_client, batch)
+    except (RequestCancelledError, RequestConflictError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except RequestOverloadedError as error:
+        raise HTTPException(status_code=429, detail=str(error)) from error
 
 
 def _get_extra_field(request, field_name):
@@ -317,14 +327,7 @@ async def generations(
         # Add diffusers_kwargs if provided
         if request.diffusers_kwargs:
             batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
-        try:
-            save_file_path_list, result = await process_generation_batch(
-                async_scheduler_client, batch
-            )
-        except RequestCancelledError as e:
-            raise HTTPException(status_code=409, detail=str(e))
-        except RequestConflictError as e:
-            raise HTTPException(status_code=409, detail=str(e))
+        save_file_path_list, result = await _process_image_batch(batch)
         save_file_path = save_file_path_list[0]
         resp_format = (request.response_format or "b64_json").lower()
         if (
@@ -476,9 +479,7 @@ async def edits(
             sampling_params=sampling,
             external_trace_header=trace_headers,
         )
-        save_file_path_list, result = await process_generation_batch(
-            async_scheduler_client, batch
-        )
+        save_file_path_list, result = await _process_image_batch(batch)
         save_file_path = save_file_path_list[0]
         resp_format = (response_format or "b64_json").lower()
 

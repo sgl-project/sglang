@@ -19,6 +19,7 @@ _PRECANCEL_CAP = 1024
 _FINISHED_HARD_CAP = 4 * _FINISHED_RETENTION
 _WAITER_CAP = 64
 _REPLAY_BYTES_CAP = 128 << 20
+_LIVE_JOB_CAP = 1024
 
 QUEUED = "queued"
 RUNNING = "running"
@@ -33,6 +34,10 @@ class RequestCancelledError(Exception):
 
 
 class RequestConflictError(Exception):
+    pass
+
+
+class RequestOverloadedError(Exception):
     pass
 
 
@@ -155,6 +160,7 @@ class JobRegistry:
         self._jobs: dict[str, JobHandle] = {}
         self._finished: list[str] = []
         self._precancelled: dict[str, float] = {}
+        self._live_jobs = 0
         self._replay_bytes = 0
         self._lock = threading.Lock()
 
@@ -179,10 +185,13 @@ class JobRegistry:
                     self._finished.append(request_id)
                     self._trim_finished()
                     return ("cancelled", None)
+                if self._live_jobs >= _LIVE_JOB_CAP:
+                    return ("capacity", None)
                 handle = JobHandle(request_id, fingerprint)
                 self._jobs[request_id] = handle
+                self._live_jobs += 1
                 return ("new", handle)
-            if handle.fingerprint != fingerprint:
+            if handle.fingerprint is None or handle.fingerprint != fingerprint:
                 return ("conflict", None)
             if handle.status in _TERMINAL:
                 return ("replay", handle.output)
@@ -214,6 +223,7 @@ class JobRegistry:
                     handle.status = COMPLETED
                 handle.finished_at_monotonic = time.monotonic()
                 self._finished.append(request_id)
+                self._live_jobs -= 1
             self._drop_replay(handle)
             replay_size = _replay_size(output)
             if handle.fingerprint is None and not output.cancelled and not output.error:

@@ -1,6 +1,7 @@
 """Unit tests for runtime/managers/job_registry (job control)."""
 
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -78,13 +79,35 @@ class TestJobRegistry(unittest.TestCase):
         self.assertEqual(verdict, "conflict")
         self.assertIsNone(payload)
 
+    def test_missing_fingerprint_never_dedupes(self):
+        for first_fingerprint, retry_fingerprint in (
+            (None, None),
+            ("fingerprint", None),
+            (None, "fingerprint"),
+        ):
+            with self.subTest(
+                first=first_fingerprint,
+                retry=retry_fingerprint,
+            ):
+                registry = JobRegistry()
+                _, handle = registry.admit("same", b"first", first_fingerprint)
+                verdict, payload = registry.admit("same", b"second", retry_fingerprint)
+                self.assertEqual(verdict, "conflict")
+                self.assertIsNone(payload)
+                self.assertEqual(handle.waiters, [])
+
+                registry.finish("same", _Output())
+                verdict, payload = registry.admit("same", b"third", retry_fingerprint)
+                self.assertEqual(verdict, "conflict")
+                self.assertIsNone(payload)
+
     def test_duplicate_waiters_are_bounded(self):
         registry = JobRegistry()
-        registry.admit("a", b"original")
+        registry.admit("a", b"original", "fingerprint")
         for index in range(_WAITER_CAP):
-            verdict, _ = registry.admit("a", str(index).encode())
+            verdict, _ = registry.admit("a", str(index).encode(), "fingerprint")
             self.assertEqual(verdict, "wait")
-        verdict, payload = registry.admit("a", b"overflow")
+        verdict, payload = registry.admit("a", b"overflow", "fingerprint")
         self.assertEqual(verdict, "overloaded")
         self.assertIsNone(payload)
 
@@ -139,12 +162,12 @@ class TestJobRegistry(unittest.TestCase):
         terminal status but drops the payload, so a duplicate replays
         "not replayable" instead of the payload."""
         registry = JobRegistry()
-        _, handle = registry.admit("bulky", None)
+        _, handle = registry.admit("bulky", None, "fingerprint")
         registry.finish("bulky", _Output(raw_frame_batches=[[b"frame"]]))
         self.assertEqual(registry.status("bulky")["status"], COMPLETED)
         self.assertIsNone(handle.output)
 
-        verdict, payload = registry.admit("bulky", b"dup")
+        verdict, payload = registry.admit("bulky", b"dup", "fingerprint")
         self.assertEqual(verdict, "replay")
         self.assertIsNone(payload)
 
@@ -152,10 +175,56 @@ class TestJobRegistry(unittest.TestCase):
         """Waiters attached before the terminal transition are owed the real
         first reply. Only the retained replay copy may be dropped."""
         registry = JobRegistry()
-        registry.admit("bulky", b"c1")
-        registry.admit("bulky", b"c2")
+        registry.admit("bulky", b"c1", "fingerprint")
+        registry.admit("bulky", b"c2", "fingerprint")
         waiters = registry.finish("bulky", _Output(trajectory_latents=object()))
         self.assertEqual(waiters, [b"c2"])
+
+    def test_live_jobs_are_bounded_and_capacity_is_released(self):
+        with patch(
+            "sglang.multimodal_gen.runtime.managers.job_registry._LIVE_JOB_CAP",
+            2,
+        ):
+            registry = JobRegistry()
+            registry.admit("first", b"first", "fingerprint")
+            registry.admit("second", b"second", "fingerprint")
+
+            verdict, payload = registry.admit("third", b"third", "fingerprint")
+            self.assertEqual(verdict, "capacity")
+            self.assertIsNone(payload)
+            self.assertEqual(registry.status("third")["status"], "unknown")
+
+            verdict, handle = registry.admit("first", b"waiter", "fingerprint")
+            self.assertEqual(verdict, "wait")
+            self.assertEqual(handle.waiters, [b"waiter"])
+
+            registry.finish("first", _Output())
+            verdict, _ = registry.admit("third", b"third", "fingerprint")
+            self.assertEqual(verdict, "new")
+            self.assertEqual(registry._live_jobs, 2)
+
+            registry.finish("first", _Output())
+            self.assertEqual(registry._live_jobs, 2)
+
+    def test_concurrent_admission_respects_live_job_cap(self):
+        with patch(
+            "sglang.multimodal_gen.runtime.managers.job_registry._LIVE_JOB_CAP",
+            8,
+        ):
+            registry = JobRegistry()
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                results = list(
+                    executor.map(
+                        lambda index: registry.admit(
+                            f"job-{index}", None, f"fingerprint-{index}"
+                        )[0],
+                        range(64),
+                    )
+                )
+
+            self.assertEqual(results.count("new"), 8)
+            self.assertEqual(results.count("capacity"), 56)
+            self.assertEqual(registry._live_jobs, 8)
 
     def test_replay_payloads_are_byte_bounded(self):
         small = np.zeros(8, dtype=np.uint8)
@@ -272,7 +341,7 @@ class TestJobRegistry(unittest.TestCase):
         self.assertTrue(acked["cancelled"])
         self.assertEqual(acked["status"], "unknown")
 
-        verdict, payload = registry.admit("not-yet-arrived", b"c1")
+        verdict, payload = registry.admit("not-yet-arrived", b"c1", "fingerprint")
         self.assertEqual(verdict, "cancelled")
         self.assertIsNone(payload)
         self.assertEqual(registry.status("not-yet-arrived")["status"], CANCELLED)
@@ -282,7 +351,7 @@ class TestJobRegistry(unittest.TestCase):
         # duplicate replays a typed cancel instead of "not replayable"
         tombstone = _Output(error="request cancelled before dispatch", cancelled=True)
         registry.finish("not-yet-arrived", tombstone)
-        verdict, payload = registry.admit("not-yet-arrived", b"c2")
+        verdict, payload = registry.admit("not-yet-arrived", b"c2", "fingerprint")
         self.assertEqual(verdict, "replay")
         self.assertIs(payload, tombstone)
         self.assertTrue(payload.cancelled)
@@ -384,6 +453,39 @@ class TestJobRegistry(unittest.TestCase):
         output, identity = scheduler._try_return.call_args.args
         self.assertEqual(identity, b"overflow")
         self.assertIn("too many duplicate waiters", output.error)
+
+    def test_scheduler_returns_typed_capacity_overload(self):
+        from unittest.mock import MagicMock
+
+        from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+        from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.jobs = JobRegistry()
+        scheduler._try_return = MagicMock()
+
+        first = Req(sampling_params=SamplingParams(prompt="first", request_id="first"))
+        second = Req(
+            sampling_params=SamplingParams(prompt="second", request_id="second")
+        )
+        first.extra["job_request_fingerprint"] = "first-fingerprint"
+        second.extra["job_request_fingerprint"] = "second-fingerprint"
+
+        with patch(
+            "sglang.multimodal_gen.runtime.managers.job_registry._LIVE_JOB_CAP",
+            1,
+        ):
+            self.assertEqual(
+                scheduler._admit_new_reqs([(b"first", first)]),
+                [(b"first", first)],
+            )
+            self.assertEqual(scheduler._admit_new_reqs([(b"second", second)]), [])
+
+        output, identity = scheduler._try_return.call_args.args
+        self.assertEqual(identity, b"second")
+        self.assertTrue(output.overloaded)
+        self.assertFalse(output.idempotency_conflict)
 
 
 if __name__ == "__main__":

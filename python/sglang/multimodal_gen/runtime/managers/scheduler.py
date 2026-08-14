@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
-from typing import Any, Iterator, List
+from typing import Any, Iterator
 
 import msgspec
 import zmq
@@ -1062,8 +1062,19 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             elif verdict == "conflict":
                 self._try_return(
                     OutputBatch(
-                        error=f"request_id {req.request_id!r} was reused with different parameters",
+                        error=(
+                            f"request_id {req.request_id!r} was reused without "
+                            "a matching idempotency fingerprint"
+                        ),
                         idempotency_conflict=True,
+                    ),
+                    identity,
+                )
+            elif verdict == "capacity":
+                self._try_return(
+                    OutputBatch(
+                        error="job-control admission capacity is exhausted",
+                        overloaded=True,
                     ),
                     identity,
                 )

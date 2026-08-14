@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
+    _process_image_batch,
     _request_fingerprint,
     cancel_job,
     job_status,
@@ -29,6 +30,7 @@ from sglang.multimodal_gen.runtime.managers.job_registry import (
     CancelReq,
     RequestCancelledError,
     RequestConflictError,
+    RequestOverloadedError,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
@@ -285,7 +287,7 @@ class TestVideoDelete(unittest.IsolatedAsyncioTestCase):
         )
 
 
-class TestConflictResponse(unittest.IsolatedAsyncioTestCase):
+class TestTypedSchedulerErrors(unittest.IsolatedAsyncioTestCase):
     async def test_typed_scheduler_conflict_is_preserved(self):
         client = SimpleNamespace(
             forward=AsyncMock(
@@ -308,6 +310,39 @@ class TestConflictResponse(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaises(RequestConflictError):
                 await process_generation_batch(client, batch)
+
+    async def test_typed_scheduler_overload_is_preserved(self):
+        client = SimpleNamespace(
+            forward=AsyncMock(
+                return_value=OutputBatch(
+                    error="job-control admission capacity is exhausted",
+                    overloaded=True,
+                )
+            )
+        )
+        batch = SimpleNamespace(trace_ctx=None, prompt="prompt")
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.entrypoints.openai.utils.trace_req",
+                return_value=nullcontext(),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.entrypoints.openai.utils.log_generation_timer",
+                return_value=nullcontext(),
+            ),
+        ):
+            with self.assertRaises(RequestOverloadedError):
+                await process_generation_batch(client, batch)
+
+    async def test_image_routes_map_scheduler_overload_to_429(self):
+        with patch(
+            "sglang.multimodal_gen.runtime.entrypoints.openai.image_api.process_generation_batch",
+            new=AsyncMock(side_effect=RequestOverloadedError("at capacity")),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await _process_image_batch(object())
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertEqual(raised.exception.detail, "at capacity")
 
 
 if __name__ == "__main__":
