@@ -49,6 +49,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
+from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
 from sglang.srt.utils import (
     empty_context,
@@ -76,12 +77,16 @@ _compile_wrapper_counter = itertools.count()
 _DYNAMIC_DIM_MAX = 2**31 - 1
 
 
-def _compile_wrapper_forward(self, *args):
+def _compile_wrapper_forward(self, *args, **kwargs):
     with torch.no_grad():
-        return self.model(*args)
+        if self.model_forward is None:
+            return self.model(*args, **kwargs)
+        return self.model_forward(*args, **kwargs)
 
 
-def _make_compile_wrapper(model: torch.nn.Module) -> torch.nn.Module:
+def _make_compile_wrapper(
+    model: torch.nn.Module, model_forward: Optional[Callable] = None
+) -> torch.nn.Module:
     wrapper_id = next(_compile_wrapper_counter)
     forward_code = _compile_wrapper_forward.__code__.replace(
         co_firstlineno=wrapper_id + 1
@@ -98,6 +103,7 @@ def _make_compile_wrapper(model: torch.nn.Module) -> torch.nn.Module:
     )
     wrapper = wrapper_type()
     wrapper.model = model
+    wrapper.model_forward = model_forward
     return wrapper
 
 
@@ -179,6 +185,7 @@ def patch_model(
     num_tokens: int,
     tp_group: GroupCoordinator,
     dynamic: bool = False,
+    model_forward: Optional[Callable] = None,
 ):
     """Patch the model to make it compatible with torch.compile"""
     backup_ca_comm = None
@@ -195,7 +202,7 @@ def patch_model(
                     "SGLANG_CPU_GRAPH_COMPILE_BACKEND", "inductor"
                 )
                 yield torch.compile(
-                    _make_compile_wrapper(model),
+                    _make_compile_wrapper(model, model_forward),
                     backend=compile_backend,
                     dynamic=dynamic,
                 )
@@ -812,6 +819,10 @@ class CPUGraphRunner:
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = self.return_hidden_states_mode
+        self._prefill_graph_model = self._get_prefill_graph_model()
+        self._prefill_uses_eager_logits_tail = (
+            self._prefill_graph_model is not self.model_runner.model
+        )
         # Static capture width: CPU graphs are decode-only.
         self.captured_req_width = 1
 
@@ -971,11 +982,6 @@ class CPUGraphRunner:
             self.prefill_warmup_bs_values = list(
                 dict.fromkeys([start_bs, min(4, self.prefill_max_bs), 1])
             )
-            if self.enable_torch_compile:
-                # Stop-gap for IntelAMXAttnBackend's
-                # `max_extend_len = torch.max(...).item()` -- see class
-                # docstring.
-                torch._dynamo.config.capture_scalar_outputs = True
 
         # Capture
         try:
@@ -1227,6 +1233,33 @@ class CPUGraphRunner:
             dim = value.ndim - 1 if name == "mrope_positions" else 0
             _mark_dynamic_axis(value, dim)
 
+    def _refresh_dynamic_forward_batch_metadata(
+        self,
+        dynamic_forward_batch: ForwardBatch,
+        forward_batch: ForwardBatch,
+        include_extend_metadata: bool,
+    ) -> None:
+        metadata_fields = [
+            "num_token_non_padded_cpu",
+            "encoder_lens_cpu",
+            "encoder_cached",
+        ]
+        if include_extend_metadata:
+            metadata_fields.extend(
+                [
+                    "extend_num_tokens",
+                    "extend_seq_lens_cpu",
+                    "extend_prefix_lens_cpu",
+                    "extend_logprob_start_lens_cpu",
+                    "top_logprobs_nums",
+                    "token_ids_logprobs",
+                    "multi_item_delimiter_indices",
+                ]
+            )
+        for name in metadata_fields:
+            value = getattr(forward_batch, name)
+            setattr(dynamic_forward_batch, name, copy.copy(value))
+
     def _compile_decode_dynamic_graph(self, skip_cross_attention: bool) -> Callable:
         with patch_model(
             self.model_runner.model,
@@ -1273,6 +1306,11 @@ class CPUGraphRunner:
         else:
             dynamic_forward_batch.mm_inputs = forward_batch.mm_inputs
         dynamic_forward_batch.encoder_out_cache_loc = None
+        self._refresh_dynamic_forward_batch_metadata(
+            dynamic_forward_batch,
+            forward_batch,
+            include_extend_metadata=False,
+        )
         return dynamic_forward_batch
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
@@ -1328,6 +1366,11 @@ class CPUGraphRunner:
                 captured_forward_batch.num_token_non_padded.copy_(
                     forward_batch.num_token_non_padded
                 )
+            self._refresh_dynamic_forward_batch_metadata(
+                captured_forward_batch,
+                forward_batch,
+                include_extend_metadata=False,
+            )
             replay_init = getattr(
                 self.model_runner.attn_backend,
                 "init_forward_metadata_cpu_graph_replay",
@@ -1381,6 +1424,11 @@ class CPUGraphRunner:
             captured_forward_batch.num_token_non_padded.copy_(
                 forward_batch.num_token_non_padded
             )
+        self._refresh_dynamic_forward_batch_metadata(
+            captured_forward_batch,
+            forward_batch,
+            include_extend_metadata=False,
+        )
 
         replay_init = getattr(
             self.model_runner.attn_backend,
@@ -1584,6 +1632,30 @@ class CPUGraphRunner:
     # Prefill (EXTEND) graph: capture / warmup
     # ------------------------------------------------------------------
 
+    def _get_prefill_graph_model(self) -> torch.nn.Module:
+        model = self.model_runner.model
+        if (
+            self.is_generation
+            and getattr(model, "pp_group", None) is not None
+            and model.pp_group.is_last_rank
+        ):
+            try:
+                layer_model = resolve_language_model(model)
+            except AttributeError:
+                layer_model = getattr(model, "language_model", model)
+
+            seen = set()
+            while not hasattr(layer_model, "layers") and hasattr(layer_model, "model"):
+                model_id = id(layer_model)
+                if model_id in seen:
+                    return model
+                seen.add(model_id)
+                layer_model = layer_model.model
+
+            if hasattr(layer_model, "layers"):
+                return layer_model
+        return model
+
     def _run_prefill_once(self, compiled_fn: Callable, forward_batch: ForwardBatch):
         # Metadata prep happens *outside* the compiled callable, exactly like
         # decode already does above -- CPU never needs a separate "capture-time"
@@ -1596,6 +1668,21 @@ class CPUGraphRunner:
                 self._mark_dynamic_prefill_metadata()
             with torch.no_grad():
                 self.model_runner.tp_group.barrier()
+                if self._prefill_uses_eager_logits_tail:
+                    original_forward = self._prefill_graph_model.forward
+
+                    def replay_forward(*args, **kwargs):
+                        return compiled_fn(*args, **kwargs)
+
+                    self._prefill_graph_model.forward = replay_forward
+                    try:
+                        return self.model_runner.model.forward(
+                            forward_batch.input_ids,
+                            forward_batch.positions,
+                            forward_batch,
+                        )
+                    finally:
+                        self._prefill_graph_model.forward = original_forward
                 return compiled_fn(
                     forward_batch.input_ids,
                     forward_batch.positions,
@@ -1629,11 +1716,16 @@ class CPUGraphRunner:
 
     def _compile_prefill_bucket(self, num_tokens: int) -> Callable:
         with patch_model(
-            self.model_runner.model,
+            self._prefill_graph_model,
             self.enable_torch_compile,
             num_tokens=num_tokens,
             tp_group=self.model_runner.tp_group,
             dynamic=True,
+            model_forward=(
+                self._prefill_graph_model.forward
+                if self._prefill_uses_eager_logits_tail
+                else None
+            ),
         ) as forward:
             dynamic_warmup_bs = [
                 bs for bs in self.prefill_warmup_bs_values if bs >= 2
@@ -1648,11 +1740,16 @@ class CPUGraphRunner:
 
     def _compile_prefill_bucket_bs1(self, num_tokens: int) -> Callable:
         with patch_model(
-            self.model_runner.model,
+            self._prefill_graph_model,
             self.enable_torch_compile,
             num_tokens=num_tokens,
             tp_group=self.model_runner.tp_group,
             dynamic=False,
+            model_forward=(
+                self._prefill_graph_model.forward
+                if self._prefill_uses_eager_logits_tail
+                else None
+            ),
         ) as forward:
             self._warmup_prefill_callable(
                 forward,
@@ -1679,15 +1776,25 @@ class CPUGraphRunner:
         dynamic_forward_batch.batch_size = forward_batch.batch_size
         dynamic_forward_batch.seq_lens_sum = forward_batch.seq_lens_sum
         dynamic_forward_batch.mm_inputs = None
+        self._refresh_dynamic_forward_batch_metadata(
+            dynamic_forward_batch,
+            forward_batch,
+            include_extend_metadata=True,
+        )
         return dynamic_forward_batch
 
     def _compile_prefill_dynamic_fallback(self) -> Callable:
         with patch_model(
-            self.model_runner.model,
+            self._prefill_graph_model,
             self.enable_torch_compile,
             num_tokens=self.prefill_max_num_tokens,
             tp_group=self.model_runner.tp_group,
             dynamic=True,
+            model_forward=(
+                self._prefill_graph_model.forward
+                if self._prefill_uses_eager_logits_tail
+                else None
+            ),
         ) as forward:
             # Warm up at two distinct num_tokens (as well as two distinct bs) so
             # both axes are established as symbolic, not just bs.
@@ -1707,11 +1814,16 @@ class CPUGraphRunner:
 
     def _compile_prefill_dynamic_batch_one(self) -> Callable:
         with patch_model(
-            self.model_runner.model,
+            self._prefill_graph_model,
             self.enable_torch_compile,
             num_tokens=self.prefill_max_num_tokens,
             tp_group=self.model_runner.tp_group,
             dynamic=True,
+            model_forward=(
+                self._prefill_graph_model.forward
+                if self._prefill_uses_eager_logits_tail
+                else None
+            ),
         ) as forward:
             for num_tokens in sorted(
                 {self.prefill_max_num_tokens, max(self.prefill_max_num_tokens // 2, 1)}
