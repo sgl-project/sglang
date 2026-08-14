@@ -1,15 +1,9 @@
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 
 from sglang.kernels.ops.attention.linear.seg_la import SegLaMeta, seg_la_fwd
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.lightning_attention import (
     LightningAttentionCase,
@@ -23,6 +17,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
     run_lightning_eagle_verify_case,
     run_lightning_eagle_verify_cuda_graph_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")

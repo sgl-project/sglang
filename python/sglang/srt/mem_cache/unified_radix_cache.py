@@ -773,7 +773,12 @@ class UnifiedRadixCache(BasePrefixCache):
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
 
-        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+        # swa_evicted_seqlen is a raw-token length, but under EAGLE the insert key is
+        # bigram-indexed, so SWA would carve tombstones at the wrong offset (#34653).
+        if (
+            envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
+            and not self.tree_core.is_eagle
+        ):
             for comp in self._components_tuple:
                 comp.free_out_of_window_slots(
                     req, effective_cache_len - 1, insert_params
