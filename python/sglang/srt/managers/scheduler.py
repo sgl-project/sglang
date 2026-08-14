@@ -25,7 +25,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.runtime_context import (
     get_device,
@@ -90,6 +90,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_dsa_seed_metadata_dim,
     prepare_abort,
+    unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
@@ -268,6 +269,7 @@ from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
+    flush_trace_batch,
     set_schedule_time_batch,
     set_time_batch,
 )
@@ -276,7 +278,12 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import get_context, get_parallel, publish
+from sglang.srt.runtime_context import (
+    get_context,
+    get_device,
+    get_parallel,
+    publish,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -309,6 +316,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
+    resolve_image_processor_backend,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
@@ -808,7 +816,7 @@ class Scheduler(
                     tokenizer_mode=get_serving().tokenizer_mode,
                     trust_remote_code=get_model().trust_remote_code,
                     revision=get_model().revision,
-                    use_fast=not get_mm().disable_fast_image_processor,
+                    image_processor_backend=resolve_image_processor_backend(get_mm()),
                     tokenizer_backend=get_serving().tokenizer_backend,
                     model_name=get_model().model_path,
                 )
@@ -824,7 +832,11 @@ class Scheduler(
 
         # Load multimodal processor for M-RoPE fallback computation.
         self._mm_processor = None
-        if self.model_config.is_multimodal and self.processor is not None:
+        if (
+            self.model_config.is_multimodal
+            and self.processor is not None
+            and not server_args.language_model_only
+        ):
             try:
                 import_processors("sglang.srt.multimodal.processors")
                 self._mm_processor = get_mm_processor(
@@ -977,6 +989,8 @@ class Scheduler(
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
+        if self.server_args.is_startup_weight_load_overlap:
+            self.tp_worker.start_startup_weight_load()
         self.maybe_init_draft_worker()
 
         # Prepare KV cache pools for all workers
@@ -992,6 +1006,9 @@ class Scheduler(
             tic = time.perf_counter()
             model_runner.post_capture_resize_kv_pool()
             self.kv_cache_allocation_time += time.perf_counter() - tic
+
+        if self.server_args.is_startup_weight_load_overlap:
+            self.tp_worker.finalize_startup_weight_load()
 
         if (
             get_exec().moe.elastic_ep_backend is not None
@@ -1393,8 +1410,18 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+            # Requests with a sent chunk that are not yet on the inflight queue.
+            self.disagg_prefill_pending_chunk_rids: Set[str] = set()
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+
+        if (
+            self.enable_unified_memory
+            and self.disaggregation_mode != DisaggregationMode.NULL
+        ):
+            self.token_to_kv_pool_allocator.set_disagg_move_gate(
+                unified_memory_disagg_move_gate(self)
+            )
 
         # Init mm receiver for EPD disaggregation mode
         if get_disagg().language_only and get_disagg().encoder_transfer_backend in [
@@ -2410,6 +2437,7 @@ class Scheduler(
                 ),
                 routing_key=recv_req.routing_key,
                 extra_key=recv_req.extra_key,
+                cache_salt=recv_req.cache_salt,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
@@ -2615,6 +2643,24 @@ class Scheduler(
 
         if req.logprob_start_len > len(req.origin_input_ids):
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
+            req.logprob_start_len = -1
+            req.set_finish_with_abort(error_msg)
+            self._add_request_to_queue(req)
+            return
+
+        if (
+            get_device().mlx_enable_sampling
+            and req.return_logprob
+            and 0 <= req.logprob_start_len < len(req.origin_input_ids)
+        ):
+            # The MLX sampling path computes output logprobs only; the
+            # prefill result carries no input_token_logprobs, so letting
+            # this through would crash output processing.
+            error_msg = (
+                "Prompt input logprobs (logprob_start_len) are not supported "
+                "on the MLX sampling path; omit logprob_start_len to get "
+                "output logprobs."
+            )
             req.logprob_start_len = -1
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
@@ -2919,6 +2965,7 @@ class Scheduler(
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.clear_pending_chunk_send(req)
             req.disagg_kv_sender.abort()
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
@@ -3860,6 +3907,12 @@ class Scheduler(
             assert _batch_result is batch_result
             # Delay-sample is non-spec only; relays the sampled bonus tokens.
             self._relay_forward_payload(batch_result.future_indices, batch_result)
+
+        # Run device-to-host copy on a separate stream to avoid blocking the
+        # forward stream. The copy waits for the sampled result and can overlap
+        # with subsequent forward computation.
+        self.copy_stream.wait_stream(self.forward_stream)
+        with self.copy_stream_ctx:
             batch_result.copy_to_cpu(
                 return_logprob=cur_batch.return_logprob,
                 return_hidden_states=cur_batch.return_hidden_states,
@@ -3881,6 +3934,9 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        # Flush async trace ops here: in overlap mode this CPU work runs while
+        # the next batch's GPU forward is in flight, giving free overlap.
+        flush_trace_batch(batch.reqs)
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():

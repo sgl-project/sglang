@@ -281,6 +281,7 @@ def fast_prefill_plan(
         fixed_split_size if fixed_split_size is not None else -1,
         False,  # disable_split_kv
         0,  # num_colocated_ctas
+        0,  # uniform_q_len
     ]
     self._plan_info = self._cached_module.plan(*args)
 
@@ -1382,6 +1383,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     sm_scale=layer.scaling,
                     window_left=swa_window_left,
                     logits_soft_cap=logits_soft_cap,
+                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
                 )
 
                 o, _ = _safe_merge_state(o1, s1, o2, s2)

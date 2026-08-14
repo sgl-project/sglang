@@ -21,6 +21,7 @@ from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     mark_fused_gelu_site,
 )
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_tp_world_size,
@@ -73,6 +74,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -104,32 +106,7 @@ def _local_seq_len(seq_len: int, sp_world_size: int) -> int:
     return padded_len // sp_world_size
 
 
-def _get_qkv_projections(
-    attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
-):
-    if attn.use_fused_qkv:
-        img_qkv, _ = attn.to_qkv(hidden_states)
-        img_query, img_key, img_value = [
-            x.contiguous() for x in img_qkv.chunk(3, dim=-1)
-        ]
-    else:
-        img_query, _ = attn.to_q(hidden_states)
-        img_key, _ = attn.to_k(hidden_states)
-        img_value, _ = attn.to_v(hidden_states)
-
-    txt_query = txt_key = txt_value = None
-    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        if attn.use_fused_added_qkv:
-            txt_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-            txt_query, txt_key, txt_value = [
-                x.contiguous() for x in txt_qkv.chunk(3, dim=-1)
-            ]
-        else:
-            txt_query, _ = attn.add_q_proj(encoder_hidden_states)
-            txt_key, _ = attn.add_k_proj(encoder_hidden_states)
-            txt_value, _ = attn.add_v_proj(encoder_hidden_states)
-
-    return img_query, img_key, img_value, txt_query, txt_key, txt_value
+_get_qkv_projections = get_qkv_projections
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -1339,7 +1316,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
     param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
-    _fsdp_shard_conditions = QwenImageDitConfig().arch_config._fsdp_shard_conditions
+    _fsdp_shard_conditions = [is_transformer_block]
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
@@ -1371,23 +1348,24 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__(config=config, hf_config=hf_config)
-        patch_size = config.arch_config.patch_size
-        in_channels = config.arch_config.in_channels
-        out_channels = config.arch_config.out_channels
-        num_layers = config.arch_config.num_layers
-        attention_head_dim = config.arch_config.attention_head_dim
-        num_attention_heads = config.arch_config.num_attention_heads
-        joint_attention_dim = config.arch_config.joint_attention_dim
-        axes_dims_rope = config.arch_config.axes_dims_rope
-        self.zero_cond_t = getattr(config.arch_config, "zero_cond_t", False)
+        arch = self.config
+        patch_size = arch.patch_size
+        in_channels = arch.in_channels
+        out_channels = arch.out_channels
+        num_layers = arch.num_layers
+        attention_head_dim = arch.attention_head_dim
+        num_attention_heads = arch.num_attention_heads
+        joint_attention_dim = arch.joint_attention_dim
+        axes_dims_rope = arch.axes_dims_rope
+        self.zero_cond_t = getattr(arch, "zero_cond_t", False)
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
 
         self.use_additional_t_cond: bool = getattr(
-            config.arch_config, "use_additional_t_cond", False
+            arch, "use_additional_t_cond", False
         )  # For qwen-image-layered now
         self.use_layer3d_rope: bool = getattr(
-            config.arch_config, "use_layer3d_rope", False
+            arch, "use_layer3d_rope", False
         )  # For qwen-image-layered now
 
         if not self.use_layer3d_rope:
