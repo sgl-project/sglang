@@ -185,6 +185,10 @@ for the reported performance measurements. Remove these `SGLANG_CACHE_DIT_*`
 variables to use lossless denoising. See the **Ascend NPU topology comparison**
 in the Benchmarks section for the measured eight- and four-NPU latency.
 
+The measured latency configuration also passes `--dit-cpu-offload false` to
+keep the transformer resident on the NPUs. Omit this flag when lower device
+memory usage is more important than avoiding CPU-to-NPU transfer latency.
+
 For an eight-NPU host, the validated topology is TP2 + SP4 with Laser
 Attention. Use Ascend Flash Attention by replacing `laser_attn` with `fa`.
 
@@ -201,6 +205,7 @@ HCCL_BUFFSIZE=256 sglang serve \
   --model-path MiniMaxAI/MiniMax-H3 \
   --model-type diffusion \
   --model-variant fl2va \
+  --dit-cpu-offload false \
   --num-gpus 8 \
   --tp-size 2 \
   --sp-degree 4 \
@@ -223,6 +228,7 @@ HCCL_BUFFSIZE=256 sglang serve \
   --model-path MiniMaxAI/MiniMax-H3 \
   --model-type diffusion \
   --model-variant fl2va \
+  --dit-cpu-offload false \
   --num-gpus 4 \
   --tp-size 2 \
   --sp-degree 2 \
@@ -843,8 +849,9 @@ the configurations with collected measurements:
 ### Ascend NPU topology comparison
 
 Both topologies used Laser Attention and the explicit Cache-DiT configuration
-from the Ascend launch commands. The measured workload was one 5-second T2VA
-request at 1344×768, 124 frames, 24 fps, and 50 inference steps.
+from the Ascend launch commands, with `--dit-cpu-offload false` keeping the DiT
+resident. The measured workload was one 5-second T2VA request at 1344×768,
+124 frames, 24 fps, and 50 inference steps.
 
 | NPU count | Topology | End-to-end latency |
 | ---: | --- | ---: |
