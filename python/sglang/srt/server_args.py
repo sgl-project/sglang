@@ -1301,6 +1301,12 @@ class ServerArgs:
         "Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. Requires 'pip install sglang[http2]'.",
         NS("serving"),
     ] = False
+    http2_max_concurrent_streams: A[
+        int,
+        "Maximum number of concurrent streams advertised on each HTTP/2 "
+        "connection (1 to 2^32 - 1). Only applies with --enable-http2.",
+        NS("serving"),
+    ] = 200
 
     # -------------------------------------------------------------------------
     # SSL/TLS
@@ -3941,6 +3947,12 @@ class ServerArgs:
             )
 
         if self.enable_http2:
+            if not 0 < self.http2_max_concurrent_streams < 2**32:
+                raise ValueError(
+                    "--http2-max-concurrent-streams must be between 1 and "
+                    "4294967295."
+                )
+
             try:
                 import granian  # noqa: F401
             except ImportError:
