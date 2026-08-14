@@ -253,15 +253,17 @@ def copy_cache_planned_mla(
     host_cache: torch.Tensor,
     device_buffer: torch.Tensor,
     item_size_bytes: int,
-    num_blocks: int = 4,
+    num_blocks: int = 1,
     block_size: int = 1024,
     is_dsv4_layout: bool = False,
     skip_io: bool = False,
 ) -> None:
     """Replay a recorded miss plan (host_cache -> device_buffer) for a skip layer.
 
-    IO-only, no planning; the small fixed grid keeps the SM footprint low while
-    overlapped on a side stream. The anchor's slot table stays valid (lockstep).
+    IO-only, no planning; the anchor's slot table stays valid (lockstep). Pass
+    num_blocks=num_reqs (one block per request, padded to the CUDA graph
+    capture size like load_cache_to_device_buffer's grid) so this scales with
+    the batch instead of round-robining a small fixed grid.
     """
     assert miss_src.dtype == torch.int64 and miss_dst.dtype == torch.int32
     assert miss_count.dtype == torch.int32

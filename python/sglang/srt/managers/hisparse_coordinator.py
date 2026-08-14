@@ -289,15 +289,16 @@ class HiSparseCoordinator:
         if not self.enable_prefetch:
             return
 
-        # Small fixed grid for the copy-only kernel: low SM footprint so the
-        # copies overlap compute with little contention.
-        self._prefetch_copy_blocks = 4
         max_group_size = max(len(g) for g in self._prefetch_groups.values())
         self.prefetch_stream = device_module.Stream()
         self._prefetch_events = [device_module.Event() for _ in range(max_group_size)]
-        # Plan recorded by the current anchor, replayed by its skip layers. One
-        # buffer set suffices: the last skip layer's event wait orders the next
-        # anchor's writes after this group's copies.
+        # The anchor of a shared-index group records its miss plan once; skip
+        # layers replay it (IO-only) on the side stream through
+        # copy_cache_planned_kernel, launched with one block per request
+        # (num_blocks=num_reqs) so its parallelism scales with the batch
+        # instead of round-robining a small fixed grid over all requests.
+        # One buffer set suffices: the last skip layer's event wait orders the
+        # next anchor's writes after this group's copies.
         self._miss_src = torch.zeros(
             (max_num_req_slots, self.top_k), dtype=torch.int64, device=self.device
         )
@@ -988,7 +989,12 @@ class HiSparseCoordinator:
 
     def _run_copy_only_kernel(self, num_reqs: int, skip_layer: int) -> None:
         """Replay the anchor's recorded miss plan into a skip layer's buffers
-        (IO-only; the anchor's slot table stays valid -- lockstep layout)."""
+        (IO-only; the anchor's slot table stays valid -- lockstep layout).
+
+        One block per request (num_blocks=num_reqs): the kernel does no
+        cross-request scheduling, so its parallelism must come from the grid,
+        same convention as the fused swap-in kernel's per-request blocks.
+        """
         copy_cache_planned_mla(
             miss_src=self._miss_src[:num_reqs],
             miss_dst=self._miss_dst[:num_reqs],
@@ -997,7 +1003,7 @@ class HiSparseCoordinator:
             host_cache=self.mem_pool_host.kv_buffer[skip_layer],
             device_buffer=self.mem_pool_device.kv_buffer[skip_layer],
             item_size_bytes=self.item_size_bytes,
-            num_blocks=self._prefetch_copy_blocks,
+            num_blocks=num_reqs,
             is_dsv4_layout=self.is_dsv4_hisparse,
             skip_io=self.skip_io,
         )
@@ -1021,25 +1027,25 @@ class HiSparseCoordinator:
 
         num_reqs = req_pool_indices.size(0)
         if self._is_shared_index_layer[layer_id]:
-            # Skip layer: wait for its prefetched copy; the anchor's slot table
-            # applies (shared index + lockstep buffers).
+            # Skip layer: wait for its prefetched copy, then reuse the
+            # anchor's slot table directly (shared index + lockstep buffers).
             slot = self._prefetch_slot[layer_id]
             self._prefetch_events[slot].wait(device_module.current_stream())
             return self.top_k_device_locs_buffer[:num_reqs]
 
-        # Anchor: swap in synchronously (recording the plan), then prefetch the
-        # skip layers' copies on the side stream.
+        # Anchor: swap in synchronously (recording the plan for skip layers to
+        # replay), then prefetch the skip layers' copies on the side stream.
         group = self._prefetch_groups.get(layer_id)
         anchor_locs = self._run_swap_in_kernel(
             req_pool_indices,
             compressed_seq_lens,
             top_k_result,
             layer_id,
-            record_plan=group is not None,
+            record_plan=bool(group),
         )
         if group:
-            # Fork: the prefetch stream must observe the anchor's plan (produced
-            # on the current stream) before replaying it.
+            # Fork: the prefetch stream must observe the anchor's plan
+            # (produced on the current stream) before replaying it.
             self.prefetch_stream.wait_stream(device_module.current_stream())
             with device_module.stream(self.prefetch_stream):
                 for skip_layer in group:

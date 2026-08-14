@@ -835,9 +835,10 @@ void load_cache_to_device_buffer(
 }
 
 // Copy-only swap-in for shared-index skip layers: replays the anchor's recorded
-// miss plan (no hit detection / LRU; the anchor's slot table stays valid). The
-// small fixed grid (num_blocks) keeps the SM footprint low while overlapping
-// compute on a side stream. SkipIO is the same probe as in the fused kernel.
+// miss plan (no hit detection / LRU; the anchor's slot table stays valid).
+// Launched with one block per request (see copy_cache_planned below) so its
+// parallelism scales with the batch instead of a fixed grid. SkipIO is the
+// same probe as in the fused kernel.
 template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout, bool SkipIO>
 __global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_kernel(
     const int64_t* __restrict__ miss_src_locs,
@@ -850,44 +851,38 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_kernel(
     void* __restrict__ device_buffer_v,
     int64_t plan_stride,
     int64_t item_size_bytes) {
+  // One block per request (grid = bs, same convention as
+  // load_cache_to_device_buffer_kernel), instead of round-robining a flat
+  // (request, miss) queue over a small fixed grid. The round-robin form scales
+  // its warp count with num_blocks, not with the batch, so it undersubscribes
+  // the GPU at realistic batch sizes -- see the git history of this kernel for
+  // the flat-queue version and its H200 microbenchmark note. Per-request grids
+  // give one block's worth of parallelism to every request unconditionally,
+  // matching load_cache_to_device_buffer_kernel's scaling instead of forcing
+  // the caller to size a grid for the batch.
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
-  const int lane_id = threadIdx.x % WARP_SIZE;
-  const int warp_global = blockIdx.x * NUM_WARPS + threadIdx.x / WARP_SIZE;
-  const int total_warps = gridDim.x * NUM_WARPS;
-  const int real = num_real_reqs[0];
+  const int bid = blockIdx.x;
+  if (bid >= num_real_reqs[0]) return;
 
-  // Warp-sized windows amortize the miss_counts loads; warps then round-robin
-  // the flattened (request, miss) space so a large sparse batch spreads over
-  // all warps (183us -> 29us at bs=100 with 2 misses/req on H200) while one
-  // request's miss burst still uses every warp.
-  int start = 0;  // flat index of the current request's first miss
-  for (int base = 0; base < real; base += WARP_SIZE) {
-    const int r_lane = base + lane_id;
-    const int cnt_lane = (r_lane < real) ? miss_counts[r_lane] : 0;
-    const int window = (real - base < WARP_SIZE) ? (real - base) : WARP_SIZE;
-    for (int j = 0; j < window; ++j) {
-      const int cnt = __shfl_sync(FULL_WARP_MASK, cnt_lane, j);
-      if (cnt == 0) continue;
-      int m0 = (warp_global - start) % total_warps;
-      if (m0 < 0) m0 += total_warps;
-      const int64_t r = base + j;
-      const int64_t* src_row = miss_src_locs + r * plan_stride;
-      const int32_t* dst_row = miss_dst_locs + r * plan_stride;
-      for (int m = m0; m < cnt; m += total_warps) {
-        // Timing probe: the plan is still walked; only the bytes stay put.
-        if constexpr (SkipIO) continue;
-        copy_miss_item<IsMLA, IsDsv4Layout>(
-            lane_id,
-            host_cache_k,
-            host_cache_v,
-            device_buffer_k,
-            device_buffer_v,
-            src_row[m],
-            static_cast<int64_t>(dst_row[m]),
-            item_size_bytes);
-      }
-      start += cnt;
-    }
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  const int warp_id = threadIdx.x / WARP_SIZE;
+  const int cnt = miss_counts[bid];
+  if (cnt == 0) return;
+
+  const int64_t* src_row = miss_src_locs + static_cast<int64_t>(bid) * plan_stride;
+  const int32_t* dst_row = miss_dst_locs + static_cast<int64_t>(bid) * plan_stride;
+  for (int m = warp_id; m < cnt; m += NUM_WARPS) {
+    // Timing probe: the plan is still walked; only the bytes stay put.
+    if constexpr (SkipIO) continue;
+    copy_miss_item<IsMLA, IsDsv4Layout>(
+        lane_id,
+        host_cache_k,
+        host_cache_v,
+        device_buffer_k,
+        device_buffer_v,
+        src_row[m],
+        static_cast<int64_t>(dst_row[m]),
+        item_size_bytes);
   }
 }
 
@@ -901,7 +896,8 @@ void copy_cache_planned(
     tvm::ffi::TensorView host_cache_v,
     tvm::ffi::TensorView device_buffer_k,
     tvm::ffi::TensorView device_buffer_v,
-    int64_t num_blocks,
+    int64_t num_blocks,  // one block per request; pass the batch size (padded to the CUDA graph capture size, same as
+                         // load_cache_to_device_buffer's grid).
     int64_t item_size_bytes) {
   using namespace host;
   const int64_t plan_stride = miss_src_locs.strides()[0];
