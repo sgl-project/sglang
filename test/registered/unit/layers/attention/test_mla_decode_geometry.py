@@ -32,15 +32,19 @@ the invariant here instead of silently costing 40% on one batch size.
 
 import unittest
 
+from sglang.kernels.ops.attention import decode_attention as da
 from sglang.kernels.ops.attention.decode_attention import (
     _MLA_BUCKET_BATCH_FREE,
     _MLA_BUCKETS,
     _fwd_grouped_kernel_stage1,
+    _keep_scheduler_splits,
     _mla_bucket,
     _mla_head_tiles,
     _mla_kv_splits,
     _mla_split_budget,
 )
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -180,6 +184,39 @@ class TestMlaDecodeGeometry(unittest.TestCase):
                     _mla_kv_splits(batch, 1, MAX_KV_SPLITS, 32),
                     _mla_kv_splits(batch, 1, MAX_KV_SPLITS, 256),
                 )
+
+
+class TestKeepSchedulerSplits(unittest.TestCase):
+    """Which configs decline the batch-wide count.
+
+    Through override_server_args, so the flags resolve the way a launched server
+    resolves them; poking the cached decision keeps passing after they move namespace.
+    """
+
+    def _publish(self, **fields):
+        override = get_context().override_server_args(**fields)
+        override.install()
+        self.addCleanup(override.restore)
+        # resolved once per process, so clear it at both ends
+        da._KEEP_SCHEDULER_SPLITS = None
+        self.addCleanup(setattr, da, "_KEEP_SCHEDULER_SPLITS", None)
+
+    def test_a_plain_config_takes_the_batch_wide_count(self):
+        self._publish()
+        self.assertFalse(_keep_scheduler_splits())
+
+    def test_deterministic_inference_keeps_the_scheduler_splits(self):
+        self._publish(enable_deterministic_inference=True)
+        self.assertTrue(_keep_scheduler_splits())
+
+    def test_an_explicit_split_tile_size_keeps_them(self):
+        self._publish(triton_attention_split_tile_size=256)
+        self.assertTrue(_keep_scheduler_splits())
+
+    def test_the_static_kv_splits_env_keeps_them(self):
+        self._publish()
+        with envs.SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS.override(True):
+            self.assertTrue(_keep_scheduler_splits())
 
 
 if __name__ == "__main__":

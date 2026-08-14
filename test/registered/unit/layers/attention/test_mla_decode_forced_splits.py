@@ -29,6 +29,7 @@ import torch
 
 from sglang.kernels.ops.attention import decode_attention as da
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -153,13 +154,20 @@ def _run(inp):
 )
 class TestMlaDecodeForcedSplits(CustomTestCase):
     def setUp(self):
-        da._KEEP_SCHEDULER_SPLITS = False
+        # a plain config, so the count comes out batch-wide whatever ran before this
+        self._publish()
         da._LOGGED_TUNE = False
 
     def tearDown(self):
         # None, not False: the real resolution has to run again for anything later in
-        # this process, and the last test in here leaves it True.
+        # this process.
         da._KEEP_SCHEDULER_SPLITS = None
+
+    def _publish(self, **fields):
+        override = get_context().override_server_args(**fields)
+        override.install()
+        self.addCleanup(override.restore)
+        da._KEEP_SCHEDULER_SPLITS = None  # resolve it from what was just published
 
     def test_tuned_matches_stock(self):
         # Not bit-for-bit: a different split count reassociates the fp32 softmax
@@ -216,7 +224,7 @@ class TestMlaDecodeForcedSplits(CustomTestCase):
         inp = _inputs([1, 4095, 4096, 16384], 16, 1, 256, seed=7)
         with envs.SGLANG_MLA_DECODE_TUNE.override(False):
             stock = _run(inp)
-        da._KEEP_SCHEDULER_SPLITS = True
+        self._publish(enable_deterministic_inference=True)
         with envs.SGLANG_MLA_DECODE_TUNE.override(True):
             self.assertEqual(
                 da._mla_forced_kv_splits(inp["q"], inp["k_buffer"], 256, True), 0
@@ -229,7 +237,7 @@ class TestMlaDecodeForcedSplits(CustomTestCase):
     def test_deterministic_mode_is_batch_invariant(self):
         # The point of keeping the scheduler's count: a request's reduction tree must
         # not depend on who it shares the batch with.
-        da._KEEP_SCHEDULER_SPLITS = True
+        self._publish(enable_deterministic_inference=True)
         lens = [4096, 1, 777, 16384]
         with envs.SGLANG_MLA_DECODE_TUNE.override(True):
             batched = _run(_inputs(lens, 16, 1, 256, seed=3))

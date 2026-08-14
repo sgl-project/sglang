@@ -92,15 +92,15 @@ def _keep_scheduler_splits() -> bool:
     """
     global _KEEP_SCHEDULER_SPLITS
     if _KEEP_SCHEDULER_SPLITS is None:
-        from sglang.srt.runtime_context import get_server_args
+        from sglang.srt.runtime_context import get_exec
 
         try:
-            server_args = get_server_args()
+            exec_cfg = get_exec()
         except ValueError:
             return False  # not published yet, ask again on the next call
         _KEEP_SCHEDULER_SPLITS = bool(
-            server_args.enable_deterministic_inference
-            or server_args.triton_attention_split_tile_size
+            exec_cfg.deterministic.enable_deterministic_inference
+            or exec_cfg.kernel.triton_attention_split_tile_size
             or envs.SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS.get()
         )
         if _KEEP_SCHEDULER_SPLITS:
