@@ -255,6 +255,25 @@ _enable_pcg_dsv2_dual_stream = (
 )
 
 
+def _get_shared_expert_fp8_block_size(
+    gate_up_quant_method: Any, down_quant_method: Any
+) -> Optional[List[int]]:
+    """Return CUDA/ROCm block metadata without probing ModelSlim on NPU.
+
+    ModelSlim MXFP8 weights also use a float8 payload, but its linear method
+    intentionally owns no ``quant_config`` attribute.  Ascend executes shared
+    experts through that method directly and does not consume the generic
+    block-FP8 metadata used by CPU/CUDA paths.
+    """
+    if _is_npu:
+        return None
+
+    gate_up_block_size = gate_up_quant_method.quant_config.weight_block_size
+    down_block_size = down_quant_method.quant_config.weight_block_size
+    assert gate_up_block_size == down_block_size
+    return gate_up_block_size
+
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -799,13 +818,16 @@ class DeepseekV2MoE(nn.Module):
                     # For compressed-tensors ptpc model, don't need to check the weight_block_size
                     pass
                 else:
-                    assert (
-                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                        == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
+                    shared_experts_weight_block_size = (
+                        _get_shared_expert_fp8_block_size(
+                            self.shared_experts.gate_up_proj.quant_method,
+                            self.shared_experts.down_proj.quant_method,
+                        )
                     )
-                    self.shared_experts_weight_block_size = (
-                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                    )
+                    if shared_experts_weight_block_size is not None:
+                        self.shared_experts_weight_block_size = (
+                            shared_experts_weight_block_size
+                        )
 
         self.top_k = config.num_experts_per_tok
 
