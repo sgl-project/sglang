@@ -847,6 +847,15 @@ class Envs:
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
+    # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.
+    # Consults the tuned per-(N, K, M) Triton tile config table in
+    # apply_fp8_linear. When a tuned config exists for this GPU / weight shape /
+    # token count, run the Triton w8a8 FP8 GEMM with it; otherwise keep the
+    # default CUTLASS path. Only takes effect on a GPU with a matching
+    # dtype=fp8_w8a8_channelwise config JSON under
+    # kernels/ops/quantization/configs/ (currently L40S), so it is a no-op on
+    # any other GPU / untuned shape even when enabled.
+    SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
 
     # ===================================================================
     # Humming quantization
@@ -963,6 +972,15 @@ class Envs:
     # Cache directories
     # ===================================================================
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
+    # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
+    # point it at a persistent mount to share builds across CI jobs.
+    SGLANG_JIT_CACHE_DIR = EnvStr(None)
+    # Log, at INFO, which dependency changed whenever a module is rebuilt.
+    SGLANG_JIT_CACHE_DEBUG = EnvBool(False)
+    # How many builds to keep per module variant. None = unset = keep all, which
+    # is what makes reverting an edit an instant hit instead of a rebuild; set
+    # it to trade that away for disk (1 keeps only the most recent build).
+    SGLANG_JIT_CACHE_KEEP = EnvInt(None)
 
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
