@@ -35,8 +35,8 @@ from sglang.srt.layers import (
     zero_copy_context,
 )
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
-from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
 from sglang.srt.layers.attention.linear.utils import get_linear_attn_prefill_backend
+from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,

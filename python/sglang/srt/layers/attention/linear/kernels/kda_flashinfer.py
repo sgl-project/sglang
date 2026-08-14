@@ -115,13 +115,9 @@ def maybe_build_cake_checkpoint_plan(
             "Cake KDA checkpoint interval must be a positive multiple of 32, "
             f"got {checkpoint_every_n_tokens}."
         )
-    extend_seq_lens = forward_batch.extend_seq_lens.to(
-        device="cpu", dtype=torch.int64
-    )
+    extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
     checkpoint_counts = (extend_seq_lens - 1) // checkpoint_every_n_tokens + 1
-    checkpoint_cu_starts = torch.zeros(
-        checkpoint_counts.numel() + 1, dtype=torch.int64
-    )
+    checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)
     checkpoint_cu_starts[1:] = torch.cumsum(checkpoint_counts, dim=0)
 
     forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts.to(
@@ -820,9 +816,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 and track_ssm_h_src.numel() > 0
             )
             state_checkpoints = (
-                ssm_states.new_empty(
-                    (num_state_checkpoints, *ssm_states.shape[1:])
-                )
+                ssm_states.new_empty((num_state_checkpoints, *ssm_states.shape[1:]))
                 if needs_checkpoints
                 else None
             )

@@ -73,9 +73,9 @@ def _make_inputs(seq_lens, num_heads):
         ).contiguous(),
         # Match Kimi K3's fused projection slice: raw BF16 logits with a wider
         # physical token-row pitch and unit head stride.
-        beta=torch.randn(
-            1, total_tokens, 32, device="cuda", dtype=torch.bfloat16
-        )[:, :, 8 : 8 + num_heads],
+        beta=torch.randn(1, total_tokens, 32, device="cuda", dtype=torch.bfloat16)[
+            :, :, 8 : 8 + num_heads
+        ],
         A_log=(
             torch.randn(1, 1, num_heads, 1, device="cuda", dtype=torch.float32) * 0.2
         ).contiguous(),
@@ -184,12 +184,8 @@ def test_kda_prefill_cake_aligned_tracking_is_bitwise_identical():
 def test_kda_prefill_cake_returns_native_interior_state_tracking():
     seq_lens = [65, 131]
     data = _make_inputs(seq_lens, 12)
-    interior_checkpoint_source = torch.tensor(
-        [0, 4], device="cuda", dtype=torch.int64
-    )
-    checkpoint_cu_starts = torch.tensor(
-        [0, 2, 5], device="cuda", dtype=torch.int64
-    )
+    interior_checkpoint_source = torch.tensor([0, 4], device="cuda", dtype=torch.int64)
+    checkpoint_cu_starts = torch.tensor([0, 2, 5], device="cuda", dtype=torch.int64)
     state_ref = data["state"].clone()
     output_ref = _extend(
         TritonKDAKernel(),
@@ -220,9 +216,7 @@ def test_kda_prefill_cake_returns_native_interior_state_tracking():
 
     out_cake, intermediate_cake = output_cake
     out_ref, intermediate_ref = output_ref
-    torch.testing.assert_close(
-        out_cake.float(), out_ref.float(), atol=1e-2, rtol=1e-2
-    )
+    torch.testing.assert_close(out_cake.float(), out_ref.float(), atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(
         intermediate_cake.float(), intermediate_ref.float(), atol=1e-2, rtol=1e-2
     )
