@@ -211,6 +211,7 @@ def build_kv_only_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=server_args.hicache_host_memory_mode,
     )
     if params.mtp_draft_device_pools:
         cache_controller.set_mtp_draft_pools(params.mtp_draft_device_pools)
@@ -315,6 +316,7 @@ def build_hybrid_swa_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=server_args.hicache_host_memory_mode,
     )
     if mtp_swa_device_pools:
         cache_controller.set_mtp_draft_pools(mtp_swa_device_pools)
@@ -602,6 +604,7 @@ def build_deepseek_v4_hicache_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=server_args.hicache_host_memory_mode,
     )
     if mtp_swa_device_buffers:
         cache_controller.set_mtp_draft_pools(mtp_swa_device_buffers)
@@ -697,6 +700,7 @@ def build_hybrid_mamba_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=server_args.hicache_host_memory_mode,
     )
     if mtp_draft_device_pools:
         cache_controller.set_mtp_draft_pools(mtp_draft_device_pools)
@@ -812,6 +816,7 @@ def build_hybrid_mamba_swa_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=server_args.hicache_host_memory_mode,
     )
     return host_pool_group, cache_controller
 
@@ -889,6 +894,7 @@ def build_anchor_sidecar_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=server_args.hicache_host_memory_mode,
     )
     if mtp_draft_device_pools:
         cache_controller.set_mtp_draft_pools(mtp_draft_device_pools)

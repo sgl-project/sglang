@@ -1852,9 +1852,11 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         labels: Dict[str, str],
     ):
         from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Gauge as _PromGauge
         from prometheus_client import Histogram as _PromHistogram
 
         Counter = self._counter_cls or _PromCounter
+        Gauge = self._gauge_cls or _PromGauge
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels
@@ -1868,6 +1870,21 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         self.backuped_tokens_total = Counter(
             name="sglang:backuped_tokens_total",
             documentation="Number of backuped tokens.",
+            labelnames=labels.keys(),
+        )
+
+        self.backup_dropped_tokens_total = Counter(
+            name="sglang:hicache_backup_dropped_tokens_total",
+            documentation="Buffer-mode backup tokens dropped by write-path rate "
+            "limiting (backlog cap or dropped-parent cascade).",
+            labelnames=labels.keys(),
+        )
+
+        self.prefetch_aux_alloc_failed_tokens_total = Counter(
+            name="sglang:hicache_prefetch_aux_alloc_failed_tokens_total",
+            documentation="Prefetch tokens abandoned because an aux pool "
+            "(e.g. the SWA trailing window) could not allocate host staging "
+            "— the whole storage fetch is forfeited, not just the aux part.",
             labelnames=labels.keys(),
         )
 
@@ -1924,6 +1941,16 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+
+    def log_backup_dropped_tokens(self, dropped_tokens: int):
+        if dropped_tokens > 0:
+            self.backup_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
+
+    def log_prefetch_aux_alloc_failed_tokens(self, num_tokens: int):
+        if num_tokens > 0:
+            self.prefetch_aux_alloc_failed_tokens_total.labels(**self.labels).inc(
+                num_tokens
+            )
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)

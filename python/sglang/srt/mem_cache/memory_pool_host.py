@@ -58,6 +58,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    _cuda_host_unregister,
     get_allocator_from_storage,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
@@ -236,6 +237,22 @@ class MambaPoolHost(HostKVCache):
         self.can_use_write_back_jit = True
         self._temporal_can_use_jit = False
         self._conv_can_use_jit = [False] * len(self.conv_buffer)
+
+    def destroy(self):
+        # Mirror HostKVCache.destroy for the mamba buffers: the base method
+        # only unregisters kv_buffer, which this pool does not have, so the
+        # temporal/conv registrations would stay pinned past teardown and any
+        # later cudaHostRegister on a recycled range fails with rc=712.
+        if getattr(self, "_destroyed", False):
+            return
+        self._destroyed = True
+        if self.pin_memory and (_is_cuda or _is_hip):
+            for buf in (self.temporal_buffer, *self.conv_buffer):
+                # 0-element conv-only temporal buffers are never registered.
+                if buf is not None and buf.numel() > 0:
+                    _cuda_host_unregister(buf)
+        self.temporal_buffer = None
+        self.conv_buffer = []
 
     def get_hybrid_pool_buffer(self):
         # Expose all mamba host tensors that need Mooncake buffer registration.

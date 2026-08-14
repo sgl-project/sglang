@@ -2686,8 +2686,28 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
-            if tree_cache.is_backuped(req.last_host_node) or tree_cache.is_root(
-                req.last_host_node
+            buffer_mode = self.server_args.hicache_host_memory_mode == "buffer_only"
+            last_host_node = req.last_host_node
+            # Buffer mode host-backups nothing, so match_prefix anchors at
+            # root; re-anchor on the deepest device node. The anchor is only
+            # read for hash/extra-key context here (never locked), so a device
+            # node serves. Cache mode keeps the is_backuped gate below: its
+            # write-through prefix is contiguous from root, so an unbacked
+            # anchor means a guaranteed storage miss.
+            if (
+                buffer_mode
+                and tree_cache.is_root(last_host_node)
+                and not tree_cache.is_root(req.last_node)
+            ):
+                last_host_node = req.last_node
+
+            if (
+                tree_cache.is_backuped(last_host_node)
+                or tree_cache.is_root(last_host_node)
+                or (
+                    buffer_mode
+                    and tree_cache.get_last_hash_value(last_host_node) is not None
+                )
             ):
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 match_end = req._compute_max_prefix_len(
@@ -2695,16 +2715,17 @@ class Scheduler(
                 )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
                 prefix_keys = (
-                    tree_cache.get_prefix_hash_values(req.last_host_node)
+                    tree_cache.get_prefix_hash_values(last_host_node)
                     if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
                 tree_cache.prefetch_from_storage(
                     req.rid,
-                    req.last_host_node,
+                    last_host_node,
                     new_input_tokens,
-                    tree_cache.get_last_hash_value(req.last_host_node),
+                    tree_cache.get_last_hash_value(last_host_node),
                     prefix_keys,
+                    matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
@@ -3316,6 +3337,16 @@ class Scheduler(
                     req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
+            if (
+                self.enable_hicache_storage
+                and self.server_args.hicache_host_memory_mode == "buffer_only"
+            ):
+                # Buffer mode: surface a staged prefetch as the request's host hit
+                # so the adder consumes it through init_load_back. Set AFTER
+                # init_next_round_input (which recomputes host_hit).
+                held_tokens = self.tree_cache.staged_prefetch_tokens(req.rid)
+                if held_tokens > 0:
+                    req.host_hit_length = held_tokens
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -4119,6 +4150,11 @@ class Scheduler(
                 if tc.enable_storage:
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
+                    if self.server_args.hicache_host_memory_mode == "buffer_only":
+                        # Queued writes, staged prefetches, and in-flight
+                        # storage writes still hold host staging
+                        # (buffer-mode unified tree only).
+                        idle &= tc.buffer_pipeline.is_idle()
 
         return idle
 
