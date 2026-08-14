@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -281,6 +282,8 @@ class WeightUpdater:
             )
             logger.error(error_msg)
             return False, error_msg
+        finally:
+            _repack_weights_after_hot_update(self.get_model())
 
     def _update_bucketed_weights_from_distributed(
         self: WeightUpdater, names, dtypes, shapes, group_name
@@ -315,6 +318,8 @@ class WeightUpdater:
             )
             logger.error(error_msg)
             return False, error_msg
+        finally:
+            _repack_weights_after_hot_update(self.get_model())
 
     def update_weights_from_tensor(
         self: WeightUpdater,
@@ -341,15 +346,18 @@ class WeightUpdater:
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
             for name, tensor in named_tensors
         ]
-        if load_format == "direct":
-            _model_load_weights_direct(self.get_model(), named_tensors)
-        elif load_format in self.custom_weight_loaders:
-            custom_loader = dynamic_import(load_format)
-            custom_loader(self.get_model(), named_tensors)
-        elif load_format is None:
-            self.get_model().load_weights(named_tensors)
-        else:
-            raise NotImplementedError(f"Unknown load_format={load_format}")
+        try:
+            if load_format == "direct":
+                _model_load_weights_direct(self.get_model(), named_tensors)
+            elif load_format in self.custom_weight_loaders:
+                custom_loader = dynamic_import(load_format)
+                custom_loader(self.get_model(), named_tensors)
+            elif load_format is None:
+                self.get_model().load_weights(named_tensors)
+            else:
+                raise NotImplementedError(f"Unknown load_format={load_format}")
+        finally:
+            _repack_weights_after_hot_update(self.get_model())
         return True, "Success"
 
     def _update_weights_from_flattened_bucket(
@@ -380,7 +388,10 @@ class WeightUpdater:
         reconstructed_tensors = bucket.reconstruct_tensors()
 
         # Load the reconstructed tensors using the standard method
-        self.get_model().load_weights(reconstructed_tensors)
+        try:
+            self.get_model().load_weights(reconstructed_tensors)
+        finally:
+            _repack_weights_after_hot_update(self.get_model())
 
         return True, "Success"
 
@@ -405,6 +416,25 @@ class WeightUpdater:
         except Exception as e:
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
+
+
+def _repack_weights_after_hot_update(model) -> None:
+    """Re-derive kernel weight layouts after an in-place weight update.
+
+    `update_weights_from_disk` and the checkpoint-engine IPC path re-run
+    `process_weights_after_loading` themselves; the paths that call
+    `model.load_weights()` directly do not, and would leave a parameter in load
+    layout while the kernel reads the transformed one.
+
+    Callers run this from a `finally`: a load that raises part way through has
+    already had layouts undone, and leaving them that way is the silent mismatch
+    this exists to prevent. The weights are then a mix of old and new -- which
+    the caller already reports -- but the layout invariant holds.
+    """
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if isinstance(quant_method, QuantizeMethodBase):
+            quant_method.repack_weights_after_hot_update(module)
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
