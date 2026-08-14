@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -589,21 +590,29 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
-        # Snapshot built -- the forward is done reading the shared pool. Publish
-        # a read-done event the scheduler's WAR barrier waits on (draft extend
-        # is the EAGLE-family war-publish phase; last write wins the mailbox).
-        read_done = self.device_module.Event()
-        read_done.record()
-        self.model_runner.war_fastpath_read_done_event = read_done
-
         self.raw_bs = raw_bs
         self.bs = bs
         shape_key = self._make_graph_key(bs)
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
-            out = self._replay_graph(shape_key, forward_batch)
+            out = self._replay_graph_with_war_read_done(shape_key, forward_batch)
 
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:num_tokens],
             hidden_states=out.hidden_states[:num_tokens],
         )
+        return out
+
+    def _replay_graph_with_war_read_done(self, shape_key, forward_batch):
+        read_boundary = self.draft_extend_attn_backend.shared_read_boundary(
+            self.forward_mode
+        )
+        # This runner does not plant an external event in its captured graph,
+        # so an in-replay declaration must conservatively publish pre-replay.
+        if read_boundary is SharedReadBoundary.IN_REPLAY:
+            read_boundary = SharedReadBoundary.PRE_REPLAY
+        if read_boundary is SharedReadBoundary.PRE_REPLAY:
+            self._publish_war_read_done(in_graph=False)
+        out = self._replay_graph(shape_key, forward_batch)
+        if read_boundary is SharedReadBoundary.POST_REPLAY:
+            self._publish_war_read_done(in_graph=False)
         return out
