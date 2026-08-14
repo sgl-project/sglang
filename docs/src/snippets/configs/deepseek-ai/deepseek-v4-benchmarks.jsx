@@ -7,6 +7,11 @@ export const benchmarks = [
   // B200 + FP4
   // ====================================================================
   {
+    match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.17",
+    accuracy: { gsm8k_pct: 96.13 },
+  },
+  {
     match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.16",
     speed: [
