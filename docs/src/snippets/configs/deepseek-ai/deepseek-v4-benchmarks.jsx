@@ -358,6 +358,58 @@ export const benchmarks = [
     ],
   },
   // ====================================================================
+  // GB300 + FP4 — Pro Official (0813)
+  //
+  // 4xGB300, random 8192/1024 with --random-range-ratio 1.0 (a true fixed
+  // length; the 0.0 default samples uniformly and averages ~5100 in), 64 warmup
+  // requests, cache flushed per point. Each strategy carries its lowest and
+  // highest measured concurrency. TTFT/TPOT are bench_serving means, hence the
+  // per-entry latencyPercentile override. Accuracy is GSM8K via sgl-eval, 1319
+  // examples at temperature 0.
+  //
+  // NOTE: the low-latency speed rows were measured with SGLANG_SIMULATE_ACC_LEN=4,
+  // which pins the DSpark accept length at exactly 4.00. The shipped recipe earns
+  // 4.678 on the same engine, so these rows are a slightly conservative stand-in
+  // for that cell rather than a direct run of the command above. Accuracy for that
+  // cell IS from the shipped command. Re-measure when convenient.
+  // ====================================================================
+  {
+    match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "main @ 273d978bed",
+    latencyPercentile: "Mean",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1, num_prompts: 5 },
+        ttft_ms: 345.49, tpot_ms: 3.32, tokens_per_sec_per_gpu: 615 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 80 },
+        ttft_ms: 2854.89, tpot_ms: 9.35, tokens_per_sec_per_gpu: 2965 },
+    ],
+    accuracy: { gsm8k_pct: 96.13 },
+  },
+  {
+    match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+    sglang_version: "main @ 273d978bed",
+    latencyPercentile: "Mean",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64, num_prompts: 320 },
+        ttft_ms: 6641.90, tpot_ms: 37.42, tokens_per_sec_per_gpu: 3281 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256, num_prompts: 1280 },
+        ttft_ms: 19710.64, tpot_ms: 76.80, tokens_per_sec_per_gpu: 5996 },
+    ],
+    accuracy: { gsm8k_pct: 96.44 },
+  },
+  {
+    match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "main @ 273d978bed",
+    latencyPercentile: "Mean",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256, num_prompts: 1280 },
+        ttft_ms: 10149.99, tpot_ms: 75.29, tokens_per_sec_per_gpu: 6758 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 512, num_prompts: 2560 },
+        ttft_ms: 34087.61, tpot_ms: 120.69, tokens_per_sec_per_gpu: 7475 },
+    ],
+    accuracy: { gsm8k_pct: 96.66 },
+  },
+  // ====================================================================
   // GB300 + NVFP4
   // ====================================================================
   {
