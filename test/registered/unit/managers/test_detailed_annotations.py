@@ -165,7 +165,7 @@ class TestStepSpanDetailedAnnotations(CustomTestCase):
         self.assertEqual(self._name(fb), "step[TARGET_VERIFY bs=2]")
 
     def test_draft_extend_v2_uses_extend_mirrors_with_context_prefix(self):
-        # EAGLE/MTP draft-extend is extend-shaped 
+        # EAGLE/MTP draft-extend is extend-shaped
         # req a: nq=2, nkv=12 -> sqsq=4, sqsk=24
         # req b: nq=3, nkv=23 -> sqsq=9, sqsk=69
         # sq=5, sk=35, sqsq=13, sqsk=93.

@@ -107,7 +107,7 @@ def build_detailed_annotation_suffix(forward_batch: ForwardBatch) -> str:
         return ""
 
     if mode == ForwardMode.EXTEND or mode == ForwardMode.DRAFT_EXTEND_V2:
-        # Both are extend-shaped, multi-query context 
+        # Both are extend-shaped, multi-query context
         nqs = [int(q) for q in ext_seq]
         nkvs = [int(p) + int(q) for p, q in zip(ext_prefix, ext_seq)]
         sq, sk, sqsq, sqsk = _agg(nqs, nkvs)
