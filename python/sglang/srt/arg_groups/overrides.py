@@ -1360,6 +1360,12 @@ def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Use flashinfer_trtllm as MoE runner backend on sm100 for "
                 f"{hf_config.architectures[0]}"
             )
+    elif (
+        server_args.quantization is None
+        and not server_args._quantization_explicitly_unset
+        and get_quantization_config(hf_config) == "modelopt_mixed"
+    ):
+        overrides["quantization"] = "modelopt_mixed"
     return overrides
 
 

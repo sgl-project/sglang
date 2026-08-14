@@ -582,7 +582,7 @@ If a model is already quantized (e.g., from Hugging Face), you can load it direc
     ```
 
 * **Mixed Precision Models:**
-    ModelOpt `MIXED_PRECISION` checkpoints are auto-detected as `modelopt_mixed`. MXFP8 dense/shared-expert linears use the shared FP8 backend and require Blackwell; routed experts use NVFP4/W4A16_NVFP4. FlashInfer CUTLASS pads output shards internally without changing checkpoint tensors.
+    ModelOpt `MIXED_PRECISION` checkpoints are auto-detected as `modelopt_mixed`. MXFP8 dense/shared-expert linears use the shared FP8 backend and require Blackwell; routed experts use NVFP4/W4A16_NVFP4.
 
 ##### Creating Your Own Quantized Checkpoints
 

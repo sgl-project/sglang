@@ -951,8 +951,8 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             ),
         ):
             layer = ReplicatedLinear(
-                input_size=64,
-                output_size=16,
+                input_size=128,
+                output_size=128,
                 bias=False,
                 params_dtype=torch.bfloat16,
                 quant_config=self._mixed_config(prefix, "MXFP8"),
@@ -962,23 +962,27 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         self.assertIsInstance(layer.quant_method, ModelOptMxfp8LinearMethod)
         self.assertEqual(layer.quant_method.weight_scale_name, "weight_scale")
         self.assertIs(layer.quant_method.w8a8_mxfp8_linear, selected_backend)
-        self.assertEqual(layer.weight_scale.shape, (16, 2))
+        self.assertEqual(layer.weight_scale.shape, (128, 4))
         self.assertEqual(layer.weight_scale.dtype, torch.uint8)
 
         scale_param = layer.weight_scale
-        loaded_scale = torch.arange(32, dtype=torch.uint8).reshape(16, 2)
+        loaded_scale = torch.arange(128 * 4).to(torch.uint8).reshape(128, 4)
         scale_param.weight_loader(scale_param, loaded_scale)
         torch.testing.assert_close(scale_param, loaded_scale)
 
         layer.quant_method.mxfp8_dense_backend = (
             Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
         )
-        layer.quant_method.process_weights_after_loading(layer)
-        derived_scale = layer.weight_scale_inv_swizzled
+        with patch(
+            "flashinfer.block_scale_interleave",
+            side_effect=lambda scale: scale.clone(),
+        ):
+            layer.quant_method.process_weights_after_loading(layer)
+            derived_scale = layer.weight_scale_inv_swizzled
 
-        reloaded_scale = loaded_scale.flip(0)
-        scale_param.weight_loader(scale_param, reloaded_scale)
-        layer.quant_method.process_weights_after_loading(layer)
+            reloaded_scale = loaded_scale.flip(0)
+            scale_param.weight_loader(scale_param, reloaded_scale)
+            layer.quant_method.process_weights_after_loading(layer)
 
         self.assertIs(layer.weight_scale, scale_param)
         self.assertIs(layer.weight_scale_inv_swizzled, derived_scale)

@@ -2395,8 +2395,28 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         "moe_runner_backend": "flashinfer_trtllm",
                     },
                 )
-        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
-            self.assertEqual(_qwen3_moe_family_overrides(None, None), {})
+        with (
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(
+                overrides_module,
+                "get_quantization_config",
+                return_value="modelopt_mixed",
+            ),
+        ):
+            self.assertEqual(
+                _qwen3_moe_family_overrides(
+                    SimpleNamespace(
+                        quantization=None,
+                        _quantization_explicitly_unset=False,
+                        moe_a2a_backend="none",
+                        moe_runner_backend="auto",
+                    ),
+                    SimpleNamespace(
+                        architectures=["Qwen3_5MoeForConditionalGeneration"]
+                    ),
+                ),
+                {"quantization": "modelopt_mixed"},
+            )
 
     def test_step3p_declarations_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _step3p_overrides
