@@ -15,11 +15,11 @@ from .modelslim_mxfp4_w4a8 import ModelSlimMXFP4W4A8Scheme
 from .modelslim_mxfp4 import ModelSlimMXFP4Scheme
 
 # isort: on
-from .modelslim_mxfp8_moe import ModelSlimMXFP8MoEScheme
 from .modelslim_mxfp4_moe import (
     ModelSlimMXFP4MoEScheme,
     ModelSlimMXFP4W4A8MoEScheme,
 )
+from .modelslim_mxfp8_moe import ModelSlimMXFP8MoEScheme
 from .modelslim_w4a4_int4 import ModelSlimW4A4Int4
 from .modelslim_w4a4_int4_moe import ModelSlimW4A4Int4MoE
 from .modelslim_w4a8_int8_moe import ModelSlimW4A8Int8MoE

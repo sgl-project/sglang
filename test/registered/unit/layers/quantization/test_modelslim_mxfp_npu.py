@@ -9,6 +9,8 @@ import torch
 from sglang.srt.hardware_backend.npu.moe import finalize_routing
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     MXFP_E8M0_NOT_LOADED as MXFP8_E8M0_NOT_LOADED,
+)
+from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUMXFP8LinearMethod,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (

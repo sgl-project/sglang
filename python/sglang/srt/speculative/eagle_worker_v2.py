@@ -74,11 +74,6 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
 )
-from sglang.srt.speculative.eagle_zero_bubble import (
-    pad_zero_bubble_seed,
-    validate_prefetched_topk1,
-    validate_zero_bubble_config,
-)
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     default_tree_mask_mode,
@@ -91,6 +86,11 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
+)
+from sglang.srt.speculative.eagle_zero_bubble import (
+    pad_zero_bubble_seed,
+    validate_prefetched_topk1,
+    validate_zero_bubble_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
