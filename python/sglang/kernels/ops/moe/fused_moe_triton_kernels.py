@@ -1279,7 +1279,8 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     loaded into registers, so it costs a few ALU ops instead of ~6 extra eager
     kernel launches (div_floor / add / arange / fill / copy) per MoE layer.
 
-    Routed IDs:   e -> e + e // num_local_routed   (insert gaps for shared slots)
+    Routed IDs:   e -> e + (e // num_local_routed) * S  (insert S-wide gaps for
+                  the shared slots that precede this id's rank)
     Shared IDs:   shared_id_base + arange(S)        (one id per shared slot)
     Shared wgt:   scale_factor                     (1.0 on aiter; 1/rsf otherwise)
     """
@@ -1297,9 +1298,13 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=mask_k)
     ws = tl.load(topk_weights_ptr + ids_row_ptr + offs_k, mask=mask_k)
 
-    # DeepEP interleaved layout: shift each routed id past the shared slots that
-    # precede it. Matches `routed + routed // num_local_routed` exactly.
-    ids = ids + ids // num_local_routed
+    # DeepEP interleaved layout: shift each routed id past ALL shared slots that
+    # precede its rank. Rank r == id // num_local_routed contributes r*S shared
+    # slots ahead of the id, so the gap is (id // num_local_routed) * S -- not a
+    # single slot. With S == 1 this reduces to the old `id // num_local_routed`,
+    # but S > 1 (e.g. multiple fused shared experts) needs the full S-wide gap or
+    # routed ids collide with an earlier rank's shared slots.
+    ids = ids + (ids // num_local_routed) * S
 
     tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
     tl.store(out_weights_ptr + out_ids_row_ptr + offs_k, ws, mask=mask_k)
