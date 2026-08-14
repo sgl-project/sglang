@@ -180,12 +180,16 @@ jobs:
               - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
               - "python/sglang/kernels/!(*.md)"
               - "python/sglang/kernels/!(aot)/**/!(*.md)"
-              - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
               - "scripts/ci/amd/*"
               - "scripts/ci/utils/*"
               - "test/**/!(*.md)"
               - ".github/workflows/pr-test-amd.yml"
+              # amd_ci_install_dependency.sh greps this Dockerfile at job time for
+              # AITER_COMMIT_DEFAULT and MORI_COMMIT, and rebuilds AITER / MoRI when
+              # they differ from what the CI image ships. A pin bump therefore changes
+              # what every AMD job runs even though the image is never rebuilt.
+              - "docker/rocm.Dockerfile"
             sgl_kernel:
               - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-amd.yml"
@@ -201,7 +205,6 @@ jobs:
               - "python/sglang/kernels/ops/diffusion/**"
               - "test/registered/kernels/ops/diffusion/**"
               - "test/registered/kernels/benchmark/diffusion/**"
-              - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
 
   # =============================================== extra (scheduled) ====================================================
