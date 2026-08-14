@@ -216,6 +216,17 @@ class Envs:
     # must go through ServerArgs.override() (enabled by the test harness).
     SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)
 
+    # MiniMax-M3 IndexCache (SILOTIGER-721): reuse the sparse block selection
+    # (topk_idx) across sparse layers during DECODE, recomputing the lightning
+    # indexer only on 1 of every STRIDE sparse layers and reusing the last
+    # selection on the other STRIDE-1. 0/1 = OFF (stock, indexer every layer).
+    # Any value > 1 is an approximation, so gate on accuracy (e.g. GSM8K).
+    SGLANG_MINIMAX_INDEXCACHE_STRIDE = EnvInt(0)
+    # IndexCache reuse mode (only used when STRIDE > 1): "full" reuses idx_o +
+    # topk_idx on reuse layers (max speedup); "topk" recomputes idx_o but reuses
+    # only the block selection (accuracy-isolation A/B).
+    SGLANG_MINIMAX_INDEXCACHE_MODE = EnvStr("full")
+
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
     # Controls weight-file ordering for load-time I/O optimization.
