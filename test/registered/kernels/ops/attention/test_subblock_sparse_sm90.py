@@ -36,6 +36,23 @@ class TestSubBlockSparseSM90(CustomTestCase):
         self.assertEqual(config.m_block_size, 64)
         self.assertEqual(config.n_block_size, 64)
 
+    def test_64x64_special_case_is_limited_to_head_dim_128(self):
+        from sglang.kernels.ops.attention.flash_attn.cute.interface import (
+            _tile_size_fwd_sm90,
+        )
+
+        config = _tile_size_fwd_sm90(
+            head_dim=96,
+            head_dim_v=96,
+            is_causal=False,
+            is_local=False,
+            sparse_block_size_q=64,
+            sparse_block_size_kv=64,
+        )
+
+        self.assertEqual(config.m_block_size, 128)
+        self.assertEqual(config.n_block_size, 128)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)

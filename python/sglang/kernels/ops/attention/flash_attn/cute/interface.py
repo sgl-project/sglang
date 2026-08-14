@@ -165,7 +165,11 @@ def _tile_size_fwd_sm90(
     head_dim <= 96 the optimal tile_m=192 is used when compatible, otherwise we
     fall back to 128.
     """
-    if sparse_block_size_q == 64 and sparse_block_size_kv == 64:
+    if (
+        head_dim == 128
+        and sparse_block_size_q == 64
+        and sparse_block_size_kv == 64
+    ):
         return FwdConfig(64, 64, True, True)
 
     if head_dim <= 64:
@@ -651,7 +655,7 @@ def _flash_attn_fwd(
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
             sparse_q = get_sparse_q_block_size(block_sparse_tensors, seqlen_q)
-            sparse_kv = (
+            sparse_block_size_kv = (
                 block_sparse_tensors.block_size[1]
                 if block_sparse_tensors is not None
                 and block_sparse_tensors.block_size is not None
@@ -663,7 +667,7 @@ def _flash_attn_fwd(
                 causal,
                 local,
                 sparse_block_size_q=sparse_q,
-                sparse_block_size_kv=sparse_kv,
+                sparse_block_size_kv=sparse_block_size_kv,
             )
     else:
         fwd_cfg = FwdConfig(

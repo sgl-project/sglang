@@ -140,11 +140,11 @@ def _sm90_sparse_attention(
     """Run a SubBlock routing plan through the existing SM90 CuTe kernel."""
     BlockSparseTensorsTorch, flash_attn_func = _load_sm90_block_sparse_attention()
 
-    # The SM90 sparse pipeline consumes each list from high slot to low slot and
-    # applies sequence-tail masking to the first block. SubBlock's fused top-k
-    # intentionally returns unsorted indices because the SM100 kernel accepts
-    # any order; sorting here puts the (possible) ragged tail block first in the
-    # SM90 consumer while preserving exactly the same selected block set.
+    # The router contract permits indices in any order, while the SM90 sparse
+    # pipeline consumes each list from high slot to low slot and applies
+    # sequence-tail masking to the first block. Sort explicitly so the largest
+    # block id -- the possible ragged tail -- occupies the highest slot without
+    # depending on the fused top-k kernel's current ascending output order.
     ordered_index = q2k_block_index.sort(dim=-1).values
     block_counts = torch.full(
         ordered_index.shape[:-1],
@@ -152,14 +152,13 @@ def _sm90_sparse_attention(
         dtype=torch.int32,
         device=ordered_index.device,
     )
-    empty_block_counts = torch.zeros_like(block_counts)
     sparse_tensors = BlockSparseTensorsTorch(
         mask_block_cnt=block_counts,
         mask_block_idx=ordered_index,
-        # CuTe traces both runtime count branches. Keep the zero-count full
-        # list materialized so its untaken branch still has a typed tensor.
-        full_block_cnt=empty_block_counts,
-        full_block_idx=ordered_index,
+        # There are no always-dense blocks in a SubBlock routing plan. None
+        # lets CuTe eliminate the unused full-block branch at compile time.
+        full_block_cnt=None,
+        full_block_idx=None,
         block_size=(SUBBLOCK_SPARSE_BLOCK_SIZE, SUBBLOCK_SPARSE_BLOCK_SIZE),
     )
     out, _ = flash_attn_func(
