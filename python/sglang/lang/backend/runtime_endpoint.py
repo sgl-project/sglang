@@ -509,9 +509,18 @@ class Runtime:
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
-        lora_path: Optional[List[Optional[str]]] = None,
+        lora_path: Optional[Union[str, List[Optional[str]]]] = None,
         session_id: Optional[str] = None,
     ):
+        if isinstance(lora_path, list):
+            batch_size = 1 if isinstance(prompt, str) else len(prompt)
+            if len(lora_path) != batch_size:
+                raise ValueError(
+                    f"lora_path length ({len(lora_path)}) must match "
+                    f"the prompt batch size ({batch_size})."
+                )
+            if isinstance(prompt, str):
+                lora_path = lora_path[0]
         json_data = {
             "text": prompt,
             "sampling_params": sampling_params,
@@ -521,13 +530,6 @@ class Runtime:
             "lora_path": lora_path,
             "session_id": session_id,
         }
-        if isinstance(lora_path, list):
-            batch_size = 1 if isinstance(prompt, str) else len(prompt)
-            if len(lora_path) != batch_size:
-                raise ValueError(
-                    f"lora_path length ({len(lora_path)}) must match "
-                    f"the prompt batch size ({batch_size})."
-                )
         response = requests.post(
             self.url + "/generate",
             json=json_data,
