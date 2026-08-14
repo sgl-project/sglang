@@ -107,8 +107,11 @@ class FlashinferDispatcher(BaseDispatcher):
             if get_moe_runner_backend().is_flashinfer_trtllm_routed()
             else self.num_experts
         )
-        # TODO: Can other moe runners use payload_in_workspace too?
-        self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
+        moe_runner_backend = get_moe_runner_backend()
+        self.payload_in_workspace = (
+            moe_runner_backend.is_flashinfer_cutlass()
+            or moe_runner_backend.is_flashinfer_cutedsl()
+        )
 
         # FlashInfer sizes the workspace from the maximum dispatched tokens per
         # EP rank. See FlashInfer's moe_a2a_get_workspace_size_per_rank(),

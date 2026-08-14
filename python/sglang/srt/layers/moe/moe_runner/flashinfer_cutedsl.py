@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
@@ -35,6 +36,17 @@ logger = logging.getLogger(__name__)
 
 _FP4_SF_VEC_SIZE = 16
 _cutedsl_logged_scalarize: set = set()
+_wrapper_run_supports_moe_output: Optional[bool] = None
+
+
+def _supports_caller_owned_output(wrapper: Any) -> bool:
+    """Whether this FlashInfer wrapper accepts a caller-owned output tensor."""
+    global _wrapper_run_supports_moe_output
+    if _wrapper_run_supports_moe_output is None:
+        _wrapper_run_supports_moe_output = (
+            "moe_output" in inspect.signature(wrapper.run).parameters
+        )
+    return _wrapper_run_supports_moe_output
 
 
 # ---------------------------------------------------------------------------
@@ -454,24 +466,32 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
             is_sf_swizzled_layout=False,
         )
 
-    output = quant_info.wrapper.run(
-        x=x_fp4,
-        x_sf=x_sf,
-        token_selected_experts=topk_ids,
-        token_final_scales=topk_weights,
-        w1_weight=quant_info.w13_weight,
-        w1_weight_sf=quant_info.w13_weight_sf,
-        w1_alpha=quant_info.w1_alpha,
-        fc2_input_scale=quant_info.a2_scale,
-        w2_weight=quant_info.w2_weight,
-        w2_weight_sf=quant_info.w2_weight_sf,
-        w2_alpha=quant_info.w2_alpha,
-    )
+    run_kwargs = {
+        "x": x_fp4,
+        "x_sf": x_sf,
+        "token_selected_experts": topk_ids,
+        "token_final_scales": topk_weights,
+        "w1_weight": quant_info.w13_weight,
+        "w1_weight_sf": quant_info.w13_weight_sf,
+        "w1_alpha": quant_info.w1_alpha,
+        "fc2_input_scale": quant_info.a2_scale,
+        "w2_weight": quant_info.w2_weight,
+        "w2_weight_sf": quant_info.w2_weight_sf,
+        "w2_alpha": quant_info.w2_alpha,
+    }
+    if dispatch_output.moe_output is not None and _supports_caller_owned_output(
+        quant_info.wrapper
+    ):
+        run_kwargs["moe_output"] = dispatch_output.moe_output
+    output = quant_info.wrapper.run(**run_kwargs)
 
     # Note: output contains routed expert results; shared_expert is handled separately
 
     # Write into pre-allocated workspace buffer if available
-    if dispatch_output.moe_output is not None:
+    if (
+        dispatch_output.moe_output is not None
+        and output.data_ptr() != dispatch_output.moe_output.data_ptr()
+    ):
         dispatch_output.moe_output.copy_(output)
         output = dispatch_output.moe_output
 
