@@ -69,6 +69,9 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     a13_scale: Optional[torch.Tensor] = None
     a2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
+    # w13 rows were permuted to interleave gate/up at load, so the activation
+    # must be applied by the fused up-GEMM epilogue (see fused_moe_kernel).
+    fuse_swiglu_interleaved: bool = False
 
 
 class TritonRunnerCore(MoeRunnerCore):
@@ -164,6 +167,7 @@ class TritonRunnerCore(MoeRunnerCore):
             filter_expert=filter_expert,
             hooks=hooks,
             swiglu_limit=self.config.swiglu_limit,
+            fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
         )
 
         return TritonRunnerOutput(hidden_states=out)
@@ -248,6 +252,7 @@ def fused_experts_none_to_triton(
             a2_scale=quant_info.a2_scale,
             block_shape=quant_info.block_shape,
             a1_q=a1_q,
+            fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
         )
 
     return StandardCombineInput(

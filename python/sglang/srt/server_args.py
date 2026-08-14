@@ -2022,7 +2022,7 @@ class ServerArgs:
     ] = False
 
     # -------------------------------------------------------------------------
-    # Torch compile and torchao
+    # Torch compile
     # -------------------------------------------------------------------------
     enable_torch_compile: A[
         bool,
@@ -2035,12 +2035,6 @@ class ServerArgs:
     torch_compile_max_bs: A[
         int, "Set the maximum batch size when using torch compile.", NS("exec.graph")
     ] = 32
-    torchao_config: A[
-        str,
-        "Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
-        NS("exec.graph"),
-    ] = ""
-
     # -------------------------------------------------------------------------
     # Speculative decoding
     # -------------------------------------------------------------------------
