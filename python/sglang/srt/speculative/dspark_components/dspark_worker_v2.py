@@ -115,9 +115,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         # Set the draft block-row convention BEFORE the draft runner exists:
         # its CG capture widths / logits buffers derive from
-        # get_num_tokens_per_req_for_target_verify at construction. The
-        # server-args hook also sets this, but scheduler actor processes may
-        # receive an already-resolved ServerArgs without re-running hooks.
+        # get_num_tokens_per_req_for_target_verify at construction.
         from sglang.srt.speculative.dspark_components.dspark_config import (
             read_draft_checkpoint_is_mask_filling,
         )
@@ -291,7 +289,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 f"{self._simulate_acc_len}."
             )
 
-        self._verify_executor = TargetVerifyExecutor(
+        self._verify_executor = self._build_verify_executor(
             target_worker=self.target_worker,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             model_runner=self.model_runner,
@@ -450,6 +448,16 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
 
+    def _build_verify_executor(self, **kwargs) -> TargetVerifyExecutor:
+        """Hook: subclasses substitute a specialized TargetVerifyExecutor;
+        kwargs are the base construction arguments, forward them through."""
+        return TargetVerifyExecutor(**kwargs)
+
+    def _on_prefill_target_hidden(self, batch, target_hidden) -> None:
+        """Hook: called with the CaptureHiddenMode.FULL prefill hiddens
+        ([sum(extend_lens), T*H], batch request order) just before they are
+        dropped. Idle prefill never reaches this (no injection)."""
+
     def _forward_prefill(
         self, batch: ScheduleBatch, on_publish
     ) -> GenerationBatchResult:
@@ -514,6 +522,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             state_slot=state_slot,
             final_pos=final_pos,
         )
+        # Last point where the FULL prefill capture is reachable; subclasses
+        # that stage per-request draft features read it here.
+        self._on_prefill_target_hidden(batch, logits_output.hidden_states)
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
 

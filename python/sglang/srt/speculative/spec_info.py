@@ -40,6 +40,10 @@ def set_dspark_mask_filling_convention(mask_filling: bool) -> None:
     _DSPARK_DRAFT_BLOCK_ROWS_EQUAL_VERIFY = bool(mask_filling)
 
 
+def dspark_mask_filling_convention() -> bool:
+    return _DSPARK_DRAFT_BLOCK_ROWS_EQUAL_VERIFY
+
+
 class SpeculativeAlgorithm(Enum):
     """Builtin speculative decoding algorithms. Plugin-registered ones are
     ``CustomSpecAlgo`` instances; ``from_string`` returns either type, and

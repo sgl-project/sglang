@@ -418,8 +418,14 @@ def _compact_verify_ids_gather_kernel(
     n,
     BLOCK: tl.constexpr,
 ):
-    # block_w = draft_block_ids row width (block rows); draft_w = drafts per
-    # request. Legacy AR heads: equal; mask-filling heads: draft_w = block_w-1.
+    # Two row widths index this kernel's inputs. block_w is the stride of
+    # draft_block_ids: the draft head's block width, whose slot 0 holds the
+    # anchor token. draft_w is the stride of draft_tokens: the number of
+    # proposed drafts per request. AR-readout heads emit one draft per block
+    # slot, so draft_w == block_w; mask-filling heads emit predictions only
+    # at slots 1..block_w-1 (slot 0 is the anchor input), so
+    # draft_w == block_w - 1 and the anchor is read with a different stride
+    # than the drafts.
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n

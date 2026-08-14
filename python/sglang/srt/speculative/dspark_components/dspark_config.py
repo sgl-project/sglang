@@ -274,9 +274,8 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     mask_filling = bool(_cfg_get(draft_hf_config, "dspark_mask_filling", False))
     if markov_head_type is not None:
         markov_head_type = str(markov_head_type).lower()
-        # No builtin head is mask-filling: a config declaring the convention
-        # names an out-of-tree head whose implementation is validated at
-        # draft-model build, so only builtin names are checked here.
+        # Mask-filling configs name an out-of-tree head; only builtin head
+        # names are checked here.
         if (
             not mask_filling
             and markov_head_type not in SUPPORTED_DSPARK_MARKOV_HEAD_TYPES
