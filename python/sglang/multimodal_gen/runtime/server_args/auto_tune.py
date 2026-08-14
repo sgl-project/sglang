@@ -11,10 +11,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
     ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
     LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_VAE_GROUP,
+    normalize_layerwise_offload_components,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -73,16 +75,23 @@ class ServerArgsAutoTuner:
 
         if args.performance_mode == "speed":
             logger.info("Applying performance_mode=speed")
-            if not args.enable_torch_compile and not args.is_arg_explicitly_set(
-                "enable_torch_compile"
+            if (
+                self._deployment_config().speed_mode_enable_torch_compile_by_default
+                and not args.enable_torch_compile
+                and not args.is_arg_explicitly_set("enable_torch_compile")
             ):
-                # speed means fastest: compile by default. An explicit
-                # --enable-torch-compile false still wins (e.g. models where
-                # compile measures slower, like short-step Z-Image runs).
+                # only models with a validated compile win opt in by default
                 args.enable_torch_compile = True
                 logger.info(
                     "performance_mode=speed enables torch.compile "
                     "(pass --enable-torch-compile false to opt out)"
+                )
+            elif not args.enable_torch_compile and not args.is_arg_explicitly_set(
+                "enable_torch_compile"
+            ):
+                logger.info(
+                    "performance_mode=speed keeps torch.compile disabled for "
+                    "this model (pass --enable-torch-compile true to opt in)"
                 )
             if args.num_gpus >= 2 and self._can_apply_fsdp_policy(
                 require_memory_headroom=False
@@ -115,12 +124,30 @@ class ServerArgsAutoTuner:
 
     def maybe_adjust_auto_component_residency_after_offload(self) -> None:
         args = self.server_args
-        if (
-            args.performance_mode != "auto"
-            or self._explicit_memory_policy
-            or current_platform.is_cpu()
-        ):
+        if args.performance_mode != "auto" or current_platform.is_cpu():
             return
+
+        # Explicitness is component-scoped below.  For example, explicitly
+        # disabling DiT layerwise offload must not freeze an unrelated,
+        # implicit ``dit_cpu_offload=True`` default on a high-memory GPU.
+        # Each mutation below already preserves its own explicit CLI flag.
+
+        explicit_cpu_components = args.is_arg_explicitly_set("cpu_offload_components")
+        explicit_layerwise_components = (
+            normalize_layerwise_offload_components(args.layerwise_offload_components)
+            if args.is_arg_explicitly_set("layerwise_offload_components")
+            else None
+        )
+        explicit_dit_layerwise = bool(
+            args.is_arg_explicitly_set("dit_layerwise_offload")
+            and args.dit_layerwise_offload
+        ) or bool(
+            explicit_layerwise_components
+            and (
+                LAYERWISE_OFFLOAD_DIT_GROUP in explicit_layerwise_components
+                or LAYERWISE_OFFLOAD_ALL_COMPONENTS in explicit_layerwise_components
+            )
+        )
 
         min_available_gb = self._get_min_available_device_memory_gb()
         deployment_config = self._deployment_config()
@@ -133,7 +160,9 @@ class ServerArgsAutoTuner:
             and min_available_gb >= disable_threshold_gb
         ):
             changed = []
-            components = deployment_config.keep_resident_components
+            components = set(deployment_config.keep_resident_components)
+            if args.pipeline_config.task_type.is_image_gen():
+                components.add(LAYERWISE_OFFLOAD_DIT_GROUP)
             if (
                 args.layerwise_offload_components is not None
                 and not args.is_arg_explicitly_set("layerwise_offload_components")
@@ -152,6 +181,8 @@ class ServerArgsAutoTuner:
                 args.dit_cpu_offload
                 and "dit" in components
                 and not args.is_arg_explicitly_set("dit_cpu_offload")
+                and not explicit_cpu_components
+                and not explicit_dit_layerwise
             ):
                 args.dit_cpu_offload = False
                 changed.append("dit_cpu_offload=False")
@@ -159,6 +190,7 @@ class ServerArgsAutoTuner:
                 args.text_encoder_cpu_offload
                 and LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP in components
                 and not args.is_arg_explicitly_set("text_encoder_cpu_offload")
+                and not explicit_cpu_components
             ):
                 args.text_encoder_cpu_offload = False
                 changed.append("text_encoder_cpu_offload=False")
@@ -166,6 +198,7 @@ class ServerArgsAutoTuner:
                 args.image_encoder_cpu_offload
                 and LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP in components
                 and not args.is_arg_explicitly_set("image_encoder_cpu_offload")
+                and not explicit_cpu_components
             ):
                 args.image_encoder_cpu_offload = False
                 changed.append("image_encoder_cpu_offload=False")
@@ -173,6 +206,7 @@ class ServerArgsAutoTuner:
                 args.vae_cpu_offload
                 and LAYERWISE_OFFLOAD_VAE_GROUP in components
                 and not args.is_arg_explicitly_set("vae_cpu_offload")
+                and not explicit_cpu_components
             ):
                 args.vae_cpu_offload = False
                 changed.append("vae_cpu_offload=False")
@@ -246,6 +280,7 @@ class ServerArgsAutoTuner:
         if (
             args.layerwise_offload_components is not None
             or args.dit_layerwise_offload is True
+            or args.is_arg_explicitly_set("cpu_offload_components")
         ):
             return
         if not current_platform.is_cuda():
@@ -403,6 +438,7 @@ class ServerArgsAutoTuner:
         if (
             args.is_arg_explicitly_set("layerwise_offload_components")
             or args.dit_layerwise_offload is True
+            or args.is_arg_explicitly_set("cpu_offload_components")
         ):
             # The legacy --dit-layerwise-offload flag is a DiT-only selector.
             # Do not merge implicit defaults into that explicit mode.
@@ -419,7 +455,7 @@ class ServerArgsAutoTuner:
         components = self._filter_high_memory_resident_components(components)
         if self._should_auto_enable_dit_layerwise_offload():
             components.insert(0, LAYERWISE_OFFLOAD_DIT_GROUP)
-            self._set_default_wan_dit_offload_prefetch_size()
+            self._set_default_dit_offload_prefetch_size()
         return components
 
     def _filter_high_memory_resident_components(
@@ -458,52 +494,31 @@ class ServerArgsAutoTuner:
 
     def _should_auto_enable_dit_layerwise_offload(self) -> bool:
         args = self.server_args
-
-        # only for wan for now
-        if not self._is_wan_pipeline_config():
-            return False
-        if not self._deployment_config().auto_dit_layerwise_offload:
+        deployment_config = self._deployment_config()
+        if args.performance_mode not in deployment_config.dit_layerwise_offload_modes:
             return False
 
         if (
             args.pipeline_config.dmd_denoising_steps is not None
-            or not current_platform.enable_dit_layerwise_offload_for_wan_by_default()
+            or not current_platform.enable_dit_layerwise_offload_by_default()
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference
             or args.is_arg_explicitly_set("dit_cpu_offload")
+            or args.is_arg_explicitly_set("cpu_offload_components")
         ):
             return False
 
-        # memory mode is memory-first: keep the broad Wan DiT layerwise policy
-        # unless a guard above says it conflicts with another placement path
-        if args.performance_mode == "memory":
-            return True
+        return True
 
-        # auto mode is performance-first: profiling only showed clear wins for
-        # Wan2.2 A14B, where coarse DiT CPU offload creates large step spikes
-        return (
-            args.performance_mode == "auto" and self._is_wan2_2_a14b_pipeline_config()
-        )
-
-    def _is_wan2_2_a14b_pipeline_config(self) -> bool:
-        config_name = self.server_args.pipeline_config.__class__.__name__
-        return config_name.startswith("Wan2_2_") and "A14B" in config_name
-
-    def _set_default_wan_dit_offload_prefetch_size(self) -> None:
+    def _set_default_dit_offload_prefetch_size(self) -> None:
         args = self.server_args
+        prefetch_size = self._deployment_config().auto_dit_offload_prefetch_size
         if (
             args.performance_mode == "auto"
-            and self._is_wan2_2_a14b_pipeline_config()
+            and prefetch_size is not None
             and not args.is_arg_explicitly_set("dit_offload_prefetch_size")
         ):
-            # p2 was the fastest stable default in the Wan2.2 A14B sweep
-            args.dit_offload_prefetch_size = 2
-
-    def _is_wan_pipeline_config(self) -> bool:
-        return any(
-            cls.__module__.endswith(".wan")
-            for cls in self.server_args.pipeline_config.__class__.mro()
-        )
+            args.dit_offload_prefetch_size = prefetch_size
 
     def _auto_uses_dit_offload(self) -> bool:
         args = self.server_args
@@ -538,6 +553,7 @@ class ServerArgsAutoTuner:
                 "dit_cpu_offload",
                 "dit_layerwise_offload",
                 "layerwise_offload_components",
+                "cpu_offload_components",
             )
         )
 
@@ -548,6 +564,7 @@ class ServerArgsAutoTuner:
             for arg_name in (
                 "dit_layerwise_offload",
                 "layerwise_offload_components",
+                "cpu_offload_components",
             )
         )
 
