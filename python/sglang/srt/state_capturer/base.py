@@ -176,11 +176,7 @@ class BaseTopkCapturer:
             forward_batch, can_run_graph, cuda_graph_batch
         )
         if no_copy_to_cpu:
-            # The overlap scheduler starts the next forward while this result's
-            # D2H copy runs on another stream. Both tensors can alias reusable
-            # buffers (DFLASH reuses its verify cache-location buffer, and every
-            # capturer reuses device_cache), so immutable snapshots must be
-            # queued on the forward stream before returning the result.
+            # Clone before the next overlapping forward reuses these buffers.
             return TopkCaptureOutput(
                 out_cache_loc=forward_batch.out_cache_loc.clone(),
                 topk=slice_gpu.clone(),
