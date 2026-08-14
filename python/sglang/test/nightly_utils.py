@@ -313,7 +313,11 @@ class NightlyBenchmarkRunner:
         return None
 
     def add_report(
-        self, results: List[BenchmarkResult], variant: Optional[str] = None
+        self,
+        results: List[BenchmarkResult],
+        variant: Optional[str] = None,
+        acc_latency: Optional[float] = None,
+        include_latency_breakdown: bool = False,
     ) -> None:
         """Add benchmark results to the full report.
 
@@ -321,7 +325,12 @@ class NightlyBenchmarkRunner:
             results: List of BenchmarkResult objects to add to report
         """
         if results:
-            report_part = generate_markdown_report(results, variant)
+            report_part = generate_markdown_report(
+                results,
+                variant,
+                acc_latency=acc_latency,
+                include_latency_breakdown=include_latency_breakdown,
+            )
             self.full_report += report_part + "\n"
 
     def write_final_report(self) -> None:
