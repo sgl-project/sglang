@@ -447,7 +447,7 @@ class VanillaD2HStrategy(ComponentResidencyStrategy):
 
     def exit(self, module: nn.Module, next_module: nn.Module | None = None) -> None:
         tensor = _module_reference_tensor(module)
-        if tensor is not None and tensor.device.type != "cpu":
+        if tensor is not None and tensor.device.type in ["cuda", "xpu"]:
             module.to("cpu", non_blocking=tensor.device.type == "cuda")
 
     def finish_use(
