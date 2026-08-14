@@ -46,7 +46,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     load_action_stats,
     normalize_action,
 )
-
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -212,9 +211,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         )
         if control_paths:
             control_tensors = [
-                self._load_control_video(
-                    p, batch.width, batch.height, batch.num_frames
-                )
+                self._load_control_video(p, batch.width, batch.height, batch.num_frames)
                 for p in control_paths
             ]
             batch.extra["preprocessed_control"] = control_tensors
