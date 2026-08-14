@@ -435,7 +435,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.components_by_type.values()
         )
 
-        # Per-component placement events: feature on + a multi-component tree.
         self._emit_component_placement = (
             params.enable_kv_cache_events
             and params.enable_kv_events_component_types
@@ -1190,7 +1189,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 self._build_backup_kv_action(state.target_node)
             )
 
-        # Deferred REPLACE GPU stores: aux components have committed by now.
         self._flush_insert_store_events(state)
 
     def _split_node(
@@ -1249,8 +1247,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     # ==== Component-placement KV events ====
 
-    # Internal component enum -> canonical on-wire names, so the event schema
-    # (kv_events.KV_COMPONENT_*) owns the vocabulary, not ComponentType.__str__.
     _COMPONENT_TYPE_TO_WIRE = {
         ComponentType.FULL: KV_COMPONENT_FULL,
         ComponentType.SWA: KV_COMPONENT_SWA,
@@ -1389,8 +1385,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
-        # Component-placement mode defers to the TAIL flush (aux SWA/Mamba
-        # commit later); legacy mode emits immediately.
         if self._emit_component_placement:
             self._note_insert_store_node(new_node)
         else:
@@ -1413,8 +1407,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_duplicate_tracking(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
-        # Component-placement mode defers to the TAIL flush (SWA recover may
-        # still add SWA here); legacy mode emits immediately.
         if self._emit_component_placement:
             self._note_insert_store_node(node)
         else:
@@ -2341,10 +2333,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 cache_actions=cache_actions,
             )
 
-        # Emit REPLACE GPU stores AFTER every component restored its device
-        # value, unioning each component's loaded nodes so the snapshot reflects
-        # FULL plus any SWA/Mamba from the same load (emitting earlier would
-        # report FULL-only).
         if self._emit_component_placement:
             restored_ids = set(kv_xfer.nodes_to_load or ())
             for xfers in comp_xfers.values():
@@ -2352,7 +2340,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     restored_ids.update(xfer.nodes_to_load or ())
             self._record_store_events_root_first(node, restored_ids, StorageMedium.GPU)
         else:
-            # Legacy: FULL-only, in the transfer's own (already root-first) order.
             for nid in kv_xfer.nodes_to_load or ():
                 self.kv_events.record_store(
                     self.node_by_id(nid), medium=StorageMedium.GPU
@@ -2427,7 +2414,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             host_lru.remove_node(node)
         self.lru_lists[component_type].insert_mru(node)
         self.component_evictable_size_[component_type] += len(value)
-        # Self-gates to a no-op outside an insert, where load_back emits instead.
         self._note_insert_store_node(node)
 
     def get_component_device_value(
