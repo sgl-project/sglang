@@ -141,13 +141,23 @@ class KimiVLForConditionalGeneration(nn.Module):
         assert isinstance(config.vision_config, MoonViTConfig)
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
-        self.vision_tower = MoonVitPretrainedModel(
-            config.vision_config,
-            prefix=add_prefix("vision_tower", prefix),
-            use_data_parallel=self.use_data_parallel,
+        self.vision_tower = (
+            None
+            if not getattr(config, "has_local_vision_tower", True)
+            else MoonVitPretrainedModel(
+                config.vision_config,
+                prefix=add_prefix("vision_tower", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
         )
 
-        self.multi_modal_projector = KimiVLMultiModalProjector(config=config)
+        # The encoder sends post-projector embeddings, so a replica without a
+        # tower has no use for the projector either.
+        self.multi_modal_projector = (
+            KimiVLMultiModalProjector(config=config)
+            if self.vision_tower is not None
+            else None
+        )
         self.quant_config = quant_config
 
         self.language_model = None
@@ -159,17 +169,18 @@ class KimiVLForConditionalGeneration(nn.Module):
             )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = (
-            torch.cat([item.feature for item in items], dim=0)
-            .type(self.vision_tower.dtype)
-            .to(self.vision_tower.device)
-        )
+        pixel_values = torch.cat([item.feature for item in items], dim=0)
 
+        # Already-embedded features need no tower, so test before touching one.
         if (
             pixel_values.dim() == 2
             and pixel_values.shape[-1] == self.config.text_config.hidden_size
         ):
             return pixel_values
+
+        pixel_values = pixel_values.type(self.vision_tower.dtype).to(
+            self.vision_tower.device
+        )
 
         image_grid_hws = torch.cat([item.image_grid_hws for item in items], dim=0)
         image_grid_hws_list = image_grid_hws.tolist()
@@ -208,6 +219,7 @@ class KimiVLForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
+            multimodal_model=self,
             data_embedding_funcs={
                 Modality.IMAGE: self.get_image_feature,
             },
@@ -254,7 +266,7 @@ class KimiVLForConditionalGeneration(nn.Module):
             is_vision_weight = ("vision" in name) or ("multi_modal_projector" in name)
             if self.config.encoder_only and not is_vision_weight:
                 continue
-            if self.config.language_only and is_vision_weight:
+            if self.vision_tower is None and is_vision_weight:
                 continue
 
             if "rotary_emb.inv_freq" in name:

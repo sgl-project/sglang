@@ -667,16 +667,25 @@ class KimiK25ForConditionalGeneration(nn.Module):
         self.quant_config = quant_config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
         # Create vision tower
-        self.vision_tower = MoonViT3dPretrainedModel(
-            config.vision_config,
-            use_data_parallel=self.use_data_parallel,
-            quant_config=(
-                quant_config if isinstance(quant_config, ModelSlimConfig) else None
-            ),
-            prefix="vision_tower",
+        self.vision_tower = (
+            None
+            if not getattr(config, "has_local_vision_tower", True)
+            else MoonViT3dPretrainedModel(
+                config.vision_config,
+                use_data_parallel=self.use_data_parallel,
+                quant_config=(
+                    quant_config if isinstance(quant_config, ModelSlimConfig) else None
+                ),
+                prefix="vision_tower",
+            )
         )
-        # Create mm projector
-        self.mm_projector = K2VLMultiModalProjector(config.vision_config)
+        # Create mm projector. The encoder sends post-projector embeddings, so a
+        # replica without a tower has no use for it either.
+        self.mm_projector = (
+            K2VLMultiModalProjector(config.vision_config)
+            if self.vision_tower is not None
+            else None
+        )
 
         self.language_model = None
         if not config.encoder_only:
@@ -694,8 +703,10 @@ class KimiK25ForConditionalGeneration(nn.Module):
         # This solves the dtype mismatch issue when using device_map="auto" and torch_dtype.
         if self.language_model is not None and hasattr(self.language_model, "dtype"):
             target_dtype = self.language_model.dtype
-            self.vision_tower = self.vision_tower.to(dtype=target_dtype)
-            self.mm_projector = self.mm_projector.to(dtype=target_dtype)
+            if self.vision_tower is not None:
+                self.vision_tower = self.vision_tower.to(dtype=target_dtype)
+            if self.mm_projector is not None:
+                self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
     @property
     def model(self):
@@ -842,6 +853,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
+            multimodal_model=self,
             data_embedding_funcs={
                 Modality.IMAGE: self.get_image_feature,
             },
@@ -864,7 +876,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         vision_params = (
             None
-            if self.config.language_only
+            if self.vision_tower is None
             else dict(self.named_parameters(remove_duplicate=False))
         )
 

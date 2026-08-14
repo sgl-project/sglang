@@ -29,7 +29,7 @@ from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import TOWER_SKIPPING_ARCHITECTURES, ServerArgs
 from sglang.srt.utils import is_hip, is_sm100_supported, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
@@ -256,7 +256,6 @@ class ModelConfig:
         is_multi_layer_eagle: bool = False,
         encoder_only: bool = False,
         language_only: bool = False,
-        language_model_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
@@ -528,10 +527,17 @@ class ModelConfig:
 
         self.hf_config.encoder_only = encoder_only
         self.hf_config.language_only = language_only
-        # Checkpoints declare this one themselves (hf_transformers/processor.py),
-        # so the flag may only turn it on: writing the default back would build a
-        # vision tower with no weights to fill.
-        self.hf_config.language_model_only = language_model_only or self.is_lm_only
+        # Two different questions: language_model_only is the checkpoint saying it
+        # never processes images (it drives the forward pipeline), while a tower
+        # can be absent *here* and an EPD replica still consume remote features.
+        # Only the architectures that implement the skip actually drop it, so ask
+        # them -- claiming otherwise makes callers reject requests a tower could
+        # still serve.
+        drops_tower = language_only and any(
+            arch in TOWER_SKIPPING_ARCHITECTURES
+            for arch in (getattr(self.hf_config, "architectures", None) or [])
+        )
+        self.hf_config.has_local_vision_tower = not (drops_tower or self.is_lm_only)
 
         # matryoshka embeddings
         self.matryoshka_dimensions = getattr(
@@ -580,7 +586,6 @@ class ModelConfig:
             override_config_file=override_config_file,
             is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
             language_only=server_args.language_only,
-            language_model_only=server_args.language_model_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
             is_draft_quantization_explicit=(

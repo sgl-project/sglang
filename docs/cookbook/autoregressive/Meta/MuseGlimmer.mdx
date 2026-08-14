@@ -159,7 +159,7 @@ Muse Glimmer enables the `muse` tool-call parser by default. This parser sends s
 
 The BF16 checkpoint supports image input. It defaults to text only. To switch, select **Modality** in the command panel above.
 
-**Text only** adds `--language-model-only`. This flag turns off the vision tower. SGLang does not build or load the vision weights. This frees memory for the KV cache. SGLang rejects image requests in this mode.
+**Text only** adds `--language-only`. This flag turns off the vision tower. SGLang does not build or load the vision weights. This frees memory for the KV cache. SGLang rejects image requests in this mode.
 
 Select **Image + text** to turn on image input.
 

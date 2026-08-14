@@ -365,6 +365,43 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         return ret_input_ids
 
 
+_VISION_TOWER_ATTRS = ("visual", "vision_tower", "vision_model", "vision_encoder")
+
+
+def items_are_precomputed(items) -> bool:
+    """True when an encoder already embedded every one of *items*.
+
+    The embedding path short-circuits on this in several places; keep the test
+    in one spot so a caller cannot guard the wrong side of the short-circuit.
+    """
+    return bool(items) and all(
+        getattr(item, "precomputed_embeddings", None) is not None for item in items
+    )
+
+
+def _require_local_encoder(multimodal_model, items, modality) -> None:
+    """Last-resort invariant: an embedder is about to run with no tower to run it on.
+
+    Requests are rejected earlier, in the tokenizer, so reaching this means the
+    dispatch logic let something through -- say so instead of dereferencing None
+    somewhere inside the model.
+    """
+    if multimodal_model is None or items_are_precomputed(items):
+        return
+    towers = [
+        getattr(multimodal_model, name)
+        for name in _VISION_TOWER_ATTRS
+        if hasattr(multimodal_model, name)
+    ]
+    if not towers or any(t is not None for t in towers):
+        return
+    raise ValueError(
+        f"This server has no local vision tower (--language-only, or a "
+        f"checkpoint declaring language_model_only=True) and no encoder "
+        f"supplied embeddings for these {modality.name.lower()} inputs."
+    )
+
+
 def embed_mm_inputs(
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],
@@ -420,6 +457,7 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
+            _require_local_encoder(multimodal_model, items, modality)
             placeholder_tensor = torch.as_tensor(
                 [item.pad_value for item in items],
                 device=input_ids.device,
@@ -519,9 +557,7 @@ def _embed_mm_inputs_with_split(
     non_precomputed_req_indices = []
     for idx, mm_input in enumerate(mm_inputs_list):
         items = [item for item in mm_input.mm_items if item is not None]
-        if items and all(
-            getattr(item, "precomputed_embeddings", None) is not None for item in items
-        ):
+        if items_are_precomputed(items):
             precomputed_req_indices.append(idx)
         else:
             non_precomputed_req_indices.append(idx)

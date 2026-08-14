@@ -3118,8 +3118,17 @@ class KimiK3ForConditionalGeneration(nn.Module):
         # shard work across ranks image-wise via the DP runner.
         self.use_data_parallel = True
 
-        self.vision_tower = KimiK3VisionTower(config.vision_config)
-        self.mm_projector = KimiK3MultiModalProjector(config.vision_config)
+        has_local_vision_tower = getattr(config, "has_local_vision_tower", True)
+        self.vision_tower = (
+            KimiK3VisionTower(config.vision_config) if has_local_vision_tower else None
+        )
+        # The encoder sends post-projector embeddings, so a replica without a
+        # tower has no use for the projector either.
+        self.mm_projector = (
+            KimiK3MultiModalProjector(config.vision_config)
+            if has_local_vision_tower
+            else None
+        )
 
         self.language_model = None
         if not config.encoder_only:
@@ -3154,7 +3163,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             self.language_model.post_load_weights()
 
     def precompile_kernels_after_loading(self) -> None:
-        if self.config.language_only:
+        if self.vision_tower is None:
             return
         if self.vision_tower.precompile_fused_rope():
             logger.info("Precompiled dynamic-token fused K3 vision RoPE kernel")
@@ -3406,6 +3415,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
+            multimodal_model=self,
             data_embedding_funcs={
                 Modality.IMAGE: self.get_image_feature,
             },
@@ -3421,7 +3431,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
         vision_params = (
             None
-            if self.config.language_only
+            if self.vision_tower is None
             else dict(self.named_parameters(remove_duplicate=False))
         )
 

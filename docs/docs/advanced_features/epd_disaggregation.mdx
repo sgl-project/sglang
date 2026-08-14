@@ -15,7 +15,11 @@ To address these challenges, we introduce Encoder–Prefill–Decode (EPD) Disag
 ### Usage
 
 You can launch a language-only model using `--language-only`, or an encoder-only model using `--encoder-only`.
-When launching a language-only model, you must additionally specify the encoder service endpoints via `--encoder-urls`.
+
+`--language-only` on its own only drops the local vision tower; it opens no ports and rejects multimodal requests.
+Joining an encoder fleet is a separate opt-in: pass `--encoder-urls` to name the encoders you already know, which
+also starts the `EncoderBootstrapServer` so further encoders can register at runtime. If every encoder registers
+dynamically and there is no seed URL, ask for the bootstrap server directly with `--enable-encoder-bootstrap`.
 
 We support multiple encoder transfer backends, including zmq_to_scheduler, zmq_to_tokenizer, and mooncake (the default is zmq_to_scheduler). The backend can be selected using `--encoder-transfer-backend`.
 

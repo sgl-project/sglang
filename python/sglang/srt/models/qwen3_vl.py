@@ -54,6 +54,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    items_are_precomputed,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -1241,7 +1242,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
         self.language_model_only = getattr(config, "language_model_only", False)
-        if self.language_model_only:
+        # Distinct from language_model_only above: an EPD replica has no tower
+        # of its own yet still consumes the encoder's features.
+        if not getattr(config, "has_local_vision_tower", True):
             self.visual = None
         else:
             self.visual = Qwen3VLMoeVisionModel(
@@ -1345,7 +1348,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         if mm_inputs and mm_inputs.mm_items:
-            _require_vision(self)
+            _require_vision(self, mm_inputs.mm_items)
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -1589,15 +1592,18 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
-def _require_vision(model) -> None:
-    if (
-        getattr(model, "language_model_only", False)
-        and getattr(model, "visual", None) is None
-    ):
-        raise RuntimeError(
-            "Checkpoint is marked language_model_only=True and was loaded "
-            "without a vision encoder; multimodal inputs are not supported."
-        )
+def _require_vision(model, items=None) -> None:
+    """Raise unless this model can turn *items* into image features. Items an
+    encoder already embedded need no local tower, so they always pass."""
+    if getattr(model, "visual", None) is not None:
+        return
+    if items_are_precomputed(items):
+        return
+    raise RuntimeError(
+        "This server has no local vision tower (--language-only, or a checkpoint "
+        "declaring language_model_only=True) and no encoder supplied embeddings "
+        "for these multimodal inputs."
+    )
 
 
 EntryClass = Qwen3VLForConditionalGeneration

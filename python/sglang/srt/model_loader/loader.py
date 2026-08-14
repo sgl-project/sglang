@@ -3104,6 +3104,12 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 )
 
             if quant_param_name not in param_dict:
+                if (
+                    "visual" in quant_param_name
+                    and getattr(model, "visual", None) is None
+                ):
+                    # Tower deliberately not built (--language-only).
+                    continue
                 raise ValueError(
                     f"Parameter {quant_param_name} not found in the model."
                 )

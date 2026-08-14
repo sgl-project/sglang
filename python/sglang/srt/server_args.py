@@ -319,6 +319,21 @@ RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
+# Architectures whose __init__ honors has_local_vision_tower and skips building
+# the tower. Others fall back to skipping only the weight load.
+TOWER_SKIPPING_ARCHITECTURES = (
+    "DotsVLMForCausalLM",
+    "KimiK25ForConditionalGeneration",
+    "KimiK3ForConditionalGeneration",
+    "KimiVLForConditionalGeneration",
+    "MuseGlimmerForConditionalGeneration",
+    "Qwen2_5_VLForConditionalGeneration",
+    "Qwen3VLForConditionalGeneration",
+    "Qwen3VLMoeForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
+)
+
 ENCODER_TRANSFER_BACKEND_CHOICES = [
     "auto",
     "zmq_to_scheduler",
@@ -3121,14 +3136,13 @@ class ServerArgs:
         bool, "For MLLM with an encoder, launch an encoder-only server", NS("disagg")
     ] = False
     language_only: A[
-        bool, "For VLM, load weights for the language model only.", NS("disagg")
-    ] = False
-    language_model_only: A[
         bool,
-        "Skip the multimodal encoder entirely: its weights are never loaded and the "
-        "tower is never built, freeing that GPU memory for KV cache. Multimodal "
-        "requests are rejected. Unlike --language-only this is a standalone mode, "
-        "not part of encoder/decoder disaggregation.",
+        "Serve the language half of a VLM only. On architectures that support "
+        "it the vision tower is not built at all, freeing that memory for KV "
+        "cache; on the rest only its weights are skipped. "
+        "This says nothing about where image features come from -- name an "
+        "encoder with --encoder-urls to receive them from an encoder server. "
+        "Without one, multimodal requests are rejected.",
         NS("disagg"),
     ] = False
     encoder_transfer_backend: A[
@@ -3152,6 +3166,11 @@ class ServerArgs:
         "One or more EncoderBootstrapServer URLs to register this encoder with on startup, for dynamic encoder discovery. Example: --encoder-register-urls http://prefill0:8997 http://prefill1:8997. Used with --encoder-only servers.",
         NS("disagg"),
     ] = dataclasses.field(default_factory=list)
+    enable_encoder_bootstrap: A[
+        bool,
+        "Join an encoder fleet: run the EncoderBootstrapServer and the multimodal receivers so encoders can register at runtime. Implied by --encoder-urls; needed only when every encoder registers dynamically.",
+        NS("disagg"),
+    ] = False
     enable_adaptive_dispatch_to_encoder: A[
         bool,
         "When enabled, adaptively dispatch: multi-image requests go to encoder in language_only epd mode, single-image requests are processed locally.",
@@ -4920,7 +4939,6 @@ class ServerArgs:
             if (
                 model_config.is_multimodal
                 and not self.language_only
-                and not self.language_model_only
                 and self.disaggregation_mode != "decode"
             ):
                 self.adjust_mem_fraction_for_vlm(model_config)
@@ -6452,11 +6470,7 @@ class ServerArgs:
                     raise ValueError(
                         "MiMo V2 CP-v2 only supports --cp-strategy zigzag."
                     )
-                if (
-                    model_config.is_multimodal
-                    and not self.language_only
-                    and not self.language_model_only
-                ):
+                if model_config.is_multimodal and not self.language_only:
                     raise ValueError(
                         "MiMo V2 CP-v2 only supports text inference; add "
                         "--language-only."
@@ -7572,39 +7586,7 @@ class ServerArgs:
         except Exception:
             return False
 
-    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
-
-    def _handle_language_model_only(self):
-        if not self.language_model_only:
-            return
-        for flag, name in (
-            (self.encoder_only, "--encoder-only"),
-            (self.language_only, "--language-only"),
-            (self.enable_prefix_mm_cache, "--enable-prefix-mm-cache"),
-            (
-                self.enable_broadcast_mm_inputs_process,
-                "--enable-broadcast-mm-inputs-process",
-            ),
-            (self.mm_enable_dp_encoder, "--mm-enable-dp-encoder"),
-        ):
-            if flag:
-                raise ValueError(
-                    f"--language-model-only cannot be combined with {name}"
-                )
-        if self.disaggregation_mode != "null":
-            raise ValueError(
-                "--language-model-only is incompatible with --disaggregation-mode "
-                "prefill/decode"
-            )
-        architectures = self.get_model_config().hf_config.architectures
-        if not any(a in self.LANGUAGE_MODEL_ONLY_ARCHITECTURES for a in architectures):
-            raise ValueError(
-                f"--language-model-only does not support {architectures}. "
-                f"Supported: {list(self.LANGUAGE_MODEL_ONLY_ARCHITECTURES)}."
-            )
-
     def _handle_encoder_disaggregation(self):
-        self._handle_language_model_only()
         if self.enable_prefix_mm_cache and not self.encoder_only:
             raise ValueError(
                 "--enable-prefix-mm-cache requires --encoder-only to be enabled"
@@ -7616,11 +7598,45 @@ class ServerArgs:
                 "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
             )
 
-        if self.language_only and len(self.encoder_urls) == 0:
+        if self.language_only:
+            model_config = self.get_model_config()
+            architectures = model_config.hf_config.architectures or []
+            if not model_config.is_multimodal:
+                raise ValueError(
+                    f"--language-only serves the language half of a multimodal "
+                    f"model, but {architectures} is text-only. Drop the flag."
+                )
+            if any(a in TOWER_SKIPPING_ARCHITECTURES for a in architectures):
+                # No tower means no local encode to fall back on: multimodal
+                # inputs must arrive already embedded, or be rejected.
+                if self.enable_adaptive_dispatch_to_encoder:
+                    raise ValueError(
+                        "--enable-adaptive-dispatch-to-encoder processes some "
+                        "requests with the local vision tower, which "
+                        "--language-only does not build on "
+                        f"{architectures}. Drop one of the two flags."
+                    )
+            else:
+                logger.info(
+                    "%s keeps its vision tower under --language-only; only the "
+                    "architectures that implement the skip free that memory.",
+                    architectures,
+                )
+
+        if self.enable_encoder_bootstrap and not self.language_only:
+            raise ValueError(
+                "--enable-encoder-bootstrap is the language side of encoder "
+                "disaggregation and requires --language-only."
+            )
+        # Naming an encoder is itself the opt-in; the explicit flag exists for
+        # fleets where every encoder registers at runtime and there is no seed.
+        if self.language_only and self.encoder_urls:
+            self.enable_encoder_bootstrap = True
+        if self.language_only and not self.enable_encoder_bootstrap:
             logger.info(
-                "--language-only is set without --encoder-urls. Encoders are "
-                "expected to register dynamically via the "
-                "EncoderBootstrapServer."
+                "--language-only without --encoder-urls or "
+                "--enable-encoder-bootstrap: serving the language half alone, "
+                "multimodal requests will be rejected."
             )
 
         # Validate IB devices when mooncake backend is used
@@ -7646,7 +7662,9 @@ class ServerArgs:
                     model_arch,
                     self.tp_size,
                 )
-        if (self.encoder_only or self.language_only) and model_arch not in [
+        # Only the encoder side needs per-arch support: consuming an encoder's
+        # embeddings is arch-agnostic, and --language-only no longer implies EPD.
+        if self.encoder_only and model_arch not in [
             "Qwen2VLForConditionalGeneration",
             "Qwen3VLForConditionalGeneration",
             "Qwen2_5_VLForConditionalGeneration",

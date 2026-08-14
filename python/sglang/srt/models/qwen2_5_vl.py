@@ -645,16 +645,19 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             # encoder_only mode: no language model, so no lm_head needed
             self.lm_head = None
 
-        self.visual = Qwen2_5_VisionTransformer(
-            config.vision_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            # NOTE: Qwen2_5-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
-            prefix=add_prefix("visual", prefix),
-            use_data_parallel=self.use_data_parallel,
-            max_context_len=self.config.max_position_embeddings,
-        )
+        if not getattr(config, "has_local_vision_tower", True):
+            self.visual = None
+        else:
+            self.visual = Qwen2_5_VisionTransformer(
+                config.vision_config,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                # NOTE: Qwen2_5-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+                quant_config=quant_config,
+                prefix=add_prefix("visual", prefix),
+                use_data_parallel=self.use_data_parallel,
+                max_context_len=self.config.max_position_embeddings,
+            )
 
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
@@ -863,7 +866,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     continue
                 # Skip loading visual/language model weights
                 if (
-                    self.config.encoder_only or self.config.language_only
+                    self.config.encoder_only or self.visual is None
                 ) and name not in params_dict:
                     continue
                 param = params_dict[name]
