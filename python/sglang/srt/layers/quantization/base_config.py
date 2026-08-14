@@ -185,6 +185,9 @@ class QuantizationConfig(ABC):
         if hf_quant_config is None:
             return None
 
+        if user_quant == "nvfp4_online":
+            return None
+
         # Check if this is a ModelOpt config
         quant_algo = hf_quant_config.get("quant_algo", "").upper()
 

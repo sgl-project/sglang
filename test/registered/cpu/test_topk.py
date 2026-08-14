@@ -1,3 +1,4 @@
+import itertools
 import unittest
 
 import torch
@@ -207,6 +208,89 @@ class TestTopK(CustomTestCase):
             self._run_single_test(123, 256, 4, renormalize, torch.bfloat16)
             self._run_single_test(123, 160, 6, renormalize, torch.bfloat16)
 
+    def test_topk_softmax_mixed_input_dtypes(self):
+        torch.manual_seed(0)
+        hidden_states = torch.randn((17, 16), dtype=torch.bfloat16)
+        gating_output = torch.randn((17, 128), dtype=torch.float32)
+        correction_bias = torch.randn(128, dtype=torch.float32)
+
+        topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
+            hidden_states=hidden_states,
+            gating_output=gating_output,
+            topk=8,
+            renormalize=True,
+            correction_bias=correction_bias,
+        )
+
+        scores = torch.softmax(gating_output, dim=-1)
+        expected_ids = torch.topk(
+            scores + correction_bias.unsqueeze(0), k=8, dim=-1
+        ).indices
+        expected_weights = scores.gather(1, topk_ids.to(torch.int64))
+        expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
+
+        self.assertEqual(
+            torch.sort(topk_ids.to(torch.int64), dim=-1).values.tolist(),
+            torch.sort(expected_ids, dim=-1).values.tolist(),
+        )
+        torch.testing.assert_close(topk_weights, expected_weights)
+
+    def test_topk_softmax_with_correction_bias(self):
+        """Bias must affect expert selection without becoming a routing weight."""
+        for num_tokens, num_experts, topk, with_bias, renormalize in itertools.product(
+            [1, 17, 128],
+            [16, 128, 384, 512],
+            [1, 2, 4, 8],
+            [False, True],
+            [False, True],
+        ):
+            torch.manual_seed(0)
+            hidden_states = torch.randn((num_tokens, 16), dtype=torch.bfloat16)
+            gating_output = torch.randn((num_tokens, num_experts), dtype=torch.bfloat16)
+            correction_bias = torch.randn(num_experts) if with_bias else None
+
+            topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
+                hidden_states=hidden_states,
+                gating_output=gating_output,
+                topk=topk,
+                renormalize=renormalize,
+                correction_bias=correction_bias,
+            )
+
+            scores = torch.softmax(gating_output.float(), dim=-1)
+            scores_for_choice = scores
+            if correction_bias is not None:
+                scores_for_choice = scores_for_choice + correction_bias.unsqueeze(0)
+            expected_choice_scores = torch.topk(
+                scores_for_choice, k=topk, dim=-1, sorted=True
+            ).values
+            selected_choice_scores = torch.sort(
+                scores_for_choice.gather(1, topk_ids.to(torch.int64)),
+                dim=-1,
+                descending=True,
+            ).values
+
+            expected_weights = scores.gather(1, topk_ids.to(torch.int64))
+            if renormalize:
+                expected_weights = expected_weights / expected_weights.sum(
+                    dim=-1, keepdim=True
+                )
+
+            self.assertEqual(topk_ids.dtype, torch.int32)
+            self.assertEqual(topk_weights.dtype, torch.float32)
+            self.assertTrue(torch.all((topk_ids >= 0) & (topk_ids < num_experts)))
+            sorted_ids = torch.sort(topk_ids, dim=-1).values
+            self.assertTrue(torch.all(sorted_ids[:, 1:] != sorted_ids[:, :-1]))
+            torch.testing.assert_close(
+                selected_choice_scores,
+                expected_choice_scores,
+                atol=1e-4,
+                rtol=1e-4,
+            )
+            torch.testing.assert_close(
+                topk_weights, expected_weights, atol=1e-4, rtol=1e-4
+            )
+
 
 class TestCustomTopK(CustomTestCase):
     def _run_single_test(
@@ -250,6 +334,79 @@ class TestCustomTopK(CustomTestCase):
             self._run_single_test(
                 123, 32, 1, False, torch.bfloat16, native_custom_f, fused_custom_f
             )
+
+    def test_topk_sigmoid_with_correction_bias(self):
+        """Biased scores must select experts while returned weights stay unbiased."""
+        for num_tokens, num_experts, topk, with_bias, renormalize in itertools.product(
+            [1, 17, 128],
+            [16, 128, 256, 384, 512],
+            [1, 2, 4, 8],
+            [False, True],
+            [False, True],
+        ):
+            torch.manual_seed(0)
+            hidden_states = torch.randn((num_tokens, 16), dtype=torch.bfloat16)
+            gating_output = torch.randn((num_tokens, num_experts), dtype=torch.bfloat16)
+            correction_bias = torch.randn(num_experts) if with_bias else None
+
+            topk_weights, topk_ids = torch.ops.sgl_kernel.topk_sigmoid_cpu(
+                hidden_states=hidden_states,
+                gating_output=gating_output,
+                topk=topk,
+                renormalize=renormalize,
+                correction_bias=correction_bias,
+            )
+
+            scores = torch.sigmoid(gating_output.float())
+            scores_for_choice = scores
+            if correction_bias is not None:
+                scores_for_choice = scores_for_choice + correction_bias.unsqueeze(0)
+
+            expected_choice_scores = torch.topk(
+                scores_for_choice, k=topk, dim=-1
+            ).values
+            selected_choice_scores = torch.sort(
+                scores_for_choice.gather(1, topk_ids.to(torch.int64)),
+                dim=-1,
+                descending=True,
+            ).values
+
+            expected_weights = scores.gather(1, topk_ids.to(torch.int64))
+            if renormalize:
+                expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
+
+            self.assertEqual(topk_ids.dtype, torch.int32)
+            self.assertEqual(topk_weights.dtype, torch.float32)
+            self.assertTrue(torch.equal(selected_choice_scores, expected_choice_scores))
+            torch.testing.assert_close(
+                topk_weights, expected_weights, atol=1e-4, rtol=1e-4
+            )
+
+    def test_topk_sigmoid_mixed_input_dtypes(self):
+        torch.manual_seed(0)
+        hidden_states = torch.randn((17, 16), dtype=torch.bfloat16)
+        gating_output = torch.randn((17, 256), dtype=torch.float32)
+
+        topk_weights, topk_ids = torch.ops.sgl_kernel.topk_sigmoid_cpu(
+            hidden_states=hidden_states,
+            gating_output=gating_output,
+            topk=8,
+            renormalize=True,
+            correction_bias=None,
+        )
+
+        scores = torch.sigmoid(gating_output)
+        expected_ids = torch.topk(scores, k=8, dim=-1).indices
+        expected_weights = scores.gather(1, topk_ids.to(torch.int64))
+        expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
+
+        self.assertTrue(
+            torch.equal(
+                torch.sort(topk_ids.to(torch.int64), dim=-1).values,
+                torch.sort(expected_ids, dim=-1).values,
+            )
+        )
+        torch.testing.assert_close(topk_weights, expected_weights, atol=1e-5, rtol=1e-5)
 
 
 if __name__ == "__main__":
