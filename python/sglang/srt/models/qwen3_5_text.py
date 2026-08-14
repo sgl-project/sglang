@@ -119,10 +119,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
-        # The body class implements the capture (flags _is_layer_to_capture on
-        # its layers and returns (hidden, aux) from forward, which our forward
-        # already unpacks); this wrapper only needs to delegate. Same guard and
-        # validation as LlamaForCausalLM.set_dflash_layers_to_capture.
         if not self.pp_group.is_last_rank:
             return
         if layers_to_capture is None:
