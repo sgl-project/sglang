@@ -1,9 +1,4 @@
 """Unit tests for --device in the shared CLI parser of sglang.test.test_utils.
-
-The choices were hardcoded to ``["auto", "cuda", "rocm", "cpu"]``: Intel XPU
-was rejected although the server accepts it, while "rocm" was offered although
-``DeviceConfig`` refuses it (PyTorch drives AMD GPUs through the "cuda" device
-type).
 """
 
 import argparse
