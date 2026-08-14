@@ -316,14 +316,15 @@ def is_sm121() -> bool:
     return is_cuda() and torch.cuda.get_device_capability() == (12, 1)
 
 
-try:
-    import sgl_kernel  # noqa: F401
+@lru_cache(maxsize=1)
+def _is_intel_amx_backend_available():
+    try:
+        import sgl_kernel  # noqa: F401
 
-    is_intel_amx_backend_available = hasattr(
-        torch.ops.sgl_kernel, "convert_weight_packed"
-    )
-except:
-    is_intel_amx_backend_available = False
+        return hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
+    except Exception:
+        return False
+
 
 try:
     # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
@@ -334,7 +335,7 @@ except:
 
 
 def cpu_has_amx_support():
-    return is_amx_tile_supported and is_intel_amx_backend_available
+    return is_amx_tile_supported and _is_intel_amx_backend_available()
 
 
 def use_intel_amx_backend(layer):
@@ -1634,6 +1635,7 @@ class ImageData:
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
     preprocess_kwargs: Optional[Dict] = None
+    content_hash: Optional[str] = None
 
 
 @dataclass
@@ -1999,7 +2001,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.15.post1")
+        min_version: Minimum version required (e.g., "0.6.17")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -3302,9 +3304,10 @@ def has_hf_quant_config(model_path: str) -> bool:
     Returns:
         True if hf_quant_config.json exists, False otherwise.
     """
-    # Check if the model_path is a local path
-    if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
-        return True
+    # Local paths are decided on the filesystem; the hub helpers below
+    # reject them as invalid repo ids.
+    if os.path.isdir(model_path):
+        return os.path.isfile(os.path.join(model_path, "hf_quant_config.json"))
 
     from huggingface_hub import try_to_load_from_cache
 

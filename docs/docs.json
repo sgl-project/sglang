@@ -82,6 +82,10 @@
       "destination": "/docs/advanced_features/cuda_graph_for_multi_modal_encoder"
     },
     {
+      "source": "/advanced_features/dcp.html",
+      "destination": "/docs/advanced_features/dcp"
+    },
+    {
       "source": "/advanced_features/deterministic_inference.html",
       "destination": "/docs/advanced_features/deterministic_inference"
     },
@@ -933,6 +937,7 @@
               "docs/advanced_features/quantization",
               "docs/advanced_features/quantized_kv_cache",
               "docs/advanced_features/dp_dpa_smg_guide",
+              "docs/advanced_features/dcp",
               "docs/advanced_features/expert_parallelism",
               "docs/advanced_features/lora",
               "docs/advanced_features/pd_disaggregation",
@@ -1006,6 +1011,7 @@
             "pages": [
               "docs/developer_guide/overview",
               "docs/developer_guide/contribution_guide",
+              "docs/developer_guide/serve_backend_plugins",
               {
                 "group": "Development",
                 "pages": [
@@ -1234,6 +1240,7 @@
                   {
                     "group": "Qwen",
                     "pages": [
+                      "cookbook/autoregressive/Qwen/Qwen3.8",
                       "cookbook/autoregressive/Qwen/Qwen3.6",
                       "cookbook/autoregressive/Qwen/Qwen3.5",
                       "cookbook/autoregressive/Qwen/Qwen3",
@@ -1276,6 +1283,12 @@
                     "group": "Meituan",
                     "pages": [
                       "cookbook/autoregressive/Meituan/LongCat-2.0"
+                    ]
+                  },
+                  {
+                    "group": "RedNote",
+                    "pages": [
+                      "cookbook/autoregressive/RedNote/Dots3-Note"
                     ]
                   },
                   {

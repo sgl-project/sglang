@@ -558,7 +558,10 @@ class MambaPool:
                     )
 
                     conv_state = _init_npu_conv_state(
-                        conv_state[0], conv_state_shape, speculative_num_draft_tokens
+                        conv_state[0],
+                        conv_state_shape,
+                        speculative_num_draft_tokens,
+                        is_kda=cache_params.is_kda,
                     )
 
                 if _is_cpu and _cpu_has_amx_support:
@@ -759,6 +762,14 @@ class MambaPool:
                     # Original dense layout (NPU/CPU, or EAGLE tree verify): one
                     # [dim, K-1] window per draft token.
                     # Shape: [num_layers, size+1, draft_tokens, dim, K-1]
+                    dense_conv_shapes = [
+                        (
+                            (conv_shape[1], conv_shape[0])
+                            if _is_npu and cache_params.is_kda
+                            else conv_shape
+                        )
+                        for conv_shape in conv_state_shape
+                    ]
                     intermediate_conv_window_cache = [
                         torch.zeros(
                             size=(
@@ -771,7 +782,7 @@ class MambaPool:
                             dtype=conv_dtype,
                             device="cuda",
                         )
-                        for conv_shape in conv_state_shape
+                        for conv_shape in dense_conv_shapes
                     ]
                     self._intermediate_conv_window_phys = intermediate_conv_window_cache
                 self.mamba_cache = self.SpeculativeState(
@@ -4618,6 +4629,18 @@ class MHATokenToKOnlyPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self._get_key_buffer(layer_id)
 
+    def set_k_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+        self.k_buffer[layer_id][loc] = cache_k
+
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError("MHATokenToKOnlyPool does not allocate V")
 
@@ -4662,6 +4685,9 @@ class MiniMaxSparseKVPool(KVCache):
         index_dtype: Optional[torch.dtype] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        main_pool_cls=MHATokenToKVPool,
+        index_kv_pool_cls=MHATokenToKVPool,
+        index_k_pool_cls=MHATokenToKOnlyPool,
     ):
         # Do not call super().__init__() — delegate to sub-pools instead.
         self.size = size
@@ -4703,7 +4729,7 @@ class MiniMaxSparseKVPool(KVCache):
             gid: i for i, gid in enumerate(local_k_only_sparse_layer_ids)
         }
 
-        self.main_pool = MHATokenToKVPool(
+        self.main_pool = main_pool_cls(
             size=size,
             page_size=page_size,
             dtype=dtype,
@@ -4717,7 +4743,7 @@ class MiniMaxSparseKVPool(KVCache):
         )
 
         self.index_kv_pool: Optional[MHATokenToKVPool] = (
-            MHATokenToKVPool(
+            index_kv_pool_cls(
                 size=size,
                 page_size=page_size,
                 dtype=index_dtype,
@@ -4732,7 +4758,7 @@ class MiniMaxSparseKVPool(KVCache):
         )
 
         self.index_k_pool: Optional[MHATokenToKOnlyPool] = (
-            MHATokenToKOnlyPool(
+            index_k_pool_cls(
                 size=size,
                 page_size=page_size,
                 dtype=index_dtype,
@@ -4880,10 +4906,7 @@ class MiniMaxSparseKVPool(KVCache):
         if cache_idx_k.dtype != sub_pool.dtype:
             if k_scale is not None:
                 cache_idx_k = cache_idx_k / k_scale
-            cache_idx_k = cache_idx_k.to(sub_pool.dtype)
-        if sub_pool.store_dtype != sub_pool.dtype:
-            cache_idx_k = cache_idx_k.view(sub_pool.store_dtype)
-        sub_pool.k_buffer[mapped_id][loc] = cache_idx_k
+        sub_pool.set_k_buffer(mapped_id, loc, cache_idx_k)
 
     def _can_fuse_kv_index_store(
         self,
