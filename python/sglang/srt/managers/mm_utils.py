@@ -43,7 +43,7 @@ from sglang.srt.runtime_context import (
     get_server_args,
     get_serving,
 )
-from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.srt.utils import flatten_nested_list, print_warning_once, is_npu
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
 
@@ -62,6 +62,7 @@ _BUFFER_OFFSET = 0
 
 _is_default_tensor_transport = None
 
+_is_npu = is_npu()
 
 def init_feature_buffer(device):
     global _GPU_FEATURE_BUFFER, _BUFFER_OFFSET

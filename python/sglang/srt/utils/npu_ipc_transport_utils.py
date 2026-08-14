@@ -378,7 +378,7 @@ class NpuIpcTensorTransportProxy:
             state["ipc_extra"] = None
             state["tensor_data"] = data
             logger.warning(
-                f"[NPU IPC] Failed to create IPC handle, falling back to CPU: {e}"
+                f"[NPU IPC] Failed to create IPC handle, falling back to CPU"
             )
 
         return state
