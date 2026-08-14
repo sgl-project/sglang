@@ -1687,10 +1687,19 @@ CLIENT_MEDIA_EXCEPTIONS = (
 
 
 def load_audio(
-    audio_file: Union[str, bytes], sr: Optional[int] = None, mono: bool = True
+    audio_file: Union[str, bytes, np.ndarray],
+    sr: Optional[int] = None,
+    mono: bool = True,
 ) -> np.ndarray:
     if sr is None:
         sr = 16000
+
+    # Caller must pre-resample to `sr`. Multi-channel layout assumed
+    # (n_samples, n_channels) per soundfile.read.
+    if isinstance(audio_file, np.ndarray):
+        if mono and audio_file.ndim > 1:
+            return np.mean(audio_file, axis=1)
+        return audio_file
 
     # Normalize input: resolve URL / base64 / file:// to bytes or path
     if isinstance(audio_file, bytes):
