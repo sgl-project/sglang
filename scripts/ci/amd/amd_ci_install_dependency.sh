@@ -389,6 +389,11 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     "
 
     if [[ "${INSTALL_AITER_TRITON}" == "true" ]]; then
+        # The installer above moved Triton out from under the image's copy, so
+        # re-point torch's recorded requirement the same way the Dockerfile does.
+        docker exec ci_sglang python3 \
+            /sglang-checkout/scripts/ci/amd/patch_torch_triton_requirement.py
+
         docker exec -i ci_sglang python3 - <<'PY'
 import importlib.metadata as metadata
 import pathlib
@@ -397,19 +402,6 @@ import re
 import triton
 
 triton_version = metadata.version("triton")
-torch_dist = metadata.distribution("torch")
-metadata_path = pathlib.Path(torch_dist._path) / "METADATA"
-source = metadata_path.read_text()
-pattern = r"^Requires-Dist: triton-rocm==3\.6\.0(?P<marker>\s*;.*)?$"
-updated, count = re.subn(
-    pattern,
-    lambda match: f"Requires-Dist: triton=={triton_version}{match.group('marker') or ''}",
-    source,
-    flags=re.MULTILINE,
-)
-if count:
-    assert count == 1, count
-    metadata_path.write_text(updated)
 
 installer = pathlib.Path(
     "/sgl-workspace/aiter/.github/scripts/install_triton.sh"

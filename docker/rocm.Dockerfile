@@ -780,6 +780,68 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
      && python3 -c "import torch; from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); assert torch.version.hip is not None, torch.__version__; print(f'[Triton] ROCm Torch {torch.__version__}, Triton {v}, triton-kernels {k}')"; \
     fi
 
+# The installer above uninstalls the triton-rocm that torch 2.11 hard-requires,
+# so torch is left naming a distribution nothing provides. See the script for
+# why neither leaving triton-rocm installed nor leaving the metadata stale works.
+RUN python3 /sgl-workspace/sglang/scripts/ci/amd/patch_torch_triton_requirement.py
+
+# Validate the stack that actually ships, after the Triton swap above. The
+# earlier check ran before it, so it could not catch a broken Triton wiring, and
+# the components installed in between are free to move torch underneath us.
+#
+# This gate checks torch's own recorded requirements rather than running `pip
+# check` over the whole environment: TileLang publishes metadata this image
+# cannot satisfy (it requires torch-c-dlpack-ext, and an apache-tvm-ffi range
+# that its own build pins outside of), so a whole-environment check fails here
+# for reasons that have nothing to do with the torch stack. The earlier gate
+# still runs `pip check`, since it sits before the TileLang build.
+RUN <<'EOF'
+set -eu
+case "${GPU_ARCH}" in
+  *-rocm724) ;;
+  *) echo "[Final] Not a ROCm 7.2.4 flavor (GPU_ARCH=${GPU_ARCH}), skip"; exit 0 ;;
+esac
+python3 -m pip check || echo "[Final] pip check reported the above; only the torch stack is enforced"
+python3 - <<'PY'
+import importlib.metadata as metadata
+import re
+
+import torch
+from packaging.requirements import Requirement
+
+assert torch.__version__.startswith("2.11."), torch.__version__
+assert torch.version.hip, torch.__version__
+
+installed = {}
+for dist in metadata.distributions():
+    name = dist.metadata["Name"]
+    if name:
+        installed[re.sub(r"[-_.]+", "-", name).lower()] = dist.version
+
+unmet = []
+for spec in metadata.distribution("torch").requires or []:
+    requirement = Requirement(spec)
+    if requirement.marker and not requirement.marker.evaluate({"extra": ""}):
+        continue
+    version = installed.get(re.sub(r"[-_.]+", "-", requirement.name).lower())
+    if version is None:
+        unmet.append(f"{requirement} -> not installed")
+    elif not requirement.specifier.contains(version, prereleases=True):
+        unmet.append(f"{requirement} -> {version}")
+assert not unmet, f"torch requirements are unsatisfied: {unmet}"
+
+cuda = sorted(name for name in installed if re.fullmatch(r"nvidia-.*-cu[0-9]+", name))
+assert not cuda, f"NVIDIA CUDA runtime packages in a ROCm image: {cuda}"
+
+print(
+    "[Final] torch", torch.__version__,
+    "HIP", torch.version.hip,
+    "triton", metadata.version("triton"),
+    "triton-kernels", metadata.version("triton-kernels"),
+)
+PY
+EOF
+
 # -----------------------
 # Performance environment variable.
 
