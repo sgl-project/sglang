@@ -15,6 +15,13 @@ import numpy as np
 import torch
 from setproctitle import setproctitle
 
+from sglang.multimodal_gen.runtime.utils.logging_utils import (  # isort: skip
+    globally_suppress_loggers,
+)
+
+# spawned workers import model dependencies before entering run_scheduler_process
+globally_suppress_loggers()
+
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
@@ -65,7 +72,6 @@ from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
-    globally_suppress_loggers,
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
@@ -987,6 +993,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         target: Union[str, List[str]] = "all",
         strength: Union[float, List[float]] = 1.0,
         merge_mode: str | None = None,
+        lora_alpha: int | None | list[int | None] = None,
     ) -> OutputBatch:
         """
         Set the LoRA adapter(s) for the pipeline.
@@ -1002,7 +1009,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.set_lora(
-            lora_nickname, lora_path, target, strength, merge_mode=merge_mode
+            lora_nickname,
+            lora_path,
+            target,
+            strength,
+            merge_mode=merge_mode,
+            lora_alpha=lora_alpha,
         )
         return OutputBatch()
 
