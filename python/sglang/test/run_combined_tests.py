@@ -148,6 +148,9 @@ def run_combined_tests(
                     spec_accept_length_threshold=performance_params.spec_accept_length_threshold,
                     skip_server_launch=share_server,
                     baseline_output_throughput=performance_params.baseline_output_throughput,
+                    baseline_ftl_s=performance_params.baseline_ftl_s,
+                    baseline_itl_ms=performance_params.baseline_itl_ms,
+                    emit_report=not performance_params.include_latency_breakdown,
                 )
                 model_result["perf_result"] = perf_result
                 if not perf_result.passed:
@@ -176,6 +179,25 @@ def run_combined_tests(
                     # Wait for GPU memory and port cleanup
                     print("\nWaiting 20 seconds for resource cleanup...")
                     time.sleep(20)
+
+            if (
+                run_perf
+                and perf_runner
+                and performance_params.include_latency_breakdown
+                and model_result["perf_result"]
+            ):
+                benchmark_results = model_result["perf_result"].benchmark_results
+                acc_latency = (
+                    model_result["accuracy_result"].latency
+                    if model_result["accuracy_result"]
+                    else None
+                )
+                perf_runner.add_report(
+                    benchmark_results,
+                    variant=model.variant,
+                    acc_latency=acc_latency,
+                    include_latency_breakdown=True,
+                )
 
             # Run tool call test
             if run_tool_call:

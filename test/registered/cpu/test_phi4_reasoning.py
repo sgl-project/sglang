@@ -43,12 +43,15 @@ class TestPhi4ReasoningCPU(unittest.TestCase):
                 baseline_accuracy=0.90,
                 api="completion",
                 num_threads=64,
+                return_latency=True,
             ),
             performance_params=PerformanceTestParams(
                 batch_sizes=[16],
                 input_lens=(1024,),
                 output_lens=(1024,),
-                baseline_output_throughput=50.0,
+                baseline_ftl_s=23.0,
+                baseline_itl_ms=310.0,
+                include_latency_breakdown=True,
             ),
             share_server=True,
         )
