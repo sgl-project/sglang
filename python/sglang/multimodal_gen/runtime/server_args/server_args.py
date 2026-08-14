@@ -912,11 +912,13 @@ class ServerArgs(DisaggServerArgsMixin):
             and self.attention_backend == "laser_attn"
             and "text_encoder" not in self.component_attention_backends
         ):
+            # Laser Attention is used only by the MiniMax-H3 transformer. Keep
+            # its Qwen3-VL encoder on the supported fused-attention backend.
             logger.info(
-                "Automatically set torch_sdpa backend for the MiniMax H3 text "
+                "Automatically set fa backend for the MiniMax H3 text "
                 "encoder; laser_attn applies to the transformer"
             )
-            self.component_attention_backends["text_encoder"] = "torch_sdpa"
+            self.component_attention_backends["text_encoder"] = "fa"
 
         if self.ring_degree > 1:
             if (
