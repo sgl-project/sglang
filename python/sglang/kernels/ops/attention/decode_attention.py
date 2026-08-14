@@ -1013,10 +1013,13 @@ def decode_attention_fwd(
     # the backend's host-side seqlen gate (lean_decode_seqlen_gate) before we get here.
     # Lean supports both the contiguous 3-D [N, head, dim] and paged 4-D
     # [num_pages, page_size, head, dim] KV layouts (page-aware address math in the kernel).
-    if _lean_head_dim_ok(
-        k_buffer.shape[-1], v_buffer.shape[-1]
-    ) and _should_use_lean_decode(
-        enable_lean, logit_cap, sinks, xai_temperature_len, score_mod
+    # ROCm/AMD only: Lean is validated on MI300X/MI355X; CUDA/NVIDIA uses the standard kernel.
+    if (
+        _is_hip
+        and _lean_head_dim_ok(k_buffer.shape[-1], v_buffer.shape[-1])
+        and _should_use_lean_decode(
+            enable_lean, logit_cap, sinks, xai_temperature_len, score_mod
+        )
     ):
         total_programs, XCD_REMAP, NUM_XCDS = _lean_decode_launch_params(
             v_buffer.shape[-2], kv_group_num
