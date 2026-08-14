@@ -793,6 +793,29 @@ def test_configure_resolves_residency_policy(monkeypatch):
     )
 
 
+def test_configure_enables_communication_aware_prefetch_for_dit_only(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    monkeypatch.setattr(
+        layerwise_offload_mod.envs, "SGLANG_DIT_COMM_AWARE_PREFETCH", True
+    )
+    # Keep this configuration test CPU-only. Runtime eligibility and coordinator
+    # behavior are covered separately; here the contract is which component
+    # receives the opt-in.
+    monkeypatch.setattr(
+        LayerwiseOffloadManager, "_initialize_coordinated_prefetch", lambda self: None
+    )
+
+    dit = _ResidentComponent(2)
+    dit.configure_layerwise_offload(_server_args())
+    assert dit.layerwise_offload_managers[0]._coordinated_prefetch_requested is True
+
+    auxiliary = _AuxiliaryResidentComponent(2)
+    auxiliary.configure_layerwise_offload(_server_args())
+    assert (
+        auxiliary.layerwise_offload_managers[0]._coordinated_prefetch_requested is False
+    )
+
+
 def test_holds_residents_reflects_configuration(monkeypatch):
     _patch_fake_device(monkeypatch)
     resident = _resident_manager(_MultiBlockModel(3), num_layers=3, resident_layers=2)
@@ -909,6 +932,22 @@ def test_enable_offload_rearms_after_disable(monkeypatch):
     assert tuple(model.blocks[2].weight.shape) == (1,)
     manager.prefetch_layer(2, non_blocking=False)
     assert torch.equal(model.blocks[2].weight.data, original)
+
+
+def test_load_all_layers_joins_pending_prefetch_producers(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(_MultiBlockModel(1), num_layers=1)
+    joined = []
+    manager._prefetch_threads[0] = SimpleNamespace(join=lambda: joined.append(0))
+
+    # The layer is already present in _gpu_layers while its producer is still
+    # submitting chunks. load_all_layers must not treat that membership as a
+    # completion signal when disable_offload restores the full model.
+    assert 0 in manager._gpu_layers
+    manager.load_all_layers()
+
+    assert joined == [0]
+    assert manager._prefetch_threads == {}
 
 
 # ---------------------------------------------------------------------------

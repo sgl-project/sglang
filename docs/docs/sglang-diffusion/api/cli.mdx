@@ -227,6 +227,24 @@ sglang generate \
 
 The values must match keys in the selected pipeline's `pipeline.modules`, such as `transformer`, `text_encoder`, `image_encoder`, `vae`, `condition_image_encoder`, `spatial_upsampler`, or `vocoder`. Use `all` to select every layerwise-offloadable component. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency.
 
+On PCIe systems where pinned-memory H2D prefetch overlaps standard NCCL Ulysses collectives, communication-aware prefetch can bound the copy queue and drain admitted chunks before each collective:
+
+```bash Command
+SGLANG_DIFFUSION_IPC_A2A=0 \
+SGLANG_DIT_COMM_AWARE_PREFETCH=1 \
+SGLANG_DIT_PREFETCH_CHUNK_MIB=2 \
+SGLANG_DIT_PREFETCH_INFLIGHT=2 \
+sglang generate \
+  --model-path Wan-AI/Wan2.2-TI2V-5B-Diffusers \
+  --dit-layerwise-offload \
+  --pin-cpu-memory \
+  --num-gpus 2 \
+  --ulysses-degree 2 \
+  --prompt "A quiet city street after rain"
+```
+
+This experimental path is disabled by default and currently supports standard NCCL Ulysses collectives. It disables itself for CUDA-IPC A2A and for layer weights that require stride-preserving host buffers. Tune chunk size and in-flight depth on the target PCIe and NUMA topology; the defaults are a conservative starting point rather than a universal optimum.
+
 ## Serve
 
 `sglang serve` starts the HTTP server and keeps the model loaded for repeated requests.
