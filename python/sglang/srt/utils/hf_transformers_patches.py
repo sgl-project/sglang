@@ -60,6 +60,7 @@ def apply_all():
     _patch_image_processor_kwargs()
     _patch_image_process_cuda_tensor()
     _patch_nemotron_h_pattern()
+    _patch_glm_moe_dsa_attribute_map()
 
     # v5 general patches
     _ensure_clean_up_tokenization_compat()
@@ -133,6 +134,32 @@ def _ensure_gguf_version():
 # ---------------------------------------------------------------------------
 # v5.4 patches (merged from transformers_v54_compat.py)
 # ---------------------------------------------------------------------------
+
+
+def _patch_glm_moe_dsa_attribute_map():
+    """Keep GLM DSA's explicit RoPE head dimension from being overwritten.
+
+    Some Transformers releases map the legacy ``head_dim`` field to
+    ``qk_rope_head_dim``.  GLM-5.2 legitimately defines both fields with
+    different values (192 and 64 respectively), so that alias changes the
+    query projection width from 16384 to 24576 and makes TP weight loading
+    fail.  Copy the class dictionary before removing the alias in case a
+    Transformers version shares it with a parent config class.
+    """
+
+    try:
+        from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import (
+            GlmMoeDsaConfig,
+        )
+    except ImportError:
+        return
+
+    attribute_map = getattr(GlmMoeDsaConfig, "attribute_map", None)
+    if not isinstance(attribute_map, dict) or "head_dim" not in attribute_map:
+        return
+
+    GlmMoeDsaConfig.attribute_map = dict(attribute_map)
+    GlmMoeDsaConfig.attribute_map.pop("head_dim", None)
 
 
 def _patch_rope_parameters_validation():
