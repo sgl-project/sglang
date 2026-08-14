@@ -134,6 +134,10 @@ else
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
 fi
 
+# shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../utils/sgl_eval_ref.sh"
+install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "$SGL_EVAL_SPEC"
+
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"
 else
@@ -145,6 +149,12 @@ else
   docker cp lmms-eval ci_sglang:/
   docker exec ci_sglang git config --global --add safe.directory /lmms-eval
   install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+
+  # lmms-eval v0.4.1 pulls latex2sympy2, which pins antlr4-python3-runtime==4.7.2
+  # and uninstalls the 4.9.3 that sgl-eval's latex2sympy2_extended requires, so
+  # every `sgl-eval run mmlu` dies with "Unsupported ANTLR version 4.7.2". Pin it
+  # back, the same way the CUDA installer does after its own lmms-eval install.
+  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "antlr4-python3-runtime==4.9.3" --force-reinstall --no-deps
 
   git_clone_with_retry https://github.com/akao-amd/human-eval.git human-eval
   docker cp human-eval ci_sglang:/
