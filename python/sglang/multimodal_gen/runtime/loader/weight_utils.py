@@ -228,6 +228,10 @@ def safetensors_weights_iterator(
         use_runai_model_streamer = (
             HAS_RUNAI_MODEL_STREAMER and envs.SGLANG_USE_RUNAI_MODEL_STREAMER
         )
+    if key_filter is not None:
+        # streamer filters after materializing all tensors, so it cannot skip
+        # a checkpoint partition at load time
+        use_runai_model_streamer = False
 
     # Validate files before loading
     corrupted_files, duplicate_files_by_key = _scan_safetensors_files(hf_weights_files)

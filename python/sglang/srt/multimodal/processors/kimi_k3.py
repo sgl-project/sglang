@@ -8,6 +8,7 @@ images onto the checkpoint-configured background
 at load time.
 """
 
+import functools
 import re
 from typing import Dict, List, Union
 
@@ -23,6 +24,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
+    KimiK3DeferredPreprocessing,
 )
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     fill_transparent_bg as _fill_transparent_bg,
@@ -272,12 +274,16 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         input_ids = self._prepare_input_ids(
             input_text, resize_configs, original_input_ids, image_sizes
         )
-        deferred_config = {
-            "image_mean": list(self._image_mean),
-            "image_std": list(self._image_std),
-            "transparent_bg_config": self._transparent_bg_config,
-        }
-        return input_ids, resize_configs, deferred_config
+        # This path only ever defers GPU preprocessing: the caller gates on
+        # `_should_defer_gpu_preprocessing` and stages CHW uint8 features.
+        deferred_preprocessing = functools.partial(
+            KimiK3DeferredPreprocessing,
+            backend="gpu",
+            image_mean=list(self._image_mean),
+            image_std=list(self._image_std),
+            transparent_bg_config=self._transparent_bg_config,
+        )
+        return input_ids, resize_configs, deferred_preprocessing
 
 
 class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
@@ -365,7 +371,11 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         return raw_bytes <= processed_bytes
 
     def _build_deferred_output(self, base_output):
-        input_ids, resize_configs, deferred_config = self._processor.prepare_deferred(
+        (
+            input_ids,
+            resize_configs,
+            deferred_preprocessing,
+        ) = self._processor.prepare_deferred(
             base_output.input_text,
             base_output.images,
             base_output.input_ids,
@@ -389,10 +399,9 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 offsets=[offset],
                 model_specific_data={
                     "image_grid_thw": torch.tensor([grid_thw], dtype=torch.int64),
-                    DEFERRED_PREPROCESSING_KEY: {
-                        **deferred_config,
-                        "resize_config": resize_config,
-                    },
+                    DEFERRED_PREPROCESSING_KEY: deferred_preprocessing(
+                        resize_config=resize_config
+                    ),
                 },
             )
             items.append(item)
