@@ -17,8 +17,7 @@ SGLANG_MLA_DECODE_TUNE replaces the scheduler's per-sequence num_kv_splits with 
 batch-wide count. Its failure mode is silent: stage-2 derives where split `i` starts
 from the same count stage-1 used, so if only one of the two launches gets the count,
 the merge reads partials that were never written and the output is quietly wrong
-rather than an error. These tests run both stages for real and compare against the
-stock path, which is the only place that mismatch shows up.
+rather than an error. Only running both stages for real catches that.
 
     python -m pytest test/registered/unit/layers/attention/test_mla_decode_forced_splits.py -v
 """
@@ -53,18 +52,18 @@ ATOL = 3e-3
 # The two head_tiles=8 cases (h128) are the only ones that catch stage-1 being handed
 # the wrong count while stage-2 keeps the right one; do not drop both.
 CASES = (
-    ("b1_h16", 1, [4096], 16, 1),
-    ("b5_h128", 5, [4096] * 5, 128, 1),
-    ("b6_h16", 6, [4096] * 6, 16, 1),
-    ("b24_h16", 24, [4096] * 24, 16, 1),
-    ("b25_h16", 25, [4096] * 25, 16, 1),
-    ("b136_h16", 136, [1024] * 136, 16, 1),
-    ("mixed_lengths", 8, [1, 31, 33, 257, 1024, 4095, 4096, 16384], 16, 1),
-    ("mixed_skew", 8, [16384, 1, 1, 1, 1, 1, 1, 1], 16, 1),
-    ("all_length_1", 4, [1, 1, 1, 1], 16, 1),
-    ("mixed_h128", 6, [7, 512, 1023, 1025, 2048, 4095], 128, 1),
-    ("page64", 4, [4096] * 4, 16, 64),
-    ("page64_mixed", 32, [1 + 257 * i % 2048 for i in range(32)], 16, 64),
+    ("b1_h16", [4096], 16, 1),
+    ("b5_h128", [4096] * 5, 128, 1),
+    ("b6_h16", [4096] * 6, 16, 1),
+    ("b24_h16", [4096] * 24, 16, 1),
+    ("b25_h16", [4096] * 25, 16, 1),
+    ("b136_h16", [1024] * 136, 16, 1),
+    ("mixed_lengths", [1, 31, 33, 257, 1024, 4095, 4096, 16384], 16, 1),
+    ("mixed_skew", [16384, 1, 1, 1, 1, 1, 1, 1], 16, 1),
+    ("all_length_1", [1, 1, 1, 1], 16, 1),
+    ("mixed_h128", [7, 512, 1023, 1025, 2048, 4095], 128, 1),
+    ("page64", [4096] * 4, 16, 64),
+    ("page64_mixed", [1 + (257 * i) % 2048 for i in range(32)], 16, 64),
 )
 
 
@@ -115,9 +114,7 @@ def _inputs(seq_lens, head_num, page_size, max_kv_splits, seed):
 
 
 def _forced(inp):
-    return da._mla_forced_kv_splits(
-        inp["q"], inp["k_buffer"], inp["max_kv_splits"], True
-    )
+    return da._mla_launch_plan(inp["q"], inp["k_buffer"], inp["max_kv_splits"], True)[1]
 
 
 def _run(inp):
@@ -173,7 +170,7 @@ class TestMlaDecodeForcedSplits(CustomTestCase):
         # Not bit-for-bit: a different split count reassociates the fp32 softmax
         # reduction. Bounded at two bf16 ULP, which is one rounding step of headroom
         # over what this actually measures.
-        for seed, (name, _, seq_lens, head_num, page_size) in enumerate(CASES):
+        for seed, (name, seq_lens, head_num, page_size) in enumerate(CASES):
             with self.subTest(case=name):
                 inp = _inputs(seq_lens, head_num, page_size, 256, seed=seed)
                 with envs.SGLANG_MLA_DECODE_TUNE.override(False):
@@ -194,11 +191,12 @@ class TestMlaDecodeForcedSplits(CustomTestCase):
     def test_both_stages_get_the_same_count(self):
         # The mismatch the tolerance above can only catch indirectly: assert the entry
         # point hands one count to both launches instead of letting them disagree.
+        # Dropping tune_mla is invisible to the numerics, it only costs the geometry.
         seen = {}
 
         def record(key, real):
             def wrapper(*args, forced_kv_splits=0, **kwargs):
-                seen[key] = forced_kv_splits
+                seen[key] = (forced_kv_splits, kwargs.get("tune_mla"))
                 return real(*args, forced_kv_splits=forced_kv_splits, **kwargs)
 
             return wrapper
@@ -213,22 +211,21 @@ class TestMlaDecodeForcedSplits(CustomTestCase):
             da._decode_grouped_att_m_fwd = stage1
             da._decode_softmax_reducev_fwd = stage2
 
-        self.assertEqual(seen["stage1"], seen["stage2"])
-        self.assertGreater(seen["stage1"], 0, "tuning did not engage, nothing tested")
+        self.assertEqual(seen["stage1"][0], seen["stage2"][0])
+        self.assertGreater(
+            seen["stage1"][0], 0, "tuning did not engage, nothing tested"
+        )
+        self.assertTrue(seen["stage1"][1], "stage-1 was left on the stock geometry")
 
     def test_scheduler_splits_are_kept_when_asked(self):
-        # --enable-deterministic-inference and friends route through
-        # _keep_scheduler_splits. The launch geometry still changes -- it is
-        # batch-independent, so determinism survives it, see the next test -- but the
-        # per-sequence count has to be left exactly as the scheduler wrote it.
+        # the geometry still changes under --enable-deterministic-inference, but it is
+        # batch-independent (see the next test); only the count has to survive verbatim
         inp = _inputs([1, 4095, 4096, 16384], 16, 1, 256, seed=7)
         with envs.SGLANG_MLA_DECODE_TUNE.override(False):
             stock = _run(inp)
         self._publish(enable_deterministic_inference=True)
         with envs.SGLANG_MLA_DECODE_TUNE.override(True):
-            self.assertEqual(
-                da._mla_forced_kv_splits(inp["q"], inp["k_buffer"], 256, True), 0
-            )
+            self.assertEqual(_forced(inp), 0)
             kept = _run(inp)
         torch.testing.assert_close(
             kept.float(), stock.float(), rtol=2 * BF16_ULP, atol=ATOL

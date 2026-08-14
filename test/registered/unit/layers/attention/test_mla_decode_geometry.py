@@ -13,19 +13,16 @@
 # ==============================================================================
 """Stage-1 split budget for the gfx950 MLA decode geometry.
 
-Stage-1 launches `batch * head_tiles * kv_splits` workgroups. Crossing the
-bucket's budget costs a whole wave rather than a proportional slice: at batch 24
-on a 68k context, 21 splits (504 blocks) measured 358 us against 528 us for 22
-splits (528 blocks), so 5% more work took 47% longer. The stock rule derived the
-count with `round()`, which overshoots -- `round(512/12) = 43` lands at 516
-blocks, past the budget.
+Stage-1 launches `batch * head_tiles * kv_splits` workgroups, and crossing the
+bucket's budget costs a step rather than a proportional slice: at batch 24 on a 68k
+context, 21 splits measured 358 us against 528 us for 22. Which is also why the
+budget is divided down with floor and not round -- `round(512/12) = 43` would put
+batch 12 at 516 blocks, just over.
 
-The budget is not a global constant: it belongs to the geometry, because how many
-stage-1 workgroups a CU can hold depends on how large each one is. Halving
-`num_warps` halves the workgroup and moves the cliff from 512 blocks to 1024.
-That is why the two live in one table, and it is what these tests pin -- a future
-edit that retunes one without the other, or that reintroduces rounding, breaks
-the invariant here instead of silently costing 40% on one batch size.
+The budget lives with the geometry rather than as a global constant, since halving
+`num_warps` moved the cliff from 512 blocks to 1024. These tests pin the two
+together, so retuning one without the other, or rounding the division up, fails here
+instead of costing 50% at one batch size.
 
     python -m pytest test/registered/unit/layers/attention/test_mla_decode_geometry.py -v
 """
@@ -34,12 +31,13 @@ import unittest
 
 from sglang.kernels.ops.attention import decode_attention as da
 from sglang.kernels.ops.attention.decode_attention import (
+    _MLA_BLOCK_N,
     _MLA_BUCKET_BATCH_FREE,
     _MLA_BUCKETS,
     _fwd_grouped_kernel_stage1,
+    _grouped_head_tiles,
     _keep_scheduler_splits,
     _mla_bucket,
-    _mla_head_tiles,
     _mla_kv_splits,
     _mla_split_budget,
 )
@@ -78,8 +76,7 @@ MAX_KV_SPLITS = 256
 
 class TestMlaDecodeGeometry(unittest.TestCase):
     def test_rule_reproduces_measured_optimum(self):
-        # The rule is a budget plus two geometry-derived constants, not a fit, so it
-        # lands on the separately measured optimum exactly.
+        # a budget plus two constants, not a fit, so it hits the measured optimum
         for batch, want in MEASURED_OPTIMUM.items():
             with self.subTest(batch=batch):
                 self.assertEqual(
@@ -94,12 +91,11 @@ class TestMlaDecodeGeometry(unittest.TestCase):
         self.assertTrue(params["USE_FORCED"].is_constexpr)
 
     def test_batch_free_geometry_is_pinned(self):
-        # Deterministic inference runs on this geometry, and BLOCK_N/num_warps reorder
-        # the fp32 accumulation. It happens to be spelled as the mid bucket, so retuning
-        # that bucket would move those numbers with nothing else complaining.
+        # Deterministic inference runs on this geometry and BLOCK_N/num_warps reorder
+        # the fp32 accumulation, so retuning either moves those numbers.
         self.assertEqual(
             (
-                _MLA_BUCKET_BATCH_FREE.block_n,
+                _MLA_BLOCK_N,
                 _MLA_BUCKET_BATCH_FREE.num_warps,
                 _MLA_BUCKET_BATCH_FREE.num_stages,
             ),
@@ -111,7 +107,7 @@ class TestMlaDecodeGeometry(unittest.TestCase):
         # BLOCK_H that drifts between the two silently mis-sizes the budget.
         for head_num, kv_group_num, want in ((16, 16, 1), (128, 128, 8), (8, 8, 1)):
             with self.subTest(head_num=head_num):
-                self.assertEqual(_mla_head_tiles(head_num, kv_group_num), want)
+                self.assertEqual(_grouped_head_tiles(head_num, kv_group_num), want)
 
     def test_never_crosses_the_budget(self):
         for head_tiles in (1, 2):
@@ -122,13 +118,12 @@ class TestMlaDecodeGeometry(unittest.TestCase):
                     if batch * head_tiles <= budget:
                         self.assertLessEqual(batch * head_tiles * splits, budget)
                     else:
-                        # one split per request is the floor, nothing left to give
+                        # already past the budget, so 1 is the floor
                         self.assertEqual(splits, 1)
 
     def test_low_batch_is_capped_not_scaled(self):
-        # Below 6, batch * splits cannot fill the 256 CUs, so the limit is where
-        # stage-2's merge traffic overtakes stage-1's parallelism -- measured at
-        # 112 and flat in batch, hence a cap on top of the budget.
+        # below 6 the budget stops binding, and more splits stopped paying at 112
+        # whatever the batch, so the cap sits on top of the budget instead of scaling
         self.assertEqual(_mla_kv_splits(1, 1, MAX_KV_SPLITS, CORE_COUNT), 112)
         self.assertEqual(_mla_kv_splits(2, 1, MAX_KV_SPLITS, CORE_COUNT), 112)
         self.assertLess(
@@ -155,8 +150,8 @@ class TestMlaDecodeGeometry(unittest.TestCase):
         self.assertTrue(all(b is not None for b in finite))
 
     def test_wider_workgroup_gets_a_tighter_budget(self):
-        # num_warps and the budget move together: fewer warps per workgroup means
-        # more of them resident, so the cliff sits further out.
+        # the budget divides by num_warps because that is where the cliff moved:
+        # halving the warps took it from 512 blocks to 1024
         budgets = [
             _mla_split_budget(w, CORE_COUNT)
             for w in sorted({b.num_warps for b in _MLA_BUCKETS}, reverse=True)
@@ -173,7 +168,7 @@ class TestMlaDecodeGeometry(unittest.TestCase):
                     _mla_split_budget(warps, 256),
                 )
         self.assertEqual(
-            _mla_kv_splits(8, 1, MAX_KV_SPLITS, 0), 0, "no device, no tune"
+            _mla_kv_splits(8, 1, MAX_KV_SPLITS, 0), 0, "no core count, no budget"
         )
 
     def test_splits_shrink_on_a_partition(self):
@@ -217,6 +212,12 @@ class TestKeepSchedulerSplits(unittest.TestCase):
         self._publish()
         with envs.SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS.override(True):
             self.assertTrue(_keep_scheduler_splits())
+
+    def test_the_geometry_rule_does_not_read_the_config(self):
+        # _mla_kv_splits answers for a device, not for a config; the decline lives one
+        # level up, so a deterministic config elsewhere cannot rewrite the pins above
+        self._publish(enable_deterministic_inference=True)
+        self.assertEqual(_mla_kv_splits(24, 1, MAX_KV_SPLITS, CORE_COUNT), 21)
 
 
 if __name__ == "__main__":
