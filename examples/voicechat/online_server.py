@@ -149,7 +149,7 @@ class VoiceChatRuntime:
             else:
                 os.environ["NVIDIA_TF32_OVERRIDE"] = previous_tf32
         self.connection_lock = asyncio.Lock()
-        self.max_audio_queue_frames = args.max_audio_queue_frames
+        self.max_audio_queue_frames = getattr(args, "max_audio_queue_frames", 256)
         self.session_capacity = args.context_length
         self.warmup_frames = 0 if args.skip_warmup else args.warmup_frames
         self.warmup_duration_ms = None
@@ -604,14 +604,14 @@ def create_app(runtime: VoiceChatRuntime) -> FastAPI:
     return app
 
 
-def main():
-    parser = argparse.ArgumentParser()
+def add_runtime_arguments(
+    parser: argparse.ArgumentParser, *, warmup_by_default: bool = True
+) -> None:
+    """Add arguments shared by realtime and direct offline inference."""
     parser.add_argument("--duplex-model", required=True)
     parser.add_argument("--eartts-model", required=True)
     parser.add_argument("--speaker-latent")
     parser.add_argument("--audio-sidecar", default="http://127.0.0.1:18081")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--context-length", type=int, default=8192)
     parser.add_argument(
         "--duplex-dtype",
@@ -624,17 +624,44 @@ def main():
     parser.add_argument("--duplex-base-gpu-id", type=int, default=0)
     parser.add_argument("--eartts-base-gpu-id", type=int, default=0)
     parser.add_argument("--eartts-attention-backend", default="torch_native")
-    parser.add_argument("--max-audio-queue-frames", type=int, default=256)
     parser.add_argument("--warmup-frames", type=int, default=2)
-    parser.add_argument("--skip-warmup", action="store_true")
+    warmup = parser.add_mutually_exclusive_group()
+    warmup.add_argument(
+        "--warmup",
+        dest="skip_warmup",
+        action="store_false",
+        help="Run a disposable warm-up session before inference.",
+    )
+    warmup.add_argument(
+        "--skip-warmup",
+        dest="skip_warmup",
+        action="store_true",
+        help="Skip the disposable warm-up session.",
+    )
+    parser.set_defaults(skip_warmup=not warmup_by_default)
     parser.add_argument("--log-level", default="warning")
-    args = parser.parse_args()
+
+
+def validate_runtime_arguments(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Validate arguments consumed by ``VoiceChatRuntime``."""
     if args.context_length < 1:
         parser.error("--context-length must be positive")
-    if args.max_audio_queue_frames < 1:
-        parser.error("--max-audio-queue-frames must be positive")
     if args.warmup_frames < 1:
         parser.error("--warmup-frames must be at least 1")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    add_runtime_arguments(parser)
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=18080)
+    parser.add_argument("--max-audio-queue-frames", type=int, default=256)
+    args = parser.parse_args()
+    validate_runtime_arguments(parser, args)
+    if args.max_audio_queue_frames < 1:
+        parser.error("--max-audio-queue-frames must be positive")
     runtime = VoiceChatRuntime(args)
     uvicorn.run(create_app(runtime), host=args.host, port=args.port)
 

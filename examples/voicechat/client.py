@@ -45,6 +45,29 @@ def resample_pcm16(pcm: bytes, source_rate: int, target_rate: int) -> bytes:
     return output.tobytes()
 
 
+def downmix_pcm16(pcm: bytes, channels: int) -> bytes:
+    if channels < 1:
+        raise ValueError("WAV input must have at least one channel.")
+    if channels == 1 or not pcm:
+        return pcm
+    samples = array("h")
+    samples.frombytes(pcm)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    if len(samples) % channels:
+        raise ValueError("PCM payload does not contain complete audio frames.")
+    mono = array(
+        "h",
+        (
+            round(sum(samples[offset : offset + channels]) / channels)
+            for offset in range(0, len(samples), channels)
+        ),
+    )
+    if sys.byteorder != "little":
+        mono.byteswap()
+    return mono.tobytes()
+
+
 def read_wav(path: Path) -> bytes:
     with wave.open(str(path), "rb") as source:
         channels, width, source_rate = (
@@ -52,13 +75,16 @@ def read_wav(path: Path) -> bytes:
             source.getsampwidth(),
             source.getframerate(),
         )
-        if (channels, width) != (1, 2):
+        if width != 2:
             raise ValueError(
-                "Input must be mono 16-bit PCM WAV; got "
+                "Input must be 16-bit PCM WAV; got "
                 f"channels={channels}, sample_width={width}."
             )
         pcm = source.readframes(source.getnframes())
-    output = resample_pcm16(pcm, source_rate, INPUT_RATE)
+    output = downmix_pcm16(pcm, channels)
+    output = resample_pcm16(output, source_rate, INPUT_RATE)
+    if channels != 1:
+        print(f"downmixed input from {channels} channels to mono")
     if source_rate != INPUT_RATE:
         print(f"resampled input from {source_rate} Hz to {INPUT_RATE} Hz")
     return output
@@ -179,7 +205,7 @@ class AudioDevices:
             self.audio = None
 
 
-def _complete_frames(pcm: bytes) -> bytes:
+def complete_frames(pcm: bytes) -> bytes:
     remainder = len(pcm) % FRAME_BYTES
     return pcm if remainder == 0 else pcm + bytes(FRAME_BYTES - remainder)
 
@@ -196,7 +222,7 @@ async def _send_frame(socket, frame: bytes) -> None:
 
 
 async def _send_wav(socket, receiver, args) -> None:
-    pcm = _complete_frames(read_wav(args.input_wav))
+    pcm = complete_frames(read_wav(args.input_wav))
     next_frame_at = asyncio.get_running_loop().time()
     for offset in range(0, len(pcm), FRAME_BYTES):
         await _send_frame(socket, pcm[offset : offset + FRAME_BYTES])

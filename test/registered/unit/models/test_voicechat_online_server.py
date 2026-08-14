@@ -124,6 +124,17 @@ def test_warmup_can_be_disabled():
     assert runtime.warmup_duration_ms is None
 
 
+def test_runtime_arguments_warm_up_realtime_by_default():
+    parser = online_server.argparse.ArgumentParser()
+    online_server.add_runtime_arguments(parser)
+
+    args = parser.parse_args(
+        ["--duplex-model", "/models/duplex", "--eartts-model", "/models/eartts"]
+    )
+
+    assert not args.skip_warmup
+
+
 def test_app_exposes_realtime_discovery_and_alias_routes():
     app = online_server.create_app(make_runtime([]))
     http_paths = {
