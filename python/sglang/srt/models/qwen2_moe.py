@@ -67,6 +67,7 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputCheck
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
+    get_moe_runner_backend,
     is_deepep_class_backend,
     uses_per_rank_fused_shared_slots,
 )
@@ -593,10 +594,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)
 
+        # deep_gemm disposes (frees) hidden_states after the routed experts run,
+        # but the deferred fused gate reads hidden_states afterwards — so keep
+        # the gate applied inside the shared expert instead of fusing it.
         use_fused_gate = (
             self.shared_expert_gate is not None
             and not use_intel_amx_backend(self.shared_expert_gate)
             and not is_npu()
+            and not get_moe_runner_backend().is_deep_gemm()
         )
 
         if hidden_states.shape[0] == 0:
