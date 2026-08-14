@@ -6836,6 +6836,20 @@ class ServerArgs:
         if a2a_backend == "megamoe":
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
+            # DeepGEMM's fused MegaMoE kernels exist only for SM90 (all-FP8)
+            # and SM100/SM103 (FP8xFP4); on SM120/SM121 (RTX PRO 6000 / RTX
+            # 6000D / RTX 5090 / DGX Spark) the forward would abort inside
+            # `fp8_fp4_mega_moe` ("Unsupported architecture"), so reject the
+            # combination up front instead of crashing at load time.
+            if is_cuda() and get_device_sm() >= 120:
+                raise ValueError(
+                    "--moe-a2a-backend megamoe is not supported on SM120/SM121 "
+                    "(RTX PRO 6000 / RTX 6000D / RTX 5090 / DGX Spark): DeepGEMM "
+                    "ships no MegaMoE kernels for this architecture. Use "
+                    "--moe-a2a-backend none with --moe-runner-backend deep_gemm "
+                    "(requires sgl-deep-gemm>=0.1.5), marlin or flashinfer_mxfp4 "
+                    "instead."
+                )
 
         if a2a_backend == "deepep":
             if self.moe_runner_backend == "flashinfer_cutedsl":
