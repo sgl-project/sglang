@@ -27,7 +27,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
-from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
+from sglang.multimodal_gen.runtime.loader.fsdp_load import (
+    register_fsdp_entrypoints,
+    shard_model,
+)
 from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
     skip_init_modules,
@@ -499,6 +502,7 @@ class TextEncoderLoader(ComponentLoader):
                         or getattr(model, "_fsdp_shard_conditions", None),
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )
+                    register_fsdp_entrypoints(model)
                 else:
                     model = model.to("cpu")
             else:
