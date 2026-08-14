@@ -26,6 +26,7 @@ export const config = {
     { id: "flash", label: "Flash", subtitle: "284B" },
     { id: "flash-official", label: "Flash Official", subtitle: "284B · 0731" },
     { id: "pro",   label: "Pro",   subtitle: "1.6T" },
+    { id: "pro-official", label: "Pro Official", subtitle: "1.6T · 0813" },
   ],
   quantizations: [
     { id: "fp8", label: "FP8" },
@@ -51,6 +52,7 @@ export const config = {
     "pro|fp4":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|fp8":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|nvfp4": "nvidia/DeepSeek-V4-Pro-NVFP4",
+    "pro-official|fp4": "deepseek-ai/DeepSeek-V4-Pro-0813",
     // H200 FP8 needs the sgl-project repackaging (Hopper can't run FP4-mixed Instruct).
     "h200|flash|fp8": "sgl-project/DeepSeek-V4-Flash-FP8",
     "h200|pro|fp8":   "sgl-project/DeepSeek-V4-Pro-FP8",
@@ -1274,6 +1276,136 @@ sgl-eval run aime25 \\
         "--port {{PORT}}",
       ],
     },
+    // ====================================================================
+    // GB300 + FP4 — Pro Official (0813)
+    //
+    // The 0813 checkpoint bundles a DSpark draft head, so the low-latency
+    // recipe uses `--speculative-algorithm DSPARK` and omits the EAGLE shape
+    // flags (SGLang reads gamma from the checkpoint). EAGLE loads on this
+    // checkpoint without erroring but accepts no draft tokens.
+    // ====================================================================
+    {
+      match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // --max-running-requests is server-wide and floor-divided by attn_dp_size,
+      // so 512 gives 128 running slots per DP rank. That is the point where both
+      // the slot budget and the KV pool run full on this topology; the three
+      // memory flags together are what keep the KV pool large enough to reach it.
+      match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend megamoe",
+        "--mem-fraction-static 0.9",
+        "--cuda-graph-max-bs-decode 128",
+        "--max-running-requests 512",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
+    // B300 + FP4 — Pro Official (0813)
+    //
+    // Derived from the verified 4xGB300 recipes above by scaling to the
+    // 8-GPU B300 node (TP/DP 8, mirroring the existing B300 Pro cells).
+    // --max-running-requests is scaled to keep 128 slots per DP rank.
+    // NOT yet run end-to-end on B300 hardware.
+    // ====================================================================
+    {
+      match: { hw: "b300", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--moe-a2a-backend megamoe",
+        "--mem-fraction-static 0.9",
+        "--cuda-graph-max-bs-decode 128",
+        "--max-running-requests 1024",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
     // ====================================================================
     // GB200 + NVFP4
     // ====================================================================
