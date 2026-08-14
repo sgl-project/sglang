@@ -20,6 +20,7 @@ from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx imp
 from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
 )
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 _msa_fallback_warned = False
@@ -94,6 +95,7 @@ def minimax_sparse_prefill(
     score = None
     if (
         use_msa
+        and envs.SGLANG_OPT_USE_MSA_PREFILL_INDEX_SCORE.get()
         and disable_index_value
         and idx_sink is None
         and score_type == "max"
