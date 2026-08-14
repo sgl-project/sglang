@@ -14,7 +14,7 @@ microphone/WAV
       v
 NeMo perception -> SGLang Duplex -> SGLang EarTTS -> NeMo codec
       ^                  |                 |
-      |                  + text/ASR state  + codec state
+      |                  + text/function state  + codec state
       +---------------------- one 80 ms frame -------------------+
 ```
 

@@ -48,6 +48,26 @@ def _stt_config(config_path: Path) -> dict:
         raise ValueError("Could not find model.stt.model in --config.") from error
 
 
+def _configure_duplex_config(config, stt_config: dict):
+    config.architectures = ["NemotronDuplexHForCausalLM"]
+    config.predict_user_text = False
+    config.use_function_head = True
+    # Temporal Mamba state is sensitive to accumulated low-precision drift.
+    # Keep it in fp32 even when model weights run in bf16 for online latency.
+    config.mamba_ssm_dtype = "float32"
+    config.duplex_text_channel_weight = float(
+        stt_config.get("duplex_text_channel_weight", 1.0)
+    )
+    config.duplex_user_channel_weight = float(
+        stt_config.get("duplex_user_channel_weight", 1.0)
+    )
+    config.duplex_function_channel_weight = float(
+        stt_config.get("duplex_function_channel_weight", 1.0)
+    )
+    config.fuse_method = "add"
+    return config
+
+
 def convert(
     checkpoint: Path,
     output: Path,
@@ -66,19 +86,7 @@ def convert(
         raise ValueError("The converter only supports fuse_method='add'.")
 
     config = AutoConfig.from_pretrained(base_model, trust_remote_code=False)
-    config.architectures = ["NemotronDuplexHForCausalLM"]
-    config.predict_user_text = False
-    config.use_function_head = True
-    config.duplex_text_channel_weight = float(
-        stt_config.get("duplex_text_channel_weight", 1.0)
-    )
-    config.duplex_user_channel_weight = float(
-        stt_config.get("duplex_user_channel_weight", 1.0)
-    )
-    config.duplex_function_channel_weight = float(
-        stt_config.get("duplex_function_channel_weight", 1.0)
-    )
-    config.fuse_method = "add"
+    config = _configure_duplex_config(config, stt_config)
     tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=False)
     pad_token = stt_config.get("pad_token", "<SPECIAL_12>")
     pad_token_id = tokenizer.convert_tokens_to_ids(pad_token)

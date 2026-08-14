@@ -1,6 +1,8 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from examples.voicechat.online_session import (
     AsyncSGLangVoiceChatSession,
     SGLangVoiceChatSession,
@@ -12,9 +14,11 @@ class FakeEngine:
         self.results = iter(results)
         self.requests = []
         self.closed = []
+        self.capacities = []
 
     def open_session(self, capacity, streaming):
-        assert capacity == 8192 and streaming
+        assert streaming
+        self.capacities.append(capacity)
         return f"session-{id(self)}"
 
     def generate(self, **kwargs):
@@ -64,6 +68,36 @@ def test_two_stage_feedback_contract():
     assert eartts.requests[-1]["custom_inputs"]["previous_audio_codes"] == [1, 2, 3]
 
 
+def test_frame_budget_counts_prompt_frame_zero_and_speaker_prefill():
+    duplex = FakeEngine(
+        [
+            {"output_ids": [99], "meta_info": {"function_tokens": [6]}},
+            {"output_ids": [7], "meta_info": {"function_tokens": [8]}},
+            {"output_ids": [9], "meta_info": {"function_tokens": [10]}},
+        ]
+    )
+    eartts = FakeEngine(
+        [
+            {"output_ids": [0]},
+            {"output_ids": [0], "meta_info": {"audio_codes": [[1]]}},
+            {"output_ids": [0], "meta_info": {"audio_codes": [[2]]}},
+            {"output_ids": [0], "meta_info": {"audio_codes": [[3]]}},
+        ]
+    )
+    session = SGLangVoiceChatSession(duplex, eartts, capacity=6)
+    session.start([10, 11], SimpleNamespace(shape=(2, 1152)), pad_token_id=12)
+
+    assert session.max_frames == 3
+    for _ in range(session.max_frames):
+        session.step([[0.0] * 4480])
+
+    with pytest.raises(ValueError, match="maximum 3 acoustic frames"):
+        session.step([[0.0] * 4480])
+    assert session.frames_processed == 3
+    assert len(duplex.requests) == 3
+    assert duplex.capacities == eartts.capacities == [6]
+
+
 class AsyncFakeEngine(FakeEngine):
     async def async_open_session(self, capacity, streaming):
         return self.open_session(capacity, streaming)
@@ -99,6 +133,8 @@ def test_async_two_stage_feedback_contract():
         second = await session.step([[1.0] * 4480])
         await session.close()
 
+        assert session.max_frames == 8187
+        assert session.frames_processed == 2
         assert (first.text_token, first.function_token, first.audio_codes) == (
             99,
             6,

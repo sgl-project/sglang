@@ -1,8 +1,10 @@
 import json
+from types import SimpleNamespace
 
 import torch
 from transformers import AutoConfig
 
+from examples.voicechat.convert_duplex_stage import _configure_duplex_config
 from sglang.srt.configs.eartts import EarTTSConfig
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.models.eartts import MaskGITSampler
@@ -73,3 +75,23 @@ def test_duplex_unified_checkpoint_name_mapping():
     assert mapper("stt_model.llm.backbone.layers.0.weight") == ("model.layers.0.weight")
     assert mapper("stt_model.llm.layers.0.weight") == "model.layers.0.weight"
     assert mapper("stt_model.function_head.weight") == "function_head.weight"
+
+
+def test_duplex_conversion_pins_function_channel_and_fp32_mamba_state():
+    config = _configure_duplex_config(
+        SimpleNamespace(),
+        {
+            "duplex_text_channel_weight": 1,
+            "duplex_user_channel_weight": 1,
+            "duplex_function_channel_weight": 2,
+        },
+    )
+
+    assert config.architectures == ["NemotronDuplexHForCausalLM"]
+    assert not config.predict_user_text
+    assert config.use_function_head
+    assert config.mamba_ssm_dtype == "float32"
+    assert config.duplex_text_channel_weight == 1.0
+    assert config.duplex_user_channel_weight == 1.0
+    assert config.duplex_function_channel_weight == 2.0
+    assert config.fuse_method == "add"

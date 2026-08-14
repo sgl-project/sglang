@@ -33,10 +33,16 @@ class SGLangVoiceChatSession:
     """
 
     def __init__(self, duplex_engine, eartts_engine, capacity=8192):
+        capacity = int(capacity)
+        if capacity < 1:
+            raise ValueError("VoiceChat session capacity must be positive.")
         self.duplex_engine = duplex_engine
         self.eartts_engine = eartts_engine
         self.duplex_session = duplex_engine.open_session(capacity, streaming=True)
         self.eartts_session = eartts_engine.open_session(capacity, streaming=True)
+        self.capacity = capacity
+        self.max_frames = None
+        self.frames_processed = 0
         self.function_token = None
         self.system_prompt_ids = None
         self.pad_token_id = None
@@ -57,6 +63,14 @@ class SGLangVoiceChatSession:
         self.system_prompt_ids = list(system_prompt_ids)
         self.pad_token_id = int(pad_token_id)
         latent_len = int(speaker_latent.shape[0])
+        duplex_frames = self.capacity - len(self.system_prompt_ids) - 1
+        eartts_frames = self.capacity - latent_len - 1
+        self.max_frames = min(duplex_frames, eartts_frames)
+        if self.max_frames < 1:
+            raise ValueError(
+                "VoiceChat session capacity cannot fit the prompt, speaker "
+                "prefill, and one acoustic frame."
+            )
         self.eartts_engine.generate(
             input_ids=[0] * latent_len,
             # EarTTS emits a deterministic placeholder token (id 0). Keeping
@@ -72,9 +86,17 @@ class SGLangVoiceChatSession:
         )
         self._started = True
 
+    def _check_frame_budget(self) -> None:
+        if self.frames_processed >= self.max_frames:
+            raise ValueError(
+                "VoiceChat session exceeded its frame-locked context budget: "
+                f"maximum {self.max_frames} acoustic frames."
+            )
+
     def step(self, acoustic_embedding) -> VoiceChatStep:
         if not self._started:
             raise RuntimeError("Call start() before sending acoustic frames.")
+        self._check_frame_budget()
         sampling = {"max_new_tokens": 1, "temperature": 0.0}
         duplex_started = time.perf_counter()
         if self.function_token is None:
@@ -99,6 +121,7 @@ class SGLangVoiceChatSession:
         duplex_ms = (time.perf_counter() - duplex_started) * 1000
         text_token = int(duplex["output_ids"][-1])
         self.function_token = int(_latest(duplex, "function_tokens"))
+        self.frames_processed += 1
 
         eartts_started = time.perf_counter()
         eartts = self.eartts_engine.generate(
@@ -137,6 +160,9 @@ class AsyncSGLangVoiceChatSession:
         self.eartts_engine = eartts_engine
         self.duplex_session = None
         self.eartts_session = None
+        self.capacity = None
+        self.max_frames = None
+        self.frames_processed = 0
         self.function_token = None
         self.system_prompt_ids = None
         self.pad_token_id = None
@@ -145,7 +171,11 @@ class AsyncSGLangVoiceChatSession:
 
     @classmethod
     async def create(cls, duplex_engine, eartts_engine, capacity=8192):
+        capacity = int(capacity)
+        if capacity < 1:
+            raise ValueError("VoiceChat session capacity must be positive.")
         self = cls(duplex_engine, eartts_engine)
+        self.capacity = capacity
         self.duplex_session = await duplex_engine.async_open_session(
             capacity, streaming=True
         )
@@ -168,8 +198,17 @@ class AsyncSGLangVoiceChatSession:
         self.system_prompt_ids = list(system_prompt_ids)
         self.pad_token_id = int(pad_token_id)
         sampling = {"max_new_tokens": 1, "temperature": 0.0}
+        latent_len = int(speaker_latent.shape[0])
+        duplex_frames = self.capacity - len(self.system_prompt_ids) - 1
+        eartts_frames = self.capacity - latent_len - 1
+        self.max_frames = min(duplex_frames, eartts_frames)
+        if self.max_frames < 1:
+            raise ValueError(
+                "VoiceChat session capacity cannot fit the prompt, speaker "
+                "prefill, and one acoustic frame."
+            )
         await self.eartts_engine.async_generate(
-            input_ids=[0] * int(speaker_latent.shape[0]),
+            input_ids=[0] * latent_len,
             sampling_params=sampling,
             session_params=SGLangVoiceChatSession._params(self.eartts_session),
             custom_inputs={
@@ -179,9 +218,17 @@ class AsyncSGLangVoiceChatSession:
         )
         self._started = True
 
+    def _check_frame_budget(self) -> None:
+        if self.frames_processed >= self.max_frames:
+            raise ValueError(
+                "VoiceChat session exceeded its frame-locked context budget: "
+                f"maximum {self.max_frames} acoustic frames."
+            )
+
     async def duplex_step(self, acoustic_embedding) -> tuple[int, int, float]:
         if not self._started:
             raise RuntimeError("Call start() before sending acoustic frames.")
+        self._check_frame_budget()
         sampling = {"max_new_tokens": 1, "temperature": 0.0}
         duplex_started = time.perf_counter()
         if self.function_token is None:
@@ -206,6 +253,7 @@ class AsyncSGLangVoiceChatSession:
         duplex_ms = (time.perf_counter() - duplex_started) * 1000
         text_token = int(duplex["output_ids"][-1])
         self.function_token = int(_latest(duplex, "function_tokens"))
+        self.frames_processed += 1
         return text_token, self.function_token, duplex_ms
 
     async def eartts_step(self, text_token: int) -> tuple[list[int], float]:

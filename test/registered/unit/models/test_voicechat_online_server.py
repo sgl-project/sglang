@@ -63,6 +63,7 @@ def make_runtime(events, frames=2, fail_encode=False):
     runtime.warmup_frames = frames
     runtime.warmup_duration_ms = None
     runtime.ready = False
+    runtime.session_capacity = 8192
     return runtime
 
 
@@ -136,3 +137,21 @@ def test_app_exposes_realtime_discovery_and_alias_routes():
 
     assert {"/", "/health", "/v1/realtime/health"} <= http_paths
     assert {"/realtime", "/v1/realtime"} <= websocket_paths
+
+
+@pytest.mark.parametrize(
+    ("tokens", "expected"),
+    [
+        ([], False),
+        ([12] * 20, False),
+        ([99] + [12] * 12, False),
+        ([12] * 8 + [99] + [12] * 11, True),
+    ],
+)
+def test_reply_truncation_guard_only_checks_active_tail(tokens, expected):
+    assert online_server._reply_may_be_truncated(tokens, pad_token_id=12) is expected
+
+
+def test_reply_truncation_guard_requires_positive_window():
+    with pytest.raises(ValueError, match="guard_frames must be positive"):
+        online_server._reply_may_be_truncated([12], pad_token_id=12, guard_frames=0)

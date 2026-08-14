@@ -66,6 +66,11 @@ docker run -d --rm \
     --port 18080
 ```
 
+The Duplex thinker defaults to `bfloat16` for interactive latency while its
+Mamba recurrent state remains fp32. Pass `--duplex-dtype float32` when
+comparing against fp32 NeMo reference outputs. EarTTS and the audio sidecar
+remain fp32 in both modes.
+
 Startup includes a disposable two-frame warm-up. The HTTP socket becomes ready
 after the first MaskGIT compilation and all temporary warm-up sessions have
 been released. Poll readiness:
@@ -125,6 +130,8 @@ python examples/voicechat/client.py \
 The default two seconds of trailing silence is sufficient for the tested short
 prompt. Increase `--trailing-silence` when evaluating longer responses because
 the full-duplex model emits output only while input frames continue arriving.
+The client prints a truncation warning if non-padding text tokens occur in the
+final 12 frames; repeat with more trailing silence when this warning appears.
 
 ## Observe and stop
 

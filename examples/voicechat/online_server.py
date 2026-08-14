@@ -33,6 +33,19 @@ DEFAULT_SYSTEM_PROMPT = "You are a helpful, concise voice assistant."
 INPUT_SAMPLE_RATE = 16_000
 OUTPUT_SAMPLE_RATE = 22_050
 FRAME_SAMPLES = 1_280
+TRUNCATION_GUARD_FRAMES = 12
+
+
+def _reply_may_be_truncated(
+    text_tokens: list[int],
+    pad_token_id: int,
+    guard_frames: int = TRUNCATION_GUARD_FRAMES,
+) -> bool:
+    """Return whether the text channel is still active near the frame budget."""
+    if guard_frames < 1:
+        raise ValueError("guard_frames must be positive.")
+    tail = text_tokens[-guard_frames:]
+    return bool(tail) and any(token != pad_token_id for token in tail)
 
 
 class AudioSidecarClient:
@@ -112,7 +125,7 @@ class VoiceChatRuntime:
         }
         self.duplex = Engine(
             model_path=args.duplex_model,
-            dtype="bfloat16",
+            dtype=args.duplex_dtype,
             mem_fraction_static=args.duplex_memory_fraction,
             context_length=args.context_length,
             base_gpu_id=args.duplex_base_gpu_id,
@@ -137,6 +150,7 @@ class VoiceChatRuntime:
                 os.environ["NVIDIA_TF32_OVERRIDE"] = previous_tf32
         self.connection_lock = asyncio.Lock()
         self.max_audio_queue_frames = args.max_audio_queue_frames
+        self.session_capacity = args.context_length
         self.warmup_frames = 0 if args.skip_warmup else args.warmup_frames
         self.warmup_duration_ms = None
         self.ready = False
@@ -161,7 +175,7 @@ class VoiceChatRuntime:
         try:
             audio_session = await asyncio.to_thread(self.sidecar.start)
             model_session = await AsyncSGLangVoiceChatSession.create(
-                self.duplex, self.eartts, capacity=8192
+                self.duplex, self.eartts, capacity=self.session_capacity
             )
             await model_session.start(
                 self.prompt_ids(DEFAULT_SYSTEM_PROMPT),
@@ -228,6 +242,7 @@ def create_app(runtime: VoiceChatRuntime) -> FastAPI:
             "frame_samples": FRAME_SAMPLES,
             "single_session": True,
             "max_audio_queue_frames": runtime.max_audio_queue_frames,
+            "context_length": runtime.session_capacity,
             "warmup": {
                 "enabled": runtime.warmup_frames > 0,
                 "frames": runtime.warmup_frames,
@@ -252,6 +267,7 @@ def create_app(runtime: VoiceChatRuntime) -> FastAPI:
             model_session = None
             started = False
             audio_enqueued = False
+            audio_frames_enqueued = 0
             prompt = DEFAULT_SYSTEM_PROMPT
             worker_tasks = []
             queues = [asyncio.Queue(runtime.max_audio_queue_frames) for _ in range(4)]
@@ -277,7 +293,7 @@ def create_app(runtime: VoiceChatRuntime) -> FastAPI:
                 )
                 audio_session = await asyncio.to_thread(runtime.sidecar.start)
                 model_session = await AsyncSGLangVoiceChatSession.create(
-                    runtime.duplex, runtime.eartts, capacity=8192
+                    runtime.duplex, runtime.eartts, capacity=runtime.session_capacity
                 )
 
                 async def ensure_started():
@@ -356,6 +372,7 @@ def create_app(runtime: VoiceChatRuntime) -> FastAPI:
 
                 async def codec_worker():
                     last_output_at = None
+                    text_tokens = []
                     while True:
                         kind, payload, timing = await queues[3].get()
                         try:
@@ -363,6 +380,10 @@ def create_app(runtime: VoiceChatRuntime) -> FastAPI:
                                 return
                             if kind == "commit":
                                 count = len(frame_timings)
+                                truncation_warning = _reply_may_be_truncated(
+                                    text_tokens,
+                                    runtime.config.pad_token_id,
+                                )
 
                                 def summarize(name):
                                     values = sorted(
@@ -383,29 +404,36 @@ def create_app(runtime: VoiceChatRuntime) -> FastAPI:
                                     }
 
                                 total = summarize("total")
-                                await send(
-                                    {
-                                        "type": "input_audio_buffer.committed",
-                                        "timing_ms": {
-                                            "frames": count,
-                                            **total,
-                                            "stages": {
-                                                name: summarize(name)
-                                                for name in (
-                                                    "queue",
-                                                    "perception",
-                                                    "duplex",
-                                                    "eartts",
-                                                    "codec",
-                                                    "total",
-                                                    "output_interval",
-                                                )
-                                            },
+                                event = {
+                                    "type": "input_audio_buffer.committed",
+                                    "truncation_warning": truncation_warning,
+                                    "timing_ms": {
+                                        "frames": count,
+                                        **total,
+                                        "stages": {
+                                            name: summarize(name)
+                                            for name in (
+                                                "queue",
+                                                "perception",
+                                                "duplex",
+                                                "eartts",
+                                                "codec",
+                                                "total",
+                                                "output_interval",
+                                            )
                                         },
-                                    }
-                                )
+                                    },
+                                }
+                                if truncation_warning:
+                                    event["warning"] = (
+                                        "The reply was still emitting in the final "
+                                        f"{TRUNCATION_GUARD_FRAMES} frames; send more "
+                                        "trailing silence to avoid truncation."
+                                    )
+                                await send(event)
                                 continue
                             codec_started = time.perf_counter()
+                            text_tokens.append(int(payload["text_token"]))
                             decoded = await asyncio.to_thread(
                                 runtime.sidecar.decode,
                                 audio_session,
@@ -499,6 +527,7 @@ def create_app(runtime: VoiceChatRuntime) -> FastAPI:
                                     "instructions": prompt,
                                     "input_sample_rate": INPUT_SAMPLE_RATE,
                                     "output_sample_rate": OUTPUT_SAMPLE_RATE,
+                                    "max_input_frames": model_session.max_frames,
                                 },
                             }
                         )
@@ -512,6 +541,11 @@ def create_app(runtime: VoiceChatRuntime) -> FastAPI:
                                 f"PCM16 samples ({FRAME_SAMPLES * 2} bytes)."
                             )
                         await ensure_started()
+                        if audio_frames_enqueued >= model_session.max_frames:
+                            raise ValueError(
+                                "VoiceChat input exceeds the frame-locked context "
+                                f"budget of {model_session.max_frames} frames."
+                            )
                         audio_enqueued = True
                         try:
                             queues[0].put_nowait(
@@ -521,6 +555,7 @@ def create_app(runtime: VoiceChatRuntime) -> FastAPI:
                                     {"enqueued": time.perf_counter()},
                                 )
                             )
+                            audio_frames_enqueued += 1
                         except asyncio.QueueFull as error:
                             raise RuntimeError(
                                 "Audio backlog exceeded "
@@ -578,6 +613,12 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--context-length", type=int, default=8192)
+    parser.add_argument(
+        "--duplex-dtype",
+        choices=("bfloat16", "float32"),
+        default="bfloat16",
+        help="Use float32 for reference comparisons or bfloat16 for latency.",
+    )
     parser.add_argument("--duplex-memory-fraction", type=float, default=0.45)
     parser.add_argument("--eartts-memory-fraction", type=float, default=0.20)
     parser.add_argument("--duplex-base-gpu-id", type=int, default=0)
@@ -588,6 +629,10 @@ def main():
     parser.add_argument("--skip-warmup", action="store_true")
     parser.add_argument("--log-level", default="warning")
     args = parser.parse_args()
+    if args.context_length < 1:
+        parser.error("--context-length must be positive")
+    if args.max_audio_queue_frames < 1:
+        parser.error("--max-audio-queue-frames must be positive")
     if args.warmup_frames < 1:
         parser.error("--warmup-frames must be at least 1")
     runtime = VoiceChatRuntime(args)

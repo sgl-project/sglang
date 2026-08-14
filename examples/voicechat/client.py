@@ -295,6 +295,11 @@ async def run(args):
                         raise RuntimeError(event["error"]["message"])
                     if event.get("type") == "input_audio_buffer.committed":
                         print(json.dumps(event))
+                        if event.get("truncation_warning"):
+                            warning = event.get(
+                                "warning", "The reply may be truncated."
+                            )
+                            print(f"WARNING: {warning}", file=sys.stderr)
                         committed.set()
                         continue
                     if event.get("type") == "response.output_audio.delta":

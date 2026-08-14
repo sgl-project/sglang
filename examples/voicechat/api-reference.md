@@ -37,6 +37,7 @@ Both paths return the same readiness and runtime information:
   "frame_samples": 1280,
   "single_session": true,
   "max_audio_queue_frames": 256,
+  "context_length": 8192,
   "warmup": {
     "enabled": true,
     "frames": 2,
@@ -119,7 +120,8 @@ Sent immediately after the WebSocket is accepted:
 
 ### `session.updated`
 
-Confirms the effective instructions and sample rates after `session.update`.
+Confirms the effective instructions, sample rates, and `max_input_frames` after
+`session.update`.
 
 ### `response.output_audio.delta`
 
@@ -153,7 +155,23 @@ are observational and depend on hardware and workload.
 
 Sent after all audio preceding the commit marker has crossed every pipeline
 stage. It includes frame count plus mean and p95 timing for the queue and each
-stage.
+stage. If any non-padding text token occurred in the final 12 frames, the event
+also reports that the client may have stopped supplying frames while the reply
+was still active:
+
+```json
+{
+  "type": "input_audio_buffer.committed",
+  "truncation_warning": true,
+  "warning": "The reply was still emitting in the final 12 frames; send more trailing silence to avoid truncation.",
+  "timing_ms": {
+    "frames": 100
+  }
+}
+```
+
+The bundled client prints this warning to stderr. Increase
+`--trailing-silence` and repeat the request when it appears.
 
 ### `error`
 
@@ -197,7 +215,9 @@ fields are currently ignored. Tool definitions are not supported.
 ```
 
 Each event must contain exactly one 80 ms input frame. The server uses a bounded
-queue and rejects input once `max_audio_queue_frames` is exceeded.
+queue and rejects input once `max_audio_queue_frames` is exceeded. It also
+rejects the frame that would exceed the prompt- and speaker-prefill-aware
+`max_input_frames` reported by `session.updated`.
 
 ### `input_audio_buffer.commit`
 
