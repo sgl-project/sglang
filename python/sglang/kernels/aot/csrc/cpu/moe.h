@@ -160,6 +160,26 @@ inline void silu_and_mul_stub(
 }
 
 template <typename scalar_t, typename input_t>
+inline void gelu_and_mul_stub(
+    scalar_t* __restrict__ out, const input_t* __restrict__ input, const input_t* __restrict__ input2, int64_t size) {
+  static_assert(
+      std::is_same_v<input_t, float> || std::is_same_v<input_t, scalar_t>,
+      "gelu_and_mul_stub only supports input_t == float or input_t == scalar_t");
+  using bVec = at::vec::Vectorized<scalar_t>;
+
+  // no remainder
+#pragma GCC unroll 4
+  for (int64_t d = 0; d < size; d += bVec::size()) {
+    auto [x0, x1] = load_float_vec2(input + d);
+    auto [y0, y1] = load_float_vec2(input2 + d);
+    x0 = fast_gelu(x0) * y0;
+    x1 = fast_gelu(x1) * y1;
+    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
+    out_vec.store(out + d);
+  }
+}
+
+template <typename scalar_t, typename input_t>
 inline void clamp_sigmoid_and_mul_stub(
     scalar_t* __restrict__ out, const input_t* __restrict__ input, int64_t size, const float alpha, const float limit) {
   static_assert(
@@ -234,34 +254,5 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const scalar_t* __restrict
   }
   for (; d < size; ++d) {
     out[d] = static_cast<scalar_t>(input[d] * weight);
-  }
-}
-
-template <typename scalar_t>
-inline void gelu_and_mul_stub(
-    scalar_t* __restrict__ out, const scalar_t* __restrict__ input, const scalar_t* __restrict__ input2, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  const float inv_sqrt2 = 1.0f / std::sqrt(2.0f);
-  const fVec half = fVec(0.5f);
-  const fVec one = fVec(1.f);
-  const fVec inv_sqrt2_v = fVec(inv_sqrt2);
-
-  // no remainder
-#pragma GCC unroll 4
-  for (int64_t d = 0; d < size; d += bVec::size()) {
-    bVec x = bVec::loadu(input + d);
-    fVec x0, x1;
-    std::tie(x0, x1) = at::vec::convert_to_float(x);
-    bVec y = bVec::loadu(input2 + d);
-    fVec y0, y1;
-    std::tie(y0, y1) = at::vec::convert_to_float(y);
-    // gelu: 0.5 * x * (1 + erf(x / sqrt(2)))
-    x0 = half * x0 * (one + (x0 * inv_sqrt2_v).erf());
-    x1 = half * x1 * (one + (x1 * inv_sqrt2_v).erf());
-    x0 = x0 * y0;
-    x1 = x1 * y1;
-    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-    out_vec.store(out + d);
   }
 }

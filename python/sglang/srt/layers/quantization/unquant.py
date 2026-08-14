@@ -463,7 +463,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
-            # [NOTE]: for cpu devices, fallback bias to float32
             if hasattr(layer, "w13_weight_bias"):
                 layer.w13_weight_bias = Parameter(
                     layer.w13_weight_bias.float(), requires_grad=False
@@ -790,10 +789,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         moe_runner_config = self.moe_runner_config
 
         if use_intel_amx_backend(layer):
-            assert moe_runner_config.activation in (
-                "silu",
-                "gelu",
-            ), f"activation = {moe_runner_config.activation} is not supported."
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
             topk_weights, topk_ids, _ = topk_output

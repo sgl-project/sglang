@@ -118,45 +118,6 @@ int moe_align_block_size(
   return num_tokens_post_pad;
 }
 
-template <typename scalar_t, int BLOCK_N>
-inline void gelu_and_mul(
-    scalar_t* __restrict__ output,
-    const float* __restrict__ input0,  // x: x0, x1
-    const float* __restrict__ input1,  // y: y0, y1
-    int64_t m_size,
-    int64_t N) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-
-  const float inv_sqrt2 = 1.0f / std::sqrt(2.0f);
-  const fVec half = fVec(0.5f);
-  const fVec one = fVec(1.f);
-  const fVec inv_sqrt2_v = fVec(inv_sqrt2);
-
-  // no remainder
-  for (int64_t m = 0; m < m_size; ++m) {
-    scalar_t* __restrict__ out = output + m * N;
-    const float* __restrict__ x = input0 + m * BLOCK_N;
-    const float* __restrict__ y = input1 + m * BLOCK_N;
-
-    for (int64_t d = 0; d < BLOCK_N; d += bVec::size()) {
-      fVec x0 = fVec::loadu(x + d);
-      fVec x1 = fVec::loadu(x + d + fVec::size());
-      fVec y0 = fVec::loadu(y + d);
-      fVec y1 = fVec::loadu(y + d + fVec::size());
-      // gelu: 0.5 * x * (1 + erf(x / sqrt(2)))
-      x0 = half * x0 * (one + (x0 * inv_sqrt2_v).erf());
-      x1 = half * x1 * (one + (x1 * inv_sqrt2_v).erf());
-      // mul
-      x0 = x0 * y0;
-      x1 = x1 * y1;
-      // convert
-      bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-      out_vec.store(out + d);
-    }
-  }
-}
-
 template <typename scalar_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn2 {
   static inline void apply(
@@ -536,23 +497,8 @@ void fused_experts_kernel_impl(
 
       } else {
         const int64_t offset = offsets[mb];
-        if (act_func == CPUActMethod::silu_and_mul) {
-          // silu_and_mul uses the fused tinygemm_kernel_nn2 path which has
-          // SiLU hardcoded in its store step. Other activations (gelu_and_mul,
-          // swiglu) use separate GEMMs followed by a dedicated activation step.
-          tinygemm_kernel(
-              /* A     */ A,
-              /* B0    */ B0,
-              /* B1    */ B1,
-              /* C     */ ic1 + offset * N + nb * BLOCK_N,
-              /* M     */ m_size,
-              /* N     */ n_size,
-              /* K     */ K,
-              /* lda   */ K,
-              /* ldb   */ n_size,
-              /* ldc   */ N);
-        } else {
-          // separate gemms for swiglu and gelu_and_mul
+        // the fused path below hardcodes SiLU in its store step
+        if (act_func != CPUActMethod::silu_and_mul) {
           tinygemm_kernel(
               /* A     */ A,
               /* B     */ B0,
@@ -573,6 +519,19 @@ void fused_experts_kernel_impl(
               /* lda   */ K,
               /* ldb   */ n_size,
               /* ldc   */ BLOCK_N);
+        } else {
+          // fused 1.bcd: silu_and_mul(A @ B0, A @ B1)
+          tinygemm_kernel(
+              /* A     */ A,
+              /* B0    */ B0,
+              /* B1    */ B1,
+              /* C     */ ic1 + offset * N + nb * BLOCK_N,
+              /* M     */ m_size,
+              /* N     */ n_size,
+              /* K     */ K,
+              /* lda   */ K,
+              /* ldb   */ n_size,
+              /* ldc   */ N);
         }
       }
       if (with_bias) {
@@ -588,7 +547,9 @@ void fused_experts_kernel_impl(
           silu_and_mul_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, C1 + m * BLOCK_N, BLOCK_N);
         }
       } else if (act_func == CPUActMethod::gelu_and_mul) {
-        gelu_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N + nb * BLOCK_N, C0, C1, m_size, N);
+        for (int64_t m = 0; m < m_size; ++m) {
+          gelu_and_mul_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, C1 + m * BLOCK_N, BLOCK_N);
+        }
       } else if (act_func == CPUActMethod::swiglu) {
         for (int64_t m = 0; m < m_size; ++m) {
           scalar_t* __restrict__ ic1_row = ic1 + (offset + m) * N;
@@ -929,24 +890,14 @@ at::Tensor fused_experts_cpu(
     const std::optional<double>& limit,
     bool is_vnni,
     const std::optional<std::string>& activation) {
-  // Determine activation function
-  auto determine_act_func = [&]() -> CPUActMethod {
-    if (alpha.has_value() && limit.has_value()) {
-      return CPUActMethod::swiglu;
-    }
-    if (activation.has_value()) {
-      const auto& act = activation.value();
-      if (act == "gelu") {
-        return CPUActMethod::gelu_and_mul;
-      } else if (act == "silu") {
-        return CPUActMethod::silu_and_mul;
-      } else {
-        TORCH_CHECK(false, "Unsupported activation: ", act, ". Supported: silu, gelu");
-      }
-    }
-    return CPUActMethod::silu_and_mul;
-  };
-  const CPUActMethod act_func_resolved = determine_act_func();
+  const CPUActMethod act_func = act_method_from_string(activation, alpha.has_value() && limit.has_value());
+  // the int8 and int4 kernels hardcode silu in their fused store step
+  const bool is_int_quant =
+      moe_comp_method == CPUQuantMethod::INT8_W8A8 || moe_comp_method == CPUQuantMethod::INT4_W4A8;
+  TORCH_CHECK(
+      !is_int_quant || act_func == CPUActMethod::silu_and_mul,
+      "fused_experts_cpu: INT8_W8A8 and INT4_W4A8 support activation='silu' only, got: ",
+      activation.value_or("silu"));
 
   auto packed_w1 = is_vnni ? w1 : convert_weight_packed(w1);
   auto packed_w2 = is_vnni ? w2 : convert_weight_packed(w2);
@@ -1120,7 +1071,6 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
       bool with_bias = w1_bias.has_value();
-      auto act_func = act_func_resolved;
 
       CHECK_MOE_SCALES_FP8(1, 2);
       fused_experts_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
@@ -1160,7 +1110,6 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
       bool with_bias = w1_bias.has_value();
-      auto act_func = act_func_resolved;
 
       // mxfp4 supports only group size of 32 (2^5)
       constexpr int64_t group_size = 32;
@@ -1245,7 +1194,7 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       bool with_bias = w1_bias.has_value();
-      auto act_func = act_func_resolved;
+
       fused_experts_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
           intermediate_cache1,

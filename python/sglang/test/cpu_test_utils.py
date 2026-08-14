@@ -1,3 +1,4 @@
+import functools
 import itertools
 import math
 
@@ -198,6 +199,16 @@ def scaled_weight(weight, scales):
     return weight_scaled
 
 
+def _activation_fn(activation):
+    """Reference gate-and-multiply for the activation fused_experts_cpu applies."""
+    if activation == "silu":
+        return SiluAndMul
+    if activation == "gelu":
+        # matches the erf gelu the kernel computes
+        return functools.partial(GeluAndMul, approximate="none")
+    raise ValueError(f"Unsupported activation: {activation}")
+
+
 def torch_naive_fused_moe(a, w1, w2, score, topk, renormalize, activation="silu"):
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
@@ -208,12 +219,7 @@ def torch_naive_fused_moe(a, w1, w2, score, topk, renormalize, activation="silu"
     if renormalize:
         topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
 
-    if activation == "silu":
-        act_fn = SiluAndMul
-    elif activation == "gelu":
-        act_fn = lambda x: GeluAndMul(x, approximate="none")
-    else:
-        raise ValueError(f"Unsupported activation: {activation}")
+    act_fn = _activation_fn(activation)
 
     topk_weight = topk_weight.view(-1)
     topk_ids = topk_ids.view(-1)
@@ -382,12 +388,7 @@ def native_fp8_fused_moe(a, w1, w2, topk_weight, topk_ids, topk, activation="sil
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D).float()
     out = torch.zeros(B * topk, w2.shape[1], dtype=torch.float32, device=a.device)
 
-    if activation == "silu":
-        act_fn = SiluAndMul
-    elif activation == "gelu":
-        act_fn = lambda x: GeluAndMul(x, approximate="none")
-    else:
-        raise ValueError(f"Unsupported activation: {activation}")
+    act_fn = _activation_fn(activation)
 
     # Calculate routing
     topk_weight = topk_weight.view(-1)
