@@ -6861,11 +6861,12 @@ class ServerArgs:
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
-        if a2a_backend == "moonep":
+        if a2a_backend == "moonep" and not envs.SGLANG_ENABLE_MOONEP_CUDA_GRAPH.get():
             logger.warning(
-                "MoonEP MoE is enabled in experimental BF16 PoC mode. "
                 "Cuda graph is disabled while the eager MoonEP dispatch/"
-                "prefetch/compute/combine path is validated."
+                "prefetch/compute/combine path is validated. MoonEP's buffers "
+                "are statically shaped, so capture should be possible; set "
+                "SGLANG_ENABLE_MOONEP_CUDA_GRAPH=1 to try it."
             )
             self.cuda_graph_config.decode.backend = Backend.DISABLED
             self.cuda_graph_config.prefill.backend = Backend.DISABLED

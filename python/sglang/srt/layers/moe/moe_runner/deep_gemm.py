@@ -50,6 +50,10 @@ if TYPE_CHECKING:
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.moonep import (
+        MoonEPCombineInput,
+        MoonEPDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
@@ -1237,6 +1241,170 @@ def post_permute_deep_gemm_to_deepep_normal(
         hidden_states=gather_out,
         topk_ids=running_state["topk_ids"],
         topk_weights=running_state["topk_weights"],
+    )
+
+
+def _moonep_m_indices(
+    cu_seqlens: torch.Tensor,
+    expert_ids: torch.Tensor,
+    all_tokens: int,
+) -> torch.Tensor:
+    """Expand MoonEP's per-group segment ends into DeepGEMM's per-row group ids.
+
+    ``cu_seqlens[g]`` is the *end* offset of group ``g`` (no leading zero), so
+    ``searchsorted(..., right=True)`` maps a row to the group that owns it and
+    naturally skips empty groups. Two kinds of rows get ``-1``, which DeepGEMM
+    skips entirely: rows past the last segment (MoonEP pads the receive buffer
+    to a static ``NvS``) and rows whose group is an unfilled prefetch slot
+    (``expert_ids`` already carries ``-1`` there).
+
+    ``expert_ids`` -- not the group index -- is the value DeepGEMM wants: it
+    indexes the leading dimension of the expert weight tensor.
+    """
+    num_groups = expert_ids.numel()
+    rows = torch.arange(all_tokens, device=cu_seqlens.device, dtype=cu_seqlens.dtype)
+    group = torch.searchsorted(cu_seqlens, rows, right=True)
+    m_indices = expert_ids[group.clamp(max=num_groups - 1)].to(torch.int32)
+    return torch.where(group < num_groups, m_indices, torch.full_like(m_indices, -1))
+
+
+@register_pre_permute("moonep", "deep_gemm")
+def pre_permute_moonep_to_deep_gemm(
+    dispatch_output: MoonEPDispatchOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepGemmRunnerInput:
+    """MoonEP dispatch output -> DeepGEMM m-grouped contiguous input.
+
+    Unlike the deepep/standard pre-permutes there is no scatter here: MoonEP's
+    ``dispatch`` already returns rows grouped by expert and padded to
+    ``token_padding``, which matches DeepGEMM's
+    ``get_mk_alignment_for_contiguous_layout()``. All that is left is deriving
+    ``m_indices`` and, for quantized experts, quantizing the activations.
+    """
+    hidden_states = dispatch_output.hidden_states
+    if hidden_states.ndim != 2:
+        raise ValueError(
+            f"MoonEP hidden states must be [NvS, H], got {hidden_states.shape}"
+        )
+
+    all_tokens = hidden_states.shape[0]
+    running_state["all_tokens"] = all_tokens
+    running_state["hidden_states_shape"] = hidden_states.shape
+    running_state["hidden_states_dtype"] = hidden_states.dtype
+    running_state["hidden_states_device"] = hidden_states.device
+    # Carried through because MoonEP's combine reconstructs from the plan and
+    # does not apply route weights itself -- the post-permute must.
+    running_state["route_weights_nvs"] = dispatch_output.route_weights_nvs
+    running_state["plan"] = dispatch_output.plan
+    running_state["num_tokens"] = dispatch_output.num_tokens
+
+    expert_ids = dispatch_output.expert_ids
+    if quant_info.w13_weight.dtype != torch.bfloat16:
+        # Quantized experts live in MoonEP's symmetric pool, so the duplicated
+        # ones have to be pulled in before the GEMM reads them, and the plan's
+        # global expert ids have to become pool rows. This runs here rather
+        # than in DeepEPMoE.run_moe_core because MXFP4 on DeepGEMM sets
+        # deprecate_flag, which delegates past that method entirely.
+        from sglang.srt.layers.moe.token_dispatcher import moonep_weights
+        from sglang.srt.layers.moe.token_dispatcher.moonep import MoonEPBuffer
+
+        layer_id = runner_config.layer_id
+        assert layer_id is not None, "MoonEP pre-permute needs runner_config.layer_id"
+        weight_pairs, scale_pairs = moonep_weights.prefetch_pairs(layer_id)
+        MoonEPBuffer.get_existing_buffer().prefetch_weight(
+            plan=dispatch_output.plan,
+            async_finish=False,
+            weight_pairs=weight_pairs,
+            scale_pairs=scale_pairs or None,
+            experts_to_copy=moonep_weights.expert_rows(
+                layer_id,
+                dispatch_output.plan.experts_to_copy[get_tp_group().rank_in_group],
+            ),
+        )
+        # The parameters are this rank's slice of the pool, but m_indices
+        # addresses the whole symmetric range -- a duplicated expert's rows
+        # live in another rank's chunk. Point the GEMM at the full ranges, of
+        # which the parameters are a sub-view.
+        pool = moonep_weights.get_pool()
+        quant_info.w13_weight = pool.ranges[moonep_weights.W13_WEIGHT].view(torch.int8)
+        quant_info.w2_weight = pool.ranges[moonep_weights.W2_WEIGHT].view(torch.int8)
+        quant_info.w13_scale = pool.ranges[moonep_weights.W13_SCALE].permute(0, 2, 1)
+        quant_info.w2_scale = pool.ranges[moonep_weights.W2_SCALE].permute(0, 2, 1)
+
+        expert_ids = moonep_weights.group_rows(
+            layer_id, expert_ids, runner_config.num_experts
+        )
+
+    m_indices = _moonep_m_indices(dispatch_output.cu_seqlens, expert_ids, all_tokens)
+    running_state["m_indices"] = m_indices
+
+    if quant_info.w13_weight.dtype == torch.bfloat16:
+        return DeepGemmRunnerInput(
+            hidden_states=hidden_states,
+            # Unused by the BF16 contiguous GEMM, but the field is non-optional.
+            hidden_states_scale=torch.empty(
+                (all_tokens, 1), device=hidden_states.device, dtype=torch.float32
+            ),
+            use_masked_gemm=False,
+            m_indices=m_indices,
+        )
+
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
+    running_state["mxfp8_act_gran_k"] = block_k
+    hidden_states_fp8, hidden_states_scale = sglang_per_token_group_quant_fp8(
+        hidden_states,
+        block_k,
+        column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+    return DeepGemmRunnerInput(
+        hidden_states=hidden_states_fp8,
+        hidden_states_scale=hidden_states_scale,
+        use_masked_gemm=False,
+        m_indices=m_indices,
+    )
+
+
+@register_post_permute("deep_gemm", "moonep")
+def post_permute_deep_gemm_to_moonep(
+    runner_output: DeepGemmRunnerOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> MoonEPCombineInput:
+    """DeepGEMM output -> MoonEP combine input, still in dispatched row order.
+
+    No gather: MoonEP's ``combine`` consumes the ``[NvS, H]`` layout directly.
+
+    Rows DeepGEMM skipped (``m_indices == -1``) were never written, so they
+    still hold whatever ``torch.empty`` left behind and must be zeroed before
+    combine reduces them. Zeroing cannot be folded into the route-weight
+    multiply below, because uninitialized memory may decode to NaN and
+    ``0 * NaN`` is NaN.
+    """
+    from sglang.srt.layers.moe.token_dispatcher.moonep import MoonEPCombineInput
+
+    hidden_states = runner_output.hidden_states
+    hidden_states.masked_fill_((running_state["m_indices"] < 0).unsqueeze(-1), 0.0)
+
+    route_weights_nvs = running_state["route_weights_nvs"]
+    if route_weights_nvs is not None:
+        hidden_states.mul_(
+            route_weights_nvs.to(dtype=hidden_states.dtype).unsqueeze(-1)
+        )
+
+    return MoonEPCombineInput(
+        hidden_states=hidden_states,
+        route_weights_nvs=route_weights_nvs,
+        plan=running_state["plan"],
+        num_tokens=running_state["num_tokens"],
     )
 
 
