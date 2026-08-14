@@ -433,6 +433,7 @@ class MambaPoolHost(HostKVCache):
         io_backend="kernel",
         *,
         is_draft: bool = False,
+        dcp_localized: bool = False,
     ):
         if self.layout in ["page_first", "page_first_direct"]:
             # no ssm state on conv-only models: nothing to transfer
@@ -717,6 +718,7 @@ class LogicalHostPool:
         io_backend,
         *,
         is_draft: bool = False,
+        dcp_localized: bool = False,
     ):
         pass
 
@@ -1008,6 +1010,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         io_backend,
         *,
         is_draft: bool = False,
+        dcp_localized: bool = False,
     ):
         if not self._has_transfer_indices(host_indices, device_indices):
             return
@@ -1401,6 +1404,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         io_backend,
         *,
         is_draft: bool = False,
+        dcp_localized: bool = False,
     ):
         if host_indices is None or device_indices is None:
             return
@@ -1649,6 +1653,7 @@ class HostPoolGroup:
         pool_transfers: Optional[list] = None,
         *,
         is_draft: bool = False,
+        dcp_localized: bool = False,
     ) -> None:
         # 1. Anchor (KV) transfer
         anchor = self.anchor_entry
@@ -1661,6 +1666,7 @@ class HostPoolGroup:
                 local_layer_id,
                 io_backend,
                 is_draft=is_draft,
+                dcp_localized=dcp_localized,
             )
 
         # 2. Extra pool transfers
@@ -1678,6 +1684,7 @@ class HostPoolGroup:
                 local_layer_id,
                 io_backend,
                 is_draft=is_draft,
+                dcp_localized=dcp_localized,
             )
 
     def _backup_uses_cpu_host_indices(self, host_pool, io_backend) -> bool:
@@ -1935,6 +1942,7 @@ class DSAIndexerPoolHost(HostKVCache):
         io_backend,
         *,
         is_draft: bool = False,
+        dcp_localized: bool = False,
     ):
         if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return

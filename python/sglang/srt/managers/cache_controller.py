@@ -821,31 +821,54 @@ class HiCacheController:
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             ack_start_event.record()
+            # DCP index translation is layer-independent, so run it once per
+            # transfer rather than once per layer (a 24-layer MLA load would
+            # otherwise launch 48 boolean-index ops on the load stream's
+            # critical path, starving transfer/compute overlap). Non-DCP pools
+            # hand back the inputs unchanged.
+            kv_host_indices, kv_device_indices = (
+                self.mem_pool_host.dcp_localize_indices(host_indices, device_indices)
+            )
+            live_indices = [
+                host_indices,
+                device_indices,
+                kv_host_indices,
+                kv_device_indices,
+            ]
+            if self.has_draft:
+                draft_host_indices, draft_device_indices = (
+                    self.mem_pool_host_draft.dcp_localize_indices(
+                        host_indices, device_indices
+                    )
+                )
+                live_indices += [draft_host_indices, draft_device_indices]
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
-                    host_indices,
-                    device_indices,
+                    kv_host_indices,
+                    kv_device_indices,
                     i,
                     self.io_backend,
+                    dcp_localized=True,
                 )
                 if self.has_draft and i < self.mem_pool_host_draft.layer_num:
                     self.mem_pool_host_draft.load_to_device_per_layer(
                         self.mem_pool_device_draft,
-                        host_indices,
-                        device_indices,
+                        draft_host_indices,
+                        draft_device_indices,
                         i,
                         self.io_backend,
+                        dcp_localized=True,
                     )
                 producer_event.complete(i)
             ack_finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
-            # still alive when the load stream is executing.
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.load_stream)
+            # still alive when the load stream is executing. The localized
+            # views are separate tensors, so they need the same treatment.
+            for indices in live_indices:
+                if indices.is_cuda:
+                    indices.record_stream(self.load_stream)
 
         self.ack_load_queue.append(
             HiCacheAck(

@@ -249,11 +249,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         io_backend,
         *,
         is_draft: bool = False,
+        dcp_localized: bool = False,
     ):
         if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
-        host_indices = self.dcp_kernel_indices(host_indices)
-        device_indices = self.dcp_kernel_indices(device_indices)
+        # The translation is layer-independent, so a layer loop should hoist it
+        # (dcp_localize_indices) instead of paying it on every layer.
+        if not dcp_localized:
+            host_indices, device_indices = self.dcp_localize_indices(
+                host_indices, device_indices
+            )
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
@@ -416,8 +421,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
-        host_indices = self.dcp_kernel_indices(host_indices)
-        device_indices = self.dcp_kernel_indices(device_indices)
+        # Once per write-back, not once per layer: the per-layer helper below
+        # takes indices that are already localized.
+        host_indices, device_indices = self.dcp_localize_indices(
+            host_indices, device_indices
+        )
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
