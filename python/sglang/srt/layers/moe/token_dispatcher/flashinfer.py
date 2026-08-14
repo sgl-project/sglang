@@ -27,9 +27,8 @@ from sglang.srt.layers.moe.topk import (
     TopKOutputChecker,
 )
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_schedule, get_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import get_int_env_var
 
 try:
     from flashinfer import nvfp4_block_scale_interleave
@@ -123,16 +122,20 @@ class FlashinferDispatcher(BaseDispatcher):
         # max_running_requests is not yet resolved at model-construction time,
         # so we use 4096 as a floor to cover decode batches and _dummy_run
         # (which warms up at batch_size = req_to_token_pool.size).
-        cps = get_server_args().chunked_prefill_size
+        cps = get_schedule().chunked_prefill_size
         default_max_tokens = max(cps if cps and cps > 0 else 4096, 4096)
-        self.max_num_tokens = get_int_env_var(
-            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK",
-            default_max_tokens,
+        configured_max_tokens = (
+            envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        )
+        self.max_num_tokens = (
+            configured_max_tokens
+            if configured_max_tokens is not None
+            else default_max_tokens
         )
 
         # Calculate workspace size. For eagle mode, use the larger workspace size since nextn layer will be unquantized.
         speculative_algo = SpeculativeAlgorithm.from_string(
-            get_server_args().speculative_algorithm
+            get_spec().speculative_algorithm
         )
         if MOE_NVFP4_DISPATCH and not speculative_algo.is_eagle():
             total_dispatch_payload_size_per_token = (

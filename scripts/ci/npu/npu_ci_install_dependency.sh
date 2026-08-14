@@ -54,14 +54,13 @@ PTA_URL="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.1
 ${PIP_INSTALL} ${PTA_URL}
 
 ### Install zbal
-${UV_PIP_INSTALL} memfabric-zbal==1.1.1
-
+${UV_PIP_INSTALL} memfabric-zbal==1.2.0
 ### Install Triton-Ascend
 ${PIP_INSTALL} triton-ascend==3.2.1.dev20260530 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly --trusted-host triton-ascend.osinfra.cn
 
 
 ### Install sgl-kernel-npu
-SGLANG_KERNEL_NPU_TAG="2026.7.2"
+SGLANG_KERNEL_NPU_TAG="2026.8.10"
 mkdir sgl-kernel-npu
 (cd sgl-kernel-npu && wget "${GITHUB_PROXY_URL:=""}https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann9.0.0-${DEVICE_TYPE}-$(arch).zip" \
 && unzip ./sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann9.0.0-${DEVICE_TYPE}-$(arch).zip \
@@ -85,3 +84,8 @@ rm -rf cann-custom-ops
 ### Install SGLang
 rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
 ${UV_PIP_INSTALL} -v -e "python[dev_npu]"
+
+### Install sgl-eval
+# shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
+source "${SCRIPT_DIR}/../utils/sgl_eval_ref.sh"
+${UV_PIP_INSTALL} "$SGL_EVAL_SPEC"

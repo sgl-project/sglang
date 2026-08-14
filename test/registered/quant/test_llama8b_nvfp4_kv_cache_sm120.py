@@ -9,7 +9,6 @@ register_cuda_ci(
     est_time=300,
     stage="extra-a",
     runner_config="1-gpu-small",
-    disabled="Temporarily disabled due to failing accuracy",
 )
 
 
@@ -31,19 +30,12 @@ class TestLlama8BNVFP4KVCacheSM120(GSM8KMixin, DefaultServerBase):
     other_args = [
         "--quantization",
         "modelopt_fp4",
-        "--fp4-gemm-backend",
-        "auto",
         "--kv-cache-dtype",
         "nvfp4",
         "--prefill-attention-backend",
         "flashinfer",
         "--decode-attention-backend",
         "trtllm_mha",
-        "--page-size",
-        "64",
-        "--mem-fraction-static",
-        "0.87",
-        "--cuda-graph-backend-prefill=disabled",
     ]
 
 

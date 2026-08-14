@@ -22,12 +22,14 @@ _compiled_fn reused for every shape.
 
 from __future__ import annotations
 
+import warnings
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 import tqdm
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compile import install_torch_compiled
 from sglang.srt.compilation.compile_phase import (
@@ -38,7 +40,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
@@ -63,19 +64,23 @@ if TYPE_CHECKING:
 _VALID_COMPILERS = ("eager", "inductor")
 
 
-def _toggle_multi_platform_ops(
+def _suppress_lru_cache_dynamo_warning() -> None:
+    warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
+
+
+def _toggle_fused_ops(
     model: torch.nn.Module, *, reverse: bool, num_tokens: int
 ) -> None:
-    """Recursively flip MultiPlatformOp submodules into / out of
+    """Recursively flip BaseFusedOp submodules into / out of
     torch.compile mode."""
     for sub in model._modules.values():
-        if isinstance(sub, MultiPlatformOp):
+        if isinstance(sub, BaseFusedOp):
             if reverse:
                 sub.leave_torch_compile()
             else:
                 sub.enter_torch_compile(num_tokens=num_tokens)
         if isinstance(sub, torch.nn.Module):
-            _toggle_multi_platform_ops(sub, reverse=reverse, num_tokens=num_tokens)
+            _toggle_fused_ops(sub, reverse=reverse, num_tokens=num_tokens)
 
 
 class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
@@ -95,6 +100,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         self._language_model: torch.nn.Module = getattr(
             model_runner.model, "language_model", model_runner.model
         )
+        _suppress_lru_cache_dynamo_warning()
         self._run_compile_pass(cuda_graph_runner)
         # model_runner.model.forward is the wrapper that builds LogitsProcessorOutput.
         # The compiled trampoline is dispatched internally by it.
@@ -157,9 +163,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         with enable_tc_piecewise_cuda_graph():
             try:
                 if compiler != "eager":
-                    _toggle_multi_platform_ops(
-                        inner_model, reverse=False, num_tokens=16
-                    )
+                    _toggle_fused_ops(inner_model, reverse=False, num_tokens=16)
 
                 cuda_graph_runner._run_dummy_forward(
                     num_tokens=cuda_graph_runner.capture_num_tokens[0]
@@ -209,7 +213,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                     inner_model, cuda_graph_runner.capture_num_tokens[-1]
                 )
             finally:
-                _toggle_multi_platform_ops(inner_model, reverse=True, num_tokens=16)
+                _toggle_fused_ops(inner_model, reverse=True, num_tokens=16)
 
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
@@ -225,7 +229,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         self,
         shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
-        dummies: Optional[Any] = None,
+        capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         # Call 1 warms FX state; call 2 captures the cuda graph inside capture_session.

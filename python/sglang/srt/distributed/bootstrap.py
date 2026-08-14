@@ -16,8 +16,12 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
+    set_flashinfer_allreduce_only,
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
+)
+from sglang.srt.distributed.parallel_state import (
+    _tag_groups_for_flashinfer_allreduce_only,
 )
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -61,15 +65,7 @@ def init_torch_distributed(
     tic = time.perf_counter()
     logger.info("Init torch distributed begin.")
 
-    try:
-        torch.get_device_module(device).set_device(ps.gpu_id)
-    except Exception:
-        logger.warning(
-            f"Context: {device=} {ps.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {ps.tp_rank=} {ps.tp_size=}"
-        )
-        raise
-
-    backend = _resolve_backend(device=device, server_args=server_args, gpu_id=ps.gpu_id)
+    backend = _resolve_backend(device=device, server_args=server_args)
 
     before_avail_memory = get_available_gpu_memory(device, ps.gpu_id)
     if not server_args.enable_p2p_check:
@@ -101,7 +97,7 @@ def init_torch_distributed(
             attn_cp_size=ps.attn_cp_size,
             moe_ep_size=ps.moe_ep_size,
             moe_dp_size=ps.moe_dp_size,
-            dcp_size=ps.dcp_size,
+            dcp_size=ps.attn_dcp_size,
         )
 
         # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
@@ -143,27 +139,10 @@ def init_torch_distributed(
     )
 
 
-def _resolve_backend(*, device: str, server_args: ServerArgs, gpu_id: int) -> str:
+def _resolve_backend(*, device: str, server_args: ServerArgs) -> str:
     backend = get_default_distributed_backend(device)
     if device == "cuda" and server_args.elastic_ep_backend == "mooncake":
         backend = "mooncake"
-        if server_args.mooncake_ib_device:
-            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-                get_ib_devices_for_gpu,
-            )
-
-            ib_device_for_gpu = get_ib_devices_for_gpu(
-                server_args.mooncake_ib_device, gpu_id
-            )
-            mooncake_ib_device = (
-                ib_device_for_gpu.split(",") if ib_device_for_gpu else []
-            )
-            try:
-                from mooncake import ep as mooncake_ep
-
-                mooncake_ep.set_device_filter(mooncake_ib_device)
-            except:
-                pass  # A warning will be raised in `init_distributed_environment`
     return backend
 
 
@@ -189,6 +168,9 @@ def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
     set_custom_all_reduce(not server_args.disable_custom_all_reduce)
     set_mscclpp_all_reduce(server_args.enable_mscclpp)
     set_torch_symm_mem_all_reduce(server_args.enable_torch_symm_mem)
+    set_flashinfer_allreduce_only(
+        server_args.flashinfer_allreduce_fusion_backend is not None
+    )
 
 
 def _init_cpu_threads_env(
@@ -258,6 +240,7 @@ def _init_parallel_groups(
         rank_offset=rank_offset,
         max_world_size=server_args.max_ep_size,
     )
+    _tag_groups_for_flashinfer_allreduce_only()
     initialize_dp_attention(
         server_args=server_args,
         model_config=model_config,

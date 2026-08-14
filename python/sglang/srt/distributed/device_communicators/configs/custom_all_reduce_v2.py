@@ -113,7 +113,7 @@ def _pack_heuristic(*args) -> Heuristic:
 
 
 def _sm100_config(world_size: int, num_sm: int) -> AllReduceConfig:
-    # SM100 (Blackwell, B200/B300). Tuned on B200 (148 SMs).
+    # SM100 (Blackwell, B200/B300/GB200). Tuned on B200 (148 SMs); world 16 on GB200.
     graph_map = {
         2: (8.000 * MB, 32.00 * MB, 128.0 * MB),
         3: (4.000 * MB, 4.000 * MB, 128.0 * MB),
@@ -122,6 +122,7 @@ def _sm100_config(world_size: int, num_sm: int) -> AllReduceConfig:
         6: (1.000 * MB, 1.000 * MB, 128.0 * MB),
         7: (0.625 * MB, 0.625 * MB, 128.0 * MB),
         8: (0.500 * MB, 0.500 * MB, 128.0 * MB, Range(8 * MB, 128 * MB)),
+        16: (0.250 * MB, 0.250 * MB, 128.0 * MB, Range(256 * KB, 128 * MB)),
     }
     eager_map = {
         2: (16.00 * MB, 128.0 * MB, 128.0 * MB),
@@ -131,8 +132,9 @@ def _sm100_config(world_size: int, num_sm: int) -> AllReduceConfig:
         6: (1.250 * MB, 1.250 * MB, 64.00 * MB, Range(0, 64 * MB)),
         7: (1.000 * MB, 1.000 * MB, 64.00 * MB, Range(0, 64 * MB)),
         8: (0.750 * MB, 0.750 * MB, 128.0 * MB, Range(0, 128 * MB)),
+        16: (0.250 * MB, 0.250 * MB, 128.0 * MB, Range(256 * KB, 128 * MB)),
     }
-    mc_blocks_map = {5: 64, 6: 48, 7: 48, 8: 32}
+    mc_blocks_map = {5: 64, 6: 48, 7: 48, 8: 32, 16: 32}
     return AllReduceConfig(
         graph=_pack_heuristic(*graph_map[world_size]),
         eager=_pack_heuristic(*eager_map[world_size]),

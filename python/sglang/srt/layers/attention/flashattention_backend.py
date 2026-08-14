@@ -18,6 +18,8 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.radix_attention import AttentionType
@@ -28,7 +30,7 @@ from sglang.srt.layers.utils.cp_utils import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_schedule, get_spec
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -41,7 +43,7 @@ if TYPE_CHECKING:
 
 from sgl_kernel import merge_state_v2
 
-from sglang.jit_kernel.flash_attention import (
+from sglang.kernels.ops.attention.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
@@ -136,6 +138,10 @@ class FlashAttentionBackend(AttentionBackend):
     needs_cpu_seq_lens: bool = False
     supports_ragged_verify_graph: bool = True
 
+    # Chunked-prefix attention reads the stable ForwardBatch cu-seqlens and
+    # KV-index buffers directly, so it needs no backend-private replay state.
+    supports_full_cuda_graph_chunked_prefix = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -166,7 +172,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-        self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
+        self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
         self.kv_cache_is_mxfp8 = self.kv_cache_dtype_str == "mxfp8"
         self.page_size = model_runner.page_size
         # Static page-table width (upper bound). The device-side page-table build
@@ -175,15 +181,18 @@ class FlashAttentionBackend(AttentionBackend):
             self.max_context_len + self.page_size - 1
         ) // self.page_size
         # Page table is built on-device (build_trtllm_mha_page_table) and the
-        # tree-mask scratch is preallocated (get_verify_buffers_to_fill_after_draft),
-        # so no seq_lens_cpu / seq_lens_sum D2H sync is ever needed.
+        # tree mask is preallocated (see VerifyMask), so no
+        # seq_lens_cpu / seq_lens_sum D2H sync is ever needed.
         self.needs_cpu_seq_lens = False
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        # Unified pool: req_to_token holds VIRTUAL ids but the MLA per-layer views
+        # are DENSE, so every page_table needs remapping. MLA-only -- the MHA/SWA
+        # sub-pools keep the strided envelope layout FA3 cannot read at all.
+        self._unified_hooks = unified_mla_hooks(model_runner.token_to_kv_pool_allocator)
+        self._unified_dense = self._unified_hooks.enabled and self.use_mla
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.ps.attn_cp_size
-        # Preallocated FULL_MASK tree-mask scratch; lets build_tree_kernel_efficient
-        # avoid the seq_lens_sum D2H sync (see get_verify_buffers_to_fill_after_draft).
-        self.cuda_graph_custom_mask = None
+        self._verify_mask = None
         # The worker fetches the tree-mask scratch from the target backend
         # only; draft-side instances must not allocate it.
         self.is_draft_runner = model_runner.is_draft_worker
@@ -195,9 +204,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
             self.speculative_num_draft_tokens is not None
             and model_runner.is_draft_worker
@@ -235,14 +242,18 @@ class FlashAttentionBackend(AttentionBackend):
                 "Prefill-aware SWA requires page_size=1, "
                 f"got page_size={self.page_size}"
             )
-            max_bs = model_runner.req_to_token_pool.size
+            # Indexed by raw req_pool_idx values (see the write below and
+            # _build_pa_page_table), which range over [0, size] (row 0 is the
+            # reserved padding slot) -- so this needs size+1, not size.
+            max_req_pool_idx = model_runner.req_to_token_pool.size
             self._pa_swa_prefill_lens = torch.zeros(
-                max_bs, dtype=torch.int32, device=model_runner.device
+                max_req_pool_idx + 1, dtype=torch.int32, device=model_runner.device
             )
             self._pa_swa_max_prefill_len = 0
 
         # Select version
         self.fa_impl_ver = fa_impl_ver
+        device_capability = get_device_capability()
         if self.fa_impl_ver == 3:
             from sgl_kernel.flash_attn import (
                 flash_attn_varlen_func,
@@ -251,13 +262,34 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
             self._get_scheduler_metadata = get_scheduler_metadata
+            self._get_fa_runtime_policy = None
         elif self.fa_impl_ver == 4:
-            from sglang.jit_kernel.flash_attention_v4 import (
-                flash_attn_varlen_func,
-                flash_attn_with_kvcache,
-            )
+            if device_capability[0] == 12:
+                from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
+                    flash_attn_varlen_func,
+                    flash_attn_with_kvcache,
+                    get_flash_attention_v4_sm120_runtime_policy,
+                )
+
+                self._get_fa_runtime_policy = (
+                    get_flash_attention_v4_sm120_runtime_policy
+                )
+            else:
+                from sglang.kernels.ops.attention.flash_attention_v4 import (
+                    flash_attn_varlen_func,
+                    flash_attn_with_kvcache,
+                )
+
+                self._get_fa_runtime_policy = None
 
             self._get_scheduler_metadata = None
+            if model_runner.server_args.enable_deterministic_inference:
+                # Must precede the first kernel compile.
+                from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+                    set_batch_invariant,
+                )
+
+                set_batch_invariant(True)
         else:
             raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
 
@@ -278,15 +310,22 @@ class FlashAttentionBackend(AttentionBackend):
         )
         self.has_softcap = _softcapping is not None and _softcapping > 0.0
 
-        # If num_splits == 0, we use a heuristic to automatically determine the number of splits.
-        # We set nums splits to 1 if deterministic inference is enabled.
-        # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
-        fa4_no_splitkv = self.fa_impl_ver == 4 and get_device_capability() < (9, 0)
-        self.num_splits = (
-            1
-            if model_runner.server_args.enable_deterministic_inference or fa4_no_splitkv
-            else 0
-        )
+        # num_splits == 0 delegates SplitKV sizing to the selected FA runtime.
+        deterministic = model_runner.server_args.enable_deterministic_inference
+        if self._get_fa_runtime_policy is None:
+            self.num_splits = 1 if deterministic else 0
+            self.decode_num_splits = self.num_splits
+            self._decode_uses_static_max_seqlen_k = False
+        else:
+            runtime_policy = self._get_fa_runtime_policy(
+                device_capability=device_capability,
+                deterministic=deterministic,
+            )
+            self.num_splits = runtime_policy.num_splits
+            self.decode_num_splits = runtime_policy.decode_num_splits
+            self._decode_uses_static_max_seqlen_k = (
+                runtime_policy.decode_uses_static_max_seqlen_k
+            )
         # Set (never getattr'd) so forward_extend can identity-check "is this the
         # full-CG prefill metadata?" to disable the pointer-keyed shear-bias
         # block-schedule cache (see forward_extend rel_bias handling).
@@ -489,6 +528,12 @@ class FlashAttentionBackend(AttentionBackend):
                 # Local attention and scheduler metadata require capture-time slice sizing.
                 # Both depend on data already filled by replay above.
                 metadata = self.decode_cuda_graph_metadata[bs]
+                if self._decode_uses_static_max_seqlen_k:
+                    # FA4 bakes its N-tile grid and SplitKV specialization into
+                    # the graph. Capture against the full replay bound, not the
+                    # padded seq-len fill value (1), or a later long-context
+                    # replay would leave K/V tiles uncovered.
+                    metadata.max_seq_len_k = self.max_context_len
                 self._maybe_update_local_attn_metadata_for_capture(metadata, bs)
                 if self._sched_meta_buf is not None:
                     sched = self._compute_scheduler_metadata(
@@ -1037,6 +1082,26 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 )
 
+        # Unified pool: one remap for every eager branch above, which all filled
+        # page_table with VIRTUAL token ids. Rebinding is safe here because those
+        # branches each produced a fresh tensor; the captured path instead folds
+        # the remap into normal_decode_set_metadata, which must write in place.
+        #
+        # Placed BEFORE the `// page_size` reduction, in token space: since
+        # dense(t) = phys_page * (ps * L) + t % ps, dense(page_start) // ps is
+        # phys_page * L, the dense page id the kernel wants. One site then serves
+        # both page sizes, and it inherits translate_kv_loc_dense's tombstone
+        # clamp so an unwritten req_to_token slot lands in the page-0 sink.
+        if self._unified_dense and metadata.page_table is not None:
+            # Flattened: the page_size == 1 translate path uses index_select,
+            # which rejects a 2-D index.
+            pt = metadata.page_table
+            metadata.page_table = (
+                self._unified_hooks.translate_kv_loc_dense(pt.reshape(-1))
+                .to(torch.int32)
+                .view(pt.shape)
+            )
+
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:
             self.strided_indices = torch.arange(
@@ -1192,7 +1257,18 @@ class FlashAttentionBackend(AttentionBackend):
         is_swa_layer = (
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
-        window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
+        causal = not (
+            layer.is_cross_attention
+            or layer.attn_type
+            in (AttentionType.ENCODER_ONLY, AttentionType.DECODER_BIDIRECTIONAL)
+        )
+        # FlashAttention's sliding-window tuple is (left, right). Bidirectional
+        # encoder layers must see the same local context on both sides.
+        window_size = (
+            (layer.sliding_window_size, 0 if causal else layer.sliding_window_size)
+            if is_swa_layer
+            else (-1, -1)
+        )
         fa_k_descale, fa_v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -1211,10 +1287,6 @@ class FlashAttentionBackend(AttentionBackend):
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
-        causal = True
-        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
-            causal = False
-
         # Check if we should use local attention
         use_local_attn = (
             self.has_local_attention
@@ -1477,7 +1549,7 @@ class FlashAttentionBackend(AttentionBackend):
             ):
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
-                    assert not get_server_args().disable_chunked_prefix_cache
+                    assert not get_schedule().disable_chunked_prefix_cache
                     # MHA for chunked prefix kv cache when running model with MLA
                     assert forward_batch.prefix_chunk_idx is not None
                     assert forward_batch.prefix_chunk_cu_seq_lens is not None
@@ -1535,7 +1607,10 @@ class FlashAttentionBackend(AttentionBackend):
                     return output, lse
                 return output
             else:
-                assert self.fa_impl_ver == 3, "Only FA3 support here"
+                # FA4 absorbed MLA is shared by extend and decode: once qv is
+                # threaded through the wrappers, decode's flash_attn_with_kvcache
+                # call takes the same qv/ver arguments as this extend path.
+                assert self.fa_impl_ver in (3, 4), "Only FA3/FA4 support here"
                 # Do absorbed multi-latent attention
                 kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
                     q.dtype
@@ -1813,6 +1888,8 @@ class FlashAttentionBackend(AttentionBackend):
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
+                if self._decode_uses_static_max_seqlen_k:
+                    kwargs["max_seqlen_k"] = metadata.encoder_max_seq_len_k
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -1832,6 +1909,8 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             elif use_local_attn:
                 # Use chunked (local) attention batching for self-attention
+                if self._decode_uses_static_max_seqlen_k:
+                    kwargs["max_seqlen_k"] = local_attn_metadata.local_max_seq_len
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -1885,6 +1964,8 @@ class FlashAttentionBackend(AttentionBackend):
                     and not pa_swa_active
                 ):
                     sched_meta = metadata.scheduler_metadata
+                if self._decode_uses_static_max_seqlen_k:
+                    kwargs["max_seqlen_k"] = metadata.max_seq_len_k
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
@@ -1898,7 +1979,13 @@ class FlashAttentionBackend(AttentionBackend):
                     window_size=window_size,
                     softcap=layer.logit_cap,
                     return_softmax_lse=use_cascade_attn,
-                    num_splits=self.num_splits,
+                    num_splits=(
+                        self.decode_num_splits
+                        if not is_swa_layer
+                        and not use_cascade_attn
+                        and not pa_swa_active
+                        else self.num_splits
+                    ),
                     out=_fa_out,
                     ver=self.fa_impl_ver,
                     scheduler_metadata=sched_meta,
@@ -1906,6 +1993,10 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
+                    if self._decode_uses_static_max_seqlen_k:
+                        kwargs["max_seqlen_k"] = (
+                            self.forward_metadata_spec_decode_expand.max_seq_len_k
+                        )
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
                             q=q_reshaped,
@@ -2185,17 +2276,16 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             }
 
-            # Worst-case FULL_MASK tree-mask scratch (bool). build_tree_kernel
-            # fills it in-place, so the GPU-only path needs no seq_lens_sum.
-            # Costs max_num_tokens * max_context_len bytes (can reach 100s of
-            # MB at long context) and is fully memset every verify step.
-            if not self.skip_prefill and not self.is_draft_runner:
-                self.cuda_graph_custom_mask = torch.zeros(
-                    max_num_tokens
-                    * (self.max_context_len + self.speculative_num_draft_tokens),
-                    dtype=torch.bool,
-                    device=self.device,
-                )
+            # topk<=1 never extracts the mask; both metadata paths gate on topk > 1.
+            self._verify_mask = maybe_create_verify_mask(
+                is_draft_runner=self.is_draft_runner,
+                skip_prefill=self.skip_prefill,
+                max_bs=max_bs,
+                max_context_len=self.max_context_len,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+                device=self.device,
+                is_read=self.topk > 1,
+            )
 
             self.draft_extend_metadata = {
                 "cache_seqlens": torch.zeros(
@@ -2543,11 +2633,9 @@ class FlashAttentionBackend(AttentionBackend):
 
         return metadata, metadata_expand
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        # Return the preallocated FULL_MASK tree-mask scratch so that
-        # build_tree_kernel_efficient fills it in-place and the worker never
-        # needs seq_lens_sum to size a dynamic allocation (no D2H sync).
-        return [self.cuda_graph_custom_mask, None]
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     @staticmethod
     def _host_max_seq_len(
@@ -2622,6 +2710,12 @@ class FlashAttentionBackend(AttentionBackend):
                             if self.use_sliding_window_kv_pool
                             else None
                         ),
+                        v2p_page_table=(
+                            self._unified_hooks.v2p_page_table
+                            if self._unified_dense
+                            else None
+                        ),
+                        kernel_page_multiplier=self._unified_hooks.kernel_page_multiplier,
                     )
 
                 else:
@@ -2738,6 +2832,12 @@ class FlashAttentionBackend(AttentionBackend):
                             if self.use_sliding_window_kv_pool
                             else None
                         ),
+                        v2p_page_table=(
+                            self._unified_hooks.v2p_page_table
+                            if self._unified_dense
+                            else None
+                        ),
+                        kernel_page_multiplier=self._unified_hooks.kernel_page_multiplier,
                     )
 
                 self._maybe_update_local_attn_metadata_for_replay(

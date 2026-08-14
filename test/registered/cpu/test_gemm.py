@@ -3,7 +3,9 @@ import unittest
 # TODO: use interface in cpu.py
 import torch
 import torch.nn as nn
-from utils import (
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.cpu_test_utils import (
     MXFP4QuantizeUtil,
     convert_weight,
     native_w8a8_per_token_matmul,
@@ -13,8 +15,6 @@ from utils import (
     unpack_and_dequant_awq,
     unpack_and_dequant_gptq,
 )
-
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")

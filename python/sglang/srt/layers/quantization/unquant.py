@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
@@ -19,17 +20,17 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
-    get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.utils import xpu_moe_ld_padding_elems
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.utils import MultiPlatformOp, copy_or_rebind_param
+from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -40,6 +41,7 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
     use_intel_xpu_backend,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -67,6 +69,7 @@ if _use_aiter:
 class Bf16GemmBackend(Enum):
     AUTO = "auto"
     CUTEDSL = "cutedsl"
+    TORCH = "torch"
 
     def is_auto(self) -> bool:
         return self == Bf16GemmBackend.AUTO
@@ -83,17 +86,26 @@ _use_cutedsl_bf16_gemm = None
 def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     global _BF16_GEMM_BACKEND, _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
 
-    backend = Bf16GemmBackend(server_args.bf16_gemm_backend)
+    from sglang.srt.utils import is_sm100_supported
+
+    backend_str = server_args.bf16_gemm_backend
+    if backend_str == "auto" and is_sm100_supported():
+        backend_str = (
+            "torch" if server_args.enable_deterministic_inference else "cutedsl"
+        )
+
+    backend = Bf16GemmBackend(backend_str)
 
     if backend.is_cutedsl():
-        from sglang.srt.utils import is_sm100_supported
-
-        if not is_sm100_supported():
+        if server_args.enable_deterministic_inference:
             raise ValueError(
-                "--bf16-gemm-backend cutedsl requires SM100/SM103 (Blackwell)"
+                "--bf16-gemm-backend cutedsl is batch-size dependent and cannot "
+                "be combined with --enable-deterministic-inference"
             )
+        if not is_sm100_supported():
+            raise ValueError("--bf16-gemm-backend cutedsl requires an SM10x GPU")
 
-        from sglang.jit_kernel.cutedsl_bf16_gemm import (
+        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
             cutedsl_bf16_gemm,
             use_cutedsl_bf16_gemm,
         )
@@ -102,6 +114,25 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
         _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
 
     _BF16_GEMM_BACKEND = backend
+
+
+def _bf16_gemm_dispatch_fake(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+@register_custom_op(fake_impl=_bf16_gemm_dispatch_fake)
+def bf16_gemm_dispatch(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    if _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
+        x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]
+    ):
+        return _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
+            *x.shape[:-1], -1
+        )
+    return F.linear(x, weight, bias)
 
 
 def get_bf16_gemm_backend() -> Bf16GemmBackend:
@@ -207,20 +238,119 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and x.dtype == torch.bfloat16
             and layer.weight.dtype == torch.bfloat16
             and (bias is None or bias.dtype == torch.bfloat16)
-            and _use_cutedsl_bf16_gemm(
+            and not layer.weight.requires_grad
+            and (bias is None or not bias.requires_grad)
+        ):
+            if torch.compiler.is_compiling():
+                # The m-dependent kernel heuristic would guard on the symbolic
+                # token dim under Dynamo and recompile per shape bucket; the
+                # opaque op resolves it at runtime with concrete shapes,
+                # keeping the per-shape kernel choice.
+                return bf16_gemm_dispatch(x, layer.weight, bias)
+            if _use_cutedsl_bf16_gemm(
                 x.numel() // x.shape[-1],
                 layer.weight.shape[0],
                 layer.weight.shape[1],
-            )
-        ):
-            x_shapes = x.shape
-            output = _cutedsl_bf16_gemm(x.view(-1, x_shapes[-1]), layer.weight, bias)
-            return output.view(*x_shapes[:-1], -1)
+            ):
+                x_shapes = x.shape
+                output = _cutedsl_bf16_gemm(
+                    x.view(-1, x_shapes[-1]), layer.weight, bias
+                )
+                return output.view(*x_shapes[:-1], -1)
+            return F.linear(x, layer.weight, bias)
 
         return F.linear(x, layer.weight, bias)
 
+    def apply_into(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        output: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run an inference-only BF16 linear into caller-owned storage."""
+        if (
+            get_bf16_gemm_backend().is_cutedsl()
+            and x.is_cuda
+            and x.ndim == 2
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+            and (bias is None or bias.dtype == torch.bfloat16)
+            and not layer.weight.requires_grad
+            and (bias is None or not bias.requires_grad)
+            and _use_cutedsl_bf16_gemm(
+                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+            )
+        ):
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                cutedsl_bf16_gemm_out,
+            )
 
-class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+            return cutedsl_bf16_gemm_out(x, layer.weight, output, bias)
+
+        if x.ndim != 2:
+            raise ValueError("caller-owned linear output currently requires a 2D input")
+        if output.shape != (x.shape[0], layer.weight.shape[0]):
+            raise ValueError(
+                f"linear output has shape {output.shape}, expected "
+                f"{(x.shape[0], layer.weight.shape[0])}"
+            )
+        torch.mm(x, layer.weight.t(), out=output)
+        if bias is not None:
+            output.add_(bias)
+        return output
+
+
+def _use_xpu_moe_ld_padding(use_triton_kernels: bool) -> bool:
+    """Whether MoE expert weights should get a padded row stride for XPU.
+
+    use_intel_xpu_backend() only tells us an XPU exists on this machine, not
+    that the weights being created land on it -- the env var can be set while
+    serving on CPU/CUDA. create_weights takes no device argument and allocates
+    under the model loader's ambient device context, so check that context too:
+    padding a non-XPU weight would make it non-contiguous for no benefit, and
+    other backends' MoE kernels expect contiguous expert tensors.
+
+    The Triton path stores B transposed and does not read a row stride, so it
+    is excluded even on XPU.
+    """
+    return (
+        use_intel_xpu_backend()
+        and torch.get_default_device().type == "xpu"
+        and not use_triton_kernels
+    )
+
+
+def _empty_xpu_moe_expert_weight(
+    num_experts: int,
+    n_dim: int,
+    k_dim: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Allocate an [E, N, K] XPU expert weight, over-allocating K when padding
+    its row stride would avoid L3 set aliasing.
+
+    Some K dims (3072, 7168 in bf16) put every weight row in the same handful
+    of L3 sets, which throttles the grouped GEMM's B loads. Over-allocating K
+    and returning a narrowed view keeps the logical [E, N, K] shape (so the
+    weight loader is unchanged) while giving the rows a non-aliasing stride.
+    The Xe20 grouped GEMM reads B's row stride from the tensor, so the padding
+    is transparent to it.
+
+    Callers must have checked _use_xpu_moe_ld_padding() first. K dims that are
+    already well distributed get no padding and allocate normally.
+    """
+    pad = xpu_moe_ld_padding_elems(k_dim, dtype.itemsize)
+    if pad == 0:
+        return torch.empty(num_experts, n_dim, k_dim, dtype=dtype)
+    # The view is non-contiguous; only the K slice is ever read or written.
+    return torch.empty(num_experts, n_dim, k_dim + pad, dtype=dtype)[:, :, :k_dim]
+
+
+class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     """MoE method without quantization."""
 
     def __init__(
@@ -249,6 +379,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     ):
         self.with_bias = with_bias
 
+        # XPU only: the sgl-kernel-xpu grouped GEMM honours the weights' row
+        # stride, so it can be padded to dodge L3 set aliasing on unlucky K
+        # dims. Every other device allocates plainly, exactly as before.
+        pad_ld_for_xpu = _use_xpu_moe_ld_padding(self.use_triton_kernels)
+
         # Fused gate_up_proj (column parallel)
         w13_up_dim = (
             2 * intermediate_size_per_partition
@@ -258,10 +393,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         w13_weight_n, w13_weight_k = (w13_up_dim, hidden_size)
         if self.use_triton_kernels:
             w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
-        w13_weight = torch.nn.Parameter(
-            torch.empty(num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype),
-            requires_grad=False,
-        )
+        if pad_ld_for_xpu:
+            w13_weight_data = _empty_xpu_moe_expert_weight(
+                num_experts, w13_weight_n, w13_weight_k, params_dtype
+            )
+        else:
+            w13_weight_data = torch.empty(
+                num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype
+            )
+        w13_weight = torch.nn.Parameter(w13_weight_data, requires_grad=False)
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
@@ -280,10 +420,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         )
         if self.use_triton_kernels:
             w2_weight_n, w2_weight_k = w2_weight_k, w2_weight_n
-        w2_weight = torch.nn.Parameter(
-            torch.empty(num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype),
-            requires_grad=False,
-        )
+        if pad_ld_for_xpu:
+            w2_weight_data = _empty_xpu_moe_expert_weight(
+                num_experts, w2_weight_n, w2_weight_k, params_dtype
+            )
+        else:
+            w2_weight_data = torch.empty(
+                num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype
+            )
+        w2_weight = torch.nn.Parameter(w2_weight_data, requires_grad=False)
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
@@ -330,8 +475,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if (
             self.use_deep_gemm
             and layer.w13_weight.dtype == torch.bfloat16
-            and get_moe_a2a_backend().is_deepep()
-            and get_deepep_mode().enable_low_latency()
+            and (get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_pplx())
             and not _is_npu
             and not _is_hip
             and hasattr(layer, "dispatcher")
@@ -340,6 +484,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
+            # The cached indices are GPU tensors. Colocated weight offloading
+            # can release their backing memory between reloads, so rebuild them
+            # once per post-processing cycle.
+            self._cache_permute_indices.clear()
+
             from flashinfer.fused_moe.core import (
                 _maybe_get_cached_w3_w1_permute_indices,
                 convert_to_block_layout,
@@ -404,10 +553,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 layer.num_local_experts, *new_shape_w2
             )
         if _is_npu:
+            # The kernels set the dispatcher output dtype themselves -- they are
+            # the ones that know what their gmms expect. NPUUnquantMoEMethod
+            # already sets bf16 here, and hardcoding it a second time would
+            # clobber a subclass that attached a quantized kernel instead.
             layer.w13_kernel.process_weights_after_loading(layer, "w13")
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
-            if hasattr(layer, "dispatcher"):
-                layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
         return
 
@@ -526,6 +677,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             layer=layer,
             dispatch_output=dispatch_output,
         )
+
+    # forward_native is aliased to forward_cpu at the end of the class body
+    # (pre-existing behavior); under torch.compile the dedicated
+    # fused_moe_forward_native is installed instead via this hook.
+    def _torch_compile_forward(self, num_tokens: int) -> Optional[Callable]:
+        # torch.compile on this layer only pays off at bs=1; keep the
+        # optimized dispatch otherwise.
+        if num_tokens == 1:
+            from sglang.srt.layers.moe.fused_moe_native import (
+                fused_moe_forward_native,
+            )
+
+            return fused_moe_forward_native
+        return None
 
     def forward_cuda(
         self,

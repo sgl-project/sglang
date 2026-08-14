@@ -34,10 +34,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
     enable_num_token_non_padded,
+    get_required_capture_hidden_mode,
+    get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
 from sglang.srt.utils import (
     empty_context,
     log_info_on_rank0,
@@ -198,6 +200,18 @@ def register_fake_ops(tp_size: int):
         @register_cpu_compile_fake(op)
         def _(input, *args, **kwargs):
             return torch.empty_like(input)
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_cpu")
+    def _(q, k, *args, **kwargs):
+        return torch.empty_like(q), torch.empty_like(k)
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_sumsq_cpu")
+    def _(q, k):
+        return torch.empty((q.shape[0], 2), dtype=torch.float32, device=q.device)
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_apply_from_stats_cpu")
+    def _(q, k, *args, **kwargs):
+        return torch.empty_like(q), torch.empty_like(k)
 
     @register_cpu_compile_fake("shm_allgather")
     def _(data, dim):
@@ -383,7 +397,7 @@ def register_fake_ops(tp_size: int):
         return topk_weights, topk_ids
 
     @register_cpu_compile_fake("topk_sigmoid_cpu")
-    def _(hidden_states, gating_output, topk, renormalize):
+    def _(hidden_states, gating_output, topk, renormalize, correction_bias=None):
         num_tokens = hidden_states.shape[0]
         shape = (num_tokens, topk)
         return (
@@ -397,6 +411,7 @@ def register_fake_ops(tp_size: int):
         gating_output,
         topk,
         renormalize,
+        correction_bias=None,
     ):
         num_tokens = hidden_states.shape[0]
         shape = (num_tokens, topk)
@@ -562,9 +577,12 @@ class CPUGraphRunner:
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
-        self.enable_return_hidden_states = (
-            model_runner.server_args.enable_return_hidden_states
+        self.return_hidden_states_mode = (
+            CaptureHiddenMode.NULL
+            if model_runner.is_draft_worker
+            else get_server_return_hidden_states_mode(model_runner.server_args)
         )
+        self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         # bs -> compiled fn (text-only / skip_cross_attention=True)
         self.graphs = {}
         # bs -> compiled fn (cross-attention / skip_cross_attention=False, enc-dec only)
@@ -585,17 +603,13 @@ class CPUGraphRunner:
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.tp_size = model_runner.server_args.tp_size
-        self.dp_size = model_runner.server_args.dp_size
+        self.dp_size = get_parallel().dp_size
         self.pp_size = model_runner.server_args.pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
-        self.capture_hidden_mode = CaptureHiddenMode.NULL
+        self.capture_hidden_mode = self.return_hidden_states_mode
         # Static capture width: CPU graphs are decode-only.
         self.captured_req_width = 1
-
-        # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
-        if self.enable_return_hidden_states:
-            self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         assert (
             not self.model_runner.server_args.enable_lora
@@ -703,21 +717,7 @@ class CPUGraphRunner:
             else forward_batch.batch_size <= self.max_bs
         )
 
-        requested_capture_hidden_mode = max(
-            forward_batch.capture_hidden_mode,
-            (
-                forward_batch.spec_info.capture_hidden_mode
-                if getattr(forward_batch.spec_info, "capture_hidden_mode", None)
-                is not None
-                else CaptureHiddenMode.NULL
-            ),
-        )
-        capture_hidden_mode_matches = (
-            requested_capture_hidden_mode == CaptureHiddenMode.NULL
-            or requested_capture_hidden_mode == self.capture_hidden_mode
-        )
-
-        return is_bs_supported and capture_hidden_mode_matches
+        return is_bs_supported
 
     def capture(self) -> None:
         capture_range = (
@@ -793,10 +793,10 @@ class CPUGraphRunner:
             encoder_lens = None
 
         spec_info = self.get_spec_info(num_tokens)
-        if self.capture_hidden_mode != CaptureHiddenMode.FULL:
-            self.capture_hidden_mode = (
-                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
-            )
+        self.capture_hidden_mode = get_required_capture_hidden_mode(
+            self.capture_hidden_mode,
+            spec_info,
+        )
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
@@ -870,43 +870,19 @@ class CPUGraphRunner:
                         self.captured_forward_batches_cross[bs] = forward_batch
                     return forward, out
 
-    def recapture_if_needed(self, forward_batch: ForwardBatch):
-
-        # If the required capture_hidden_mode changes, we need to recapture the graph
-
-        # These are the different factors that can influence the capture_hidden_mode
-        capture_hidden_mode_required_by_forward_batch = (
-            forward_batch.capture_hidden_mode
-        )
-        capture_hidden_mode_required_by_spec_info = getattr(
-            forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
-        )
-        capture_hidden_mode_required_for_returning_hidden_states = (
-            CaptureHiddenMode.FULL
-            if self.enable_return_hidden_states
-            else CaptureHiddenMode.NULL
-        )
-
-        # Determine the highest capture_hidden_mode required
-        # (If we have FULL, we can emulate LAST or NULL)
-        # (If we have LAST, we can emulate NULL)
-        required_capture_hidden_mode = max(
-            capture_hidden_mode_required_by_forward_batch,
-            capture_hidden_mode_required_by_spec_info,
-            capture_hidden_mode_required_for_returning_hidden_states,
-        )
-
-        # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
-        if self.capture_hidden_mode != required_capture_hidden_mode:
-            self.capture_hidden_mode = required_capture_hidden_mode
-            self.capture()
+    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
+        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
+            raise RuntimeError(
+                "The runtime hidden-state mode exceeds the fixed CPU graph "
+                f"capture mode ({self.capture_hidden_mode.name})."
+            )
 
     def prepare_replay(
         self,
         forward_batch: ForwardBatch,
         skip: bool = False,
     ):
-        self.recapture_if_needed(forward_batch)
+        self._validate_capture_hidden_mode(forward_batch)
 
         graphs = self.graphs_cross if not skip else self.graphs
         cfbs = (
@@ -1027,9 +1003,9 @@ class CPUGraphRunner:
                     retrieve_next_token=None,
                     retrieve_next_sibling=None,
                     retrieve_cum_len=None,
-                    spec_steps=self.model_runner.server_args.speculative_num_steps,
+                    spec_steps=get_spec().speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
-                    draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                    draft_token_num=get_spec().speculative_num_draft_tokens,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,

@@ -139,6 +139,9 @@ def _cpu_per_layer_pf_lf_copy(
 
 
 class _FakeEvent:
+    def __init__(self, enable_timing=False):
+        self.enable_timing = enable_timing
+
     def record(self):
         pass
 
@@ -156,6 +159,15 @@ class _FakeDeviceModule:
 
 
 class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
+    def setUp(self):
+        # start_writing probes timing support via a module-cached check;
+        # clear it on both sides so results from (or against) the fake
+        # device module never leak across tests.
+        manager_cache_controller._timing_events_supported.cache_clear()
+
+    def tearDown(self):
+        manager_cache_controller._timing_events_supported.cache_clear()
+
     def _patched_transfers(self, src_registry=None, module=MEMORY_POOL_HOST_MODULE):
         staged_side_effect = None
         if src_registry is not None:
@@ -672,12 +684,32 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         self.assertEqual(group.layout, "page_first")
         self.assertTrue(group.can_use_write_back_jit)
 
+    def test_host_pool_group_destroys_logical_anchor(self):
+        logical_host_pool = LogicalHostPool(8, 2, layout="page_first")
+        group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=logical_host_pool,
+                    device_pool=None,
+                    layer_mapper=lambda _: 0,
+                    is_primary_index_anchor=True,
+                )
+            ]
+        )
+
+        self.assertIsNone(group.destroy())
+
     def test_write_back_jit_hybrid_write_keeps_extra_host_indices_on_cpu(self):
         captured = {}
 
         class FakeHostGroup:
             layout = "page_first"
             can_use_write_back_jit = True
+            anchor_entry = SimpleNamespace(
+                name=PoolName.KV, host_pool=SimpleNamespace(size_per_token=2)
+            )
+            entry_map = {}
 
             def backup_from_device_all_layer(
                 self,
@@ -718,8 +750,13 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             )
         )
 
-        with mock.patch.object(
-            hybrid_cache_controller, "device_module", _FakeDeviceModule
+        with (
+            mock.patch.object(
+                hybrid_cache_controller, "device_module", _FakeDeviceModule
+            ),
+            mock.patch.object(
+                manager_cache_controller, "device_module", _FakeDeviceModule
+            ),
         ):
             controller.start_writing()
 
@@ -733,6 +770,10 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         class FakeHostGroup:
             layout = "page_first"
             can_use_write_back_jit = False
+            anchor_entry = SimpleNamespace(
+                name=PoolName.KV, host_pool=SimpleNamespace(size_per_token=2)
+            )
+            entry_map = {}
 
             def backup_from_device_all_layer(
                 self,
@@ -770,8 +811,13 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             return_value=(op.host_indices, op.device_indices, op.pool_transfers)
         )
 
-        with mock.patch.object(
-            hybrid_cache_controller, "device_module", _FakeDeviceModule
+        with (
+            mock.patch.object(
+                hybrid_cache_controller, "device_module", _FakeDeviceModule
+            ),
+            mock.patch.object(
+                manager_cache_controller, "device_module", _FakeDeviceModule
+            ),
         ):
             controller.start_writing()
 
@@ -785,6 +831,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         class FakeHostPool:
             layout = "page_first"
             can_use_write_back_jit = True
+            size_per_token = 2
 
             def backup_from_device_all_layer(
                 self, device_pool, host_indices, device_indices, io_backend
@@ -825,6 +872,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         class FakeHostPool:
             layout = "page_first"
             can_use_write_back_jit = False
+            size_per_token = 2
 
             def backup_from_device_all_layer(
                 self, device_pool, host_indices, device_indices, io_backend

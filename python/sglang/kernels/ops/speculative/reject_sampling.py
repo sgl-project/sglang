@@ -111,6 +111,8 @@ def speculative_sampling_classic_kernel(
         else:
             q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
             q_val = tl.load(q_ptr, mask=mask, other=0.0)
+            # Treat NaN q (degenerate draft rows) as 0: residual falls back to p.
+            q_val = tl.where(q_val == q_val, q_val, 0.0)
             diff = p_val - q_val
             val = tl.where(diff > 0.0, diff, 0.0)
 
@@ -137,6 +139,8 @@ def speculative_sampling_classic_kernel(
             else:
                 q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
                 q_val = tl.load(q_ptr, mask=mask, other=0.0)
+                # Same NaN-q guard as pass 1.
+                q_val = tl.where(q_val == q_val, q_val, 0.0)
                 diff = p_val - q_val
                 val = tl.where(diff > 0.0, diff, 0.0)
 

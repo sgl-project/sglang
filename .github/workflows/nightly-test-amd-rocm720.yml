@@ -41,7 +41,7 @@ on:
           - nightly-2-gpu-mi35x-glm51-mxfp4-rocm720
           # 2-GPU DeepSeek-R1-MXFP4 TP2 (MI35x only)
           - nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2-rocm720
-          # 8-GPU GPT-OSS (MI30x mixes Grok1-FP8; MI35x mixes Qwen3-Coder-Next)
+          # 8-GPU GPT-OSS (MI35x mixes Qwen3-Coder-Next)
           - nightly-accuracy-8-gpu-rocm720
           - nightly-accuracy-8-gpu-mi35x-rocm720
           # 8-GPU Grok1-INT4 (MI30x + MI35x)
@@ -70,6 +70,7 @@ on:
           - nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720
           - nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720
           - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720
+          - nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720
           # 8-GPU Kimi-K2.6 (MI30x + MI35x)
           - nightly-8-gpu-kimi-k26-rocm720
           - nightly-8-gpu-mi35x-kimi-k26-rocm720
@@ -87,6 +88,8 @@ on:
           - nightly-8-gpu-mi35x-glm5-mxfp4-rocm720
           # 4-GPU MiniMax-M2.5 (MI35x)
           - nightly-4-gpu-mi35x-minimax-m25-rocm720
+          # 4-GPU MiniMax-M3 MXFP8 (MI35x)
+          - nightly-4-gpu-mi35x-minimax-m3-rocm720
           # 8-GPU MiniMax-M2.7 (MI30x only)
           - nightly-8-gpu-minimax-m27-rocm720
           # Diffusion (MI30x)
@@ -142,7 +145,7 @@ jobs:
 
   nightly-test-1-gpu-unit-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-unit-rocm720,'))
-    runs-on: linux-mi325-1gpu-sglang
+    runs-on: linux-mi300-1gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -172,7 +175,7 @@ jobs:
 
   nightly-test-1-gpu-kernel-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-kernel-rocm720,'))
-    runs-on: linux-mi325-1gpu-sglang
+    runs-on: linux-mi300-1gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -237,7 +240,7 @@ jobs:
 
   nightly-accuracy-2-gpu-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-2-gpu-rocm720,'))
-    runs-on: linux-mi325-2gpu-sglang
+    runs-on: linux-mi300-2gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -336,7 +339,7 @@ jobs:
 
   nightly-accuracy-2-gpu-vlm-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-2-gpu-vlm-rocm720,'))
-    runs-on: linux-mi325-2gpu-sglang
+    runs-on: linux-mi300-2gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -367,7 +370,7 @@ jobs:
 
   nightly-perf-2-gpu-text-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-perf-2-gpu-text-rocm720,'))
-    runs-on: linux-mi325-2gpu-sglang
+    runs-on: linux-mi300-2gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -399,7 +402,7 @@ jobs:
 
   nightly-perf-2-gpu-vlm-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-perf-2-gpu-vlm-rocm720,'))
-    runs-on: linux-mi325-2gpu-sglang
+    runs-on: linux-mi300-2gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -431,7 +434,7 @@ jobs:
 
   nightly-4-gpu-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-rocm720,'))
-    runs-on: linux-mi325-4gpu-sglang
+    runs-on: linux-mi300-4gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -462,12 +465,12 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 8-GPU GPT-OSS (MI30x mixes Grok1-FP8; MI35x mixes Qwen3-Coder-Next)
+  # 8-GPU GPT-OSS (MI35x mixes Qwen3-Coder-Next)
   # ==============================================================================
 
   nightly-accuracy-8-gpu-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-8-gpu-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -491,18 +494,9 @@ jobs:
         timeout-minutes: 180
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-gpt-oss --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
-      - name: Accuracy Test ROCm 7.2 (8-GPU Grok1-FP8)
-        timeout-minutes: 60
-        run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e RCCL_MSCCL_ENABLE=0 \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-grok1-fp8 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -546,7 +540,7 @@ jobs:
 
   nightly-8-gpu-grok1-int4-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-grok1-int4-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -643,7 +637,7 @@ jobs:
 
   nightly-8-gpu-grok2-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-grok2-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -740,7 +734,7 @@ jobs:
 
   nightly-8-gpu-deepseek-v31-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v31-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -786,7 +780,7 @@ jobs:
 
   nightly-8-gpu-deepseek-v32-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v32-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -830,7 +824,7 @@ jobs:
 
   nightly-8-gpu-deepseek-v32-mtp-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v32-mtp-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -874,7 +868,7 @@ jobs:
 
   nightly-8-gpu-deepseek-v3-kv-fp8-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v3-kv-fp8-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1315,6 +1309,7 @@ jobs:
           echo "## SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton" >> github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-flash --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1327,6 +1322,7 @@ jobs:
           echo "## SGLANG_HACK_FLASHMLA_BACKEND=triton" >> github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_HACK_FLASHMLA_BACKEND=triton \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-flash --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1364,6 +1360,7 @@ jobs:
           echo "## SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton" >> github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1376,6 +1373,7 @@ jobs:
           echo "## SGLANG_HACK_FLASHMLA_BACKEND=triton" >> github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_HACK_FLASHMLA_BACKEND=triton \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1413,6 +1411,7 @@ jobs:
           echo "## SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton" >> github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro-mtp --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1425,8 +1424,47 @@ jobs:
           echo "## SGLANG_HACK_FLASHMLA_BACKEND=triton" >> github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_HACK_FLASHMLA_BACKEND=triton \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro-mtp --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+
+  nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720,'))
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: |
+          # --skip-test-time-deps: GSM8K doesn't need lmms-eval / human-eval.
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Accuracy + DSpark Accept Length Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro-DSpark FP4, unified_kv_triton)
+        timeout-minutes: 300
+        run: |
+          > github_summary.md  # Clear summary file
+          echo "## SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton" >> github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro-dspark --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
   # ==============================================================================
@@ -1435,7 +1473,7 @@ jobs:
 
   nightly-8-gpu-kimi-k26-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-kimi-k26-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1508,7 +1546,7 @@ jobs:
 
   nightly-8-gpu-qwen3-235b-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-qwen3-235b-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1534,6 +1572,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-8-gpu-qwen3-235b --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1580,7 +1619,7 @@ jobs:
 
   nightly-8-gpu-qwen35-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-qwen35-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1608,6 +1647,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-qwen35 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1712,7 +1752,7 @@ jobs:
 
   nightly-8-gpu-glm51-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-glm51-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1891,12 +1931,50 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
+  # 4-GPU MiniMax-M3 MXFP8 (MI35x)
+  # ==============================================================================
+
+  nightly-4-gpu-mi35x-minimax-m3-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-minimax-m3-rocm720,'))
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+
+      - name: Accuracy Test MI35x ROCm 7.2 (4-GPU MiniMax-M3 MXFP8)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_AITER=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-4-gpu-mi35x-minimax-m3-tp4 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ==============================================================================
   # 8-GPU MiniMax-M2.7 (MI30x only)
   # ==============================================================================
 
   nightly-8-gpu-minimax-m27-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-minimax-m27-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1946,7 +2024,7 @@ jobs:
 
   nightly-1-gpu-zimage-turbo-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-1-gpu-zimage-turbo-rocm720,'))
-    runs-on: linux-mi325-1gpu-sglang
+    runs-on: linux-mi300-1gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1999,7 +2077,7 @@ jobs:
       - nightly-4-gpu-rocm720
       - nightly-2-gpu-mi35x-glm51-mxfp4-rocm720
       - nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2-rocm720
-      # 8-GPU GPT-OSS (MI30x mixes Grok1-FP8; MI35x mixes Qwen3-Coder-Next)
+      # 8-GPU GPT-OSS (MI35x mixes Qwen3-Coder-Next)
       - nightly-accuracy-8-gpu-rocm720
       - nightly-accuracy-8-gpu-mi35x-rocm720
       # 8-GPU Grok1-INT4 (MI30x + MI35x)
@@ -2028,6 +2106,7 @@ jobs:
       - nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720
       - nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720
       - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720
+      - nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720
       # 8-GPU Kimi-K2.6 (MI30x + MI35x)
       - nightly-8-gpu-kimi-k26-rocm720
       - nightly-8-gpu-mi35x-kimi-k26-rocm720
@@ -2045,6 +2124,8 @@ jobs:
       - nightly-8-gpu-mi35x-glm5-mxfp4-rocm720
       # 4-GPU MiniMax-M2.5 (MI35x)
       - nightly-4-gpu-mi35x-minimax-m25-rocm720
+      # 4-GPU MiniMax-M3 MXFP8 (MI35x)
+      - nightly-4-gpu-mi35x-minimax-m3-rocm720
       # 8-GPU MiniMax-M2.7 (MI30x only)
       - nightly-8-gpu-minimax-m27-rocm720
       # Diffusion (MI30x)

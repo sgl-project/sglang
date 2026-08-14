@@ -25,7 +25,13 @@ from typing import Optional
 
 import torch
 
-from sglang.kernels.ops.attention.dcp_kernels import CPTritonContext, correct_attn_out
+from sglang.kernels.ops.attention.dcp_kernels import (
+    CPTritonContext,
+    _lse_pack_dim,
+    correct_attn_out,
+    dcp_lse_combine_triton,
+    dcp_pack_a2a_send,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -80,7 +86,6 @@ def cp_lse_ag_out_rs_mha(
     cp_group: GroupCoordinator,
     return_lse: bool = False,
 ):
-    """Merge DCP partial attention outputs using natural-log LSE (PR #25090)."""
     if cp_group.world_size == 1:
         return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
 
@@ -90,7 +95,8 @@ def cp_lse_ag_out_rs_mha(
     scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
     scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
 
-    out = torch.nan_to_num(cp_attn_out, nan=0.0, posinf=0.0, neginf=0.0) * scale
+    out = cp_attn_out.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+    out.mul_(scale)
     out = cp_group.all_reduce(out)
 
     cp_num_heads = global_lse.shape[1] // cp_group.world_size
@@ -108,11 +114,16 @@ def cp_lse_ag_out_rs_mla(
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
     ctx: Optional[CPTritonContext] = None,
+    is_lse_base_on_e: bool = False,
 ):
-    """Merge DCP partial attention outputs via Triton correction (PR #14194).
+    """Merge DCP partial attention outputs with the LSE's actual log base.
 
     cp_attn_out: [ B, H, D ]
     cp_attn_lse: [ B, H ]
+
+    FlashInfer MLA returns base-2 LSE, while FlashMLA returns natural-log LSE.
+    The correction kernel must use the matching exp/log pair or it computes
+    incorrect cross-rank softmax weights.
     """
     if cp_group.world_size == 1:
         return cp_attn_out
@@ -128,7 +139,12 @@ def cp_lse_ag_out_rs_mla(
         cp_attn_lse = cp_attn_lse.to(torch.float32)
     lses = _ag_lse(cp_attn_lse, cp_group)
     out, _ = correct_attn_out(
-        cp_attn_out, lses, cp_group.rank_in_group, ctx, new_output
+        cp_attn_out,
+        lses,
+        cp_group.rank_in_group,
+        ctx,
+        new_output,
+        is_lse_base_on_e=is_lse_base_on_e,
     )
     out = cp_group.reduce_scatter_along_dim(out, dim=0)
     return out.to(cp_attn_out.dtype)
@@ -141,7 +157,14 @@ def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
     gathered_kv_a = kv_a.new_empty(
         (kv_a.shape[0] * dcp_world_size, *kv_a.shape[1:]),
     )
-    parallel.dcp_group.all_gather_into_tensor(gathered_kv_a, kv_a)
+    # pynccl has no fp8 dtype; all-gather is a byte copy, so transport an fp8 KV
+    # cache as raw bytes via a uint8 view (works with --kv-cache-dtype fp8_*).
+    if kv_a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        parallel.dcp_group.all_gather_into_tensor(
+            gathered_kv_a.view(torch.uint8), kv_a.contiguous().view(torch.uint8)
+        )
+    else:
+        parallel.dcp_group.all_gather_into_tensor(gathered_kv_a, kv_a)
     gathered_kv_a = (
         gathered_kv_a.reshape((dcp_world_size,) + kv_a.shape)
         .transpose(0, 1)
@@ -193,6 +216,12 @@ def all_gather_kv_cache_for_mha_extend(
         [kv_a.shape[-1], k_pe.shape[-1]], dim=-1
     )
     prefix_kv_a = prefix_kv_a.squeeze(1)
+    # torch.cat can't promote fp8 (gathered prefix) + bf16 (current extend), so
+    # align dtypes first (dequant the fp8 prefix; exact for the scale=1.0 default).
+    if prefix_kv_a.dtype != kv_a.dtype:
+        prefix_kv_a = prefix_kv_a.to(kv_a.dtype)
+    if prefix_k_pe.dtype != k_pe.dtype:
+        prefix_k_pe = prefix_k_pe.to(k_pe.dtype)
     # re-organize kv with query orders
     prefix_lens_cu = torch.zeros(
         len(seq_lens) + 1,
@@ -342,3 +371,202 @@ def all_gather_kv_cache_for_dcp(
     gatherd_kv_cache = torch.cat(kv_cache_tuple, dim=0)
 
     return gatherd_kv_cache
+
+
+# ---------------------------------------------------------------------------
+# A2A communication backend for DCP decode (alternative to AG+RS above): exchange
+# per-head partial outputs + LSEs across DCP ranks, then combine locally with the
+# Triton LSE kernel. fi_a2a delegates the exchange to FlashInfer MNNVL (#2951).
+# ---------------------------------------------------------------------------
+
+# Per-process singleton: MNNVL workspace + this rank's cp position. Populated
+# once, pre-CUDA-graph-capture, by init_fi_a2a_workspace().
+_FI_A2A_STATE: Optional[dict] = None
+
+
+def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
+    # Call once per process BEFORE CUDA-graph capture: the FlashInfer init syncs
+    # the stream and barriers cross-rank, neither of which is capturable.
+    global _FI_A2A_STATE
+    if _FI_A2A_STATE is not None:
+        return
+    if cp_group.world_size == 1:
+        return
+
+    import torch.distributed as dist
+
+    try:
+        from flashinfer.comm.dcp_alltoall import (
+            decode_cp_a2a_allocate_mnnvl_workspace,
+            decode_cp_a2a_init_workspace,
+        )
+        from flashinfer.comm.mapping import Mapping
+        from flashinfer.comm.mnnvl import MnnvlConfig, is_mnnvl_fabric_supported
+    except ImportError as e:
+        raise ImportError(
+            "--dcp-comm-backend fi_a2a requires FlashInfer with the DCP "
+            "all-to-all kernel (flashinfer #2951); could not import "
+            "flashinfer.comm.dcp_alltoall."
+        ) from e
+
+    # Reuse the MoE adapter: its Split() returns a CommBackend (what FlashInfer's
+    # Mapping expects); the flashinfer_comm_fusion copy has drifted to return a
+    # raw ProcessGroup, so don't swap without re-checking the Split() contract.
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
+        TorchDistributedCommBackend,
+    )
+
+    if not is_mnnvl_fabric_supported(torch.cuda.current_device()):
+        raise RuntimeError(
+            "--dcp-comm-backend fi_a2a requires MNNVL fabric memory (e.g. "
+            "GB200 NVL72); is_mnnvl_fabric_supported() returned False. Use "
+            "--dcp-comm-backend a2a or ag_rs on clusters without MNNVL."
+        )
+
+    cp_size = cp_group.world_size
+    cp_rank = cp_group.rank_in_group
+    mapping = Mapping(
+        world_size=cp_size,
+        rank=cp_rank,
+        gpus_per_node=torch.cuda.device_count(),
+        cp_size=cp_size,
+        tp_size=1,
+        pp_size=1,
+    )
+    workspace = decode_cp_a2a_allocate_mnnvl_workspace(
+        mapping,
+        mnnvl_config=MnnvlConfig(
+            comm_backend=TorchDistributedCommBackend(cp_group.device_group)
+        ),
+    )
+    decode_cp_a2a_init_workspace(workspace, cp_rank, cp_size)
+    # REQUIRED barrier before the first alltoall: every rank must finish init,
+    # else a rank writes a peer's FIFO before it is ready -> deadlock.
+    dist.barrier(group=cp_group.device_group)
+    _FI_A2A_STATE = {
+        "workspace": workspace,
+        "cp_rank": cp_rank,
+    }
+
+
+def dcp_a2a_lse_reduce(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: "GroupCoordinator",
+    is_lse_base_on_e: bool = True,
+    cuda_graph_buffers: Optional[dict] = None,
+    comm_backend: str = "a2a",
+) -> torch.Tensor:
+    """A2A DCP reduce: all-to-all exchange of head partials, then local Triton
+    combine. Output + fp32 LSE are packed into ONE all_to_all (LSE reinterpreted
+    as output-dtype columns along D) -> 1 NCCL call/layer instead of 2.
+    is_lse_base_on_e: True=base-e (FlashAttention), False=base-2 (FlashInfer-MLA).
+    """
+    if cp_group.world_size == 1:
+        return cp_attn_out
+
+    if comm_backend == "fi_a2a":
+        return _dcp_fi_a2a_lse_reduce(
+            cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
+        )
+
+    N = cp_group.world_size
+    B, H, D = cp_attn_out.shape
+    assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
+    H_per_rank = H // N
+    out_dtype = cp_attn_out.dtype
+    lpd = _lse_pack_dim(out_dtype)  # 2 for bf16/fp16
+
+    if cuda_graph_buffers is not None:
+        send_combined = cuda_graph_buffers["send_combined"]
+        recv_combined = cuda_graph_buffers["recv_combined"]
+    else:
+        send_combined = torch.empty(
+            N,
+            B,
+            H_per_rank,
+            D + lpd,
+            dtype=out_dtype,
+            device=cp_attn_out.device,
+        )
+        recv_combined = torch.empty_like(send_combined)
+
+    send_words = send_combined.view(torch.float32)
+    dcp_pack_a2a_send(
+        cp_attn_out,
+        cp_attn_lse,
+        send_combined[:, :, :, :D],
+        send_words[:, :, :, D // lpd],
+    )
+
+    # Transport as raw bytes (uint8): the output may be fp8 (fp8 KV cache),
+    # which pynccl's dtype enum can't send; byte a2a is exact for equal chunks.
+    cp_group.all_to_all_single(
+        recv_combined.reshape(-1).view(torch.uint8),
+        send_combined.reshape(-1).view(torch.uint8),
+    )
+
+    recv_output = recv_combined[:, :B, :, :D]
+    recv_lse = recv_combined.view(torch.float32)[:, :B, :, D // lpd]
+
+    combined, _ = dcp_lse_combine_triton(
+        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
+    )
+    return combined
+
+
+def _dcp_fi_a2a_lse_reduce(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: "GroupCoordinator",
+    is_lse_base_on_e: bool = True,
+) -> torch.Tensor:
+    """fi_a2a: delegate only the cross-rank exchange to FlashInfer's MNNVL kernel,
+    then reuse the local Triton LSE combine. FlashInfer takes output + LSE as
+    separate tensors: partial_o [B, H_per_rank, cp_size, D] (peer axis 2nd-to-last),
+    softmax_stats [B, H_per_rank, cp_size, 2] fp32 (S padded 1->2).
+    """
+    from flashinfer.comm.dcp_alltoall import decode_cp_a2a_alltoall
+
+    state = _FI_A2A_STATE
+    assert state is not None, (
+        "fi_a2a workspace not initialized — call init_fi_a2a_workspace(dcp_group) "
+        "at model-runner init (before CUDA graph capture)."
+    )
+
+    N = cp_group.world_size
+    B, H, D = cp_attn_out.shape
+    assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
+    H_per_rank = H // N
+
+    # Note(kpham-sgl): empty(), not zeros() -- the pack below fills partial_o and
+    # stats slot 0, and slot 1 is never read by anyone. The a2a moves the stats
+    # field as opaque bytes and we only ever read slot 0 back off the wire.
+    partial_o = torch.empty(
+        B, H_per_rank, N, D, dtype=cp_attn_out.dtype, device=cp_attn_out.device
+    )
+    softmax_stats = torch.empty(
+        B, H_per_rank, N, 2, dtype=torch.float32, device=cp_attn_out.device
+    )
+    dcp_pack_a2a_send(
+        cp_attn_out,
+        cp_attn_lse,
+        partial_o.permute(2, 0, 1, 3),
+        softmax_stats[..., 0].permute(2, 0, 1),
+    )
+
+    o_out, stats_out = decode_cp_a2a_alltoall(
+        partial_o,
+        softmax_stats,
+        state["workspace"],
+        state["cp_rank"],
+        N,
+    )
+
+    recv_output = o_out.permute(2, 0, 1, 3)
+    recv_lse = stats_out[..., 0].permute(2, 0, 1)
+
+    combined, _ = dcp_lse_combine_triton(
+        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
+    )
+    return combined
