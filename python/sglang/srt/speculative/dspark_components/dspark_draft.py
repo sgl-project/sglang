@@ -184,6 +184,11 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        self._embed_module = draft_model.get_input_embeddings()
+        if self._embed_module is None:
+            raise RuntimeError(
+                "DSpark draft embedding must be attached before proposal."
+            )
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -201,10 +206,8 @@ class DraftBlockProposer:
         verify_window: VerifyWindow,
         bs: int,
         device: str,
-        target_model,
         sampling_info,
     ) -> DraftProposal:
-        embed_module = target_model.get_input_embeddings()
         draft_sampler = self._draft_sampler
         all_greedy = sampling_info is None or sampling_info.is_all_greedy
         fwd = self._run_forward(
@@ -213,7 +216,7 @@ class DraftBlockProposer:
             verify_window=verify_window,
             bs=bs,
             device=device,
-            embed_module=embed_module,
+            embed_module=self._embed_module,
             draft_sampler=draft_sampler,
             sampling_info=sampling_info,
         )
@@ -355,7 +358,7 @@ class DraftBlockProposer:
         else:
             raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
 
-        draft_num_tokens = bs * gamma
+        draft_num_tokens = bs * query_token_num
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,

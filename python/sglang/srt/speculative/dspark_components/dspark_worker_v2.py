@@ -580,8 +580,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._observers.begin_step()
 
-        target_model = self.target_worker.model_runner.model
-
         verify_window = alloc_verify_window(
             batch=batch,
             bs=bs,
@@ -599,7 +597,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 verify_window=verify_window,
                 bs=bs,
                 device=device,
-                target_model=target_model,
                 sampling_info=sampling_info,
             )
         draft_block_ids = proposal.draft_block_ids

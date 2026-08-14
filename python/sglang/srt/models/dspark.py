@@ -441,7 +441,7 @@ class DSparkDraftMixin:
     def attach_shared_modules(
         self, *, embed_tokens: nn.Module, lm_head: nn.Module
     ) -> None:
-        if self.get_input_embeddings() is None:
+        if self.embed_tokens is None:
             self.embed_tokens = embed_tokens
         self.lm_head = lm_head
 
@@ -490,8 +490,9 @@ class DSparkDraftMixin:
             if any(name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES):
                 continue
             normalized_name = name.removeprefix("model.")
-            if normalized_name.startswith("embed_tokens.") and not bool(
-                getattr(self, "has_embed_tokens", False)
+            if (
+                normalized_name.startswith("embed_tokens.")
+                and not self.has_embed_tokens
             ):
                 raise ValueError(
                     "DSpark checkpoint contains embed_tokens weights, but "

@@ -109,7 +109,7 @@ class TestDSparkDraftModel(unittest.TestCase):
     def test_target_embedding_is_used_when_checkpoint_omits_one(self):
         target_embedding = object()
         target_lm_head = object()
-        model = SimpleNamespace(get_input_embeddings=lambda: None)
+        model = SimpleNamespace(embed_tokens=None)
 
         DSparkDraftMixin.attach_shared_modules(
             model, embed_tokens=target_embedding, lm_head=target_lm_head

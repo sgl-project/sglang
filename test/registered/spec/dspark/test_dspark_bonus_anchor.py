@@ -1,5 +1,6 @@
 import logging
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -7,6 +8,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
     resolve_runtime_config,
 )
+from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     DsparkDraftSampler,
     _resolve_corrected_logits_dtype,
@@ -103,8 +105,81 @@ def test_non_dspark_target_verify_width_is_unchanged():
     )
 
 
+def test_bonus_anchor_eager_forward_uses_draft_embedding_and_counts_all_queries():
+    class RecordingEmbedding:
+        def __init__(self):
+            self.input_ids = None
+
+        def __call__(self, input_ids):
+            self.input_ids = input_ids.clone()
+            return torch.zeros((*input_ids.shape, 4))
+
+    class RecordingRunner:
+        device = "cpu"
+        decode_cuda_graph_runner = None
+
+        def __init__(self):
+            self.forward_batch = None
+
+        def forward(self, forward_batch):
+            self.forward_batch = forward_batch
+            hidden_states = torch.zeros(forward_batch.input_ids.numel(), 4)
+            return SimpleNamespace(
+                logits_output=SimpleNamespace(hidden_states=hidden_states),
+                can_run_graph=False,
+            )
+
+    embedding = RecordingEmbedding()
+    runner = RecordingRunner()
+    draft_model = SimpleNamespace(get_input_embeddings=lambda: embedding)
+    proposer = DraftBlockProposer(
+        draft_model=draft_model,
+        draft_model_runner=runner,
+        gamma=2,
+        sample_from_anchor=False,
+        mask_token_id=990,
+        draft_block_spec_info=SimpleNamespace(),
+    )
+    batch = SimpleNamespace(
+        seq_lens=torch.tensor([4, 5]),
+        seq_lens_cpu=torch.tensor([4, 5]),
+        req_pool_indices=torch.tensor([0, 1]),
+        can_run_dp_cuda_graph=False,
+        global_num_tokens=None,
+    )
+    draft_input = SimpleNamespace(
+        bonus_tokens=torch.tensor([7, 8]),
+        reserved_seq_lens_cpu=None,
+    )
+    verify_window = SimpleNamespace(
+        positions_2d=torch.arange(6).view(2, 3),
+        verify_cache_loc_2d=torch.arange(6).view(2, 3),
+    )
+
+    with patch(
+        "sglang.srt.speculative.dspark_components.dspark_draft."
+        "enable_num_token_non_padded",
+        return_value=True,
+    ):
+        proposer._run_forward(
+            batch=batch,
+            draft_input=draft_input,
+            verify_window=verify_window,
+            bs=2,
+            device="cpu",
+            embed_module=proposer._embed_module,
+        )
+
+    assert embedding.input_ids.shape == (2, 3)
+    assert runner.forward_batch.input_ids.numel() == 6
+    assert runner.forward_batch.num_token_non_padded.item() == 6
+    assert runner.forward_batch.num_token_non_padded_cpu == 6
+
+
 def test_folded_sampler_skips_bonus_anchor_hidden_state():
     class FakeModel:
+        config = SimpleNamespace(torch_dtype=torch.float32)
+        embed_tokens = SimpleNamespace(weight=torch.empty(1))
         lm_head = SimpleNamespace(org_vocab_size=4, weight=torch.empty(1))
         confidence_head = None
 
@@ -146,6 +221,7 @@ def test_folded_sampler_skips_bonus_anchor_hidden_state():
 def test_folded_sampler_uses_logit_dtype_for_quantized_lm_head():
     model = SimpleNamespace(
         config=SimpleNamespace(torch_dtype=torch.bfloat16),
+        embed_tokens=SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16)),
         lm_head=SimpleNamespace(
             org_vocab_size=4,
             weight=torch.empty((4, 1), dtype=torch.uint8),
