@@ -205,19 +205,23 @@ class SWAComponent(TreeComponent):
         state = {"len": float("inf")}
 
         # unified_kv never caches the SWA ring (per-request, not content-stable),
-        # so SWA bookkeeping must not gate the match here.
-        swa_device_only_hicache = (
-            not self.tree_core.has_swa_host_pool and self.tree_core.enable_hicache
-        )
+        # so SWA bookkeeping must not gate the match here. This holds with or
+        # without HiCache: the node's FULL KV is intact and an out-of-window span
+        # needs no SWA, so a tombstone is still a usable boundary.
+        swa_device_only = not self.tree_core.has_swa_host_pool
 
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
             # HiCache: a host-only tombstone is a valid match boundary too
             # — load_back will restore SWA from host before use.
             if cd.value is None and (match_device_only or cd.host_value is None):
-                state["len"] = 0
-                if swa_device_only_hicache and (node.backuped or not node.evicted):
+                if swa_device_only and (node.backuped or not node.evicted):
+                    # Accepted as a boundary, so do not restart the window here:
+                    # zeroing the accumulator rejects every following node until a
+                    # full window is re-accumulated, which stalls the match short
+                    # of what insert just wrote.
                     return True
+                state["len"] = 0
                 return False
             state["len"] += len(node.key)
             return state["len"] >= sliding_window_size
