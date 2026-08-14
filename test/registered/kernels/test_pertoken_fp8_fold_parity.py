@@ -52,7 +52,9 @@ class TestPerTokenFp8FoldParity(CustomTestCase):
             torch.float8_e4m3fn
         )
         # Per-channel weight scale, 1-D [N] (this checkpoint's layout).
-        weight_scale = torch.rand(self.N, dtype=torch.float32, device=device) * 0.05 + 0.01
+        weight_scale = (
+            torch.rand(self.N, dtype=torch.float32, device=device) * 0.05 + 0.01
+        )
         return x, weight, weight_scale
 
     def _prequant(self, x):

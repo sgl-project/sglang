@@ -1826,13 +1826,27 @@ def apply_fp8_linear(
     )
 
     if input_prequantized:
-        assert input_scale is not None and input_scale.numel() == 1
+        assert input_scale is not None
         qinput = input_2d
-        if channelwise_cutlass and not native_scalar_a_scale:
-            # Unsupported CUTLASS epilogues require one A scale per row.
-            x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
-        else:
+        # A per-token [M, 1] activation scale (folded upstream for per-channel
+        # fp8, e.g. fused RMSNorm+quant) arrives here when a quant method unwraps
+        # its (fp8, scale, dtype) tuple before apply_fp8_linear. Keep it as-is:
+        # per_tensor_activations is False for a 2-D scale, so it flows to the
+        # per-channel bpreshuffle / rowwise GEMM below (or the safe unfused
+        # fallback when the weight is not per-channel). Per-tensor static scales
+        # (numel == 1) keep the existing scaled_mm path.
+        is_per_token_scale = (
+            input_scale.dim() == 2 and input_scale.shape[0] == input_2d.shape[0]
+        )
+        if is_per_token_scale:
             x_scale = input_scale
+        else:
+            assert input_scale.numel() == 1
+            if channelwise_cutlass and not native_scalar_a_scale:
+                # Unsupported CUTLASS epilogues require one A scale per row.
+                x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
+            else:
+                x_scale = input_scale
     elif compressed_tensor_quant:
         # Maybe apply padding to output, see comment in __init__
         num_token_padding = output_padding
