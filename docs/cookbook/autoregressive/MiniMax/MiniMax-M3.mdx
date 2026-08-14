@@ -499,5 +499,5 @@ print(response.choices[0].message.content)
 
 **Validation.** PD disaggregation preserves output quality — the K-only sparse index transfers arrive intact and disaggregated output matches non-disaggregated serving. GSM8K is scored with the single sgl-eval harness used by the benchmark card above (full 1319-question split, chat with `--thinking`); see that card for per-platform single-node accuracy.
 
-- **2 × 4×B200** (TP4+TP4, MXFP8, NIXL over InfiniBand) — output matches single-node serving. The 2-node PD serving benchmark (512-token input, 256-token output, 16 concurrent — a different workload from the card's single-node `random` isl=2048 / osl=256 / conc=64 row, so the throughput figures are not directly comparable) measured mean TTFT 1.1 s and TPOT 16.6 ms (≈ 60 tok/s per stream, ≈ 2.3k tok/s aggregate).
+- **2 × 4×B200** (TP4+TP4, MXFP8, NIXL over InfiniBand) — output matches single-node serving. The 2-node PD serving benchmark (512-token input, 256-token output, 16 concurrent — a different workload from the card's single-node `random` isl=8192 / osl=1024 / conc=64 & 256 rows, so the throughput figures are not directly comparable) measured mean TTFT 1.1 s and TPOT 16.6 ms (≈ 60 tok/s per stream, ≈ 2.3k tok/s aggregate).
 - **2 × 8×H200** (TP8+TP8, bf16, mooncake) — output matches single-node serving.
