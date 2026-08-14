@@ -246,6 +246,18 @@ class TestModelSlimMXFP4MoE(CustomTestCase):
         self.assertEqual(normalized.shape, (2, 2, 2))
         torch.testing.assert_close(normalized.reshape(2, 4), flat_input_scale)
 
+        canonical = _normalize_mxfp_input_scale(
+            normalized, payload, activation_is_fp4=False
+        )
+        torch.testing.assert_close(canonical, normalized)
+
+        with self.assertRaisesRegex(ValueError, "got \\(4, 2\\)"):
+            _normalize_mxfp_input_scale(
+                flat_input_scale.transpose(0, 1).contiguous(),
+                payload,
+                activation_is_fp4=False,
+            )
+
     def test_flat_deepep_mxfp_scales_follow_payload_shape(self):
         flat_scale = torch.arange(18 * 192, dtype=torch.int32).to(torch.uint8)
 
@@ -267,7 +279,7 @@ class TestModelSlimMXFP4MoE(CustomTestCase):
         torch.testing.assert_close(fp8_scale.reshape(-1), flat_scale)
 
         with patch.object(torch, "float4_e2m1fn_x2", torch.uint8, create=True):
-            with self.assertRaisesRegex(ValueError, "with 3456 values"):
+            with self.assertRaisesRegex(ValueError, "got \\(3455,\\)"):
                 NPUW4A4MXFP4MoEMethod("w13")._quantize_input(
                     fp4_payload, flat_scale[:-1]
                 )

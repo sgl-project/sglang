@@ -134,11 +134,19 @@ def _normalize_mxfp_input_scale(
 
     expected_shape = (hidden_states.shape[0], logical_k // 64, 2)
     expected_numel = expected_shape[0] * expected_shape[1] * expected_shape[2]
-    if scale.ndim not in (1, 2, 3) or scale.numel() != expected_numel:
+    expected_flat_shape = (expected_numel,)
+    expected_block_shape = (expected_shape[0], expected_shape[1] * 2)
+    actual_shape = tuple(scale.shape)
+    if actual_shape not in (
+        expected_flat_shape,
+        expected_block_shape,
+        expected_shape,
+    ):
         raise ValueError(
             "MXFP activation scale must be flat, [tokens, K/32], or "
-            f"[tokens, K/64, 2] with {expected_numel} values for payload "
-            f"{tuple(hidden_states.shape)}; got {tuple(scale.shape)}."
+            f"[tokens, K/64, 2] with shapes {expected_flat_shape}, "
+            f"{expected_block_shape}, or {expected_shape} for payload "
+            f"{tuple(hidden_states.shape)}; got {actual_shape}."
         )
     return scale.reshape(expected_shape)
 
