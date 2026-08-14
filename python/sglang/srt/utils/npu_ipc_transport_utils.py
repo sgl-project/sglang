@@ -52,7 +52,9 @@ class MmItemMemoryChunk:
 
     def try_to_recycle(self) -> bool:
         val = float(self.sync_flag.buffer_wrapper.item())
-        logger.debug(f"[try_to_recycle] area={self.area}, flag={val}, tp_size={self.tp_size}")
+        logger.debug(
+            f"[try_to_recycle] area={self.area}, flag={val}, tp_size={self.tp_size}"
+        )
 
         if val == float(self.tp_size):
             self.sync_flag.buffer_wrapper *= 0.0
@@ -72,7 +74,9 @@ class MmItemMemoryPool:
 
         self.sync_flag_list = []
 
-        init_chunk = MmItemMemoryChunk((0, memory_size), self.pop_sync_buffer(), tp_size)
+        init_chunk = MmItemMemoryChunk(
+            (0, memory_size), self.pop_sync_buffer(), tp_size
+        )
         self.available_chunks = [init_chunk]
         self.occupied_chunks = []
 
@@ -236,7 +240,9 @@ class MmItemMemoryPool:
                     to_merge_chunk_sync = to_merge_chunk.sync_flag
                     merged_chunk_area = (to_merge_chunk.start, chunk.end)
                     merged_chunks.append(
-                        MmItemMemoryChunk(merged_chunk_area, to_merge_chunk_sync, self.tp_size)
+                        MmItemMemoryChunk(
+                            merged_chunk_area, to_merge_chunk_sync, self.tp_size
+                        )
                     )
                     self.push_sync_buffer(chunk.sync_flag)
                 else:
