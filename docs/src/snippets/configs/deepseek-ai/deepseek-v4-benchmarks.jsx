@@ -375,7 +375,7 @@ export const benchmarks = [
   // ====================================================================
   {
     match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
-    sglang_version: "0.0.0.dev1+g273d978be",
+    sglang_version: "main @ 273d978bed",
     latencyPercentile: "Mean",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1, num_prompts: 5 },
@@ -387,7 +387,7 @@ export const benchmarks = [
   },
   {
     match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
-    sglang_version: "0.0.0.dev1+g273d978be",
+    sglang_version: "main @ 273d978bed",
     latencyPercentile: "Mean",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64, num_prompts: 320 },
@@ -399,7 +399,7 @@ export const benchmarks = [
   },
   {
     match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "0.0.0.dev1+g273d978be",
+    sglang_version: "main @ 273d978bed",
     latencyPercentile: "Mean",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256, num_prompts: 1280 },
