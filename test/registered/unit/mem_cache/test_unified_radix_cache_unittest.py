@@ -261,8 +261,18 @@ def _write_backup(cache, node, write_back: bool = False) -> int:
     )
 
 
-def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
-    """Create (tree, allocator, req_to_token_pool) from a CacheConfig."""
+def build_fixture(
+    cfg: CacheConfig,
+    *,
+    enable_kv_cache_events: bool = False,
+    tree_page_size: Optional[int] = None,
+    mamba_cache_chunk_size: Optional[int] = None,
+):
+    """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
+
+    ``tree_page_size`` stands in for DCP, which widens the tree page past the
+    ``page_size`` the rest of the config still sees.
+    """
     server_args = ServerArgs(
         model_path="dummy",
         page_size=cfg.page_size,
@@ -271,7 +281,11 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
     # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
     # loads the HF config for self.model_path — impossible for the dummy model.
     # Mirror the property's default for a dummy HF config: FLA_CHUNK_SIZE.
-    server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, cfg.page_size)
+    server_args._mamba_cache_chunk_size = (
+        max(FLA_CHUNK_SIZE, cfg.page_size)
+        if mamba_cache_chunk_size is None
+        else mamba_cache_chunk_size
+    )
     set_global_server_args_for_scheduler(server_args)
     device = get_device()
 
@@ -372,7 +386,7 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
     cache_init_params = CacheInitParams(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=allocator,
-        page_size=cfg.page_size,
+        page_size=cfg.page_size if tree_page_size is None else tree_page_size,
         disable=False,
         sliding_window_size=cfg.sliding_window_size,
         tree_components=cfg.components,
@@ -5159,6 +5173,41 @@ class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
         order = self._mamba_lru_mru_to_lru(cache)
         self.assertIs(order[0], b1)
         self.assertGreater(order.index(a1), order.index(a2))
+
+
+class TestMambaCheckpointGrid(CustomTestCase):
+    """A donated mamba checkpoint is only reusable at a depth the tree can name.
+
+    ``tree_page_size`` simulates DCP: it widens the page the tree allocates on
+    while ``page_size`` and the mamba chunk grid stay where they are, which is
+    exactly the split that lets a checkpoint land between two node boundaries.
+    """
+
+    cfg = CacheConfig(
+        page_size=64,
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        kv_size=1024,
+        max_context_len=1024,
+    )
+
+    def _grid(self, cache):
+        component = next(
+            c
+            for c in cache._components_tuple
+            if c.component_type is ComponentType.MAMBA
+        )
+        return component.mamba_checkpoint_grid
+
+    def test_grid_follows_the_widened_tree_page(self):
+        cache, _, _ = build_fixture(
+            self.cfg, tree_page_size=256, mamba_cache_chunk_size=64
+        )
+        self.assertEqual(self._grid(cache), 256)
+
+    def test_grid_is_the_chunk_size_without_widening(self):
+        cache, _, _ = build_fixture(self.cfg, mamba_cache_chunk_size=64)
+        self.assertEqual(self._grid(cache), 64)
 
 
 class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
