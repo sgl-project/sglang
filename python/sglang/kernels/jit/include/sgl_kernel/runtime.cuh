@@ -29,6 +29,9 @@
 #ifndef cudaDevAttrComputeCapabilityMinor
 #define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
 #endif
+#ifndef cudaDevAttrL2CacheSize
+#define cudaDevAttrL2CacheSize hipDeviceAttributeL2CacheSize
+#endif
 #ifndef cudaRuntimeGetVersion
 #define cudaRuntimeGetVersion hipRuntimeGetVersion
 #endif
@@ -64,6 +67,13 @@ inline auto get_sm_count(int device_id) -> uint32_t {
   int sm_count;
   RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id));
   return static_cast<uint32_t>(sm_count);
+}
+
+// Return the L2 cache size in bytes for the given device
+inline auto get_l2_cache_size(int device_id) -> uint32_t {
+  int l2_cache_size;
+  RuntimeDeviceCheck(cudaDeviceGetAttribute(&l2_cache_size, cudaDevAttrL2CacheSize, device_id));
+  return static_cast<uint32_t>(l2_cache_size);
 }
 
 // Return the Major compute capability for the given device

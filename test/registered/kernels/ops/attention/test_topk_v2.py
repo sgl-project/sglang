@@ -295,5 +295,73 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
 
 
+# (batch, seq) chosen to land on each of the adaptive cluster-split bands and
+# their fallback boundaries. The small-batch cluster kernel splits one row across
+# N in {8,4,2} co-resident blocks; the host picks N from (batch, max_seq) so the
+# split stays a single cluster-wave (caps calibrated on B200/sm100, scaled by SM
+# count at runtime). Correctness is routing-independent -- the selected top-k must
+# equal torch.topk's on any path -- so these shapes validate every split factor and
+# the persistent-pool fallback regardless of which one a given GPU actually takes.
+SPLIT_CONFIGS = [
+    # --- 8-way split band (batch <= 64 & max_seq >= 196608) ---
+    (64, 196608),
+    (64, 262144),
+    # --- 4-way split band (64 < batch <= 74 & max_seq >= 131072) ---
+    (72, 131072),
+    (72, 262144),
+    (74, 262144),  # 4-way batch cap
+    # --- 2-way split band (74 < batch <= 76 & max_seq >= 114688) ---
+    (75, 131072),
+    (76, 262144),  # 2-way batch cap
+    # --- 2-way split, low band (30 < batch <= 64 & 114688 <= max_seq < 196608) ---
+    (48, 114688),  # 2-way seq floor
+    (48, 131072),
+    (64, 163840),
+    # --- fallback (persistent pool + main<3>): just outside every split band ---
+    (77, 262144),  # batch above the 2-way cap
+    (96, 262144),  # well above all caps
+    (72, 98304),  # in a split batch band but seq below its floor
+]
+
+
+def _run_both(scores, seq_lens, page_table, inv_cpu, k):
+    """Return (transformed-output-inverted, raw) top-k indices from one launch."""
+    batch = scores.shape[0]
+    out = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
+    raw = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
+    metadata = plan_topk_v2(seq_lens)
+    topk_transform_512_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata, raw)
+    torch.cuda.synchronize()
+    out_cpu, raw_cpu = out.cpu().tolist(), raw.cpu().tolist()
+    inv_out = [_invert(out_cpu[i], inv_cpu[i]) for i in range(batch)]
+    raw_out = [[v for v in raw_cpu[i] if v != -1] for i in range(batch)]
+    return inv_out, raw_out
+
+
+@pytest.mark.parametrize("page_mode", ["identity", "perm"])
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize("batch,seq", SPLIT_CONFIGS)
+@torch.inference_mode()
+def test_topk_v2_split(batch: int, seq: int, k: int, page_mode: str) -> None:
+    """Adaptive cluster-split bands: both the page-transformed output and the raw
+    index output must match torch.topk (zero-tolerance set equality, ties aside),
+    across the 8/4/2-way split factors and the persistent-pool fallback."""
+    torch.manual_seed(batch * 100003 + seq * 7 + k + 17)
+    device = "cuda"
+    width = (seq + 3) & ~3
+    scores = torch.randn(batch, width, dtype=torch.float32, device=device)[:, :seq]
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(batch, num_pages, page_mode, device)
+
+    inv_out, raw_out = _run_both(scores, seq_lens, page_table, inv_cpu, k)
+    ref_raw = _reference(scores, seq_lens, k)
+    scores_cpu, seq_cpu = scores.cpu(), seq_lens.cpu()
+    # transformed output (inverted through the page table) matches torch.topk
+    _assert_topk_close(scores_cpu, ref_raw, inv_out, batch, seq_cpu, k)
+    # the raw (pre-transform) output matches torch.topk directly
+    _assert_topk_close(scores_cpu, ref_raw, raw_out, batch, seq_cpu, k)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
