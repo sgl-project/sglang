@@ -27,6 +27,11 @@ class BaseDiT(nn.Module, ABC):
     # execution semantics support only a subset of the available backends.
     _fsdp_shard_conditions: list = []
     _compile_conditions: list = []
+    # Methods that drive a forward pass without going through __call__. FSDP2
+    # only unshards around the wrapped module's own forward, so anything the
+    # shard conditions left in the root group stays sharded unless the entry
+    # point is registered; loaders read this and register each name.
+    _fsdp_forward_methods: tuple[str, ...] = ()
     param_names_mapping: dict
     reverse_param_names_mapping: dict
     hidden_size: int
