@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import math
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
@@ -42,9 +41,6 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
 
-logger = logging.getLogger(__name__)
-
-
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -79,23 +75,6 @@ class MambaComponent(TreeComponent):
         self.mamba_checkpoint_grid = math.lcm(
             self.mamba_cache_chunk_size, params.page_size
         )
-        track_interval = get_exec().mamba.mamba_track_interval
-        assert track_interval % self.mamba_checkpoint_grid == 0, (
-            f"--mamba-track-interval must be a multiple of "
-            f"{self.mamba_checkpoint_grid}, the lcm of the mamba chunk size and the "
-            f"tree page, or a decode checkpoint lands where no node can carry it. "
-            f"Got {track_interval} with page_size={params.page_size}."
-        )
-        if (
-            params.chunked_prefill_size is not None
-            and 0 < params.chunked_prefill_size < self.mamba_checkpoint_grid
-        ):
-            logger.warning(
-                "chunked_prefill_size=%s is smaller than the mamba checkpoint grid "
-                "%s, so chunked-prefill handoffs will not checkpoint at all.",
-                params.chunked_prefill_size,
-                self.mamba_checkpoint_grid,
-            )
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
