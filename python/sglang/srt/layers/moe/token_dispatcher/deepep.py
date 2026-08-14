@@ -34,6 +34,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_npu,
+    is_npu_before_atlas_a5,
     load_json_config,
 )
 
@@ -479,6 +480,18 @@ class _DeepEPDispatcherImplBase:
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
         if _is_npu:
+            if (
+                self.deepep_output_dtype
+                in (
+                    DispatcherOutputDtype.MXFP8,
+                    DispatcherOutputDtype.MXFP4,
+                )
+                and is_npu_before_atlas_a5()
+            ):
+                raise RuntimeError(
+                    "Ascend NPU before Atlas A5 does not support "
+                    f"{self.deepep_output_dtype.value} DeepEP dispatch."
+                )
             if self.deepep_output_dtype == DispatcherOutputDtype.FP8:
                 logger.warning_once(
                     "Ascend A2/A3 NPU does not support fp8 "

@@ -319,6 +319,30 @@ class TestModelSlimKVScales(CustomTestCase):
 
 
 class TestAscendMXDeepEPBridge(CustomTestCase):
+    def test_pre_a5_rejects_mxfp_dispatch(self):
+        validator = deepep._DeepEPDispatcherImplBase._validate_and_adjust_dtype
+
+        for dtype in (DispatcherOutputDtype.MXFP8, DispatcherOutputDtype.MXFP4):
+            dispatcher = SimpleNamespace(deepep_output_dtype=dtype)
+            with (
+                patch.object(deepep, "_is_npu", True),
+                patch.object(deepep, "is_npu_before_atlas_a5", return_value=True),
+                self.assertRaisesRegex(RuntimeError, "before Atlas A5"),
+            ):
+                validator(dispatcher)
+
+    def test_a5_accepts_mxfp_dispatch(self):
+        validator = deepep._DeepEPDispatcherImplBase._validate_and_adjust_dtype
+        dispatcher = SimpleNamespace(deepep_output_dtype=DispatcherOutputDtype.MXFP4)
+
+        with (
+            patch.object(deepep, "_is_npu", True),
+            patch.object(deepep, "is_npu_before_atlas_a5", return_value=False),
+        ):
+            validator(dispatcher)
+
+        self.assertEqual(dispatcher.deepep_output_dtype, DispatcherOutputDtype.MXFP4)
+
     def test_deepep_dtype_flags(self):
         self.assertEqual(
             deepep._deepep_dtype_flags(DispatcherOutputDtype.MXFP8),
