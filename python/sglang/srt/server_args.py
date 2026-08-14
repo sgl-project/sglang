@@ -7481,6 +7481,11 @@ class ServerArgs:
                 "(--weight-cache-mode off) for this configuration."
             )
 
+        if self.weight_cache_mode != "off" and self.enable_eplb:
+            raise ValueError(
+                "--weight-cache-mode is not supported together with --enable-eplb."
+            )
+
     def _is_mistral_native_format(self) -> bool:
         """True iff the checkpoint requires load_format=mistral.
 
