@@ -37,7 +37,7 @@
 export const config = {
   modelName: "Qwen3.8-27B",
 
-  supportedHardware: ["h200", "rtx6000", "rtx5090", "dgx-spark"],
+  supportedHardware: ["h200", "rtx6000", "rtx5090", "dgx-spark", "gb300"],
 
   // RTX PRO 6000 and RTX 5090 (SM120 / Blackwell Desktop) are workstation and
   // consumer cards, not datacenter GPUs, so they are not in the shared catalog.
@@ -69,6 +69,7 @@ export const config = {
   // Playground's speculative axis instead of splitting the strategy dimension.
   strategies: [
     { id: "balanced", label: "Balanced" },
+    { id: "high-throughput", label: "High-Throughput" },
   ],
   nodesOptions: [
     { id: "single", label: "Single Node" },
@@ -130,6 +131,7 @@ export const config = {
     // TODO: verify an arm64 build of this tag for DGX Spark (GB10 is aarch64);
     // the x86-only tag will not pull there.
     "dgx-spark": "lmsysorg/sglang:qwen38-27b",
+    gb300:   "lmsysorg/sglang:dev",
   },
 
   github: {
@@ -384,8 +386,9 @@ export const config = {
     // DGX Spark (GB10, SM121): single node, 128GB coherent unified memory
     // shared with the CPU — every checkpoint fits, so all three quants get a
     // cell. FlashInfer attention comes from the SM120 pair; the platform gets
-    // its own operating point at 8192-token prefill chunks and 0.95 static
-    // fraction. Unvalidated on SM121 / aarch64.
+    // its own operating point at 8192-token prefill chunks, 0.95 static
+    // fraction, and prefill CUDA graphs disabled. Unvalidated on SM121 /
+    // aarch64.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       env: [],
@@ -395,6 +398,7 @@ export const config = {
         "--mem-fraction-static 0.95",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 8192",
+        "--disable-prefill-cuda-graph",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -410,6 +414,7 @@ export const config = {
         "--mem-fraction-static 0.95",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 8192",
+        "--disable-prefill-cuda-graph",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -425,8 +430,118 @@ export const config = {
         "--mem-fraction-static 0.95",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 8192",
+        "--disable-prefill-cuda-graph",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // GB300 (SM103), single 288GB GPU. All six cells measured on a 4xGB300
+    // devbox on 2026-08-14 against lmsysorg/sglang:dev @ c4271c3fe1262fc2adbd162c33b25de5255251c5.
+    // With no --attention-backend pin, :dev on GB300 resolves attention to
+    // triton (the newer c7c03ec resolves trtllm_mha); the cells keep engine-default
+    // resolution so the benchmark card and the cell see the same kernel. The
+    // `high-throughput` strategy adds the in-checkpoint MTP head
+    // (EAGLE / NEXTN semantics, num-steps 3, topk 1, draft-tokens 4).
+    {
+      match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 2048",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 2048",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 2048",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 2048",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 2048",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 2048",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
