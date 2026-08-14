@@ -5,6 +5,9 @@ import os
 import tempfile
 import unittest
 
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    get_lock as get_diffusion_lock,
+)
 from sglang.srt.model_loader.weight_utils import filter_duplicate_safetensors_files
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -82,6 +85,32 @@ class TestFilterDuplicateSafetensorsFiles(CustomTestCase):
             index_file=INDEX_NAME,
         )
         self.assertEqual(result, [single])
+
+
+class TestDiffusionWeightLock(CustomTestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.lock_dir = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_long_snapshot_path_uses_bounded_lock_filename(self):
+        component_path = os.path.join(
+            "/scratch",
+            "models--" + "very-long-repository-name-" * 8,
+            "snapshots",
+            "a" * 64,
+            "transformer",
+            "config.json",
+        )
+
+        lock = get_diffusion_lock(component_path, self.lock_dir)
+        lock_filename = os.path.basename(lock.lock_file)
+
+        self.assertLessEqual(len(os.fsencode(lock_filename)), 255)
+        with lock:
+            self.assertTrue(os.path.exists(lock.lock_file))
 
 
 if __name__ == "__main__":
