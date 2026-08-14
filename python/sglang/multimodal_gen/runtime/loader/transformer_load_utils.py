@@ -615,6 +615,9 @@ def _needs_device_weight_postprocess(
 ) -> bool:
     """Return whether post-load weight processing needs CUDA/NPU tensors."""
     quant_name = _get_quant_config_name(quant_config)
+    if quant_name == "modelopt_fp8":
+        return True
+
     serialized_flag_by_quant_name = {
         "fp8": "is_checkpoint_fp8_serialized",
         "mxfp8": "is_checkpoint_fp8_serialized",

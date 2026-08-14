@@ -314,6 +314,13 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         warning.assert_called_once()
 
+    def test_modelopt_fp8_serialized_checkpoint_needs_device_postprocess(self):
+        self.assertTrue(
+            _needs_device_weight_postprocess(
+                ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+            )
+        )
+
     def test_online_fp8_needs_device_weight_postprocess(self):
         self.assertTrue(_needs_device_weight_postprocess(Fp8Config()))
         self.assertFalse(
