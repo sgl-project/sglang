@@ -1634,6 +1634,7 @@ class ImageData:
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
     preprocess_kwargs: Optional[Dict] = None
+    content_hash: Optional[str] = None
 
 
 @dataclass
@@ -1999,7 +2000,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.15.post1")
+        min_version: Minimum version required (e.g., "0.6.17")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise

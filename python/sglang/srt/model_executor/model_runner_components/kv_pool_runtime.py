@@ -7,6 +7,7 @@ import msgspec
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_world_group
+from sglang.srt.mem_cache.kv_cache_configurator import mm_runtime_reservation_gb
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import get_available_gpu_memory, get_device_memory_capacity
@@ -75,8 +76,12 @@ def compute_post_capture_kv_resize(
             )
             / 1024,
         )
+    mm_reservation_gb = mm_runtime_reservation_gb(
+        is_multimodal=model_runner.model_config.is_multimodal,
+        mm_feature_transport=model_runner.server_args.mm_feature_transport,
+    )
     budget_bytes = (
-        int(max(0.0, free_gb - headroom_gb) * (1 << 30))
+        int(max(0.0, free_gb - headroom_gb - mm_reservation_gb) * (1 << 30))
         + pool.post_capture_backed_bytes
     )
     config = model_runner.kv_cache_configurator.config_from_budget(

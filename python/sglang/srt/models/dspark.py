@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.platforms import current_platform
@@ -555,6 +556,8 @@ class DSparkDraftMixin:
         Cached; None (per-layer fallback) when a QKV weight cannot be sliced
         (quantized) or layers disagree on norm epsilon / bias presence.
         """
+        if not envs.SGLANG_DSPARK_STACKED_CTX_KV.get():
+            return None
         cached = getattr(self, "_stacked_ctx_kv_cache", False)
         if cached is not False:
             return cached
