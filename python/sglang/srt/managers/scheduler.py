@@ -435,7 +435,7 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_session_radix_cache = server_args.enable_session_radix_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None

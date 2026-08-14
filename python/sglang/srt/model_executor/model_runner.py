@@ -314,6 +314,13 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        # Set the global server_args in the scheduler process (target worker
+        # only, so a draft init cannot clobber target-derived global state).
+        # Before the constructor's bag reads (page_size below): a standalone
+        # construction (benchmark/one_batch, the manual runner tests) has no
+        # earlier publish.
+        if not is_draft_worker:
+            set_global_server_args_for_scheduler(server_args)
         self.draft_attention_backend = resolve_draft_attention_backend(
             draft_attention_backend=draft_attention_backend,
             server_args=server_args,
@@ -333,7 +340,7 @@ class ModelRunner:
             server_args.speculative_algorithm
         )
         self.capture_tail_hooks = []
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.mtp_draft_device_pools = ()
@@ -360,11 +367,6 @@ class ModelRunner:
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
             enable_show_time_cost()
-
-        # Set the global server_args in the scheduler process (target worker
-        # only, so a draft init cannot clobber target-derived global state).
-        if not self.is_draft_worker:
-            set_global_server_args_for_scheduler(server_args)
 
         misc_utils.maybe_disable_chunked_prefix_cache(
             use_mla_backend=self.use_mla_backend,
