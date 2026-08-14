@@ -332,12 +332,18 @@ class EarTTSForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         params = dict(self.named_parameters())
         buffers = dict(self.named_buffers())
+        loaded_params = set()
         for name, weight in weights:
             if name.startswith("model.backbone."):
                 suffix = name[len("model.backbone.") :]
                 if suffix == "embed_tokens.weight":
                     continue
-                self.backbone.load_weights([(f"model.{suffix}", weight)])
+                backbone_params = self.backbone.load_weights(
+                    [(f"model.{suffix}", weight)]
+                )
+                loaded_params.update(
+                    f"backbone.{param_name}" for param_name in backbone_params
+                )
                 continue
             name = name.replace("model.total_emb.", "total_emb.", 1)
             name = name.replace("model.sampler.", "sampler.", 1)
@@ -352,6 +358,21 @@ class EarTTSForCausalLM(nn.Module):
             if target is not None:
                 loader = getattr(target, "weight_loader", default_weight_loader)
                 loader(target, weight)
+                loaded_params.add(name)
+
+        # EarTTS never reads the backbone token embedding because every call
+        # supplies fused audio/text embeddings. All other parameters, plus the
+        # codec silence-token buffer, must come from the converted checkpoint.
+        required = set(params)
+        required.discard("backbone.model.embed_tokens.weight")
+        required.add("sil_tokens")
+        missing = required - loaded_params
+        if missing:
+            raise RuntimeError(
+                "Some EarTTS weights are not initialized from the checkpoint: "
+                f"{sorted(missing)}"
+            )
+        return loaded_params
 
 
 EntryClass = EarTTSForCausalLM

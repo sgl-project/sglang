@@ -4,7 +4,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 
 
 def test_custom_inputs_single_request():
-    metadata = {"acoustic_embedding": [[1.0, 2.0]], "input_asr_id": 7}
+    metadata = {"acoustic_embedding": [[1.0, 2.0]], "input_function_ids": [7]}
     req = GenerateReqInput(input_ids=[1], custom_inputs=metadata)
 
     req.normalize_batch_and_arguments()
@@ -49,7 +49,7 @@ def test_empty_input_ids_only_allowed_for_session_continuation():
     req = GenerateReqInput(
         input_ids=[],
         session_params={"id": "voicechat", "rid": None},
-        custom_inputs={"input_asr_id": 0},
+        custom_inputs={"input_function_ids": [0]},
     )
     req.normalize_batch_and_arguments()
     assert req.is_single

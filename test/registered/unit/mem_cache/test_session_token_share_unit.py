@@ -16,6 +16,7 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.test.test_utils import CustomTestCase
@@ -23,7 +24,7 @@ from sglang.test.test_utils import CustomTestCase
 VOCAB = 1 << 20
 
 
-def _recv(rid, input_ids, max_new_tokens=8):
+def _recv(rid, input_ids, max_new_tokens=8, custom_inputs=None):
     return SimpleNamespace(
         rid=rid,
         input_ids=array("q", input_ids),
@@ -34,6 +35,7 @@ def _recv(rid, input_ids, max_new_tokens=8):
         sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
         lora_id=None,
         custom_logit_processor=None,
+        custom_inputs=custom_inputs,
         stream=False,
         return_logprob=False,
         top_logprobs_num=0,
@@ -57,9 +59,14 @@ class TestSessionTokenShare(CustomTestCase):
     def setUp(self):
         self.session = Session(capacity_of_str_len=0, session_id="s", streaming=True)
 
-    def _create(self, rid, input_ids, max_new_tokens=8):
+    def _create(self, rid, input_ids, max_new_tokens=8, custom_inputs=None):
         return self.session.create_req(
-            _recv(rid, input_ids, max_new_tokens=max_new_tokens),
+            _recv(
+                rid,
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                custom_inputs=custom_inputs,
+            ),
             tokenizer=None,
             vocab_size=VOCAB,
         )
@@ -124,6 +131,36 @@ class TestSessionTokenShare(CustomTestCase):
         r4 = self._create("r4", [70])
         self.assertEqual(list(r4.origin_input_ids), in1 + out1 + [70])
         self.assertEqual(list(r4.full_untruncated_fill_ids), list(r4.origin_input_ids))
+
+    def test_empty_continuation_custom_inputs_survive_abort(self):
+        first_custom_inputs = {"acoustic_embedding": [[1.0]], "frame": 1}
+        r1 = self._create("r1", [10], custom_inputs=first_custom_inputs)
+        self.assertIs(r1.custom_inputs, first_custom_inputs)
+        self._decode_and_finish(r1, [20])
+
+        second_custom_inputs = {"acoustic_embedding": [[2.0]], "frame": 2}
+        r2 = self._create("r2", [], custom_inputs=second_custom_inputs)
+        self.assertEqual(list(r2.origin_input_ids), [10, 20])
+        self.assertIs(r2.custom_inputs, second_custom_inputs)
+
+        # An aborted frame must not become part of session history. The next
+        # empty continuation resumes from the last successfully committed turn
+        # and receives its own per-frame inputs.
+        r2.output_ids.append(30)
+        r2._refresh_fill_ids()
+        self.session.abort_req()
+        third_custom_inputs = {"acoustic_embedding": [[3.0]], "frame": 3}
+        r3 = self._create("r3", [], custom_inputs=third_custom_inputs)
+        self.assertEqual(list(r3.origin_input_ids), [10, 20])
+        self.assertIs(r3.custom_inputs, third_custom_inputs)
+
+    def test_empty_first_streaming_request_is_aborted(self):
+        with get_parallel().override(tp_rank=0):
+            req = self._create("r1", [], custom_inputs={"frame": 1})
+
+        self.assertIsNotNone(req.to_finish)
+        self.assertFalse(self.session._inflight)
+        self.assertIn("empty session continuation", req.to_finish.message.lower())
 
     def test_first_turn_abort(self):
         self._create("r1", [1, 2, 3])

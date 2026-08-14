@@ -1,13 +1,14 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers import AutoConfig
 
 from examples.voicechat.convert_duplex_stage import _configure_duplex_config
 from sglang.srt.configs.eartts import EarTTSConfig
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
-from sglang.srt.models.eartts import MaskGITSampler
+from sglang.srt.models.eartts import EarTTSForCausalLM, MaskGITSampler
 from sglang.srt.models.nemotron_duplex_h import NemotronDuplexHForCausalLM
 from sglang.srt.models.registry import ModelRegistry
 
@@ -56,6 +57,57 @@ def test_maskgit_outputs_one_valid_code_per_quantizer():
     assert codes.dtype == torch.long
     assert torch.all(codes >= 0)
     assert torch.all(codes < config.codebook_size)
+
+
+class _FakeEarTTSBackbone:
+    def load_weights(self, weights):
+        [(name, _)] = weights
+        return {name}
+
+
+def _fake_eartts_model():
+    model = SimpleNamespace(backbone=_FakeEarTTSBackbone())
+    params = [
+        ("backbone.model.embed_tokens.weight", torch.nn.Parameter(torch.zeros(1))),
+        ("backbone.model.layers.0.weight", torch.nn.Parameter(torch.zeros(1))),
+        ("total_emb.bos_emb", torch.nn.Parameter(torch.zeros(1))),
+    ]
+    buffers = [("sil_tokens", torch.zeros(1, dtype=torch.int32))]
+    model.named_parameters = lambda: iter(params)
+    model.named_buffers = lambda: iter(buffers)
+    return model
+
+
+def test_eartts_weight_loader_requires_complete_checkpoint():
+    model = _fake_eartts_model()
+
+    with pytest.raises(RuntimeError, match="total_emb.bos_emb"):
+        EarTTSForCausalLM.load_weights(
+            model,
+            [
+                ("model.backbone.layers.0.weight", torch.ones(1)),
+                ("model.sil_tokens", torch.ones(1, dtype=torch.int32)),
+            ],
+        )
+
+
+def test_eartts_weight_loader_accepts_complete_checkpoint():
+    model = _fake_eartts_model()
+
+    loaded = EarTTSForCausalLM.load_weights(
+        model,
+        [
+            ("model.backbone.layers.0.weight", torch.ones(1)),
+            ("model.total_emb.bos_emb", torch.ones(1)),
+            ("model.sil_tokens", torch.ones(1, dtype=torch.int32)),
+        ],
+    )
+
+    assert loaded == {
+        "backbone.model.layers.0.weight",
+        "total_emb.bos_emb",
+        "sil_tokens",
+    }
 
 
 def test_gemma3_rmsnorm_float32_cuda_path_falls_back_to_native():
