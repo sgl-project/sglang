@@ -49,6 +49,10 @@ _PAD_GATE = -1000.0
 
 
 class PtxKDAKernel(LinearAttnKernelBase):
+    # Tracked batches route to the embedded Triton fallback, which forwards
+    # the fp32 snapshot arguments (see _triton_extend).
+    supports_track_state_snapshot: bool = True
+
     def __init__(self):
         # tcgen05 + TMEM with sm_103a-only encodings: GB300 (SM103) only.
         self.supports_prefill = torch.cuda.is_available() and (
