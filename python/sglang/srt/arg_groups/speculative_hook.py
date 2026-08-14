@@ -398,7 +398,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         # config it loads itself, before any graph is captured.
         logger.error(
             "Failed to read the DSpark draft config%s; assuming the DeepSpec "
-            "gamma-wide layout. A speculators (bonus-anchor) checkpoint will "
+            "gamma-wide layout. A bonus-anchor checkpoint will "
             "fail draft CUDA-graph capture until this read succeeds. Error: %s",
             (
                 " (gamma and block layout cannot be resolved)"
@@ -422,11 +422,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     # been serialized from another checkpoint and would mis-size CUDA graphs.
     server_args.speculative_dspark_bonus_anchor = bool(
         draft_checkpoint_config is not None
-        and draft_checkpoint_config.speculators_convention
+        and draft_checkpoint_config.bonus_anchor
     )
     if server_args.speculative_dspark_bonus_anchor:
         logger.info(
-            "DSpark draft checkpoint uses the speculators bonus-anchor layout; "
+            "DSpark draft checkpoint uses the bonus-anchor layout; "
             "the draft block is gamma + 1 slots wide (slot 0 is the anchor and "
             "is not sampled)."
         )

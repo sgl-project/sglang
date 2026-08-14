@@ -30,11 +30,11 @@ def _base_dspark_hf_config(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**fields)
 
 
-class TestDsparkSpeculatorsConventionDetection(CustomTestCase):
+class TestDsparkAnchorLayoutDetection(CustomTestCase):
     def test_deepspec_checkpoint_not_flagged(self):
         # No speculators_model_type field at all -- the normal DeepSpec case.
         config = parse_dspark_draft_config(draft_hf_config=_base_dspark_hf_config())
-        self.assertFalse(config.speculators_convention)
+        self.assertFalse(config.bonus_anchor)
 
     def test_other_speculators_model_type_not_flagged(self):
         # speculators_model_type present but not "dspark" -- a different
@@ -42,13 +42,13 @@ class TestDsparkSpeculatorsConventionDetection(CustomTestCase):
         config = parse_dspark_draft_config(
             draft_hf_config=_base_dspark_hf_config(speculators_model_type="eagle3")
         )
-        self.assertFalse(config.speculators_convention)
+        self.assertFalse(config.bonus_anchor)
 
     def test_speculators_dspark_checkpoint_flagged(self):
         config = parse_dspark_draft_config(
             draft_hf_config=_base_dspark_hf_config(speculators_model_type="dspark")
         )
-        self.assertTrue(config.speculators_convention)
+        self.assertTrue(config.bonus_anchor)
 
     def test_speculators_dspark_checkpoint_flagged_case_insensitive(self):
         # Checkpoint config values are author-controlled strings, not a
@@ -62,7 +62,7 @@ class TestDsparkSpeculatorsConventionDetection(CustomTestCase):
                         speculators_model_type=variant
                     )
                 )
-                self.assertTrue(config.speculators_convention)
+                self.assertTrue(config.bonus_anchor)
 
     def test_non_string_speculators_model_type_not_flagged(self):
         # Malformed config where the field is present but not a string (e.g.
@@ -71,7 +71,7 @@ class TestDsparkSpeculatorsConventionDetection(CustomTestCase):
         config = parse_dspark_draft_config(
             draft_hf_config=_base_dspark_hf_config(speculators_model_type=123)
         )
-        self.assertFalse(config.speculators_convention)
+        self.assertFalse(config.bonus_anchor)
 
 
 def _speculators_hf_config(
@@ -119,14 +119,14 @@ class TestSpeculatorsProposalGamma(CustomTestCase):
             draft_hf_config=_speculators_hf_config(block_size=8, speculative_tokens=7)
         )
         self.assertEqual(config.gamma, 7)
-        self.assertTrue(config.speculators_convention)
+        self.assertTrue(config.bonus_anchor)
 
     def test_gamma_falls_back_to_block_size_without_speculators_config(self):
         # DeepSpec-native checkpoints have no speculators_config at all --
         # gamma must still resolve from block_size as before.
         config = parse_dspark_draft_config(draft_hf_config=_base_dspark_hf_config())
         self.assertEqual(config.gamma, 5)  # dspark_block_size=5 in the fixture
-        self.assertFalse(config.speculators_convention)
+        self.assertFalse(config.bonus_anchor)
 
     def test_gamma_respects_default_proposal_method_selection(self):
         # Multiple proposal methods present; must pick the one named by
@@ -166,7 +166,7 @@ class TestDraftBlockWidth(CustomTestCase):
         )
         self.assertEqual(proposer.draft_width, 7)
 
-    def test_speculators_convention_draft_width_is_gamma_plus_one(self):
+    def test_bonus_anchor_draft_width_is_gamma_plus_one(self):
         proposer = DraftBlockProposer(
             draft_model=None,
             draft_model_runner=None,
@@ -281,7 +281,7 @@ class TestSampleFromAnchorIsAuthoritative(CustomTestCase):
                 block_size=16, speculative_tokens=16, sample_from_anchor=True
             )
         )
-        self.assertFalse(config.speculators_convention)
+        self.assertFalse(config.bonus_anchor)
         self.assertEqual(config.gamma, 16)
 
     def test_bonus_anchor_speculators_checkpoint_flagged(self):
@@ -291,7 +291,7 @@ class TestSampleFromAnchorIsAuthoritative(CustomTestCase):
                 block_size=16, speculative_tokens=15, sample_from_anchor=False
             )
         )
-        self.assertTrue(config.speculators_convention)
+        self.assertTrue(config.bonus_anchor)
         self.assertEqual(config.gamma, 15)
 
     def test_sample_from_anchor_overrides_model_type_heuristic(self):
@@ -307,9 +307,19 @@ class TestSampleFromAnchorIsAuthoritative(CustomTestCase):
                 block_size=8, speculative_tokens=7, sample_from_anchor=False
             )
         )
-        self.assertNotEqual(
-            dense.speculators_convention, bonus.speculators_convention
+        self.assertNotEqual(dense.bonus_anchor, bonus.bonus_anchor)
+
+    def test_explicit_bonus_anchor_without_speculators_model_type(self):
+        config = parse_dspark_draft_config(
+            draft_hf_config=_base_dspark_hf_config(sample_from_anchor=False)
         )
+        self.assertTrue(config.bonus_anchor)
+
+    def test_invalid_sample_from_anchor_fails_fast(self):
+        with self.assertRaisesRegex(ValueError, "sample_from_anchor must be a bool"):
+            parse_dspark_draft_config(
+                draft_hf_config=_base_dspark_hf_config(sample_from_anchor="false")
+            )
 
     def test_geometry_disagreeing_with_flag_fails_fast(self):
         # sample_from_anchor says dense, geometry says 1+N. Silently picking

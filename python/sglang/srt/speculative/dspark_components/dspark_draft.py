@@ -165,16 +165,16 @@ def sample_draft_block(
 class DraftBlockProposer:
     """Runs the DSpark draft model's forward pass and samples its block.
 
-    ``bonus_anchor`` (from DSparkDraftConfig.speculators_convention, threaded
+    ``bonus_anchor`` (from DSparkDraftConfig.bonus_anchor, threaded
     in by dspark_worker_v2.py) selects between two block layouts:
 
-    - False (DeepSpec, the original convention this class was written for):
+    - False (sampled-anchor layout):
       the draft block is exactly ``gamma`` slots wide, anchor-first -- slot 0
       IS the anchor token and is itself a real, trained draft prediction.
       ``self.gamma`` (the real draft-token count used everywhere else in the
       codebase -- verify window sizing, KV commit, accept-length accounting)
       already equals the forward-pass width; no adjustment needed.
-    - True (speculators): the draft block is ``gamma + 1`` slots wide --
+    - True (bonus-anchor layout): the draft block is ``gamma + 1`` slots wide --
       slot 0 is still the anchor token (the draft transformer must see it to
       attend to), but it's an untrained conditioning token, not a draft
       prediction, so its hidden state/logits are excluded before sampling.
@@ -185,7 +185,7 @@ class DraftBlockProposer:
     Mirrors vLLM's validated `dspark_bonus_anchor`/`sample_from_anchor` fix
     (vllm-project/vllm#47093) rather than unconditionally widening every
     DSpark block the way an earlier draft of this fix did -- see the
-    docstring on ``speculators_convention`` in dspark_config.py.
+    layout resolution in dspark_config.py.
     """
 
     def __init__(

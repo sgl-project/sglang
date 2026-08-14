@@ -56,7 +56,7 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
     mask_token_id: Optional[int]
     markov_rank: int
     markov_head_type: Optional[str]
-    speculators_convention: bool
+    bonus_anchor: bool
     # None for the ordinary DSpark checkpoint that samples in the full target
     # vocab and shares the target lm_head. A speculators-trained checkpoint with
     # an independent, reduced-vocabulary head (RedHatAI/*-speculator.dspark)
@@ -80,7 +80,7 @@ class DSparkRuntimeConfig(msgspec.Struct, frozen=True):
     gamma: int
     verify_num_draft_tokens: int
     mask_token_id: int
-    speculators_convention: bool
+    bonus_anchor: bool
 
 
 def resolve_runtime_config(
@@ -133,7 +133,7 @@ def resolve_runtime_config(
         gamma=gamma,
         verify_num_draft_tokens=gamma + 1,
         mask_token_id=mask_token_id,
-        speculators_convention=draft_config.speculators_convention,
+        bonus_anchor=draft_config.bonus_anchor,
     )
 
 
@@ -141,7 +141,7 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
     """Load and parse the draft checkpoint's hf config.
 
     Startup needs more than one fact out of this file -- gamma for the verify
-    window, and speculators_convention for the draft block width that sizes
+    window, and bonus_anchor for the draft block width that sizes
     CUDA-graph capture -- so it is parsed once and the caller picks fields off
     the result. Raises on config-load failure; callers pick the fallback.
     """
@@ -256,8 +256,8 @@ def _resolve_speculators_proposal_gamma(config: Any) -> Optional[int]:
     """speculators checkpoints carry their real draft length in
     speculators_config.proposal_methods[i].speculative_tokens -- prefer this
     over block_size (which counts the anchor+gamma block width, off by one
-    from gamma for speculators-trained checkpoints; see the comment on
-    speculators_convention below)."""
+    from gamma for bonus-anchor checkpoints; see the layout resolution in
+    parse_dspark_draft_config below)."""
     cfg = _get_speculators_config(config)
     proposal_methods = cfg.get("proposal_methods") or []
     if not isinstance(proposal_methods, (list, tuple)) or not proposal_methods:
@@ -366,52 +366,27 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
             f"DSpark mask_token_id must be non-negative, got {mask_token_id}."
         )
 
-    # speculators (github.com/vllm-project/speculators)-trained DSpark
-    # checkpoints use a different block-slot convention than the
-    # DeepSpec-trained ones this file was originally written against:
-    # DeepSpec trains block slot k to predict anchor+k+1, with the anchor
-    # itself (slot 0) also a real, trained prediction -- the draft block is
-    # exactly `gamma` slots wide, anchor-first. speculators instead trains
-    # the anchor as a separate, untrained conditioning token and slot j
-    # (j=1..gamma) to predict anchor+j -- the draft block is `gamma + 1`
-    # slots wide, with slot 0 (the anchor) excluded from both the sampled
-    # draft tokens and block-accept verification. Feeding a speculators
-    # checkpoint through the DeepSpec-width path reads every real slot one
-    # position early, degrading accept length to ~1 regardless of the
-    # underlying model's real speculative quality.
-    #
-    # This mirrors vLLM's validated `dspark_bonus_anchor` fix
-    # (vllm-project/vllm#47093 -- vllm/transformers_utils/configs/
-    # speculators/algos.py + vllm/v1/worker/gpu/spec_decode/dspark/
-    # speculator.py's `sample_from_anchor` flag) rather than unconditionally
-    # widening every DSpark block: DeepSpec-trained checkpoints
-    # (speculators_convention=False) keep exactly the behavior they had
-    # before this field existed. Diagnosed by jessiewei7 on
-    # sgl-project/sglang#30261 (2026-07-09); the width fix itself lives in
-    # dspark_draft.py's DraftBlockProposer and DsparkDraftSampler (see
-    # `bonus_anchor` there) -- this function only resolves the config-level
-    # facts (the flag, and the correct gamma to use for such checkpoints).
-    # Which of the two conventions a given speculators checkpoint uses is NOT
-    # implied by it being a speculators checkpoint: the trainer writes the
-    # choice into `sample_from_anchor`, and both values occur in the wild.
-    #   sample_from_anchor=False -> the anchor is a separate conditioning token
-    #                               -> gamma + 1 slots  (speculators_convention)
-    #   sample_from_anchor=True  -> the anchor is itself a trained prediction
-    #                               -> gamma slots      (DeepSpec layout)
-    # Keying off `speculators_model_type` alone (as this did originally) reads
-    # every dense speculators checkpoint one slot too wide, which is the exact
-    # mirror of the bug this flag was added to fix, so trust the explicit field
-    # first and fall back to the model-type heuristic only when it is absent.
+    # sample_from_anchor determines the draft layout for every DSpark checkpoint:
+    # False uses a separate bonus anchor and gamma + 1 slots; True uses gamma
+    # sampled slots. Legacy Speculators configs omitted the field and defaulted
+    # to False, while native DSpark configs default to True. Checkpoint origin is
+    # therefore only a backward-compatible default, never an override.
     speculators_model_type = _cfg_get(draft_hf_config, "speculators_model_type", None)
     is_speculators_dspark = (
         isinstance(speculators_model_type, str)
         and speculators_model_type.lower() == "dspark"
     )
-    sample_from_anchor = _cfg_get(draft_hf_config, "sample_from_anchor", None)
-    if isinstance(sample_from_anchor, bool):
-        speculators_convention = not sample_from_anchor
+    raw_sample_from_anchor = _cfg_get(draft_hf_config, "sample_from_anchor", None)
+    if raw_sample_from_anchor is None:
+        sample_from_anchor = not is_speculators_dspark
+    elif isinstance(raw_sample_from_anchor, bool):
+        sample_from_anchor = raw_sample_from_anchor
     else:
-        speculators_convention = is_speculators_dspark
+        raise ValueError(
+            "DSpark sample_from_anchor must be a bool when set, got "
+            f"{raw_sample_from_anchor!r}."
+        )
+    bonus_anchor = not sample_from_anchor
 
     # Cross-check against the block geometry, which encodes the same fact
     # independently: a 1+N checkpoint ships block_size == speculative_tokens + 1
@@ -421,19 +396,19 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     declared_block_size = _cfg_get(draft_hf_config, "block_size", None)
     declared_tokens = _resolve_speculators_proposal_gamma(draft_hf_config)
     if (
-        isinstance(sample_from_anchor, bool)
+        raw_sample_from_anchor is not None
         and declared_block_size is not None
         and declared_tokens is not None
     ):
-        geometry_convention = int(declared_block_size) == int(declared_tokens) + 1
-        if geometry_convention != speculators_convention:
+        geometry_bonus_anchor = int(declared_block_size) == int(declared_tokens) + 1
+        if geometry_bonus_anchor != bonus_anchor:
             raise ValueError(
                 "DSpark draft config is self-inconsistent: sample_from_anchor="
                 f"{sample_from_anchor} implies a "
-                f"{'gamma + 1' if speculators_convention else 'gamma'}-slot block, "
+                f"{'gamma + 1' if bonus_anchor else 'gamma'}-slot block, "
                 f"but block_size={int(declared_block_size)} vs "
                 f"speculative_tokens={int(declared_tokens)} implies a "
-                f"{'gamma + 1' if geometry_convention else 'gamma'}-slot block. "
+                f"{'gamma + 1' if geometry_bonus_anchor else 'gamma'}-slot block. "
                 "Fix the checkpoint config; running either way silently "
                 "misreads every draft slot."
             )
@@ -477,6 +452,6 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         mask_token_id=mask_token_id,
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
-        speculators_convention=speculators_convention,
+        bonus_anchor=bonus_anchor,
         draft_vocab_size=resolve_draft_vocab_size(draft_hf_config),
     )

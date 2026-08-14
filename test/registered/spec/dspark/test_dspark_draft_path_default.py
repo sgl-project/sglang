@@ -65,7 +65,7 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
     def test_draft_config_is_read_once_for_gamma_and_layout(self, read_config):
         read_config.return_value = SimpleNamespace(
             resolve_gamma=lambda *, default=None: 7,
-            speculators_convention=True,
+            bonus_anchor=True,
         )
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
@@ -86,7 +86,7 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
     def test_explicit_gamma_still_reads_layout_once(self, read_config):
         read_config.return_value = SimpleNamespace(
             resolve_gamma=lambda *, default=None: 999,
-            speculators_convention=True,
+            bonus_anchor=True,
         )
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
