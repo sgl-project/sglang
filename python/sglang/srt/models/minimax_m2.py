@@ -27,10 +27,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.kernels.ops.communication.all_reduce import (
-    fused_parallel_qknorm,
-    get_fused_parallel_qknorm_max_occupancy,
-)
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_pp_group,
@@ -101,6 +97,7 @@ from sglang.srt.utils import (
     get_compiler_backend,
     is_cpu,
     is_cuda,
+    is_xpu,
     is_non_idle_and_non_empty,
     is_npu,
     make_layers,
@@ -113,6 +110,13 @@ _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
+
+if not _is_xpu:
+    from sglang.kernels.ops.communication.all_reduce import (
+        fused_parallel_qknorm,
+        get_fused_parallel_qknorm_max_occupancy,
+    )
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import split_qkv_tp_rmsnorm_rope
