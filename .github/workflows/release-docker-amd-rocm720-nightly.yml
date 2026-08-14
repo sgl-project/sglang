@@ -21,6 +21,11 @@ on:
           - gfx950-rocm724
           - gfx942-rocm720
           - gfx950-rocm720
+      image_repo:
+        description: 'Push to this repo only instead of rocm/sgl-dev + lmsysorg/sglang-rocm (e.g. myuser/sglang-rocm-staging). Authenticates with DOCKERHUB_AMD_TEST_USERNAME/TOKEN.'
+        required: false
+        type: string
+        default: ''
   schedule:
     - cron: '0 12 * * *'
 
@@ -79,13 +84,31 @@ jobs:
           echo "Detected version: ${VERSION}"
           echo "Pretend version for pip: ${PRETEND_VERSION}"
 
+      # Guard against clicking through the dispatch form on a test branch and
+      # publishing an unreviewed image to the public rocm/sgl-dev repo.
+      - name: Require image_repo when dispatching from a branch
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref_name != 'main' && inputs.image_repo == '' }}
+        run: |
+          echo "::error::Dispatched from '${{ github.ref_name }}' without image_repo, which would publish to rocm/sgl-dev. Set image_repo to a staging repo."
+          exit 1
+
       - name: Login to Docker Hub
+        if: ${{ inputs.image_repo == '' }}
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
           password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
-      - name: Build and Push to rocm/sgl-dev
+      - name: Login to Docker Hub (staging)
+        if: ${{ inputs.image_repo != '' }}
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_TEST_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TEST_TOKEN }}
+
+      - name: Build and push image
+        env:
+          IMAGE_REPO: ${{ inputs.image_repo || 'rocm/sgl-dev' }}
         run: |
           version=${{ steps.version.outputs.version }}
           pretend_version=${{ steps.version.outputs.pretend_version }}
@@ -111,8 +134,10 @@ jobs:
           # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
           # UBUNTU_MIRROR forces apt over HTTPS to dodge port-80 reachability flakes
           # to Canonical's archive.ubuntu.com mirror IPs from the amd-docker-scale runner.
-          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg ENABLE_NIXL=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
-          docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
+          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg ENABLE_NIXL=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t "${IMAGE_REPO}:${tag}-${{ env.DATE }}" --no-cache
+          docker push "${IMAGE_REPO}:${tag}-${{ env.DATE }}"
+
+          echo "- \`${IMAGE_REPO}:${tag}-${{ env.DATE }}\`" >> "$GITHUB_STEP_SUMMARY"
 
       # Persist the tag right after rocm/sgl-dev push succeeds so the local
       # registry mirror can run even if a later step in this job (lmsys push)
@@ -131,12 +156,14 @@ jobs:
           retention-days: 1
 
       - name: Login to Docker Hub (lmsys)
+        if: ${{ inputs.image_repo == '' }}
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Push to lmsysorg/sglang-rocm
+        if: ${{ inputs.image_repo == '' }}
         run: |
           docker tag rocm/sgl-dev:${{ env.IMAGE_TAG }} lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
           docker push lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
