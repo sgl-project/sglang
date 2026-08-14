@@ -25,7 +25,7 @@ source.
 |-------------------------------|-----------------------------------------------------------------------------------------------|
 | Tensor Parallelism            | `--tp-size 64`                                                                                |
 | Data Parallelism              | `--enable-dp-attention \`<br/>`--dp-size 4`                                                   |
-| Expert Parallelism            | `--ep-size 64 \`<br/>`--moe-a2a-backend deepep \`<br/>`--deepep-mode auto`                    |
+| Expert Parallelism            | `--moe-a2a-backend deepep \`<br/>`--deepep-mode auto`                                    |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | auto based on device memory, or set explicit value;<br/>disable with `--chunked-prefill-size -1`; e.g., `--chunked-prefill-size 8192` |
 | NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs 16` |
@@ -145,7 +145,6 @@ rank by matching the local IP address against `IPS`.
 # ============================================================
 # Before running, update the following variables:
 #   IPS: IP addresses of each node in the cluster
-#   IP_MASTER: rank 0 node IP address with port
 #   MODEL_PATH: path to the model weights directory
 #   HCCL_SOCKET_IFNAME: network interface name for HCCL
 #   GLOO_SOCKET_IFNAME: network interface name for Gloo
