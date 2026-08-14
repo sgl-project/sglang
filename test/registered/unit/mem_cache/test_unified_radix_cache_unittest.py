@@ -271,7 +271,9 @@ def build_fixture(
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
 
     ``tree_page_size`` stands in for DCP, which widens the tree page past the
-    ``page_size`` the rest of the config still sees.
+    ``page_size`` the rest of the config still sees. It only reaches values
+    derived from the tree page: the allocator keeps ``cfg.page_size``, whereas
+    DCP sets the two equal, so do not read insert or match behaviour off it.
     """
     server_args = ServerArgs(
         model_path="dummy",

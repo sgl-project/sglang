@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -39,6 +38,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
 from sglang.srt.runtime_context import (
     get_exec,
     mamba_cache_chunk_size,
+    mamba_checkpoint_grid,
 )
 
 if TYPE_CHECKING:
@@ -72,9 +72,7 @@ class MambaComponent(TreeComponent):
         self.mamba_cache_chunk_size = mamba_cache_chunk_size()
         # params.page_size is the tree page the allocator actually uses, already
         # widened by dcp_size, so it is the one grid a checkpoint depth can land on.
-        self.mamba_checkpoint_grid = math.lcm(
-            self.mamba_cache_chunk_size, params.page_size
-        )
+        self.mamba_checkpoint_grid = mamba_checkpoint_grid(params.page_size)
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
