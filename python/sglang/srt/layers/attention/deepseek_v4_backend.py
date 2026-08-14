@@ -64,7 +64,7 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
@@ -480,9 +480,7 @@ class DSV4AttnMetadata:
                 (num_tokens, SWA_WINDOW + w4), **self.cuda_int32_kwargs
             )
             self.trtllm_c4_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
-            self.trtllm_c4_lens = torch.empty(
-                (num_tokens,), **self.cuda_int32_kwargs
-            )
+            self.trtllm_c4_lens = torch.empty((num_tokens,), **self.cuda_int32_kwargs)
         if self.c128_page_indices is not None:
             w128 = self.c128_page_indices.shape[-1]
             assert w128 % 4 == 0, f"{w128=}"
@@ -491,9 +489,9 @@ class DSV4AttnMetadata:
             )
             self.trtllm_c128_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
             self.trtllm_c128_indices[:, SWA_WINDOW:].copy_(self.c128_page_indices)
-            self.trtllm_c128_lens = (
-                self.c128_topk_lengths_clamp1 + SWA_WINDOW
-            ).to(torch.int32)
+            self.trtllm_c128_lens = (self.c128_topk_lengths_clamp1 + SWA_WINDOW).to(
+                torch.int32
+            )
 
 
 @dataclass
@@ -2077,9 +2075,9 @@ class DeepseekV4AttnBackend(
         if compress_ratio == 4:
             assert extra_indices is not None and extra_topk_lengths is not None
             width = extra_indices.shape[-1]
-            assert SWA_WINDOW + width == sparse_indices.shape[1], (
-                f"{width=} {sparse_indices.shape=}"
-            )
+            assert (
+                SWA_WINDOW + width == sparse_indices.shape[1]
+            ), f"{width=} {sparse_indices.shape=}"
             sparse_indices[:, SWA_WINDOW:].copy_(extra_indices)
             # Lens include the fixed 128 SWA slots; SWA validity itself is
             # derived from seq_lens inside the kernel.
@@ -2216,9 +2214,10 @@ class DeepseekV4AttnBackend(
                 )
                 core.trtllm_prefill_c4_indices[:, :SWA_WINDOW].copy_(swa_indices)
             sparse_indices = core.trtllm_prefill_c4_indices
-            assert sparse_indices.shape == (sum_q, SWA_WINDOW + width), (
-                f"{sparse_indices.shape=} {width=}"
-            )
+            assert sparse_indices.shape == (
+                sum_q,
+                SWA_WINDOW + width,
+            ), f"{sparse_indices.shape=} {width=}"
             sparse_indices[:, SWA_WINDOW:].copy_(extra_indices[:sum_q])
             # Total lens include the fixed 128 SWA slots; SWA validity itself
             # is derived from seq_lens/cum_seq_lens_q inside the kernel.

@@ -153,6 +153,14 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         assert (
             not server_args.enable_hisparse
         ), "--dsv4-attn-backend trtllm does not support enable_hisparse."
+        if server_args.enable_dp_attention and server_args.enable_mixed_chunk:
+            logger.warning(
+                "Disabling mixed-chunk scheduling for the TRT-LLM DeepSeek-V4 "
+                "backend with DP attention. Uneven cached-prefix batches can "
+                "leave DP ranks in different live forward modes and deadlock "
+                "rank-coupled DeepEP collectives."
+            )
+            server_args.enable_mixed_chunk = False
         logger.info(
             "DeepSeek V4 attention: trtllm backend enabled "
             "(uniform-FP8 KV pool, decode + sparse prefill)."

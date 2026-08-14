@@ -642,7 +642,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # Uniform 512-dim e4m3 layout for the trtllm attention backend
         self.uniform_fp8 = (
             not self._unified_kv
-        ) and get_server_args().dsv4_attn_backend == "trtllm"
+        ) and get_exec().kernel.dsv4_attn_backend == "trtllm"
 
         if self._unified_kv:
             self.swa_kv_pool = None

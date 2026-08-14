@@ -1807,6 +1807,7 @@ class ServerArgs:
             "sparse MLA kernel. The backend choice is shared by prefill and decode.",
             choices=DSV4_ATTN_BACKEND_CHOICES,
         ),
+        NS("exec.kernel"),
     ] = "auto"
     disable_flashinfer_autotune: A[
         bool, "Disable FlashInfer autotuning.", NS("exec.kernel")
