@@ -1328,7 +1328,7 @@ class Envs:
     # Compute the sparse index top-k on every Nth sparse
     # layer ("source") and reuse it on the following N-1 ("skip") layers.
     # 1 disables the sharing (every layer computes its own top-k).
-    SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(4)
+    SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(6)
     # Gluon sparse PREFILL. Replaces the Triton flash_prefill_with_gqa_share_sparse
     # main-attention step with AITER's pa_decode_gluon (every prefill query
     # token treated as a length-1 decode over a per-token sparse block table).
