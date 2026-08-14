@@ -15,6 +15,8 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import (
     ModelConfig,
+    can_use_compact_npu_dsa_indexer_cache,
+    can_use_npu_quant_lightning_indexer,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -22,6 +24,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
+    resolve_dsa_indexer_layer_ids,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.distributed.utils import get_pp_indices
@@ -1280,6 +1283,39 @@ class KVCacheConfigurator:
             NPUMLATokenToKVPool,
         )
 
+        indexer_layer_ids = None
+        if is_dsa_model and can_use_compact_npu_dsa_indexer_cache(self.server_args):
+            is_nextn = self.is_draft_worker and bool(
+                self.model_config.num_nextn_predict_layers
+            )
+            indexer_layer_ids = resolve_dsa_indexer_layer_ids(
+                self.model_config.hf_config,
+                self.layer_info.start_layer,
+                self.layer_info.end_layer,
+                is_nextn=is_nextn,
+            )
+            logger.info(
+                "NPU DSA Indexer cache uses %d physical layer(s) for %d "
+                "local transformer layer(s): %s",
+                len(indexer_layer_ids),
+                self.layer_info.num_effective_layers,
+                indexer_layer_ids,
+            )
+        elif is_dsa_model:
+            logger.info(
+                "NPU DSA Indexer cache keeps the uniform all-layer layout "
+                "for PD disaggregation or HiCache compatibility."
+            )
+
+        enable_quant_lightning_indexer = (
+            is_dsa_model
+            and can_use_npu_quant_lightning_indexer(
+                self.server_args,
+                self.model_config.hf_config,
+                self.kv_cache_dtype,
+                self.gpu_id,
+            )
+        )
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -1292,6 +1328,17 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            indexer_layer_ids=indexer_layer_ids,
+            enable_npu_quant_lightning_indexer=enable_quant_lightning_indexer,
+            kv_cache_dim=(
+                calculate_mla_kv_cache_dim(
+                    model_config=self.model_config,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    server_args=self.server_args,
+                )
+                if enable_quant_lightning_indexer
+                else None
+            ),
         )
         return token_to_kv_pool
 

@@ -130,7 +130,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.kv_cache_dim = self.override_kv_cache_dim or (
             self.kv_lora_rank + self.qk_rope_head_dim
         )
-        return self.kv_cache_dim * self.dtype.itemsize * self.layer_num
+        size_per_token = self.kv_cache_dim * self.dtype.itemsize * self.layer_num
+        if (
+            self.layout == "page_first_kv_split"
+            and self.device_pool.index_head_dim is not None
+        ):
+            # Ascend allocates Indexer K as a third per-layer host buffer.  It
+            # must participate in fixed-byte host capacity sizing as well.
+            size_per_token += (
+                self.device_pool.index_head_dim * self.dtype.itemsize * self.layer_num
+            )
+        return size_per_token
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()

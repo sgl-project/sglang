@@ -1814,27 +1814,9 @@ class DeepseekV2AttentionMLA(
 
         self.skip_topk = None
         self.next_skip_topk = None
+        self.indexer = None
         if self.use_dsa:
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
-            self.indexer = Indexer(
-                hidden_size=hidden_size,
-                index_n_heads=get_dsa_index_n_heads(config),
-                index_head_dim=get_dsa_index_head_dim(config),
-                rope_head_dim=qk_rope_head_dim,
-                index_topk=get_dsa_index_topk(config),
-                q_lora_rank=q_lora_rank,
-                max_position_embeddings=max_position_embeddings,
-                rope_theta=rope_theta,
-                scale_fmt="ue8m0",
-                block_size=128,
-                rope_scaling=rope_scaling,
-                is_neox_style=is_neox_style,
-                prefix=add_prefix("indexer", prefix),
-                quant_config=quant_config,
-                layer_id=layer_id,
-                alt_stream=alt_stream,
-                config=config,
-            )
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
@@ -1849,6 +1831,27 @@ class DeepseekV2AttentionMLA(
                 else:
                     self.skip_topk = dsa_layer_skips_topk(config, layer_id)
                     self.next_skip_topk = dsa_layer_skips_topk(config, layer_id + 1)
+
+            if not self.skip_topk or is_nextn:
+                self.indexer = Indexer(
+                    hidden_size=hidden_size,
+                    index_n_heads=get_dsa_index_n_heads(config),
+                    index_head_dim=get_dsa_index_head_dim(config),
+                    rope_head_dim=qk_rope_head_dim,
+                    index_topk=get_dsa_index_topk(config),
+                    q_lora_rank=q_lora_rank,
+                    max_position_embeddings=max_position_embeddings,
+                    rope_theta=rope_theta,
+                    scale_fmt="ue8m0",
+                    block_size=128,
+                    rope_scaling=rope_scaling,
+                    is_neox_style=is_neox_style,
+                    prefix=add_prefix("indexer", prefix),
+                    quant_config=quant_config,
+                    layer_id=layer_id,
+                    alt_stream=alt_stream,
+                    config=config,
+                )
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -1930,6 +1933,8 @@ class DeepseekV2AttentionMLA(
         self.w_kc = None
         self.w_vc = None
         self.w_scale = 1.0
+        self.kv_quant_method = None
+        self._init_kv_quant_weights(quant_config, prefix)
 
         # Full-head Q/absorb weights for --dcp-replicate-q-proj, gathered once
         # pre-CUDA-graph-capture by the model runner; None unless replicate is on.
@@ -1965,6 +1970,26 @@ class DeepseekV2AttentionMLA(
         self.init_mla_forward()
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
+
+    def _init_kv_quant_weights(
+        self, quant_config: Optional[QuantizationConfig], prefix: str
+    ) -> None:
+        if quant_config is None or not _is_npu:
+            return
+
+        self.kv_quant_method = quant_config.get_quant_method(self, prefix=prefix)
+        if self.kv_quant_method is None:
+            return
+
+        self.kv_quant_method.create_weights(
+            self,
+            num_heads=self.num_local_heads,
+            num_kv_heads=1,
+        )
+
+    def refresh_fa_k_scale_params(self) -> None:
+        if self.kv_quant_method is not None:
+            self.kv_quant_method.process_weights_after_loading(self)
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):

@@ -10,9 +10,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -141,7 +144,9 @@ def _make_model_runner(
     mr.ps = ParallelState.trivial()
     mr.pp_group = SimpleNamespace(rank_in_group=0)
     mr.spec_aux_config = SimpleNamespace(
-        eagle_draft_num_layers=None, dflash_draft_num_layers=None
+        eagle_draft_num_layers=None,
+        eagle_draft_kv_cache_dtype=None,
+        dflash_draft_num_layers=None,
     )
 
     return mr
@@ -587,6 +592,41 @@ class TestEagleConfigurator(unittest.TestCase):
         total_layers = num_layers + eagle_draft_num_layers
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
+
+
+class TestNPUDSAEagleConfigurator(CustomTestCase):
+    @patch("sglang.srt.configs.model_config.is_npu_atlas_a5", return_value=True)
+    def test_target_fp8_and_draft_bf16_are_budgeted_separately(self, _mock_is_a5):
+        runner = _make_model_runner(num_layers=2, use_mla_backend=True)
+        runner.device = "npu"
+        runner.gpu_id = 0
+        runner.kv_cache_dtype = torch.float8_e4m3fn
+        runner.model_config.num_nextn_predict_layers = 1
+        runner.model_config.hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
+            index_head_dim=128,
+            index_topk_freq=1,
+            index_skip_topk_offset=1,
+        )
+        runner.server_args.enable_hierarchical_cache = False
+        runner.server_args.dsa_prefill_backend = "ascend"
+        runner.server_args.dsa_decode_backend = "ascend"
+        runner.spec_algorithm.is_eagle.return_value = True
+        runner.spec_algorithm.is_none.return_value = False
+        runner.spec_aux_config.eagle_draft_num_layers = 1
+        runner.spec_aux_config.eagle_draft_kv_cache_dtype = torch.bfloat16
+
+        from sglang.srt.model_executor.pool_configurator import (
+            DefaultPoolConfigurator,
+        )
+
+        with get_parallel().override(attn_tp_size=1):
+            configurator = DefaultPoolConfigurator(runner)
+
+        target_bytes = 2 * (656 + 132)
+        draft_bytes = 576 * torch.bfloat16.itemsize + 128 * torch.bfloat16.itemsize
+        self.assertEqual(configurator._cell_size, target_bytes + draft_bytes)
 
 
 class TestFactory(unittest.TestCase):

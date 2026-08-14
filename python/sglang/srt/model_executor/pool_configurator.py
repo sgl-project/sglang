@@ -21,6 +21,8 @@ import torch
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
+    can_use_compact_npu_dsa_indexer_cache,
+    can_use_npu_quant_lightning_indexer,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -28,6 +30,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
+    resolve_dsa_indexer_layer_ids,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
@@ -91,6 +94,52 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     if cell_size is None or int(cell_size) <= 0:
         return 0
     return int(cell_size) * get_parallel().attn_dcp_size
+
+
+def _is_npu_pool_device(device: object) -> bool:
+    return str(device).split(":", 1)[0].casefold() == "npu"
+
+
+def _get_npu_dsa_indexer_size_per_token(
+    model_config,
+    kv_cache_dtype: torch.dtype,
+    *,
+    has_scale_cache: bool,
+) -> int:
+    """Bytes used by one physical Ascend DSA Indexer layer per token."""
+    size = get_dsa_index_head_dim(model_config.hf_config) * torch._utils._element_size(
+        kv_cache_dtype
+    )
+    if has_scale_cache:
+        size += torch.float32.itemsize
+    return size
+
+
+def _get_npu_dsa_indexer_layer_count(kvc: KVCacheConfigurator, num_layers: int) -> int:
+    if not can_use_compact_npu_dsa_indexer_cache(kvc.server_args):
+        return num_layers
+    is_nextn = kvc.is_draft_worker and bool(kvc.model_config.num_nextn_predict_layers)
+    return len(
+        resolve_dsa_indexer_layer_ids(
+            kvc.model_config.hf_config,
+            kvc.layer_info.start_layer,
+            kvc.layer_info.end_layer,
+            is_nextn=is_nextn,
+        )
+    )
+
+
+def _npu_dsa_indexer_has_scale_cache(
+    kvc: KVCacheConfigurator, kv_cache_dtype: Optional[torch.dtype] = None
+) -> bool:
+    if kv_cache_dtype is None:
+        kv_cache_dtype = kvc.kv_cache_dtype
+    return can_use_npu_quant_lightning_indexer(
+        kvc.server_args,
+        kvc.model_config.hf_config,
+        kv_cache_dtype,
+        kvc.gpu_id,
+    )
 
 
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
@@ -177,10 +226,49 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
-                self._cell_size = int(
-                    self._cell_size
-                    * (1 + int(eagle_draft_num_layers) / int(num_layers))
-                )
+                if (
+                    kvc.spec_algorithm.is_eagle()
+                    and _is_npu_pool_device(kvc.device)
+                    and is_deepseek_dsa(kvc.model_config.hf_config)
+                ):
+                    from sglang.srt.mem_cache.kv_cache_configurator import (
+                        calculate_mla_kv_cache_dim,
+                    )
+
+                    draft_num_layers = int(eagle_draft_num_layers)
+                    draft_kv_cache_dtype = (
+                        kvc.spec_aux_config.eagle_draft_kv_cache_dtype
+                        or kvc.kv_cache_dtype
+                    )
+                    draft_main_size_per_layer = calculate_mla_kv_cache_dim(
+                        model_config=kvc.model_config,
+                        kv_cache_dtype=draft_kv_cache_dtype,
+                        server_args=kvc.server_args,
+                    ) * torch._utils._element_size(draft_kv_cache_dtype)
+                    draft_indexer_layers = len(
+                        resolve_dsa_indexer_layer_ids(
+                            kvc.model_config.hf_config,
+                            0,
+                            draft_num_layers,
+                            is_nextn=True,
+                        )
+                    )
+                    self._cell_size += (
+                        draft_num_layers * draft_main_size_per_layer
+                        + draft_indexer_layers
+                        * _get_npu_dsa_indexer_size_per_token(
+                            kvc.model_config,
+                            draft_kv_cache_dtype,
+                            has_scale_cache=_npu_dsa_indexer_has_scale_cache(
+                                kvc, draft_kv_cache_dtype
+                            ),
+                        )
+                    )
+                else:
+                    self._cell_size = int(
+                        self._cell_size
+                        * (1 + int(eagle_draft_num_layers) / int(num_layers))
+                    )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
         if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
@@ -211,9 +299,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             get_glm_dsa_layer_split_effective_num_layers,
         )
 
-        effective_num_layers = get_glm_dsa_layer_split_effective_num_layers(
-            kvc, num_layers
-        )
+        if _is_npu_pool_device(kvc.device):
+            # The Ascend MLA pool is not wrapped by LayerSplitDSATokenToKVPool.
+            effective_num_layers = num_layers
+        else:
+            effective_num_layers = get_glm_dsa_layer_split_effective_num_layers(
+                kvc, num_layers
+            )
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
@@ -247,27 +339,36 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
-                index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
-                indexer_size_per_token = (
-                    index_head_dim
-                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4
-                )
-                element_size = torch._utils._element_size(
-                    DSATokenToKVPool.index_k_with_scale_buffer_dtype
-                )
-                indexer_ratio = 1
-                if kvc.server_args.enable_hisparse:
-                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+                if _is_npu_pool_device(kvc.device):
+                    cell_size += _get_npu_dsa_indexer_size_per_token(
+                        model_config,
+                        kv_cache_dtype,
+                        has_scale_cache=_npu_dsa_indexer_has_scale_cache(kvc),
+                    ) * _get_npu_dsa_indexer_layer_count(kvc, effective_num_layers)
+                else:
+                    index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
+                    indexer_size_per_token = (
+                        index_head_dim
+                        + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+                    )
+                    element_size = torch._utils._element_size(
+                        DSATokenToKVPool.index_k_with_scale_buffer_dtype
+                    )
+                    indexer_ratio = 1
+                    if kvc.server_args.enable_hisparse:
+                        from sglang.srt.mem_cache.sparsity import (
+                            parse_hisparse_config,
+                        )
 
-                    indexer_ratio = parse_hisparse_config(
-                        kvc.server_args
-                    ).host_to_device_ratio
-                cell_size += int(
-                    indexer_size_per_token
-                    * effective_num_layers
-                    * element_size
-                    * indexer_ratio
-                )
+                        indexer_ratio = parse_hisparse_config(
+                            kvc.server_args
+                        ).host_to_device_ratio
+                    cell_size += int(
+                        indexer_size_per_token
+                        * effective_num_layers
+                        * element_size
+                        * indexer_ratio
+                    )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
             # (sparse-only, single-head; kv layers store K+V, k-only layers store K).
