@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import torch
+from transformers import Qwen2_5_VLForConditionalGeneration
 
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
@@ -11,6 +12,12 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     ComponentOffloadStrategy,
     ResidentStrategy,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_transformers import (
+    LayerwiseOffloadableQwen2_5VLForConditionalGeneration,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding import (
     RealtimeTextEncodingStage,
@@ -215,6 +222,71 @@ def test_realtime_text_encoder_use_starts_at_call_site():
     assert len(uses) == 1
     assert uses[0].component_name == "text_encoder"
     assert uses[0].start_at_stage_entry is False
+
+
+def test_transformers_qwen_generation_model_supports_layerwise_offload():
+    assert issubclass(
+        LayerwiseOffloadableQwen2_5VLForConditionalGeneration,
+        LayerwiseOffloadableModuleMixin,
+    )
+    assert LayerwiseOffloadableQwen2_5VLForConditionalGeneration.layer_names == [
+        "model.language_model.layers",
+        "model.visual.blocks",
+    ]
+
+
+def test_layerwise_qwen_loads_through_upstream_class(monkeypatch):
+    model = Qwen2_5_VLForConditionalGeneration.__new__(
+        Qwen2_5_VLForConditionalGeneration
+    )
+    upstream_load = Mock(return_value=model)
+    monkeypatch.setattr(
+        Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        upstream_load,
+    )
+
+    loaded = LayerwiseOffloadableQwen2_5VLForConditionalGeneration.from_pretrained(
+        "model", subfolder="text_encoder"
+    )
+
+    upstream_load.assert_called_once_with("model", subfolder="text_encoder")
+    assert loaded is model
+    assert type(loaded) is LayerwiseOffloadableQwen2_5VLForConditionalGeneration
+
+
+def test_qwen_layered_registers_stage_loaded_text_encoder(monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines import qwen_image
+
+    text_encoder = object()
+    stage = SimpleNamespace(text_encoder=text_encoder)
+    pipeline = qwen_image.QwenImageLayeredPipeline.__new__(
+        qwen_image.QwenImageLayeredPipeline
+    )
+    pipeline.model_path = "model"
+    pipeline.modules = {
+        name: object()
+        for name in ("vae", "tokenizer", "processor", "transformer", "scheduler")
+    }
+    pipeline.add_stage_factory = lambda _role, factory, _name: factory()
+    pipeline.add_standard_timestep_preparation_stage = lambda **_kwargs: None
+    pipeline.add_standard_denoising_stage = lambda: None
+    pipeline.add_standard_decoding_stage = lambda: None
+    monkeypatch.setattr(
+        qwen_image,
+        "QwenImageLayeredBeforeDenoisingStage",
+        lambda **_kwargs: stage,
+    )
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            vae_precision="bf16",
+            text_encoder_precisions=("bf16",),
+        )
+    )
+
+    pipeline.create_pipeline_stages(server_args)
+
+    assert pipeline.modules["text_encoder"] is text_encoder
 
 
 def test_single_component_stage_is_finished_at_stage_exit():

@@ -173,14 +173,16 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
         self.vae_dtype = vae_dtype
         self.text_encoder_dtype = text_encoder_dtype
         if text_encoder is None:
-            from transformers import Qwen2_5_VLForConditionalGeneration
-
-            text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_path, subfolder="text_encoder"
+            from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_transformers import (
+                load_qwen2_5vl_generation_model,
             )
-        self.text_encoder = text_encoder.to(
-            device=get_local_torch_device(), dtype=self.text_encoder_dtype
-        )
+
+            text_encoder = load_qwen2_5vl_generation_model(
+                model_path,
+                server_args=self.server_args,
+                dtype=self.text_encoder_dtype,
+            )
+        self.text_encoder = text_encoder
         self.tokenizer = tokenizer
         self.processor = processor
         self.transformer = transformer

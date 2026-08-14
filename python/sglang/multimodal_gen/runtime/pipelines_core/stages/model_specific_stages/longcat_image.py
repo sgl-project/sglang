@@ -204,16 +204,14 @@ class LongCatPromptRewriteStage(PipelineStage):
     ):
         super().__init__()
         self.text_encoder_dtype = text_encoder_dtype
-        from transformers import Qwen2_5_VLForConditionalGeneration
+        from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_transformers import (
+            load_qwen2_5vl_generation_model,
+        )
 
-        cpu_offload = self.server_args.should_start_component_on_cpu("text_encoder")
-        init_device = torch.device("cpu") if cpu_offload else get_local_torch_device()
-        self.text_encoder = (
-            Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_path, subfolder="text_encoder"
-            )
-            .to(init_device)
-            .to(dtype=self.text_encoder_dtype)
+        self.text_encoder = load_qwen2_5vl_generation_model(
+            model_path,
+            server_args=self.server_args,
+            dtype=self.text_encoder_dtype,
         )
         self.tokenizer = tokenizer
         self.text_processor = text_processor
