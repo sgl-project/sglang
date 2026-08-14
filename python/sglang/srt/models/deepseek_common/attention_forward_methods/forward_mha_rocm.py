@@ -29,6 +29,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha imp
 )
 from sglang.srt.models.deepseek_common.utils import (
     _is_block_scale_fp8,
+    _is_per_channel_dynamic_fp8,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
@@ -65,7 +66,7 @@ if _use_aiter_gfx95:
             rmsnorm2d_fwd_with_dynamicquant(
                 out, x, yscale, weight, eps, group_size=0  # group_size=0 -> per-token
             )
-            return out, yscale
+            return out, yscale, x.dtype
 
         _has_rmsnorm_pertoken_fp8 = True
     except ImportError:
@@ -163,12 +164,15 @@ class DeepseekMHARocmForwardMixin:
             elif (
                 _use_aiter_gfx95
                 and _has_rmsnorm_pertoken_fp8
-                and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+                and _is_per_channel_dynamic_fp8(self.q_b_proj)
             ):
-                # Per-channel fp8 q_b_proj (prefill): fold the per-token fp8
-                # activation quant into q_a_layernorm. q becomes (fp8, scale[m,1])
-                # consumed by apply_fp8_linear's tuple path -> gemm_a8w8_bpreshuffle,
-                # removing the standalone per-token quant before q_b_proj.
+                # Per-channel *dynamic* fp8 q_b_proj (prefill): fold the per-token
+                # fp8 activation quant into q_a_layernorm. q becomes
+                # (fp8, scale[m,1], orig_dtype) consumed by apply_fp8_linear's
+                # tuple path -> gemm_a8w8_bpreshuffle, removing the standalone
+                # per-token quant before q_b_proj. Gated on the real layout
+                # contract (see _is_per_channel_dynamic_fp8): per-tensor / static
+                # / non-preshuffled fp8 fall through to the bf16 path below.
                 # Block-scale fp8 is handled above.
                 q_tuple = _fused_rmsnorm_pertoken_fp8(
                     q,
@@ -215,14 +219,16 @@ class DeepseekMHARocmForwardMixin:
         elif (
             _use_aiter_gfx95
             and _has_rmsnorm_pertoken_fp8
-            and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn
+            and _is_per_channel_dynamic_fp8(self.kv_b_proj)
         ):
-            # Per-channel fp8 kv_b_proj (prefill): fold the per-token fp8 quant
-            # into kv_a_layernorm. kv_a_quanted=(fp8, scale[m,1]) feeds kv_b_proj
-            # via apply_fp8_linear's tuple path (removing the standalone per-token
-            # quant). kv_a (bf16) is still needed for the KV-cache write
-            # (_set_mla_kv_buffer) and the mha_one_shot refetch, so normalize it
-            # separately in bf16 as before.
+            # Per-channel *dynamic* fp8 kv_b_proj (prefill): fold the per-token
+            # fp8 quant into kv_a_layernorm. kv_a_quanted=(fp8, scale[m,1],
+            # orig_dtype) feeds kv_b_proj via apply_fp8_linear's tuple path
+            # (removing the standalone per-token quant). Gated on the real layout
+            # contract (see _is_per_channel_dynamic_fp8): per-tensor / static /
+            # non-preshuffled fp8 fall through to the bf16 path below. kv_a (bf16)
+            # is still needed for the KV-cache write (_set_mla_kv_buffer) and the
+            # mha_one_shot refetch, so normalize it separately in bf16 as before.
             kv_a_quanted = _fused_rmsnorm_pertoken_fp8(
                 kv_a,
                 self.kv_a_layernorm.weight,

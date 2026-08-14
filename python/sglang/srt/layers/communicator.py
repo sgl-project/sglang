@@ -126,10 +126,14 @@ def _fused_rmsnorm_fp8_per_token_quant(
                   and returns updated residual_out as second element.
 
     Returns:
-        If residual is None:  (out_fp8, scale)
-        If residual provided: ((out_fp8, scale), residual_out)
+        If residual is None:  (out_fp8, scale, orig_dtype)
+        If residual provided: ((out_fp8, scale, orig_dtype), residual_out)
+
+    ``orig_dtype`` carries the pre-quant activation dtype so apply_fp8_linear
+    can preserve it (FP16 must not be silently promoted to BF16).
     """
     M, N = hidden_states.shape
+    orig_dtype = hidden_states.dtype
     out_fp8 = torch.empty((M, N), dtype=_aiter_fp8_dtype, device=hidden_states.device)
     scale = torch.empty(M, dtype=torch.float32, device=hidden_states.device)
     if residual is not None:
@@ -144,7 +148,7 @@ def _fused_rmsnorm_fp8_per_token_quant(
             epsilon,
             0,  # group_size=0 → per-token
         )
-        return (out_fp8, scale.unsqueeze(1)), residual_out
+        return (out_fp8, scale.unsqueeze(1), orig_dtype), residual_out
     else:
         _aiter_rmsnorm_quant(
             out_fp8,
@@ -154,7 +158,7 @@ def _fused_rmsnorm_fp8_per_token_quant(
             epsilon,
             0,  # group_size=0 → per-token
         )
-        return (out_fp8, scale.unsqueeze(1))
+        return (out_fp8, scale.unsqueeze(1), orig_dtype)
 
 
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
@@ -635,9 +639,23 @@ class LayerCommunicator:
                         )
                 else:
                     hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
-                    hidden_states, residual = self.input_layernorm(
-                        hidden_states, residual
-                    )
+                    if _use_aiter and quant_format == "fp8_per_token":
+                        # AR-fusion kernels are unavailable at this token count
+                        # (typically large-batch prefill), but we can still fold
+                        # the entry-proj per-token fp8 quant into the post-AR
+                        # RMSNorm so fused_qkv_a_proj_with_mqa consumes the
+                        # (fp8, scale, orig_dtype) tuple instead of a standalone
+                        # per-token quant. Mirrors the non-AR path below.
+                        hidden_states, residual = _fused_rmsnorm_fp8_per_token_quant(
+                            hidden_states,
+                            self.input_layernorm.weight.data,
+                            self.input_layernorm.variance_epsilon,
+                            residual=residual,
+                        )
+                    else:
+                        hidden_states, residual = self.input_layernorm(
+                            hidden_states, residual
+                        )
             else:
                 if residual is None:
                     residual = hidden_states

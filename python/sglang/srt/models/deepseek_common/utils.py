@@ -89,6 +89,41 @@ def _is_block_scale_fp8(proj: torch.nn.Module) -> bool:
     return weight_scale.shape[-1] > 1
 
 
+def _is_per_channel_dynamic_fp8(proj: torch.nn.Module) -> bool:
+    """Return True only when proj's (fp8, per-token scale) tuple may be fed
+    straight to ``gemm_a8w8_bpreshuffle``.
+
+    That kernel assumes a specific layout contract, and only this exact
+    configuration establishes it:
+      * preshuffled weight   -> only produced on the aiter bpreshuffle path,
+      * dynamic activation   -> proj has no static per-tensor ``input_scale``,
+      * per-channel w scale  -> one scale per output row. This checkpoint stores
+        it as a 1-D ``[N]`` tensor, though ``[N, 1]`` is also accepted.
+
+    Block-scale (2-D ``[N, K/block]``), per-tensor (scalar ``input_scale`` or
+    single-element ``weight_scale``), and static-input-scale fp8 all violate
+    this contract, so they must keep the plain bf16 + separate-quant path.
+    Callers use this to gate tuple production/consumption; ``_is_block_scale_fp8``
+    covers the block-scale case separately.
+    """
+    if not _use_aiter_bpreshuffle_gfx95:
+        return False
+    if not hasattr(proj, "weight") or proj.weight.dtype != torch.float8_e4m3fn:
+        return False
+    # Static per-tensor activation scaling => not the dynamic per-token path.
+    if getattr(proj, "input_scale", None) is not None:
+        return False
+    weight_scale = getattr(proj, "weight_scale", None)
+    if weight_scale is None:
+        return False
+    # Block-scale (2-D with >1 columns) is not per-channel -- handled elsewhere.
+    if weight_scale.dim() == 2 and weight_scale.shape[-1] > 1:
+        return False
+    # Per-channel: one scale per output row (numel > 1), stored 1-D [N] or 2-D
+    # [N, 1]. Per-tensor (numel == 1) keeps the bf16 + separate-quant path.
+    return weight_scale.numel() > 1
+
+
 def awq_dequantize_func():
     """
     Get the AWQ dequantize function for the current device

@@ -55,6 +55,7 @@ from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _is_block_scale_fp8,
     _is_gfx95_supported,
+    _is_per_channel_dynamic_fp8,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
@@ -108,10 +109,12 @@ if _use_aiter:
 
         def fused_qk_rmsnorm_q_pertoken_fp8(q, q_weight, q_eps, k, k_weight, k_eps):
             # Fold the q_b_proj per-token fp8 activation quant INTO the fused
-            # q/kv RMSNorm: q is emitted as (fp8, x_scale[m,1]) ready for the
-            # tuned gemm_a8w8_bpreshuffle, eliminating the standalone per-token
-            # quant launch before q_b_proj. k (kv_a) stays bf16 (it feeds the
-            # absorbed w_kc/w_vc BMMs, not a bpreshuffle GEMM).
+            # q/kv RMSNorm: q is emitted as (fp8, x_scale[m,1], orig_dtype) ready
+            # for the tuned gemm_a8w8_bpreshuffle, eliminating the standalone
+            # per-token quant launch before q_b_proj. orig_dtype carries the
+            # pre-quant activation dtype so apply_fp8_linear can preserve it
+            # (FP16 must not be silently promoted to BF16). k (kv_a) stays bf16
+            # (it feeds the absorbed w_kc/w_vc BMMs, not a bpreshuffle GEMM).
             q_q = torch.empty_like(q, dtype=torch.float8_e4m3fn)
             q_s = torch.empty((q.shape[0], 1), dtype=torch.float32, device=q.device)
             k_out = torch.empty_like(k)
@@ -127,7 +130,7 @@ if _use_aiter:
                 k_epsilon=k_eps,
                 quant_type=_AiterQuantType.per_Token,
             )
-            return (q_q, q_s), k_out
+            return (q_q, q_s, q.dtype), k_out
 
         _has_fused_qk_pertoken_fp8 = True
 
@@ -408,15 +411,18 @@ class DeepseekMLARocmForwardMixin:
                 _use_aiter
                 and _has_fused_qk_pertoken_fp8
                 and not self.use_dsa
-                and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+                and _is_per_channel_dynamic_fp8(self.q_b_proj)
             ):
-                # Per-channel fp8 q_b_proj: fold its per-token activation quant
-                # into the fused q/kv RMSNorm. q becomes a (fp8, x_scale[m,1])
-                # tuple consumed directly by gemm_a8w8_bpreshuffle in
-                # apply_fp8_linear, removing the standalone per-token quant
-                # before q_b_proj. Per-token scale needs no bpreshuffle
-                # materialize (mirrors the non-tuple per-channel path in
-                # apply_fp8_linear). Block-scale fp8 is handled above.
+                # Per-channel *dynamic* fp8 q_b_proj: fold its per-token
+                # activation quant into the fused q/kv RMSNorm. q becomes a
+                # (fp8, x_scale[m,1], orig_dtype) tuple consumed directly by
+                # gemm_a8w8_bpreshuffle in apply_fp8_linear, removing the
+                # standalone per-token quant before q_b_proj. Per-token scale
+                # needs no bpreshuffle materialize (mirrors the non-tuple
+                # per-channel path in apply_fp8_linear). Gated on the real
+                # layout contract (see _is_per_channel_dynamic_fp8): per-tensor
+                # / static / non-preshuffled fp8 fall through to the bf16 path.
+                # Block-scale fp8 is handled above.
                 q, k_nope = fused_qk_rmsnorm_q_pertoken_fp8(
                     q,
                     self.q_a_layernorm.weight,

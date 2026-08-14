@@ -1758,12 +1758,12 @@ def apply_fp8_linear(
     # This could change in the future.
     # We also don't pad when using torch.compile,
     # as it breaks with dynamic shapes.
-    # Pre-quantized fast path: the caller already produced (qfp8, x_scale[m,1])
-    # by folding the per-token activation quant into the upstream fused RMSNorm
-    # (fused_qk_rmsnorm quant_type=per_Token). Skip the standalone
-    # per_token_group_quant_fp8 launch and go straight to the tuned
-    # gemm_a8w8_bpreshuffle. Only the aiter per-token-per-channel GEMM below
-    # consumes this shape; other backends have no pre-quant producer wired.
+    # Pre-quantized fast path: the caller already produced
+    # (qfp8, x_scale[m,1], orig_dtype) by folding the per-token activation quant
+    # into the upstream fused RMSNorm (fused_qk_rmsnorm quant_type=per_Token).
+    # Skip the standalone per_token_group_quant_fp8 launch and go straight to the
+    # tuned gemm_a8w8_bpreshuffle. Only the aiter per-token-per-channel GEMM
+    # below consumes this shape; other backends have no pre-quant producer wired.
     if isinstance(input, tuple):
         assert _use_aiter, (
             "apply_fp8_linear received a pre-quantized (fp8, scale) tuple but "
@@ -1771,7 +1771,13 @@ def apply_fp8_linear(
         )
         # Mirror the non-tuple aiter bpreshuffle branch below: WQ=weight.T,
         # output feature dim = weight.shape[1], x_scale is per-token [m, 1].
-        qinput, x_scale = input
+        # orig_dtype carries the pre-quant activation dtype so FP16 is not
+        # silently promoted to BF16; older 2-tuple producers default to bf16.
+        if len(input) == 3:
+            qinput, x_scale, orig_dtype = input
+        else:
+            qinput, x_scale = input
+            orig_dtype = pre_quant_output_dtype or torch.bfloat16
         input_2d = qinput.view(-1, qinput.shape[-1])
         output_shape = [*qinput.shape[:-1], weight.shape[1]]
         output = gemm_a8w8_bpreshuffle(
@@ -1779,7 +1785,7 @@ def apply_fp8_linear(
             WQ=weight.T,
             x_scale=x_scale,
             w_scale=weight_scale,
-            dtype=torch.bfloat16,
+            dtype=orig_dtype,
         )
         if bias is not None:
             output += bias

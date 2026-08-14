@@ -187,6 +187,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _is_per_channel_dynamic_fp8,
     _is_xpu,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
@@ -2429,11 +2430,17 @@ class DeepseekV2DecoderLayer(nn.Module):
             if weight_scale is None:
                 return "fp8_pending"
             # Block-scale fp8 -> fused RMSNorm + group-128 quant ("fp8").
-            # Per-channel fp8 -> fused RMSNorm + per-token quant
+            if _is_block_scale_fp8(proj):
+                return "fp8"
+            # Per-channel *dynamic* fp8 -> fused RMSNorm + per-token quant
             # ("fp8_per_token"): folds the entry-proj activation quant into
             # input_layernorm so the standalone per-token quant before
-            # fused_qkv_a_proj_with_mqa is eliminated.
-            return "fp8" if _is_block_scale_fp8(proj) else "fp8_per_token"
+            # fused_qkv_a_proj_with_mqa is eliminated. Gated on the real layout
+            # contract (dynamic, per-channel, preshuffled) — per-tensor / static
+            # / non-preshuffled fp8 must keep the bf16 + separate-quant path.
+            if _is_per_channel_dynamic_fp8(proj):
+                return "fp8_per_token"
+            return ""
         return ""
 
     def _resolve_gfx95_quant_format(self) -> str:

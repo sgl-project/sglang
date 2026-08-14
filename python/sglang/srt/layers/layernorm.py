@@ -378,9 +378,11 @@ def _forward_with_allreduce_fusion_quant(
 ):
     """Fused AR + RMSNorm + per-TOKEN FP8 quant (ROCm/aiter, whole-row scale).
 
-    Returns ``((fp8, scale), residual)`` on success, or ``None`` when no fused
-    quant path is available (caller must fall back to the plain fused
-    AR+RMSNorm + a separate per-token quant).
+    Returns ``((fp8, scale, orig_dtype), residual)`` on success, or ``None``
+    when no fused quant path is available (caller must fall back to the plain
+    fused AR+RMSNorm + a separate per-token quant). ``orig_dtype`` is the
+    pre-quant activation dtype, carried so apply_fp8_linear can preserve it
+    (FP16 must not be silently promoted to BF16).
 
     Unlike the per-group variant, the per-token scale is ``[m, 1]`` over the
     whole hidden row, which is what ``gemm_a8w8_bpreshuffle`` (per-channel fp8
@@ -417,7 +419,7 @@ def _forward_with_allreduce_fusion_quant(
     fp8_out, residual_out, scale_out = result
     if use_bpreshuffle:
         scale_out = materialize_bpreshuffle_fp8_scale(scale_out)
-    return (fp8_out, scale_out), residual_out
+    return (fp8_out, scale_out, x.dtype), residual_out
 
 
 def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
@@ -916,8 +918,8 @@ class RMSNorm(BaseFusedOp):
     ):
         """Fused AR + RMSNorm + per-token FP8 quant (ROCm/aiter).
 
-        Returns ``((fp8, scale), residual)`` or ``None`` (caller falls back to
-        the plain fused AR+RMSNorm + separate quant).
+        Returns ``((fp8, scale, orig_dtype), residual)`` or ``None`` (caller
+        falls back to the plain fused AR+RMSNorm + separate quant).
         """
         return _forward_with_allreduce_fusion_quant(
             self, x, residual, self.weight, use_attn_tp_group
