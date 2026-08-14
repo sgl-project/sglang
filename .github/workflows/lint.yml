@@ -51,9 +51,10 @@ jobs:
         run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
 
       # Not in the rust-ext build job: its cache key covers the built .so files,
-      # and a test script is not a build input.
+      # and a test script is not a build input. Tests take ~1s; the timeout is
+      # for a cold cache, which codegens the dependency graph first.
       - name: Run rust/ workspace tests
-        run: bash scripts/ci/run_rust_workspace_tests.sh
+        run: cd rust && timeout 900 cargo test --workspace
 
       - name: Run lychee docs checks (offline references)
         uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2
