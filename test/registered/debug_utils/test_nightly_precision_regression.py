@@ -65,9 +65,9 @@ SCHEMA_VERSION = 3
 EXP_NAME = "nightly_precision"
 PROMPT = "The capital of France is"
 NIGHTLY_PRECISION_SERVER_TIMEOUT = 3600
-# Pin fusion ON: captured inputs.1 must be TP-partial (the comparator's tp:partial
-# contract), and SM90 auto-enable was dropped in #23402.
-PRECISION_FUSION_BACKEND = "trtllm"
+# Ordinary all-reduce gives the precision harness a stable capture boundary across
+# runners without inheriting fusion-kernel numerical variance.
+PRECISION_FUSION_BACKEND = None
 TP_LAYOUT_POLICY = "per-tensor-v1"
 
 
@@ -414,7 +414,7 @@ def _test_one_model(
         )
         today_exp_dir = today_dump_dir / EXP_NAME
         _assert_decode_captured(today_exp_dir, tp_size=model_setup.tp_size)
-        _assert_fused_tp_layout(today_exp_dir)
+        _assert_unfused_tp_layout(today_exp_dir)
 
         has_baseline = baseline_exp_dir.exists() and any(baseline_exp_dir.glob("*.pt"))
 
@@ -601,9 +601,7 @@ def _run_server_and_dump(
         "--disable-cuda-graph",
         "--disable-piecewise-cuda-graph",
         "--disable-radix-cache",
-        # Explicit `trtllm`, not `auto` (which resolves to mnnvl on SM90).
-        "--flashinfer-allreduce-fusion-backend",
-        PRECISION_FUSION_BACKEND,
+        "--enforce-disable-flashinfer-allreduce-fusion",
     ]
 
     proc = popen_launch_server(
@@ -715,22 +713,18 @@ def _detect_tp_layouts(dump_dir: Path) -> dict[str, str]:
     return layouts
 
 
-def _assert_fused_tp_layout(dump_dir: Path) -> None:
+def _assert_unfused_tp_layout(dump_dir: Path) -> None:
     layouts = _detect_tp_layouts(dump_dir)
-    non_initial_layers = {
-        name: layout
-        for name, layout in layouts.items()
-        if (match := _LAYER_INPUT_RE.match(name)) and int(match.group(1)) > 0
+    layer_inputs = {
+        name: layout for name, layout in layouts.items() if _LAYER_INPUT_RE.match(name)
     }
-    if not non_initial_layers:
-        raise AssertionError("no non-initial transformer layer dumps found")
-    replicated = [
-        name for name, layout in non_initial_layers.items() if layout != "partial"
-    ]
-    if replicated:
+    if not layer_inputs:
+        raise AssertionError("no transformer layer input dumps found")
+    partial = [name for name, layout in layer_inputs.items() if layout != "replicated"]
+    if partial:
         raise AssertionError(
-            "flashinfer allreduce fusion did not produce TP-partial hidden states; "
-            f"replicated layers={replicated}. Refusing to compare or update baseline."
+            "flashinfer allreduce fusion was not fully disabled; "
+            f"TP-partial layers={partial}. Refusing to compare or update baseline."
         )
 
 
@@ -752,17 +746,17 @@ class TestTpLayoutDetection(unittest.TestCase):
                 {"partial": "partial", "replicated": "replicated"},
             )
 
-    def test_rejects_replicated_non_initial_layer(self):
+    def test_rejects_partial_layer_when_fusion_disabled(self):
         with tempfile.TemporaryDirectory() as td:
             dump_dir = Path(td)
             name = "non_intrusive__model.layers.8.inputs.1"
             for rank in (0, 1):
                 torch.save(
-                    {"value": torch.tensor([[1.0, 2.0]])},
+                    {"value": torch.tensor([[float(rank), 2.0]])},
                     dump_dir / f"step=0___rank={rank}___name={name}.pt",
                 )
             with self.assertRaisesRegex(AssertionError, "Refusing to compare"):
-                _assert_fused_tp_layout(dump_dir)
+                _assert_unfused_tp_layout(dump_dir)
 
 
 def _update_baseline(model_baseline_dir: Path, today_exp_dir: Path):
