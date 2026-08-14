@@ -8,6 +8,7 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
     mamba_cache_chunk_size,
+    mamba_checkpoint_grid,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
 )
@@ -2630,6 +2631,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
         chunk_size = mamba_cache_chunk_size()
+        # The donated depth has to be a radix node boundary, which DCP widens past
+        # chunk_size; the kernel still snapshots on the chunk_size grid.
+        checkpoint_grid = mamba_checkpoint_grid()
 
         def _force_track_h(i: int) -> int:
             assert i % chunk_size == 0
@@ -2642,7 +2646,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        mask = req.extend_range.length >= chunk_size
+        mask = req.extend_range.length >= checkpoint_grid
         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         mamba_track_seqlen = -1
         if mask:
@@ -2659,13 +2663,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # mamba radix cache to track which seqlen this mamba state should store at.
             mamba_track_seqlen_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_range.length // chunk_size) * chunk_size
+                + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
             )
 
             # mamba_track_fla_chunk_aligned is the aligned seqlen based on chunk_size
-            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
-            # page_size > chunk_size, we need to force the math calculation to retrieve the correct mamba state from h
-            # by _force_track_h()
+            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which is true when
+            # checkpoint_grid is coarser than chunk_size, we need to force the math calculation to
+            # retrieve the correct mamba state from h by _force_track_h()
             mamba_track_fla_chunk_aligned = (
                 len(req.prefix_indices)
                 + (req.extend_range.length // chunk_size) * chunk_size
