@@ -3419,6 +3419,11 @@ class ServerArgs:
         "Allow saving memory using release_memory_occupation and resume_memory_occupation",
         NS("exec.features"),
     ] = False
+    enable_longcat_double_stream: A[
+        bool,
+        "Overlap LongCat's routed-MoE branch with its dense attention/MLP branch.",
+        NS("exec.features"),
+    ] = False
     enable_weights_cpu_backup: A[
         bool,
         "Save model weights (both main model and draft model, if any) to CPU memory during release_weights_occupation and resume_weights_occupation",
@@ -3913,6 +3918,10 @@ class ServerArgs:
         )
 
         handle_pd_disaggregation(self)
+        if self.enable_longcat_double_stream and self.disaggregation_mode == "prefill":
+            raise ValueError(
+                "--enable-longcat-double-stream is not supported on a PD prefill node"
+            )
 
     def _handle_dcp_validation(self):
         if self.dcp_size < 1:

@@ -534,6 +534,50 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             return self.forward_native(positions, query, key, offsets)
 
 
+class LongcatExplicitInterleavedRotaryEmbedding(RotaryEmbedding):
+    """LongCat RoPE using the explicit interleaved Ascend operator."""
+
+    def get_cos_sin_cache(
+        self,
+        positions: torch.Tensor,
+        dtype: torch.dtype,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        indices = torch.add(positions, offsets) if offsets is not None else positions
+        indices = indices.flatten()
+        cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
+        cos = cos[indices].repeat(1, 2).to(dtype).contiguous()
+        sin = sin[indices].repeat(1, 2).to(dtype).contiguous()
+        return cos.unsqueeze(-2).unsqueeze(-2), sin.unsqueeze(-2).unsqueeze(-2)
+
+    def forward_npu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens, num_q_heads, _ = query.shape
+        num_k_heads = key.shape[1]
+        cos, sin = self.get_cos_sin_cache(positions, query.dtype, offsets)
+        query_rot = query[..., : self.rotary_dim]
+        key_rot = key[..., : self.rotary_dim]
+        query_pass = query[..., self.rotary_dim :]
+        key_pass = key[..., self.rotary_dim :]
+        query_rot = torch_npu.npu_interleave_rope(
+            query_rot.reshape(num_tokens, num_q_heads, 1, self.rotary_dim), cos, sin
+        ).reshape(num_tokens, num_q_heads, self.rotary_dim)
+        key_rot = torch_npu.npu_interleave_rope(
+            key_rot.reshape(num_tokens, num_k_heads, 1, self.rotary_dim), cos, sin
+        ).reshape(num_tokens, num_k_heads, self.rotary_dim)
+        if self.rotary_dim == self.head_size:
+            return query_rot, key_rot
+        return (
+            torch.cat((query_rot, query_pass), dim=-1),
+            torch.cat((key_rot, key_pass), dim=-1),
+        )
+
+
 class Llama3RotaryEmbedding(RotaryEmbedding):
 
     def __init__(

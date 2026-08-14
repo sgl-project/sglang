@@ -23,6 +23,7 @@ from sglang.srt.layers.rotary_embedding.rope_variant import (
     FourierRotaryEmbedding,
     Gemma4RotaryEmbedding,
     Llama3RotaryEmbedding,
+    LongcatExplicitInterleavedRotaryEmbedding,
     Phi3LongRoPEScaledRotaryEmbedding,
 )
 from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
@@ -231,6 +232,15 @@ def get_rope(
                     is_neox_style,
                     dtype,
                 )
+        elif scaling_type == "longcat_explicit_interleaved":
+            rotary_emb = LongcatExplicitInterleavedRotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox_style,
+                dtype,
+            )
         elif scaling_type == "linear":
             scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
             rotary_emb = LinearScalingRotaryEmbedding(
