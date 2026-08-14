@@ -39,6 +39,20 @@ if TYPE_CHECKING:
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
 
+def _wait_for_rank_sync(runner: Optional[ModelRunner], stream, fallback_stream) -> None:
+    if runner is None or not getattr(
+        runner.model, "requires_dp_attention_rank_sync_ordering", False
+    ):
+        return
+
+    event = runner.rank_sync_done_event
+    runner.rank_sync_done_event = None
+    if event is None:
+        stream.wait_stream(fallback_stream)
+    else:
+        stream.wait_event(event)
+
+
 def _resolve_elastic_world_dp_size(
     dp_size: int,
     *,
@@ -233,6 +247,7 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    rank_sync_runner: Optional[ModelRunner] = None,
     dwdp: bool = False,
 ):
     # Check if other DP workers have running batches
@@ -311,6 +326,10 @@ def prepare_mlp_sync_batch_raw(
         disable_overlap_schedule
         or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
     ):
+        if not disable_overlap_schedule and not skip_all_gather:
+            # Order the GPU metadata rendezvous after the previous rank phase.
+            stream = torch.get_device_module(tp_group.device).current_stream()
+            _wait_for_rank_sync(rank_sync_runner, stream, model_runner.forward_stream)
         group = tp_group.device_group
         device = tp_group.device
     else:
@@ -401,6 +420,7 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
+    rank_sync_runner: ModelRunner
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(
@@ -415,6 +435,7 @@ class SchedulerDPAttnAdapter:
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            rank_sync_runner=self.rank_sync_runner,
             dwdp=get_parallel().dwdp_size > 1,
         )
 

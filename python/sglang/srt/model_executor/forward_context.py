@@ -38,6 +38,7 @@ class ForwardContext:
     write time — use dataclasses.replace for per-call overrides."""
 
     attn_backend: AttentionBackend
+    rank_sync_done_event: Optional[object] = None
 
 
 _current: Optional[ForwardContext] = None

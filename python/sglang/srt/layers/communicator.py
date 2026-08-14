@@ -73,6 +73,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -780,13 +781,19 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        return self._communicate_summable_tensor_pair_fn(
+        output = self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             context=self._context,
             allow_reduce_scatter=self.allow_reduce_scatter,
         )
+        # Publish after the final layer's rank-coupled communication.
+        if self.is_last_layer:
+            rank_sync_done_event = get_forward_context().rank_sync_done_event
+            if rank_sync_done_event is not None:
+                rank_sync_done_event.record()
+        return output
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
