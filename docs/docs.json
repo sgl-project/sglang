@@ -936,6 +936,7 @@
               "docs/advanced_features/separate_reasoning",
               "docs/advanced_features/quantization",
               "docs/advanced_features/quantized_kv_cache",
+              "docs/advanced_features/reasoning_aware_compression",
               "docs/advanced_features/dp_dpa_smg_guide",
               "docs/advanced_features/dcp",
               "docs/advanced_features/expert_parallelism",
@@ -1242,6 +1243,7 @@
                     "group": "Qwen",
                     "pages": [
                       "cookbook/autoregressive/Qwen/Qwen3.8",
+                      "cookbook/autoregressive/Qwen/Qwen3.8-27B",
                       "cookbook/autoregressive/Qwen/Qwen3.6",
                       "cookbook/autoregressive/Qwen/Qwen3.5",
                       "cookbook/autoregressive/Qwen/Qwen3",
