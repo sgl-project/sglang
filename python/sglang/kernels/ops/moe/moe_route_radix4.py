@@ -30,7 +30,9 @@ _MAX_TOKENS = 1024
 logger = logging.getLogger(__name__)
 
 
-def _is_supported_cdna() -> bool:
+def supported_hardware() -> bool:
+    """Whether this device is one the kernel targets, before asking whether it
+    builds. The kernel is wave64 and GFX9 DPP throughout, hence gfx942/gfx950."""
     if not is_hip_runtime() or not torch.cuda.is_available():
         return False
     gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
@@ -38,7 +40,8 @@ def _is_supported_cdna() -> bool:
 
 
 @cache_once
-def _jit_route_radix4_module() -> Module:
+def build() -> Module:
+    """Compile and load the kernel, raising if the toolchain cannot."""
     return load_jit(
         "moe_route_radix4",
         cuda_files=["moe/route_radix4_hip.cuh"],
@@ -51,11 +54,18 @@ def _jit_route_radix4_module() -> Module:
 
 @cache_once
 def available() -> bool:
-    """CDNA only, and only if the kernel actually builds on this toolchain."""
-    if not _is_supported_cdna():
+    """Whether dispatch may use the kernel: targeted hardware, and a kernel that
+    builds on this toolchain.
+
+    A build failure is swallowed on purpose, since serving would rather fall back
+    to aiter than refuse to start. That makes this the wrong gate for a test,
+    which wants a kernel that stopped compiling to be a failure and not a skip --
+    the tests pair supported_hardware() with build() instead.
+    """
+    if not supported_hardware():
         return False
     try:
-        _jit_route_radix4_module()
+        build()
         return True
     except Exception as e:  # pragma: no cover - toolchain dependent
         logger.warning(f"Failed to load the JIT ROCm radix router: {e}")
@@ -101,18 +111,21 @@ def route_radix4(
 
     Experts are ranked by sigmoid(score) + bias but the emitted weight is the
     plain sigmoid, scaled by routed_scaling_factor and, when renormalize is set,
-    divided by the sum over the selected experts. A NaN ranking value is floored
-    so it can never displace a finite expert, and experts that tie on the full
-    ranking value go to the lower expert id, same as the CUDA router. aiter
-    breaks those ties in its own wave64 traversal order, so on a tied row the two
-    can name different experts; both are a valid top-k and the weights agree.
-    Winners come out unordered, which the MoE sorting stage downstream does not
-    care about.
+    divided by the sum over the selected experts. A NaN ranking value keys below
+    every number, so it can never displace one.
+
+    A row is what aiter would have produced, expert for expert and column for
+    column: winners come out highest ranking value first, and experts that tie on
+    the full ranking value are separated the way aiter's wave64 walk reaches them
+    (kAiterTieLaneRank in the kernel). Matching on tied rows too is what keeps a
+    token's routing from depending on the batch size, since batches past
+    _MAX_TOKENS fall back to aiter. None of it depends on how the kernel's
+    compaction raced, so a row also repeats bit for bit run to run.
     """
     M = scores.shape[0]
     out_w = torch.empty((M, topk), dtype=torch.float32, device=scores.device)
     out_i = torch.empty((M, topk), dtype=torch.int32, device=scores.device)
-    _jit_route_radix4_module().run(
+    build().run(
         scores,
         bias,
         out_w,

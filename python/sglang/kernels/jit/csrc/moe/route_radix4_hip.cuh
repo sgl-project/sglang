@@ -13,14 +13,19 @@
 /// waves; transposing the bin totals onto lanes turns the 16-step walk over
 /// them into a 4-step DPP prefix sum plus a ballot.
 ///
-/// Selection contract, shared with the CUDA router in route_radix.cuh: experts
-/// rank by sigmoid(score) + bias, a NaN ranking value is floored so it can never
-/// displace a finite expert, and among experts whose whole key is identical the
-/// lowest id wins. Ties are settled by rank and the renorm divisor is summed
-/// across threads rather than read back off the staged row, so the same input
-/// always yields the same experts with the same weights, bit for bit. Where in a
-/// row a winner lands is not stable, and the sorting stage downstream does not
-/// read it.
+/// Selection contract: experts rank by sigmoid(score) + bias and a NaN ranking
+/// value keys below every number, so it can never displace one. Experts whose
+/// whole key is identical are separated by kAiterTieLaneRank below, which is
+/// where aiter's wave64 walk reaches them; the CUDA router in route_radix.cuh
+/// gives that tie to the lowest id instead, the one point the two contracts part.
+///
+/// Winners are emitted highest key first, equal keys in that same tie order. So
+/// a row is what aiter would have produced, expert for expert and column for
+/// column, on every input rather than only on the ones that do not tie -- this
+/// kernel and aiter both serve K3 depending on the batch size, and a routing
+/// that changed with the batch size would be the cost of them disagreeing.
+/// Nothing the compaction races over reaches the output: it fills the staged row
+/// in whatever order it wins, and the epilogue ranks that row afterwards.
 
 #pragma once
 
@@ -59,6 +64,45 @@ struct RouteRadix4Params {
 
 namespace radix4 {
 
+/// Rank of a wave64 lane in the order aiter's router walks them. Its tie
+/// positions come out of a cumsum over that walk, so two experts whose ranking
+/// value is equal bit for bit are separated by where they sit in it, and this is
+/// the one piece of the walk that is not implied by the expert id. Read off aiter
+/// by comparison, and test_moe_route_radix4 pins it back against aiter so a
+/// change on their side surfaces as a failure rather than as a silent divergence.
+static __device__ __constant__ uint8_t kAiterTieLaneRank[64] = {
+    56, 57, 58, 59, 63, 62, 61, 60, 52, 53, 54, 55, 51, 50, 49, 48, 40, 41, 42, 43, 47, 46,
+    45, 44, 36, 37, 38, 39, 35, 34, 33, 32, 24, 25, 26, 27, 31, 30, 29, 28, 20, 21, 22, 23,
+    19, 18, 17, 16, 8,  9,  10, 11, 15, 14, 13, 12, 4,  5,  6,  7,  3,  2,  1,  0,
+};
+
+/// Where an expert falls in that walk: a bijection onto [0, EXPERTS). Experts
+/// travel in groups of four, a group sits in one lane, and the lanes that hold
+/// four groups rather than three come first in each rank band.
+SGL_DEVICE uint32_t tie_priority(int expert) {
+  const int group = expert >> 2;
+  const int lane = group & 63;
+  const int bank = group >> 6;
+  const int rank = static_cast<int>(kAiterTieLaneRank[lane]);
+  const int group_rank = (rank < 32) ? (rank * 3 + bank) : (96 + (rank - 32) * 4 + bank);
+  return static_cast<uint32_t>((group_rank << 2) + (expert & 3));
+}
+
+/// How many of the bitmap's members come before p. Every thread runs the same
+/// straight line over the same broadcast words, so the walk costs the block no
+/// divergence, only NWORDS popcounts.
+template <int NWORDS>
+SGL_DEVICE int tie_rank(const uint64_t* bits, uint32_t p) {
+  const uint32_t w = p >> 6;
+  int n = 0;
+#pragma unroll
+  for (uint32_t j = 0; j < NWORDS; ++j) {
+    const uint64_t below = (j < w) ? ~0ull : ((j == w) ? ((1ull << (p & 63)) - 1ull) : 0ull);
+    n += __popcll(bits[j] & below);
+  }
+  return n;
+}
+
 SGL_DEVICE float load_score(const bf16_t* p, int i) {
   return __uint_as_float(static_cast<uint32_t>(reinterpret_cast<const uint16_t*>(p)[i]) << 16);
 }
@@ -67,20 +111,21 @@ SGL_DEVICE float load_score(const fp32_t* p, int i) {
   return p[i];
 }
 
-/// Sets NaN to a very small value, so the expert it belongs to sorts last and is
-/// never selected.
-inline constexpr float kNanFloor = -1e30f;
-
-SGL_DEVICE float nan_floor(float x) {
-  return (x == x) ? x : kNanFloor;
-}
-
-/// Monotonic float -> uint32 map, so unsigned compares order the floats.
+/// Monotonic float -> uint32 map, so unsigned compares order the floats. The map
+/// never returns 0: a negative f gives ~u, which is 0 only for the all-ones NaN,
+/// and a positive one has the sign bit set. Key 0 is therefore free to mean "NaN,
+/// ranks below everything", -inf included.
 SGL_DEVICE uint32_t sortable(float f) {
   uint32_t u = __float_as_uint(f);
   // Map -0.0 and +0.0 to the same value.
   if (u == 0x80000000u) u = 0u;
   return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+/// The ranking key: 0 for a NaN, so the expert it belongs to can never displace
+/// one whose ranking value is a number.
+SGL_DEVICE uint32_t rank_key(float x) {
+  return (x == x) ? sortable(x) : 0u;
 }
 
 template <int CTRL, int RM, int BM, int N>
@@ -165,7 +210,7 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
     if (e < EXPERTS) {
       const float g = 1.0f / (1.0f + __expf(-radix4::load_score(srow, e)));
       sig[i] = g;
-      key[i] = radix4::sortable(radix4::nan_floor(g + radix4::load_score(sbias, e)));
+      key[i] = radix4::rank_key(g + radix4::load_score(sbias, e));
       or_all |= key[i];
       and_all &= key[i];
     } else {
@@ -176,15 +221,16 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
   }
   uint32_t alive = valid;
 
-  constexpr int PACK_WORDS = (VPT + 1) / 2;
-  static_assert(BLOCK <= 0xffff, "epilogue counters are 16-bit fields");
+  // One bit per expert, indexed by tie priority rather than by id.
+  constexpr int TIE_WORDS = (EXPERTS + 63) / 64;
 
   __shared__ uint32_t s_hist[2][NWAVE][8];
   __shared__ uint32_t s_pre[2][NWAVE];
-  __shared__ uint32_t s_scan[NWAVE][2 * PACK_WORDS];
+  __shared__ uint64_t s_tie[TIE_WORDS];
   __shared__ float s_w[TOPK];
   __shared__ float s_wsum[NWAVE];
   __shared__ int s_id[TOPK];
+  __shared__ uint32_t s_key[TOPK];
   __shared__ int s_cnt;
 
 #pragma unroll
@@ -319,6 +365,7 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
         if (pos < TOPK) {
           s_w[pos] = sig[i];
           s_id[pos] = tid + i * BLOCK;
+          s_key[pos] = key[i];
           wsum += sig[i];
         }
       }
@@ -326,83 +373,44 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
     radix4::stage_wave_sum(wsum, lane, wid, s_wsum);
     __syncthreads();
   } else {
-    // All 32 pivot bits are fixed and the survivors still outnumber the quota,
-    // which means keys that are equal bit for bit. The lowest ids win then. The
-    // expert a thread tid holds is tid + i * BLOCK, so for a fixed i the thread
-    // order already is the id order, and the i's follow one another: scan each i
-    // separately, then add the totals of the smaller i's.
-    uint32_t win = 0u, eqm = 0u;
+    // Every pivot bit is fixed and the survivors still outnumber the quota, so
+    // what is left are keys equal bit for bit and only the tie rule separates
+    // them: `need` of them get in, the ones aiter's walk reaches first. Marking
+    // the survivors in a bitmap indexed by that walk turns "how many come before
+    // me" into a popcount, which costs the block no divergence and no scan.
+    for (int j = tid; j < TIE_WORDS; j += BLOCK)
+      s_tie[j] = 0ull;
+    if (tid == 0) s_cnt = 0;
+    __syncthreads();
+
+    uint32_t eqm = 0u;
 #pragma unroll
     for (int i = 0; i < VPT; ++i) {
-      if (!((valid >> i) & 1u)) continue;
-      const uint32_t k = key[i] & pmask;
-      if (k > pivot)
-        win |= 1u << i;
-      else if (k == pivot)
+      if (((valid >> i) & 1u) && (key[i] & pmask) == pivot) {
         eqm |= 1u << i;
-    }
-
-    // Packed into uint32 the same way: the low 16 bits hold i = 2j, the high 16
-    // bits i = 2j + 1; the first PACK_WORDS hold the ties, the next PACK_WORDS the
-    // outright winners. own keeps the original value, because the prefix the scan
-    // returns includes the thread itself and has to come back off later.
-    uint32_t own[2 * PACK_WORDS], sc[2 * PACK_WORDS];
-#pragma unroll
-    for (int j = 0; j < PACK_WORDS; ++j) {
-      own[j] = ((eqm >> (2 * j)) & 1u) | (((eqm >> (2 * j + 1)) & 1u) << 16);
-      own[PACK_WORDS + j] = ((win >> (2 * j)) & 1u) | (((win >> (2 * j + 1)) & 1u) << 16);
-      sc[j] = own[j];
-      sc[PACK_WORDS + j] = own[PACK_WORDS + j];
-    }
-    // Unlike the histogram above, this caller wants every lane's prefix, not just
-    // the wave total the last lane carries.
-    radix4::wave_sum_dpp(sc);
-    if (lane == WAVE - 1) {
-#pragma unroll
-      for (int j = 0; j < 2 * PACK_WORDS; ++j)
-        s_scan[wid][j] = sc[j];
+        const uint32_t p = radix4::tie_priority(tid + i * BLOCK);
+        atomicOr(&s_tie[p >> 6], 1ull << (p & 63));
+      }
     }
     __syncthreads();
 
-    // Neither 16-bit half ever reaches 2^16, so the packed uint32 can be added
-    // and subtracted whole without carrying between the two counts it holds.
-    uint32_t tot[2 * PACK_WORDS];
-#pragma unroll
-    for (int j = 0; j < 2 * PACK_WORDS; ++j) {
-      uint32_t below = 0u, all = 0u;
-#pragma unroll
-      for (int w = 0; w < NWAVE; ++w) {
-        const uint32_t v = s_scan[w][j];
-        if (w < wid) below += v;
-        all += v;
-      }
-      sc[j] += below - own[j];  // inclusive within the wave -> exclusive block-wide
-      tot[j] = all;
-    }
-
-    uint32_t eq_rank[VPT], win_rank[VPT];
-    uint32_t eq_ahead = 0u, win_ahead = 0u;
+    // The outright winners are TOPK - need of them, so the ties owe exactly the
+    // `need` the loop stopped short of and the row comes out full.
 #pragma unroll
     for (int i = 0; i < VPT; ++i) {
-      const int j = i >> 1, sh = 16 * (i & 1);
-      eq_rank[i] = eq_ahead + ((sc[j] >> sh) & 0xffffu);
-      win_rank[i] = win_ahead + ((sc[PACK_WORDS + j] >> sh) & 0xffffu);
-      eq_ahead += (tot[j] >> sh) & 0xffffu;
-      win_ahead += (tot[PACK_WORDS + j] >> sh) & 0xffffu;
-    }
-
-    // By this point the outright winners can never fill the quota on their own
-    // and the ties always cover the rest, so the two ranks address exactly the
-    // TOPK positions of the output row, with no gaps and no collisions.
-    const uint32_t need_eq = (win_ahead < TOPK) ? (TOPK - win_ahead) : 0u;
-#pragma unroll
-    for (int i = 0; i < VPT; ++i) {
-      const bool taken = ((win >> i) & 1u) || (((eqm >> i) & 1u) && eq_rank[i] < need_eq);
-      const uint32_t slot = win_rank[i] + (eq_rank[i] < need_eq ? eq_rank[i] : need_eq);
-      if (taken && slot < TOPK) {
-        s_w[slot] = sig[i];
-        s_id[slot] = tid + i * BLOCK;
-        wsum += sig[i];
+      if (!((valid >> i) & 1u)) continue;
+      const int e = tid + i * BLOCK;
+      const bool tied = ((eqm >> i) & 1u) != 0u;
+      const bool taken =
+          (key[i] & pmask) > pivot || (tied && radix4::tie_rank<TIE_WORDS>(s_tie, radix4::tie_priority(e)) < need);
+      if (taken) {
+        const int pos = atomicAdd(&s_cnt, 1);
+        if (pos < TOPK) {
+          s_w[pos] = sig[i];
+          s_id[pos] = e;
+          s_key[pos] = key[i];
+          wsum += sig[i];
+        }
       }
     }
     radix4::stage_wave_sum(wsum, lane, wid, s_wsum);
@@ -410,6 +418,24 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
   }
 
   if (tid < TOPK) {
+    // Where the compaction put a winner is a race; where it is emitted is not.
+    // Tie priorities are distinct, so (key desc, priority asc) is a strict total
+    // order and counting the winners that outrank this one lands each of them on
+    // a position of its own. The whole staged row sits in lanes 0..TOPK-1 of this
+    // wave, so the walk over it reads the other lanes' registers instead of LDS:
+    // readlane is a scalar op and the lane index is a constant of the unrolled
+    // loop, which leaves the vector unit with just the compares.
+    const uint32_t k = s_key[tid];
+    const int id = s_id[tid];
+    const auto p = static_cast<int>(radix4::tie_priority(id));
+    int rank = 0;
+#pragma unroll
+    for (int q = 0; q < TOPK; ++q) {
+      const auto kq = static_cast<uint32_t>(__builtin_amdgcn_readlane(static_cast<int>(k), q));
+      const int pq = __builtin_amdgcn_readlane(p, q);
+      rank += (kq > k || (kq == k && pq < p)) ? 1 : 0;
+    }
+
     // The weight is the plain sigmoid; the bias only ever ranked the experts.
     float scale = params.routed_scaling_factor;
     if (params.renormalize) {
@@ -421,9 +447,9 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
       // of NaN sums to NaN; neither may turn a finite weight into an inf.
       scale /= (sum > 0.0f) ? sum : 1.0f;
     }
-    const size_t o = static_cast<size_t>(token) * params.stride_out + tid;
+    const size_t o = static_cast<size_t>(token) * params.stride_out + rank;
     params.out_w[o] = s_w[tid] * scale;
-    params.out_i[o] = s_id[tid];
+    params.out_i[o] = id;
   }
 }
 
