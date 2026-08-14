@@ -2032,8 +2032,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     return ToolCallProcessingResult(None, text, finish_reason)
 
             if is_required and detector_owns_format:
-                # _process_messages attaches no json_schema constraint for these
-                # detectors, so the text is never the JSON array decoded below.
                 logger.warning(
                     "Required tool call missing from %s output (%d chars)",
                     self.tool_call_parser,

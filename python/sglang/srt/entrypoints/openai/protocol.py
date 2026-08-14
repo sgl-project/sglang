@@ -1076,6 +1076,14 @@ class ChatCompletionRequest(BaseModel):
         )
 
         if tool_call_constraint and has_existing_constraints:
+            if self.tool_choice == "required" or isinstance(
+                self.tool_choice, ToolChoice
+            ):
+                raise ValueError(
+                    "tool_choice 'required' or a named tool cannot be combined with "
+                    "response_format, regex, or ebnf: the tool-call constraint and the "
+                    "output constraint cannot both be honored."
+                )
             logger.warning("Constrained decoding is not compatible with tool calls.")
         elif tool_call_constraint:
             constraint_type, constraint_value = tool_call_constraint

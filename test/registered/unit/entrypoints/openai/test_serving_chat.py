@@ -1608,6 +1608,57 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(remaining, '["get_weather"]')
         self.assertEqual(finish_reason["type"], "stop")
 
+    def test_required_tool_choice_rejects_conflicting_output_constraint(self):
+        """response_format and a forced tool call cannot both be honored: the
+        tool-call constraint was dropped with only a warning, so the model was
+        constrained to a shape that can never contain a tool call."""
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+        constraint = ("structural_tag", None)
+        conflicting = [
+            {"type": "json_object"},
+            {
+                "type": "json_schema",
+                "json_schema": {"name": "a", "schema": {"type": "object"}},
+            },
+        ]
+        for tool_choice in (
+            "required",
+            ToolChoice(function=ToolChoiceFuncName(name="get_weather")),
+        ):
+            for response_format in conflicting:
+                with self.subTest(tool_choice=tool_choice, rf=response_format["type"]):
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "hi"}],
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        response_format=response_format,
+                    )
+                    with self.assertRaises(ValueError) as ctx:
+                        request.to_sampling_params(
+                            stop=[],
+                            model_generation_config={},
+                            tool_call_constraint=constraint,
+                        )
+                    self.assertIn("cannot be combined", str(ctx.exception))
+
+    def test_auto_tool_choice_keeps_response_format_without_raising(self):
+        """ "auto" means the model need not call a tool, so dropping the
+        tool-call constraint still leaves a satisfiable request."""
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            tool_choice="auto",
+            response_format={"type": "json_object"},
+        )
+        sampling_params = request.to_sampling_params(
+            stop=[],
+            model_generation_config={},
+            tool_call_constraint=("structural_tag", None),
+        )
+        self.assertEqual(sampling_params["json_schema"], '{"type": "object"}')
+
     def test_kimi_k2_streaming_tool_call_id_with_history(self):
         """Ensure streaming first chunk tool_call.id increase with tool calls history for kimi_k2 parser."""
 
