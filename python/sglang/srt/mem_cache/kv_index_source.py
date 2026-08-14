@@ -264,6 +264,69 @@ class KVIndexSource:
             full_to_swa_map=None,
         )
 
+    def rebind_write_loc(self, forward_batch) -> None:
+        """The WRITE half of the id-space contract, folded
+        onto the choke point.
+
+        Translate the forward batch's write loc to KERNEL-FACING ids exactly
+        once, at ForwardBatch preparation. REBIND, never mutate: the translate
+        returns a FRESH tensor, so the ScheduleBatch's aliased tensor stays
+        VIRTUAL (radix/accept/inflight machinery reads it). ORDER-CRITICAL for
+        hybrid SWA: one virtual id maps to TWO kernel-facing ids — the swa
+        rail must be computed from the still-VIRTUAL loc BEFORE the full-side
+        rebind replaces it. No-op (byte-identical) on non-unified pools.
+
+        Also stashes this source on the batch for the read-rail producers
+        (the deepseek MHA mixin) that translate req_to_token-derived indices
+        at production.
+        """
+        if not self.enabled or forward_batch.out_cache_loc is None:
+            return
+        if self._translate_swa is not None:
+            # int64, like every id the allocator emits; a backend that needs
+            # int32 narrows where it fills its own buffer.
+            forward_batch.swa_out_cache_loc = self._translate_swa(
+                forward_batch.out_cache_loc
+            )
+        forward_batch.out_cache_loc = self._translate_full(forward_batch.out_cache_loc)
+        forward_batch.out_cache_loc_is_physical = True
+        forward_batch._kv_index_source = self
+
+    def build_into(
+        self,
+        *,
+        out: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fill a backend-owned padded 2-D block table's live prefix with
+        FULL-side canonical entries (trtllm_mla / flashmla consume such tables
+        directly — their rows ARE the canonical rows).
+
+        Prefix-only: columns past each row's live pages keep the backend's own
+        fill (-1 sentinel or stale-but-unread values) — that tail is the
+        consumer kernel's contract, not ours. Unified-only: callers dispatch on
+        ``self.enabled`` and keep their static builder otherwise.
+        """
+        assert self.enabled, "KVIndexSource.build_into on a passthrough source"
+        # Cap at the widest legal column: the table may be padded past the
+        # context (alignment constraints); a page can only START inside
+        # req_to_token.
+        max_pages = min(
+            out.shape[1],
+            -(-self.req_to_token.shape[1] // self.page_size),
+        )
+        return build_kernel_page_table(
+            req_to_token=self.req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            v2p=self._full_v2p,
+            multiplier=self._full_mult,
+            page_size=self.page_size,
+            max_pages=max_pages,
+            out=out,
+        )
+
     def _rows_for(self, bs: int) -> torch.Tensor:
         if self._rows is None or self._rows.numel() < bs:
             self._rows = torch.arange(

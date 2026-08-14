@@ -410,61 +410,21 @@ class NgramEmbeddingInfo:
 
 def apply_unified_kv_loc_rebind(fb, model_runner) -> None:
     """Unified memory pool: translate the forward batch's WRITE loc to
-    KERNEL-FACING ids, exactly once, at ForwardBatch preparation.
+    kernel-facing ids, exactly once, at ForwardBatch preparation.
 
-    The one rule of the physical-loc contract: ScheduleBatch-side tensors stay
-    VIRTUAL always (the radix / accept / inflight machinery reads them); each
+    The ONE RULE of the id-space contract: ScheduleBatch-side tensors stay
+    VIRTUAL always (radix/accept/inflight machinery reads them); each
     ForwardBatch is translated exactly once at its construction. `init_new`
-    calls this for every standard construction; a hand-built live forward
-    (e.g. the DFLASH draft-block batch) calls it explicitly.
+    calls this for every standard construction; the rare hand-built live
+    forward (e.g. the DFLASH draft-block batch) calls it explicitly. Backends
+    assert `out_cache_loc_is_physical`, so a construction site that forgets
+    fails loudly instead of writing virtual ids as if physical.
 
-    REBIND, never mutate: the translate returns a FRESH tensor, so the
-    ScheduleBatch's aliased tensor is untouched — scheduler-thread readers
-    (on_forward_launched, accept bookkeeping) require virtual ids.
-
-    ORDER-CRITICAL for hybrid SWA: one virtual id maps to TWO kernel-facing
-    ids (full and swa). The swa rail must be derived from the still-VIRTUAL
-    loc BEFORE the full-side rebind replaces it.
-
-    No-op on non-unified pools, whose `out_cache_loc` is already physical.
+    ALL id-space knowledge (which translate, dense vs physical, the swa rail
+    ordering) lives on the choke point — see KVIndexSource.rebind_write_loc.
+    No-op (byte-identical) on non-unified pools.
     """
-    # Local import: sglang.srt.mem_cache imports back into this module
-    # (deep_gemm_wrapper -> ForwardMode), so a top-level import would cycle.
-    from sglang.srt.mem_cache.multi_ended_allocator import (
-        UnifiedMambaTokenToKVPoolAllocator,
-        UnifiedSWATokenToKVPoolAllocator,
-    )
-
-    allocator = model_runner.token_to_kv_pool_allocator
-    if (
-        not isinstance(
-            allocator,
-            (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWATokenToKVPoolAllocator),
-        )
-        # A speculative draft runner is handed the TARGET's allocator but owns
-        # a SEPARATE KV pool, direct-indexed by the virtual ids it shares. Its
-        # locs must stay virtual, so the rebind is a no-op there.
-        or allocator.get_kvcache() is not model_runner.token_to_kv_pool
-        or fb.out_cache_loc is None
-    ):
-        return
-    if isinstance(allocator, UnifiedSWATokenToKVPoolAllocator):
-        # From the STILL-VIRTUAL loc — see ORDER-CRITICAL above. Read off the
-        # allocator we already hold: it and its `UnifiedSWAKVPool` are built as
-        # a pair and expose the same translation, so the pool adds a second
-        # dependency for nothing.
-        fb.swa_out_cache_loc = allocator.translate_loc_from_full_to_swa(
-            fb.out_cache_loc
-        )
-    # Dense-first, exactly the preference the attention backends use for their
-    # kernel-facing translate handle: dense view ids under dense views, and
-    # the plain physical ids under strided views (where the dense translate
-    # collapses onto it at page-multiplier 1). Using the same preference here
-    # is what makes every downstream consumer — backend metadata, cuda-graph
-    # refill, pool doors — a pure passthrough.
-    fb.out_cache_loc = allocator.translate_kv_loc_dense(fb.out_cache_loc)
-    fb.out_cache_loc_is_physical = True
-    fb._unified_kv_loc_translate = allocator.translate_kv_loc_dense
+    model_runner.kv_index_source.rebind_write_loc(fb)
 
 
 def resolve_swa_write_loc(fb, token_to_kv_pool) -> torch.Tensor:
@@ -533,10 +493,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # a hand-built ForwardBatch that skipped the rebind fails loudly instead
     # of writing virtual ids as if physical.
     out_cache_loc_is_physical: bool = False
-    # The allocator's translate, stashed for read-rail producers so that
-    # req_to_token-derived READ indices can be translated where they are
-    # built. None on non-unified pools.
-    _unified_kv_loc_translate: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    # The read-path choke point (KVIndexSource), stashed by rebind_write_loc
+    # for the read-rail producers (fetch_mha_one_shot_kv_indices /
+    # prepare_chunked_kv_indices) so req_to_token-derived READ indices can be
+    # translated at production. Replaces the bare translate callable this
+    # field used to hold. None on non-unified pools.
+    _kv_index_source: Optional[object] = None
     # Saved swa rail across a draft-input forward, alongside
     # output_cache_loc_backup.
     swa_output_cache_loc_backup: Optional[torch.Tensor] = None

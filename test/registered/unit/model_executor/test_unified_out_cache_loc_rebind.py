@@ -50,11 +50,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.mem_cache.multi_ended_allocator import (
-    UnifiedMambaTokenToKVPoolAllocator,
-    UnifiedSWATokenToKVPoolAllocator,
-)
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -86,34 +81,29 @@ def _make_fb(out_cache_loc, **kw):
 
 
 def _make_runner(v2p=None, swa_map=None, own_pool=False):
-    """Fake ModelRunner whose allocator/pool are REAL unified classes (the
-    rebind narrows by isinstance), with only the translate methods stubbed.
+    """Fake ModelRunner carrying a KVIndexSource with the translate surface
+    under test (the isinstance capability probe itself is pinned in
+    test_kv_index_source.py; here we pin the REBIND semantics).
 
-    `v2p=None` builds a non-unified runner, so the rebind must no-op.
-    `own_pool=True` shapes it like a SPECULATIVE DRAFT runner: the target's
-    allocator, but a pool of its own — the rebind must no-op there too.
+    `own_pool=True` models a SPECULATIVE DRAFT runner — the target's allocator
+    but a pool of its own — which the choke point's ownership probe leaves
+    DISABLED, so the rebind must no-op.
     """
-    if v2p is None:
-        return SimpleNamespace(
-            token_to_kv_pool_allocator=SimpleNamespace(),
-            token_to_kv_pool=SimpleNamespace(),
-        )
-    cls = (
-        UnifiedSWATokenToKVPoolAllocator
-        if swa_map is not None
-        else UnifiedMambaTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.kv_index_source import KVIndexSource
+
+    src = KVIndexSource(
+        req_to_token=torch.zeros((1, 4), dtype=torch.int64),
+        token_to_kv_pool_allocator=SimpleNamespace(),
+        token_to_kv_pool=SimpleNamespace(),
+        page_size=1,
+        device=_DEV,
     )
-    allocator = object.__new__(cls)
-    # Fresh-tensor gather, like the real translate_kv_loc_dense.
-    allocator.translate_kv_loc_dense = lambda t: v2p[t.to(torch.int64)]
-    if swa_map is not None:
-        allocator.translate_loc_from_full_to_swa = swa_map
-    pool = (
-        object.__new__(UnifiedSWAKVPool) if swa_map is not None else SimpleNamespace()
-    )
-    # The allocator's OWN kvcache. A draft runner reads/writes a different one.
-    allocator.get_kvcache = lambda: object() if own_pool else pool
-    return SimpleNamespace(token_to_kv_pool_allocator=allocator, token_to_kv_pool=pool)
+    if v2p is not None and not own_pool:
+        src.enabled = True
+        # Fresh-tensor gather, like the composite's translate_kv_loc_dense.
+        src._translate_full = lambda t, out=None: v2p[t.to(torch.int64)]
+        src._translate_swa = swa_map
+    return SimpleNamespace(kv_index_source=src)
 
 
 class TestApplyUnifiedKvLocRebind(CustomTestCase):
@@ -131,7 +121,7 @@ class TestApplyUnifiedKvLocRebind(CustomTestCase):
         self.assertTrue(torch.equal(fb.out_cache_loc, virtual + 1000))
         self.assertTrue(torch.equal(virtual, virtual_copy))
         self.assertTrue(fb.out_cache_loc_is_physical)
-        self.assertIsNotNone(fb._unified_kv_loc_translate)
+        self.assertIsNotNone(fb._kv_index_source)
         # No SWA pool on this runner -> no swa rail.
         self.assertIsNone(fb.swa_out_cache_loc)
 
@@ -181,7 +171,7 @@ class TestApplyUnifiedKvLocRebind(CustomTestCase):
         self.assertIs(fb.out_cache_loc, virtual)  # identity alias preserved
         self.assertFalse(fb.out_cache_loc_is_physical)
         self.assertIsNone(fb.swa_out_cache_loc)
-        self.assertIsNone(fb._unified_kv_loc_translate)
+        self.assertIsNone(fb._kv_index_source)
 
     def test_none_loc_is_a_noop(self):
         fb = _make_fb(None)
@@ -291,7 +281,7 @@ class TestTboSplitCarriesContractFields(CustomTestCase):
         fb.seq_lens = torch.ones(n, dtype=torch.int64)
         fb.swa_out_cache_loc = torch.tensor([20, 21, 22, 23], dtype=torch.int64)
         fb.out_cache_loc_is_physical = True
-        fb._unified_kv_loc_translate = lambda t: t
+        fb._kv_index_source = SimpleNamespace(translate_full=lambda t: t)
 
         with patch.object(
             tbo,
@@ -310,7 +300,7 @@ class TestTboSplitCarriesContractFields(CustomTestCase):
             )
 
         # The strict unknown-field check did not raise, the swa rail is
-        # token-sliced like out_cache_loc, and the contract flag + callable are
+        # token-sliced like out_cache_loc, and the contract flag + source are
         # inherited by the child.
         self.assertTrue(
             torch.equal(child.out_cache_loc, torch.tensor([11, 12], dtype=torch.int64))
@@ -321,7 +311,7 @@ class TestTboSplitCarriesContractFields(CustomTestCase):
             )
         )
         self.assertTrue(child.out_cache_loc_is_physical)
-        self.assertIsNotNone(child._unified_kv_loc_translate)
+        self.assertIsNotNone(child._kv_index_source)
 
 
 class TestSetMlaKvBufferDoorContract(CustomTestCase):
@@ -372,7 +362,9 @@ class TestReadRailTranslatesAtProduction(CustomTestCase):
         fb.seq_lens = torch.tensor([2, 3], dtype=torch.int64)
         fb.seq_lens_cpu = torch.tensor([2, 3], dtype=torch.int32)
         fb.req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
-        fb._unified_kv_loc_translate = translate
+        fb._kv_index_source = (
+            SimpleNamespace(translate_full=translate) if translate is not None else None
+        )
         return fb
 
     def test_one_shot_indices_translated_once_and_cached(self):

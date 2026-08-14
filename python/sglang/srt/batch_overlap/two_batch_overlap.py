@@ -750,9 +750,10 @@ class TboForwardBatchPreparer:
             "reuse_dsa_topk_indices",  # forward-level flag, inherited by both child batches
             # Unified write-loc contract: both children inherit the parent's
             # rebound state (the out_cache_loc slices above are kernel-facing
-            # iff the parent was rebound; the translate is batch-invariant).
+            # iff the parent was rebound; the choke-point source is
+            # batch-invariant).
             "out_cache_loc_is_physical",
-            "_unified_kv_loc_translate",
+            "_kv_index_source",
         ]:
             output_dict[key] = getattr(batch, key)
 
