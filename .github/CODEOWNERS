@@ -43,6 +43,7 @@
 /python/sglang/srt/layers/attention/dsa @1am9trash @hubertlu-tw @kkHuang-amd @HaiShaw @Fridge003 @YAMY1234 @rainj-me
 /python/sglang/srt/layers/attention/vision.py @mickqian @yuan-luo @yhyang201
 /python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ @HaiShaw @b8zhong @OrangeRedeng @TamirBaydasov @Alisehen @mmangkad @TallMessiWu
+/python/sglang/srt/layers/quantization/nvfp4_online.py @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ @HaiShaw @b8zhong @OrangeRedeng @TamirBaydasov @Alisehen @mmangkad @TallMessiWu @zianglih
 /python/sglang/srt/layers/quantization/quark @kkHuang-amd @yichiche @hubertlu-tw @1am9trash @BowenBao
 /python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
@@ -91,6 +92,8 @@
 /test/registered/prefill_only @sundar24295s @chanh @fortunecookiee
 /benchmark/prefill_only/bench_score.py @sundar24295s @chanh @fortunecookiee
 /test/registered/npu @ping1jing2 @ssshinigami  @e-martirosian
+/test/registered/backends/test_flashinfer_trtllm_gen_moe_backend.py @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ @HaiShaw @b8zhong @OrangeRedeng @Alisehen @mmangkad @zianglih
+/test/registered/rl/test_update_weights_from_disk_blackwell.py @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ @HaiShaw @b8zhong @OrangeRedeng @Alisehen @mmangkad @zianglih
 /test/srt/test_modelopt* @Edwardf0t1
 /python/sglang/srt/layers/gemma4_fused_ops.py @merrymercy @Ying1123 @Fridge003 @ispobock @HaiShaw @ch-wan @BBuf @Edwardf0t1 @kpham-sgl @pyc96
 /python/sglang/srt/function_call/gemma4_detector.py @CatherineSue @JustinTong0323 @kpham-sgl @pyc96
