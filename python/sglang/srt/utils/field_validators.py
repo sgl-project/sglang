@@ -38,6 +38,28 @@ from array import array
 from typing import Any
 
 
+def normalize_lora_paths(
+    value: Any,
+    batch_size: int,
+    *,
+    is_single: bool,
+    expansion_factor: int = 1,
+) -> str | list[str | None] | None:
+    """Normalize LoRA paths to the request's single or batch shape."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value if is_single else [value] * (batch_size * expansion_factor)
+    if not isinstance(value, list):
+        raise ValueError("lora_path should be a list or a string.")
+    expected_size = 1 if is_single else batch_size
+    if len(value) != expected_size:
+        raise ValueError(
+            f"lora_path list length ({len(value)}) must match batch size ({expected_size})"
+        )
+    return value[0] if is_single else value * expansion_factor
+
+
 def validate_list_i64_1d(v: Any) -> list[int]:
     """Validates type: list[int]"""
     if v is None:
