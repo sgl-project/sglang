@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - python/sglang/kernels/aot/python/sgl_kernel/version.py
+      - sgl-kernel/python/sgl_kernel/version.py
   workflow_call:
     inputs:
       checkout_ref:
@@ -83,7 +83,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
     steps:
       # Self-hosted build nodes retain the workspace across jobs. Prior builds
-      # leave root-owned artifacts under python/sglang/kernels/aot/build/ that actions/checkout
+      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
       # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
       # container before checkout recreates the workspace.
       - name: Clean workspace (remove root-owned files from prior runs)
@@ -102,7 +102,7 @@ jobs:
 
       - name: Build wheels
         run: |
-          cd python/sglang/kernels/aot
+          cd sgl-kernel
           chmod +x ./build.sh
           if [ -n "${{ inputs.arch }}" ]; then
             ./build.sh "${{ inputs.python_version }}" "${{ inputs.cuda_version }}" "${{ inputs.arch }}"
@@ -118,7 +118,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact_name }}
-          path: python/sglang/kernels/aot/dist/*
+          path: sgl-kernel/dist/*
           if-no-files-found: error
 
   # cu130 is the PyPI-released variant; cu129 wheels are published only to the
@@ -141,7 +141,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       # Self-hosted build nodes retain the workspace across jobs. Prior builds
-      # leave root-owned artifacts under python/sglang/kernels/aot/build/ that actions/checkout
+      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
       # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
       # container before checkout recreates the workspace.
       - name: Clean workspace (remove root-owned files from prior runs)
@@ -161,7 +161,7 @@ jobs:
 
       - name: Build wheels
         run: |
-          cd python/sglang/kernels/aot
+          cd sgl-kernel
           chmod +x ./build.sh
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" ${{ matrix.arch == 'aarch64' && 'aarch64' || '' }}
         env:
@@ -172,7 +172,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}${{ matrix.arch == 'aarch64' && '-aarch64' || '' }}
-          path: python/sglang/kernels/aot/dist/*
+          path: sgl-kernel/dist/*
 
   release-cu129:
     needs: build-cu129-matrix
@@ -185,7 +185,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: python/sglang/kernels/aot/dist/
+          path: sgl-kernel/dist/
           merge-multiple: true
           pattern: wheel-*
 
@@ -193,7 +193,7 @@ jobs:
         id: set_tag_name
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat python/sglang/kernels/aot/python/sgl_kernel/version.py | cut -d'"' -f2)"
+            TAG_NAME="v$(cat sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)"
             echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           else
             echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
@@ -206,7 +206,7 @@ jobs:
           repository: sgl-project/whl
           token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           files: |
-            python/sglang/kernels/aot/dist/*
+            sgl-kernel/dist/*
 
       - name: Clone wheel index
         run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
@@ -242,7 +242,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       # Self-hosted build nodes retain the workspace across jobs. Prior builds
-      # leave root-owned artifacts under python/sglang/kernels/aot/build/ that actions/checkout
+      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
       # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
       # container before checkout recreates the workspace.
       - name: Clean workspace (remove root-owned files from prior runs)
@@ -262,7 +262,7 @@ jobs:
 
       - name: Build wheels
         run: |
-          cd python/sglang/kernels/aot
+          cd sgl-kernel
           chmod +x ./build.sh
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" ${{ matrix.arch == 'aarch64' && 'aarch64' || '' }}
         env:
@@ -270,7 +270,7 @@ jobs:
           NVCC_THREADS: 8
 
       - name: Strip +cu130 local version for PyPI upload
-        working-directory: python/sglang/kernels/aot
+        working-directory: sgl-kernel
         run: |
           set -eux
           pip install wheel
@@ -295,7 +295,7 @@ jobs:
           ls -lh dist-pypi/
 
       - name: Upload to PyPI
-        working-directory: python/sglang/kernels/aot
+        working-directory: sgl-kernel
         run: |
           pip install twine
           python3 -m twine upload --skip-existing dist-pypi/* -u __token__ -p ${{ secrets.PYPI_TOKEN_SGLANG_KERNEL }}
@@ -304,7 +304,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}${{ matrix.arch == 'aarch64' && '-aarch64' || '' }}
-          path: python/sglang/kernels/aot/dist/*
+          path: sgl-kernel/dist/*
 
   release-cu130:
     needs: build-cu130-matrix
@@ -317,7 +317,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: python/sglang/kernels/aot/dist/
+          path: sgl-kernel/dist/
           merge-multiple: true
           pattern: wheel-*
 
@@ -325,7 +325,7 @@ jobs:
         id: set_tag_name
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat python/sglang/kernels/aot/python/sgl_kernel/version.py | cut -d'"' -f2)"
+            TAG_NAME="v$(cat sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)"
             echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           else
             echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
@@ -338,7 +338,7 @@ jobs:
           repository: sgl-project/whl
           token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           files: |
-            python/sglang/kernels/aot/dist/*
+            sgl-kernel/dist/*
 
       - name: Clone wheel index
         run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
@@ -368,7 +368,7 @@ jobs:
         rocm-version: ["700", "720"]
     steps:
       # Self-hosted build nodes retain the workspace across jobs. Prior builds
-      # leave root-owned artifacts under python/sglang/kernels/aot/build/ that actions/checkout
+      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
       # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
       # container before checkout recreates the workspace.
       - name: Clean workspace (remove root-owned files from prior runs)
@@ -388,8 +388,8 @@ jobs:
 
       - name: Build wheels
         run: |
-          cp 3rdparty/amd/wheel/sgl-kernel/* python/sglang/kernels/aot/
-          cd python/sglang/kernels/aot
+          cp 3rdparty/amd/wheel/sgl-kernel/* sgl-kernel/
+          cd sgl-kernel
           chmod +x ./build_rocm.sh
           ./build_rocm.sh "${{ matrix.rocm-version }}"
 
@@ -397,7 +397,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-rocm${{ matrix.rocm-version }}
-          path: python/sglang/kernels/aot/dist/*
+          path: sgl-kernel/dist/*
 
   release-rocm700:
     needs: build-rocm-matrix
@@ -410,7 +410,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: python/sglang/kernels/aot/dist/
+          path: sgl-kernel/dist/
           merge-multiple: true
           pattern: wheel-*-rocm700
 
@@ -418,7 +418,7 @@ jobs:
         id: set_tag_name
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat python/sglang/kernels/aot/python/sgl_kernel/version.py | cut -d'"' -f2)"
+            TAG_NAME="v$(cat sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)"
             echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           else
             echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
@@ -431,7 +431,7 @@ jobs:
           repository: sgl-project/whl
           token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           files: |
-            python/sglang/kernels/aot/dist/*
+            sgl-kernel/dist/*
 
       - name: Clone wheel index
         run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
@@ -461,7 +461,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: python/sglang/kernels/aot/dist/
+          path: sgl-kernel/dist/
           merge-multiple: true
           pattern: wheel-*-rocm720
 
@@ -469,7 +469,7 @@ jobs:
         id: set_tag_name
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat python/sglang/kernels/aot/python/sgl_kernel/version.py | cut -d'"' -f2)"
+            TAG_NAME="v$(cat sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)"
             echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           else
             echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
@@ -482,7 +482,7 @@ jobs:
           repository: sgl-project/whl
           token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           files: |
-            python/sglang/kernels/aot/dist/*
+            sgl-kernel/dist/*
 
       - name: Clone wheel index
         run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
@@ -512,7 +512,7 @@ jobs:
         musa-version: ["43"]
     steps:
       # Self-hosted build nodes retain the workspace across jobs. Prior builds
-      # leave root-owned artifacts under python/sglang/kernels/aot/build/ that actions/checkout
+      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
       # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
       # container before checkout recreates the workspace.
       - name: Clean workspace (remove root-owned files from prior runs)
@@ -538,19 +538,19 @@ jobs:
 
       - name: Build wheels
         run: |
-          cd python/sglang/kernels/aot
+          cd sgl-kernel
           mv pyproject_musa.toml pyproject.toml
           python setup_musa.py sdist bdist_wheel
 
       - name: Rename MUSA wheels
         run: |
-          bash scripts/ci/musa/rename_wheels_musa.sh ${{ matrix.musa-version }} python/sglang/kernels/aot/dist
+          bash scripts/ci/musa/rename_wheels_musa.sh ${{ matrix.musa-version }} sgl-kernel/dist
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-musa${{ matrix.musa-version }}
-          path: python/sglang/kernels/aot/dist/*
+          path: sgl-kernel/dist/*
 
   release-musa43:
     needs: build-musa43
@@ -561,7 +561,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: python/sglang/kernels/aot/dist/
+          path: sgl-kernel/dist/
           merge-multiple: true
           pattern: wheel-*
 
@@ -569,7 +569,7 @@ jobs:
         id: set_tag_name
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat python/sglang/kernels/aot/python/sgl_kernel/version.py | cut -d'"' -f2)"
+            TAG_NAME="v$(cat sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)"
             echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           else
             echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
@@ -582,7 +582,7 @@ jobs:
           repository: sgl-project/whl
           token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           files: |
-            python/sglang/kernels/aot/dist/*
+            sgl-kernel/dist/*
 
       - name: Clone wheel index
         run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
