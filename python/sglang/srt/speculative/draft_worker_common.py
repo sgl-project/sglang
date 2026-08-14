@@ -101,6 +101,10 @@ def build_draft_tp_worker(
 
     draft_model_runner = draft_worker.model_runner
     draft_worker.draft_runner = draft_model_runner
+
+    # DFlash drafts have no vocab; borrow the target's.
+    if draft_model_runner.model_config.vocab_size is None:
+        draft_model_runner.model_config.vocab_size = target_model_config.vocab_size
     return DraftWorkerBundle(
         draft_worker=draft_worker,
         draft_model_runner=draft_model_runner,

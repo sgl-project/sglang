@@ -8,7 +8,30 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from sglang.kernels.ops.diffusion.bitexact_gate import (
+    BitExactFusionGate,
+    tensors_equal,
+)
+from sglang.kernels.ops.diffusion.fused_linear_gelu import (
+    can_fuse_linear_gelu,
+    fused_gelu_active,
+    fused_linear_gelu_tanh,
+    mark_fused_gelu_site,
+)
+from sglang.kernels.ops.diffusion.hunyuan_qknorm import (
+    mark_hunyuan_qknorm_site,
+    try_hunyuan_qknorm,
+)
+from sglang.kernels.ops.diffusion.triton.hunyuan_qkv_pack import (
+    hunyuan_qkv_rope_pack,
+)
 from sglang.multimodal_gen.configs.models.dits import HunyuanVideoConfig
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_double_block,
+    is_refiner_block,
+    is_single_block,
+    is_txt_in,
+)
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -55,6 +78,134 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+_HUNYUAN_QKV_PACK = BitExactFusionGate("HunyuanVideo QKV RoPE pack", per_signature=True)
+_HUNYUAN_QKV_PACK_SIGS = _HUNYUAN_QKV_PACK.verified_sigs
+assert _HUNYUAN_QKV_PACK_SIGS is not None
+
+
+def _hunyuan_qknorm(
+    site: nn.Module,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fused = try_hunyuan_qknorm(
+        site,
+        q,
+        k,
+        q_norm.weight,
+        k_norm.weight,
+        q_norm.variance_epsilon,
+    )
+    if fused is not None:
+        return fused
+    return q_norm(q.contiguous()).to(q), k_norm(k.contiguous()).to(k)
+
+
+class HunyuanMLP(MLP):
+    """Hunyuan MLP with a quality-gated cublasLt GELU epilogue."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        mark_fused_gelu_site(self, "fc_in")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if fused_gelu_active(self) and can_fuse_linear_gelu(self.fc_in, x):
+            x = fused_linear_gelu_tanh(x, self.fc_in.weight, self.fc_in.bias)
+        else:
+            x, _ = self.fc_in(x)
+            x = self.act(x)
+        x, _ = self.fc_out(x)
+        return x
+
+
+def _hunyuan_pack_qkv(
+    img_q: torch.Tensor,
+    img_k: torch.Tensor,
+    img_v: torch.Tensor,
+    txt_q: torch.Tensor,
+    txt_k: torch.Tensor,
+    txt_v: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply image RoPE and pack image/text QKV in one bit-exact kernel."""
+    if torch.compiler.is_compiling():
+        return _hunyuan_pack_qkv_reference(
+            img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin
+        )
+    sig = (
+        img_q.dtype,
+        img_q.device,
+        img_q.shape[0],
+        img_q.shape[2],
+        img_q.shape[3],
+        tuple(img_q.stride()[2:]),
+        tuple(txt_q.stride()[2:]),
+        cos.dtype,
+        sin.dtype,
+    )
+    verified = sig in _HUNYUAN_QKV_PACK_SIGS
+    can_attempt = (
+        not _HUNYUAN_QKV_PACK.disabled
+        and img_q.is_cuda
+        and img_q.dtype == torch.bfloat16
+        and img_q.shape[-1] <= 128
+        and img_q.shape[-1] % 2 == 0
+        and all(x.stride(-1) == 1 for x in (img_q, img_k, img_v, txt_q, txt_k, txt_v))
+        and (verified or not torch.cuda.is_current_stream_capturing())
+    )
+    if not can_attempt:
+        return _hunyuan_pack_qkv_reference(
+            img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin
+        )
+    try:
+        out = hunyuan_qkv_rope_pack(img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin)
+    except Exception as exc:
+        _HUNYUAN_QKV_PACK.on_exception(exc, logger=logger)
+        return _hunyuan_pack_qkv_reference(
+            img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin
+        )
+    if verified:
+        return out
+    return _HUNYUAN_QKV_PACK.accept_or_fallback(
+        out,
+        _hunyuan_pack_qkv_reference(img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin),
+        sig=sig,
+        equal=tensors_equal,
+        logger=logger,
+        mismatch_msg=(
+            "HunyuanVideo fused QKV RoPE pack is not bit-exact on this platform"
+        ),
+    )
+
+
+def _hunyuan_pack_qkv_reference(
+    img_q: torch.Tensor,
+    img_k: torch.Tensor,
+    img_v: torch.Tensor,
+    txt_q: torch.Tensor,
+    txt_k: torch.Tensor,
+    txt_v: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.cat(
+            (_apply_rotary_emb(img_q, cos, sin, is_neox_style=False), txt_q),
+            dim=1,
+        ),
+        torch.cat(
+            (_apply_rotary_emb(img_k, cos, sin, is_neox_style=False), txt_k),
+            dim=1,
+        ),
+        torch.cat((img_v, txt_v), dim=1),
+    )
 
 
 class MixedRowParallelLinear(RowParallelLinear):
@@ -151,7 +302,7 @@ class MMDoubleStreamBlock(nn.Module):
             quant_config=quant_config,
         )
 
-        self.img_mlp = MLP(
+        self.img_mlp = HunyuanMLP(
             hidden_size,
             mlp_hidden_dim,
             bias=True,
@@ -203,7 +354,7 @@ class MMDoubleStreamBlock(nn.Module):
             quant_config=quant_config,
         )
 
-        self.txt_mlp = MLP(
+        self.txt_mlp = HunyuanMLP(
             hidden_size,
             mlp_hidden_dim,
             bias=True,
@@ -219,6 +370,7 @@ class MMDoubleStreamBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn",
         )
+        mark_hunyuan_qknorm_site(self)
 
     def forward(
         self,
@@ -263,15 +415,10 @@ class MMDoubleStreamBlock(nn.Module):
         img_q, img_k, img_v = img_qkv[:, :, 0], img_qkv[:, :, 1], img_qkv[:, :, 2]
 
         # Apply QK-Norm if needed
-
-        img_q = self.img_attn_q_norm(img_q.contiguous()).to(img_v)
-        img_k = self.img_attn_k_norm(img_k.contiguous()).to(img_v)
-        # Apply rotary embeddings
-        cos, sin = freqs_cis
-        img_q, img_k = (
-            _apply_rotary_emb(img_q, cos, sin, is_neox_style=False),
-            _apply_rotary_emb(img_k, cos, sin, is_neox_style=False),
+        img_q, img_k = _hunyuan_qknorm(
+            self, img_q, img_k, self.img_attn_q_norm, self.img_attn_k_norm
         )
+
         # Prepare text for attention using fused operation
         txt_attn_input = self.txt_attn_norm(txt, txt_attn_shift, txt_attn_scale)
 
@@ -286,22 +433,26 @@ class MMDoubleStreamBlock(nn.Module):
         txt_q, txt_k, txt_v = txt_qkv[:, :, 0], txt_qkv[:, :, 1], txt_qkv[:, :, 2]
 
         # Apply QK-Norm if needed
-        txt_q = self.txt_attn_q_norm(txt_q.contiguous()).to(txt_q.dtype)
-        txt_k = self.txt_attn_k_norm(txt_k.contiguous()).to(txt_k.dtype)
+        txt_q, txt_k = _hunyuan_qknorm(
+            self, txt_q, txt_k, self.txt_attn_q_norm, self.txt_attn_k_norm
+        )
+
+        cos, sin = freqs_cis
+        q, k, v = _hunyuan_pack_qkv(img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin)
 
         # Run distributed attention
         if txt_is_sharded:
             attn = self.attn(
-                torch.cat((img_q, txt_q), dim=1),
-                torch.cat((img_k, txt_k), dim=1),
-                torch.cat((img_v, txt_v), dim=1),
+                q,
+                k,
+                v,
                 seq_lens=seq_lens,
             )
         else:
             attn = self.attn(
-                torch.cat((img_q, txt_q), dim=1),
-                torch.cat((img_k, txt_k), dim=1),
-                torch.cat((img_v, txt_v), dim=1),
+                q,
+                k,
+                v,
                 num_replicated_suffix=text_seq_len,
             )
         img_attn, txt_attn = attn.split([image_seq_len, text_seq_len], dim=1)
@@ -417,6 +568,7 @@ class MMSingleStreamBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn",
         )
+        mark_hunyuan_qknorm_site(self)
 
     def forward(
         self,
@@ -450,33 +602,28 @@ class MMSingleStreamBlock(nn.Module):
         q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
 
         # Apply QK-Norm
-        q = self.q_norm(q.contiguous()).to(v.dtype)
-        k = self.k_norm(k.contiguous()).to(v.dtype)
+        q, k = _hunyuan_qknorm(self, q, k, self.q_norm, self.k_norm)
 
         # Split into image and text parts
         img_q, txt_q = q[:, :-txt_len], q[:, -txt_len:]
         img_k, txt_k = k[:, :-txt_len], k[:, -txt_len:]
         img_v, txt_v = v[:, :-txt_len], v[:, -txt_len:]
-        # Apply rotary embeddings to image parts
         cos, sin = freqs_cis
-        img_q, img_k = (
-            _apply_rotary_emb(img_q, cos, sin, is_neox_style=False),
-            _apply_rotary_emb(img_k, cos, sin, is_neox_style=False),
-        )
+        q, k, v = _hunyuan_pack_qkv(img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin)
 
         # Run distributed attention
         if txt_is_sharded:
             attn_output = self.attn(
-                torch.cat((img_q, txt_q), dim=1),
-                torch.cat((img_k, txt_k), dim=1),
-                torch.cat((img_v, txt_v), dim=1),
+                q,
+                k,
+                v,
                 seq_lens=seq_lens,
             )
         else:
             attn_output = self.attn(
-                torch.cat((img_q, txt_q), dim=1),
-                torch.cat((img_k, txt_k), dim=1),
-                torch.cat((img_v, txt_v), dim=1),
+                q,
+                k,
+                v,
                 num_replicated_suffix=txt_len,
             )
         attn_output = attn_output.view(batch_size, seq_len, -1)
@@ -508,9 +655,8 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
     # PY: we make the input args the same as HF config
 
     # shard single stream, double stream blocks, and refiner_blocks
-    _fsdp_shard_conditions = HunyuanVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = HunyuanVideoConfig()._compile_conditions
-    _supported_attention_backends = HunyuanVideoConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_double_block, is_single_block, is_refiner_block]
+    _compile_conditions = [is_double_block, is_single_block, is_txt_in]
     param_names_mapping = HunyuanVideoConfig().param_names_mapping
     reverse_param_names_mapping = HunyuanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = HunyuanVideoConfig().lora_param_names_mapping
