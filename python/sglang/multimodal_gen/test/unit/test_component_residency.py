@@ -12,6 +12,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
     ComponentOffloadStrategy,
     ResidentStrategy,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding import (
+    RealtimeTextEncodingStage,
+)
 
 
 def test_component_offload_releases_preferred_component_after_request():
@@ -181,6 +184,37 @@ def test_single_component_stage_is_prepared_at_stage_entry():
 
     strategy.prepare_for_use.assert_called_once_with(module, use, manager.state)
     strategy.wait_for_use.assert_called_once_with(module, use, manager.state)
+
+
+def test_explicit_component_use_is_prepared_only_at_call_site():
+    module = torch.nn.Linear(2, 2)
+    use = ComponentUse("stage", "text_encoder", start_at_stage_entry=False)
+    stage = _Stage(use)
+    manager, server_args = _manager_for_stage(stage, {"text_encoder": module})
+    strategy = Mock()
+    manager.strategy_for = Mock(return_value=strategy)
+
+    manager.before_stage(stage, 0, SimpleNamespace(is_warmup=False), server_args)
+    manager.begin_stage()
+
+    strategy.prepare_for_use.assert_not_called()
+
+    manager.begin_use(use)
+
+    strategy.prepare_for_use.assert_called_once_with(module, use, manager.state)
+    strategy.wait_for_use.assert_called_once_with(module, use, manager.state)
+
+
+def test_realtime_text_encoder_use_starts_at_call_site():
+    stage = RealtimeTextEncodingStage.__new__(RealtimeTextEncodingStage)
+    stage.text_encoders = [None]
+    stage._registered_stage_name = None
+
+    uses = stage.component_uses(SimpleNamespace(), "RealtimeTextEncodingStage")
+
+    assert len(uses) == 1
+    assert uses[0].component_name == "text_encoder"
+    assert uses[0].start_at_stage_entry is False
 
 
 def test_single_component_stage_is_finished_at_stage_exit():

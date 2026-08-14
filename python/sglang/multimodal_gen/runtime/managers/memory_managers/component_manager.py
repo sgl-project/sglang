@@ -42,6 +42,7 @@ class ComponentUse:
     memory_intensive: bool = False
     target_dtype: torch.dtype | None = None
     keep_ready_after_warmup: bool = False
+    start_at_stage_entry: bool = True
 
 
 @dataclass(slots=True)
@@ -198,7 +199,7 @@ class ComponentResidencyManager:
     def begin_stage(self) -> None:
         """Prepare a stage that declares one uninterrupted component use."""
         stage_uses = self._stage_uses_by_index[self.state.stage_index]
-        if len(stage_uses) == 1:
+        if len(stage_uses) == 1 and stage_uses[0].start_at_stage_entry:
             self.begin_use(stage_uses[0])
 
     def end_stage(self) -> None:
