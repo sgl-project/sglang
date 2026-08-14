@@ -40,7 +40,7 @@ from sglang.srt.utils import (
 )
 
 _is_cpu = is_cpu()
-_cpu_has_amx_support = _is_cpu and cpu_has_amx_support()
+_is_cpu_amx_available = _is_cpu and cpu_has_amx_support()
 
 # ---------------------------------------------------------------------------
 # 2-D Multidimensional RoPE (matches HF Gemma4RotaryEmbedding for vision)
@@ -183,7 +183,9 @@ class Gemma4VisionAttention(nn.Module):
             num_heads=self.num_heads_per_partition,
             num_kv_heads=self.num_kv_heads_per_partition,
             dropout=0.0,
-            flatten_batch=True,
+            # sdpa asserts bsz == 1 under flatten_batch, which batched video
+            # frames violate; Gemma 4 passes its own 4-D mask regardless
+            flatten_batch=backend != "sdpa",
             softmax_in_single_precision=False,
             softmax_scale=1.0,
         )
@@ -208,8 +210,8 @@ class Gemma4VisionAttention(nn.Module):
             # ROCm: use triton_attn to avoid SDPA flatten_batch issues
             # with multi-image/video inputs
             return "triton_attn"
-        if is_cpu():
-            return "amx_attn"
+        # not amx_attn: VisionAMXAttention swallows softmax_scale and the mask
+        # in **kwargs, and the CPU flash_attn hardcodes sm_scale
         return "sdpa"
 
     def forward(
@@ -231,7 +233,7 @@ class Gemma4VisionAttention(nn.Module):
         k = self.k_norm(k.reshape(-1, self.head_dim)).reshape(k.shape)
         v = self.v_norm(v.reshape(-1, self.head_dim)).reshape(v.shape)
 
-        if _is_cpu and _cpu_has_amx_support:
+        if _is_cpu_amx_available:
             cos = cos.reshape(bsz * seq_len, self.head_dim)
             sin = sin.reshape(bsz * seq_len, self.head_dim)
             q, k = torch.ops.sgl_kernel.apply_multidimensional_rope_cpu(q, k, cos, sin)
