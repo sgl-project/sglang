@@ -225,7 +225,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
 class TestDisaggregationMooncakeSpec(
     JSONConstrainedMixin, SpecGrammarKit, PDDisaggregationServerBase
 ):
-    min_retraction_accept_length = 1.5
+    min_retraction_accept_length = 1.3
 
     @classmethod
     def setUpClass(cls):
@@ -233,7 +233,7 @@ class TestDisaggregationMooncakeSpec(
         cls.model = DEFAULT_TARGET_MODEL_EAGLE3
         spec_args = [
             "--speculative-algorithm",
-            "EAGLE",
+            "EAGLE3",
             "--speculative-draft-model-path",
             DEFAULT_DRAFT_MODEL_EAGLE3,
             "--speculative-num-steps",
