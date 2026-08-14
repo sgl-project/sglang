@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.vision import (
 )
 from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
 from sglang.srt.multimodal.mm_utils import concat_or_single
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import get_bool_env_var, is_hip, print_info_once
 
@@ -638,7 +639,7 @@ class MoonViT3dEncoder(nn.Module):
                 seq_len=num_tokens,
                 forward_metadata=metadata,
             )
-        torch.cuda.synchronize(device)
+        current_platform.synchronize(device)
         return True
 
     def prepare_forward_metadata(

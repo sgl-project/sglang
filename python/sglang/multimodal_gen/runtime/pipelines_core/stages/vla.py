@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     Req,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.vla.observation import (
     collate_vla_observation_batches,
@@ -76,7 +77,7 @@ def materialize_vla_action_batch(
 
 def synchronize_vla_action_tensor(actions: torch.Tensor | None) -> None:
     if actions is not None and actions.device.type == "cuda":
-        torch.cuda.synchronize(actions.device)
+        current_platform.synchronize(actions.device)
 
 
 def _effective_prefix_cache_enabled(
@@ -215,7 +216,7 @@ class VLAPrefixEncodingStage(PipelineStage):
                 server_args.pipeline_config.empty_cache_after_prefix
                 and torch.cuda.is_available()
             ):
-                torch.cuda.empty_cache()
+                current_platform.empty_cache()
 
         return [result for result in results if result is not None]
 
@@ -332,7 +333,7 @@ class VLAPrefixEncodingStage(PipelineStage):
             server_args.pipeline_config.empty_cache_after_prefix
             and torch.cuda.is_available()
         ):
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
         return batch
 
 

@@ -18,6 +18,7 @@ from sglang.srt.layers.moe.dwdp.transport import DWDPTransport
 from sglang.srt.layers.moe.dwdp.weight_buffer import WeightBuffer
 from sglang.srt.layers.moe.dwdp.weight_manager import DWDPWeightManager
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -188,7 +189,7 @@ class DwdpManager:
                     if key in peer_views:
                         full_tensor[nxt].copy_(peer_views[key][nxt - ps])
 
-        torch.cuda.synchronize(weight_buffer.device_id)
+        current_platform.synchronize(weight_buffer.device_id)
 
     def _allgather_small_params(
         self, moe_layers: List[Tuple[int, FusedMoE]], group

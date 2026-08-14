@@ -1037,8 +1037,8 @@ class DefaultModelLoader(BaseModelLoader):
             ):
                 model.load_weights(weights)
             if target_device.type == "cuda":
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+                current_platform.synchronize()
+                current_platform.empty_cache()
         else:
             model.load_weights(weights)
 
@@ -2642,7 +2642,7 @@ class PreshardedModelLoader(DefaultModelLoader):
                     verify_hashes=verify_hashes,
                 )
             if torch.cuda.is_available():
-                torch.cuda.synchronize()
+                current_platform.synchronize()
 
             loaded_storages: set = set()
             for k in loaded_param_keys:

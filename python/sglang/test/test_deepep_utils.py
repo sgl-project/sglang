@@ -8,6 +8,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.platforms import current_platform
+
 
 def init_dist(local_rank: int, num_local_ranks: int):
     # NOTES: you may rewrite this function with your own cluster settings
@@ -84,7 +86,7 @@ def create_grouped_scores(
 
 def bench(fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
     # Flush L2 cache with 256 MB data
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     cache = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda")
 
     # Warmup
@@ -104,7 +106,7 @@ def bench(fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
         end_events[i].record()
         if post_fn is not None:
             post_fn()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     times = np.array(
         [s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)]

@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.memory_pool import (
     maybe_detect_oob,
     unwrap_write_loc,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -550,8 +551,6 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     # ---- HiCache CPU offload: skip empty (non-owned) layers ---------------
 
     def get_cpu_copy(self, indices, mamba_indices=None):
-        from sglang.srt.utils import current_platform
-
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -570,8 +569,6 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         return {"kv": kv_cache_cpu, "index_k": self.index_key_cache.cpu_copy(indices)}
 
     def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
-        from sglang.srt.utils import current_platform
-
         kv_cache_cpu = kv_cache_cpu_dict["kv"]
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size

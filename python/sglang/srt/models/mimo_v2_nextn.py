@@ -44,6 +44,7 @@ from sglang.srt.models.mimo_v2 import (
     MiMoV2MLP,
     load_mimo_v2_qkv_proj_weight,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -390,8 +391,8 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
 
 EntryClass = MiMoV2MTP

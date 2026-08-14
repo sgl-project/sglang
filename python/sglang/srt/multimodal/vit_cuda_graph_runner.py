@@ -25,6 +25,7 @@ import torch.nn as nn
 
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.platforms import current_platform
 
 
 class ViTCudaGraphRunner:
@@ -171,7 +172,7 @@ class ViTCudaGraphRunner:
             warmup_kwargs["rotary_pos_emb_sin"] = rotary_pos_emb_sin
         with torch.no_grad():
             vit.blocks[0](self.block_input[graph_key], **warmup_kwargs)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         with self._capture_context(), torch.cuda.graph(graph):
             y = None

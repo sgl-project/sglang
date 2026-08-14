@@ -42,6 +42,7 @@ from sglang.srt.models.bailing_moe_linear import (
     BailingMoeV2_5ForCausalLM,
 )
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BumpAllocator, add_prefix
 
@@ -237,8 +238,8 @@ class BailingMoeForCausalLMNextN(nn.Module):
         del self.lm_head.weight
         self.model.word_embeddings.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         self.base_load_weights_func(self, weights, is_nextn=True)

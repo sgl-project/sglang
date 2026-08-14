@@ -11,6 +11,7 @@ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_ga
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.platforms import current_platform
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
@@ -720,7 +721,7 @@ class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
         for layer in self.layers:
             layer.mlp = None
             layer.self_attn.o_proj = None
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
 
 class Qwen3DSparkModel(DSparkDraftModel):

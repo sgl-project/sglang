@@ -28,6 +28,7 @@ from sglang.srt.layers.moe.dwdp.layout import (
     LayerWeightSpecs,
     MnnvlHandleSet,
 )
+from sglang.srt.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ def _copy_local_weights_to_handles(
             cuda.cuMemcpyDtoD(reservation.base + data_offset, param.data_ptr(), nbytes),
             "cuMemcpyDtoD",
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         reservation.close(release_handles=False)
 
@@ -85,7 +86,7 @@ def _copy_local_weights_to_handles(
             f"phys_size={phys_size}, data_offset={data_offset}"
         )
 
-    torch.cuda.empty_cache()
+    current_platform.empty_cache()
 
     return handles, sizes
 

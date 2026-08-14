@@ -423,7 +423,7 @@ class UpscalerModel:
                 except torch.cuda.OutOfMemoryError:
                     if self.device.type != "cuda":
                         raise
-                    torch.cuda.empty_cache()
+                    current_platform.empty_cache()
                     logger.warning(
                         "Real-ESRGAN full-frame upscale OOM; retrying with tiled upscale"
                     )

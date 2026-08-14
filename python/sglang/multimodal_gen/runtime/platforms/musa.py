@@ -119,6 +119,16 @@ class MusaPlatformBase(Platform):
         torch.cuda.reset_peak_memory_stats(device)
         return float(torch.cuda.max_memory_allocated(device))
 
+    # MUSA device ops go through torch.cuda: the `torchada` import above maps
+    # that API surface onto MThreads hardware. So these must NOT fall back to
+    # the base implementation, which would dispatch on device_type ("musa")
+    # and reach torch.musa instead.
+    def empty_cache(self) -> None:
+        torch.cuda.empty_cache()
+
+    def synchronize(self, device: torch.device | int | None = None) -> None:
+        torch.cuda.synchronize(device)
+
     @classmethod
     def get_available_gpu_memory(
         cls,

@@ -294,7 +294,7 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
 #### Device Operations (from DeviceMixin)
 
 > Methods annotated **[Active]** are called by SGLang core through `current_platform` — OOT implementations take effect immediately.
-> Methods annotated **[Planned]** are reserved interfaces — SGLang core still uses hardcoded calls (e.g. `torch.cuda.empty_cache()`). OOT implementations will NOT take effect until the core is migrated in a future PR.
+> Methods annotated **[Planned]** are reserved interfaces — SGLang core still uses hardcoded calls (e.g. `torch.cuda.set_device()`). OOT implementations will NOT take effect until the core is migrated in a future PR.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -343,18 +343,6 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
       <td>Get <code>DeviceCapability(major, minor)</code>. None if N/A</td>
     </tr>
     <tr>
-      <td><code>empty_cache()</code></td>
-      <td><code>pass</code></td>
-      <td>Planned</td>
-      <td>Release cached device memory</td>
-    </tr>
-    <tr>
-      <td><code>synchronize()</code></td>
-      <td><code>pass</code></td>
-      <td>Planned</td>
-      <td>Synchronize device operations</td>
-    </tr>
-    <tr>
       <td><code>get_device_total_memory(device_id)</code></td>
       <td><code>raise NotImplementedError</code></td>
       <td><strong>Active</strong></td>
@@ -377,6 +365,18 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
       <td><code>False</code></td>
       <td><strong>Active</strong></td>
       <td>Whether pinned host memory is available for a target device</td>
+    </tr>
+    <tr>
+      <td><code>empty_cache()</code></td>
+      <td><code>pass</code></td>
+      <td><strong>Active</strong></td>
+      <td>Release cached device memory</td>
+    </tr>
+    <tr>
+      <td><code>synchronize(device=None)</code></td>
+      <td><code>pass</code></td>
+      <td><strong>Active</strong></td>
+      <td>Wait for pending work on <code>device</code> (<code>None</code> = current device). Overrides must accept the argument — some call sites pass a concrete device</td>
     </tr>
     <tr>
       <td><code>get_torch_distributed_backend_str()</code></td>

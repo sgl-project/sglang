@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -751,7 +752,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
             history_latents = torch.cat([history_latents, latents], dim=2)
             chunk_latents_list.append(latents)
 
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
         # Store per-chunk latents for chunk-by-chunk VAE decode (matches diffusers behavior).
         # The standard DecodingStage will check for this attribute and decode each chunk
