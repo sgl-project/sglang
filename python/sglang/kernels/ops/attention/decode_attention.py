@@ -489,11 +489,19 @@ def _fwd_grouped_kernel_stage1(
             qpe = tl.load(
                 Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
             )
+        offs_n = split_kv_start + tl.arange(0, BLOCK_N)
+        kv_loc_next = tl.load(
+            kv_indices + cur_batch_kv_start_idx + offs_n,
+            mask=offs_n < split_kv_end,
+            other=0,
+        )
         for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
-            kv_loc = tl.load(
-                kv_indices + cur_batch_kv_start_idx + offs_n,
-                mask=offs_n < split_kv_end,
+            kv_loc = kv_loc_next
+            offs_n_next = offs_n + BLOCK_N
+            kv_loc_next = tl.load(
+                kv_indices + cur_batch_kv_start_idx + offs_n_next,
+                mask=offs_n_next < split_kv_end,
                 other=0,
             )
             # Page-aware KV address math (see _fwd_kernel_stage1).
