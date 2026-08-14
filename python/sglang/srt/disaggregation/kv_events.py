@@ -33,6 +33,8 @@ import msgspec
 import zmq
 from pydantic import BaseModel
 
+from sglang.srt.utils.network import NetworkAddress
+
 logger = logging.getLogger(__name__)
 
 
@@ -66,6 +68,181 @@ class EventBatch(
     ts: float
     events: list[Any]
     attn_dp_rank: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# Port map
+#
+# The kv-events config implies more than the publisher's own socket: the replay
+# socket sits alongside it, and the router-facing load range is packed after it
+# by default. Deciding all of that here keeps "which ports does this config
+# occupy" in one place -- the module that defines the config and binds the
+# sockets the range must avoid.
+# ---------------------------------------------------------------------------
+
+
+_BIND_WILDCARD_HOSTS = frozenset({"*", "0.0.0.0", "::"})
+
+
+def endpoint_is_bind_style(endpoint: str) -> bool:
+    """Whether the publisher binds this endpoint rather than connecting to it.
+
+    Same intent as ``ZmqEventPublisher``'s heuristic, but decided on the parsed
+    host rather than a substring match, because the substring form treats every
+    IPv6 address as a wildcard -- ``tcp://[2001:db8::5]:5557`` contains ``::``
+    and would be advertised and then fail to bind on any host where that address
+    is not local, which is exactly the advertised-but-unbound state this module
+    exists to prevent.
+    """
+    if endpoint.startswith(("ipc://", "inproc://")):
+        return True
+    if not endpoint.startswith("tcp://"):
+        return False
+    try:
+        return NetworkAddress.parse(endpoint[len("tcp://") :]).host in (
+            _BIND_WILDCARD_HOSTS
+        )
+    except ValueError:
+        return False
+
+
+def _parse_bindable_tcp(endpoint: str) -> Optional[tuple[str, int]]:
+    """``(host, port)`` if this is a TCP endpoint the publisher can bind, else None."""
+    if not endpoint.startswith("tcp://") or not endpoint_is_bind_style(endpoint):
+        return None
+    try:
+        addr = NetworkAddress.parse(endpoint[len("tcp://") :])
+    except ValueError:
+        return None
+    if not (0 < addr.port < 65536):
+        return None
+    return addr.host, addr.port
+
+
+def _advertisable_config(server_args):
+    """The kv-events config, only when ``/server_info`` will describe it.
+
+    Discovery rides on the kv-events descriptor, so a load range that this
+    returns None for would be bound and never advertised -- a router cannot
+    find it, and the port is claimed for nothing. Mirrors
+    `ServerArgs.describe_kv_events_publisher`'s preconditions;
+    `test_binding_and_advertising_agree` pins the two together.
+    """
+    raw = server_args.kv_events_config
+    page_size = getattr(server_args, "page_size", None)
+    if not raw or page_size is None or page_size <= 0:
+        return None
+    try:
+        cfg = KVEventsConfig.from_cli(raw)
+    except Exception:
+        return None
+    if cfg.publisher == "null" or not cfg.endpoint:
+        return None
+    if not cfg.endpoint.startswith("tcp://"):
+        return None
+    try:
+        addr = NetworkAddress.parse(cfg.endpoint[len("tcp://") :])
+    except ValueError:
+        return None
+    if not addr.host or not (0 < addr.port < 65536):
+        return None
+    return cfg
+
+
+def _tcp_port(endpoint: Optional[str]) -> Optional[int]:
+    """Port of a ``tcp://`` endpoint regardless of host, or None.
+
+    Deliberately not `_parse_bindable_tcp`: this answers "what will something
+    else occupy", and `ZmqEventPublisher` binds its replay socket for any host,
+    so gating on bind-style would arm the collision check for only the wildcard
+    spelling of the endpoint it is meant to avoid.
+    """
+    if not endpoint or not endpoint.startswith("tcp://"):
+        return None
+    try:
+        return NetworkAddress.parse(endpoint[len("tcp://") :]).port
+    except ValueError:
+        return None
+
+
+def _reserved_port_ranges(cfg, dp_size: int):
+    """Half-open port ranges the KV-event publisher claims, per rank."""
+    for endpoint in (cfg.endpoint, cfg.replay_endpoint):
+        port = _tcp_port(endpoint)
+        if port is not None:
+            yield port, port + dp_size
+
+
+def resolve_load_pub_range(server_args):
+    """``((host, base), reason)`` -- exactly one of the two is None.
+
+    ``reason`` is a string when an operator would want to know why load
+    publishing is off, and None when declining is unremarkable (no kv-events
+    config at all). Returning it rather than logging keeps this callable from
+    ``/server_info`` on every request without turning a static misconfiguration
+    into request-rate log volume; `create_load_pub_writer` logs it once.
+
+    Rank ``r`` binds ``base + r``, and ``/server_info`` advertises ``base``.
+    ``--load-publish-endpoint`` sets the range outright; otherwise it defaults
+    to the ``dp_size`` ports immediately after the KV-event range. Consumers
+    read the advertised base rather than deriving it, so overriding the
+    adjacency costs nothing.
+
+    Every rejection here exists because binding anyway would be worse than not
+    publishing: a range that is not advertised is a port claimed for nothing, a
+    non-wildcard host would be connected to rather than bound, and a range
+    overlapping the KV publisher's own sockets would take a port whose later,
+    unguarded bind then kills scheduler startup.
+    """
+    cfg = _advertisable_config(server_args)
+    if cfg is None:
+        # Load discovery rides on the kv-events descriptor; without one there is
+        # nothing to advertise through, so this is not a misconfiguration.
+        return None, None
+
+    dp_size = server_args.dp_size
+    explicit = server_args.load_publish_endpoint
+    if explicit:
+        resolved = _parse_bindable_tcp(explicit)
+        if resolved is None:
+            return None, (
+                f"--load-publish-endpoint={explicit!r} is not a bindable tcp:// "
+                f"address (a concrete host would be connected to, not bound)"
+            )
+        host, base = resolved
+    else:
+        resolved = _parse_bindable_tcp(cfg.endpoint)
+        if resolved is None:
+            return None, None
+        host, kv_port = resolved
+        base = kv_port + dp_size
+
+    if base + dp_size - 1 > 65535:
+        return None, f"load port range from {base} would run past the u16 ceiling"
+
+    for lo, hi in _reserved_port_ranges(cfg, dp_size):
+        if base < hi and lo < base + dp_size:
+            return None, (
+                f"load port range [{base}, {base + dp_size}) overlaps the "
+                f"kv-events range [{lo}, {hi}); set --load-publish-endpoint to "
+                f"move it"
+            )
+    return (host, base), None
+
+
+def load_pub_port_base(server_args) -> Optional[int]:
+    """Base port of the router-facing load range. See `resolve_load_pub_range`."""
+    resolved, _ = resolve_load_pub_range(server_args)
+    return resolved[1] if resolved else None
+
+
+def load_pub_endpoint(server_args, dp_rank: int) -> Optional[str]:
+    """This rank's router-facing PUB endpoint. See `resolve_load_pub_range`."""
+    resolved, _ = resolve_load_pub_range(server_args)
+    if resolved is None:
+        return None
+    host, base = resolved
+    return NetworkAddress(host, base + dp_rank).to_tcp()
 
 
 class KVCacheEvent(

@@ -173,7 +173,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     sock_send,
 )
-from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
+from sglang.srt.managers.load_snapshot import (
+    create_load_pub_writer,
+    create_load_snapshot_writer,
+)
 from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
     resolve_min_free_slots,
@@ -221,6 +224,9 @@ from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
 from sglang.srt.managers.scheduler_components.load_inquirer import SchedulerLoadInquirer
+from sglang.srt.managers.scheduler_components.load_publisher import (
+    SchedulerLoadPublisher,
+)
 from sglang.srt.managers.scheduler_components.logprob_result_processor import (
     SchedulerLogprobResultProcessor,
 )
@@ -645,6 +651,7 @@ class Scheduler(
         self.init_kv_events_publisher()
 
         self.init_load_inquirer()
+        self.init_load_publisher()
 
         self.init_output_streamer()
 
@@ -751,7 +758,11 @@ class Scheduler(
             enable_scripted_runtime=envs.SGLANG_TEST_SCRIPTED_RUNTIME.get(),
         )
 
+        # The internal writer needs port_args, which only this path has; the
+        # router writer is built alongside it so both are ready before
+        # init_load_publisher wires them to the inquirer.
         self.load_snapshot_writer = None
+        self.load_pub_writer = None
         self.recv_from_tokenizer = None
 
         if not is_rank_zero:
@@ -769,6 +780,11 @@ class Scheduler(
             )
         except Exception as e:
             logger.warning("load snapshot writer init failed: %s", e)
+        try:
+            self.load_pub_writer = create_load_pub_writer(self.server_args, dp_rank)
+        except Exception as e:
+            # An optional sink must not be able to take down the engine.
+            logger.warning("router-facing load writer init failed: %s", e)
 
     def init_idle_sleeper(self) -> None:
         if (
@@ -787,18 +803,7 @@ class Scheduler(
             self.idle_sleeper = None
 
     def publish_load_snapshot(self, force: bool = False):
-        writer = self.load_snapshot_writer
-        if writer is None:
-            return
-        if not force:
-            writer.publish_counter += 1
-            if writer.publish_counter < writer.publish_interval:
-                return
-        writer.publish_counter = 0
-        try:
-            writer.write(self.load_inquirer.get_loads())
-        except Exception as e:
-            logger.warning("load snapshot publish failed: %s", e)
+        self.load_publisher.publish(force=force)
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -2129,6 +2134,14 @@ class Scheduler(
             get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
+        )
+
+    def init_load_publisher(self) -> None:
+        self.load_publisher = SchedulerLoadPublisher(
+            inquirer=self.load_inquirer,
+            internal_writer=self.load_snapshot_writer,
+            router_writer=self.load_pub_writer,
+            internal_interval=get_observability().load_snapshot_publish_interval,
         )
 
     def init_output_streamer(self) -> None:
