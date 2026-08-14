@@ -59,6 +59,18 @@ logger = logging.getLogger(__name__)
 # Use power of 2 values for better memory allocation.
 DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 << 16))
 
+# How many consecutive steps the incremental-decoding offsets may stay frozen.
+# The commit gate below keeps them still while the decoded tail looks like an
+# incomplete UTF-8 character, but "ends in U+FFFD" is only a proxy for that:
+# U+FFFD is also a complete character a model can emit, and a byte-fallback
+# token decodes to one on its own. A real incomplete character is at most three
+# bytes short, so it completes within the next few tokens; a tail that still
+# looks incomplete after this many steps is output, not a pending character.
+# Committing it keeps the re-decoded window bounded -- while the offsets are
+# frozen the window grows with the output, and since it is re-decoded every
+# step the request costs O(n^2) in its own output length.
+MAX_STALLED_DECODE_STEPS = 8
+
 
 @dataclasses.dataclass
 class DecodeStatus:
@@ -70,6 +82,8 @@ class DecodeStatus:
     read_offset: int
     # Offset that's sent to tokenizer for incremental update.
     sent_offset: int = 0
+    # Consecutive steps the offsets above have stayed frozen.
+    stalled_steps: int = 0
     decoded_text_len: int = dataclasses.field(init=False)
     decoded_text_chunks: List[str] = dataclasses.field(default_factory=list)
 
@@ -377,8 +391,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 # in a prior "�" recovery step; we skip it from this step's
                 # emission so we don't double-send.
                 pending = s.sent_offset - s.decoded_text_len
-                if new_text and not new_text.endswith("�"):
-                    # Clean text: commit to decoded_text and advance offsets.
+                clean = bool(new_text) and not new_text.endswith("�")
+                if clean or s.stalled_steps >= MAX_STALLED_DECODE_STEPS:
+                    # Clean text, or a tail that has stopped looking like a
+                    # pending character: commit to decoded_text and advance
+                    # offsets so the decoded window stays bounded.
+                    s.stalled_steps = 0
                     s.append_decoded_text(new_text)
                     s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)
@@ -388,6 +406,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     # Incomplete UTF-8: emit the printable prefix only; do not
                     # commit (token offsets stay so the next iteration retries
                     # with more tokens).
+                    s.stalled_steps += 1
                     printable = find_printable_text(new_text)
                     s.sent_offset = s.decoded_text_len + len(printable)
                     output_strs.append(printable[pending:] if pending else printable)
