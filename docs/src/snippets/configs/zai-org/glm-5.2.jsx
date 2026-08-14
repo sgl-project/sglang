@@ -296,6 +296,23 @@ sgl-eval run aime25 \\
         "--port {{PORT}}",
       ],
     },
+    {
+      // H200 fp8 high-throughput — restored to match main (#31554): DP8 + DeepEP, no spec.
+      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--mem-fraction-static 0.85",
+        "--max-running-requests 256",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
 
     // ====================================================================
     // B200 + FP8 (Blackwell) — TP8.  low-latency verified on b200-verda-k8s
