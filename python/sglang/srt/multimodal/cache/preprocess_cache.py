@@ -37,11 +37,13 @@ class CacheLookup(Generic[V]):
 
 
 @dataclass(frozen=True)
-class CacheReservation(Generic[K, V]):
+class CacheMiss(Generic[K, V]):
+    """One in-flight miss; one caller computes it while other callers wait."""
+
     key: K
     future: concurrent.futures.Future[V]
     generation: int
-    owner: bool
+    should_compute: bool
 
 
 @dataclass
@@ -237,13 +239,13 @@ class MultimodalPreprocessCache(Generic[K, V]):
                 future = concurrent.futures.Future()
                 generation = self._generation
                 self._inflight[key] = (future, generation)
-                owner = True
+                should_compute = True
             else:
                 future, generation = inflight
                 self.singleflight_joins += 1
-                owner = False
+                should_compute = False
 
-        if owner:
+        if should_compute:
             self.create_background_task(
                 self._compute_owned_value(
                     key, future, generation, compute, size_bytes=size_bytes
@@ -251,9 +253,9 @@ class MultimodalPreprocessCache(Generic[K, V]):
             )
 
         # The cache owns the shared computation. Cancelling either its first
-        # caller or a later joiner ends only that caller's local await.
+        # computing caller or a later waiter ends only that caller's local await.
         value = await asyncio.shield(asyncio.wrap_future(future))
-        return CacheLookup(value, hit=False, joined=not owner)
+        return CacheLookup(value, hit=False, joined=not should_compute)
 
     async def _compute_owned_value(
         self,
@@ -295,20 +297,20 @@ class MultimodalPreprocessCache(Generic[K, V]):
         task.add_done_callback(self._background_task_done)
         return task
 
-    def reserve_many(
+    def lookup_or_claim_many(
         self,
         keys: list[K],
         *,
         predicate: Optional[Callable[[K, V], bool]] = None,
-    ) -> list[CacheLookup[V] | CacheReservation[K, V]]:
-        """Atomically use compatible hits and reserve the remaining keys."""
-        results: list[CacheLookup[V] | CacheReservation[K, V]] = []
+    ) -> list[CacheLookup[V] | CacheMiss[K, V]]:
+        """Return cache hits and single-flight misses for the requested keys."""
+        results: list[CacheLookup[V] | CacheMiss[K, V]] = []
         with self._lock:
             for key in keys:
                 if not self.enabled:
                     future: concurrent.futures.Future[V] = concurrent.futures.Future()
                     results.append(
-                        CacheReservation(key, future, self._generation, owner=True)
+                        CacheMiss(key, future, self._generation, should_compute=True)
                     )
                     continue
 
@@ -331,54 +333,54 @@ class MultimodalPreprocessCache(Generic[K, V]):
                     generation = self._generation
                     self._inflight[key] = (future, generation)
                     results.append(
-                        CacheReservation(key, future, generation, owner=True)
+                        CacheMiss(key, future, generation, should_compute=True)
                     )
                 else:
                     future, generation = inflight
                     self.singleflight_joins += 1
                     results.append(
-                        CacheReservation(key, future, generation, owner=False)
+                        CacheMiss(key, future, generation, should_compute=False)
                     )
         return results
 
-    def fulfill(
+    def complete_miss(
         self,
-        reservation: CacheReservation[K, V],
+        miss: CacheMiss[K, V],
         value: V,
         *,
         cache_value: V | object = _USE_RESULT,
         size_bytes: Optional[int] = None,
     ) -> None:
-        if not reservation.owner:
-            raise ValueError("Only an owning reservation can be fulfilled")
+        if not miss.should_compute:
+            raise ValueError("Only the caller computing a cache miss can complete it")
         self.put(
-            reservation.key,
+            miss.key,
             value if cache_value is _USE_RESULT else cache_value,
             size_bytes,
-            _generation=reservation.generation,
+            _generation=miss.generation,
         )
-        reservation.future.set_result(value)
+        miss.future.set_result(value)
         with self._lock:
-            if self._inflight.get(reservation.key) == (
-                reservation.future,
-                reservation.generation,
+            if self._inflight.get(miss.key) == (
+                miss.future,
+                miss.generation,
             ):
-                self._inflight.pop(reservation.key, None)
+                self._inflight.pop(miss.key, None)
 
-    def fail(self, reservation: CacheReservation[K, V], error: BaseException) -> None:
-        if not reservation.owner:
-            raise ValueError("Only an owning reservation can fail")
-        reservation.future.set_exception(error)
-        reservation.future.exception()
+    def fail_miss(self, miss: CacheMiss[K, V], error: BaseException) -> None:
+        if not miss.should_compute:
+            raise ValueError("Only the caller computing a cache miss can fail it")
+        miss.future.set_exception(error)
+        miss.future.exception()
         with self._lock:
-            if self._inflight.get(reservation.key) == (
-                reservation.future,
-                reservation.generation,
+            if self._inflight.get(miss.key) == (
+                miss.future,
+                miss.generation,
             ):
-                self._inflight.pop(reservation.key, None)
+                self._inflight.pop(miss.key, None)
 
-    async def wait(self, reservation: CacheReservation[K, V]) -> V:
-        return await asyncio.shield(asyncio.wrap_future(reservation.future))
+    async def wait_for_miss(self, miss: CacheMiss[K, V]) -> V:
+        return await asyncio.shield(asyncio.wrap_future(miss.future))
 
     def stats(self) -> dict[str, int]:
         with self._lock:

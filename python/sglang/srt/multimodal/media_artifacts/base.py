@@ -19,7 +19,7 @@ from PIL import Image
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import (
     CacheLookup,
-    CacheReservation,
+    CacheMiss,
     MediaSnapshot,
     build_artifact_key,
     media_preprocess_kwargs,
@@ -53,7 +53,7 @@ class MediaArtifactInput:
     """One decoded raw multimodal input that missed the preprocess cache.
 
     The shared cache layer has already validated its content digest, derived
-    its artifact key, and reserved the cache miss. The model-specific artifact
+    its artifact key, and claimed the cache miss. The model-specific artifact
     builder can therefore preprocess ``media`` without loading or hashing it
     again.
     """
@@ -282,7 +282,7 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
                 allow_featureless=featureless_hit_mask[index],
             )
 
-        # Deduplicate misses before decode and reserve them across requests.
+        # Deduplicate misses before decode and share their work across requests.
         first_index_by_key: dict[str, int] = {}
         previous_metadata: dict[str, ArtifactT] = {}
         for index in load_indices:
@@ -297,7 +297,7 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
                     previous_metadata[key] = previous
 
         unique_keys = list(first_index_by_key)
-        reservations = self.mm_preprocess_cache.reserve_many(
+        cache_results = self.mm_preprocess_cache.lookup_or_claim_many(
             unique_keys,
             predicate=lambda key, artifact: self.artifact_usable(
                 artifact,
@@ -305,17 +305,17 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
             ),
         )
         resolved_by_key: dict[str, ArtifactT] = {}
-        owners: list[CacheReservation[str, ArtifactT]] = []
-        for key, reservation in zip(unique_keys, reservations):
-            if isinstance(reservation, CacheLookup):
-                resolved_by_key[key] = reservation.value
-            elif reservation.owner:
-                owners.append(reservation)
+        misses_to_compute: list[CacheMiss[str, ArtifactT]] = []
+        for key, result in zip(unique_keys, cache_results):
+            if isinstance(result, CacheLookup):
+                resolved_by_key[key] = result.value
+            elif result.should_compute:
+                misses_to_compute.append(result)
 
-        if owners:
-            owner_task = self.mm_preprocess_cache.create_background_task(
-                self._fulfill_artifact_reservations(
-                    owners,
+        if misses_to_compute:
+            miss_task = self.mm_preprocess_cache.create_background_task(
+                self._compute_cache_misses(
+                    misses_to_compute,
                     first_index_by_key,
                     snapshots,
                     previous_metadata,
@@ -323,12 +323,14 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
                     modality,
                 )
             )
-            # Shared work outlives cancellation of the request that became owner.
-            await asyncio.shield(owner_task)
+            # Shared work outlives cancellation of the request doing the work.
+            await asyncio.shield(miss_task)
 
-        for key, reservation in zip(unique_keys, reservations):
-            if isinstance(reservation, CacheReservation) and not reservation.owner:
-                resolved_by_key[key] = await self.mm_preprocess_cache.wait(reservation)
+        for key, result in zip(unique_keys, cache_results):
+            if isinstance(result, CacheMiss) and not result.should_compute:
+                resolved_by_key[key] = await self.mm_preprocess_cache.wait_for_miss(
+                    result
+                )
 
         for index, artifact in enumerate(artifacts):
             if artifact is None:
@@ -339,19 +341,20 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
             raise RuntimeError("Artifact cache did not resolve every media item")
         return cast(list[ArtifactT], artifacts)
 
-    async def _fulfill_artifact_reservations(
+    async def _compute_cache_misses(
         self,
-        owners: Sequence[CacheReservation[str, ArtifactT]],
+        misses_to_compute: Sequence[CacheMiss[str, ArtifactT]],
         first_index_by_key: Mapping[str, int],
         snapshots: Sequence[Optional[MediaSnapshot]],
         previous_metadata: Mapping[str, ArtifactT],
         resolved_by_key: dict[str, ArtifactT],
         modality: Modality,
     ) -> None:
+        """Preprocess misses claimed by this request and publish their results."""
         try:
-            owner_entries = []
-            for reservation in owners:
-                index = first_index_by_key[reservation.key]
+            miss_entries = []
+            for miss in misses_to_compute:
+                index = first_index_by_key[miss.key]
                 snapshot = snapshots[index]
                 assert snapshot is not None
                 media = await asyncio.wrap_future(
@@ -359,43 +362,43 @@ class MediaArtifactCacheMixin(Generic[ArtifactT]):
                         self.decode_media_snapshot, snapshot, modality
                     )
                 )
-                owner_entries.append(
+                miss_entries.append(
                     MediaArtifactInput(
                         content_digest=snapshot.content_digest,
-                        artifact_key=reservation.key,
+                        artifact_key=miss.key,
                         modality=modality,
                         media=media,
                     )
                 )
 
-            owner_artifacts = await self._run_artifact_batch(owner_entries)
-            if len(owner_artifacts) != len(owners):
+            miss_artifacts = await self._run_artifact_batch(miss_entries)
+            if len(miss_artifacts) != len(misses_to_compute):
                 raise ValueError(
                     "prepare_artifact_batch must return one artifact per cache miss"
                 )
-            for reservation, entry, artifact in zip(
-                owners, owner_entries, owner_artifacts
+            for miss, entry, artifact in zip(
+                misses_to_compute, miss_entries, miss_artifacts
             ):
                 self.validate_artifact(artifact, entry)
-                previous = previous_metadata.get(reservation.key)
+                previous = previous_metadata.get(miss.key)
                 if (
                     previous is not None
                     and previous.feature_hash != artifact.feature_hash
                 ):
                     raise ValueError(
                         "Cached media artifact feature hash changed for identical "
-                        f"identity {reservation.key}"
+                        f"identity {miss.key}"
                     )
                 cache_value = artifact.cache_value()
                 self.validate_artifact(cache_value, entry)
-                self.mm_preprocess_cache.fulfill(
-                    reservation,
+                self.mm_preprocess_cache.complete_miss(
+                    miss,
                     artifact,
                     cache_value=cache_value,
                 )
-                resolved_by_key[reservation.key] = artifact
+                resolved_by_key[miss.key] = artifact
         except BaseException as error:
-            for reservation in owners:
-                if not reservation.future.done():
-                    self.mm_preprocess_cache.fail(reservation, error)
+            for miss in misses_to_compute:
+                if not miss.future.done():
+                    self.mm_preprocess_cache.fail_miss(miss, error)
             raise

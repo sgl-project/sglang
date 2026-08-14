@@ -13,7 +13,7 @@ from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.multimodal.cache import (
-    CacheReservation,
+    CacheMiss,
     MultimodalPreprocessCache,
     build_artifact_key,
     build_processor_fingerprint,
@@ -294,16 +294,16 @@ class TestMultimodalPreprocessCache(unittest.TestCase):
         )
         self.assertEqual((cache.hits, cache.misses), (1, 0))
 
-    def test_reservation_rejects_an_incompatible_racing_entry(self):
+    def test_claimed_miss_rejects_an_incompatible_racing_entry(self):
         cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
         cache.put("key", b"metadata-only")
 
-        reservation = cache.reserve_many(
+        miss = cache.lookup_or_claim_many(
             ["key"], predicate=lambda key, value: value == b"full-feature"
         )[0]
 
-        self.assertIsInstance(reservation, CacheReservation)
-        self.assertTrue(reservation.owner)
+        self.assertIsInstance(miss, CacheMiss)
+        self.assertTrue(miss.should_compute)
         self.assertNotIn("key", cache)
         self.assertEqual(cache.current_size_bytes, 0)
 
@@ -415,40 +415,40 @@ class TestMultimodalPreprocessCache(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_reserve_many_batches_owners_and_joins(self):
+    def test_lookup_or_claim_many_batches_owned_and_joined_misses(self):
         async def run():
             cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
-            reservations = cache.reserve_many(["a", "b", "a"])
-            owners = [
+            results = cache.lookup_or_claim_many(["a", "b", "a"])
+            misses_to_compute = [
                 item
-                for item in reservations
-                if isinstance(item, CacheReservation) and item.owner
+                for item in results
+                if isinstance(item, CacheMiss) and item.should_compute
             ]
-            self.assertEqual([item.key for item in owners], ["a", "b"])
+            self.assertEqual([item.key for item in misses_to_compute], ["a", "b"])
 
-            cache.fulfill(owners[0], b"value-a")
-            cache.fulfill(owners[1], b"value-b")
-            self.assertEqual(await cache.wait(reservations[2]), b"value-a")
+            cache.complete_miss(misses_to_compute[0], b"value-a")
+            cache.complete_miss(misses_to_compute[1], b"value-b")
+            self.assertEqual(await cache.wait_for_miss(results[2]), b"value-a")
             self.assertEqual(cache.get("b"), b"value-b")
 
         asyncio.run(run())
 
-    def test_cancelled_reservation_waiter_does_not_cancel_owner(self):
+    def test_cancelled_miss_waiter_does_not_cancel_computing_caller(self):
         async def run():
             cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
-            owner = cache.reserve_many(["key"])[0]
-            joiner = cache.reserve_many(["key"])[0]
-            self.assertTrue(owner.owner)
-            self.assertFalse(joiner.owner)
+            computing_miss = cache.lookup_or_claim_many(["key"])[0]
+            waiting_miss = cache.lookup_or_claim_many(["key"])[0]
+            self.assertTrue(computing_miss.should_compute)
+            self.assertFalse(waiting_miss.should_compute)
 
-            waiter = asyncio.create_task(cache.wait(joiner))
+            waiter = asyncio.create_task(cache.wait_for_miss(waiting_miss))
             await asyncio.sleep(0)
             waiter.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await waiter
 
-            cache.fulfill(owner, b"artifact")
-            self.assertEqual(owner.future.result(), b"artifact")
+            cache.complete_miss(computing_miss, b"artifact")
+            self.assertEqual(computing_miss.future.result(), b"artifact")
             self.assertEqual(cache.get("key"), b"artifact")
 
         asyncio.run(run())
@@ -456,15 +456,15 @@ class TestMultimodalPreprocessCache(unittest.TestCase):
     def test_disabled_cache_does_not_join_or_retain(self):
         async def run():
             cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=0)
-            reservations = cache.reserve_many(["a", "a"])
+            misses = cache.lookup_or_claim_many(["a", "a"])
             self.assertTrue(
                 all(
-                    isinstance(item, CacheReservation) and item.owner
-                    for item in reservations
+                    isinstance(item, CacheMiss) and item.should_compute
+                    for item in misses
                 )
             )
-            for item in reservations:
-                cache.fulfill(item, b"value")
+            for item in misses:
+                cache.complete_miss(item, b"value")
             self.assertEqual(len(cache), 0)
             self.assertEqual(cache.stats()["singleflight_joins"], 0)
 
@@ -497,18 +497,18 @@ class TestMultimodalPreprocessCache(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_clear_starts_a_new_reservation_generation(self):
+    def test_clear_starts_a_new_cache_miss_generation(self):
         cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
-        old = cache.reserve_many(["key"])[0]
+        old = cache.lookup_or_claim_many(["key"])[0]
         cache.clear()
-        new = cache.reserve_many(["key"])[0]
+        new = cache.lookup_or_claim_many(["key"])[0]
 
-        self.assertTrue(old.owner)
-        self.assertTrue(new.owner)
+        self.assertTrue(old.should_compute)
+        self.assertTrue(new.should_compute)
         self.assertIsNot(old.future, new.future)
-        cache.fulfill(old, b"old")
+        cache.complete_miss(old, b"old")
         self.assertNotIn("key", cache)
-        cache.fulfill(new, b"new")
+        cache.complete_miss(new, b"new")
         self.assertEqual(cache.get("key"), b"new")
 
 
