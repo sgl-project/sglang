@@ -307,8 +307,12 @@ jobs:
           source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash || true
           source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash || true
 
-          # Original per-run log path {date}/{testcase}.
-          log_path="/root/.cache/tests/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
+          # Nightly log path mirrors the output layout; PR keeps the original {date}/{testcase}.
+          if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
+            log_path="/root/.cache/tests/logs/log/${branch_label}-${create_time}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}/${HOSTNAME}"
+          else
+            log_path="/root/.cache/tests/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
+          fi
           rm -rf ${log_path}
           mkdir -p ${log_path}
           echo "Log path: ${log_path}"
@@ -317,34 +321,23 @@ jobs:
           test_exit_code=0
           cd test
 
-          # Install missing python deps (add new ones to REQUIRED_PIP_PKGS).
-          # Retry on transient failures and fall back to the in-cluster PyPI cache.
-          PIP_INDEXES=(
-            "https://pypi.org/simple/"
-            "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
-          )
+          # Install missing python deps
+          PIP_INDEXES=("https://pypi.org/simple/" "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple")
           REQUIRED_PIP_PKGS=(tabulate)
           for pkg in "${REQUIRED_PIP_PKGS[@]}"; do
-            if ${PYTHON_FOR_SGLANG} -c "import ${pkg}" >/dev/null 2>&1; then
-              echo "${pkg}: already available, skip"
-              continue
-            fi
+            ${PYTHON_FOR_SGLANG} -c "import ${pkg}" 2>/dev/null && { echo "${pkg}: available, skip"; continue; }
             ok=0
             for attempt in 1 2 3; do
               for index in "${PIP_INDEXES[@]}"; do
-                echo "${pkg}: install attempt ${attempt}/3 via ${index}"
+                echo "${pkg}: attempt ${attempt}/3 via ${index}"
                 if ${PYTHON_FOR_SGLANG} -m pip install "${pkg}" --retries 3 --timeout 60 \
                     -i "${index}" --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local; then
-                  ok=1
-                  break 2
+                  ok=1; break 2
                 fi
               done
               [ "${attempt}" -lt 3 ] && sleep 15
             done
-            if [ "${ok}" != "1" ]; then
-              echo "ERROR: failed to install ${pkg} after retries"
-              exit 1
-            fi
+            [ "${ok}" = "1" ] || { echo "ERROR: failed to install ${pkg}"; exit 1; }
           done
 
           # Append `--nightly` and `--continue-on-error` arguments when the job belongs to the nightly pipeline.
@@ -368,8 +361,12 @@ jobs:
             TIMEOUT_FLAG="--timeout-from-est-time"
           fi
 
+          # Nightly additionally persists the full suite log to ${log_path}/${tc_name}.log
+          # under the structured path; PR runs only tee to /tmp/test_output.log.
+          LOG_TEE_TARGET="$([ "${{ inputs.is_nightly_pipeline_job }}" = "true" ] && echo "${log_path}/${tc_name}.log")"
+
           # Run NPU test suite with run_suite.py.
-          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
+          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log ${LOG_TEE_TARGET} || test_exit_code=$?
 
           echo "Finished test: ${tc_name}"
 
