@@ -1,5 +1,6 @@
 import logging
-from importlib.metadata import PackageNotFoundError, version as _dist_version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _dist_version
 
 from packaging.version import parse as _parse_version
 
