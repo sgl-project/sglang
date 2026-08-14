@@ -6,9 +6,10 @@ from typing import Tuple
 
 import numpy as np
 import torch
+from torch.multiprocessing.reductions import reduce_tensor
+
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
-from torch.multiprocessing.reductions import reduce_tensor
 
 logger = logging.getLogger(__name__)
 

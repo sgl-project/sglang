@@ -27,7 +27,11 @@ from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecuto
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+)
+from sglang.srt.multimodal.transport.cuda_ipc import (
     MmItemMemoryPool as CudaMmItemMemoryPool,
+)
+from sglang.srt.multimodal.transport.cuda_ipc import (
     get_mm_feature_pool_size_per_worker,
 )
 from sglang.srt.utils import (
