@@ -12,17 +12,11 @@ leak checker, hence this AST-level guard.
 """
 
 import ast
-import unittest
 import warnings
 from collections import Counter
 from pathlib import Path
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
-
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
-
-_REPO_ROOT = Path(__file__).resolve().parents[4]
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 _SRT_DIR = _REPO_ROOT / "python" / "sglang" / "srt"
 _SPECULATIVE_DIR = _SRT_DIR / "speculative"
 assert _SRT_DIR.is_dir(), f"srt dir not found: {_SRT_DIR}"
@@ -193,40 +187,41 @@ def _scan_class_subtree(class_node):
     return sites
 
 
-class TestDecodeBookkeepingOwnership(CustomTestCase):
-    def test_bookkeeping_sites_match_owner_allowlist(self):
-        found = _scan_srt()
-        allow = Counter(_OWNER_SITES)
-        unexpected = found - allow
-        missing = allow - found
-        msg = []
-        if unexpected:
-            msg.append(
-                "New bookkeeping mutation(s) beyond the recorded counts:\n  "
-                + "\n  ".join(f"{site} x{n}" for site, n in sorted(unexpected.items()))
-                + "\nThese are owned by the sites in _OWNER_SITES -- do not "
-                "repeat them; a genuinely new owner must be recorded there."
-            )
-        if missing:
-            msg.append(
-                "Recorded site(s) no longer exist (update _OWNER_SITES):\n  "
-                + "\n  ".join(f"{site} x{n}" for site, n in sorted(missing.items()))
-            )
-        self.assertFalse(msg, "\n\n".join(msg))
+def check_bookkeeping_sites_match_owner_allowlist():
+    found = _scan_srt()
+    allow = Counter(_OWNER_SITES)
+    unexpected = found - allow
+    missing = allow - found
+    messages = []
+    if unexpected:
+        messages.append(
+            "New bookkeeping mutation(s) beyond the recorded counts:\n  "
+            + "\n  ".join(f"{site} x{n}" for site, n in sorted(unexpected.items()))
+            + "\nThese are owned by the sites in _OWNER_SITES -- do not "
+            "repeat them; a genuinely new owner must be recorded there."
+        )
+    if missing:
+        messages.append(
+            "Recorded site(s) no longer exist (update _OWNER_SITES):\n  "
+            + "\n  ".join(f"{site} x{n}" for site, n in sorted(missing.items()))
+        )
+    if messages:
+        raise AssertionError("\n\n".join(messages))
 
-    def test_spec_v2_draft_workers_do_no_scheduler_bookkeeping(self):
-        classes = _draft_worker_classes()
-        names = {node.name for _, node in classes}
-        # Discovery sanity: fail loudly instead of silently guarding nothing.
-        self.assertIn("EagleDraftWorker", names)
-        self.assertIn("FrozenKVMTPDraftWorker", names)
 
-        violations = []
-        for rel, node in classes:
-            for scope, kind in _scan_class_subtree(node):
-                violations.append((rel, f"{node.name}.{scope}", kind))
-        self.assertFalse(
-            violations,
+def check_spec_v2_draft_workers_do_no_scheduler_bookkeeping():
+    classes = _draft_worker_classes()
+    names = {node.name for _, node in classes}
+    for expected in ("EagleDraftWorker", "FrozenKVMTPDraftWorker"):
+        if expected not in names:
+            raise AssertionError(f"draft worker discovery missed {expected}")
+
+    violations = []
+    for rel, node in classes:
+        for scope, kind in _scan_class_subtree(node):
+            violations.append((rel, f"{node.name}.{scope}", kind))
+    if violations:
+        raise AssertionError(
             "Spec-v2 draft worker(s) repeat scheduler-owned bookkeeping:\n  "
             + "\n  ".join(map(str, sorted(violations)))
             + "\nUnder spec v2 the iter-clock ticks, `maybe_evict_swa`, and "
@@ -236,4 +231,5 @@ class TestDecodeBookkeepingOwnership(CustomTestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=3)
+    check_bookkeeping_sites_match_owner_allowlist()
+    check_spec_v2_draft_workers_do_no_scheduler_bookkeeping()

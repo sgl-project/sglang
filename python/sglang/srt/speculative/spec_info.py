@@ -128,8 +128,10 @@ class SpeculativeAlgorithm(Enum):
         return self.is_dflash_family()
 
     def is_war_publish_phase(self, forward_mode) -> bool:
-        # The step's last shared-buffer-reading phase owns the WAR read-done publish.
-        if self.is_dflash_family():
+        # The step's last shared-buffer-reading phase owns the WAR read-done
+        # publish. DSPARK has no draft_extend: its draft samples inside the
+        # verify graph, so verify is that last phase.
+        if self.is_dflash_family() or self.is_dspark():
             return forward_mode.is_target_verify()
         return forward_mode.is_draft_extend_v2()
 
