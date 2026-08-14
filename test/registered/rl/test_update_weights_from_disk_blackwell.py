@@ -7,6 +7,11 @@ import unittest
 
 import requests
 
+from sglang.srt.constants import (
+    GPU_MEMORY_TYPE_CUDA_GRAPH,
+    GPU_MEMORY_TYPE_KV_CACHE,
+    GPU_MEMORY_TYPE_WEIGHTS,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -44,10 +49,17 @@ class UpdateWeightsFromDiskBase:
             )
 
     def _launch_server(self, backend_test_suite):
-        launch_kwargs = {}
-        if self.launch_env is not None:
-            launch_kwargs["env"] = self.launch_env
-        other_args = backend_test_suite.get("other_args")
+        launch_kwargs = {
+            "env": {
+                "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "1",
+                **(self.launch_env or {}),
+            }
+        }
+        other_args = (
+            *backend_test_suite.get("other_args", ()),
+            "--enable-memory-saver",
+            "--cuda-graph-backend-prefill=disabled",
+        )
         return popen_launch_server(
             self.model,
             self.base_url,
@@ -140,6 +152,18 @@ class UpdateWeightsFromDiskBase:
             timeout=self.update_timeout,
         )
 
+    def _offload_engine_and_resume_weights(self):
+        self._post_json("/release_memory_occupation", {})
+        self._post_json(
+            "/resume_memory_occupation", {"tags": [GPU_MEMORY_TYPE_WEIGHTS]}
+        )
+
+    def _resume_kv_cache_and_cuda_graph(self):
+        self._post_json(
+            "/resume_memory_occupation",
+            {"tags": [GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]},
+        )
+
     def test_parameterized_update_weights_from_disk(self):
         for backend_test_suite in self.backend_test_suites:
             case_name = backend_test_suite.get("name", "default")
@@ -154,6 +178,7 @@ class UpdateWeightsFromDiskBase:
                     for update_test_suite in self.update_test_suites:
                         with self.subTest(case_name=case_name, **update_test_suite):
                             self._wait_until_idle()
+                            self._offload_engine_and_resume_weights()
                             ret = self._run_update_weights(
                                 self.model,
                                 flush_cache=update_test_suite["flush_cache"],
@@ -161,6 +186,7 @@ class UpdateWeightsFromDiskBase:
                                     "abort_all_requests"
                                 ],
                             )
+                            self._resume_kv_cache_and_cuda_graph()
                             self.assertTrue(ret.get("success"), f"{ret=}")
                             self.assertEqual(self._get_model_info(), self.model)
                             self._assert_non_empty_decode()
@@ -169,7 +195,7 @@ class UpdateWeightsFromDiskBase:
                                 baseline_sig, updated_sig
                             )
                 finally:
-                    kill_process_tree(process.pid)
+                    kill_process_tree(process.pid, wait_timeout=60)
 
 
 class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTestCase):
@@ -179,8 +205,6 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
         {
             "name": "flashinfer_trtllm_routed_mxfp8",
             "other_args": (
-                "--base-gpu-id",
-                "0",
                 "--tp-size",
                 "4",
                 "--dp-size",
@@ -202,14 +226,44 @@ class TestServerUpdateWeightsFromDiskNVFP4(UpdateWeightsFromDiskBase, CustomTest
         {
             "name": "flashinfer_trtllm_nvfp4",
             "other_args": (
-                "--base-gpu-id",
-                "0",
                 "--tp-size",
                 "4",
                 "--fp4-gemm-backend",
                 "flashinfer_trtllm",
                 "--moe-runner-backend",
                 "flashinfer_trtllm_routed",
+            ),
+        },
+    )
+
+
+class TestServerUpdateWeightsFromDiskNVFP4CuteDSL(
+    UpdateWeightsFromDiskBase, CustomTestCase
+):
+    model = "nvidia/Qwen3-30B-A3B-NVFP4"
+    launch_env = {
+        "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1",
+        "SGLANG_FLASHINFER_MOE_FUSED_FINALIZE": "1",
+        "FLASHINFER_NVFP4_4OVER6": "1",
+        "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
+        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
+        "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1",
+    }
+    backend_test_suites = (
+        {
+            "name": "flashinfer_cutedsl_nvfp4",
+            "other_args": (
+                "--tp-size",
+                "4",
+                "--ep-size",
+                "4",
+                "--fp4-gemm-backend",
+                "flashinfer_cutedsl",
+                "--moe-runner-backend",
+                "flashinfer_cutedsl",
+                "--moe-a2a-backend",
+                "none",
+                "--enable-deterministic-inference",
             ),
         },
     )

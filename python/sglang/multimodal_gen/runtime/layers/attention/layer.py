@@ -130,6 +130,22 @@ def _kv_gather_unsupported_reason(
     return None
 
 
+def _count_active_replicated_modes(
+    num_replicated_prefix: int,
+    num_replicated_suffix: int,
+    num_replicated_kv_prefix: int,
+) -> int:
+    """Count active replicated-token modes without adding symbolic booleans."""
+    return sum(
+        int(value > 0)
+        for value in (
+            num_replicated_prefix,
+            num_replicated_suffix,
+            num_replicated_kv_prefix,
+        )
+    )
+
+
 def build_varlen_mask_meta(
     key_mask: torch.Tensor,
 ) -> dict:
@@ -822,13 +838,10 @@ class USPAttention(nn.Module):
             and not effective_skip_sp
             and get_sequence_parallel_world_size() > 1
         )
-        replicated_mode_count = sum(
-            value > 0
-            for value in (
-                num_replicated_prefix,
-                num_replicated_suffix,
-                num_replicated_kv_prefix,
-            )
+        replicated_mode_count = _count_active_replicated_modes(
+            num_replicated_prefix,
+            num_replicated_suffix,
+            num_replicated_kv_prefix,
         )
         if (
             self.sp_attention_mode == "kv_gather"
