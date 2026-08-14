@@ -354,8 +354,6 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
         if _is_xpu:
-            # torch.cuda.get_device_capability() is unavailable on XPU builds
-            # of torch, and "CUDA compute capability" has no meaning here.
             if error:
                 raise RuntimeError(
                     f"Quantization scheme requiring compute capability "
