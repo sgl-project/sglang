@@ -1,14 +1,14 @@
 ---
 title: "SGLang Plugin System"
 metatags:
-    description: "Extend SGLang with hardware platforms, runtime hooks, and out-of-tree serve backends."
+    description: "Allows hardware vendors and developers to extend SGLang without modifying the main repository code."
 ---
 
 ## Overview
 
 Allows hardware vendors and developers to extend SGLang **without modifying the main repository code**.
 
-The framework provides three plugin types, all discovered via Python's standard `setuptools` entry points:
+The framework provides two plugin types, both discovered via Python's standard `setuptools` entry_points:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -34,23 +34,18 @@ The framework provides three plugin types, all discovered via Python's standard 
       <td><code>sglang.srt.plugins</code></td>
       <td>Inject hooks (before/after/around/replace) into any function/method, or replace entire classes</td>
     </tr>
-    <tr>
-      <td><strong>Serve Backend Plugin</strong></td>
-      <td><code>sglang.serve_backends</code></td>
-      <td>Add an out-of-tree serving runtime to <code>sglang serve</code> without claiming the <code>sglang</code> executable</td>
-    </tr>
   </tbody>
 </table>
 
 ### Principles
 
 - **Non-intrusive**: Existing CUDA/ROCm/NPU/XPU code remains unchanged. OOT code paths are added alongside existing hardware-specific logic.
-- **Zero configuration**: Plugins are automatically discovered after `pip install`, with no SGLang source changes required.
+- **Zero configuration**: Plugins are automatically discovered after `pip install`, no sglang code changes required.
 - **Environment variable control**: `SGLANG_PLATFORM` selects or validates the active platform plugin; `SGLANG_PLUGINS` (comma-separated) controls which general plugins to load.
 
 ### Current Scope & Future Direction
 
-The plugin system supports **out-of-tree (OOT) hardware platforms**, general runtime hooks, and complete serving backends. This lets another ecosystem project use the common `sglang serve` frontend while retaining its own parser, process topology, APIs, and release cycle. The main-repo hardware paths (CUDA, ROCm, NPU, XPU, etc.) continue to use the existing `is_cuda()`/`is_npu()`/… utility functions.
+The plugin system currently targets **out-of-tree (OOT) hardware platforms** — enabling new devices to integrate with SGLang without any changes to the main repository. The main-repo hardware paths (CUDA, ROCm, NPU, XPU, etc.) continue to use the existing `is_cuda()`/`is_npu()`/… utility functions.
 
 As the plugin interfaces mature and stabilize, in-tree hardware backends can be gradually migrated to the same plugin architecture. This would replace the scattered `if device == "cuda" … elif device == "npu" …` branches throughout the codebase with a single polymorphic dispatch through the platform interface, making each hardware backend self-contained and the core engine hardware-agnostic.
 
@@ -826,147 +821,6 @@ Target paths use fully-qualified dotted notation. Both formats are supported:
 
 ---
 
-## Plugin Type 3: Serve Backend Plugin
-
-### Description
-
-A serve backend plugin connects an out-of-tree runtime to the SGLang-owned CLI:
-
-```bash
-sglang serve MODEL_PATH --model-type my_backend [backend-options]
-```
-
-SGLang owns the `sglang` console script. An extension package registers metadata under `sglang.serve_backends`; it must **not** publish another console script named `sglang`. This single-owner rule avoids install-order-dependent executable replacement and prevents uninstalling an extension from removing the core command.
-
-An extension can keep a project-specific executable as a compatibility alias. Both commands should call the same backend implementation:
-
-```bash
-my-project serve MODEL_PATH                    # Optional legacy alias
-sglang serve MODEL_PATH --model-type my_backend
-```
-
-### Quick start
-
-**1. Register a backend factory in `pyproject.toml`:**
-
-```toml
-[project]
-name = "my-sglang-backend"
-version = "0.1.0"
-dependencies = ["sglang"]
-
-[project.entry-points."sglang.serve_backends"]
-my_backend = "my_project.sglang_backend:create_backend"
-```
-
-The entry point name, `my_backend`, becomes an accepted `--model-type` value. Choose a globally distinctive name. `auto` and SGLang's in-tree backend names are reserved.
-
-**2. Implement a lightweight factory:**
-
-```python
-import argparse
-
-from sglang.cli.serve_backends import (
-    ServeBackend,
-    ServeBackendDetection,
-    ServeRequest,
-)
-
-
-def detect(request: ServeRequest) -> ServeBackendDetection:
-    if request.model_path is None:
-        return ServeBackendDetection.UNKNOWN
-    if is_my_model(request.model_path):
-        return ServeBackendDetection.MATCH
-    return ServeBackendDetection.NO_MATCH
-
-
-def run(request: ServeRequest) -> None:
-    parser = argparse.ArgumentParser(prog="sglang serve")
-    parser.add_argument("--model-path", required=True)
-    parser.add_argument("--my-option")
-    args, remaining = parser.parse_known_args(request.argv)
-    launch_my_server(args, remaining)
-
-
-def create_backend() -> ServeBackend:
-    return ServeBackend(api_version=1, run=run, detect=detect)
-```
-
-Keep the module containing `create_backend()` and `detect()` lightweight. Explicit selection imports only the selected backend. Automatic selection loads installed backend factories and runs their detectors, so these paths should not initialize GPUs, import model weights, or start workers.
-
-`request.argv` contains all backend-owned arguments after SGLang removes `--model-type`. A positional model is normalized before dispatch:
-
-```bash
-sglang serve org/model --model-type my_backend --my-option value
-```
-
-The backend receives:
-
-```python
-("--model-path", "org/model", "--my-option", "value")
-```
-
-`run()` must honor `-h` and `--help` without launching a server. For a real launch, it should block for the server lifetime; SGLang applies its common child-process cleanup after `run()` returns or raises. This enables targeted help:
-
-```bash
-sglang serve --model-type my_backend --help
-```
-
-### Config-only backends
-
-By default, SGLang requires a model path before it invokes a backend. A pipeline runtime that can resolve its model from a configuration file can opt out:
-
-```python
-def create_backend() -> ServeBackend:
-    return ServeBackend(
-        api_version=1,
-        run=run,
-        detect=detect,
-        requires_model_path=False,
-    )
-```
-
-It can then accept commands such as:
-
-```bash
-sglang serve --model-type my_backend --config pipeline.yaml
-```
-
-Config-only requests generally need explicit `--model-type` unless the detector can identify the backend from the remaining arguments.
-
-### Automatic routing
-
-The default `--model-type auto` applies these rules:
-
-1. SGLang asks every backend that provides `detect()` for a result.
-2. One `MATCH` selects that backend.
-3. Multiple matches fail with an ambiguity error and require explicit `--model-type`.
-4. No matches preserve the existing LLM fallback.
-5. `UNKNOWN` and detector failures do not claim the request.
-
-A backend can omit `detect` to remain explicit-only:
-
-```python
-ServeBackend(api_version=1, run=run, requires_model_path=False)
-```
-
-The registry never resolves overlap by package installation order or a hidden priority. This makes routing stable as independent ecosystem projects add support for intersecting model families.
-
-### Compatibility contract
-
-Each `ServeBackend` must declare the API version it implements. Use a literal owned by the extension rather than importing SGLang's current version constant; this lets a future SGLang release detect an older plugin contract. SGLang rejects an incompatible backend with an actionable error. Extension packages should also declare the SGLang version range they test in their package dependencies and CI.
-
-The public contract intentionally stays small:
-
-- `ServeRequest`: normalized arguments and optional model path
-- `ServeBackend`: runner, optional detector, and model-path requirement
-- `ServeBackendDetection`: `MATCH`, `NO_MATCH`, or `UNKNOWN`
-
-Out-of-tree projects continue to own backend-specific parsing, validation, cleanup hooks, and server lifecycle. SGLang retains the common process-tree cleanup around backend dispatch.
-
----
-
 ## File Reference
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -1000,10 +854,6 @@ Out-of-tree projects continue to own backend-specific parsing, validation, clean
     <tr>
       <td><code>sglang/srt/plugins/hook_registry.py</code></td>
       <td><code>HookRegistry</code>, <code>HookType</code>, <code>plugin_hook</code> decorator</td>
-    </tr>
-    <tr>
-      <td><code>sglang/cli/serve_backends.py</code></td>
-      <td>Serve backend extension contract, entry point discovery, and automatic routing</td>
     </tr>
   </tbody>
 </table>
