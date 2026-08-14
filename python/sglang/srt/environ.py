@@ -1,5 +1,6 @@
 import functools
 import json
+import math
 import os
 import subprocess
 import warnings
@@ -190,6 +191,14 @@ class EnvFloat(EnvField):
             return float(value)
         except ValueError:
             raise ValueError(f'"{value}" is not a valid float value')
+
+
+class EnvFiniteFloat(EnvFloat):
+    def parse(self, value: str) -> float:
+        parsed = super().parse(value)
+        if not math.isfinite(parsed):
+            raise ValueError(f'"{value}" is not a valid finite float value')
+        return parsed
 
 
 class GateGemvMode(IntEnum):
@@ -1138,6 +1147,15 @@ class Envs:
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
+    # Reject audio whose accepted decoded duration exceeds this value. 0 or
+    # negative disables the cap. Default mirrors vLLM's
+    # VLLM_MAX_AUDIO_DECODE_DURATION_S.
+    SGLANG_MAX_AUDIO_DECODE_DURATION_S = EnvFiniteFloat(600.0)
+    # Limit application-visible projected or accumulated PCM bytes,
+    # independently of duration. Decoder/resampler native frames and
+    # TorchCodec returned-tensor backing storage are outside this cap. 0 or
+    # negative disables it. Default mirrors vLLM's 256 MiB limit.
+    SGLANG_MAX_AUDIO_DECODE_BYTES = EnvInt(268_435_456)
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)

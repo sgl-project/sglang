@@ -48,9 +48,9 @@ from sglang.srt.entrypoints.openai.realtime import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
+    iter_audio_chunks,
     needs_space,
     process_asr_chunk,
-    split_audio_chunks,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters import resolve_adapter
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -395,13 +395,12 @@ class OpenAIServingTranscription(OpenAIServingBase):
         last_char = ""
 
         try:
-            chunks = split_audio_chunks(request.audio_data, state.chunk_size_sec)
+            chunks = iter_audio_chunks(request.audio_data, state.chunk_size_sec)
 
-            for i, chunk_audio in enumerate(chunks):
+            for chunk_audio, is_last in chunks:
                 if await raw_request.is_disconnected():
                     logger.info("[streaming_asr] client disconnected, stopping")
                     break
-                is_last = i == len(chunks) - 1
 
                 delta = await process_asr_chunk(
                     tokenizer_manager=self.tokenizer_manager,
@@ -413,6 +412,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
                     raw_request=raw_request,
                     routing_key=self.extract_routing_key(raw_request),
                 )
+                # The next cumulative prefix may be as large as this one. Drop
+                # the completed encoding before advancing the lazy iterator.
+                del chunk_audio
 
                 if delta:
                     for word in delta.split(" "):
