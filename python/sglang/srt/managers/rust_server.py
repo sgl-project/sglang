@@ -386,6 +386,12 @@ class RustServer:
                 "ingress has no equivalent). Launch without SGLANG_RUST_SERVER, or "
                 "drop --preferred-sampling-params and send those values per request."
             )
+        if getattr(server_args, "speculative_decoding_stats", "none") != "none":
+            raise ValueError(
+                "SGLANG_RUST_SERVER does not yet expose "
+                "--speculative-decoding-stats through its Rust response path. "
+                "Launch the Python HTTP server or set the mode to 'none'."
+            )
         http_addr = f"{server_args.host}:{server_args.port}"
 
         # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,

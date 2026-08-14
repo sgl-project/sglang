@@ -668,6 +668,7 @@ class SchedulerBatchResultProcessor:
         # delayed result is processed. Use the draft token count recorded on result.
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
+        stats_mode = getattr(self.server_args, "speculative_decoding_stats", "none")
 
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
@@ -690,6 +691,20 @@ class SchedulerBatchResultProcessor:
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
                 req.spec_num_correct_drafts += num_correct_drafts
                 req.update_spec_correct_drafts_histogram(num_correct_drafts)
+
+                # ``accept_lens`` is the verifier's raw result. Record it before
+                # grammar/stop handling can shorten the client-visible run.
+                # DSpark supplies the per-request ragged verify width in
+                # ``cap_lens``; all other built-ins use the result-local stride.
+                if stats_mode != "none":
+                    verify_len = cap_lens[i] if cap_lens is not None else stride
+                    req.spec_num_proposed_drafts += max(verify_len - 1, 0)
+                    if stats_mode == "detailed":
+                        if req.spec_verify_lens is None:
+                            req.spec_verify_lens = []
+                            req.spec_accept_lens = []
+                        req.spec_verify_lens.append(verify_len)
+                        req.spec_accept_lens.append(accept_lens[i])
 
                 if block_accept_lens is not None:
                     req.spec_num_block_accept_tokens += block_accept_lens[i]

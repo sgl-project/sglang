@@ -1126,6 +1126,16 @@ class Req(ReqDllmMixin):
         # Per-request count of accepted draft tokens (excludes the bonus token).
         self.spec_num_correct_drafts = 0
 
+        # Per-request count of verified draft tokens (excludes the root token).
+        # Unlike ``spec_verify_ct * (configured_width - 1)``, this remains exact
+        # for adaptive and ragged verification widths.
+        self.spec_num_proposed_drafts = 0
+
+        # Raw, ordered verification results. Both lengths include the root /
+        # bonus token. They are initialized lazily only in ``detailed`` mode.
+        self.spec_verify_lens: Optional[List[int]] = None
+        self.spec_accept_lens: Optional[List[int]] = None
+
         self.spec_num_block_accept_tokens = 0
 
         self.spec_num_cap_tokens = 0

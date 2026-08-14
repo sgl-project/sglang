@@ -59,6 +59,7 @@ from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
     should_include_usage,
+    speculative_decoding_stats_from_meta,
     to_openai_style_logprobs,
 )
 from sglang.srt.environ import envs
@@ -1496,6 +1497,7 @@ class OpenAIServingChat(OpenAIServingBase):
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
+        speculative_decoding_stats = {}
 
         # Usage tracking
         prompt_tokens = {}
@@ -1555,6 +1557,12 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
+                if finish_reason_type is not None:
+                    stats = speculative_decoding_stats_from_meta(
+                        content["meta_info"], index
+                    )
+                    if stats is not None:
+                        speculative_decoding_stats[index] = stats
 
                 # Track finish_reason for each index
                 if finish_reason_type:
@@ -1625,6 +1633,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     index=idx,
                     finish_reason=final_finish_reason,
                     matched_stop=matched_stop,
+                    sglext=(
+                        {
+                            "speculative_decoding_stats": [
+                                speculative_decoding_stats[idx].model_dump(
+                                    exclude_none=True
+                                )
+                            ]
+                        }
+                        if idx in speculative_decoding_stats
+                        else None
+                    ),
                 )
 
             # Send hidden states if requested
@@ -1772,11 +1791,22 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        spec_stats = [
+            stats
+            for idx, ret_item in enumerate(ret)
+            if (
+                stats := speculative_decoding_stats_from_meta(
+                    ret_item["meta_info"], idx
+                )
+            )
+            is not None
+        ]
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or spec_stats:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                speculative_decoding_stats=spec_stats or None,
             )
 
         for idx, ret_item in enumerate(ret):

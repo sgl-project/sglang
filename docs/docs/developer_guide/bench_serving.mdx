@@ -253,6 +253,10 @@ When `--output-file` is set, one JSON object is appended per run. Base fields:
 - Duration and totals: completed, total_input_tokens, total_output_tokens, retokenized totals
 - Throughputs and latency statistics as printed in the console
 - `accept_length` when available (sglang)
+- `speculative_decoding_stats` when an SGLang server was launched with
+  `--speculative-decoding-stats summary` or `detailed`. This container is
+  independent of `--output-details` and keeps an index-aligned entry for every
+  measured request; missing or failed responses have `stats: null`.
 
 With `--output-details`, an extended object also includes arrays:
 

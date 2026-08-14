@@ -358,6 +358,98 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(response.usage.total_tokens, 2073)
         self.assertEqual(response.usage.prompt_tokens_details.image_tokens, 2035)
 
+    def test_non_streaming_response_returns_speculative_decoding_sglext(self):
+        ret = [
+            {
+                "text": "Answer",
+                "meta_info": {
+                    "id": "chatcmpl-spec-stats",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 7,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                    "speculative_decoding_stats": {
+                        "schema_version": 1,
+                        "mode": "detailed",
+                        "num_verification_steps": 2,
+                        "num_verified_draft_tokens": 9,
+                        "num_accepted_draft_tokens": 5,
+                        "draft_acceptance_rate": 5 / 9,
+                        "mean_accept_length": 3.5,
+                        "accepted_draft_tokens_histogram": [0, 1, 0, 1],
+                        "verify_lengths": [6, 5],
+                        "accept_lengths": [4, 3],
+                    },
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(self.basic_req, ret, created=123)
+
+        self.assertIsNotNone(response.sglext)
+        stats = response.sglext.speculative_decoding_stats[0]
+        self.assertEqual(stats.index, 0)
+        self.assertEqual(stats.verify_lengths, [6, 5])
+        self.assertEqual(stats.accept_lengths, [4, 3])
+
+    def test_streaming_stats_are_only_returned_on_finish_chunk(self):
+        stats = {
+            "schema_version": 1,
+            "mode": "detailed",
+            "num_verification_steps": 2,
+            "num_verified_draft_tokens": 9,
+            "num_accepted_draft_tokens": 5,
+            "draft_acceptance_rate": 5 / 9,
+            "mean_accept_length": 3.5,
+            "accepted_draft_tokens_histogram": [0, 1, 0, 1],
+            "verify_lengths": [6, 5],
+            "accept_lengths": [4, 3],
+        }
+
+        async def _mock_generate(*args, **kwargs):
+            for text, finish_reason in (("A", None), ("", {"type": "stop"})):
+                yield {
+                    "text": text,
+                    "meta_info": {
+                        "id": "chatcmpl-spec-stream",
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                        "finish_reason": finish_reason,
+                        "speculative_decoding_stats": stats,
+                    },
+                    "index": 0,
+                }
+
+        self.tm.generate_request = _mock_generate
+        self.tm.server_args.incremental_streaming_output = True
+
+        async def run_stream():
+            return [
+                chunk
+                async for chunk in self.chat._generate_chat_stream(
+                    Mock(), self.stream_req, self.fastapi_request
+                )
+            ]
+
+        chunks = get_or_create_event_loop().run_until_complete(run_stream())
+        payloads = [
+            json.loads(chunk.removeprefix("data: "))
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        chunks_with_stats = [payload for payload in payloads if "sglext" in payload]
+
+        self.assertEqual(len(chunks_with_stats), 1)
+        self.assertEqual(chunks_with_stats[0]["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(
+            chunks_with_stats[0]["sglext"]["speculative_decoding_stats"][0][
+                "accept_lengths"
+            ],
+            [4, 3],
+        )
+
     def test_kimi_tool_call_keeps_default_reasoning(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="thinking", default_enabled=True

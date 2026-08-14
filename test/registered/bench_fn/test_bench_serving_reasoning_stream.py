@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from sglang.benchmark.serving import (
     RequestFuncInput,
     async_request_openai_chat_completions,
+    async_request_openai_completions,
     calculate_metrics,
     set_global_args,
 )
@@ -261,6 +262,36 @@ class TestBenchServingReasoningStream(CustomTestCase):
         self.assertEqual(out.generated_text, "ok")
         self.assertGreater(out.ttft, 0.0)
 
+    def test_stream_captures_stats_from_final_finish_chunk(self):
+        stats = {
+            "index": 0,
+            "schema_version": 1,
+            "mode": "detailed",
+            "num_verification_steps": 2,
+            "num_verified_draft_tokens": 9,
+            "num_accepted_draft_tokens": 5,
+            "draft_acceptance_rate": 5 / 9,
+            "mean_accept_length": 3.5,
+            "accepted_draft_tokens_histogram": [0, 1, 0, 1],
+            "verify_lengths": [6, 5],
+            "accept_lengths": [4, 3],
+        }
+        chunks = [
+            _make_chunk(content="answer"),
+            {
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "sglext": {"speculative_decoding_stats": [stats]},
+            },
+        ]
+
+        out = self._run(chunks)
+
+        self.assertTrue(out.success, msg=f"request failed: {out.error}")
+        self.assertEqual(
+            out.speculative_decoding_stats,
+            {key: value for key, value in stats.items() if key != "index"},
+        )
+
 
 class TestBenchServingReasoningNonStream(CustomTestCase):
     def _run(self, response_body):
@@ -348,6 +379,92 @@ class TestBenchServingReasoningNonStream(CustomTestCase):
         self.assertEqual(out.generated_text, "answer")
         self.assertGreater(out.ttft, 0.0)
         self.assertEqual(out.output_len, 1)
+
+    def test_non_stream_captures_speculative_decoding_stats(self):
+        response = _make_response(content="answer", completion_tokens=1)
+        stats = {
+            "index": 0,
+            "schema_version": 1,
+            "mode": "summary",
+            "num_verification_steps": 1,
+            "num_verified_draft_tokens": 5,
+            "num_accepted_draft_tokens": 3,
+            "draft_acceptance_rate": 0.6,
+            "mean_accept_length": 4.0,
+            "accepted_draft_tokens_histogram": [0, 0, 0, 1],
+        }
+        response["sglext"] = {"speculative_decoding_stats": [stats]}
+
+        out, _ = self._run(response)
+
+        self.assertTrue(out.success, msg=f"request failed: {out.error}")
+        self.assertEqual(
+            out.speculative_decoding_stats,
+            {key: value for key, value in stats.items() if key != "index"},
+        )
+
+
+class TestBenchServingCompletionStats(CustomTestCase):
+    def test_stream_captures_stats_from_finish_chunk(self):
+        set_global_args(
+            Namespace(
+                disable_stream=False,
+                disable_ignore_eos=True,
+                return_logprob=False,
+                top_logprobs_num=0,
+                cache_report=False,
+                header=None,
+            )
+        )
+        stats = {
+            "index": 0,
+            "schema_version": 1,
+            "mode": "detailed",
+            "num_verification_steps": 1,
+            "num_verified_draft_tokens": 5,
+            "num_accepted_draft_tokens": 3,
+            "draft_acceptance_rate": 0.6,
+            "mean_accept_length": 4.0,
+            "accepted_draft_tokens_histogram": [0, 0, 0, 1],
+            "verify_lengths": [6],
+            "accept_lengths": [4],
+        }
+
+        class Handler(_SSEHandler):
+            pass
+
+        Handler.chunks = [
+            {"choices": [{"index": 0, "text": "answer"}]},
+            {
+                "choices": [{"index": 0, "text": "", "finish_reason": "stop"}],
+                "sglext": {"speculative_decoding_stats": [stats]},
+            },
+        ]
+        port = _free_port()
+        server = HTTPServer(("127.0.0.1", port), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            req = RequestFuncInput(
+                prompt="hello",
+                api_url=f"http://127.0.0.1:{port}/v1/completions",
+                prompt_len=1,
+                output_len=64,
+                model="dummy-model",
+                lora_name="",
+                image_data=None,
+                extra_request_body={},
+            )
+            out = asyncio.run(async_request_openai_completions(req))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertTrue(out.success, msg=f"request failed: {out.error}")
+        self.assertEqual(
+            out.speculative_decoding_stats,
+            {key: value for key, value in stats.items() if key != "index"},
+        )
 
 
 if __name__ == "__main__":
