@@ -294,8 +294,36 @@ def produce_block_sparse_loads(
     )
 
     mask_begin, mask_end = split_block_range(curr_mask_block_cnt, split_idx, num_splits)
-    full_begin, full_end = split_block_range(curr_full_block_cnt, split_idx, num_splits)
     mask_empty = mask_begin == mask_end
+
+    # A zero runtime count does not keep CuTe from compiling both sides of the
+    # dynamic branches below. Specialize the mask-only representation here so
+    # the compiler never tries to index a missing full-block list.
+    if const_expr(curr_full_block_idx is None):
+        kv_producer_state = load_block_list(
+            curr_mask_block_idx,
+            mask_begin,
+            mask_end,
+            first_block_preloaded=False,
+            kv_producer_state=kv_producer_state,
+            load_K=load_K,
+            load_V=load_V,
+            pipeline_k=pipeline_k,
+            pipeline_v=pipeline_v,
+            intra_wg_overlap=intra_wg_overlap,
+        )
+        if const_expr(intra_wg_overlap) and not mask_empty:
+            kv_producer_state = finish_overlap_v_load(
+                curr_mask_block_idx,
+                mask_begin,
+                mask_end,
+                load_V,
+                pipeline_v,
+                kv_producer_state,
+            )
+        return kv_producer_state
+
+    full_begin, full_end = split_block_range(curr_full_block_cnt, split_idx, num_splits)
     full_empty = full_begin == full_end
 
     if mask_empty:
