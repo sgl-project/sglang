@@ -13,7 +13,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect Rust workspace and ratchet changes
+      - name: Detect changed paths
         id: paths
         uses: dorny/paths-filter@v3
         with:
@@ -21,6 +21,12 @@ jobs:
             rust_workspace:
               - 'rust/**'
               - 'proto/sglang/runtime/v1/sglang.proto'
+              - '.github/workflows/lint.yml'
+            formatter:
+              - '**/*.py'
+              - '**/*.pyi'
+              - '**/*.ipynb'
+              - '.pre-commit-config.yaml'
               - '.github/workflows/lint.yml'
             ratchet:
               - 'python/sglang/**'
@@ -69,15 +75,20 @@ jobs:
           workspaces: rust
           shared-key: "rust-workspace-lint"
 
-      # Ratchet gate: any output other than 'false' (including unclassified
-      # events) keeps check-static-ratchets — fail open like rust_workspace.
+      # Fail open: only a literal 'false' filter output skips a check;
+      # unclassified events (push, classification failure) run everything.
+      # Neither skip loses coverage: the ratchet only reads python/sglang, and
+      # black is per-file deterministic over a fully formatted tree.
       - name: Run pre-commit checks
         run: |
           skip="no-commit-to-branch"
           if [ "${{ steps.paths.outputs.ratchet }}" = "false" ]; then
             skip="$skip,check-static-ratchets"
           fi
-          echo "ratchet changes: ${{ steps.paths.outputs.ratchet }}; SKIP=$skip"
+          if [ "${{ steps.paths.outputs.formatter }}" = "false" ]; then
+            skip="$skip,black-jupyter"
+          fi
+          echo "ratchet: ${{ steps.paths.outputs.ratchet }}; formatter: ${{ steps.paths.outputs.formatter }}; SKIP=$skip"
           SKIP="$skip" pre-commit run --all-files --show-diff-on-failure
 
       # Not in the rust-ext build job: its cache key covers the built .so files,
