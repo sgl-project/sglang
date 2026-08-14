@@ -46,15 +46,11 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-Pick the checkpoint precision — the only deployment choice. The recipe runs on a single 8-GPU H200 node with DP8 attention × TP8 × EP8 and DeepEP as the MoE all-to-all transport. Blackwell is not supported yet.
+Pick the hardware and the checkpoint precision. The recipe runs on a single 8-GPU Hopper node with DP8 attention × TP8 × EP8 and DeepEP as the MoE all-to-all transport. Blackwell is not supported yet.
 
 **Precision** — selects the MoE path, not just the weights. The BF16 cells pin `--moe-runner-backend deep_gemm` with BF16 DeepEP dispatch output (JIT DeepGEMM is enabled via `SGLANG_ENABLE_JIT_DEEPGEMM=1`). The FP8 cells leave both at `auto` and let SGLang resolve the runner from the checkpoint's quantization config.
 
 **Spec Decode** — NEXTN is on in every cell: 3 draft steps, 4 draft tokens per step, and the draft model path pointing at the target checkpoint itself. dots3's MTP layer is full-sharing — it carries the dots3 sliding-window attention geometry and reuses the target LM head — so no separate draft checkpoint is needed. Target verification and draft extension run on the paged, absorbed SWA-MLA FA3 path.
-
-<Note>
-Every cell in the Deploy panel above is currently **unverified**: the recipe runs, but no serving round on public weights has landed (the checkpoint is not yet released). Treat the cells as starting points and re-measure throughput and accuracy on your workload.
-</Note>
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/rednote/dots3-note.jsx";
@@ -70,13 +66,7 @@ dots3.note is RedNote's native multimodal omni model, built on the dots3 languag
 - **Hybrid attention** — dots3 combines MLA with full-attention and sliding-window layers of different geometry, attention gates, and optional DSA indexing on full-attention layers.
 - **MTP speculative decoding** — a full-sharing MTP/NextN architecture exposes one recursively shared, SWA-shaped MTP layer and shares the target LM head.
 
-<Note>
-The dots3.note checkpoint is **not yet publicly released**. The recipes on this page were validated against [SGLang PR #33829](https://github.com/sgl-project/sglang/pull/33829); a Hugging Face repository will be linked here at launch.
-</Note>
-
-**Resources:** [SGLang PR #33829](https://github.com/sgl-project/sglang/pull/33829)
-
-{/* TODO: Add the Hugging Face link once the checkpoint is released. */}
+**Resources:** [Hugging Face](https://huggingface.co/dots-studio/dots3-note-prev) · [SGLang PR #33829](https://github.com/sgl-project/sglang/pull/33829)
 
 ## 2. Configuration Tips
 
