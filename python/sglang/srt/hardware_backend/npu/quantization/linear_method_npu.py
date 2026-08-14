@@ -63,6 +63,25 @@ def _get_npu_ops():
     return torch.ops.npu
 
 
+def validate_npu_block_fp8_model_dtype(params_dtype: torch.dtype) -> None:
+    """Reject unsupported model dtypes before an Ascend block-FP8 forward."""
+    if params_dtype != torch.bfloat16:
+        raise ValueError(
+            "Standard block-FP8 on Ascend currently requires model dtype "
+            f"torch.bfloat16, got {params_dtype}."
+        )
+
+
+def validate_npu_block_fp8_moe_config(
+    params_dtype: torch.dtype, *, with_bias: bool
+) -> None:
+    validate_npu_block_fp8_model_dtype(params_dtype)
+    if with_bias:
+        raise ValueError(
+            "Standard block-FP8 MoE expert bias is not supported on Ascend."
+        )
+
+
 def _npu_device_index(tensor: torch.Tensor) -> int:
     device_index = tensor.device.index
     if device_index is not None:

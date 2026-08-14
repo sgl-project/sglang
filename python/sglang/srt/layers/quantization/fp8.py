@@ -558,6 +558,13 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
 
+        if _is_npu and block_quant and not use_mxfp8:
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                validate_npu_block_fp8_model_dtype,
+            )
+
+            validate_npu_block_fp8_model_dtype(params_dtype)
+
         if block_quant:
             block_n, block_k = quant_config.weight_block_size
             Fp8LinearMethod.validate_block_quant_shapes(
@@ -1182,6 +1189,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         Registers weights into `layer`. This static method can be reused by other quantization methods that require loading FP8 checkpoints first (e.g. requantization to other formats as MXFP4).
         """
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        if _is_npu and block_quant and not use_mxfp8:
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                validate_npu_block_fp8_moe_config,
+            )
+
+            validate_npu_block_fp8_moe_config(params_dtype, with_bias=with_bias)
 
         if is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn

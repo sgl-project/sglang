@@ -657,7 +657,10 @@ class CompressedTensorsConfig(QuantizationConfig):
                     )
 
             if self._is_fp8_w8a8(weight_quant, input_quant):
-                is_fp8_w8a8_supported = self._check_scheme_supported(
+                # CUDA compute capability is not meaningful on Ascend.  Select
+                # the NPU implementation before touching torch.cuda so an
+                # NPU-only PyTorch build can construct the scheme.
+                is_fp8_w8a8_supported = _is_npu or self._check_scheme_supported(
                     CompressedTensorsW8A8Fp8.get_min_capability(), error=False
                 )
                 if is_fp8_w8a8_supported:
@@ -791,6 +794,11 @@ class CompressedTensorsConfig(QuantizationConfig):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
             return CompressedTensorsW4A4Nvfp4MoE()
         elif self._is_fp8_w8a8(weight_quant, input_quant):
+            if _is_npu and weight_quant.strategy == QuantizationStrategy.BLOCK:
+                raise NotImplementedError(
+                    "Compressed-tensors block-FP8 MoE is not implemented on "
+                    "Ascend; use the native Fp8Config block-FP8 path."
+                )
             logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
             return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
         elif self._is_dynamic_token_w8a8(weight_quant, input_quant):

@@ -5,12 +5,18 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from compressed_tensors.quantization import (
+    QuantizationArgs,
+    QuantizationStrategy,
+)
 
 from sglang.srt.hardware_backend.npu.quantization import linear_method_npu
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     fp8_grouped_matmul_npu,
     fp8_matmul_npu,
     relayout_npu_block_fp8_weight,
+    validate_npu_block_fp8_model_dtype,
+    validate_npu_block_fp8_moe_config,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUBlockFP8MoEMethod,
@@ -25,6 +31,13 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization import fp8, fp8_utils
+from sglang.srt.layers.quantization.compressed_tensors import compressed_tensors
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW8A8Fp8,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -67,6 +80,15 @@ class _FakeNPUOps:
 
 
 class TestNPUBlockFP8Layout(CustomTestCase):
+    def test_model_dtype_rejects_fp16_before_runtime(self):
+        validate_npu_block_fp8_model_dtype(torch.bfloat16)
+        with self.assertRaisesRegex(ValueError, "requires model dtype"):
+            validate_npu_block_fp8_model_dtype(torch.float16)
+
+    def test_moe_bias_is_rejected_before_runtime(self):
+        with self.assertRaisesRegex(ValueError, "expert bias"):
+            validate_npu_block_fp8_moe_config(torch.bfloat16, with_bias=True)
+
     def test_dense_relayout_distinguishes_a5_payload_dtype(self):
         raw = (
             torch.arange(256 * 128, dtype=torch.int64)
@@ -226,6 +248,45 @@ class TestNPUBlockFP8Ops(CustomTestCase):
 
 
 class TestNPUBlockFP8Integration(CustomTestCase):
+    def test_compressed_tensors_scheme_does_not_probe_cuda_on_npu(self):
+        weight_quant = QuantizationArgs(
+            num_bits=8,
+            type="float",
+            strategy=QuantizationStrategy.BLOCK,
+            symmetric=True,
+            dynamic=False,
+            block_structure=[128, 128],
+        )
+        input_quant = QuantizationArgs(
+            num_bits=8,
+            type="float",
+            strategy=QuantizationStrategy.TOKEN,
+            symmetric=True,
+            dynamic=True,
+        )
+        config = CompressedTensorsConfig(
+            target_scheme_map={},
+            ignore=[],
+            quant_format="float-quantized",
+            sparsity_scheme_map={},
+            sparsity_ignore_list=[],
+        )
+        with (
+            patch.object(compressed_tensors, "_is_npu", True),
+            patch.object(
+                config,
+                "_check_scheme_supported",
+                side_effect=AssertionError("CUDA capability must not be queried"),
+            ),
+        ):
+            scheme = config._get_scheme_from_parts(
+                weight_quant=weight_quant,
+                input_quant=input_quant,
+                format="float-quantized",
+            )
+
+        self.assertIsInstance(scheme, CompressedTensorsW8A8Fp8)
+
     def test_dispatch_selects_npu_kernel_before_cuda_backends(self):
         with patch.object(fp8_utils, "_is_npu", True):
             self.assertIs(fp8_utils.dispatch_w8a8_block_fp8_linear(), fp8_matmul_npu)

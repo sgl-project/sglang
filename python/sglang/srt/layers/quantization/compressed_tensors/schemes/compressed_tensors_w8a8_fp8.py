@@ -78,6 +78,12 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
 
         if self.strategy == QuantizationStrategy.BLOCK:
             assert self.weight_block_size is not None
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                    validate_npu_block_fp8_model_dtype,
+                )
+
+                validate_npu_block_fp8_model_dtype(params_dtype)
             layer.weight_block_size = self.weight_block_size
             # Validate block quantization shapes
             validate_fp8_block_shape(
