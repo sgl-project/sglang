@@ -56,6 +56,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
+    Cosmos3DenoisingStage,
     Cosmos3ImagePreprocessStage,
     Cosmos3LatentPreparationStage,
     Cosmos3TimestepPreparationStage,
