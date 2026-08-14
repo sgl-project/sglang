@@ -2098,6 +2098,14 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         return swa.sliding_window_size if unified_compress_only_hicache else 0
 
+    def swa_retain_floor(self, req) -> int | None:
+        if not self.is_mamba_enabled or self._sliding_window_size is None:
+            return None
+        checkpoint = req.mamba_last_track_seqlen
+        if checkpoint is None:
+            return None
+        return checkpoint - self._sliding_window_size
+
     def supports_swa(self) -> bool:
         return self.is_swa_enabled
 
