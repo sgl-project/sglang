@@ -134,7 +134,7 @@ def _should_emit_normal_text_as_message(
     return True
 
 
-def _serialize_sse_event(event: Any) -> str:
+def _serialize_responses_event_data(event: Any) -> str:
     if not hasattr(event, "response"):
         return event.model_dump_json(indent=None)
 
@@ -1489,7 +1489,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             sequence_number += 1
             # Get event type from the event's type field if it exists
             event_type = getattr(event, "type", "unknown")
-            return f"event: {event_type}\ndata: {_serialize_sse_event(event)}\n\n"
+            return (
+                f"event: {event_type}\n"
+                f"data: {_serialize_responses_event_data(event)}\n\n"
+            )
 
         current_content_index = 0
         current_output_index = 0
@@ -1916,7 +1919,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 event.sequence_number = sequence_number
             sequence_number += 1
             event_type = getattr(event, "type", "unknown")
-            return f"event: {event_type}\ndata: {_serialize_sse_event(event)}\n\n"
+            return (
+                f"event: {event_type}\n"
+                f"data: {_serialize_responses_event_data(event)}\n\n"
+            )
 
         # The streaming Response* event models echo ``tools`` through a
         # narrower OpenAI SDK Tool union; strip it to avoid pydantic
