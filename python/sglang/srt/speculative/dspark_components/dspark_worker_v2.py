@@ -18,7 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -88,7 +88,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.device = target_worker.device
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
