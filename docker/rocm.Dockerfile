@@ -20,6 +20,12 @@
 # At runtime use --disaggregation-transfer-backend nixl (env is wired via /etc/bash.bashrc).
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
 
+# Editing AITER_COMMIT_DEFAULT, MORI_REPO or MORI_COMMIT below also changes what
+# AMD CI runs, not just what this image builds: PR CI does not rebuild the image,
+# so scripts/ci/amd/amd_ci_install_dependency.sh greps these values out of this
+# file at job time and rebuilds AITER / MoRI in the container whenever they differ
+# from the versions the image shipped with.
+
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
