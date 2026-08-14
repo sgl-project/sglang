@@ -30,6 +30,19 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
+# Single source of truth for the CUDA-graph capture trace output directory,
+# shared by both the original single-trace export and the per-batch-size
+# (SGLANG_GRAPH_BATCH_CAPTURE) traces so they land in the same place.
+GRAPH_CAPTURE_PROFILE_DIRNAME = "graph_capture_profile"
+
+
+def graph_capture_profile_dir() -> str:
+    """``<SGLANG_TORCH_PROFILER_DIR>/graph_capture_profile`` — the one directory
+    both capture-trace modes write to. Change the location here only."""
+    return os.path.join(
+        envs.SGLANG_TORCH_PROFILER_DIR.get(), GRAPH_CAPTURE_PROFILE_DIRNAME
+    )
+
 
 def export_cuda_graph_capture_trace(prof_context, *, runner_name: str, tp_rank: int):
     """Persist a CUDA-graph capture profiler trace (chrome trace) to disk.
@@ -37,15 +50,13 @@ def export_cuda_graph_capture_trace(prof_context, *, runner_name: str, tp_rank: 
     Opt-in via ``SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE`` (no-op otherwise). The
     capture profiler must have run with ``record_shapes=True`` so the trace can
     be inspected offline as a per-kernel shape/identity record. The file lands in
-    ``<SGLANG_TORCH_PROFILER_DIR>/graph_capture_profile/`` and is namespaced by
-    runner class and TP rank so concurrent capture passes (e.g. EAGLE3
-    target/draft/draft-extend) and ranks don't overwrite each other.
+    ``graph_capture_profile_dir()`` and is namespaced by runner class and TP rank
+    so concurrent capture passes (e.g. EAGLE3 target/draft/draft-extend) and
+    ranks don't overwrite each other.
     """
     if not envs.SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.get():
         return
-    output_dir = os.path.join(
-        envs.SGLANG_TORCH_PROFILER_DIR.get(), "graph_capture_profile"
-    )
+    output_dir = graph_capture_profile_dir()
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(
         output_dir, f"cuda_graph_capture-{runner_name}-TP-{tp_rank}.json.gz"

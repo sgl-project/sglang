@@ -87,6 +87,31 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         self.assertEqual(sa.deepep_mode, "low_latency")
         self.assertEqual(sa.elastic_ep_backend, "none")
 
+    def test_image_processor_backend_choices(self):
+        for backend in ("auto", "torchvision", "pil"):
+            with self.subTest(backend=backend):
+                sa = self._parse(["--image-processor-backend", backend])
+                self.assertEqual(sa.image_processor_backend, backend)
+
+    def test_startup_weight_load_mode(self):
+        """The startup loading mode keeps serial as the safe default."""
+        serial = self._parse([])
+        overlap = self._parse(["--startup-weight-load-mode", "overlap"])
+        self.assertEqual(serial.startup_weight_load_mode, "serial")
+        self.assertFalse(serial.is_startup_weight_load_overlap)
+        self.assertEqual(overlap.startup_weight_load_mode, "overlap")
+        self.assertTrue(overlap.is_startup_weight_load_overlap)
+
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(
+                [
+                    "--model",
+                    "dummy",
+                    "--startup-weight-load-mode",
+                    "unsupported",
+                ]
+            )
+
     def test_deprecated_flags_still_work(self):
         """Deprecated flags set the correct dest field."""
         sa = self._parse(["--stream-output"])
