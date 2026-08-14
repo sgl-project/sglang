@@ -430,31 +430,10 @@ class TritonAttnBackend(AttentionBackend):
         return kv_indptr, kv_indices, dcp_lens
 
     def _kv_index_view(self, forward_batch: ForwardBatch, bs: int):
-        """Per-batch read-index source view, stashed on the ForwardBatch so
-        TBO children and multi-consumer forwards build it once. Eager path
-        only; the captured path rebuilds into the capture-stable buffers at
-        replay prep (see _apply_cuda_graph_metadata)."""
-        view = forward_batch.kv_index_view
-        if view is not None:
-            return view
-        max_pages = None
-        if self.kv_index_source.enabled:
-            if forward_batch.seq_lens_cpu is not None:
-                max_seq = (
-                    int(forward_batch.seq_lens_cpu.max())
-                    if forward_batch.seq_lens_cpu.numel() > 0
-                    else 1
-                )
-            else:
-                max_seq = self.max_context_len
-            max_pages = max(-(-max_seq // self.page_size), 1)
-        view = self.kv_index_source.batch_view(
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            max_pages=max_pages,
-        )
-        forward_batch.kv_index_view = view
-        return view
+        """Eager per-batch read-index view (stashed on the ForwardBatch by the
+        source); the captured path rebuilds into the capture-stable buffers at
+        replay prep instead (see _apply_cuda_graph_metadata)."""
+        return self.kv_index_source.view_for_forward_batch(forward_batch)
 
     def _fill_kv_indptr_and_indices(
         self,

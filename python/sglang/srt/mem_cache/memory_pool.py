@@ -1555,11 +1555,11 @@ class KVWriteLoc:
     - ``swa_loc``: the SWA-sub-pool PHYSICAL location for hybrid SWA pools
       (``None`` otherwise); under the unified pool this is
       ``forward_batch.swa_out_cache_loc`` (the swa rail of the same rebind).
-    - ``full_loc``: the full-attention-sub-pool PHYSICAL location for the
-      unified memory pool (``None`` otherwise), carried in attention metadata
-      (``ForwardMetadata.out_cache_loc_full_physical``). Since the rebind it is
-      the SAME id space as ``loc`` (a same-space alias slated for collapse);
-      the shared full pool writes it directly and never translates.
+    - ``full_loc``: OPTIONAL full-attention-sub-pool location. Since the
+      ForwardBatch rebind it is the SAME id space as ``loc``, so pools fall
+      back to ``loc`` when it is ``None`` — only triton's captured path still
+      passes its capture-stable ``ForwardMetadata.out_cache_loc_full_physical``
+      buffer here (a same-space alias slated for collapse).
 
     ``swa_loc`` and ``full_loc`` are the parallel pair (each a pre-resolved
     PHYSICAL loc into its sub-pool, mirroring ``swa_kv_pool`` / ``full_kv_pool``);
