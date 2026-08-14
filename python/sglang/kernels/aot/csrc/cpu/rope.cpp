@@ -134,7 +134,46 @@ struct RotaryEmbedInternal<scalar_t, RotaryMode::Interleaved> {
       out[d + 1] = static_cast<scalar_t>(y * cos + x * sin);
     }
   }
+  template <typename param_t>
+  static inline void
+  apply(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, SplitCosSinRow<param_t> cache, int size) {
+    using fVec = at::vec::Vectorized<float>;
+    constexpr int kFloatVecSize = fVec::size();
+    constexpr int kVecStep = 2 * kFloatVecSize;
+    int d = 0;
+    for (; d + kVecStep <= size; d += kVecStep) {
+      auto [xy0, xy1] = load_float_vec2(input + d);
+      auto [x, y] = at::vec::deinterleave2(xy0, xy1);
 
+      const int rotary_offset = d / 2;
+      const auto cos = load_float_vec(cache.cos + rotary_offset);
+      const auto sin = load_float_vec(cache.sin + rotary_offset);
+
+      const fVec out0 = x * cos - y * sin;
+      const fVec out1 = y * cos + x * sin;
+
+      std::tie(xy0, xy1) = at::vec::interleave2(out0, out1);
+
+      if constexpr (std::is_same_v<scalar_t, float>) {
+        xy0.store(out + d);
+        xy1.store(out + d + kFloatVecSize);
+      } else {
+        convert_from_float_ext<scalar_t>(xy0, xy1).store(out + d);
+      }
+    }
+
+    // Scalar tail.
+    for (; d < size; d += 2) {
+      const int rotary_index = d / 2;
+
+      const float x = static_cast<float>(input[d]);
+      const float y = static_cast<float>(input[d + 1]);
+      const float cos = static_cast<float>(cache.cos[rotary_index]);
+      const float sin = static_cast<float>(cache.sin[rotary_index]);
+      out[d] = static_cast<scalar_t>(x * cos - y * sin);
+      out[d + 1] = static_cast<scalar_t>(y * cos + x * sin);
+    }
+  }
   // mRoPE: cos/sin may come from different T/H/W rows per pair index.
   static inline void
   apply(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, MropeCosSinRow<scalar_t> cache, int size) {
@@ -263,7 +302,86 @@ void rotary_embedding_kernel_impl(
   });
 }
 
+template <typename scalar_t, typename param_t>
+void apply_rotary_embedding_single_kernel_impl(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
+    const param_t* __restrict__ cos,
+    const param_t* __restrict__ sin,
+    const RopeParams& p,
+    int64_t cos_stride_s,
+    int64_t sin_stride_s) {
+  at::parallel_for(0, p.rows(), 0, [&](int64_t begin, int64_t end) {
+    int64_t batch = 0;
+    int64_t seq = 0;
+
+    data_index_init(begin, batch, p.batches, seq, p.seqlen);
+    for (int64_t row = begin; row < end; ++row) {
+      const SplitCosSinRow<param_t> cache{
+          cos + seq * cos_stride_s,
+          sin + seq * sin_stride_s,
+      };
+
+      for (int64_t head = 0; head < p.num_heads; ++head) {
+        const scalar_t* input_row = input + p.q_offset(batch, seq, head);
+        scalar_t* output_row = output + p.q_out_offset(batch, seq, head);
+        RotaryEmbedInternal<scalar_t, RotaryMode::Interleaved>::apply(
+            output_row, input_row, cache, static_cast<int>(p.rotary_dim));
+      }
+
+      data_index_step(batch, p.batches, seq, p.seqlen);
+    }
+  });
+}
+
 }  // namespace
+
+// Diffusion GPT-J-style rotary embedding.
+at::Tensor apply_rotary_embedding_cpu(const at::Tensor& input, const at::Tensor& cos, const at::Tensor& sin) {
+  const int64_t input_dim = input.dim();
+
+  TORCH_CHECK(
+      input_dim == 3 || input_dim == 4,
+      "expects input to be "
+      "[S, H, D] or [B, S, H, D], but got ",
+      input_dim,
+      "D tensor with shape ",
+      input.sizes());
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+
+  CHECK_DIM(2, cos);
+  CHECK_DIM(2, sin);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(cos);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(sin);
+
+  const int64_t head_size = input.size(-1);
+  const int64_t num_tokens = input_dim == 3 ? input.size(0) : input.size(1);
+  const auto input_dtype = input.scalar_type();
+  const auto param_dtype = cos.scalar_type();
+
+  const RopeParams p{
+      input,
+      input,
+      head_size,
+      head_size,
+  };
+
+  at::Tensor output = at::empty(input.sizes(), input.options());
+
+  CPU_DISPATCH_FLOATING_TYPES_EXT(input_dtype, param_dtype, [&] {
+    apply_rotary_embedding_single_kernel_impl<scalar_t, param_t>(
+        output.data_ptr<scalar_t>(),
+        input.data_ptr<scalar_t>(),
+        cos.data_ptr<param_t>(),
+        sin.data_ptr<param_t>(),
+        p,
+        cos.stride(0),
+        sin.stride(0));
+  });
+
+  return output;
+}
 
 // 2D : [num_tokens, num_heads*head_size] inplace
 // 3D : [num_tokens, num_heads, head_size] outplace

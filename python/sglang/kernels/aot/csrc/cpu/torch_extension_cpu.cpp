@@ -468,6 +468,7 @@ void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data);
 void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op);
 
 // rope
+at::Tensor apply_rotary_embedding_cpu(const at::Tensor& input, const at::Tensor& cos, const at::Tensor& sin);
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& positions,
     at::Tensor& query,
@@ -857,6 +858,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("shm_reduce_scatter_tensor", torch::kCPU, &shm_reduce_scatter_tensor);
 
   // rope
+  m.def("apply_rotary_embedding_cpu(Tensor input, Tensor cos, Tensor sin) -> Tensor");
+  m.impl("apply_rotary_embedding_cpu", torch::kCPU, &apply_rotary_embedding_cpu);
   m.def(
       "rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
