@@ -521,7 +521,13 @@ class Runtime:
             "lora_path": lora_path,
             "session_id": session_id,
         }
-        assert not isinstance(lora_path, list) or len(lora_path) == len(prompt)
+        if isinstance(lora_path, list):
+            batch_size = 1 if isinstance(prompt, str) else len(prompt)
+            if len(lora_path) != batch_size:
+                raise ValueError(
+                    f"lora_path length ({len(lora_path)}) must match "
+                    f"the prompt batch size ({batch_size})."
+                )
         response = requests.post(
             self.url + "/generate",
             json=json_data,
