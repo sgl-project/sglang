@@ -105,9 +105,6 @@ def _moe_sorting_small_kernel(
     )
     dest = blocks_before * BLOCK_SIZE + rank
 
-    total_blocks = tl.sum(tl.where(is_leader, blocks_of_e, 0), axis=0)
-    num_valid = total_blocks * BLOCK_SIZE
-
     if EMIT_MX and pid > NUM_BUF:
         # Quant CTA: one (pair, column-chunk) slice each. Mirrors
         # fused_dynamic_mxfp8_quant_moe_sort (group_size=32, e8m0 RoundUp
@@ -117,6 +114,7 @@ def _moe_sorting_small_kernel(
         CHUNKS: tl.constexpr = N_COLS // QCHUNK
         p = q_id // CHUNKS
         c0 = (q_id % CHUNKS) * QCHUNK
+
         if p < P:
             offs_q = tl.arange(0, QCHUNK)
             offs_g = tl.arange(0, QCHUNK // 32)
@@ -146,6 +144,9 @@ def _moe_sorting_small_kernel(
             sw = base_sw + (y // 8) * 256 + (y % 4) * 64 + ((y % 8) // 4) * 2
             tl.store(qscale_ptr + sw, exp.to(tl.uint8))
         return
+
+    total_blocks = tl.sum(tl.where(is_leader, blocks_of_e, 0), axis=0)
+    num_valid = total_blocks * BLOCK_SIZE
 
     # pid 0: sort outputs.
     # Pass 1: padding over the whole used region; pass 2: scatter real pairs.
@@ -381,7 +382,8 @@ def apply_aiter_small_moe_sort_patch() -> None:
     @functools.wraps(orig_mx_quant)
     def mx_quant_wrapper(input, sorted_ids, *args, **kwargs):
         pre = getattr(sorted_ids, "_premx_quant", None)
-        if pre is not None:
+        if pre is not None and pre[0].shape == input.shape:
+            del sorted_ids._premx_quant
             return pre
         return orig_mx_quant(input, sorted_ids, *args, **kwargs)
 

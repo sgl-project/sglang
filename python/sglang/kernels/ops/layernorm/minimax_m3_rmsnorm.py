@@ -151,7 +151,7 @@ def gemma_fused_add_rmsnorm(
         q8 = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=x.device)
         scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
     else:
-        q8 = scale = out  # unused placeholder pointers
+        q8 = scale = None
     block_n = triton.next_power_of_2(n)
     _gemma_fused_add_rmsnorm_kernel[(m,)](
         x2,
