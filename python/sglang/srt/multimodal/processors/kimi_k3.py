@@ -23,7 +23,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
-from sglang.srt.multimodal.cache import build_feature_hash
+from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     KimiK3DeferredPreprocessing,
@@ -502,9 +502,9 @@ class KimiK3ImageProcessor(
         feature: torch.Tensor,
         deferred: Optional[KimiK3DeferredPreprocessing] = None,
     ) -> KimiK3ImagePreprocessArtifact:
-        item = MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
-        item.set_pad_value()
-        feature_hash = build_feature_hash(artifact_key, item.hash)
+        feature_hash = resolve_multimodal_item_hash(
+            feature=feature, namespace=artifact_key
+        )
         if not self.keep_mm_features_on_device and feature.device.type != "cpu":
             feature = feature.cpu()
         return KimiK3ImagePreprocessArtifact(

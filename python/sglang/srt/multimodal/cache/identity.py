@@ -322,24 +322,46 @@ def build_artifact_key(
     return _digest_bytes(_canonical_json(payload))
 
 
-def build_feature_hash(artifact_key: str, processor_output_hash: int) -> int:
-    """Namespace a processor-output hash by its complete artifact identity."""
-    artifact_key = parse_content_hash(artifact_key)
-    if (
-        isinstance(processor_output_hash, bool)
-        or not isinstance(processor_output_hash, int)
-        or processor_output_hash < 0
-    ):
-        raise ValueError("processor_output_hash must be a non-negative integer")
-    output_hash_bytes = processor_output_hash.to_bytes(
-        max(1, (processor_output_hash.bit_length() + 7) // 8),
-        byteorder="big",
-        signed=False,
+def resolve_multimodal_item_hash(
+    *,
+    existing_hash: Optional[int] = None,
+    feature: Any = None,
+    precomputed_embeddings: Any = None,
+    namespace: Optional[str] = None,
+) -> int:
+    """Resolve an item cache hash, optionally scoped to an artifact identity.
+
+    The namespace covers processor metadata that can affect encoder output even
+    when two feature tensors contain the same bytes.
+    """
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+        import uuid
+
+        item_hash = uuid.uuid4().int
+    elif existing_hash is not None:
+        item_hash = existing_hash
+    else:
+        from sglang.srt.managers.mm_utils import hash_feature
+
+        value = feature if feature is not None else precomputed_embeddings
+        item_hash = hash_feature(value)
+
+    if namespace is None:
+        return item_hash
+
+    if isinstance(item_hash, bool) or not isinstance(item_hash, int) or item_hash < 0:
+        raise ValueError("item hash must be a non-negative integer")
+    namespace = parse_content_hash(namespace)
+    assert namespace is not None
+    hash_bytes = item_hash.to_bytes(
+        max(1, (item_hash.bit_length() + 7) // 8), byteorder="big", signed=False
     )
     digest = _hash_parts(
         b"multimodal-feature-v1",
-        bytes.fromhex(artifact_key[len(CONTENT_HASH_PREFIX) :]),
-        output_hash_bytes,
+        bytes.fromhex(namespace[len(CONTENT_HASH_PREFIX) :]),
+        hash_bytes,
     )
     return int.from_bytes(
         bytes.fromhex(digest[len(CONTENT_HASH_PREFIX) :])[:8],

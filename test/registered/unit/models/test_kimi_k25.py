@@ -28,7 +28,11 @@ from sglang.srt.models.kimi_k25 import (
     mm_projection_auto,
 )
 from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
-from sglang.srt.multimodal.cache import MultimodalPreprocessCache, snapshot_media
+from sglang.srt.multimodal.cache import (
+    MultimodalPreprocessCache,
+    resolve_multimodal_item_hash,
+    snapshot_media,
+)
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     KimiK3DeferredPreprocessing,
@@ -943,13 +947,16 @@ def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
     assert key not in processor.mm_preprocess_cache
 
 
-def test_kimi_k3_feature_hash_is_namespaced_by_artifact_identity():
+def test_kimi_k3_artifact_and_data_item_share_hash_resolution():
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_feature_transport = "cpu"
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor._tokenizer = _Tokenizer()
+    processor.use_cuda_ipc = False
     feature = torch.zeros((4, 3), dtype=torch.float32)
     digest = "sha256:" + "ab" * 32
 
-    first = processor._make_artifact(
+    artifact = processor._make_artifact(
         content_digest=digest,
         artifact_key="sha256:" + "01" * 32,
         original_size=(2, 2),
@@ -963,22 +970,18 @@ def test_kimi_k3_feature_hash_is_namespaced_by_artifact_identity():
         grid_thw=(1, 1, 1),
         feature=feature,
     )
-    second = processor._make_artifact(
-        content_digest=digest,
-        artifact_key="sha256:" + "02" * 32,
-        original_size=(4, 1),
-        resize_config={
-            "num_tokens": 1,
-            "new_width": 4,
-            "new_height": 1,
-            "pad_width": 0,
-            "pad_height": 1,
-        },
-        grid_thw=(1, 1, 1),
-        feature=feature,
-    )
+    direct_item = MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
+    direct_item.set_pad_value()
+    composed_item = processor.compose_request([1, 99, 2], [artifact]).mm_items[0]
 
-    assert first.feature_hash != second.feature_hash
+    expected_hash = resolve_multimodal_item_hash(
+        existing_hash=direct_item.hash,
+        namespace=artifact.artifact_key,
+    )
+    expected_item = MultimodalDataItem(modality=Modality.IMAGE, hash=expected_hash)
+    expected_item.set_pad_value()
+    assert artifact.feature_hash == composed_item.hash == expected_hash
+    assert composed_item.pad_value == expected_item.pad_value
 
 
 def test_kimi_k3_untrusted_path_change_is_a_cache_miss():

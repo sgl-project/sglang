@@ -11,14 +11,15 @@ import numpy as np
 import torch
 from PIL import Image
 
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.multimodal.cache import (
     CacheReservation,
     MultimodalPreprocessCache,
     build_artifact_key,
-    build_feature_hash,
     build_processor_fingerprint,
     estimate_cache_size_bytes,
     parse_content_hash,
+    resolve_multimodal_item_hash,
     snapshot_media,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -236,7 +237,7 @@ class TestMediaIdentity(unittest.TestCase):
         self.assertNotEqual(base, changed_backend)
         self.assertNotEqual(base, changed_config)
 
-    def test_feature_hash_includes_artifact_and_processor_output(self):
+    def test_item_hash_namespace_covers_identity_and_processor_output(self):
         digest = snapshot_media(b"image").content_digest
         first = build_artifact_key(
             digest,
@@ -248,11 +249,25 @@ class TestMediaIdentity(unittest.TestCase):
             modality="image",
             processor_fingerprint="processor-b",
         )
-        self.assertNotEqual(build_feature_hash(first, 1), build_feature_hash(second, 1))
-        self.assertNotEqual(build_feature_hash(first, 1), build_feature_hash(first, 2))
-        self.assertIsInstance(build_feature_hash(first, 1 << 128), int)
+        self.assertNotEqual(
+            resolve_multimodal_item_hash(existing_hash=1, namespace=first),
+            resolve_multimodal_item_hash(existing_hash=1, namespace=second),
+        )
+        self.assertNotEqual(
+            resolve_multimodal_item_hash(existing_hash=1, namespace=first),
+            resolve_multimodal_item_hash(existing_hash=2, namespace=first),
+        )
         with self.assertRaises(ValueError):
-            build_feature_hash(first, -1)
+            resolve_multimodal_item_hash(existing_hash=-1, namespace=first)
+
+    def test_multimodal_data_item_uses_shared_feature_hash(self):
+        feature = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+        expected = resolve_multimodal_item_hash(feature=feature)
+        item = MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
+
+        item.set_pad_value()
+
+        self.assertEqual(item.hash, expected)
 
 
 class TestMultimodalPreprocessCache(unittest.TestCase):
