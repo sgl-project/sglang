@@ -70,7 +70,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**GLM-5.2** is Z.ai's flagship Mixture-of-Experts model built on **DeepSeek Sparse Attention (DSA)**: a lightning indexer selects a sparse set of key tokens per query (top-2048), so attention cost stays near-constant as context grows. It ships in two precisions — **FP8** (`zai-org/GLM-5.2-FP8`) and full **BF16** (`zai-org/GLM-5.2`) — both with **78 transformer layers**, **256 routed experts** (8 active per token), a **1M-token context window**, and a single **MTP (Multi-Token Prediction)** layer for built-in EAGLE-style speculative decoding. FP8 is the recommended deployment; BF16 (~1.5 TB) needs an 8×B300 node or a multi-node setup. For Blackwell, NVIDIA also publishes an **NVFP4** build (`nvidia/GLM-5.2-NVFP4`) that quantizes only the MoE experts' linear weights and activations to 4-bit (the shared expert stays unquantized), holding accuracy within ~1 point of the FP8 baseline on GPQA Diamond, SciCode, and IFBench.
+**GLM-5.2** is Z.ai's flagship Mixture-of-Experts model built on **DeepSeek Sparse Attention (DSA)**: a lightning indexer selects a sparse set of key tokens per query (top-2048), so attention cost stays near-constant as context grows. It ships in two precisions — **FP8** (`zai-org/GLM-5.2-FP8`) and full **BF16** (`zai-org/GLM-5.2`) — both with **78 transformer layers**, **256 routed experts** (8 active per token), a **1M-token context window**, and a single **MTP (Multi-Token Prediction)** layer for built-in EAGLE-style speculative decoding. FP8 is the recommended deployment; BF16 (~1.5 TB) needs an 8×B300 node or a multi-node setup. For Blackwell, NVIDIA also publishes an **NVFP4** build (`nvidia/GLM-5.2-NVFP4`) that quantizes only the MoE experts' linear weights and activations to 4-bit (the shared expert stays unquantized), holding accuracy within ~1 point of the FP8 baseline on GPQA Diamond, SciCode, and IFBench. For AMD MI355X (gfx950), AMD publishes an **MXFP4** build (`amd/GLM-5.2-MXFP4`, Quark-quantized) — see the AMD GPUs configuration tip below; this recipe is inferred from the validated `amd/GLM-5.1-MXFP4` MI355X recipe and not yet benchmarked on GLM-5.2 (`verified: false`).
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
@@ -96,12 +96,17 @@ import { Playground } from "/src/snippets/_playground.jsx";
       <td style={{padding: "9px 12px"}}>MoE · DSA · 256 experts (top-8) · MTP · NVFP4</td>
       <td style={{padding: "9px 12px", textAlign: "right"}}>1,048,576</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/amd/GLM-5.2-MXFP4">GLM-5.2-MXFP4</a></strong></td>
+      <td style={{padding: "9px 12px"}}>MoE · DSA · 256 experts (top-8) · MTP · MXFP4</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>1,048,576</td>
+    </tr>
   </tbody>
 </table>
 
 **Recommended generation:** `temperature=1.0`, `top_p=0.95` (the checkpoint's `generation_config.json` defaults; informational — do not hardcode in client code).
 
-**Resources:** [GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) · [GLM-5.2 (BF16)](https://huggingface.co/zai-org/GLM-5.2) · [GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4).
+**Resources:** [GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) · [GLM-5.2 (BF16)](https://huggingface.co/zai-org/GLM-5.2) · [GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4) · [GLM-5.2-MXFP4](https://huggingface.co/amd/GLM-5.2-MXFP4).
 
 ## 2. Configuration Tips
 
@@ -114,6 +119,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 - **Chunked-prefill size is regime-dependent.** At long input (8K+) the default `--chunked-prefill-size 2048` is too small and leaves the balanced point prefill-bound (queueing dominates TTFT). Raising it to `--chunked-prefill-size 32768` on the balanced recipe gave roughly **+34–78% output throughput and −39–59% TTFT** on 8×H200 and 8×B200 (8K-in / 1K-out) in our testing. It is **neutral for high-throughput** (decode-bound there) — keep the default. `--max-running-requests` tracks KV capacity, not a tuning free-for-all: ~60–90 concurrent 8K+1K FP8 requests fit on a single 8-GPU node, so pin balanced near `--max-running-requests 80` and let high-throughput run wider.
 
 - **AMD GPUs (MI300X / MI325X / MI355X).** FP8 (`zai-org/GLM-5.2-FP8`) runs single-node at `tp=8` on all three. BF16 (`zai-org/GLM-5.2`, ~1.51 TB) only fits single-node on **MI325X** (2 TB HBM) and **MI355X** (2.3 TB); **MI300X** (1.5 TB) cannot hold the BF16 weights plus KV cache on one node, so use FP8 there (or a multi-node BF16 layout once validated). Use the DSA tilelang backend (`--dsa-prefill-backend tilelang --dsa-decode-backend tilelang`) and add `--chunked-prefill-size 131072` plus `--watchdog-timeout 1200` (20 min for weight loading). FP8 uses about half the memory of BF16 (~89 GB/GPU vs ~175 GB/GPU). GLM-5.2 and DeepSeek-V3.2 share the same model structure; for other DSA / HiSparse tips see the [DeepSeek-V3.2 cookbook](../DeepSeek/DeepSeek-V3_2).
+- **MI355X MXFP4 (gfx950-only).** AMD publishes a Quark-quantized **`amd/GLM-5.2-MXFP4`** build for MI355X. It needs `--trust-remote-code` (Quark's custom quant config) and runs at `tp=4` (the 4-bit MoE weights fit a 4-GPU slice) with `--kv-cache-dtype fp8_e4m3`, the same DSA tilelang backends, `--chunked-prefill-size`, and `--watchdog-timeout` as the FP8/BF16 recipes above. This recipe is carried over from the validated `amd/GLM-5.1-MXFP4` MI355X deployment (same DSA architecture family) and has not yet been benchmarked on GLM-5.2, so the Deploy panel marks it unverified.
 
 <Note>
 **gfx950 block-FP8 accuracy: fixed as of the pinned MI355X image (`v0.5.13.post1-rocm720-mi35x-20260618`).** Earlier SGLang ROCm images miscompiled AMD aiter's `gemm_a8w8_blockscale_bpreshuffle` GEMM on gfx950 (ROCm 7.2): the error was small per layer but compounded across all 78 layers and silently corrupted output — in-context reasoning broke (GSM8K ≈ 0) while short factual prompts still looked fine. The root cause was a gfx950/ROCm-7.2 miscompile of the CK kernel (a packed illegal-type FMA that relied on an LLVM coercion pass removed in ROCm 7.2; non-deterministic wrong rows near tile boundaries). This is resolved in the pinned image and newer: GLM-5.2-FP8 on MI350X/MI355X (gfx950) was re-validated at TP4 and TP8 — **GSM8K ≈ 0.96 (0% invalid)** and **15/15 needle-in-haystack retrieval to ~118K tokens**. **MI300X / MI325X (gfx942) were never affected.** If you must run an older image, treat gfx950 FP8 output as unverified. Background: [sgl-project/sglang#28685](https://github.com/sgl-project/sglang/issues/28685) (analysis) and the upstream CK fix [ROCm/rocm-libraries#8639](https://github.com/ROCm/rocm-libraries/pull/8639) (scalar FMA + accumulator anchor; restores correctness and determinism at -O3).

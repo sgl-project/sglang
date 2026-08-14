@@ -1,0 +1,391 @@
+---
+title: Qwen3.8-27B
+description: "Deploy Qwen3.8-27B with SGLang — dense hybrid GDN vision-language model with BF16/FP8/NVFP4 W4A4 checkpoints and in-checkpoint MTP, single-GPU on H200, RTX PRO 6000, RTX 5090 and DGX Spark."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install sglang
+```
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+```bash Command
+docker pull lmsysorg/sglang:qwen38-27b
+```
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick your card + checkpoint precision to generate the launch command. The model runs single-GPU on every supported card — H200, RTX PRO 6000, RTX 5090 and DGX Spark — and ships one operating point.
+
+<Note>
+`--mamba-full-memory-ratio` is the one sizing flag that matters for throughput
+on hybrid GDN models: the default (0.9) over-provisions the KV pool and silently
+clamps concurrency. Set your average request length in the
+[Mamba ratio calculator](#mamba-ratio-calculator) below; everything else follows
+the panels, and the computed value is pinned into the command.
+</Note>
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/Qwen/qwen3.8-27b.jsx";
+import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_calculator.jsx";
+
+<Deployment config={config} />
+
+### Mamba ratio calculator
+
+<Qwen38MambaRatioCalculator />
+
+<Accordion title="How --mamba-full-memory-ratio is calculated">
+
+Hybrid GDN models split post-weight memory into a worst-case-reserved **GDN
+state pool** (sets the concurrency ceiling) and a paged **attention KV pool**,
+divided by `--mamba-full-memory-ratio`. Every parameter below except `L` and the
+target concurrency is read live from the Deploy panel and Playground selection;
+the balanced value is the per-request cost ratio:
+
+```text Formula
+ratio = (S + D) x state_bytes / (L x kv_bytes_per_token)
+```
+
+- `S` — state slots per running request: `extra_buffer=5` (default),
+  `extra_buffer_lazy=4`, `no_buffer=3`, disabled radix cache `=1`.
+- `D` — verify intermediate states under speculative decoding:
+  `--speculative-num-draft-tokens` (4 at the recommended EAGLE 3/1/4), 0 otherwise.
+- `state_bytes` — one state slot, from the fixed geometry
+  (48 GDN layers x 48 heads x 128 x 128 at `--mamba-ssm-dtype`, plus bf16 conv
+  state): 153.9 MB at fp32, 78.4 MB at bf16.
+- `kv_bytes_per_token` — 16 attention layers x GQA 4 x 256 x K+V:
+  32.8 KB at fp8, 65.5 KB at bf16.
+- `L` — average total request length in tokens: input + output.
+
+`--max-mamba-cache-size = target_concurrency x (S + D)` is the equivalent
+explicit pin and overrides the ratio; the calculator emits it alongside. After
+boot, verify with the `max_running_requests` line in the server log — it should
+not be capped below your target concurrency.
+
+</Accordion>
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the recipes above**. The Deploy panel emits this model's documented launch recipes; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+**Qwen3.8-27B** is a dense hybrid Gated Delta Networks (GDN) **vision-language**
+model: a 27B causal language model paired with a vision encoder, with native
+image and video understanding alongside text. SGLang serves it through the
+Qwen3-VL path, so the vision tower is live on the recipes below.
+
+The language model is 64 layers, laid out as 16 repeats of *3 × (Gated DeltaNet
+→ FFN)* followed by *1 × (Gated Attention → FFN)* — 48 linear-attention layers
+to 16 full-attention ones. Gated DeltaNet runs 48 value heads and 16 QK heads at
+head_dim 128; Gated Attention is GQA 24/4 at head_dim 256 with a 64-dim rotary
+slice. Hidden size is 5120 over a 17,408-dim FFN, and the checkpoint ships an
+MTP head trained with multiple steps. Context is 262,144 tokens natively,
+extensible to 1,000,000. The serving-relevant architecture is identical to
+Qwen3.6-27B.
+
+Thinking mode is on by default and can be disabled per request; reasoning depth
+is tunable with `reasoning_effort`, and `preserve_thinking` retains reasoning
+context from earlier messages.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "38%"}} />
+    <col style={{width: "30%"}} />
+    <col style={{width: "32%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Quantization</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Weights</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.8-27B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>BF16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/Qwen/Qwen3.8-27B">Qwen/Qwen3.8-27B</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>Qwen3.8-27B-FP8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FP8 (blockwise)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://huggingface.co/Qwen/Qwen3.8-27B-FP8">Qwen/Qwen3.8-27B-FP8</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.8-27B-NVFP4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>NVFP4 W4A4 + FP8 projections</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4">RadixArk/Qwen3.8-27B-NVFP4</a></td>
+    </tr>
+  </tbody>
+</table>
+
+The NVFP4 checkpoint declares `kv_cache_quant_algo: FP8`; SGLang's default
+`--kv-cache-dtype auto` honors it, so the KV pool runs in `fp8_e4m3` with the
+checkpoint's calibration scales automatically.
+
+## 2. Configuration Tips
+
+- **SM120/SM121 (RTX PRO 6000 Blackwell, RTX 5090, DGX Spark)**: use `--attention-backend
+  flashinfer`; `trtllm_mha` is SM100-only. MTP with the FlashInfer backend
+  requires a FlashInfer build whose prefill `plan` accepts `uniform_q_len`
+  (newer than 0.6.15.post1); otherwise run spec with `--attention-backend triton`.
+  On DGX Spark the 128GB is unified memory shared with the host CPU, so all
+  three checkpoints fit; its cells use 8192-token prefill chunks,
+  `--mem-fraction-static 0.95`, and `--disable-prefill-cuda-graph`. The SM121
+  recipe is not yet validated on that platform.
+- **H200 (SM90)**: BF16 and FP8 only — the card has no FP4 tensor cores, so the
+  NVFP4 checkpoint's MLP would fall back to the Marlin W4A16 weight-only path
+  and its cell is greyed out. The H200 recipes use 32768-token prefill chunks
+  (SM90 prefill is fast enough that a big chunk barely stalls decode, unlike
+  the SM120 guidance below), and the FlashInfer GDN prefill backend engages by
+  default under them. `--attention-backend fa3` is a valid alternative,
+  measured slightly faster at bs=1.
+- **MTP**: `--speculative-algorithm EAGLE --speculative-num-steps 3
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` uses the
+  in-checkpoint MTP head. (This recipe was originally documented with `NEXTN`,
+  an alias of `EAGLE` — same algorithm.)
+- **DSpark**: the trained draft model is a separate checkpoint — add
+  `--speculative-algorithm DSPARK --speculative-draft-model-path
+  RadixArk/Qwen3.8-27B-DSpark` (the Playground's Speculative Decoding card
+  emits this pair).
+- **Hardware fit**: FP8 weights ~28.5GB (not serviceable beyond bs≤2 on
+  32GB cards); NVFP4 weights ~16.5GB (recommended for RTX 5090-class GPUs).
+- `--mamba-radix-cache-strategy extra_buffer_lazy` lowers the state cost per
+  request from 5 slots to 4 at no accuracy cost. On small-VRAM cards (RTX 5090
+  32GB) the state pool bounds concurrency long before KV does — prefer lowering
+  `S` (lazy strategy, or `--disable-radix-cache` for S=1); the
+  [calculator](#mamba-ratio-calculator) re-derives the ratio for the new `S`.
+  The balanced ratio itself is VRAM-independent.
+- `--chunked-prefill-size 2048`: decode steps stall behind each prefill chunk
+  on hybrid GDN models, and 8192-token chunks stall them ~600ms at a time.
+  2048 keeps decode inter-token latency smooth under mixed load and also
+  improves single-wave TTFT. (DGX Spark is the exception: its cells run
+  8192-token chunks.)
+
+## 3. Agent Harnesses
+
+Agent harnesses drive the model through the OpenAI-compatible endpoint — or, for
+Claude Code, through SGLang's Anthropic-compatible one — so any of them works
+once three things line up.
+
+**The parsers ship in the command.** Every recipe above carries
+`--reasoning-parser qwen3 --tool-call-parser qwen3_coder`, because without them a
+harness receives tool calls as raw text instead of structured `tool_calls`. The
+**Parsers** card in the [Playground](#playground) is therefore an opt-out — both
+chips start on, and turning one off strips its flag.
+
+`qwen3_coder` is the right tool-call parser for this checkpoint: its chat
+template instructs the model to reply with an inner `<function=…>` /
+`<parameter=…>` block nested in `<tool_call></tool_call>`, which is exactly what
+that parser decodes. The Hermes parser (`--tool-call-parser hermes`) reads a
+*different* payload — bare JSON inside `<tool_call>` — so pointing a Hermes-format
+harness at this model without switching the flag yields tool calls that never
+parse. `--reasoning-parser qwen3` matches the template's `enable_thinking`
+toggle, which defaults to on.
+
+**Endpoint and model id.** The base URL is `http://<host>:30000/v1`. The `model`
+string a harness sends must equal the server's `--model-path` — the OpenAI
+`/v1/models` name defaults to it — unless you override it with
+`--served-model-name`, which is usually worth doing to keep harness configs short.
+
+SGLang also serves an Anthropic-compatible `/v1/messages`, which is what
+[§3.3](#3-3-claude-code) uses. It converts each request to the OpenAI shape,
+hands it to the same chat-serving path, and converts the response back — so the
+parser flags above apply there identically.
+
+**Auth.** `--api-key` is unset by default, so the server accepts unauthenticated
+requests. Harnesses that insist on a key can send any placeholder; set
+`--api-key` on the server if the endpoint is reachable beyond localhost.
+
+### 3.1 OpenCode
+
+[OpenCode](https://opencode.ai/docs/providers/) reaches a self-hosted endpoint
+through a provider entry in `opencode.json`.
+
+<Accordion title="Register SGLang as an OpenCode provider">
+
+Store the credential first — pick **Other**, give the provider an id, and enter
+any placeholder when the server has no `--api-key`:
+
+```bash Command
+opencode
+/connect
+```
+
+Then declare the provider in `opencode.json`:
+
+```json Config
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "sglang": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "SGLang (Qwen3.8-27B)",
+      "options": {
+        "baseURL": "http://localhost:30000/v1"
+      },
+      "models": {
+        "RadixArk/Qwen3.8-27B-NVFP4": {
+          "name": "Qwen3.8-27B NVFP4"
+        }
+      }
+    }
+  }
+}
+```
+
+`npm` selects the transport — `@ai-sdk/openai-compatible` is the one for a plain
+OpenAI-shaped endpoint. `apiKey` is optional and takes a `"{env:VAR_NAME}"`
+reference rather than a literal. The `models` keys are the ids sent on the wire,
+so they must match the served model name. Confirm with `/models`.
+
+</Accordion>
+
+### 3.2 Pi
+
+[Pi](https://pi.dev/docs/latest/custom-provider)
+(`@earendil-works/pi-coding-agent`) registers providers from an extension rather
+than a config file.
+
+<Accordion title="Register SGLang as a Pi provider">
+
+```javascript Extension
+pi.registerProvider("sglang", {
+  baseUrl: "http://localhost:30000/v1",
+  api: "openai-completions",
+  apiKey: "$SGLANG_API_KEY",
+  models: [
+    {
+      id: "RadixArk/Qwen3.8-27B-NVFP4",
+      name: "Qwen3.8-27B",
+      reasoning: true,
+      input: ["text", "image"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 262144,
+      maxTokens: 32768,
+    },
+  ],
+});
+```
+
+`api: "openai-completions"` is what selects the OpenAI-compatible transport, and
+`apiKey` takes a `$ENV_VAR` reference rather than a literal. `contextWindow` is
+the checkpoint's native 262,144; set `maxTokens` to whatever output cap you want
+per turn. Confirm registration with `pi --list-models`.
+
+</Accordion>
+
+### 3.3 Claude Code
+
+Claude Code speaks the Anthropic API, so it points at SGLang's `/v1/messages`
+rather than the OpenAI endpoint.
+
+<Warning>
+Anthropic documents that routing Claude Code to non-Claude models through a
+gateway is **not supported**. The wiring below works because SGLang implements
+the Anthropic message format, but it sits outside what Claude Code is tested
+against — expect newer Claude Code features to degrade or fail.
+</Warning>
+
+<Accordion title="Point Claude Code at SGLang">
+
+`ANTHROPIC_BASE_URL` is the server origin — Claude Code appends `/v1/messages`
+itself, so leave the `/v1` suffix off:
+
+```bash Command
+export ANTHROPIC_BASE_URL=http://localhost:30000
+export ANTHROPIC_AUTH_TOKEN=placeholder
+```
+
+The two credential variables travel in different headers:
+`ANTHROPIC_AUTH_TOKEN` goes out as `Authorization: Bearer`, `ANTHROPIC_API_KEY`
+as `x-api-key`. Either satisfies a server started without `--api-key`; with
+`--api-key` set, pick the variable matching the header your server reads. A
+credential variable also takes precedence over a saved claude.ai login for that
+session.
+
+The same pair can live in a settings file instead, which persists across shells
+and wins over a shell export:
+
+```json Config
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:30000",
+    "ANTHROPIC_AUTH_TOKEN": "placeholder"
+  }
+}
+```
+
+Run `/status` in Claude Code to confirm which base URL and credential source the
+session picked up.
+
+</Accordion>
+
+### 3.4 Hermes Agent
+
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) (Nous Research, MIT)
+selects a self-hosted endpoint through its setup wizard or its config file.
+
+<Accordion title="Point Hermes Agent at SGLang">
+
+```bash Command
+hermes model
+# choose "Custom endpoint (self-hosted / VLLM / etc.)", then enter the
+# base URL, an API key (blank for a local server) and the model name
+```
+
+Equivalently, in `~/.hermes/config.yaml`:
+
+```yaml Config
+model:
+  default: RadixArk/Qwen3.8-27B-NVFP4
+  provider: custom
+  base_url: http://localhost:30000/v1
+  api_key: ""
+  context_length: 262144
+```
+
+For several endpoints at once, declare them under `providers:` and switch with
+`/model custom:<name>` mid-session:
+
+```yaml Config
+providers:
+  workstation:
+    api: http://localhost:30000/v1
+  server:
+    api: https://gpu-host.internal:30000/v1
+    key_env: SGLANG_API_KEY
+```
+
+</Accordion>
