@@ -855,7 +855,9 @@ def hash_feature(f):
     elif isinstance(f, torch.Tensor):
         return tensor_hash([f])
     elif is_ipc_tensor_transport_proxy(f):
-        target_device = torch.npu.current_device() if _is_npu() else torch.cuda.current_device()
+        target_device = (
+            torch.npu.current_device() if _is_npu() else torch.cuda.current_device()
+        )
         reconstruct_t = f.reconstruct_on_target_device(target_device)
         return tensor_hash([reconstruct_t])
     elif isinstance(f, ShmPointerMMData):

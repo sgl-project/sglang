@@ -7921,9 +7921,7 @@ class ServerArgs:
 
         if requested_transport == "npu_ipc":
             if not is_npu():
-                raise ValueError(
-                    "--mm-feature-transport=npu_ipc requires Ascend NPU."
-                )
+                raise ValueError("--mm-feature-transport=npu_ipc requires Ascend NPU.")
             if self.nnodes != 1:
                 raise ValueError(
                     "--mm-feature-transport=npu_ipc only supports a single node."

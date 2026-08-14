@@ -137,6 +137,7 @@ from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 def is_ipc_tensor_transport_proxy(obj) -> bool:
     return isinstance(obj, (CudaIpcTensorTransportProxy, NpuIpcTensorTransportProxy))
 
+
 if TYPE_CHECKING:
     from typing import Any, Dict
 
@@ -638,6 +639,7 @@ class MultimodalInputs:
 
         # try reconstructing from cuda-ipc
         from sglang.srt.utils import is_npu
+
         reconstruct_device = None
         for mm_item in mm_items:
             if (
@@ -645,7 +647,11 @@ class MultimodalInputs:
                 and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
             ):
                 if reconstruct_device is None:
-                    reconstruct_device = torch.npu.current_device() if is_npu() else torch.cuda.current_device()
+                    reconstruct_device = (
+                        torch.npu.current_device()
+                        if is_npu()
+                        else torch.cuda.current_device()
+                    )
                 mm_item.reconstruct(reconstruct_device)
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:

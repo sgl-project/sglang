@@ -229,17 +229,19 @@ class MmItemMemoryPool:
 
         return sync_flag, available_slice, byte_offset
 
-    def wrap_tensor(
-        self, tensor: torch.Tensor, *, use_pool_handle_cache: bool
-    ):
-        sync_flag, available_slice, byte_offset = self.return_a_slice_tensor_with_flag(tensor)
+    def wrap_tensor(self, tensor: torch.Tensor, *, use_pool_handle_cache: bool):
+        sync_flag, available_slice, byte_offset = self.return_a_slice_tensor_with_flag(
+            tensor
+        )
         if isinstance(available_slice, torch.Tensor):
             available_slice.copy_(tensor.view(torch.int8).view(-1), non_blocking=True)
             return NpuIpcTensorTransportProxy(
                 data=available_slice,
                 info_data=tensor,
                 sync_buffer_meta=sync_flag,
-                pool_ipc_handle=self._pool_ipc_handle if use_pool_handle_cache else None,
+                pool_ipc_handle=(
+                    self._pool_ipc_handle if use_pool_handle_cache else None
+                ),
                 pool_byte_offset=byte_offset,
                 pool_device_index=self._pool_device_index,
             )
@@ -333,8 +335,10 @@ class NpuIpcTensorTransportProxy:
     @property
     def get_sync_flag(self):
         if not hasattr(self, "_sync_flag"):
-            shm_name = self.proxy_state["tensor_data"].get("sync_buffer_meta", {}).get(
-                "handle"
+            shm_name = (
+                self.proxy_state["tensor_data"]
+                .get("sync_buffer_meta", {})
+                .get("handle")
             )
             if not shm_name:
                 shm_name = self.proxy_state.get("sync_buffer_meta", {}).get("handle")
@@ -406,7 +410,9 @@ class NpuIpcTensorTransportProxy:
         except Exception:
             state["ipc_extra"] = None
             state["tensor_data"] = data
-            logger.warning(f"[NPU IPC] Failed to create IPC handle, falling back to CPU: {e}")
+            logger.warning(
+                f"[NPU IPC] Failed to create IPC handle, falling back to CPU: {e}"
+            )
 
         return state
 
@@ -473,7 +479,9 @@ class NpuIpcTensorTransportProxy:
             recons_dtype = ipc_extra["recons_dtype"]
 
             if "pool_handle" in ipc_extra:
-                logger.info(f"[NPU IPC] Reconstruct from pool: shape={recons_shape}, device={rebuild_device}")
+                logger.info(
+                    f"[NPU IPC] Reconstruct from pool: shape={recons_shape}, device={rebuild_device}"
+                )
                 (
                     slice_tensor,
                     _target_device,
@@ -488,7 +496,9 @@ class NpuIpcTensorTransportProxy:
                 try:
                     original_handle = ipc_extra["handle"]
                     target_device = torch.device(f"npu:{rebuild_device_idx}")
-                    logger.info(f"[NPU IPC] Reconstruct from handle: device={target_device}")
+                    logger.info(
+                        f"[NPU IPC] Reconstruct from handle: device={target_device}"
+                    )
                     func, args = original_handle
                     list_args = list(args)
                     for i, arg in enumerate(list_args):
@@ -514,7 +524,9 @@ class NpuIpcTensorTransportProxy:
                 consumer_count,
             )
         elif isinstance(self.proxy_state["tensor_data"], torch.Tensor):
-            logger.info(f"[NPU IPC] Reconstruct from tensor_data: device={rebuild_device}")
+            logger.info(
+                f"[NPU IPC] Reconstruct from tensor_data: device={rebuild_device}"
+            )
             reconstructed_tensor = self.proxy_state["tensor_data"].to(
                 rebuild_device, non_blocking=True
             )

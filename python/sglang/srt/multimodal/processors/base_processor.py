@@ -27,12 +27,10 @@ from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecuto
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+)
+from sglang.srt.multimodal.transport.cuda_ipc import (
     MmItemMemoryPool as CudaMmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
-)
-from sglang.srt.utils.npu_ipc_transport_utils import (
-    MmItemMemoryPool as NpuMmItemMemoryPool,
-    NpuIpcTensorTransportProxy,
 )
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
@@ -44,6 +42,9 @@ from sglang.srt.utils import (
     load_image,
     load_video,
     logger,
+)
+from sglang.srt.utils.npu_ipc_transport_utils import (
+    MmItemMemoryPool as NpuMmItemMemoryPool,
 )
 
 _is_cpu = is_cpu()
@@ -208,7 +209,8 @@ class BaseMultimodalProcessor(ABC):
         )
         self.mm_feature_transport = (
             configured_mm_feature_transport
-            if configured_mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm", "npu_ipc")
+            if configured_mm_feature_transport
+            in ("cpu", "cuda_ipc", "cuda_vmm", "npu_ipc")
             else "cpu"
         )
         self.use_device_ipc = self.mm_feature_transport in ("cuda_ipc", "npu_ipc")
@@ -394,6 +396,7 @@ class BaseMultimodalProcessor(ABC):
             # tokenizer workers. Each worker gets an equal share so that adding
             # workers doesn't multiply the GPU-side footprint.
             from sglang.srt.utils import is_npu
+
             device_type = "npu" if is_npu() else "cuda"
             device_name = "NPU" if device_type == "npu" else "GPU"
             worker_num = self.server_args.tokenizer_worker_num
