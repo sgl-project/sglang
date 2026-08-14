@@ -594,7 +594,14 @@ def maybe_download_lora(
     Returns:
         Local path to the model
     """
-    allow_patterns = ["*.json", "*.safetensors", "*.bin"]
+    # Repositories often publish several adapter revisions side by side.  If a
+    # filename is pinned, do not download every weight before selecting it.
+    # Keep JSON metadata so PEFT's lora_alpha remains available.
+    allow_patterns = (
+        ["*.json", weight_name, f"**/{weight_name}"]
+        if weight_name is not None
+        else ["*.json", "*.safetensors", "*.bin"]
+    )
 
     local_path = maybe_download_model(
         model_name_or_path,
