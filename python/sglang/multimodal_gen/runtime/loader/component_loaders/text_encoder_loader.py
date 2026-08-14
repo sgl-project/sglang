@@ -502,7 +502,8 @@ class TextEncoderLoader(ComponentLoader):
                         or getattr(model, "_fsdp_shard_conditions", None),
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )
-                    register_fsdp_entrypoints(model)
+                    if hasattr(model, "_fsdp_shard_conditions"):
+                        register_fsdp_entrypoints(model)
                 else:
                     model = model.to("cpu")
             else:
