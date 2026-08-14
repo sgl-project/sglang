@@ -52,6 +52,12 @@ class AscendFABackend(AttentionBackend):
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         return AscendFAMetadataBuilder
 
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        """Whether this backend can serve as the ring-attention kernel; the
+        per-hop online-softmax merge needs the kernel's softmax LSE."""
+        return True
+
 
 class AscendFAImpl(AttentionImpl):
 

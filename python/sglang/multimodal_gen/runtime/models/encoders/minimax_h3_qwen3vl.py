@@ -41,6 +41,10 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
     eight otherwise-idle ranks during encoding.
     """
 
+    # encode_ids drives the forward pass; __call__ is never used, so FSDP2
+    # needs it registered or the root group (the vision tower) stays sharded.
+    _fsdp_forward_methods = ("encode_ids",)
+
     supports_dp_encode = True
 
     @staticmethod

@@ -607,15 +607,23 @@ class MqaAttentionBase(nn.Module):
         from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 
         rope_theta, rope_scaling = get_rope_config(config)
-        self.rope_scaling = rope_scaling
-        scaling = rope_scaling or {}
+        self.rope_scaling = dict(rope_scaling) if rope_scaling else None
+        scaling = self.rope_scaling or {}
+
+        # RoPE is selected at layer granularity in the reference model. Pure
+        # SWA layers use the main unscaled RoPE, while C4/C128 layers use the
+        # compressed YaRN RoPE for Q, their SWA branch, and compressed KV.
         self.rope_base = (
             config.compress_rope_theta if self.compress_ratio else rope_theta
         )
         original_seq_len: int = (
             rope_original_seq_len
             if rope_original_seq_len is not None
-            else scaling["original_max_position_embeddings"]
+            else (
+                scaling["original_max_position_embeddings"]
+                if self.compress_ratio
+                else 0
+            )
         )
         freqs_cis = precompute_freqs_cis(
             dim=self.qk_rope_head_dim,
@@ -693,14 +701,16 @@ class MQALayer(MqaAttentionBase):
             compress_ratio=compress_ratio_override,
         )
 
-        if self.rope_scaling:
-            self.rope_scaling["rope_type"] = "deepseek_yarn"
+        active_rope_scaling = None
+        if self.compress_ratio in (4, 128):
+            active_rope_scaling = dict(self.rope_scaling or {})
+            active_rope_scaling["rope_type"] = "deepseek_yarn"
         self.rotary_emb = get_rope_wrapper(
             head_size=self.rope_head_dim,
             rotary_dim=self.rope_head_dim,
             max_position=config.max_position_embeddings,
             base=self.rope_base,
-            rope_scaling=self.rope_scaling,
+            rope_scaling=active_rope_scaling,
             is_neox_style=False,
             device=get_device().device,
         )
@@ -743,7 +753,7 @@ class MQALayer(MqaAttentionBase):
                 head_dim=self.head_dim,
                 rotate=False,
                 prefix=add_prefix("compressor", prefix),
-                rotary_emb=getattr(self, "rotary_emb", None),
+                rotary_emb=self.rotary_emb,
             )
             if self.compress_ratio == 4:
                 self.indexer = C4Indexer(
@@ -753,7 +763,7 @@ class MQALayer(MqaAttentionBase):
                     quant_config=quant_config,
                     prefix=add_prefix("indexer", prefix),
                     alt_streams=self.alt_streams_indexer,
-                    rotary_emb=getattr(self, "rotary_emb", None),
+                    rotary_emb=self.rotary_emb,
                 )
 
         self.attn_mqa = RadixAttention(
@@ -1262,7 +1272,10 @@ class MQALayer(MqaAttentionBase):
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
             and get_is_capture_mode()
-            and x.shape[0] <= self._multi_stream_bs_limit
+            and (
+                is_in_breakable_cuda_graph()
+                or x.shape[0] <= self._multi_stream_bs_limit
+            )
             and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
             and not (_is_hip and self.compressor is None)
         )
