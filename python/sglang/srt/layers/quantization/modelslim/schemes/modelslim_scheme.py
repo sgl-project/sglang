@@ -2,14 +2,26 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from typing import Optional
 
 import torch
 
 from sglang.srt.layers.quantization.base_scheme import BaseLinearScheme, BaseMoEScheme
 
-__all__ = ["ModelSlimLinearScheme", "ModelSlimMoEScheme"]
+__all__ = ["ModelSlimKVSchemeBase", "ModelSlimLinearScheme", "ModelSlimMoEScheme"]
+
+
+class ModelSlimKVSchemeBase(ABC):
+    """Interface implemented by ModelSlim attention/KV quantization schemes."""
+
+    @abstractmethod
+    def create_weights(self, *args, **kwargs):
+        raise NotImplementedError
+
+    @abstractmethod
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        raise NotImplementedError
 
 
 class ModelSlimLinearScheme(BaseLinearScheme):

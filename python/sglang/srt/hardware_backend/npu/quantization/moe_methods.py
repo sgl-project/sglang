@@ -5,7 +5,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
 if TYPE_CHECKING:
@@ -20,6 +20,7 @@ from sglang.srt.hardware_backend.npu.moe.matmul import (
 )
 from sglang.srt.hardware_backend.npu.moe.quant import HiddenStatesDynamicQuant
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+    _get_float4_e2m1fn_x2_dtype,
     _get_float8_e8m0fnu_dtype,
 )
 
@@ -62,6 +63,43 @@ def _require_e8m0_dtype():
                 "with a torch_npu build exposing float8_e8m0fnu (torch_npu >= 2.9)."
             )
     return _E8M0_DTYPE
+
+
+def _require_fp4_dtype():
+    fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+    if fp4_dtype is None:
+        raise RuntimeError(
+            "float4_e2m1fn_x2 dtype not found — MXFP4 MoE requires Ascend A5 "
+            "with a torch_npu build exposing float4_e2m1fn_x2."
+        )
+    return fp4_dtype
+
+
+def _pack_mxfp_weight_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Convert checkpoint ``[E, N, K/32]`` scales to ``[E, K/64, N, 2]``."""
+    if scale.ndim != 3:
+        raise ValueError(
+            f"MXFP expert weight scale must be 3D [E, N, K/32], got {scale.shape}."
+        )
+    if scale.shape[-1] % 2 != 0:
+        raise ValueError(
+            "MXFP expert weight scale block dimension must be even for pair "
+            f"packing, got {scale.shape[-1]}."
+        )
+    return scale.reshape(
+        scale.shape[0], scale.shape[1], scale.shape[2] // 2, 2
+    ).transpose(1, 2)
+
+
+def _normalize_mxfp_input_scale(scale: torch.Tensor) -> torch.Tensor:
+    if scale.ndim == 3:
+        return scale
+    if scale.ndim != 2 or scale.shape[-1] % 2 != 0:
+        raise ValueError(
+            "MXFP activation scale must be [tokens, K/32] or "
+            f"[tokens, K/64, 2], got {scale.shape}."
+        )
+    return scale.reshape(scale.shape[0], scale.shape[1] // 2, 2)
 
 
 # DEPRECATED METHOD
@@ -760,6 +798,174 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
 
 
 # ---------------------------------------------------------------------------
+#  Packed MXFP4 ModelSlim MoE methods
+# ---------------------------------------------------------------------------
+class _NPUPackedMXFP4MoEMethod(_NPUMoEMethodBase):
+    """Common packed-FP4 weight layout used by W4A4 and W4A8 ModelSlim MoE."""
+
+    activation_is_fp4 = False
+    deepep_dispatcher_dtype = "mxfp8"
+
+    def __init__(self, weight_prefix: str) -> None:
+        super().__init__(quant_config=None)
+        if weight_prefix not in ("w13", "w2"):
+            raise ValueError(
+                f"weight_prefix must be 'w13' or 'w2', got {weight_prefix!r}."
+            )
+        self.weight_prefix = weight_prefix
+        self.matmul = GroupedMatmul()
+
+    def _format_weight(self, weight: torch.Tensor, fp4_dtype) -> torch.Tensor:
+        if self.activation_is_fp4:
+            return npu_format_cast(weight)
+        return npu_format_cast(
+            weight,
+            NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=fp4_dtype,
+        )
+
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, weight_prefix: str
+    ) -> None:
+        self._validate_weight_prefix(layer, weight_prefix)
+        fp4_dtype = _require_fp4_dtype()
+        weight = getattr(layer, f"{weight_prefix}_weight").data
+        weight_scale = getattr(layer, f"{weight_prefix}_weight_scale").data
+        expected_scale_blocks = (weight.shape[-1] * 2 + 31) // 32
+        if weight_scale.shape[:2] != weight.shape[:2] or (
+            weight_scale.shape[-1] != expected_scale_blocks
+        ):
+            raise ValueError(
+                f"{weight_prefix} MXFP4 scale shape {tuple(weight_scale.shape)} "
+                f"does not match packed weight shape {tuple(weight.shape)}."
+            )
+
+        weight = self._format_weight(weight, fp4_dtype).transpose(1, 2)
+        weight_scale = _pack_mxfp_weight_scale(weight_scale)
+        setattr(
+            layer,
+            f"{weight_prefix}_weight",
+            Parameter(weight, requires_grad=False),
+        )
+        setattr(
+            layer,
+            f"{weight_prefix}_weight_scale",
+            Parameter(weight_scale, requires_grad=False),
+        )
+
+        if weight_prefix == "w13":
+            from sglang.srt.layers.moe import get_moe_a2a_backend
+
+            if get_moe_a2a_backend().is_deepep():
+                dispatcher_dtype = self.deepep_dispatcher_dtype
+            elif self.activation_is_fp4:
+                # AscendTP has no MXFP4 routing mode. It sends BF16 and the
+                # grouped-matmul method performs dynamic MXFP4 quantization.
+                dispatcher_dtype = "bf16"
+            else:
+                dispatcher_dtype = "mxfp8"
+            self._set_dispatcher_output_dtype(layer, dispatcher_dtype)
+
+    @staticmethod
+    def _weight_scale(
+        quant_info: "AscendQuantInfo", weight_prefix: str
+    ) -> torch.Tensor:
+        scale = (
+            quant_info.w13_weight_scale
+            if weight_prefix == "w13"
+            else quant_info.w2_weight_scale
+        )
+        if scale is None:
+            raise RuntimeError(
+                f"{weight_prefix}_weight_scale is required for MXFP4 MoE; "
+                "unit-scale fallback is not allowed."
+            )
+        return scale
+
+    def _quantize_input(
+        self,
+        hidden_states: torch.Tensor,
+        input_scale: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if input_scale is not None:
+            return hidden_states, _normalize_mxfp_input_scale(input_scale)
+        if hidden_states.dtype not in (torch.float16, torch.bfloat16):
+            raise RuntimeError(
+                "Pre-quantized MXFP MoE activations require their UE8M0 scale; "
+                f"got dtype={hidden_states.dtype} with no scale."
+            )
+
+        if self.activation_is_fp4:
+            return torch.ops.npu.npu_dynamic_mx_quant(
+                hidden_states,
+                dst_type=_require_fp4_dtype(),
+                round_mode="round",
+            )
+        return torch.ops.npu.npu_dynamic_mx_quant(
+            hidden_states, dst_type=torch.float8_e4m3fn
+        )
+
+    def _scale_args(
+        self, weight_scale: torch.Tensor, input_scale: torch.Tensor
+    ) -> Dict[str, Any]:
+        e8m0_dtype = _require_e8m0_dtype()
+        fp4_dtype = _require_fp4_dtype()
+        if self.activation_is_fp4:
+            return {
+                "scale": [weight_scale],
+                "per_token_scale": [input_scale],
+                "scale_dtype": e8m0_dtype,
+                "per_token_scale_dtype": e8m0_dtype,
+                "x_dtype": fp4_dtype,
+                "weight_dtype": fp4_dtype,
+            }
+        return {
+            "antiquant_scale": [weight_scale],
+            "per_token_scale": [input_scale],
+            "per_token_scale_dtype": e8m0_dtype,
+            "x_dtype": torch.float8_e4m3fn,
+            "weight_dtype": fp4_dtype,
+        }
+
+    def apply(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        output_dtype: torch.dtype,
+        weight_prefix: str,
+        group_list_type,
+    ) -> torch.Tensor:
+        weight_scale = self._weight_scale(quant_info, weight_prefix)
+        hidden_states, input_scale = self._quantize_input(
+            hidden_states, pertoken_scale
+        )
+        return self.matmul.forward(
+            quant_info,
+            weight_prefix,
+            hidden_states,
+            expert_tokens,
+            output_dtype,
+            group_list_type=group_list_type,
+            transposed=True,
+            **self._scale_args(weight_scale, input_scale),
+        )
+
+
+class NPUW4A4MXFP4MoEMethod(_NPUPackedMXFP4MoEMethod):
+    """W4A4 MXFP4 grouped matmul for pre-quantized ModelSlim experts."""
+
+    activation_is_fp4 = True
+    deepep_dispatcher_dtype = "mxfp4"
+
+
+class NPUW4A8MXFPMoEMethod(_NPUPackedMXFP4MoEMethod):
+    """W4A8 grouped matmul with packed MXFP4 weights and MXFP8 activations."""
+
+
+# ---------------------------------------------------------------------------
 #  NPUMXFP8MoEMethod
 # ---------------------------------------------------------------------------
 class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
@@ -775,11 +981,10 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
     ``apply_fused_gmm1_swiglu`` for w13 and ``apply`` only for w2 — hence the
     per-prefix matmul chosen here.
 
-    Where the *activation* quant happens depends on the dispatcher. On
-    ``ascend_tp`` it comes for free from ``npu_moe_init_routing_v2(quant_mode=3)``,
-    which emits the e4m3 payload and e8m0 scale as part of routing. DeepEP has no
-    mxfp8 dispatch dtype, so it hands over bf16 and w13 quantises the hidden
-    states itself before gmm1.
+    Where the *activation* quant happens depends on the dispatcher. AscendTP
+    uses ``npu_moe_init_routing_v2(quant_mode=3)``; A5 DeepEP requests MXFP8 on
+    the wire. Both emit an e4m3 payload plus an e8m0 block scale. The method can
+    still dynamically quantize BF16 input when no quantizing dispatcher is used.
     """
 
     def __init__(self, weight_prefix: str):
@@ -864,12 +1069,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         )
 
         if weight_prefix == "w13":
-            from sglang.srt.layers.moe import get_moe_a2a_backend
-
-            # DeepEP has no mxfp8 entry in its dispatch dtype table, so let it
-            # keep sending bf16; apply_fused_gmm1_swiglu quantises instead.
-            dispatcher_dtype = "bf16" if get_moe_a2a_backend().is_deepep() else "mxfp8"
-            self._set_dispatcher_output_dtype(layer, dispatcher_dtype)
+            self._set_dispatcher_output_dtype(layer, "mxfp8")
 
     def apply_fused_gmm1_swiglu(
         self,
@@ -892,6 +1092,8 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         """
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+        else:
+            pertoken_scale = _normalize_mxfp_input_scale(pertoken_scale)
 
         e8m0_dtype = _require_e8m0_dtype()
         return self.matmul.forward(

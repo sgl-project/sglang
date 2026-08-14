@@ -215,6 +215,7 @@ class DispatcherOutputDtype(Enum):
     - INT8: dispatch hidden states in int8
     - NVFP4: dispatch hidden states in nvfp4
     - MXFP8: dispatch hidden states in mxfp8 (fp8_e4m3 + e8m0 block scale)
+    - MXFP4: dispatch hidden states in packed mxfp4 + e8m0 block scale
     """
 
     BF16 = "bf16"
@@ -222,6 +223,7 @@ class DispatcherOutputDtype(Enum):
     INT8 = "int8"
     NVFP4 = "nvfp4"
     MXFP8 = "mxfp8"
+    MXFP4 = "mxfp4"
 
 
 def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
