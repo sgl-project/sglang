@@ -137,6 +137,32 @@ def adjust_tp_num_heads_if_necessary(model_config, tp_size, is_post_update):
                 )
 
 
+def adjust_swa_num_heads_if_necessary(model_config, tp_size, weight_block_size):
+    # Sliding-window layers carry their own head counts, so the padded
+    # full-attention num_attention_heads does not describe them
+    from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
+
+    text_config = model_config.hf_text_config
+    if not hasattr(text_config, "swa_num_key_value_heads"):
+        return
+
+    swa_num_key_value_heads = text_config.swa_num_key_value_heads
+    swa_num_attention_heads = getattr(
+        text_config, "swa_num_attention_heads", model_config.num_attention_heads
+    )
+    # ModelConfig always materializes swa_head_dim, defaulting it to head_dim.
+    swa_pad_size = get_num_heads_padding_size(
+        tp_size, weight_block_size, text_config.swa_head_dim
+    )
+    padded_num_key_value_heads = pad_vocab_size(swa_num_key_value_heads, swa_pad_size)
+    padded_num_attention_heads = padded_num_key_value_heads * (
+        swa_num_attention_heads // swa_num_key_value_heads
+    )
+
+    update_config(text_config, "swa_num_key_value_heads", padded_num_key_value_heads)
+    update_config(text_config, "swa_num_attention_heads", padded_num_attention_heads)
+
+
 def update_intermediate_size(model_config, attr_name, intermediate_padding_size):
     attr_value = intermediate_padding_size
     if (
@@ -223,37 +249,24 @@ def adjust_config_with_unaligned_cpu_tp(
                 + model_config.hf_config.qk_rope_head_dim,
             )
 
-        swa_num_key_value_heads = getattr(
-            model_config.hf_text_config,
-            "swa_num_key_value_heads",
-            model_config.get_total_num_kv_heads(),
-        )
-        swa_num_attention_heads = getattr(
-            model_config.hf_text_config,
-            "swa_num_attention_heads",
-            model_config.num_attention_heads,
-        )
+        # gate is on full-attention counts; Gemma 4 has 2 full-attention KV
+        # heads, so only TP 1 and 2 clear it and both align the 8 sliding heads
+        adjust_swa_num_heads_if_necessary(model_config, tp_size, weight_block_size)
+
         query_heads_per_kv = (
             model_config.num_attention_heads // model_config.get_total_num_kv_heads()
         )
-        swa_query_heads_per_kv = swa_num_attention_heads // swa_num_key_value_heads
         total_kv_heads = model_config.get_total_num_kv_heads()
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
         head_dim = resolve_head_dim(
             model_config, model_config.num_attention_heads, True
         )
-        swa_head_dim = getattr(model_config.hf_text_config, "swa_head_dim", head_dim)
 
         pad_size = get_num_heads_padding_size(tp_size, weight_block_size, head_dim)
-        swa_pad_size = get_num_heads_padding_size(
-            tp_size, weight_block_size, swa_head_dim
-        )
         num_key_value_heads = pad_vocab_size(total_kv_heads, pad_size)
-        swa_num_key_value_heads = pad_vocab_size(swa_num_key_value_heads, swa_pad_size)
 
         num_attention_heads = num_key_value_heads * query_heads_per_kv
-        swa_num_attention_heads = swa_num_key_value_heads * swa_query_heads_per_kv
         for config in [
             model_config,
             model_config.hf_config,
@@ -261,16 +274,6 @@ def adjust_config_with_unaligned_cpu_tp(
         ]:
             update_config(config, "num_key_value_heads", num_key_value_heads)
             update_config(config, "num_attention_heads", num_attention_heads)
-            update_config(
-                model_config.hf_text_config,
-                "swa_num_key_value_heads",
-                swa_num_key_value_heads,
-            )
-            update_config(
-                model_config.hf_text_config,
-                "swa_num_attention_heads",
-                swa_num_attention_heads,
-            )
 
     adjust_tp_num_heads_if_necessary(model_config.hf_config, tp_size, True)
     if hasattr(model_config.hf_config, "text_config"):
