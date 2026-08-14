@@ -107,13 +107,19 @@ def patch_function(
 
 def _apply_specs(specs: list[PatchSpec]) -> list[PatchState]:
     states: list[PatchState] = []
-    for spec in specs:
-        target_fn: Callable[..., Any] = _resolve_target(spec.target)
-        print(f"[source_patcher] patching {spec.target}")
-        state: PatchState = patch_function(
-            target=target_fn, edits=spec.edits, preamble=spec.preamble
-        )
-        states.append(state)
+    try:
+        for spec in specs:
+            target_fn: Callable[..., Any] = _resolve_target(spec.target)
+            print(f"[source_patcher] patching {spec.target}")
+            state: PatchState = patch_function(
+                target=target_fn, edits=spec.edits, preamble=spec.preamble
+            )
+            states.append(state)
+    except Exception:
+        for state in reversed(states):
+            state.restore()
+        raise
+
     return states
 
 

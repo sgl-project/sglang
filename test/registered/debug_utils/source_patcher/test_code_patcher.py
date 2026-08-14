@@ -256,6 +256,32 @@ class TestCodePatcher:
 
         assert obj.greet("world") == "hello world"
 
+    def test_rolls_back_when_later_patch_fails(self, sample_module: ModuleType) -> None:
+        cls = sample_module.SampleClass
+        obj = cls()
+
+        patches = [
+            PatchSpec(
+                target=f"{SAMPLE_MODULE_NAME}.SampleClass.greet",
+                edits=[
+                    EditSpec(
+                        match='greeting = f"hello {name}"',
+                        replacement='greeting = f"partial_patched {name}"',
+                    )
+                ],
+            ),
+            PatchSpec(
+                target=f"{SAMPLE_MODULE_NAME}.NonexistentClass.method",
+                edits=[],
+            ),
+        ]
+
+        with pytest.raises((ImportError, AttributeError)):
+            with CodePatcher(patches=patches):
+                pass
+
+        assert obj.greet("world") == "hello world"
+
 
 if __name__ == "__main__":
     import sys
