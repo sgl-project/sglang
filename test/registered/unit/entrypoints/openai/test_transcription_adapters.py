@@ -30,11 +30,13 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 # Per-second scaling rate every speech-LM adapter uses for max_new_tokens.
 _TOKENS_PER_SECOND = 15
 
-# (arch string, adapter class, expected floor max_new_tokens, expected default language)
+# (arch string, adapter class, expected floor max_new_tokens, expected response language)
+# Response language is always None: these adapters neither honor a request-side
+# hint nor detect+report a language, so they must not claim one.
 _SPEECH_LM_CASES = [
-    ("GlmAsrForConditionalGeneration", GlmAsrAdapter, 448, "auto"),
-    ("Qwen2AudioForConditionalGeneration", Qwen2AudioAdapter, 448, "auto"),
-    ("GraniteSpeechForConditionalGeneration", GraniteSpeechAdapter, 448, "auto"),
+    ("GlmAsrForConditionalGeneration", GlmAsrAdapter, 448, None),
+    ("Qwen2AudioForConditionalGeneration", Qwen2AudioAdapter, 448, None),
+    ("GraniteSpeechForConditionalGeneration", GraniteSpeechAdapter, 448, None),
 ]
 
 
@@ -114,24 +116,47 @@ class TestSpeechLMAdapterContract(CustomTestCase):
                 )
                 self.assertGreater(above["max_new_tokens"], floor)
 
-    def test_verbose_response_defaults_language_and_has_no_segments(self):
-        for _, cls, _, default_language in _SPEECH_LM_CASES:
+    def test_verbose_response_language_unset_and_has_no_segments(self):
+        for _, cls, _, expected_language in _SPEECH_LM_CASES:
             with self.subTest(adapter=cls.__name__):
                 resp = cls().build_verbose_response(
                     self._request(duration=3.456), "hello", {}, None, None
                 )
-                self.assertEqual(resp.language, default_language)
+                self.assertEqual(resp.language, expected_language)
                 self.assertEqual(resp.duration, 3.46)
                 self.assertEqual(resp.text, "hello")
                 self.assertEqual(resp.segments, [])
 
-    def test_verbose_response_honors_request_language(self):
+    def test_verbose_response_does_not_claim_request_language(self):
+        # Even when the client sends a language hint, these adapters neither
+        # honor nor detect it, so the response must not claim it (guards against
+        # re-introducing a misleading echo).
         for _, cls, _, _ in _SPEECH_LM_CASES:
             with self.subTest(adapter=cls.__name__):
                 resp = cls().build_verbose_response(
                     self._request(language="fr"), "bonjour", {}, None, None
                 )
-                self.assertEqual(resp.language, "fr")
+                self.assertIsNone(resp.language)
+
+    def test_glm_postprocess_strips_assistant_prefix(self):
+        # GLM-ASR wraps the transcript in an assistant preamble + quotes;
+        # postprocess_text must strip it (mirrors HF strip_prefix=True) so it
+        # doesn't leak into the transcript and inflate WER.
+        adapter = GlmAsrAdapter()
+        self.assertEqual(
+            adapter.postprocess_text(
+                'The spoken content of the audio is "hello world".'
+            ),
+            "hello world",
+        )
+        self.assertEqual(
+            adapter.postprocess_text("The transcription of the audio is 'bonjour'."),
+            "bonjour",
+        )
+        # A raw transcript with no preamble must pass through unchanged.
+        self.assertEqual(
+            adapter.postprocess_text("just the transcript"), "just the transcript"
+        )
 
 
 if __name__ == "__main__":

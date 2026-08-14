@@ -53,8 +53,9 @@ class GraniteSpeechAdapter(TranscriptionAdapter):
         tokenizer,
         usage: TranscriptionUsage,
     ) -> TranscriptionVerboseResponse:
+        # ``language`` left unset. It is multilingual and infers the language from the audio.
         return TranscriptionVerboseResponse(
-            language=request.language or "auto",
+            language=None,
             duration=round(request.audio_duration_s, 2),
             text=text,
             segments=[],

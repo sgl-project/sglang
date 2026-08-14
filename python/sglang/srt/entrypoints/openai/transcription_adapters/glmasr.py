@@ -30,6 +30,15 @@ class GlmAsrAdapter(TranscriptionAdapter):
     disabled and the default (no-op) prompt/response handling applies.
     """
 
+    # Assistant framing GLM-ASR was trained to emit around the transcript.
+    # Mirrors HF ``GlmAsrProcessor.decode(strip_prefix=True)`` so the raw
+    # transcript is returned
+    _ASSISTANT_PREFIXES = (
+        "The spoken content of the audio is",
+        "The transcription of the audio is",
+        "The content of the input audio is",
+    )
+
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
         # ``/v1/audio/transcriptions`` has no request-side length field, so the
         # adapter is the only control. Short clips use the floor; longer clips
@@ -43,6 +52,28 @@ class GlmAsrAdapter(TranscriptionAdapter):
             ),
         }
 
+    def postprocess_text(self, text: str) -> str:
+        # Strip the assistant prefix and surrounding quotes GLM-ASR wraps the
+        # transcript in (mirrors HF's ``strip_prefix=True``).
+        stripped = text.strip()
+        for prefix in self._ASSISTANT_PREFIXES:
+            if stripped.startswith(prefix):
+                stripped = stripped[len(prefix) :].strip()
+                break
+        if stripped.endswith("."):
+            stripped = stripped[:-1].strip()
+        if (
+            len(stripped) >= 2
+            and stripped[0] == stripped[-1]
+            and stripped[0]
+            in {
+                "'",
+                '"',
+            }
+        ):
+            stripped = stripped[1:-1].strip()
+        return stripped
+
     def build_verbose_response(
         self,
         request: TranscriptionRequest,
@@ -52,7 +83,7 @@ class GlmAsrAdapter(TranscriptionAdapter):
         usage: TranscriptionUsage,
     ) -> TranscriptionVerboseResponse:
         return TranscriptionVerboseResponse(
-            language=request.language or "auto",
+            language=None,
             duration=round(request.audio_duration_s, 2),
             text=text,
             segments=[],

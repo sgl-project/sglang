@@ -51,8 +51,9 @@ class Qwen2AudioAdapter(TranscriptionAdapter):
         tokenizer,
         usage: TranscriptionUsage,
     ) -> TranscriptionVerboseResponse:
+        # ``language`` left unset. It auto-detects the spoken language internally.
         return TranscriptionVerboseResponse(
-            language=request.language or "auto",
+            language=None,
             duration=round(request.audio_duration_s, 2),
             text=text,
             segments=[],

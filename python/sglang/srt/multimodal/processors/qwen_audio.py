@@ -1,4 +1,7 @@
+import logging
 import re
+
+import numpy as np
 
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -10,6 +13,8 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
@@ -82,6 +87,23 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
             tokenize=False,
         )
 
+    def _warn_if_audio_exceeds_window(self, audios) -> None:
+        # Qwen2-Audio's encoder is a single fixed 30s window, so
+        # warn user if audio is truncated.
+        feature_extractor = self._processor.feature_extractor
+        max_samples = int(
+            feature_extractor.sampling_rate * feature_extractor.chunk_length
+        )
+        for audio in audios:
+            if isinstance(audio, np.ndarray) and audio.shape[-1] > max_samples:
+                logger.warning(
+                    "Qwen2-Audio input is %.1fs but the encoder window is %ds; "
+                    "only the first %ds will be transcribed (audio truncated).",
+                    audio.shape[-1] / feature_extractor.sampling_rate,
+                    feature_extractor.chunk_length,
+                    feature_extractor.chunk_length,
+                )
+
     def get_mm_data(self, prompt, embeddings, **kwargs):
         audio_feature_lens = kwargs.get("audio_feature_lens", None)
 
@@ -142,6 +164,8 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
         )
         if base_output is None:
             return None
+
+        self._warn_if_audio_exceeds_window(base_output.audios)
 
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
