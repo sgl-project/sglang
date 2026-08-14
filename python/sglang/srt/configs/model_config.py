@@ -1520,10 +1520,20 @@ class ModelConfig:
             # of an NVFP4/mixed checkpoint) must not be overridden back to the
             # source format
             if self.quantization not in REQUANTIZATION_METHODS:
-
                 # Detect which checkpoint is it
                 if not preserve_online_draft_quantization:
-                    for _, method in QUANTIZATION_METHODS.items():
+                    quantization_methods = list(QUANTIZATION_METHODS.items())
+                    # ModelOpt metadata is normalized to modelopt_fp4/modelopt_fp8
+                    # above, and those format handlers otherwise claim the
+                    # checkpoint before Humming gets a chance to consume it. An
+                    # explicit Humming request must take precedence over automatic
+                    # checkpoint-format detection.
+                    if self.quantization == "humming":
+                        quantization_methods.sort(
+                            key=lambda item: item[0] != "humming"
+                        )
+
+                    for _, method in quantization_methods:
                         quantization_override = method.override_quantization_method(
                             quant_cfg, self.quantization
                         )

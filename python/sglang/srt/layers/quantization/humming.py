@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
 import math
+import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, List
 
@@ -220,6 +221,12 @@ class HummingConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "HummingConfig":
+        # ModelConfig normalizes ModelOpt metadata to names such as
+        # ``modelopt_fp4`` for backend selection. Humming's schema library
+        # consumes the original ModelOpt format name plus ``quant_algo``.
+        if config.get("quant_method", "").startswith("modelopt_"):
+            config = config.copy()
+            config["quant_method"] = "modelopt"
         return cls(full_config=config)
 
     def get_scaled_act_names(self) -> List[str]:
@@ -338,6 +345,24 @@ class HummingConfig(QuantizationConfig):
             if force_weight_schema is not None and force_input_schema is None:
                 force_input_schema = HummingInputSchema()
 
+            is_modelopt_nvfp4 = (
+                getattr(weight_schema, "quant_method", None) == "modelopt"
+                and str(getattr(weight_schema, "quant_algo", "")).lower() == "nvfp4"
+            )
+            if (
+                force_input_schema is None
+                and is_modelopt_nvfp4
+                and torch.cuda.is_available()
+                and torch.cuda.get_device_capability()[0] < 12
+            ):
+                # ModelOpt NVFP4 uses K-groups of 16. On pre-SM120 devices,
+                # Humming lowers FP8 x FP4 through a kernel whose K quantum is
+                # 32, so its default FP8 activation fallback cannot consume
+                # those scales. Keep activations in the model dtype instead;
+                # this uses a K quantum of 16 and preserves checkpoint weights
+                # exactly. An explicit input-quant config still takes priority.
+                input_schema = HummingInputSchema()
+
             return HummingLayerQuantizationConfig(
                 weight_schema=weight_schema,
                 input_schema=input_schema,
@@ -423,6 +448,11 @@ class HummingLinearMethod(LinearMethodBase):
         self.is_online_quant = self.quant_config.is_online_quant
 
     def prepare_weight_loader(self, layer: torch.nn.Module, weight_loader: Callable):
+        # DeepSeek/GLM weights are loaded concurrently.  Multiple shards of an
+        # unexpectedly unquantized merged linear can therefore enter the
+        # fallback conversion at the same time.
+        fallback_lock = threading.Lock()
+
         def new_weight_loader(
             param: torch.nn.Parameter,
             loaded_weight: torch.Tensor,
@@ -459,32 +489,36 @@ class HummingLinearMethod(LinearMethodBase):
                 # fallback to unquantized linear
                 # some model skip some layer when quantizing model, but
                 # don't mark the layer as unquantized.
-                if not layer.is_fallback:
-                    layer.is_fallback = True
-                    for name, _ in list(layer.named_parameters()):
-                        if name != "bias":
-                            delattr(layer, name)
-                    delattr(layer, "locks")
-                    self.__class__ = UnquantizedLinearMethod  # type: ignore
-                    tensor = torch.empty(
-                        (
-                            layer.output_partition_sizes_sum,
-                            layer.input_size_per_partition,
-                        ),
-                        dtype=layer.param_dtype,
-                        device=param.device,
-                    )
-                    extra_weight_attrs = layer.extra_weight_attrs.copy()
-                    orig_weight_loader = extra_weight_attrs.pop("weight_loader")
-                    layer.weight = ModelWeightParameter(
-                        data=tensor,
-                        input_dim=1,
-                        output_dim=0,
-                        weight_loader=orig_weight_loader,
-                    )
-                    layer.weight.tp_size = layer.tp_size
-                    layer.weight.tp_rank = layer.tp_rank
-                    set_weight_attrs(layer.weight, extra_weight_attrs)
+                with fallback_lock:
+                    if not layer.is_fallback:
+                        for name, _ in list(layer.named_parameters()):
+                            if name != "bias":
+                                delattr(layer, name)
+                        delattr(layer, "locks")
+                        tensor = torch.empty(
+                            (
+                                layer.output_partition_sizes_sum,
+                                layer.input_size_per_partition,
+                            ),
+                            dtype=layer.param_dtype,
+                            device=param.device,
+                        )
+                        extra_weight_attrs = layer.extra_weight_attrs.copy()
+                        orig_weight_loader = extra_weight_attrs.pop("weight_loader")
+                        layer.weight = ModelWeightParameter(
+                            data=tensor,
+                            input_dim=1,
+                            output_dim=0,
+                            weight_loader=orig_weight_loader,
+                        )
+                        # ReplicatedLinear intentionally has no TP metadata.
+                        layer.weight.tp_size = getattr(layer, "tp_size", 1)
+                        layer.weight.tp_rank = getattr(layer, "tp_rank", 0)
+                        set_weight_attrs(layer.weight, extra_weight_attrs)
+                        self.__class__ = UnquantizedLinearMethod  # type: ignore
+                        # Publish the fallback state only after ``layer.weight``
+                        # is ready for other loader threads.
+                        layer.is_fallback = True
 
                 param = layer.weight
                 if shard_id is not None:
@@ -756,6 +790,11 @@ class HummingMoEMethod(FusedMoEMethodBase):
                     num_experts=num_experts,
                     param_dtype=params_dtype,
                     has_bias=with_bias,
+                    # w13 stacks the gate (w1) and up (w3) projections.  Some
+                    # checkpoint schemas, including ModelOpt NVFP4, keep one
+                    # tensor-wise scale for each projection and therefore need
+                    # two loader slots.
+                    stack_size=2,
                 ),
             },
             "w2": {
@@ -767,6 +806,7 @@ class HummingMoEMethod(FusedMoEMethodBase):
                     num_experts=num_experts,
                     param_dtype=params_dtype,
                     has_bias=with_bias,
+                    stack_size=1,
                 ),
             },
         }

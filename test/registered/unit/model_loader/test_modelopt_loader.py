@@ -5,7 +5,10 @@ This test module verifies the functionality of ModelOptModelLoader, which
 applies NVIDIA Model Optimizer quantization to models during loading.
 """
 
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +22,11 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.layers.quantization.humming import (
+    HummingConfig,
+    HummingLinearMethod,
+    HummingMoEMethod,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
@@ -476,7 +484,7 @@ class TestParseQuantHfConfig(CustomTestCase):
     ]
 
     def setUp(self):
-        """Set up a real ModelConfig using TinyLlama (already used elsewhere)."""
+        """Set up the fields exercised here without a remote model lookup."""
         self.mock_tp_rank = patch(
             "sglang.srt.distributed.parallel_state.get_tensor_model_parallel_rank",
             return_value=0,
@@ -489,9 +497,16 @@ class TestParseQuantHfConfig(CustomTestCase):
         )
         self.mock_mp_is_initialized.start()
 
-        self.model_config = ModelConfig(
-            model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        self.model_config = ModelConfig.__new__(ModelConfig)
+        self.model_config.model_path = "/nonexistent"
+        self.model_config.revision = None
+        self.model_config.hf_config = SimpleNamespace(
+            quantization_config=None,
+            compression_config=None,
         )
+        self.model_config.quantization = None
+        self.model_config.is_draft_model = False
+        self.model_config.is_draft_quantization_explicit = False
 
     def tearDown(self):
         self.mock_tp_rank.stop()
@@ -610,6 +625,186 @@ class TestParseQuantHfConfig(CustomTestCase):
         result = self.model_config._parse_quant_hf_config()
         self.assertEqual(result["quant_method"], "gptq")
         self.assertNotIn("quant_algo", result)
+
+    def test_explicit_humming_overrides_normalized_modelopt_fp4(self):
+        """A ModelOpt NVFP4 checkpoint must honor ``--quantization humming``."""
+        self.model_config.quantization = "humming"
+        self.model_config.hf_config.quantization_config = {
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "weights": {
+                        "dynamic": False,
+                        "num_bits": 4,
+                        "type": "float",
+                        "group_size": 16,
+                    },
+                    "input_activations": {
+                        "dynamic": False,
+                        "num_bits": 4,
+                        "type": "float",
+                        "group_size": 16,
+                    },
+                }
+            },
+        }
+
+        self.model_config._verify_quantization()
+
+        self.assertEqual(self.model_config.quantization, "humming")
+        # _parse_quant_hf_config normalizes the checkpoint metadata in place;
+        # Humming must translate that alias back to its ModelOpt schema name.
+        humming_config = HummingConfig.from_config(
+            self.model_config.hf_config.quantization_config
+        )
+        self.assertEqual(humming_config.full_config["quant_method"], "modelopt")
+
+    def test_humming_modelopt_nvfp4_moe_allocates_both_w13_scales(self):
+        """GLM-style gated MoE needs separate ModelOpt scales for w1 and w3."""
+        humming_config = HummingConfig.from_config(
+            {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4",
+                "config_groups": {
+                    "group_0": {
+                        "targets": ["Linear"],
+                        "weights": {
+                            "dynamic": False,
+                            "num_bits": 4,
+                            "type": "float",
+                            "group_size": 16,
+                        },
+                        "input_activations": {
+                            "dynamic": False,
+                            "num_bits": 4,
+                            "type": "float",
+                            "group_size": 16,
+                        },
+                    }
+                },
+            }
+        )
+        with (
+            patch(
+                "sglang.srt.layers.quantization.humming.torch.cuda.is_available",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.humming.torch.cuda.get_device_capability",
+                return_value=(9, 0),
+            ),
+            patch(
+                "sglang.srt.layers.quantization.humming.envs."
+                "SGLANG_HUMMING_INPUT_QUANT_CONFIG.get",
+                return_value=None,
+            ),
+        ):
+            layer_config = humming_config.get_quant_config_for_layer(
+                prefix="model.layers.3.mlp.experts", layer_type="moe"
+            )
+        self.assertIsNotNone(layer_config)
+        # FP8 activations require K-groups >= 32 in Humming's SM90 kernels,
+        # while NVIDIA NVFP4 checkpoints use 16. Keep H20 activations in BF16.
+        self.assertEqual(layer_config.input_schema.get_activation_bits(), 16)
+
+        layer = nn.Module()
+        HummingMoEMethod(layer_config).create_weights(
+            layer=layer,
+            num_experts=3,
+            hidden_size=32,
+            intermediate_size_per_partition=16,
+            params_dtype=torch.bfloat16,
+        )
+
+        # w13 contains the gate/up pair; w2 is a single down projection.
+        self.assertEqual(tuple(layer.w13_weight_scale_2.shape), (3, 2))
+        self.assertEqual(tuple(layer.w2_weight_scale_2.shape), (3,))
+
+    def test_humming_unquantized_merged_linear_fallback_is_thread_safe(self):
+        """Concurrent GLM shard loads must publish a complete fallback layer."""
+        layer_config = HummingConfig.from_config(
+            {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4",
+                "config_groups": {
+                    "group_0": {
+                        "targets": ["Linear"],
+                        "weights": {
+                            "dynamic": False,
+                            "num_bits": 4,
+                            "type": "float",
+                            "group_size": 16,
+                        },
+                        "input_activations": {
+                            "dynamic": False,
+                            "num_bits": 4,
+                            "type": "float",
+                            "group_size": 16,
+                        },
+                    }
+                },
+            }
+        ).get_quant_config_for_layer("model.layers.0.self_attn.qkv", "linear")
+        self.assertIsNotNone(layer_config)
+
+        loaded_shards = []
+
+        def original_loader(param, loaded_weight, shard_id):
+            loaded_shards.append(shard_id)
+
+        method = HummingLinearMethod(layer_config)
+        layer = nn.Module()
+        method.create_weights(
+            layer=layer,
+            input_size_per_partition=32,
+            output_partition_sizes=[16, 16],
+            input_size=32,
+            output_size=32,
+            params_dtype=torch.bfloat16,
+            weight_loader=original_loader,
+        )
+        quantized_param = layer.weight
+        loader = quantized_param.weight_loader
+        entered_allocation = Event()
+        release_allocation = Event()
+        second_started = Event()
+        real_empty = torch.empty
+
+        def blocking_empty(*args, **kwargs):
+            entered_allocation.set()
+            self.assertTrue(release_allocation.wait(timeout=5))
+            return real_empty(*args, **kwargs)
+
+        loaded_weight = torch.ones((16, 32), dtype=torch.bfloat16)
+
+        def load_second_shard():
+            second_started.set()
+            return loader(quantized_param, loaded_weight, 1)
+
+        with patch(
+            "sglang.srt.layers.quantization.humming.torch.empty",
+            side_effect=blocking_empty,
+        ):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(loader, quantized_param, loaded_weight, 0)
+                self.assertTrue(entered_allocation.wait(timeout=5))
+                second = executor.submit(load_second_shard)
+                self.assertTrue(second_started.wait(timeout=5))
+                try:
+                    time.sleep(0.05)
+                    self.assertFalse(second.done())
+                finally:
+                    release_allocation.set()
+                first.result(timeout=5)
+                second.result(timeout=5)
+
+        self.assertTrue(layer.is_fallback)
+        self.assertTrue(hasattr(layer, "weight"))
+        self.assertEqual(layer.weight.tp_size, 1)
+        self.assertEqual(layer.weight.tp_rank, 0)
+        self.assertCountEqual(loaded_shards, [0, 1])
 
     def test_inherited_draft_modelopt_fp4_accepts_fp8_checkpoint(self):
         # ServerArgs has already copied the target's modelopt_fp4 request to the
