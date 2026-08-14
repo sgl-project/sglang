@@ -37,7 +37,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_write_pad,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
@@ -268,9 +268,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         kvc.server_args
                     ).host_to_device_ratio
                 if (
-                    get_memory().enable_hisparse
+                    kvc.server_args.enable_hisparse
                     or kvc.is_draft_worker
-                    or get_memory().enable_hierarchical_cache
+                    or kvc.server_args.enable_hierarchical_cache
                 ):
                     num_indexer_layers = num_layers
                 else:

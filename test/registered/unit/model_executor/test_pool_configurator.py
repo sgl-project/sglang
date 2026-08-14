@@ -123,6 +123,7 @@ def _make_model_runner(
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
     sa.enable_hisparse = False
+    sa.enable_hierarchical_cache = False
     sa.enable_dsa_cache_layer_split = False
     sa.kv_cache_dtype = "auto"
     mr.server_args = sa
@@ -221,6 +222,12 @@ class TestDefaultConfigurator(unittest.TestCase):
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
 
+    # dsa_layer_skips_topk re-checks the DSA precondition against the real
+    # helper, so patch it at the source too, not just in the caller's namespace.
+    @patch(
+        "sglang.srt.configs.model_config.is_deepseek_dsa",
+        return_value=True,
+    )
     @patch(
         "sglang.srt.model_executor.pool_configurator.get_dsa_index_head_dim",
         return_value=128,
@@ -234,7 +241,11 @@ class TestDefaultConfigurator(unittest.TestCase):
         side_effect=(576, 656),
     )
     def test_dsa_mla_cell_size_uses_backend_kv_layout(
-        self, mock_calculate_mla_kv_cache_dim, _mock_is_dsa, _mock_index_head_dim
+        self,
+        mock_calculate_mla_kv_cache_dim,
+        _mock_is_dsa,
+        _mock_index_head_dim,
+        _mock_is_dsa_src,
     ):
         num_layers = 2
         raw = _make_model_runner(
