@@ -510,7 +510,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             per_rank_kv_heads = getattr(kv_pool_for_heads, "head_num", 0)
             if per_rank_kv_heads > 0:
                 kv_args.kv_head_num = per_rank_kv_heads
-                kv_args.total_kv_head_num = per_rank_kv_heads * attn_tp_size
+                kv_args.total_kv_head_num = (
+                    self.scheduler.model_config.get_total_num_kv_heads()
+                )
             if hasattr(kv_manager, "set_kv_buffer_tensors"):
                 kv_pool = kv_pool_for_heads
                 if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
