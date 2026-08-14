@@ -140,6 +140,9 @@ class SiluAndMul(BaseFusedOp):
         return F.silu(x[..., :d]) * x[..., d:]
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if torch.version.hip is not None:
+            return self.forward_native(x)
+
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
