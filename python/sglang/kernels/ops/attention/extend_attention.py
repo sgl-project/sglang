@@ -65,12 +65,24 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
 
     # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware
     if _is_hip:
-        if _is_gfx95 and 128 < Lq <= 256:
-            # gfx950 (CDNA4), 128 < head_dim <= 256: a larger query tile halves KV bytes
+        if _is_gfx95 and Lq <= 256:
+            # gfx950 (CDNA4), head_dim <= 256: a larger query tile halves KV bytes
             # streamed per call (each workgroup reads the whole prefix); 8 warps
-            # hide the loads. Measured on MI350X head_dim 256: -36% kernel time,
-            # 28% -> 44% MFU, numerically equivalent (BLOCK_N reduction order
-            # unchanged). Other AMD archs / head dims keep the default below.
+            # hide the loads, and BLOCK_M / num_warps = 16 rows per warp is exactly
+            # one matrix_instr_nonkdim=16 MFMA tile, so neither smaller nor larger
+            # BLOCK_M pays off. Measured on MI350X head_dim 256: -36% kernel time,
+            # 28% -> 44% MFU. Measured on MI350X head_dim 64 (gpt-oss-120b at TP4,
+            # 16 q / 2 kv heads, 8x8192-token prefill): -47% kernel time on
+            # full-attention layers (5.39 -> 2.88 ms) and -51% on sliding-window
+            # layers (5.49 -> 2.68 ms); head_dim 128 -32% (7.64 -> 5.22 ms).
+            # In situ on a served gpt-oss-120b at TP4, ISL 8192: _fwd_kernel
+            # 1309 -> 742 us/call, 36% -> 24% of prefill GPU time, prefill GPU
+            # total -14%, TTFT -14% at 8-way and -16% at 16-way concurrency.
+            # Bit-identical output at every head dim (BLOCK_N reduction order
+            # unchanged -- only the query tiling and warp count move). Costs a few
+            # microseconds on prefills too short to fill the grid (single request
+            # under ~2k tokens), which is noise next to the long-prompt win.
+            # Other AMD archs / larger head dims keep the default below.
             BLOCK_M, BLOCK_N = (128, 64)
             num_warps = 8
         else:
@@ -591,7 +603,28 @@ def _fwd_kernel(
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
     extend_end = 0 if SKIP_EXTEND else cur_block_m_end
-    for start_n in range(0, extend_end, BLOCK_N):
+    # Sliding window: start the loop at the first tile that can hold an unmasked
+    # element instead of walking (and masking away) every earlier tile.
+    #
+    # The window mask below keeps (q, kv) iff q <= kv + SLIDING_WINDOW_SIZE, with
+    # q = cur_block_m * BLOCK_M + i and kv = start_n + j. Row i = 0 always exists
+    # (the early return above guarantees cur_block_m * BLOCK_M <
+    # cur_seq_len_extend), and the largest kv in a tile is start_n + BLOCK_N - 1,
+    # so a tile can hold an unmasked element only if
+    #     cur_block_m * BLOCK_M <= start_n + BLOCK_N - 1 + SLIDING_WINDOW_SIZE.
+    # Writing A = cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, that is
+    # start_n >= A - BLOCK_N + 1, whose smallest BLOCK_N-aligned solution is
+    # exactly (A // BLOCK_N) * BLOCK_N. Every tile below that floor is entirely
+    # masked out, where SKIP_TILE already suppresses both the MMA and the
+    # online-softmax rescale, so skipping the iteration outright is
+    # bit-identical and drops the per-tile cross-wave tl.max reduction that
+    # currently dominates sliding-window layers.
+    extend_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        extend_start = (
+            tl.maximum(cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0) // BLOCK_N
+        ) * BLOCK_N
+    for start_n in range(extend_start, extend_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_block_m_end
 
