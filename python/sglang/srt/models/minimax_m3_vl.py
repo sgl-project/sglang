@@ -54,6 +54,15 @@ _device_sm = get_device_sm()
 
 
 class MiniMaxM3SparseForConditionalGeneration(nn.Module):
+    # MINIMAX_M3_PACKED_MODULES_FIX: route the MXFP4 checkpoint's separate q/k/v + gate/up
+    # shards into the model's fused qkv_proj / index_qkv_proj / gate_up_proj
+    # params. Without this the loader hands a merged tensor to a half-width
+    # param and crashes with a param/loaded shape-mismatch AssertionError.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "index_qkv_proj": ["index_q_proj", "index_k_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
     def __init__(
         self,
         config,
