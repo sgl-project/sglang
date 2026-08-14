@@ -556,6 +556,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Preallocated piecewise-graph attention output, set by RadixAttention.
     _attn_output: Optional[torch.Tensor] = None
 
+    # Shared by LongCat MLAProlog layers for one forward pass. The tuple is
+    # (cos, sin, int64 cache indices); layer 0 refreshes it and later layers
+    # consume the exact same position-aligned tensors.
+    npu_mlaprolog_runtime_cache: Optional[
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = None
+    npu_dsa_interleave_half_rope_cache: Optional[
+        Tuple[torch.Tensor, torch.Tensor]
+    ] = None
+
     # For logits and logprobs post processing
     next_token_logits_buffer: torch.Tensor = None
     temperature: torch.Tensor = None
