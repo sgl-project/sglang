@@ -17,7 +17,7 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_run:
-    workflows: ["PR Test Base", "PR Test Extra"]
+    workflows: ["PR Test Base", "PR Test Extra", "PR Test ROCm 7.2 (AMD)"]
     types: [requested, completed]
   workflow_dispatch:
     inputs:
@@ -143,6 +143,16 @@ jobs:
             const ptRun = await findRun('pr-test.yml', hasCI ? labelOnOpts : labelOffOpts);
             // pr-test-extra gates on BOTH labels (see check-changes there).
             const peRun = await findRun('pr-test-extra.yml', (hasCI && hasExtra) ? labelOnOpts : labelOffOpts);
+            // The AMD PR gate. Unlike pr-test it carries an on.pull_request.paths
+            // filter, so "no run for this SHA" is a legitimate outcome meaning the
+            // PR touched nothing ROCm-relevant. Finding ptRun proves the Actions
+            // index is already warm for this SHA (pr-test has no paths filter, so
+            // every pushed SHA has one), which lets us tell that apart from an
+            // indexing race without spending the retry budget on the common case.
+            const amdRun = await findRun(
+              'pr-test-amd-rocm720.yml',
+              (hasCI && !ptRun) ? labelOnOpts : labelOffOpts,
+            );
 
             // Skipped run = "no real run" -- happens when a label is added
             // after a commit, because GHA doesn't retrigger on `labeled`.
@@ -152,6 +162,7 @@ jobs:
             const peBlockedByCIText = ':x: **Blocked** -- `run-ci` is required first.';
             const notExtraEnabledText = ':warning: **Not enabled** -- add `run-ci-extra` label to opt in.';
             const stalePushText = ':warning: **Not run on latest push** -- push again to dispatch.';
+            const amdNotTriggeredText = ':heavy_minus_sign: **Not triggered** -- no ROCm-relevant paths changed.';
 
             // Status icon: body otherwise looks uniformly "dispatched" even
             // for gate-failed runs (call-gate exits on missing label).
@@ -178,6 +189,12 @@ jobs:
                 : !hasExtra
                   ? notExtraEnabledText
                   : stalePushText;
+            // No stale-push branch here: pr-test-amd-rocm720 gates on `run-ci`
+            // alone, so with the label present a missing run means the paths
+            // filter excluded the PR, not that a dispatch was missed.
+            const amdText = isReal(amdRun)
+              ? runLink(amdRun)
+              : (!hasCI ? missingCIText : amdNotTriggeredText);
 
             const outerStart = '<!-- pr-states:start -->';
             const outerEnd   = '<!-- pr-states:end -->';
@@ -185,6 +202,8 @@ jobs:
             const ptEnd      = '<!-- slot:pr-test:end -->';
             const peStart    = '<!-- slot:pr-test-extra:start -->';
             const peEnd      = '<!-- slot:pr-test-extra:end -->';
+            const amdStart   = '<!-- slot:pr-test-amd-rocm720:start -->';
+            const amdEnd     = '<!-- slot:pr-test-amd-rocm720:end -->';
 
             const newBlock = [
               outerStart,
@@ -193,6 +212,7 @@ jobs:
               '',
               `Latest PR Test (Base): ${ptStart}${ptText}${ptEnd}`,
               `Latest PR Test (Extra): ${peStart}${peText}${peEnd}`,
+              `Latest PR Test (AMD ROCm 7.2): ${amdStart}${amdText}${amdEnd}`,
               outerEnd,
             ].join('\n');
 

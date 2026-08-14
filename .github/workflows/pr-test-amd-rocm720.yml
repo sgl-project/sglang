@@ -1460,3 +1460,33 @@ jobs:
           # If the loop completes, all jobs were successful
           echo "All jobs completed successfully"
           exit 0
+
+  # =============================================== notify pr-states ====================================================
+  # Same as pr-test.yml / pr-test-extra.yml: dispatch pr-states.yml after every
+  # attempt so the AMD row in the PR body refreshes on reruns too.
+  # workflow_run.completed only fires on the initial completion (one
+  # workflow_run record across attempts), and rerunning is how a PR recovers an
+  # AMD run that pr-gate blocked, so without this the row would go stale exactly
+  # when it starts carrying real results.
+  #
+  # Fork PRs are excluded: their pull_request GITHUB_TOKEN is forced read-only
+  # regardless of declared `actions: write`, so dispatch 403s. Fork PRs get
+  # updates via pr-states' workflow_run subscription (initial completion) and
+  # pull_request_target (push / label).
+  notify-pr-states:
+    needs: [pr-test-amd-rocm720-finish]
+    if: |
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch pr-states refresh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh workflow run pr-states.yml \
+            --repo ${{ github.repository }} \
+            --ref main \
+            -f pr_number="$PR_NUMBER"
