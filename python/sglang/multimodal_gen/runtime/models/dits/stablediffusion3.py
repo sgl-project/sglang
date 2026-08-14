@@ -40,8 +40,7 @@ class SD3Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         quant_config=None,
     ):
         super().__init__(config=config, hf_config=hf_config)
-        self.config = config
-        arch_config = config.arch_config
+        arch_config = self.config
         sample_size = arch_config.sample_size
         patch_size = arch_config.patch_size
         in_channels = arch_config.in_channels
