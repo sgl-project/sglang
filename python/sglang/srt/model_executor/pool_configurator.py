@@ -459,6 +459,36 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 + self._draft_cell_size
             )
 
+        # DFLASH/DSPARK: scale cell_size to account for draft model KV cache,
+        # mirroring DefaultPoolConfigurator.  The draft worker allocates its
+        # own KV pool sized by the target's max_total_num_tokens, so the
+        # target profile must reserve head-room for it or the draft pool will
+        # overrun the budget.
+        #
+        # _pre_dflash_cell_size and _dflash_draft_num_layers are stored for
+        # SWAChunkCapPoolConfigurator, which sizes the full pool independently
+        # (it does not use _cell_size) and must add the draft cost explicitly.
+        self._pre_dflash_cell_size = self._cell_size
+        self._dflash_draft_num_layers = 0
+        if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+            from sglang.srt.speculative.dflash_utils import (
+                scale_kv_cell_size_per_token_for_dflash,
+            )
+
+            draft_num_layers = kvc.spec_aux_config.dflash_draft_num_layers
+            total_layers = self._full_layers_num + self._swa_layers_num
+            if (
+                draft_num_layers is not None
+                and int(draft_num_layers) > 0
+                and int(total_layers) > 0
+            ):
+                self._dflash_draft_num_layers = int(draft_num_layers)
+                self._cell_size = scale_kv_cell_size_per_token_for_dflash(
+                    target_cell_size_per_token=self._cell_size,
+                    target_num_layers=int(total_layers),
+                    draft_num_layers=int(draft_num_layers),
+                )
+
     def _solve_pool_sizes(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
@@ -593,6 +623,14 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
             + self._swa_per_token * self._draft_swa_full_layers_num
         )
+        # DFLASH/DSPARK: add draft KV cost to full_cell_size using the exact
+        # per-token delta computed by scale_kv_cell_size_per_token_for_dflash
+        # in the parent __init__ (_cell_size - _pre_dflash_cell_size).  This
+        # mirrors the parent's ceiling-division rounding and avoids float
+        # drift from swa_full_tokens_ratio.
+        if self._dflash_draft_num_layers > 0:
+            draft_kv_per_token = int(self._cell_size - self._pre_dflash_cell_size)
+            full_cell_size += draft_kv_per_token
         full_tokens = (
             int((available_bytes - fixed_swa_bytes) // full_cell_size) // page_size
         ) * page_size

@@ -589,6 +589,232 @@ class TestEagleConfigurator(unittest.TestCase):
         self.assertLessEqual(used, available)
 
 
+class TestDFlashHybridSWAConfigurator(unittest.TestCase):
+    """DFLASH + hybrid SWA: draft KV must be budgeted so total fits in available memory."""
+
+    def _make_dflash_hybrid_runner(
+        self,
+        *,
+        full_layers=16,
+        swa_layers=16,
+        ratio=0.5,
+        page_size=1,
+        dflash_draft_num_layers=4,
+    ):
+        mr = _make_model_runner(
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(full_layers)),
+            swa_attention_layer_ids=list(range(full_layers, full_layers + swa_layers)),
+            swa_num_kv_heads=4,
+            page_size=page_size,
+            swa_full_tokens_ratio=ratio,
+        )
+        mr.spec_algorithm.is_dflash.return_value = True
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.dflash_draft_num_layers = dflash_draft_num_layers
+        return mr
+
+    def _dflash_total_memory(self, mr, config):
+        """Compute total memory including draft KV pool."""
+        mc = mr.model_config
+        full_pt = _full_per_token(mr)
+        swa_pt = _swa_per_token(mr)
+        nf = len(mc.full_attention_layer_ids)
+        ns = len(mc.swa_attention_layer_ids)
+        ratio = mr.server_args.swa_full_tokens_ratio
+        draft_layers = mr.spec_aux_config.dflash_draft_num_layers
+        total_layers = nf + ns
+
+        full_tokens = config.full_max_total_num_tokens or 0
+        swa_tokens = config.swa_max_total_num_tokens or 0
+
+        # Target pools
+        target_bytes = full_tokens * full_pt * nf + swa_tokens * swa_pt * ns
+        # Draft pool: draft uses full_tokens slots, per-token cost approximated
+        # by target's blended per-layer cost (same as scale_kv_cell_size_per_token_for_dflash)
+        target_cell_size = full_pt * nf + ratio * swa_pt * ns
+        draft_per_layer = target_cell_size // total_layers if total_layers else 0
+        draft_bytes = full_tokens * draft_per_layer * draft_layers
+
+        return target_bytes + draft_bytes
+
+    def test_dflash_hybrid_does_not_exceed_budget(self):
+        """Total memory (target full + target SWA + draft KV) <= available."""
+        available = 10_000_000
+        mr = self._make_dflash_hybrid_runner(dflash_draft_num_layers=4)
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, 1)
+
+        used = self._dflash_total_memory(mr, config)
+        self.assertLessEqual(used, available)
+
+    def test_dflash_hybrid_fewer_tokens_than_no_dflash(self):
+        """DFlash scaling should reduce max_total_num_tokens vs no DFlash."""
+        available = 10_000_000
+
+        # With DFlash
+        mr_dflash = self._make_dflash_hybrid_runner(dflash_draft_num_layers=4)
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg_dflash = create_memory_pool_configurator(mr_dflash)
+            config_dflash = cfg_dflash.calculate_pool_sizes(available, 1)
+
+        # Without DFlash
+        mr_plain = _make_model_runner(
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(16)),
+            swa_attention_layer_ids=list(range(16, 32)),
+            swa_num_kv_heads=4,
+            swa_full_tokens_ratio=0.5,
+        )
+        with mock_cpu_env():
+            cfg_plain = create_memory_pool_configurator(mr_plain)
+            config_plain = cfg_plain.calculate_pool_sizes(available, 1)
+
+        self.assertLess(
+            config_dflash.max_total_num_tokens,
+            config_plain.max_total_num_tokens,
+            "DFlash should reduce token count to reserve headroom for draft KV",
+        )
+
+    def test_dflash_all_swa_does_not_exceed_budget(self):
+        """DFlash + all-SWA (full_layers=0): draft KV must still be budgeted."""
+        available = 10_000_000
+        mr = _make_model_runner(
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[],
+            swa_attention_layer_ids=list(range(32)),
+            swa_num_kv_heads=4,
+            swa_full_tokens_ratio=0.5,
+        )
+        mr.spec_algorithm.is_dflash.return_value = True
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.dflash_draft_num_layers = 4
+
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, 1)
+
+        swa_pt = _swa_per_token(mr)
+        ns = len(mr.model_config.swa_attention_layer_ids)
+        draft_layers = 4
+        total_layers = ns
+        # All-SWA: cell_size = swa_pt * ns; scaled = swa_pt * ns * (ns + draft) / ns
+        # used = swa_tokens * swa_pt * (ns + draft)
+        used = config.swa_max_total_num_tokens * swa_pt * (ns + draft_layers)
+        self.assertLessEqual(used, available)
+
+
+class TestDFlashSWAChunkCapConfigurator(unittest.TestCase):
+    """DFLASH + SWAChunkCap: draft KV must be budgeted in the full pool calc."""
+
+    def test_dflash_chunk_cap_does_not_exceed_budget(self):
+        available = 10_000_000
+        mr = _make_model_runner(
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(16)),
+            swa_attention_layer_ids=list(range(16, 32)),
+            swa_num_kv_heads=4,
+            swa_full_tokens_ratio=0.5,
+            disable_radix_cache=True,
+            chunked_prefill_size=4,
+            sliding_window_size=8,
+            page_size=1,
+            max_running_requests=2,
+        )
+        mr.spec_algorithm.is_dflash.return_value = True
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.dflash_draft_num_layers = 4
+
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, 1)
+
+        # Verify total memory (target full + target SWA + draft KV) <= available
+        mc = mr.model_config
+        full_pt = _full_per_token(mr)
+        swa_pt = _swa_per_token(mr)
+        nf = len(mc.full_attention_layer_ids)
+        ns = len(mc.swa_attention_layer_ids)
+        ratio = mr.server_args.swa_full_tokens_ratio
+        draft_layers = 4
+        total_layers = nf + ns
+
+        full_tokens = config.full_max_total_num_tokens or 0
+        swa_tokens = config.swa_max_total_num_tokens or 0
+
+        target_bytes = full_tokens * full_pt * nf + swa_tokens * swa_pt * ns
+        target_cell_size = full_pt * nf + ratio * swa_pt * ns
+        draft_per_layer = target_cell_size // total_layers
+        draft_bytes = full_tokens * draft_per_layer * draft_layers
+
+        used = target_bytes + draft_bytes
+        self.assertLessEqual(used, available)
+
+    def test_dflash_chunk_cap_fewer_tokens_than_no_dflash(self):
+        """DFlash should reduce full_tokens in chunk-cap mode too."""
+        available = 10_000_000
+
+        def _make():
+            return _make_model_runner(
+                is_hybrid_swa=True,
+                full_attention_layer_ids=list(range(16)),
+                swa_attention_layer_ids=list(range(16, 32)),
+                swa_num_kv_heads=4,
+                swa_full_tokens_ratio=0.5,
+                disable_radix_cache=True,
+                chunked_prefill_size=4,
+                sliding_window_size=8,
+                page_size=1,
+                max_running_requests=2,
+            )
+
+        # With DFlash
+        mr_dflash = _make()
+        mr_dflash.spec_algorithm.is_dflash.return_value = True
+        mr_dflash.spec_algorithm.is_dflash_family.return_value = True
+        mr_dflash.spec_algorithm.is_none.return_value = False
+        mr_dflash.spec_aux_config.dflash_draft_num_layers = 4
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg_dflash = create_memory_pool_configurator(mr_dflash)
+            config_dflash = cfg_dflash.calculate_pool_sizes(available, 1)
+
+        # Without DFlash
+        mr_plain = _make()
+        with mock_cpu_env():
+            cfg_plain = create_memory_pool_configurator(mr_plain)
+            config_plain = cfg_plain.calculate_pool_sizes(available, 1)
+
+        self.assertLess(
+            config_dflash.full_max_total_num_tokens,
+            config_plain.full_max_total_num_tokens,
+            "DFlash should reduce full_tokens in chunk-cap mode too",
+        )
+
+
 class TestFactory(unittest.TestCase):
     def test_default_for_non_swa(self):
         mr = _make_model_runner(is_hybrid_swa=False)
