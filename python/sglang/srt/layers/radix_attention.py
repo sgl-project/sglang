@@ -249,12 +249,30 @@ class RadixAttention(nn.Module):
                 mha_companion_layers is not None
                 and mha_companion_layers[self.layer_id] is self
             )
-            if is_in_breakable_cuda_graph():
-                op = (
-                    breakable_unified_attention_with_output_and_lse
-                    if return_lse
-                    else breakable_unified_attention_with_output
+            in_bcg = is_in_breakable_cuda_graph()
+            if in_bcg and return_lse:
+                # A BCG eager break may not return CUDA tensors, so LSE goes
+                # into a buffer allocated here. Allocated once, during capture:
+                # replay re-runs only the break, which writes into this same
+                # buffer -- the address the next captured segment reads from.
+                lse = q.new_empty(
+                    (output.shape[0], self.tp_q_head_num), dtype=torch.float32
                 )
+                breakable_unified_attention_with_output_into_lse(
+                    q,
+                    k,
+                    v,
+                    output,
+                    lse,
+                    save_kv_cache,
+                    self.layer_id,
+                    use_mha_companion=use_mha_companion,
+                    key_value_num_tokens=key_value_num_tokens,
+                    **kwargs,
+                )
+                return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
+            if in_bcg:
+                op = breakable_unified_attention_with_output
             else:
                 op = (
                     unified_attention_with_output_and_lse
@@ -297,6 +315,7 @@ def _unified_attention_with_output_impl(
     use_mha_companion: bool,
     return_lse: bool,
     *,
+    lse_out: Optional[torch.Tensor] = None,
     key_value_num_tokens: Optional[int] = None,
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
@@ -393,6 +412,15 @@ def _unified_attention_with_output_impl(
     # Use context.raw_num_tokens (pre-padding count from PCG runner) instead of
     # forward_batch.extend_num_tokens, which is None for TARGET_VERIFY batches.
     _zero_padded_pcg_tail(output, context)
+    if lse_out is not None:
+        # The caller owns a padded, capture-stable LSE buffer (BCG: an eager
+        # break may not return CUDA tensors, since a fresh allocation per replay
+        # would not match the address baked into the next captured segment).
+        # Writing into it also avoids the per-call padded allocation below.
+        assert lse is not None
+        lse_out[:real_query_num_tokens].copy_(lse)
+        lse_out[real_query_num_tokens:].zero_()
+        return None
     if lse is not None and lse.shape[0] != output.shape[0]:
         padded_lse = lse.new_zeros((output.shape[0], *lse.shape[1:]))
         padded_lse[:real_query_num_tokens].copy_(lse)
@@ -490,6 +518,52 @@ def unified_attention_with_output_and_lse(
     return lse
 
 
+@register_custom_op(mutates_args=["output", "lse_out"])
+@register_split_op()
+def unified_attention_with_output_into_lse(
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
+    output: torch.Tensor,
+    lse_out: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    *,
+    use_mha_companion: bool = False,
+    key_value_num_tokens: Optional[int] = None,
+    q_rope: Optional[torch.Tensor] = None,
+    k_rope: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    is_neox: Optional[bool] = None,
+    llama_4_scaling: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """``unified_attention_with_output_and_lse`` writing LSE into a caller-owned
+    buffer instead of returning it. Used under BCG, where ``@no_graph`` forbids
+    returning CUDA tensors from an eager break.
+    """
+    _unified_attention_with_output_impl(
+        query,
+        key,
+        value,
+        output,
+        save_kv_cache,
+        layer_id,
+        use_mha_companion,
+        True,
+        lse_out=lse_out,
+        key_value_num_tokens=key_value_num_tokens,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        sinks=sinks,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+        llama_4_scaling=llama_4_scaling,
+        topk_indices=topk_indices,
+    )
+
+
 @register_custom_op(mutates_args=["attn_out", "idx_out"])
 @register_split_op()
 def unified_sparse_attention_with_output(
@@ -550,8 +624,8 @@ def unified_sparse_attention_with_output(
 breakable_unified_attention_with_output = no_graph(
     unified_attention_with_output, enable=True
 )
-breakable_unified_attention_with_output_and_lse = no_graph(
-    unified_attention_with_output_and_lse, enable=True
+breakable_unified_attention_with_output_into_lse = no_graph(
+    unified_attention_with_output_into_lse, enable=True
 )
 
 
