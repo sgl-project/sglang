@@ -1,6 +1,7 @@
 """CPU coverage for Kimi-K2.5/K2.7 encoder-DP wiring."""
 
 import asyncio
+import functools
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -30,6 +31,7 @@ from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
 from sglang.srt.multimodal.cache import MultimodalPreprocessCache, snapshot_media
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
+    KimiK3DeferredPreprocessing,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
@@ -41,7 +43,6 @@ from sglang.srt.multimodal.processors.kimi_k3 import (
     _expand_k3_image_prompt_token_ids,
 )
 from sglang.srt.multimodal.processors.kimi_k3_artifact import (
-    KimiK3DeferredConfig,
     KimiK3ImageArtifact,
     KimiK3PreprocessConfig,
     KimiK3ResizeConfig,
@@ -782,18 +783,24 @@ def test_kimi_k3_cached_deferred_artifact_has_model_contract():
         },
         grid_thw=(1, 1, 1),
         feature=feature,
-        deferred=KimiK3DeferredConfig(
+        deferred=KimiK3DeferredPreprocessing(
             backend="gpu",
-            feature_layout="chw",
-            image_mean=(0.5, 0.5, 0.5),
-            image_std=(0.5, 0.5, 0.5),
+            image_mean=[0.5, 0.5, 0.5],
+            image_std=[0.5, 0.5, 0.5],
             transparent_bg_config=None,
+            resize_config={
+                "num_tokens": 1,
+                "new_width": 2,
+                "new_height": 2,
+                "pad_width": 0,
+                "pad_height": 0,
+            },
         ),
     )
 
-    config = artifact.deferred.as_dict(artifact.resize_config)
-    assert config["backend"] == "gpu"
-    assert config["feature_layout"] == "chw"
+    config = artifact.deferred
+    assert config.backend == "gpu"
+    assert config.resize_config["new_width"] == 2
 
 
 def test_kimi_k3_model_accepts_mixed_cached_eager_and_deferred_artifacts():
@@ -817,20 +824,21 @@ def test_kimi_k3_model_accepts_mixed_cached_eager_and_deferred_artifacts():
     model.mm_projector = _Projector()
     eager = _image_item(torch.ones((1, 3)), [[1, 1, 1]])
     deferred = _image_item(torch.zeros((3, 2, 2), dtype=torch.uint8), [[1, 1, 1]])
-    deferred.model_specific_data[DEFERRED_PREPROCESSING_KEY] = {
-        "backend": "gpu",
-        "feature_layout": "chw",
-        "image_mean": [0.5, 0.5, 0.5],
-        "image_std": [0.5, 0.5, 0.5],
-        "transparent_bg_config": None,
-        "resize_config": {
-            "num_tokens": 1,
-            "new_width": 2,
-            "new_height": 2,
-            "pad_width": 0,
-            "pad_height": 0,
-        },
-    }
+    deferred.model_specific_data[DEFERRED_PREPROCESSING_KEY] = (
+        KimiK3DeferredPreprocessing(
+            backend="gpu",
+            image_mean=[0.5, 0.5, 0.5],
+            image_std=[0.5, 0.5, 0.5],
+            transparent_bg_config=None,
+            resize_config={
+                "num_tokens": 1,
+                "new_width": 2,
+                "new_height": 2,
+                "pad_width": 0,
+                "pad_height": 0,
+            },
+        )
+    )
 
     with (
         patch("sglang.srt.models.kimi_k3.configured_tp_size", return_value=1),
@@ -1111,10 +1119,6 @@ def test_kimi_k3_cancelled_artifact_owner_does_not_fail_joiner():
 
 
 def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
-    from sglang.srt.multimodal.kimi_k3_image_processing import (
-        DEFERRED_PREPROCESSING_KEY,
-    )
-
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
     processor.mm_feature_transport = "cpu"
@@ -1140,11 +1144,13 @@ def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
                         "pad_height": 2,
                     },
                 ],
-                {
-                    "image_mean": [0.5, 0.5, 0.5],
-                    "image_std": [0.5, 0.5, 0.5],
-                    "transparent_bg_config": None,
-                },
+                functools.partial(
+                    KimiK3DeferredPreprocessing,
+                    backend="gpu",
+                    image_mean=[0.5, 0.5, 0.5],
+                    image_std=[0.5, 0.5, 0.5],
+                    transparent_bg_config=None,
+                ),
             )
         ),
     )
@@ -1174,10 +1180,13 @@ def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
     ]
     assert all(item.hash is not None for item in output.mm_items)
     assert all(item.pad_value is not None for item in output.mm_items)
-    assert all(
-        DEFERRED_PREPROCESSING_KEY in item.model_specific_data
-        for item in output.mm_items
-    )
+    deferred = [
+        item.model_specific_data[DEFERRED_PREPROCESSING_KEY] for item in output.mm_items
+    ]
+    # The staged features are CHW uint8, so the config has to route them to the
+    # GPU arm of `materialize_item_features`.
+    assert [config.backend for config in deferred] == ["gpu", "gpu"]
+    assert [config.resize_config["new_width"] for config in deferred] == [4, 2]
 
 
 @pytest.mark.parametrize(

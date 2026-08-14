@@ -8,6 +8,7 @@ images onto the checkpoint-configured background
 at load time.
 """
 
+import functools
 import math
 import re
 from typing import Dict, List, Optional, Union
@@ -25,6 +26,7 @@ from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.multimodal.cache import build_feature_hash
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
+    KimiK3DeferredPreprocessing,
 )
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     fill_transparent_bg as _fill_transparent_bg,
@@ -40,7 +42,6 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 from sglang.srt.multimodal.processors.kimi_k3_artifact import (
-    KimiK3DeferredConfig,
     KimiK3ImageArtifact,
     KimiK3PreprocessConfig,
     KimiK3ResizeConfig,
@@ -299,12 +300,16 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         input_ids = self._prepare_input_ids(
             input_text, resize_configs, original_input_ids, image_sizes
         )
-        deferred_config = {
-            "image_mean": list(self._image_mean),
-            "image_std": list(self._image_std),
-            "transparent_bg_config": self._transparent_bg_config,
-        }
-        return input_ids, resize_configs, deferred_config
+        # This path only ever defers GPU preprocessing: the caller gates on
+        # `_should_defer_gpu_preprocessing` and stages CHW uint8 features.
+        deferred_preprocessing = functools.partial(
+            KimiK3DeferredPreprocessing,
+            backend="gpu",
+            image_mean=list(self._image_mean),
+            image_std=list(self._image_std),
+            transparent_bg_config=self._transparent_bg_config,
+        )
+        return input_ids, resize_configs, deferred_preprocessing
 
     def prepare_image_features(self, images):
         """Prepare prompt-independent, per-image features in one processor call."""
@@ -444,7 +449,11 @@ class KimiK3ImageProcessor(
         return raw_bytes <= processed_bytes
 
     def _build_deferred_output(self, base_output):
-        input_ids, resize_configs, deferred_config = self._processor.prepare_deferred(
+        (
+            input_ids,
+            resize_configs,
+            deferred_preprocessing,
+        ) = self._processor.prepare_deferred(
             base_output.input_text,
             base_output.images,
             base_output.input_ids,
@@ -468,10 +477,9 @@ class KimiK3ImageProcessor(
                 offsets=[offset],
                 model_specific_data={
                     "image_grid_thw": torch.tensor([grid_thw], dtype=torch.int64),
-                    DEFERRED_PREPROCESSING_KEY: {
-                        **deferred_config,
-                        "resize_config": resize_config,
-                    },
+                    DEFERRED_PREPROCESSING_KEY: deferred_preprocessing(
+                        resize_config=resize_config
+                    ),
                 },
             )
             items.append(item)
@@ -492,7 +500,7 @@ class KimiK3ImageProcessor(
         resize_config: dict,
         grid_thw: tuple[int, int, int],
         feature: torch.Tensor,
-        deferred: Optional[KimiK3DeferredConfig] = None,
+        deferred: Optional[KimiK3DeferredPreprocessing] = None,
     ) -> KimiK3ImageArtifact:
         item = MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
         item.set_pad_value()
@@ -549,12 +557,12 @@ class KimiK3ImageProcessor(
                 resize_config=resize_config,
                 grid_thw=grid_thw,
                 feature=feature,
-                deferred=KimiK3DeferredConfig(
+                deferred=KimiK3DeferredPreprocessing(
                     backend="gpu",
-                    feature_layout="chw",
-                    image_mean=config.image_mean,
-                    image_std=config.image_std,
+                    image_mean=list(config.image_mean),
+                    image_std=list(config.image_std),
                     transparent_bg_config=config.transparent_bg_config,
+                    resize_config=resize_config,
                 ),
             )
 
@@ -606,9 +614,7 @@ class KimiK3ImageProcessor(
                 "image_grid_thw": torch.tensor([artifact.grid_thw], dtype=torch.int64)
             }
             if artifact.deferred is not None:
-                model_specific_data[DEFERRED_PREPROCESSING_KEY] = (
-                    artifact.deferred.as_dict(artifact.resize_config)
-                )
+                model_specific_data[DEFERRED_PREPROCESSING_KEY] = artifact.deferred
             item = MultimodalDataItem(
                 modality=Modality.IMAGE,
                 feature=artifact.feature,

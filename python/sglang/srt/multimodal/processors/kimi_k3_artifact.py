@@ -9,6 +9,10 @@ from typing import Any, Optional, Protocol
 
 import torch
 
+from sglang.srt.multimodal.kimi_k3_image_processing import (
+    KimiK3DeferredPreprocessing,
+)
+
 
 class KimiK3MediaProcessorConfigProvider(Protocol):
     """Typed view of the HF media processor state consumed by this adapter."""
@@ -79,25 +83,6 @@ class KimiK3ResizeConfig:
 
 
 @dataclass(frozen=True)
-class KimiK3DeferredConfig:
-    backend: str
-    feature_layout: str
-    image_mean: tuple[float, ...]
-    image_std: tuple[float, ...]
-    transparent_bg_config: Optional[dict]
-
-    def as_dict(self, resize_config: KimiK3ResizeConfig) -> dict:
-        return {
-            "backend": self.backend,
-            "feature_layout": self.feature_layout,
-            "image_mean": list(self.image_mean),
-            "image_std": list(self.image_std),
-            "transparent_bg_config": self.transparent_bg_config,
-            "resize_config": resize_config.as_dict(),
-        }
-
-
-@dataclass(frozen=True)
 class KimiK3ImageArtifact:
     """One image's reusable metadata and, when already on CPU, its feature."""
 
@@ -108,7 +93,7 @@ class KimiK3ImageArtifact:
     resize_config: KimiK3ResizeConfig
     grid_thw: tuple[int, int, int]
     feature: Optional[torch.Tensor]
-    deferred: Optional[KimiK3DeferredConfig] = None
+    deferred: Optional[KimiK3DeferredPreprocessing] = None
 
     @property
     def has_feature(self) -> bool:
@@ -130,15 +115,14 @@ class KimiK3ImageArtifact:
         if self.deferred is not None:
             deferred = (
                 self.deferred.backend,
-                self.deferred.feature_layout,
                 self.deferred.image_mean,
                 self.deferred.image_std,
                 self.deferred.transparent_bg_config,
+                self.deferred.resize_config,
             )
         return (
             self.content_digest,
             self.artifact_key,
-            self.feature_identity,
             self.feature_hash,
             self.original_size,
             (

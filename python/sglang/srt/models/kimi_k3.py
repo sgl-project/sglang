@@ -3287,9 +3287,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
                             )
                         materialized[index] = item.feature
                     else:
-                        deferred_by_backend.setdefault(config["backend"], []).append(
-                            index
-                        )
+                        deferred_by_backend.setdefault(config.backend, []).append(index)
 
                 for backend, indices in deferred_by_backend.items():
                     group_items = [selected_items[index] for index in indices]
@@ -3301,19 +3299,19 @@ class KimiK3ForConditionalGeneration(nn.Module):
                         )
 
                         image_scale, image_bias = normalization_tensors(
-                            first_config["image_mean"],
-                            first_config["image_std"],
+                            first_config.image_mean,
+                            first_config.image_std,
                             device,
                         )
                         pixel_values, produced_grids = _gpu_preprocess_images(
                             [item.feature for item in group_items],
-                            [config["resize_config"] for config in group_configs],
+                            [config.resize_config for config in group_configs],
                             image_scale,
                             image_bias,
                             self.vision_tower.patch_size,
                             to_chw=lambda image: to_chw_uint8(image, device=device),
                             post_resize=lambda x: fill_transparent_bg(
-                                x, first_config["transparent_bg_config"]
+                                x, first_config.transparent_bg_config
                             ),
                         )
                         expected_grids = grid_thws_host[indices]

@@ -197,8 +197,8 @@ def test_kimi_k3_epd_preprocess_preserves_raw_per_image_items():
         assert item.hash is not None
         assert item.pad_value is not None
         deferred = item.model_specific_data[DEFERRED_PREPROCESSING_KEY]
-        assert deferred["image_mean"] == [0.5, 0.5, 0.5]
-        assert deferred["image_std"] == [0.5, 0.5, 0.5]
+        assert deferred.image_mean == [0.5, 0.5, 0.5]
+        assert deferred.image_std == [0.5, 0.5, 0.5]
 
 
 def test_kimi_k3_epd_preserves_verified_content_identity():
@@ -311,7 +311,7 @@ def test_kimi_k3_epd_default_cpu_materialization_is_owner_only_and_exact():
     assert len(processor.calls[0]) == 1
     assert processor.calls[0][0]["image"].getpixel((0, 0)) == (11, 0, 0)
     assert torch.all(materialized == 11)
-    assert items[0].model_specific_data[DEFERRED_PREPROCESSING_KEY]["backend"] == "cpu"
+    assert items[0].model_specific_data[DEFERRED_PREPROCESSING_KEY].backend == "cpu"
 
 
 def test_encoder_preprocess_materializes_only_local_size_balanced_items():
