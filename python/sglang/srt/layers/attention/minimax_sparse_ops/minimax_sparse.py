@@ -1,7 +1,7 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
 import logging
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional
 
 import torch
 
@@ -210,9 +210,15 @@ def minimax_sparse_decode(
     msa_plan=None,  # per-forward MSA fmha_sm100 plan (cached)
     # ---- IndexCache (SILOTIGER-721) ----
     skip_indexer: bool = False,  # "full" reuse: do NOT launch the indexer at all
-    reuse_idx_o: Optional[torch.Tensor] = None,  # "full" reuse: index-head output to reuse
-    reuse_main_topk_idx: Optional[torch.Tensor] = None,  # reuse this block selection for main attn
-    reuse_real_seq_lens: Optional[torch.Tensor] = None,  # reuse effective KV lengths (dense path)
+    reuse_idx_o: Optional[
+        torch.Tensor
+    ] = None,  # "full" reuse: index-head output to reuse
+    reuse_main_topk_idx: Optional[
+        torch.Tensor
+    ] = None,  # reuse this block selection for main attn
+    reuse_real_seq_lens: Optional[
+        torch.Tensor
+    ] = None,  # reuse effective KV lengths (dense path)
     return_index_state: bool = False,  # also return (idx_o, main_topk_idx, real_seq_lens) for caching
 ):
     # Step 1: Flash decode with topk index (using index head). When the dense main

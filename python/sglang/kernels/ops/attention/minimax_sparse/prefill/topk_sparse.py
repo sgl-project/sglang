@@ -373,9 +373,7 @@ def flash_prefill_with_gqa_share_sparse(
     out_dtype = (
         q.dtype if q.dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
     )
-    o = torch.empty(
-        total_q, num_q_heads, v_head_dim, device=q.device, dtype=out_dtype
-    )
+    o = torch.empty(total_q, num_q_heads, v_head_dim, device=q.device, dtype=out_dtype)
     # launch kernel
     num_q_loop = (
         max_seqblock_q // 131072 + 1

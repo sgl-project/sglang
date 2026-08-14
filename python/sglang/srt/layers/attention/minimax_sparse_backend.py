@@ -607,9 +607,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             if indexcache_on:
                 self._indexcache_state = (idx_o, main_topk_idx, real_seq_lens)
         else:
-            cached_idx_o, cached_topk_idx, cached_real_seq_lens = (
-                self._indexcache_state
-            )
+            cached_idx_o, cached_topk_idx, cached_real_seq_lens = self._indexcache_state
             if self.indexcache_mode == "topk":
                 # Recompute idx_o; reuse only the block selection.
                 idx_o, o = minimax_sparse_decode(
