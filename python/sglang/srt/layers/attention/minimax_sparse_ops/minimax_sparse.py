@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
 )
 from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx import (
     flash_prefill_with_topk_index,
+    topk_index_from_block_score,
 )
 from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
@@ -88,46 +89,87 @@ def minimax_sparse_prefill(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k, seqlens_cpu
         )
 
-    # All seqlen is less than topk, use full attention
-    # Step 1: Flash attention with topk index (using index head)
-    idx_o, topk_idx = flash_prefill_with_topk_index(
-        q=idx_q,
-        k_cache=idx_k_cache,
-        v_cache=idx_v_cache,
-        sink=idx_sink,
-        page_table=page_table,
-        cu_seqlens=cu_seqlens,
-        seq_lens=seq_lens,
-        prefix_lens=prefix_lens,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        block_size_q=block_size_q,
-        block_size_k=block_size_k,
-        topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
-        sm_scale=idx_sm_scale,
-        score_type=score_type,
-        disable_index_value=disable_index_value,
-        cu_seqblocks_q=cu_seqblocks_q,
-        max_seqblock_q=max_seqblock_q,
-        all_seqblock_q=all_seqblock_q,
-        q_scale=idx_q_scale,
-        k_scale=idx_k_scale,
-        v_scale=idx_v_scale,
-        page_size=page_size,
-    )
-    # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
     num_idx_heads = idx_q.shape[1]
     num_kv_heads = k_cache.shape[1]
+    score = None
+    if (
+        use_msa
+        and disable_index_value
+        and idx_sink is None
+        and score_type == "max"
+        and page_size == block_size_k == 128
+    ):
+        from .msa import MSAUnavailableError, msa_sparse_prefill_index_score
+
+        try:
+            score = msa_sparse_prefill_index_score(
+                idx_q,
+                idx_k_cache,
+                page_table,
+                cu_seqlens,
+                seq_lens,
+                prefix_lens,
+                block_size_k,
+                sm_scale=idx_sm_scale,
+                q_scale=idx_q_scale,
+                k_scale=idx_k_scale,
+                meta_cache=msa_meta_cache,
+            )
+        except MSAUnavailableError as err:
+            _warn_msa_fallback(err)
+
+    if score is not None:
+        idx_o = None
+        topk_idx = topk_index_from_block_score(
+            score,
+            cu_seqlens,
+            prefix_lens,
+            cu_seqblocks_q,
+            max_seqblock_q,
+            all_seqblock_q,
+            block_size_q,
+            block_size_k,
+            topk,
+            init_blocks,
+            local_blocks,
+        )
+    else:
+        idx_o, topk_idx = flash_prefill_with_topk_index(
+            q=idx_q,
+            k_cache=idx_k_cache,
+            v_cache=idx_v_cache,
+            sink=idx_sink,
+            page_table=page_table,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            block_size_q=block_size_q,
+            block_size_k=block_size_k,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            sm_scale=idx_sm_scale,
+            score_type=score_type,
+            disable_index_value=disable_index_value,
+            cu_seqblocks_q=cu_seqblocks_q,
+            max_seqblock_q=max_seqblock_q,
+            all_seqblock_q=all_seqblock_q,
+            q_scale=idx_q_scale,
+            k_scale=idx_k_scale,
+            v_scale=idx_v_scale,
+            page_size=page_size,
+        )
+
+    # Reduce topk idx if num_idx_heads > num_kv_heads.
     idx_group_size = num_idx_heads // num_kv_heads
     if idx_group_size > 1:
         topk_idx = topk_index_reduce(
             topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
         )
-    # Step 3: Sparse attention using topk index (main head). The MSA path only
-    # replaces this step; the indexer above is unchanged. MSA has no attn-sink
-    # input, so keep the Triton path when sink is present.
+    # Step 3: Sparse attention using topk index (main head). MSA has no
+    # attn-sink input, so keep the Triton path when sink is present.
     if use_msa and sink is None:
         from .msa import MSAUnavailableError, msa_sparse_prefill_main
 

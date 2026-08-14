@@ -99,6 +99,82 @@ def _pack_page_table(
     return page_table[req, logical_page].to(torch.int32)
 
 
+def _prefill_kv_indices(
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_size: int,
+    meta_cache: Optional[dict],
+) -> torch.Tensor:
+    if meta_cache is not None and "kv_indices" in meta_cache:
+        return meta_cache["kv_indices"]
+    kv_indices = _pack_page_table(page_table, seq_lens, page_size)
+    if meta_cache is not None:
+        meta_cache["kv_indices"] = kv_indices
+    return kv_indices
+
+
+def msa_sparse_prefill_index_score(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    block_size_k: int,
+    sm_scale: Optional[float] = None,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    meta_cache: Optional[dict] = None,
+) -> torch.Tensor:
+    """Return MSA block-max scores as a zero-copy ``[H, Q, blocks]`` view."""
+    fmha_sm100, _ = _load_fmha_sm100()
+    _check_msa_dtypes(q, k_cache, k_cache)
+    max_slots, num_kv_heads, head_dim = k_cache.shape
+    num_q_heads = q.shape[1]
+    if max_slots % block_size_k != 0:
+        raise ValueError(
+            f"max_slots={max_slots} not divisible by page_size={block_size_k}"
+        )
+
+    n_phys_pages = max_slots // block_size_k
+    k_paged = k_cache.view(n_phys_pages, block_size_k, num_kv_heads, head_dim).permute(
+        0, 2, 1, 3
+    )
+    kv_indices = _prefill_kv_indices(page_table, seq_lens, block_size_k, meta_cache)
+    plan = meta_cache.get("index_plan") if meta_cache is not None else None
+    if plan is None:
+        plan = _run_fmha_sm100_plan(
+            (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32),
+            seq_lens.to(torch.int32),
+            num_q_heads,
+            num_kv_heads=num_kv_heads,
+            page_size=block_size_k,
+            causal=True,
+            qo_offset=prefix_lens.to(torch.int32),
+            output_maxscore=True,
+            use_fp8_kvcache=q.dtype == torch.float8_e4m3fn,
+        )
+        if meta_cache is not None:
+            meta_cache["index_plan"] = plan
+    max_score = meta_cache.get("index_score") if meta_cache is not None else None
+    _, max_score = fmha_sm100(
+        q,
+        k_paged,
+        k_paged,
+        plan,
+        kv_indices=kv_indices,
+        max_score=max_score,
+        output_o=False,
+        output_maxscore=True,
+        sm_scale=head_dim**-0.5 if sm_scale is None else sm_scale,
+        q_scale=unit_scale(q_scale),
+        k_scale=unit_scale(k_scale),
+    )
+    if meta_cache is not None:
+        meta_cache["index_score"] = max_score
+    return max_score.permute(0, 2, 1)
+
+
 def msa_sparse_prefill_main(
     q: torch.Tensor,  # [total_q, num_q_heads, head_dim]
     k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (slot-major NHD)
@@ -151,7 +227,7 @@ def msa_sparse_prefill_main(
         # Per-request Q lengths and physical page table are layer-invariant.
         # Build them on the first sparse layer and reuse them for this forward.
         qo_segment_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
-        kv_indices = _pack_page_table(page_table, seq_lens, P)
+        kv_indices = _prefill_kv_indices(page_table, seq_lens, P, meta_cache)
         plan = _run_fmha_sm100_plan(
             qo_segment_lens,
             seq_lens.to(torch.int32),
