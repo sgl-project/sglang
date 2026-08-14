@@ -234,6 +234,7 @@ class Fp8Config(QuantizationConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
         is_fp4_experts: bool = False,
+        use_scale_ue8m0: bool = False,
         kv_cache_quant_algo: Optional[str] = None,
     ) -> None:
         super().__init__()
@@ -241,6 +242,9 @@ class Fp8Config(QuantizationConfig):
         # model_loader from ModelConfig. Default False off the DSV4 path.
         self.is_fp4_experts = is_fp4_experts
         self.dequant_fp4_to_fp8 = False
+        # Whether dynamic activation scales must follow the checkpoint's
+        # UE8M0 (power-of-two) numerical contract.
+        self.use_scale_ue8m0 = use_scale_ue8m0
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -323,6 +327,7 @@ class Fp8Config(QuantizationConfig):
                 normalized.append(f"model.{base}")
             ignored_layers = normalized
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
+        use_scale_ue8m0 = cls.get_from_keys_or(config, ["scale_fmt"], None) == "ue8m0"
         kv_cache_quant_algo = cls.get_from_keys_or(
             config, ["kv_cache_quant_algo"], None
         )
@@ -341,6 +346,7 @@ class Fp8Config(QuantizationConfig):
             weight_block_size=weight_block_size,
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
+            use_scale_ue8m0=use_scale_ue8m0,
             kv_cache_quant_algo=kv_cache_quant_algo,
         )
 
@@ -2367,6 +2373,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.weight_block_size,
+            use_scale_ue8m0=self.quant_config.use_scale_ue8m0,
         )
 
     def apply(

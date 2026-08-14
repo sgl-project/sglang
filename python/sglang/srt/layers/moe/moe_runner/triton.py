@@ -69,6 +69,7 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     a13_scale: Optional[torch.Tensor] = None
     a2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
+    use_scale_ue8m0: bool = False
 
 
 class TritonRunnerCore(MoeRunnerCore):
@@ -153,6 +154,7 @@ class TritonRunnerCore(MoeRunnerCore):
             a1_scale=quant_info.a13_scale,
             a2_scale=quant_info.a2_scale,
             block_shape=quant_info.block_shape,
+            use_scale_ue8m0=quant_info.use_scale_ue8m0,
             activation=self.config.activation,
             is_gated=self.config.is_gated,
             no_combine=self.config.no_combine,
@@ -221,7 +223,13 @@ def fused_experts_none_to_triton(
         # SGLANG_OPT_MOE_QUANT_ONCE: use the caller's pre-quantized activation
         # (per-token-group-128 fp8 q + scales) instead of re-quantizing inside
         # invoke_fused_moe_kernel.
-        pre_quant = dispatch_output.hidden_states_pre_quant
+        # Quant-once currently produces continuous FP32 scales. Reusing it
+        # would bypass the UE8M0 quantization below for the gate-up GEMM.
+        pre_quant = (
+            None
+            if quant_info.use_scale_ue8m0
+            else dispatch_output.hidden_states_pre_quant
+        )
         if pre_quant is not None:
             a1_q, a1_scale = pre_quant
         else:
@@ -248,6 +256,7 @@ def fused_experts_none_to_triton(
             a2_scale=quant_info.a2_scale,
             block_shape=quant_info.block_shape,
             a1_q=a1_q,
+            use_scale_ue8m0=quant_info.use_scale_ue8m0,
         )
 
     return StandardCombineInput(
