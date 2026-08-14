@@ -2,48 +2,15 @@ import logging
 import threading
 import time
 from multiprocessing import shared_memory
-from typing import Any, Tuple
+from typing import Tuple
 
 import numpy as np
 import torch
-from torch.multiprocessing.reductions import reduce_tensor
-
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
+from torch.multiprocessing.reductions import reduce_tensor
 
 logger = logging.getLogger(__name__)
-
-MM_FEATURE_CACHE_SIZE = envs.SGLANG_MM_FEATURE_CACHE_MB.get() * 1024 * 1024
-
-MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = (
-    envs.SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC.get()
-)
-
-SHM_LOCK_FILE = "/tmp/shm_wr_lock.lock"
-
-DEFER_NPU_IPC_FEATURE_RECONSTRUCTION_KEY = (
-    "_sglang_defer_npu_ipc_feature_reconstruction"
-)
-
-
-def get_mm_feature_pool_size_per_worker(
-    total_pool_size: int, tokenizer_worker_num: int
-) -> int:
-    """Split the NPU IPC feature-pool budget without exceeding it.
-
-    Each tokenizer worker owns a distinct NPU allocation, even though all pools
-    are created on ``base_npu_id``.  Therefore a minimum per-worker allocation
-    would make the HBM reservation larger than the configured budget.
-    Keep the configured value as a hard per-node cap and leave at most
-    ``tokenizer_worker_num - 1`` bytes unused when it is not evenly divisible.
-    """
-    if total_pool_size <= 0:
-        raise ValueError("total_pool_size must be positive")
-    if tokenizer_worker_num <= 0:
-        raise ValueError("tokenizer_worker_num must be positive")
-
-    return total_pool_size // tokenizer_worker_num
 
 
 class ShmSyncBuffer:
@@ -329,7 +296,6 @@ class NpuIpcTensorTransportProxy:
         else:
             self.proxy_state = self.get_proxy_state(data, info_data)
         self.reconstruct_tensor = None
-        self.reconstructed_storage = None
         self._consumer_acknowledged = False
 
     @property
@@ -584,7 +550,6 @@ class NpuIpcTensorTransportProxy:
     def deserialize(data):
         proxy = NpuIpcTensorTransportProxy.__new__(NpuIpcTensorTransportProxy)
         proxy.reconstruct_tensor = None
-        proxy.reconstructed_storage = None
         proxy._consumer_acknowledged = data.get("consumer_acknowledged", False)
         proxy.proxy_state = {}
         if "ipc_extra" in data:

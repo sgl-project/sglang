@@ -33,10 +33,8 @@ from sglang.srt.managers.mm_schedule import (
     init_mm_embedding_cache as init_mm_embedding_cache,
 )
 from sglang.srt.managers.schedule_batch import (
-    CudaIpcTensorTransportProxy,
     Modality,
     MultimodalInputs,
-    NpuIpcTensorTransportProxy,
     is_ipc_tensor_transport_proxy,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch

@@ -666,7 +666,7 @@ class MultimodalInputs:
             )
 
             if is_npu():
-                device = torch.npu.current_device()
+                device = torch.npu.current_device() if torch.npu.is_available() else "cpu"
             elif torch.cuda.is_available():
                 device = torch.cuda.current_device()
             else:
