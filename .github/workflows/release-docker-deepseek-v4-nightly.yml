@@ -130,7 +130,10 @@ jobs:
   build-kernel-wheel:
     needs: [resolve-target-ref]
     if: ${{ github.repository == 'bytedance-iaas/sglang' && (github.event_name == 'schedule' || inputs.compile_kernel) }}
-    uses: ./.github/workflows/release-whl-kernel.yml
+    # Reference the kernel build workflow from the deepseek_v4 branch itself, so
+    # the wheel build logic tracks that branch's source layout (sgl-kernel/)
+    # instead of forcing ep_main's shared release-whl-kernel.yml to chase it.
+    uses: bytedance-iaas/sglang/.github/workflows/release-whl-kernel.yml@bytedance/deepseek_v4
     with:
       checkout_ref: ${{ needs.resolve-target-ref.outputs.target_ref }}
       cuda_version: "13.0"
