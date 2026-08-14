@@ -440,13 +440,31 @@ def load_dict(file_path):
         ) from e
 
 
+def _split_hf_subfolder(path: str) -> tuple[str, str | None]:
+    """Split 'namespace/repo/subfolder' into (repo_id, subfolder), or return (path, None)."""
+    if os.path.isabs(path):
+        return path, None
+    parts = path.split("/")
+    if len(parts) > 2:
+        return "/".join(parts[:2]), "/".join(parts[2:])
+    return path, None
+
+
 def prepare_diffusers_component_path_for_loading(component_path: str) -> str:
     """Download component repos if needed and patch legacy flat ModelOpt configs."""
-    local_component_path = (
-        maybe_download_model(component_path)
-        if not os.path.exists(component_path)
-        else component_path
-    )
+    if os.path.exists(component_path):
+        local_component_path = component_path
+    else:
+        repo_id, subfolder = _split_hf_subfolder(component_path)
+        if subfolder is not None:
+            # component_path is 'namespace/repo/subfolder' — download only that subfolder
+            local_repo = maybe_download_model(
+                repo_id,
+                allow_patterns=[f"{subfolder}/**", f"{subfolder}/*"],
+            )
+            local_component_path = os.path.join(local_repo, subfolder)
+        else:
+            local_component_path = maybe_download_model(component_path)
     config_path = os.path.join(local_component_path, "config.json")
     if not os.path.exists(config_path):
         return local_component_path
@@ -576,7 +594,14 @@ def maybe_download_lora(
     Returns:
         Local path to the model
     """
-    allow_patterns = ["*.json", "*.safetensors", "*.bin"]
+    # Repositories often publish several adapter revisions side by side.  If a
+    # filename is pinned, do not download every weight before selecting it.
+    # Keep JSON metadata so PEFT's lora_alpha remains available.
+    allow_patterns = (
+        ["*.json", weight_name, f"**/{weight_name}"]
+        if weight_name is not None
+        else ["*.json", "*.safetensors", "*.bin"]
+    )
 
     local_path = maybe_download_model(
         model_name_or_path,

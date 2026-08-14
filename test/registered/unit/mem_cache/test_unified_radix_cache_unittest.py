@@ -559,9 +559,9 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         seq = [1, 2, 3, 4]
         self._insert(cache, allocator, seq)
         stored = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(stored), 2)
-        self.assertEqual([list(e.token_ids) for e in stored], [[1, 2], [3, 4]])
-        stored_hashes = [e.block_hashes[0] for e in stored]
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(list(stored[0].token_ids), [1, 2, 3, 4])
+        stored_hashes = self._event_hashes(stored)
 
         result = cache.evict(EvictParams(num_tokens=len(seq)))
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
@@ -575,7 +575,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
         self._insert(cache, allocator, [1, 2, 3, 4])
         first_insert = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(first_insert), 2)
+        self.assertEqual(len(first_insert), 1)
         split_parent_hash = first_insert[0].block_hashes[0]
 
         self._insert(cache, allocator, [1, 2, 5, 6])
@@ -599,13 +599,13 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         seq = [1, 2, 3, 4]
         self._insert(cache, allocator, seq)
         stored_gpu = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(stored_gpu), 2)
-        stored_hashes = [e.block_hashes[0] for e in stored_gpu]
+        self.assertEqual(len(stored_gpu), 1)
+        stored_hashes = self._event_hashes(stored_gpu)
 
         node = self._leaf_for(cache, seq)
         self._backup_node(cache, node)
         stored_cpu = self._stored_events(cache, StorageMedium.CPU)
-        self.assertCountEqual([e.block_hashes[0] for e in stored_cpu], stored_hashes)
+        self.assertCountEqual(self._event_hashes(stored_cpu), stored_hashes)
 
         cache.evict(EvictParams(num_tokens=len(seq)))
         removed_gpu = self._removed_events(cache, StorageMedium.GPU)
@@ -613,7 +613,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
         self._load_back_node(cache, node)
         restored_gpu = self._stored_events(cache, StorageMedium.GPU)
-        self.assertCountEqual([e.block_hashes[0] for e in restored_gpu], stored_hashes)
+        self.assertCountEqual(self._event_hashes(restored_gpu), stored_hashes)
 
         cache.evict(EvictParams(num_tokens=len(seq)))
         self._removed_events(cache, StorageMedium.GPU)
@@ -648,14 +648,12 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             [[1, 2], [3, 4]],
         )
 
-        # Both split fragments must be published, with intact parentage.
+        # Both split fragments must be published as one parent-linked batch.
         stored_cpu = self._stored_events(cache, StorageMedium.CPU)
-        self.assertEqual(
-            [list(e.token_ids) for e in stored_cpu],
-            [[1, 2], [3, 4]],
-        )
+        self.assertEqual(len(stored_cpu), 1)
+        self.assertEqual(list(stored_cpu[0].token_ids), [1, 2, 3, 4])
         self.assertIsNone(stored_cpu[0].parent_block_hash)
-        self.assertEqual(stored_cpu[1].parent_block_hash, stored_cpu[0].block_hashes[0])
+        self.assertEqual(len(stored_cpu[0].block_hashes), 2)
 
     def test_hicache_reinsert_evicted_node_emits_gpu_store(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
@@ -665,8 +663,8 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         seq = [1, 2, 3, 4]
         self._insert(cache, allocator, seq)
         stored_gpu = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(stored_gpu), 2)
-        stored_hashes = [e.block_hashes[0] for e in stored_gpu]
+        self.assertEqual(len(stored_gpu), 1)
+        stored_hashes = self._event_hashes(stored_gpu)
 
         node = self._leaf_for(cache, seq)
         self._backup_node(cache, node)
@@ -680,7 +678,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self._insert(cache, allocator, seq)
         restored_gpu = self._stored_events(cache, StorageMedium.GPU)
         self.assertFalse(node.evicted)
-        self.assertCountEqual([e.block_hashes[0] for e in restored_gpu], stored_hashes)
+        self.assertCountEqual(self._event_hashes(restored_gpu), stored_hashes)
 
 
 class UnifiedRadixCacheSuite:
@@ -2786,6 +2784,8 @@ class UnifiedRadixCacheSuite:
                 cd = ancestor.component_data[ct]
                 if cd.value is not None and cd.host_value is None:
                     cd.host_value = cd.value.clone()
+            # A real backup registers duplicate tracking at its ack.
+            cache.tree_core._update_duplicate_tracking(ancestor)
 
     def _simulate_backup_tree(self, cache):
         """Backup all non-root nodes (simulates write-through)."""
@@ -3826,6 +3826,10 @@ class UnifiedRadixCacheSuite:
             leaf, device_frees, host_frees, target=EvictLayer.HOST
         )
         cache._free_values(device_frees, host_frees)
+        full_host_pool = cache.cache_controller.mem_pool_host
+        mamba_host_pool = cache.components[ComponentType.MAMBA]._mamba_pool_host
+        full_available_before = full_host_pool.available_size()
+        mamba_available_before = mamba_host_pool.available_size()
 
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
 
@@ -3843,12 +3847,27 @@ class UnifiedRadixCacheSuite:
             req_to_token_pool,
             tokens[:branching_seqlen],
         )
+        cache.writing_check(write_back=True)
+        # Full was already backed up, so only one Mamba slot is allocated.
+        self.assertEqual(
+            full_host_pool.available_size(),
+            full_available_before,
+        )
+        self.assertEqual(
+            mamba_host_pool.available_size(),
+            mamba_available_before - 1,
+        )
+
         second_match = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
         )
 
         self.assertEqual(len(second_match.device_indices), branching_seqlen)
         self.assertIsNone(second_match.mamba_branching_seqlen)
+        branching_node = cache.resolve_node_handle(second_match.last_device_node)
+        self.assertIsNotNone(
+            branching_node.component_data[ComponentType.MAMBA].host_value
+        )
 
     def test_scheduler_hicache_full_mamba_init_load_back_appends_new_indices(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
