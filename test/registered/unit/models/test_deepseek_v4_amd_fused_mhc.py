@@ -47,6 +47,38 @@ class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):
         ):
             self.assertFalse(deepseek_v4_fused_mhc._is_fused_mhc_post_pre_enabled())
 
+    def test_is_fused_mhc_post_pre_enabled_policy(self):
+        # Full gating table for _is_fused_mhc_post_pre_enabled, migrated from the
+        # removed test_deepseek_v4_fused_mhc_policy.py now that the helper lives
+        # in this module (it used to patch deepseek_v4.is_sm120_supported /
+        # deepseek_v4._is_fused_mhc_post_pre_enabled, both gone after the
+        # consolidation -> the registered CPU test AttributeError'd). Fusion
+        # requires the opt-in flag AND TileLang post AND (TileLang pre OR SM120).
+        cases = [
+            # (fuse, pre, post, sm120, expected)
+            (True, False, True, True, True),  # SM120 waives the standalone pre flag
+            (True, False, True, False, False),  # non-SM120 still needs the pre flag
+            (True, True, True, False, True),  # non-SM120 with the pre flag on
+            (False, False, True, True, False),  # fusion opt-in is required
+            (True, False, False, True, False),  # TileLang post is required
+        ]
+        for fuse, pre, post, sm120, expected in cases:
+            with self.subTest(fuse=fuse, pre=pre, post=post, sm120=sm120):
+                with (
+                    envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(fuse),
+                    envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.override(pre),
+                    envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(post),
+                    mock.patch.object(
+                        deepseek_v4_fused_mhc,
+                        "is_sm120_supported",
+                        return_value=sm120,
+                    ),
+                ):
+                    self.assertEqual(
+                        deepseek_v4_fused_mhc._is_fused_mhc_post_pre_enabled(),
+                        expected,
+                    )
+
     @mock.patch.object(deepseek_v4_fused_mhc, "is_gfx95_supported", return_value=True)
     @mock.patch.object(deepseek_v4_fused_mhc, "get_bool_env_var", return_value=True)
     @mock.patch.object(deepseek_v4_fused_mhc, "_is_hip", True)
@@ -215,6 +247,77 @@ class TestAmdFusedMhcAttnBoundaryFallback(unittest.TestCase):
         )
         layer.hc_pre.assert_called_once()
         self.assertIs(layer.hc_pre.call_args.args[0], closed_post)
+
+
+class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
+    """Regression: a fused-success result with ``norm_fused=False`` must have its
+    layernorm applied at the call site before the activation reaches attention.
+
+    ``try_fused_hc_post_pre`` (the Triton fused post+pre) always returns
+    ``norm_fused=False`` -- it does not apply the input/post-attention layernorm.
+    The boundary dispatcher reaches it whenever the aiter kernel declines
+    (notably after an aiter import/kernel failure permanently disables the aiter
+    path). The pre-fix fused-success branch unpacked the tuple and fed the raw
+    (unnormalized) hidden_states straight into ``self_attn`` with ``x_quant=None``,
+    silently corrupting every subsequent layer. The fix mirrors the unfused
+    ``hc_pre`` branch: apply the input layernorm when ``norm_fused`` is False.
+
+    Drives the real ``DeepseekV4DecoderLayer.forward`` with the boundary forced to
+    return ``norm_fused=False`` and halts at ``self_attn`` via a sentinel.
+    """
+
+    def test_fused_success_applies_input_layernorm_when_not_norm_fused(self):
+        try:
+            import sglang.srt.models.deepseek_v4 as deepseek_v4
+            from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+        except Exception as e:  # pragma: no cover - env without full model deps
+            self.skipTest(f"deepseek_v4 import unavailable: {e}")
+
+        class _StopForward(Exception):
+            pass
+
+        layer = mock.Mock()
+        layer.use_fused_mhc_post_pre = True
+        layer._input_layernorm_weight_bf16 = None
+
+        fused_hs = object()
+        residual, post, comb = object(), object(), object()
+        # Fused dispatch SUCCEEDS but reports the input layernorm was NOT applied
+        # (norm_fused=False) -- the Triton fused post+pre contract.
+        layer._apply_mhc_post_pre_boundary.return_value = (
+            residual,
+            fused_hs,
+            post,
+            comb,
+            False,
+        )
+        normed = object()
+        layer.input_layernorm.return_value = normed
+        layer.self_attn.maybe_use_decode_attn_tp.side_effect = _StopForward
+
+        # Force the non-aiter (torch layernorm) branch deterministically so the
+        # test does not depend on the runner arch and needs no real tensors.
+        with (
+            mock.patch.object(deepseek_v4, "_use_aiter", False),
+            mock.patch.object(deepseek_v4, "_is_gfx95_supported", False),
+            self.assertRaises(_StopForward),
+        ):
+            DeepseekV4DecoderLayer.forward(
+                layer,
+                positions=object(),
+                hidden_states=object(),
+                input_ids=object(),
+                forward_batch=object(),
+                input_ids_global=object(),
+                prev_residual=object(),
+                prev_post=object(),
+                prev_comb=object(),
+            )
+
+        # The fused (unnormalized) layer input must be run through the input
+        # layernorm before attention. Pre-fix this was never called on the
+        # fused-success path.
+        layer.input_layernorm.assert_called_once_with(fused_hs)
 
 
 def _hardware_available() -> bool:

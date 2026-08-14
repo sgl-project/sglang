@@ -1816,7 +1816,23 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if fused is not None:
                 residual, hidden_states, post, comb, norm_fused = fused
-                x_quant = None
+                if not norm_fused:
+                    # The Triton fused post+pre returns the layer input WITHOUT
+                    # the input layernorm applied (norm_fused=False). Apply it
+                    # (fp8-quant on aiter gfx95) before attention, exactly as the
+                    # unfused hc_pre path below does; otherwise unnormalized
+                    # activations reach self_attn.
+                    if _use_aiter and _is_gfx95_supported:
+                        x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
+                            hidden_states,
+                            self.input_layernorm.weight,
+                            self.rms_norm_eps,
+                        )
+                    else:
+                        hidden_states = self.input_layernorm(hidden_states)
+                        x_quant = None
+                else:
+                    x_quant = None
             else:
                 # Fused dispatch declined: close the previous layer's deferred
                 # mHC post (prev_residual/prev_post/prev_comb) before opening this
@@ -1897,6 +1913,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if fused is not None:
                 residual, hidden_states, post, comb, norm_fused = fused
+                if not norm_fused:
+                    # The Triton fused post+pre skips the post-attention
+                    # layernorm (norm_fused=False); apply it before the MoE,
+                    # matching the unfused hc_pre path below.
+                    hidden_states = self.post_attention_layernorm(hidden_states)
             else:
                 hidden_states = self.hc_post(hidden_states, residual, post, comb)
                 residual = hidden_states
@@ -2185,6 +2206,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if fused is not None:
                 ffn_residual, hidden_states, post, comb, norm_fused = fused
+                if not norm_fused:
+                    # The Triton fused post+pre skips the post-attention
+                    # layernorm (norm_fused=False); apply it before the MoE,
+                    # matching the unfused hc_pre path below.
+                    hidden_states = self.post_attention_layernorm(hidden_states)
                 state.ffn_residual = ffn_residual
                 state.ffn_post = post
                 state.ffn_comb = comb
