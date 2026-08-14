@@ -21,7 +21,7 @@ from sglang.srt.multimodal.kimi_k3_vit_cuda_graph_runner import (
     KimiK3ViTCudaGraphRunner,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -167,7 +167,7 @@ def test_kimi_k3_vision_tower_reuses_prepared_forward_metadata(monkeypatch):
     )
 
     assert len(actual) == len(reference) == 1
-    assert torch.equal(actual[0], reference[0])
+    torch.testing.assert_close(actual[0], reference[0], rtol=0, atol=0, equal_nan=True)
 
 
 def test_kimi_k3_dp_helper_passes_host_grid_list_to_capable_tower():
@@ -357,7 +357,7 @@ def test_kimi_k3_position_interpolation_uses_contiguous_chw(monkeypatch):
     assert torch.equal(actual, expected)
 
 
-def test_kimi_k3_prepares_shared_attention_metadata_once(monkeypatch):
+def test_kimi_k3_prepares_shared_attention_metadata_once(monkeypatch, request):
     metadata_ids = []
     values_are_contiguous = []
 
@@ -370,11 +370,13 @@ def test_kimi_k3_prepares_shared_attention_metadata_once(monkeypatch):
             values_are_contiguous.append(v.is_contiguous())
             return q
 
-    monkeypatch.setattr(
-        kimi_k3_vl,
-        "get_server_args",
-        lambda: SimpleNamespace(mm_attention_backend="flashinfer_cudnn"),
+    # Force the backend through the context, not by patching an import binding:
+    # production reads the published config bag (get_mm().mm_attention_backend).
+    override = get_context().override_server_args(
+        mm_attention_backend="flashinfer_cudnn"
     )
+    override.install()
+    request.addfinalizer(override.restore)
     monkeypatch.setitem(kimi_k3_vl.QKV_BACKEND_IMPL, "flashinfer_cudnn", FakeAttention)
 
     encoder = MoonViT3dEncoder(
@@ -422,6 +424,7 @@ if __name__ == "__main__":
 class _K3TowerStub:
     device = torch.device("cpu")
     merge_kernel_size = (2, 2)
+    patch_size = 2
 
     def __init__(self):
         self.config = SimpleNamespace(hidden_size=2)
@@ -461,18 +464,17 @@ def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
     ]
     sharded_embeddings = torch.randn(2, 2)
 
+    # The IPC consumer count asks for the *configured* TP size (matching
+    # MmItemMemoryPool.try_to_recycle), so publish it; the live topology the
+    # sharding helper reads is forced through the context's own override.
     with mock_patch(
         "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
         return_value=sharded_embeddings,
-    ) as run_dp, mock_patch(
-        "sglang.srt.models.kimi_k3.get_server_args",
-        return_value=SimpleNamespace(tp_size=1),
-    ), mock_patch(
-        "sglang.srt.models.kimi_k3.get_parallel",
-        return_value=SimpleNamespace(attn_tp_size=1),
+    ) as run_dp, get_context().override_server_args(tp_size=1), get_parallel().override(
+        tp_size=1, attn_tp_size=1
     ):
         output = model.get_image_feature(items)
-        # exercise the loader inside the patch scope: it reads server args
+        # Exercise the loader while the runtime topology is forced.
         loader_in_scope = run_dp.call_args.kwargs["load_local_pixel_values"]
         local = loader_in_scope([1])
         both = loader_in_scope([0, 1])
@@ -498,6 +500,83 @@ def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
         both,
         torch.cat([items[0].feature, items[1].feature]).to(torch.float32),
     )
+
+
+def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
+    from unittest.mock import patch as mock_patch
+
+    from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+    from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+    from sglang.srt.multimodal.kimi_k3_image_processing import (
+        DEFERRED_PREPROCESSING_KEY,
+        KimiK3DeferredPreprocessing,
+    )
+
+    model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.use_data_parallel = True
+    model.vision_tower = _K3TowerStub()
+    model.mm_projector = lambda image_embeds: image_embeds
+
+    deferred_config = KimiK3DeferredPreprocessing(
+        backend="gpu",
+        image_mean=[0.5, 0.5, 0.5],
+        image_std=[0.5, 0.5, 0.5],
+        transparent_bg_config=None,
+        resize_config={
+            "num_tokens": 1,
+            "new_width": 2,
+            "new_height": 2,
+            "pad_width": 0,
+            "pad_height": 0,
+        },
+    )
+    items = [
+        MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(index, index)],
+            feature=torch.full((3, 2, 2), index, dtype=torch.uint8),
+            model_specific_data={
+                "image_grid_thw": torch.tensor([[1, 1, 1]]),
+                DEFERRED_PREPROCESSING_KEY: deferred_config,
+            },
+        )
+        for index in range(2)
+    ]
+    calls = []
+
+    def fake_preprocess(images, resize_configs, *args, **kwargs):
+        calls.append([int(image[0, 0, 0]) for image in images])
+        return torch.tensor([[float(calls[-1][0]), 0.0]]), torch.tensor([[1, 1, 1]])
+
+    # Configured TP size (the IPC consumer count) comes from the published
+    # bags; the live topology is forced through the context's own override.
+    with mock_patch(
+        "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
+        return_value=torch.zeros(1, 2),
+    ) as run_dp, get_context().override_server_args(tp_size=1), get_parallel().override(
+        tp_size=1, attn_tp_size=1
+    ), mock_patch(
+        "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
+        side_effect=fake_preprocess,
+    ):
+        model.get_image_feature(items)
+        loader = run_dp.call_args.kwargs["load_local_pixel_values"]
+        one = loader([1])
+
+    assert calls == [[1]]
+    assert one.dtype == torch.float32
+    assert one.tolist() == [[1.0, 0.0]]
+
+
+def test_kimi_k3_scheduler_leaves_feature_placement_to_dp_owner():
+    from sglang.srt.managers.mm_schedule import _can_skip_pre_embed_feature_move
+    from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+
+    model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+
+    assert _can_skip_pre_embed_feature_move(model.get_image_feature)
 
 
 def test_kimi_k3_rejects_aggregated_items():
