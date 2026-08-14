@@ -11,6 +11,7 @@ from sglang.kernels.spec import KernelBackend, KernelSpec
 # (module, public_fn) migrated from speculative/triton_ops.
 _TRITON_KERNELS = [
     ("cache_locs", "assign_extend_cache_locs_func"),
+    ("cache_locs_npu", "read_cache_locations_npu"),
     ("cache_locs", "generate_draft_decode_kv_indices"),
     ("eagle", "fill_bonus_tokens"),
     ("eagle", "fill_accept_out_cache_loc"),
@@ -18,10 +19,12 @@ _TRITON_KERNELS = [
     ("multi_layer_eagle", "rotate_input_ids"),
     ("spec_tree", "sgl_build_tree_kernel_efficient_triton"),
     ("spec_tree", "verify_tree_greedy_kernel_triton"),
+    ("spec_tree_npu", "build_full_tree_npu"),
     ("topk1", "draft_topk1_postprocess"),
     ("ragged_verify_kernels", "pad_verify_lens_to_bucket"),
     ("ragged_verify_kernels", "build_qo_indptr"),
     ("reject_sampling", "chain_speculative_sampling_triton"),
+    ("replay_pack_npu", "draft_replay_pack_npu"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

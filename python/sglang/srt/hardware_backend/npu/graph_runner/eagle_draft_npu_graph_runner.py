@@ -34,12 +34,18 @@ if TYPE_CHECKING:
 
 class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def __init__(self, eagle_worker: EagleDraftWorker):
+        self.use_fia_v2 = (
+            eagle_worker.draft_runner.model_config.attention_arch == AttentionArch.MLA
+            and eagle_worker.draft_runner.kv_cache_dtype == torch.float8_e4m3fn
+        )
         self._init_arch_map()
         super().__init__(eagle_worker)
 
     def _init_arch_map(self):
         self.attr_name: Dict[str, str] = {
-            AttentionArch.MLA: "actual_seq_lengths_kv",
+            AttentionArch.MLA: (
+                "actual_seq_kvlen" if self.use_fia_v2 else "actual_seq_lengths_kv"
+            ),
             AttentionArch.MHA: "context_lens",
         }
         self.attr_type: Dict[str, Union[list, torch.Tensor]] = {
@@ -88,7 +94,9 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
 
     def _replay_graph(self, shape_key, forward_batch):
         hf_config = self.model_runner.model_config.hf_config
-        if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
+        if not is_deepseek_dsa(hf_config) and (
+            not is_deepseek_v4(hf_config) or self.use_fia_v2
+        ):
             seq_lens_for_each_draft_step = []
             for speculative_step_id in range(self.speculative_num_steps - 1):
                 seq_lens_cpu = (

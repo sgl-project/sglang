@@ -4,12 +4,14 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     should_remap_pd_dsa_seed_to_local_slots,
 )
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.eagle_zero_bubble import pad_zero_bubble_seed
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
@@ -49,6 +51,13 @@ def build_eagle_disagg_draft_input(
         ],
         dim=0,
     )
+    if envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get():
+        topk_p, topk_index = pad_zero_bubble_seed(
+            topk_p=topk_p,
+            topk_index=topk_index,
+            num_steps=server_args.speculative_num_steps,
+            topk=server_args.speculative_eagle_topk,
+        )
 
     hidden_states = torch.stack(
         [req.hidden_states_tensor for req in batch.reqs], dim=0

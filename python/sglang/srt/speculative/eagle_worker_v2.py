@@ -39,7 +39,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -69,6 +73,11 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
     EagleVerifyInput,
+)
+from sglang.srt.speculative.eagle_zero_bubble import (
+    pad_zero_bubble_seed,
+    validate_prefetched_topk1,
+    validate_zero_bubble_config,
 )
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
@@ -152,6 +161,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
+        )
+        self.enable_spec_v2_zero_bubble = envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get()
+        validate_zero_bubble_config(
+            enabled=self.enable_spec_v2_zero_bubble,
+            topk=self.topk,
+            num_steps=self.speculative_num_steps,
+            enable_multi_layer_eagle=server_args.enable_multi_layer_eagle,
+            is_eagle3=self.speculative_algorithm.is_eagle3(),
+            use_rejection_sampling=get_spec().speculative_use_rejection_sampling,
+            speculative_adaptive=server_args.speculative_adaptive,
         )
 
         self._rebuild_topk1_chain_buffers()
@@ -493,6 +512,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
+        if self.enable_spec_v2_zero_bubble:
+            return self._build_prefetched_verify_input(batch, draft_input)
         forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
@@ -546,6 +567,52 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             top_scores_index,
             draft_tokens,
             draft_probs,
+            target_worker=self.target_worker,
+            topk=self.topk,
+            num_steps=self.speculative_num_steps,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+            tree_mask_mode=self.tree_mask_mode,
+            device=self.device,
+        )
+
+    def _build_prefetched_verify_input(
+        self, batch: ScheduleBatch, draft_input: EagleDraftInput
+    ) -> EagleVerifyInput:
+        if batch.forward_mode.is_idle():
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                self.device,
+            )
+        batch_size = int(batch.seq_lens.shape[0])
+        validate_prefetched_topk1(
+            topk_index=draft_input.topk_index,
+            batch_size=batch_size,
+            num_steps=self.speculative_num_steps,
+        )
+        if batch_size <= self._topk1_parents_prealloc.shape[0]:
+            parent_list = self._topk1_parents_prealloc[:batch_size]
+            selected_index = self._topk1_score_indices_prealloc[:batch_size]
+        else:
+            parent_list = torch.arange(
+                -1,
+                self.speculative_num_steps - 1,
+                device=self.device,
+                dtype=torch.long,
+            ).repeat(batch_size, 1)
+            selected_index = torch.arange(
+                self.speculative_num_steps,
+                device=self.device,
+                dtype=torch.long,
+            ).repeat(batch_size, 1)
+        return build_eagle_verify_input(
+            batch,
+            draft_input,
+            parent_list,
+            selected_index,
+            draft_input.topk_index,
+            None,
             target_worker=self.target_worker,
             topk=self.topk,
             num_steps=self.speculative_num_steps,
@@ -829,6 +896,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk_p, topk_index = fast_sample(probs, num_samples=1)
         else:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        if self.enable_spec_v2_zero_bubble:
+            topk_p, topk_index = pad_zero_bubble_seed(
+                topk_p=topk_p,
+                topk_index=topk_index,
+                num_steps=self.speculative_num_steps,
+                topk=self.topk,
+            )
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -1003,6 +1077,71 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             next_draft_input.draft_probs = ret_draft_probs
         if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
+        if self.enable_spec_v2_zero_bubble:
+            self._prefetch_next_draft(batch, batch_result)
+
+    def _prefetch_next_draft(
+        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+    ) -> None:
+        next_draft_input = batch_result.next_draft_input
+        if self.speculative_num_steps == 1 or batch.forward_mode.is_idle():
+            next_draft_input.topk_p, next_draft_input.topk_index = (
+                pad_zero_bubble_seed(
+                    topk_p=next_draft_input.topk_p,
+                    topk_index=next_draft_input.topk_index,
+                    num_steps=self.speculative_num_steps,
+                    topk=self.topk,
+                )
+            )
+            next_draft_input.hidden_states = None
+            return
+
+        old_forward_mode = batch.forward_mode
+        old_seq_lens = batch.seq_lens
+        old_seq_lens_cpu = batch.seq_lens_cpu
+        old_seq_lens_sum = batch.seq_lens_sum
+        old_spec_info = batch.spec_info
+        old_out_cache_loc = batch.out_cache_loc
+        try:
+            batch.forward_mode = ForwardMode.DECODE
+            batch.seq_lens = batch_result.new_seq_lens
+            if self.server_args.disable_cuda_graph:
+                batch.seq_lens_cpu = batch.seq_lens.to("cpu")
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            batch.spec_info = next_draft_input
+            forward_batch, can_run_graph = prepare_for_draft(
+                next_draft_input,
+                self.req_to_token_pool,
+                batch,
+                self.cuda_graph_runner,
+                self.draft_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            if (
+                can_run_graph
+                and self.seed_dsa_topk_from_draft_extend
+                and next_draft_input.dsa_topk_indices is None
+            ):
+                can_run_graph = False
+            if can_run_graph:
+                _, _, draft_tokens, _ = self.cuda_graph_runner.execute(forward_batch)
+            else:
+                self.draft_attn_backend.init_forward_metadata(forward_batch)
+                forward_batch.mark_forward_metadata_ready()
+                _, _, draft_tokens, _ = self.draft_forward(forward_batch)
+            next_draft_input.topk_index = draft_tokens.clone()
+            next_draft_input.topk_p = torch.ones_like(
+                draft_tokens, dtype=torch.float32
+            )
+            next_draft_input.hidden_states = None
+        finally:
+            batch.forward_mode = old_forward_mode
+            batch.seq_lens = old_seq_lens
+            batch.seq_lens_cpu = old_seq_lens_cpu
+            batch.seq_lens_sum = old_seq_lens_sum
+            batch.spec_info = old_spec_info
+            batch.out_cache_loc = old_out_cache_loc
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
@@ -1157,7 +1296,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     device=self.device,
                     hidden_size=hidden_size,
                     dtype=hidden_dtype,
-                    topk=self.topk,
+                    topk=(
+                        self.topk * self.speculative_num_steps
+                        if self.draft_worker.enable_spec_v2_zero_bubble
+                        else self.topk
+                    ),
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )

@@ -12,6 +12,7 @@ from sglang.kernels.spec import KernelBackend, KernelSpec
 _TRITON_KERNELS = [
     ("allocator", "alloc_extend_kernel"),
     ("allocator", "alloc_decode_kernel"),
+    ("allocator_npu", "alloc_extend_npu"),
     ("common", "write_req_to_token_pool_triton"),
     ("common", "get_last_loc_triton"),
     ("common", "get_last_loc_triton_safe"),

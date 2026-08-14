@@ -18,6 +18,14 @@ indexer_weight_stream = None
 gva_is_inited = False
 
 
+@functools.lru_cache(maxsize=1)
+def is_ascend_a5() -> bool:
+    """Return whether the active device is an Ascend A5 (Ascend 950 series)."""
+    if not _is_npu:
+        return False
+    return torch.npu.get_device_name(torch.npu.current_device()).startswith("Ascend950")
+
+
 class NPUACLFormat(IntEnum):
     ACL_FORMAT_UNDEFINED = -1
     ACL_FORMAT_ND = 2
