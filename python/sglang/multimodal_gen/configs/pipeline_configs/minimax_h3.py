@@ -141,16 +141,30 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "enable_torch_compile": False,
             "is_dit_layerwise_offload_selected": False,
             "model_variant": "fl2va",
-            "num_gpus": 4,
             "performance_mode": "speed",
             "quantization": None,
             "regional_compile": False,
             "ring_degree": 1,
-            "sp_degree": 4,
             "tp_size": 1,
-            "ulysses_degree": 4,
             "use_fsdp_inference": False,
         }
+        if (
+            current_platform.is_cuda()
+            and "H200" in device_name.upper()
+            and capability_int == 90
+        ):
+            profile = "4xH200"
+            expected.update(num_gpus=4, sp_degree=4, ulysses_degree=4)
+        elif (
+            current_platform.is_cuda()
+            and "B300" in device_name.upper()
+            and capability_int == 103
+        ):
+            profile = "8xB300"
+            expected.update(num_gpus=8, sp_degree=8, ulysses_degree=8)
+        else:
+            profile = None
+
         mismatches = {
             name: {"expected": wanted, "actual": actual[name]}
             for name, wanted in expected.items()
@@ -160,19 +174,19 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                 else actual[name] != wanted
             )
         }
-        if (
-            not current_platform.is_cuda()
-            or "H200" not in device_name.upper()
-            or capability_int != 90
-        ):
+        if profile is None:
             mismatches["device"] = {
-                "expected": "NVIDIA H200 (compute capability 9.0)",
+                "expected": (
+                    "NVIDIA H200 (compute capability 9.0) or "
+                    "NVIDIA B300 (compute capability 10.3)"
+                ),
                 "actual": f"{device_name} (compute capability {capability_int})",
             }
         if mismatches:
             raise ValueError(
                 'MiniMax-H3 quality="high" is validated only for '
-                f"the strict 4xH200 fl2va deployment; mismatches: {mismatches}"
+                "the strict 4xH200 or 8xB300 fl2va deployments; "
+                f"mismatches: {mismatches}"
             )
 
     def validate_server_args(self, server_args) -> None:

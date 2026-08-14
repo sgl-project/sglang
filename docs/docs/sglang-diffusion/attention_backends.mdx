@@ -67,7 +67,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sol_attn`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`SOL_ATTN`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Requires the upstream <code>sol-attn</code> package. Install with <code>pip install git+https://github.com/NVlabs/Sana.git@sol-engine#subdirectory=techniques/sparse_backends</code>. BF16, head dim 128. Configure via <code>--attention-backend-config</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Requires the upstream <code>sol-attn</code> package. Install with <code>pip install git+https://github.com/NVlabs/Sana.git@sol-engine#subdirectory=techniques/sparse_backends</code>. BF16, head dim 128. Configure via <code>--attention-backend-config</code>. Dense guard steps use the platform-selected FlashAttention implementation (including FA4 on Blackwell), and packed sparse calls preserve document boundaries.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`video_sparse_attn`</td>

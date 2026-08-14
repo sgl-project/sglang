@@ -6,11 +6,13 @@ import re
 
 import torch
 
-from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+    FlashAttentionImpl,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
@@ -98,7 +100,6 @@ class SolAttnImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
-        del num_heads, num_kv_heads, extra_impl_args
         if head_size != _SOL_ATTN_HEAD_DIM:
             raise ValueError(
                 f"Sol-Attn requires head_size={_SOL_ATTN_HEAD_DIM}, got {head_size}"
@@ -107,6 +108,18 @@ class SolAttnImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
         self.prefix = prefix
         self.layer_idx = self._parse_layer_idx(prefix)
+        # Dense guards must use the platform-selected FlashAttention version.
+        # Calling the low-level wrapper directly defaults to FA3, which is not
+        # available on Blackwell; the CUDA resolver selects FA4 for this impl.
+        self.dense_impl = FlashAttentionImpl(
+            num_heads=num_heads,
+            head_size=head_size,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            num_kv_heads=num_kv_heads,
+            prefix=f"{prefix}.dense",
+            **extra_impl_args,
+        )
 
     @staticmethod
     def _parse_layer_idx(prefix: str) -> int | None:
@@ -140,18 +153,13 @@ class SolAttnImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
-        output = flash_attn_varlen_func(
+        return self.dense_impl.forward_varlen(
             query,
             key,
             value,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            softmax_scale=self.softmax_scale,
-            causal=self.causal,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
-        return output[0] if isinstance(output, tuple) else output
 
     def _run_sol_attn_thd(
         self,
@@ -186,32 +194,8 @@ class SolAttnImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        del attn_metadata
         if self._should_use_dense():
-            q = query.transpose(1, 2).reshape(
-                query.shape[0] * query.shape[1], query.shape[2], query.shape[3]
-            )
-            k = key.transpose(1, 2).reshape(
-                key.shape[0] * key.shape[1], key.shape[2], key.shape[3]
-            )
-            v = value.transpose(1, 2).reshape(
-                value.shape[0] * value.shape[1], value.shape[2], value.shape[3]
-            )
-            cu_seqlens = torch.arange(
-                0,
-                (query.shape[0] + 1) * query.shape[1],
-                query.shape[1],
-                device=query.device,
-                dtype=torch.int32,
-            )
-            out = self._dense_varlen(
-                q,
-                k,
-                v,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=query.shape[1],
-            )
-            return out.reshape(query.shape[0], query.shape[1], query.shape[2], -1)
+            return self.dense_impl.forward(query, key, value, attn_metadata)
         q = query.reshape(query.shape[0] * query.shape[1], query.shape[2], -1)
         k = key.reshape(key.shape[0] * key.shape[1], key.shape[2], -1)
         v = value.reshape(value.shape[0] * value.shape[1], value.shape[2], -1)
@@ -228,7 +212,6 @@ class SolAttnImpl(AttentionImpl):
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
-        del cu_seqlens_host
         if self._should_use_dense():
             return self._dense_varlen(
                 query,
@@ -237,4 +220,36 @@ class SolAttnImpl(AttentionImpl):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
             )
-        return self._run_sol_attn_thd(query, key, value)
+
+        bounds = (
+            cu_seqlens_host
+            if cu_seqlens_host is not None
+            else tuple(int(value) for value in cu_seqlens.tolist())
+        )
+        segments = [
+            (start, stop)
+            for start, stop in zip(bounds[:-1], bounds[1:])
+            if stop > start
+        ]
+        if not segments:
+            return torch.zeros_like(query)
+
+        # Sparse kernels operate on one document. Running once on the packed
+        # buffer would let documents attend across boundaries; in MiniMax-H3 it
+        # would also mix the aligned padding tail into every real query.
+        output = torch.zeros_like(query)
+        for start, stop in segments:
+            # H3 exposes its one live document as (0, used, total), with
+            # max_seqlen=used. The trailing document is alignment padding and
+            # must stay zero rather than becoming an independent sparse call.
+            trailing_padding = (
+                len(bounds) == 3
+                and start == bounds[1]
+                and stop == query.shape[0]
+                and bounds[1] == max_seqlen
+            )
+            if not trailing_padding:
+                output[start:stop] = self._run_sol_attn_thd(
+                    query[start:stop], key[start:stop], value[start:stop]
+                )
+        return output

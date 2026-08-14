@@ -413,6 +413,10 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         current_mode = getattr(self, "_minimax_h3_cache_mode", None)
         self._minimax_h3_quality = quality
 
+        # Let the common stage reject Cache-DiT before H3 arms input
+        # preservation. BCG is a fixed server policy, so no cache can already
+        # be mounted on this path; the parent also emits the one-time warning
+        # when a mode actually requested caching.
         if self.server_args.enable_breakable_cuda_graph:
             if desired_mode is not None:
                 super()._maybe_enable_cache_dit(num_inference_steps, batch)

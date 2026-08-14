@@ -536,7 +536,8 @@ done
   against the reference implementation and the CI ground truth.
 - `"high"`: the audited accelerated path. Quality is guaranteed (the audited
   Cache-DiT configuration measures SSIM 0.931 / PSNR 28.16 dB against
-  `lossless`), but output is no longer bit-identical to the reference.
+  `lossless` on 4×H200, and passes the temporal-artifact review described below
+  on 8×B300), but output is no longer bit-identical to the reference.
 
 One resident server serves both levels; a `quality: "high"` request mounts
 its audited Cache-DiT policy at the batch boundary, and a later
@@ -558,6 +559,11 @@ sglang serve \
   --enable-torch-compile false \
   --port 30010
 ```
+
+The validated B300 deployment uses the same command with
+`--num-gpus 8 --sp-degree 8 --ulysses-degree 8`. Both profiles deliberately
+keep TP1, Ring1, eager execution, resident components, and native dense
+attention.
 
 Then choose a request level:
 
@@ -610,10 +616,43 @@ absolute perceptual quality: the `high` path can produce a different but
 still plausible realization. It also changes the joint audio-video denoise
 trajectory, while these two metrics cover video only.
 
-`quality: "high"` currently accepts only the exact workload and 4×H200
-deployment above; other hardware, task modes, request shapes, step counts, or
-flow shifts fail before denoising. Offline generation uses the same level
-name, for example `sglang generate --quality high`.
+The same audited Cache-DiT policy was re-evaluated on 8×B300 against both a
+lossless Diffusers baseline and SGLang lossless. Latency is the median of three
+requests after one warmup request. The three fixed prompt/seed pairs were
+scored against SGLang lossless with frame-aligned LPIPS AlexNet at 1 fps.
+Consecutive 4 fps frame sheets were also reviewed with the
+[Sol-Engine H3 temporal-artifact taxonomy](https://nvlabs.github.io/Sana/Sol-Engine/H3/)
+for flicker, coherence, boundaries, mosaic/static regions, ghosting, broken
+motion, and major blur.
+
+![MiniMax-H3 B300 quality and latency comparison](./assets/minimax-h3-b300-quality-high.png)
+
+| B300 arm | Median latency | Speedup vs Diffusers | LPIPS mean / max | Temporal review | Decision |
+| --- | ---: | ---: | ---: | --- | --- |
+| Diffusers BF16 dense, Ulysses8 | 30.29 s | 1.00× | n/a | Baseline implementation | Baseline |
+| SGLang lossless | 18.61 s | 1.63× | 0.000 / 0.000 | Reference | Default exact path |
+| SGLang generic Sol-Attn | 17.97 s | 1.69× | 0.229 / 0.301 | Pass | Evaluated, not admitted |
+| SGLang `quality="high"` Cache-DiT | 10.70 s | 2.83× | 0.100 / 0.214 | Pass | **Validated high path** |
+| SGLang Cache-DiT + generic Sol-Attn | 10.35 s | 2.93× | 0.215 / 0.283 | Pass | Evaluated, not admitted |
+
+The B300 high path is 1.74× faster than SGLang lossless. Adding generic
+Sol-Attn saves only another 3.4% while more than doubling mean LPIPS, so sparse
+attention is not enabled by `quality="high"`. The temporal rubric was applied
+by aligned human review rather than the Gemini judge used by the published
+Sol-Engine evaluation. LPIPS remains a same-seed trajectory-distance signal,
+not an absolute image-quality score.
+
+The generic Sol-Attn experiment used `tau=1`, diagonal thresholding, ten dense
+prefix steps, dense DiT blocks 0 and 1, and no KV sink. It is not NVIDIA's
+H3-specific Sol-Engine policy. The dedicated H3 SubBlock sparse backend is
+currently built for SM100 and rejects B300's SM103, so it is not included in
+the B300 comparison.
+
+`quality: "high"` currently accepts only the exact workload and either the
+4×H200 deployment above or its audited 8×B300 TP1/Ulysses8 counterpart;
+other hardware, task modes, request shapes, step counts, or flow shifts fail
+before denoising. Offline generation uses the same level name, for example
+`sglang generate --quality high`.
 
 <Note>
 `quality` selects a model sampling level and can change generated content.
@@ -647,7 +686,7 @@ combined with FSDP inference or DiT layerwise offload. Breakable CUDA graph
 execution takes precedence and leaves Cache-DiT disabled. Tune the cache
 thresholds only after comparing both video and audio quality on the target
 task profile. A real B200 request has completed, but the `quality: "high"`
-path above remains fail-closed to the audited 4×H200 workload.
+path above remains fail-closed to the audited 4×H200 and 8×B300 workloads.
 </Warning>
 
 ## 7. Runtime feature recipes

@@ -238,6 +238,11 @@ class _HopperCapability:
         return 90
 
 
+class _BlackwellCapability:
+    def to_int(self) -> int:
+        return 103
+
+
 def _quality_server_args():
     return SimpleNamespace(
         attention_backend=None,
@@ -280,6 +285,30 @@ def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
         "Cache-DiT was requested but is disabled because breakable CUDA graphs "
         "are enabled."
     )
+
+
+def test_quality_admission_accepts_validated_b300_profile():
+    config = MiniMaxH3PipelineConfig()
+    server_args = _quality_server_args()
+    server_args.num_gpus = 8
+    server_args.sp_degree = 8
+    server_args.ulysses_degree = 8
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(
+            current_platform, "get_device_name", return_value="NVIDIA B300 SXM6"
+        ),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_BlackwellCapability(),
+        ),
+    ):
+        config.validate_quality_deployment(server_args)
+        server_args.ulysses_degree = 4
+        with pytest.raises(ValueError, match="8xB300"):
+            config.validate_quality_deployment(server_args)
 
 
 def test_quality_admission_fails_closed_outside_validated_request():

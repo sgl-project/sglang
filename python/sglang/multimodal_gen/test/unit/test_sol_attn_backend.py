@@ -113,6 +113,104 @@ class TestSolAttnBackend(unittest.TestCase):
     def test_supports_packed_varlen(self):
         self.assertTrue(SolAttnBackend.supports_packed_varlen())
 
+    def test_dense_varlen_delegates_to_platform_selected_flash_attention(self):
+        impl = SolAttnImpl(
+            num_heads=8,
+            head_size=128,
+            causal=False,
+            softmax_scale=128**-0.5,
+            prefix="blocks.5.attn",
+        )
+        query = MagicMock()
+        key = MagicMock()
+        value = MagicMock()
+        cu_seqlens = MagicMock()
+        expected = MagicMock()
+        impl.dense_impl.forward_varlen = MagicMock(return_value=expected)
+
+        actual = impl._dense_varlen(
+            query,
+            key,
+            value,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=4096,
+        )
+
+        self.assertIs(actual, expected)
+        impl.dense_impl.forward_varlen.assert_called_once_with(
+            query,
+            key,
+            value,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=4096,
+        )
+
+    def test_sparse_varlen_keeps_h3_padding_tail_zero(self):
+        impl = SolAttnImpl(
+            num_heads=8,
+            head_size=128,
+            causal=False,
+            softmax_scale=128**-0.5,
+            prefix="blocks.5.attn",
+        )
+        query = torch.randn(96, 2, 128)
+        key = torch.randn_like(query)
+        value = torch.randn_like(query)
+        sparse_output = torch.full_like(query[:80], 7)
+
+        with (
+            patch.object(impl, "_should_use_dense", return_value=False),
+            patch.object(
+                impl, "_run_sol_attn_thd", return_value=sparse_output
+            ) as run_sparse,
+        ):
+            output = impl.forward_varlen(
+                query,
+                key,
+                value,
+                cu_seqlens=torch.tensor([0, 80, 96], dtype=torch.int32),
+                max_seqlen=80,
+                cu_seqlens_host=(0, 80, 96),
+            )
+
+        run_sparse.assert_called_once()
+        self.assertTrue(torch.equal(output[:80], sparse_output))
+        self.assertTrue(torch.count_nonzero(output[80:]) == 0)
+
+    def test_sparse_varlen_runs_packed_documents_independently(self):
+        impl = SolAttnImpl(
+            num_heads=8,
+            head_size=128,
+            causal=False,
+            softmax_scale=128**-0.5,
+            prefix="blocks.5.attn",
+        )
+        query = torch.randn(80, 2, 128)
+        key = torch.randn_like(query)
+        value = torch.randn_like(query)
+
+        def segment_output(q, _k, _v):
+            return torch.full_like(q, q.shape[0])
+
+        with (
+            patch.object(impl, "_should_use_dense", return_value=False),
+            patch.object(
+                impl, "_run_sol_attn_thd", side_effect=segment_output
+            ) as run_sparse,
+        ):
+            output = impl.forward_varlen(
+                query,
+                key,
+                value,
+                cu_seqlens=torch.tensor([0, 32, 80], dtype=torch.int32),
+                max_seqlen=48,
+                cu_seqlens_host=(0, 32, 80),
+            )
+
+        self.assertEqual(run_sparse.call_count, 2)
+        self.assertTrue(torch.all(output[:32] == 32))
+        self.assertTrue(torch.all(output[32:] == 48))
+
 
 if __name__ == "__main__":
     unittest.main()
