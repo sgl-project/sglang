@@ -33,8 +33,10 @@ concurrency:
   # A PR number if a pull request and otherwise the commit hash. This cancels
   # queued and in-progress runs for the same PR (presubmit) or commit
   # (postsubmit). The workflow name is prepended to avoid conflicts between
-  # different workflows.
-  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
+  # different workflows. Manual dispatches key on the run id instead, mirroring
+  # nightly-test-amd-rocm720.yml, so that dispatching one gpu_arch after another
+  # off the same commit does not cancel the build already running.
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || github.event.number || github.sha }}
   cancel-in-progress: True
 
 jobs:
