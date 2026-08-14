@@ -88,6 +88,8 @@ class MoeRunner:
             self.runner_core = None  # FlashInfer CUTLASS only supports fused path
         elif runner_backend.is_flashinfer_mxfp4():
             self.runner_core = None  # FlashInfer MXFP4 only supports fused path
+        elif runner_backend.is_b12x():
+            self.runner_core = None  # b12x only supports the fused path
             # Import flashinfer_cutlass here (not at module top, to avoid a circular
             # import) to register the flashinfer_mxfp4 fused func before the pool lookup.
             from sglang.srt.layers.moe.moe_runner import (  # noqa: F401

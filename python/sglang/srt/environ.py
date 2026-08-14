@@ -1525,6 +1525,21 @@ class Envs:
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
 
+    # ==================================================================
+    # b12x MoE runner backend (SM12x / GB10)
+    # ==================================================================
+    # Upper bound on tokens in one b12x MoE call, used to size its scratch
+    # workspace at load time. Track --chunked-prefill-size if that is raised.
+    SGLANG_B12X_MAX_TOKENS = EnvInt(4096)
+    # Drop b12x's one-CTA-per-SM pin for moe_block_size==8. Measured a 4.4%
+    # regression on GB10, so off: the pin suits the kernel it ships with.
+    SGLANG_B12X_RELAX_BLOCKS_PER_SM = EnvBool(False)
+    # Directory to import b12x from, ahead of the pip-installed one. Set this to
+    # a 0.15.3 checkout: its W4A16 kernel takes weights as tensors with static
+    # strides, where 1.2.2 passes raw pointers and rebuilds layouts at runtime.
+    # Measured 707.9 vs 875.6 us/call on DSv4-Flash decode, bit-identical output.
+    SGLANG_B12X_PATH = EnvStr("")
+
 
 envs = Envs()
 EnvField._allow_set_name = False
