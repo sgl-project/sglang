@@ -89,9 +89,7 @@ class AscendKVManager(MooncakeKVManager):
                     dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
                 return src_kv_ptrs, dst, len(src_kv_ptrs)
 
-            return super().get_mla_kv_ptrs_with_pp(
-                src_kv_ptrs, dst_kv_ptrs, state_type
-            )
+            return super().get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs, state_type)
 
         # src_kv_ptrs: k_data, v_data, index_k_data(optional)
         # dst_kv_ptrs: k_data, v_data, index_k_data(optional)

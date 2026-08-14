@@ -533,6 +533,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             safe_swa_loc,
             kv_out,
         )
+
     def set_compress_buffer(
         self,
         layer_id: int,

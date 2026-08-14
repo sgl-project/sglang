@@ -70,9 +70,7 @@ class DSV4ReqToTokenTablesMixin:
         pages = values[groups * page_size - token_slice.start] // page_size
         prefix_pages = self.req_to_c128_sidecar[req_pool_idx, :end_group].clone()
         prefix_pages[groups] = pages
-        self._dsv4_allocator.replace_req_c128_prefix(
-            req_pool_idx, prefix_pages, self
-        )
+        self._dsv4_allocator.replace_req_c128_prefix(req_pool_idx, prefix_pages, self)
 
     def register_dsv4_allocator(self, allocator) -> None:
         """Wire the DSV4NPUTokenToKVPoolAllocator ref so ``free(req)`` can

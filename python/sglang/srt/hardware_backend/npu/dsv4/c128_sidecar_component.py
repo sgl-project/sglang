@@ -224,9 +224,7 @@ class C128SidecarComponent(TreeComponent):
         # Every stored value belongs to the old child's end boundary. Splitting
         # inside that group leaves the page on the child.
         ct = self.component_type
-        new_parent.component_data[ct].session_ref = child.component_data[
-            ct
-        ].session_ref
+        new_parent.component_data[ct].session_ref = child.component_data[ct].session_ref
         assert new_parent.component_data[ct].session_ids is None
 
     def evict_component(

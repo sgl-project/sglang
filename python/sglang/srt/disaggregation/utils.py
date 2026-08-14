@@ -1124,9 +1124,7 @@ def setup_state_kv_args(
     if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
         from sglang.srt.disaggregation.ascend.conn import AscendStateType
 
-        c128_ptrs, c128_lens, c128_item_lens = (
-            token_to_kv_pool.get_c128_kv_buf_infos()
-        )
+        c128_ptrs, c128_lens, c128_item_lens = token_to_kv_pool.get_c128_kv_buf_infos()
         if c128_ptrs:
             append_state_component(
                 kv_args,
@@ -1140,9 +1138,8 @@ def setup_state_kv_args(
     # local SWA indices. Keep draft buffers in a separate positional component
     # to avoid mixing them into the target's heterogeneous state layout, while
     # reusing the existing SWA transport dispatch on both GPU and NPU.
-    if (
-        isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        and isinstance(draft_token_to_kv_pool, DeepSeekV4TokenToKVPool)
+    if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool) and isinstance(
+        draft_token_to_kv_pool, DeepSeekV4TokenToKVPool
     ):
         if not draft_token_to_kv_pool.compression_ratios or not all(
             ratio == 0 for ratio in draft_token_to_kv_pool.compression_ratios

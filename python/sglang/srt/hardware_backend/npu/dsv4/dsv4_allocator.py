@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.allocation import alloc_paged_token_slots_extend
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
 
+
 def get_last_loc(
     req_to_c128_sidecar: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -51,9 +52,7 @@ def get_last_loc(
     page_ids = req_to_c128_sidecar[req_pool_indices, last_pos // page_size].to(
         prefix_lens.dtype
     )
-    last_loc = (
-        page_ids * page_size + last_pos.to(prefix_lens.dtype) % page_size
-    )
+    last_loc = page_ids * page_size + last_pos.to(prefix_lens.dtype) % page_size
     return torch.where(prefix_lens > 0, last_loc, torch.full_like(prefix_lens, -1))
 
 

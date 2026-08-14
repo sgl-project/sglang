@@ -336,9 +336,7 @@ class CompressorAscendBackendMixin:
                 )
             else:
                 c128_page_size = req_to_token_pool.c128_page_size
-                n_groups = (
-                    n_c_tokens + c128_page_size - 1
-                ) // c128_page_size
+                n_groups = (n_c_tokens + c128_page_size - 1) // c128_page_size
                 c_page_table = req_to_token_pool.req_to_c128_sidecar[
                     req_pool_64, :n_groups
                 ].to(torch.int32)
@@ -389,9 +387,7 @@ class CompressorAscendBackendMixin:
 
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
-        state_pool = pool._get_state_pool(
-            compressor.layer_id, compressor.is_in_indexer
-        )
+        state_pool = pool._get_state_pool(compressor.layer_id, compressor.is_in_indexer)
         state_cache = state_pool.state_cache_3d
         table_cache = fm.dsv4_explicit_state_block_tables
         if ratio not in table_cache:

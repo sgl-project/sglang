@@ -1187,9 +1187,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _swa_payload():
                 window_size = self.sliding_window_size
-                window_start = max(
-                    req.disagg_decode_prefix_len, seq_len - window_size
-                )
+                window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, window_start:seq_len
