@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AMD ROCm CI on upstream SGLang — trigger rules and one week of coverage</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --bg-sunk: #f6f7f9;
+    --fg: #16181d;
+    --fg-2: #565b66;
+    --fg-3: #868c99;
+    --line: #e3e6ea;
+    --line-2: #eceef1;
+    --accent: #2f6feb;
+    --ok: #1a7f47;
+    --warn: #9a6300;
+    --bad: #c0362c;
+    --ok-bg: #e8f5ee;
+    --warn-bg: #fdf3e0;
+    --bad-bg: #fbeceb;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181d;
+      --bg-sunk: #1c1f26;
+      --fg: #e7e9ee;
+      --fg-2: #a3a9b5;
+      --fg-3: #767d8a;
+      --line: #2b2f38;
+      --line-2: #23262e;
+      --accent: #6ba0ff;
+      --ok: #52c07f;
+      --warn: #e0a53f;
+      --bad: #ef7a70;
+      --ok-bg: #172b20;
+      --warn-bg: #2c2415;
+      --bad-bg: #2e1b19;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 400 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Helvetica, Arial, sans-serif;
+    font-variant-numeric: tabular-nums;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 56px 24px 96px; }
+  h1 { font-size: 30px; line-height: 1.25; margin: 0 0 10px; letter-spacing: -0.02em; font-weight: 640; }
+  h2 { font-size: 21px; line-height: 1.3; margin: 0 0 12px; letter-spacing: -0.01em; font-weight: 620; }
+  h3 { font-size: 15px; margin: 0 0 8px; font-weight: 620; }
+  p { margin: 0 0 12px; }
+  section { margin-top: 52px; }
+  .lede { color: var(--fg-2); font-size: 16px; margin-bottom: 4px; }
+  .meta { color: var(--fg-3); font-size: 13px; }
+  code {
+    font-family: var(--mono); font-size: 0.88em;
+    background: var(--bg-sunk); border: 1px solid var(--line-2);
+    border-radius: 4px; padding: 1px 5px; white-space: nowrap;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .muted { color: var(--fg-2); }
+  .small { font-size: 13px; }
+
+  .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-top: 26px; }
+  .stat { border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  .stat .v { font-size: 27px; font-weight: 620; line-height: 1.15; letter-spacing: -0.02em; }
+  .stat .l { font-size: 12.5px; color: var(--fg-2); margin-top: 4px; }
+  .v.ok { color: var(--ok); } .v.warn { color: var(--warn); } .v.bad { color: var(--bad); }
+
+  table { width: 100%; border-collapse: collapse; margin: 14px 0 18px; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line-2); vertical-align: top; }
+  th { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-3); border-bottom: 1px solid var(--line); }
+  tbody tr:last-child td { border-bottom: none; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .framed { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .framed th:first-child, .framed td:first-child { padding-left: 14px; }
+  .framed th:last-child, .framed td:last-child { padding-right: 14px; }
+
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 8px; vertical-align: 1px; }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); }
+  .dot.bad { background: var(--bad); } .dot.neutral { background: var(--fg-3); }
+
+  .note { border: 1px solid var(--line); border-left-width: 3px; border-radius: 6px; padding: 13px 16px; margin: 16px 0; font-size: 14px; }
+  .note.warn { border-left-color: var(--warn); background: var(--warn-bg); }
+  .note.bad  { border-left-color: var(--bad);  background: var(--bad-bg); }
+  .note .t { font-weight: 620; margin-bottom: 5px; }
+
+  .tabs { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+  .tab {
+    font: inherit; font-size: 13px; cursor: pointer;
+    background: transparent; color: var(--fg-2);
+    border: 1px solid var(--line); border-radius: 999px; padding: 4px 13px;
+  }
+  .tab[aria-selected="true"] { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+  .tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .bars { margin: 6px 0 4px; }
+  .bar-row { display: grid; grid-template-columns: minmax(0, 150px) 1fr auto; gap: 12px; align-items: center; margin-bottom: 9px; font-size: 13.5px; }
+  .bar-track { display: block; background: var(--bg-sunk); border-radius: 4px; height: 20px; overflow: hidden; }
+  .bar-fill { display: block; height: 100%; border-radius: 4px; background: var(--accent); }
+  .bar-fill.ok { background: var(--ok); } .bar-fill.warn { background: var(--warn); } .bar-fill.bad { background: var(--bad); }
+  .bar-val { color: var(--fg-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+  .cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+  .card { border: 1px solid var(--line); border-radius: 8px; }
+  .card > .hd { padding: 9px 15px; border-bottom: 1px solid var(--line-2); font-size: 12.5px; font-weight: 600; color: var(--fg-2); display: flex; justify-content: space-between; gap: 10px; }
+  .card > .bd { padding: 15px; }
+  .card > .bd > :last-child { margin-bottom: 0; }
+  .pill { font-size: 11px; border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; color: var(--fg-3); white-space: nowrap; }
+
+  hr { border: none; border-top: 1px solid var(--line-2); margin: 34px 0; }
+  footer { margin-top: 56px; padding-top: 20px; border-top: 1px solid var(--line-2); color: var(--fg-3); font-size: 13px; }
+  @media (max-width: 760px) {
+    .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .cards { grid-template-columns: 1fr; }
+    .bar-row { grid-template-columns: minmax(0, 110px) 1fr auto; }
+    .wrap { padding: 36px 16px 64px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>AMD ROCm CI on upstream SGLang</h1>
+  <p class="lede">What actually triggers the AMD gate, and what happened to it across one week of merges into <code>sgl-project/sglang</code>.</p>
+  <p class="meta">Window: 2026-08-07 to 2026-08-14 18:39 UTC &middot; 423 merged pull requests &middot; measured on each PR&rsquo;s merge commit</p>
+
+  <div class="stats">
+    <div class="stat"><div class="v">423</div><div class="l">PRs merged in the week</div></div>
+    <div class="stat"><div class="v">346</div><div class="l">Eligible for AMD GPU jobs</div></div>
+    <div class="stat"><div class="v warn">77</div><div class="l">Got a complete verdict</div></div>
+    <div class="stat"><div class="v bad">4</div><div class="l">Merged on a green AMD run</div></div>
+  </div>
+
+  <section>
+    <h2>What triggers AMD CI</h2>
+    <p>Three gates, all of which must pass before a single GPU job starts. The first and third are path checks that use different syntax and different path lists, which is where the coverage holes come from.</p>
+
+    <h3>Gate 1 &mdash; the run is created</h3>
+    <p class="muted small"><code>on.pull_request.paths</code>. No <code>types</code> is declared, so only <code>opened</code>, <code>synchronize</code> and <code>reopened</code> fire &mdash; adding the <code>run-ci</code> label or marking a draft ready does <strong>not</strong> dispatch a run. There is no <code>branches</code> restriction.</p>
+    <div class="framed">
+      <table>
+        <thead><tr><th>Path pattern</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><code>python/**</code></td><td>Any Python change, including files no AMD filter later matches.</td></tr>
+          <tr><td><code>scripts/ci/**</code></td><td>All CI scripts, not just the AMD ones.</td></tr>
+          <tr><td><code>test/**</code></td><td>The whole test tree.</td></tr>
+          <tr><td><code>python/sglang/kernels/aot/**</code></td><td>AOT kernel sources.</td></tr>
+          <tr><td><code>.github/workflows/pr-test-amd-rocm720.yml</code></td><td>The workflow editing itself.</td></tr>
+          <tr><td><code>docker/rocm.Dockerfile</code></td><td>Creates a run, but matches no filter &mdash; see the gap below.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Gate 2 &mdash; pr-gate.yml</h3>
+    <p class="muted small">Called with all defaults and evaluated at job runtime against a live API read, so a rerun picks up the current state. The PR must not be a draft and must carry the <code>run-ci</code> label. Actors without write access get a 120-minute cooldown &mdash; computed from <code>pr-test.yml</code> run history, so the cooldown is shared with CUDA CI.</p>
+
+    <h3>Gate 3 &mdash; check-changes selects the job groups</h3>
+    <p class="muted small">A second, independent <code>dorny/paths-filter</code> evaluation. The count column is how many of the 357 triggered PRs matched each flag this week.</p>
+    <div class="framed">
+      <table>
+        <thead><tr><th>Flag</th><th>Matches</th><th>Dispatches</th><th class="num">PRs</th></tr></thead>
+        <tbody>
+          <tr><td><code>main_package</code></td><td class="muted small"><code>python/sglang/**</code> minus <code>multimodal_gen</code> and <code>kernels/aot</code>, <code>python/pyproject_other.toml</code>, <code>scripts/ci/amd/*</code>, <code>scripts/ci/utils/*</code>, <code>test/**</code></td><td class="small">stage-a / b / c &mdash; 33 GPU jobs</td><td class="num">284</td></tr>
+          <tr><td><code>sgl_kernel</code></td><td class="muted small"><code>python/sglang/kernels/aot/**</code></td><td class="small">2 kernel unit jobs, plus all of stage-a/b/c</td><td class="num">5</td></tr>
+          <tr><td><code>jit_kernel</code></td><td class="muted small"><code>python/sglang/kernels/**</code>, <code>test/registered/kernels/**</code></td><td class="small">2 JIT unit + benchmark jobs</td><td class="num">80</td></tr>
+          <tr><td><code>multimodal_gen</code></td><td class="muted small"><code>python/sglang/multimodal_gen/**</code>, <code>python/sglang/cli/**</code>, <code>srt/observability/**</code>, <code>kernels/ops/diffusion/**</code></td><td class="small">8 diffusion jobs</td><td class="num">101</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note warn">
+      <div class="t">The gap between gate 1 and gate 3</div>
+      Gate 1 admits <code>scripts/ci/**</code> and <code>docker/rocm.Dockerfile</code>, but gate 3 only matches <code>scripts/ci/amd/*</code> and <code>scripts/ci/utils/*</code> &mdash; both single-level &mdash; and never matches the Dockerfile at all. Anything in that gap creates a run in which every job skips, and since nothing fails, the run reports green. Eleven PRs landed that way this week, including a ROCm Dockerfile change and a <code>python/pyproject.toml</code> bump. Also caught: <code>scripts/ci/cuda/</code>, <code>scripts/ci/npu/</code>, <code>scripts/ci/xpu/</code>, <code>scripts/ci/slurm/**</code>, <code>scripts/ci/utils/diffusion/**</code> and <code>scripts/ci/runner_configs.yml</code>.
+    </div>
+  </section>
+
+  <section>
+    <h2>Where the week&rsquo;s merges landed</h2>
+    <div class="tabs" role="tablist" aria-label="Population">
+      <button class="tab" id="tab-all" role="tab" aria-selected="true" aria-controls="outcomes">All 423 merged</button>
+      <button class="tab" id="tab-eligible" role="tab" aria-selected="false" aria-controls="outcomes">346 eligible for GPU jobs</button>
+      <span class="meta">measured on each PR&rsquo;s merge commit</span>
+    </div>
+    <div class="framed">
+      <table id="outcomes">
+        <thead><tr><th>Outcome</th><th class="num">PRs</th><th class="num">Share</th><th>What it means</th></tr></thead>
+        <tbody id="outcomes-body"></tbody>
+      </table>
+    </div>
+    <p>Of the 346 PRs that should have run AMD GPU jobs, 273 reached a GPU but only <strong>77 produced a complete verdict</strong> before merging &mdash; and 73 of those 77 were red. Put the other way: 95% of finished AMD runs this week were failing, and the remaining 269 eligible PRs merged with no AMD answer at all.</p>
+  </section>
+
+  <section>
+    <h2>The dominant failure mode is timing, not labels</h2>
+    <p>Cancellation, not the <code>run-ci</code> gate, is what removes most AMD signal. Of the 196 cancelled runs, <strong>190 (97%) were killed at or after the merge</strong>, a median of one minute afterwards &mdash; that is <code>cancel-pr-workflows-on-close.yml</code> reacting to <code>pull_request_target: closed</code>. When killed, a median of only 25% of their GPU jobs had passed.</p>
+
+    <div class="cards">
+      <div class="card">
+        <div class="hd"><span>Median minutes</span></div>
+        <div class="bd">
+          <div class="bars">
+            <div class="bar-row"><span>AMD run to finish</span><span class="bar-track"><span class="bar-fill bad" style="width:100%"></span></span><span class="bar-val">389 min</span></div>
+            <div class="bar-row"><span>Run start to merge</span><span class="bar-track"><span class="bar-fill" style="width:54%"></span></span><span class="bar-val">210 min</span></div>
+          </div>
+          <p class="muted small" style="margin-top:10px">The AMD suite needs roughly twice the time it is allowed to exist. The merge routinely wins the race.</p>
+        </div>
+      </div>
+      <div class="card">
+        <div class="hd"><span>6,110 GPU jobs executed this week</span></div>
+        <div class="bd">
+          <div class="bars">
+            <div class="bar-row"><span>Passed</span><span class="bar-track"><span class="bar-fill ok" style="width:100%"></span></span><span class="bar-val">3,225 &middot; 53%</span></div>
+            <div class="bar-row"><span>Cancelled</span><span class="bar-track"><span class="bar-fill warn" style="width:61%"></span></span><span class="bar-val">1,962 &middot; 32%</span></div>
+            <div class="bar-row"><span>Failed</span><span class="bar-track"><span class="bar-fill bad" style="width:29%"></span></span><span class="bar-val">923 &middot; 15%</span></div>
+          </div>
+          <p class="muted small" style="margin-top:10px">Roughly a third of all AMD GPU time this week produced a result that was thrown away.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="note bad">
+      <div class="t">The loop</div>
+      Queues run hours deep, so a run finishes long after its PR is ready. The PR merges, the run is cancelled, and the capacity spent on it is wasted &mdash; which lengthens the queue for the next run. Adding runners alone does not break this; shortening the wall-clock time of a run until it beats the merge does.
+    </div>
+  </section>
+
+  <section>
+    <h2>Why a run takes hours</h2>
+    <p>One PR with only <code>main_package</code> set dispatches 33 GPU jobs. Pool sizes and load are from a 12-hour window ending 2026-08-14 05:02 UTC.</p>
+    <div class="framed">
+      <table>
+        <thead><tr><th>Runner pool</th><th class="num">Runners</th><th class="num">Jobs per PR run</th><th class="num">Jobs in 12h</th><th class="num">Avg queue wait</th></tr></thead>
+        <tbody>
+          <tr><td><code>linux-mi300-1gpu-sglang</code></td><td class="num">120</td><td class="num">19</td><td class="num muted">1443</td><td class="num muted">45 min</td></tr>
+          <tr><td><code>linux-mi300-2gpu-sglang</code></td><td class="num">27</td><td class="num">2</td><td class="num muted">217</td><td class="num muted">33 min</td></tr>
+          <tr><td><span class="dot warn"></span><code>linux-mi300-4gpu-sglang</code></td><td class="num">2</td><td class="num">1</td><td class="num muted">25</td><td class="num muted">26 min</td></tr>
+          <tr><td><code>linux-mi300-8gpu-sglang</code></td><td class="num">19</td><td class="num">4</td><td class="num muted">124</td><td class="num muted">18 min</td></tr>
+          <tr><td><code>linux-mi35x-gpu-1</code></td><td class="num">4</td><td class="num">1</td><td class="num muted">77</td><td class="num muted">2 min</td></tr>
+          <tr><td><span class="dot warn"></span><code>linux-mi35x-gpu-8</code></td><td class="num">7</td><td class="num">5</td><td class="num muted">197</td><td class="num muted">35 min</td></tr>
+          <tr><td><span class="dot bad"></span><code>linux-mi35x-gpu-8.fabric</code></td><td class="num">1</td><td class="num">1</td><td class="num muted">57</td><td class="num muted">174 min</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="muted">The binding constraint is <code>linux-mi35x-gpu-8.fabric</code>: one runner, one disaggregation job per <code>main_package</code> PR, a 60-minute timeout. It can serve at most about a dozen runs a day against a demand of roughly 40. Worst observed wait was 660 minutes. The <code>max-parallel</code> throttles compound this &mdash; the 14-way stage-b matrix is capped at 4, and several other stages at 1 &mdash; which converts a wide run into a long one, and long runs are exactly what the merge cancels.</p>
+  </section>
+
+  <section>
+    <h2>Open pull requests</h2>
+    <div class="cards">
+      <div class="card">
+        <div class="hd"><span>#34812 &mdash; gate AMD tests on rocm.Dockerfile</span><span class="pill">verified live</span></div>
+        <div class="bd">
+          <p class="small">Adds <code>docker/rocm.Dockerfile</code> to <code>main_package</code> and removes a dead <code>python/pyproject_rocm.toml</code> rule. The pins in that file are not inert: <code>amd_ci_install_dependency.sh</code> greps <code>AITER_COMMIT_DEFAULT</code> and <code>MORI_COMMIT</code> at job time and rebuilds against them, because the image is never rebuilt for a PR.</p>
+          <p class="small muted">Nine commits in 60 days touched only this file. One of them, a MoRI bump, reported a green AMD check with all 17 GPU jobs skipped.</p>
+          <p class="small"><a href="https://github.com/sgl-project/sglang/pull/34812">View PR #34812</a></p>
+        </div>
+      </div>
+      <div class="card">
+        <div class="hd"><span>#34813 &mdash; show AMD state in the PR body</span><span class="pill">verified live</span></div>
+        <div class="bd">
+          <p class="small"><code>pr-states.yml</code> writes a CI-states block into every PR description but only queries <code>pr-test.yml</code> and <code>pr-test-extra.yml</code>. A merge oncall reading the description cannot see AMD at all. Adds a third row plus a <code>notify-pr-states</code> job so reruns refresh it.</p>
+          <p class="small muted">Costs no runner capacity. The rendering cannot be tested by a PR run, since <code>pull_request_target</code> always executes the base-branch copy.</p>
+          <p class="small"><a href="https://github.com/sgl-project/sglang/pull/34813">View PR #34813</a></p>
+        </div>
+      </div>
+    </div>
+
+    <hr>
+
+    <h3>Not yet addressed</h3>
+    <p>Both open PRs together cover the 11 skipped-everything PRs and the 71 gate-blocked ones. They do nothing for the 196 cancelled runs, which is the largest bucket. That one needs the run to get shorter than the time-to-merge: move the disaggregation and DeepSeek-V4 accuracy jobs off the per-PR path onto nightly or the existing <code>run-ci-extra</code> opt-in, which frees the single fabric runner and five of the seven MI35x 8-GPU slots per run, then relax the <code>max-parallel</code> caps so the remaining suite runs wide instead of long.</p>
+  </section>
+
+  <footer>
+    <p><strong>Method.</strong> 423 PRs merged into <code>sgl-project/sglang</code> between 2026-08-07 and 2026-08-14 18:39 UTC, joined against the GitHub Actions API by merge-commit SHA. The AMD PR gate changed mid-window &mdash; PR #34204 (2026-08-12 10:31 UTC) swapped it from <code>pr-test-amd.yml</code> to <code>pr-test-amd-rocm720.yml</code> &mdash; so each PR is scored against whichever workflow was the gate on its merge date; both carry an identical <code>on.pull_request.paths</code> list. Path predictions were reproduced with <code>dorny/paths-filter</code>&rsquo;s own matcher (picomatch with <code>{ dot: true }</code>) and agreed with reality on 419 of 423 PRs.</p>
+    <p>All figures derive from public data on a public repository. Self-contained page &mdash; no scripts, fonts or assets are loaded from the network.</p>
+  </footer>
+</div>
+
+<script>
+  var OUTCOMES = [
+    { label: "Never triggered",              all: 66,  eligible: null, tone: "neutral", note: "No changed file matched on.pull_request.paths \u2014 docs-only and similar. Correct behaviour." },
+    { label: "Triggered, every job skipped", all: 11,  eligible: null, tone: "warn",    note: "Run created, no check-changes flag matched. Reports green while testing nothing." },
+    { label: "Blocked at pr-gate",           all: 71,  eligible: 71,   tone: "bad",     note: "Draft, missing run-ci label, or rate-limit cooldown. Zero GPU jobs." },
+    { label: "Reached a GPU, then cancelled",all: 196, eligible: 196,  tone: "bad",     note: "Killed mid-flight, a median of 1 minute after the PR merged." },
+    { label: "Ran to completion, red",       all: 73,  eligible: 73,   tone: "warn",    note: "A real verdict, but a failing one." },
+    { label: "Ran to completion, green",     all: 4,   eligible: 4,    tone: "ok",      note: "The only PRs that merged on a passing AMD result." }
+  ];
+
+  var body = document.getElementById("outcomes-body");
+  var tabAll = document.getElementById("tab-all");
+  var tabEl = document.getElementById("tab-eligible");
+
+  function render(scope) {
+    var eligibleOnly = scope === "eligible";
+    var total = eligibleOnly ? 346 : 423;
+    var rows = eligibleOnly ? OUTCOMES.filter(function (o) { return o.eligible !== null; }) : OUTCOMES;
+    body.innerHTML = "";
+    rows.forEach(function (o) {
+      var n = eligibleOnly ? o.eligible : o.all;
+      var tr = document.createElement("tr");
+
+      var c1 = document.createElement("td");
+      var dot = document.createElement("span");
+      dot.className = "dot " + o.tone;
+      c1.appendChild(dot);
+      c1.appendChild(document.createTextNode(o.label));
+
+      var c2 = document.createElement("td");
+      c2.className = "num";
+      c2.textContent = String(n);
+
+      var c3 = document.createElement("td");
+      c3.className = "num muted";
+      c3.textContent = Math.round((100 * n) / total) + "%";
+
+      var c4 = document.createElement("td");
+      c4.className = "muted small";
+      c4.textContent = o.note;
+
+      tr.appendChild(c1); tr.appendChild(c2); tr.appendChild(c3); tr.appendChild(c4);
+      body.appendChild(tr);
+    });
+    tabAll.setAttribute("aria-selected", String(!eligibleOnly));
+    tabEl.setAttribute("aria-selected", String(eligibleOnly));
+  }
+
+  tabAll.addEventListener("click", function () { render("all"); });
+  tabEl.addEventListener("click", function () { render("eligible"); });
+  render("all");
+</script>
+</body>
+</html>
