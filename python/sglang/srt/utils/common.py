@@ -316,14 +316,15 @@ def is_sm121() -> bool:
     return is_cuda() and torch.cuda.get_device_capability() == (12, 1)
 
 
-try:
-    import sgl_kernel  # noqa: F401
+@lru_cache(maxsize=1)
+def _is_intel_amx_backend_available():
+    try:
+        import sgl_kernel  # noqa: F401
 
-    is_intel_amx_backend_available = hasattr(
-        torch.ops.sgl_kernel, "convert_weight_packed"
-    )
-except:
-    is_intel_amx_backend_available = False
+        return hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
+    except Exception:
+        return False
+
 
 try:
     # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
@@ -334,7 +335,7 @@ except:
 
 
 def cpu_has_amx_support():
-    return is_amx_tile_supported and is_intel_amx_backend_available
+    return is_amx_tile_supported and _is_intel_amx_backend_available()
 
 
 def use_intel_amx_backend(layer):
@@ -1634,6 +1635,7 @@ class ImageData:
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
     preprocess_kwargs: Optional[Dict] = None
+    content_hash: Optional[str] = None
 
 
 @dataclass
@@ -1643,9 +1645,12 @@ class VideoData:
 
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]
 
 
-def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -> bool:
+def is_jpeg_with_cuda(
+    image_bytes: bytes = b"", gpu_image_decode: GPUImageDecodeMode = True
+) -> bool:
     """
     Check three conditions:
     1. whether CUDA is available.
@@ -1659,10 +1664,19 @@ def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -
     return False
 
 
+@lru_cache(maxsize=16)
+def _warn_fancy_jpeg_fallback(error: str) -> None:
+    logger.warning(
+        "High-fidelity GPU JPEG decode is unavailable; falling back to PIL. "
+        "Install the Kimi-K3 serving image or NVIDIA nvImageCodec. Error: %s",
+        error,
+    )
+
+
 def _load_image(
     image_bytes: bytes = b"",
     image_file: str = "",
-    gpu_image_decode: bool = True,
+    gpu_image_decode: GPUImageDecodeMode = True,
 ) -> Union[torch.Tensor, Image.Image]:
     """
     Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
@@ -1673,19 +1687,29 @@ def _load_image(
         image_bytes = get_image_bytes(image_file)
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
+            if gpu_image_decode == "nvjpeg_fancy":
+                from sglang.srt.utils.nvjpeg_decoder import (
+                    decode_jpeg_with_fancy_upsampling,
+                )
+
+                return decode_jpeg_with_fancy_upsampling(image_bytes)
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
         except Exception as e:
-            logger.warning(
-                f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
-            )
+            if gpu_image_decode == "nvjpeg_fancy":
+                _warn_fancy_jpeg_fallback(f"{type(e).__name__}: {e}")
+            else:
+                logger.warning(
+                    "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
+                    e,
+                )
     return Image.open(BytesIO(image_bytes))
 
 
 def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
-    gpu_image_decode: bool = True,
+    gpu_image_decode: GPUImageDecodeMode = True,
 ) -> tuple[Union[torch.Tensor, Image.Image], Optional[tuple[int, int]]]:
     """
     Load image from multiple input formats, including:
@@ -1977,7 +2001,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.15.post1")
+        min_version: Minimum version required (e.g., "0.6.17")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -3280,9 +3304,10 @@ def has_hf_quant_config(model_path: str) -> bool:
     Returns:
         True if hf_quant_config.json exists, False otherwise.
     """
-    # Check if the model_path is a local path
-    if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
-        return True
+    # Local paths are decided on the filesystem; the hub helpers below
+    # reject them as invalid repo ids.
+    if os.path.isdir(model_path):
+        return os.path.isfile(os.path.join(model_path, "hf_quant_config.json"))
 
     from huggingface_hub import try_to_load_from_cache
 
@@ -3505,14 +3530,17 @@ def dispose_tensor(x: torch.Tensor):
     interfering with torch.compile's memory tracking and graph recording.
     """
 
-    # Skip disposal during piecewise CUDA graph capture/replay: freeing the
-    # backing storage would invalidate addresses recorded in the graph.
-    # Local import avoids a circular dependency.
+    # Skip disposal under a captured prefill graph (piecewise or breakable):
+    # freeing the backing storage would invalidate addresses recorded in the
+    # graph. Local imports avoid a circular dependency.
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        is_in_breakable_cuda_graph,
+    )
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
         is_in_tc_piecewise_cuda_graph,
     )
 
-    if is_in_tc_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return
 
     from sglang.srt.runtime_context import get_flags
