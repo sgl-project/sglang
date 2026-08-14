@@ -344,7 +344,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
         self._ensure_retry_count: Dict[str, int] = {}
-        self._max_ensure_retries: int = 15  # scheduling cycles
+        self._max_ensure_retries: int = 15  # parallel info fetch attempts
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
         # Retracted requests staged for rebootstrap while generation is paused.
@@ -825,8 +825,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ready: Dict[str, List[DecodeRequest]] = {}
         remaining: List[DecodeRequest] = []
 
+        # Fetches run off this thread, so a fatal config mismatch is surfaced
+        # here rather than wherever it was hit. Checked once per cycle so no
+        # per-addr path below can mask it.
+        self.kv_manager.raise_parallel_info_error()
+
         now = time.monotonic()
         for bootstrap_addr, reqs in addr_to_reqs.items():
+            # The fetch is asynchronous, so a result may have landed since the
+            # last attempt: check the cache on every cycle and let the retry
+            # interval below pace only new fetch attempts.
+            if self.kv_manager.has_parallel_info(bootstrap_addr):
+                self._clear_ensure_state(bootstrap_addr)
+                ready[bootstrap_addr] = reqs
+                continue
+
+            if self.kv_manager.parallel_info_fetch_in_flight(bootstrap_addr):
+                # An attempt is already running; waiting for it is not a new
+                # attempt, so the retry budget below still counts fetches.
+                remaining.extend(reqs)
+                continue
+
             last_attempt = self._ensure_last_attempt_time.get(bootstrap_addr)
             if last_attempt is not None and (
                 now - last_attempt < self._ensure_retry_interval
@@ -834,32 +853,45 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 remaining.extend(reqs)
                 continue
 
-            self._ensure_last_attempt_time[bootstrap_addr] = now
-
-            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
-                if bootstrap_addr in self._ensure_retry_count:
-                    del self._ensure_retry_count[bootstrap_addr]
-                if bootstrap_addr in self._ensure_last_attempt_time:
-                    del self._ensure_last_attempt_time[bootstrap_addr]
-                ready[bootstrap_addr] = reqs
-                continue
-
-            count = self._ensure_retry_count.get(bootstrap_addr, 0) + 1
-            self._ensure_retry_count[bootstrap_addr] = count
-
+            count = self._ensure_retry_count.get(bootstrap_addr, 0)
             if count >= self._max_ensure_retries:
+                # Every attempt has finished without publishing anything: an
+                # outstanding fetch is skipped above, so reaching this point
+                # means the last one is done too. Checking the budget before
+                # spending an attempt keeps the last attempt's result from
+                # being discarded unseen.
+                if self.kv_manager.has_parallel_info(bootstrap_addr):
+                    # It published between the check at the top of this cycle
+                    # and here; the requests are fine, so do not abort them.
+                    self._clear_ensure_state(bootstrap_addr)
+                    ready[bootstrap_addr] = reqs
+                    continue
+
                 error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
                 logger.error(error_msg)
                 for decode_req in reqs:
                     # kv_receiver may be None from a prior self.queue cleanup
                     if decode_req.kv_receiver is not None:
                         decode_req.kv_receiver.abort()
-                del self._ensure_retry_count[bootstrap_addr]
-                del self._ensure_last_attempt_time[bootstrap_addr]
-            else:
-                remaining.extend(reqs)
+                self._clear_ensure_state(bootstrap_addr)
+                continue
+
+            self._ensure_retry_count[bootstrap_addr] = count + 1
+            self._ensure_last_attempt_time[bootstrap_addr] = now
+
+            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
+                self._clear_ensure_state(bootstrap_addr)
+                ready[bootstrap_addr] = reqs
+                continue
+
+            remaining.extend(reqs)
 
         return ready, remaining
+
+    def _clear_ensure_state(self, bootstrap_addr: str) -> None:
+        """Drop the per-addr fetch retry bookkeeping once info is available."""
+        self._ensure_retry_count.pop(bootstrap_addr, None)
+        self._ensure_last_attempt_time.pop(bootstrap_addr, None)
 
     def _resolve_pending_reqs(self) -> None:
         """Batch-resolve prefill_dp_ranks for pending requests and initialize receivers."""

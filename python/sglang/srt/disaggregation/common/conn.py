@@ -105,7 +105,7 @@ class PrefillServerInfo:
     # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
     prefill_http_port: Optional[int] = None
 
-    # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
+    # Pre-computed rank mapping (set by _publish_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
     target_tp_ranks: Optional[List[int]] = None
     target_cp_ranks: Optional[List[int]] = None
@@ -246,6 +246,21 @@ class CommonKVManager(BaseKVManager):
             self.connection_lock = threading.Lock()
             self.required_prefill_response_num_table: Dict[int, int] = {}
             self.prefill_info_table: Dict[str, PrefillServerInfo] = {}
+            # Parallel-info fetches run here instead of inline on the scheduler
+            # thread; see try_ensure_parallel_info. A few workers so one
+            # unreachable bootstrap server cannot delay the fetch for other
+            # addrs (at most one fetch per addr is in flight).
+            self._parallel_info_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="pd-parallel-info"
+            )
+            # Addrs with a fetch in flight, mutated under connection_lock so
+            # repeated scheduling cycles do not queue duplicate fetches. The
+            # parallel_info_fetch_in_flight() predicate reads it without the
+            # lock: a stale answer only costs a skipped cycle or one extra call
+            # that the re-check under the lock rejects.
+            self._parallel_info_inflight: Set[str] = set()
+            # Set by a fetch thread when it hits a fatal config mismatch.
+            self._parallel_info_fatal: Optional[BaseException] = None
             self.heartbeat_failures: Dict[str, int] = {}
             self.session_pool: Dict = defaultdict(requests.Session)
             self.session_pool_lock = threading.Lock()
@@ -506,11 +521,84 @@ class CommonKVManager(BaseKVManager):
 
     def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
         """Single non-blocking attempt to fetch and cache prefill parallel info.
-        Returns True if info is available (cached or freshly fetched)."""
-        if bootstrap_addr in self.prefill_info_table:
+        Returns True if info is available (cached or freshly fetched).
+
+        This runs on the decode scheduler's event loop, so the HTTP fetch itself
+        is handed to a background executor: a bootstrap server that stops
+        answering (rather than refusing) would otherwise stall the loop for the
+        full request timeout. Callers already treat False as "not available yet,
+        retry on a later scheduling cycle".
+        """
+        self.raise_parallel_info_error()
+
+        if self.has_parallel_info(bootstrap_addr):
             return True
 
-        info: PrefillServerInfo = None
+        with self.connection_lock:
+            # Re-check under the lock: a fetch may have published between the
+            # check above and here, and would then be repeated needlessly.
+            if bootstrap_addr in self.prefill_info_table:
+                return True
+            if bootstrap_addr in self._parallel_info_inflight:
+                return False
+            self._parallel_info_inflight.add(bootstrap_addr)
+
+        self._parallel_info_executor.submit(self._publish_parallel_info, bootstrap_addr)
+        return False
+
+    def raise_parallel_info_error(self) -> None:
+        """Re-raise, on the calling thread, a fatal error hit by a fetch thread.
+
+        A config mismatch is fatal exactly as it was when the fetch ran inline on
+        the scheduler thread, so it must not be left inside the executor. Callers
+        driving the fetch should call this once per scheduling cycle so the error
+        surfaces even if they take a path that does not fetch.
+        """
+        fatal = self._parallel_info_fatal
+        if fatal is not None:
+            raise fatal
+
+    def has_parallel_info(self, bootstrap_addr: str) -> bool:
+        """Whether parallel info for this addr is already cached. Cheap enough
+        to call on every scheduling cycle, unlike try_ensure_parallel_info which
+        may start a fetch."""
+        return bootstrap_addr in self.prefill_info_table
+
+    def parallel_info_fetch_in_flight(self, bootstrap_addr: str) -> bool:
+        """Whether a fetch for this addr has already been submitted and not
+        finished yet. Callers use this to avoid spending a retry attempt on a
+        fetch that is still running."""
+        return bootstrap_addr in self._parallel_info_inflight
+
+    def _publish_parallel_info(self, bootstrap_addr: str) -> None:
+        """Executor-thread body of try_ensure_parallel_info: fetch, validate and
+        publish the parallel info for one bootstrap addr."""
+        try:
+            info = self._fetch_parallel_info(bootstrap_addr)
+            if info is None:
+                return
+            self._check_parallel_info(info)
+            self._resolve_rank_mapping(info)
+            with self.connection_lock:
+                self.prefill_info_table[bootstrap_addr] = info
+            logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
+        except Exception as e:
+            # Config mismatches (and any unexpected error, which used to take
+            # the scheduler thread down here too) are re-raised on the scheduler
+            # thread by try_ensure_parallel_info. Log here as well so the error
+            # is never silent, even if no later call comes for this addr.
+            logger.exception(
+                f"Fatal error while fetching prefill parallel info from [{bootstrap_addr}]"
+            )
+            self._parallel_info_fatal = e
+        finally:
+            with self.connection_lock:
+                self._parallel_info_inflight.discard(bootstrap_addr)
+
+    def _fetch_parallel_info(self, bootstrap_addr: str) -> Optional[PrefillServerInfo]:
+        """Blocking HTTP fetch of one prefill server's parallel info. Returns
+        None if the bootstrap server is unreachable or answers non-200, which
+        the caller retries on a later scheduling cycle."""
         try:
             url = (
                 f"http://{bootstrap_addr}/route?"
@@ -519,18 +607,17 @@ class CommonKVManager(BaseKVManager):
             )
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
-                data = response.json()
-                info = PrefillServerInfo(**data)
-            else:
-                logger.error(
-                    f"Failed to get prefill server info: {response.status_code}, {response.text}"
-                )
-                return False
+                return PrefillServerInfo(**response.json())
+            logger.error(
+                f"Failed to get prefill server info: {response.status_code}, {response.text}"
+            )
         except Exception as e:
             logger.error(f"Error fetching prefill server info from bootstrap: {e}")
-            return False
+        return None
 
-        # Sanity checks
+    def _check_parallel_info(self, info: PrefillServerInfo) -> None:
+        """Validate the prefill server config against ours. Raises RuntimeError
+        on a mismatch, which is fatal for the engine."""
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             raise RuntimeError(
                 f"Page size mismatch: prefill server has page_size={info.page_size}, "
@@ -558,11 +645,6 @@ class CommonKVManager(BaseKVManager):
                     "PD decode DCP currently requires prefill attention CP=1, "
                     f"got {info.attn_cp_size}."
                 )
-
-        self._resolve_rank_mapping(info)
-        self.prefill_info_table[bootstrap_addr] = info
-        logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
-        return True
 
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
@@ -1280,7 +1362,7 @@ class CommonKVReceiver(BaseKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
 
-        # Read pre-computed rank mapping from prefill_info (computed in try_ensure_parallel_info)
+        # Read pre-computed rank mapping from prefill_info (computed in _publish_parallel_info)
         self.prefill_info = self.kv_mgr.prefill_info_table[self.bootstrap_addr]
         self.target_tp_rank = self.prefill_info.target_tp_rank
         self.target_tp_ranks = self.prefill_info.target_tp_ranks

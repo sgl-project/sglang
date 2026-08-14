@@ -163,9 +163,12 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._max_ensure_retries = 1
         queue._ensure_retry_interval = 0
-        queue._ensure_retry_count = {"127.0.0.1:11500": 0}
+        # Budget already spent, so this cycle takes the abort path.
+        queue._ensure_retry_count = {"127.0.0.1:11500": 1}
         queue._ensure_last_attempt_time = {}
         queue.kv_manager = MagicMock()
+        queue.kv_manager.has_parallel_info.return_value = False
+        queue.kv_manager.parallel_info_fetch_in_flight.return_value = False
         queue.kv_manager.try_ensure_parallel_info.return_value = False
 
         cleared_req = SimpleNamespace(
