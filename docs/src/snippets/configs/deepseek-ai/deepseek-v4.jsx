@@ -119,6 +119,14 @@ sgl-eval run gpqa \\
   --temperature 1.0 --top-p 1.0 --thinking \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
+        "pro-official":
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run gpqa \\
+  --model {{MODEL_NAME}} --api-key <api-key> \\
+  --n-repeats 16 --max-tokens 400000 \\
+  --temperature 1.0 --top-p 1.0 --thinking \\
+  --out-dir /sgl-workspace/logs \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
       },
       aime25_pct: {
         "flash-official":
@@ -145,6 +153,14 @@ sgl-eval run aime25 \\
   --temperature 1.0 --top-p 1.0 --thinking \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
+        "pro-official":
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run aime25 \\
+  --model {{MODEL_NAME}} --api-key <api-key> \\
+  --n-repeats 16 --max-tokens 400000 \\
+  --temperature 1.0 --top-p 1.0 --thinking \\
+  --out-dir /sgl-workspace/logs \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
       },
     },
     numPromptsByConc: { 1: 32, 16: 32, 64: 128, 256: 512, 1024: 2048, 4096: 4096 },
@@ -154,6 +170,7 @@ sgl-eval run aime25 \\
   defaultAccuracy: {
     flash: { gpqa_pct: 88.1, aime25_pct: 95,   gsm8k_pct: 96.13 },
     pro:   { gpqa_pct: 90.1, aime25_pct: 97.5, gsm8k_pct: 96.13 },
+    "pro-official": { gpqa_pct: 89.7, aime25_pct: 98.1, gsm8k_pct: 96.13 },
   },
 
   // The eval set rendered in the benchmark card + "⚡ Reproduce" (the engine
@@ -206,8 +223,8 @@ sgl-eval run aime25 \\
       knobs: [
         { id: "tp", label: "TP", values: [
           null,
-          { value: 1, hide: { variant: ["pro"] } },
-          { value: 2, hide: { variant: ["pro"] } },
+          { value: 1, hide: { variant: ["pro", "pro-official"] } },
+          { value: 2, hide: { variant: ["pro", "pro-official"] } },
           4,
           8,
           { value: 16, disable: { nodes: ["single"] },
@@ -223,8 +240,8 @@ sgl-eval run aime25 \\
           values: [
             null,
             false,
-            { value: 1, hide: { variant: ["pro"] } },
-            { value: 2, hide: { variant: ["pro"] } },
+            { value: 1, hide: { variant: ["pro", "pro-official"] } },
+            { value: 2, hide: { variant: ["pro", "pro-official"] } },
             4,
             8,
             { value: 16, disable: { nodes: ["single"] },
@@ -267,8 +284,8 @@ sgl-eval run aime25 \\
       },
       ep: { label: "EP", values: [
         null,
-        { value: 1, hide: { variant: ["pro"] } },
-        { value: 2, hide: { variant: ["pro"] } },
+        { value: 1, hide: { variant: ["pro", "pro-official"] } },
+        { value: 2, hide: { variant: ["pro", "pro-official"] } },
         4,
         8,
         { value: 16, disable: { nodes: ["single"] },
@@ -299,7 +316,7 @@ sgl-eval run aime25 \\
           hide: { variant: ["flash-official", "pro-official"] } },
         { id: "dspark",     label: "DSpark",
           flags: ["--speculative-algorithm DSPARK"],
-          hide: { variant: ["flash", "pro"] },
+          hide: { variant: ["flash", "pro"], hw: ["mi300x", "mi355x"] },
           disable: [
             { when: { dpAttnOn: [true] },
               reason: "DSpark is not compatible with DP Attention on the current release." },
@@ -1353,7 +1370,7 @@ sgl-eval run aime25 \\
     // ====================================================================
     {
       match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",

@@ -1,6 +1,6 @@
 // DeepSeek-V4 per-cell benchmark numbers, keyed by the same `match` tuple as
 // deepseek-v4.jsx cells. See _deployment.jsx for the speed/accuracy schema.
-// Measured on sglang v0.5.15 / v0.5.15.post1 / v0.5.16 (per-cell sglang_version).
+// Measured on sglang v0.5.15 / v0.5.15.post1 / v0.5.16 / v0.5.17 (per-cell sglang_version).
 // tokens_per_sec_per_gpu is total (input+output) tok/s/GPU = output/GPU × (isl+osl)/osl.
 export const benchmarks = [
   // ====================================================================
