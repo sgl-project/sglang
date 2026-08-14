@@ -56,6 +56,10 @@ class _FakeTreeCore:
     def _cascade_evict(self, node, component, tracker, device_frees, host_frees):
         self.cascaded.append(node)
 
+    def _restate_component_placement(self, node, medium):
+        # KV-event hook; no-op here (this fake emits no events).
+        pass
+
 
 class _FakeUnifiedCache:
     tree_components = _FakeTreeCore.tree_components
