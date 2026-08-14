@@ -22,6 +22,9 @@ from sglang.srt.hardware_backend.npu.moe.quant import HiddenStatesDynamicQuant
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _get_float4_e2m1fn_x2_dtype,
     _get_float8_e8m0fnu_dtype,
+    _npu_is_a5_for_tensor,
+    fp8_grouped_matmul_npu,
+    relayout_npu_block_fp8_weight,
 )
 
 logger = logging.getLogger(__name__)
@@ -231,6 +234,96 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
         if bias is None:
             bias = getattr(quant_info, f"{weight_prefix}_weight_bias", None)
         return {"bias": [bias]} if bias is not None else {}
+
+
+# ---------------------------------------------------------------------------
+#  Standard [128,128] block-FP8 MoE
+# ---------------------------------------------------------------------------
+class NPUBlockFP8MoEMethod(_NPUMoEMethodBase):
+    """One W13/W2 grouped GEMM for standard block-FP8 checkpoints.
+
+    Routing is intentionally owned by the modular Ascend runner. The same
+    ``apply`` therefore serves AscendTP prefill/decode and DeepEP normal/LL
+    payloads without duplicating (or conditionally importing) routing helpers.
+    """
+
+    def __init__(self, weight_prefix: str) -> None:
+        super().__init__(quant_config=None)
+        if weight_prefix not in ("w13", "w2"):
+            raise ValueError(
+                f"weight_prefix must be 'w13' or 'w2', got {weight_prefix!r}."
+            )
+        self.weight_prefix = weight_prefix
+
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, weight_prefix: str
+    ) -> None:
+        if weight_prefix != self.weight_prefix:
+            raise ValueError(
+                f"Kernel for {self.weight_prefix!r} cannot process {weight_prefix!r}."
+            )
+        self._validate_weight_prefix(layer, weight_prefix)
+        weight_name = f"{weight_prefix}_weight"
+        scale_name = f"{weight_prefix}_weight_scale_inv"
+        scale = layer._parameters.get(scale_name)
+        if scale is None:
+            raise RuntimeError(
+                f"{scale_name} is required for standard Ascend block-FP8 MoE."
+            )
+        weight = layer._parameters[weight_name]
+        if weight.device.type != "npu" or scale.device != weight.device:
+            raise RuntimeError(
+                "Ascend block-FP8 MoE weights and scales must share one NPU device."
+            )
+
+        weight_data, scale_data = relayout_npu_block_fp8_weight(
+            weight.data,
+            scale.data,
+            (128, 128),
+            before_a5=not _npu_is_a5_for_tensor(weight),
+        )
+        weight.data = weight_data
+        scale.data = scale_data
+        weight.requires_grad_(False)
+        scale.requires_grad_(False)
+
+        if weight_prefix == "w13":
+            # Both pre-A5 soft-FP8 and A5 dynamic block quantization consume a
+            # BF16 routed payload. This also keeps DeepEP normal/LL contracts
+            # identical; the GMM dynamically quantizes locally on A5.
+            self._set_dispatcher_output_dtype(layer, "bf16")
+
+    def apply(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        output_dtype: torch.dtype,
+        weight_prefix: str,
+        group_list_type,
+    ) -> torch.Tensor:
+        if weight_prefix != self.weight_prefix:
+            raise ValueError(
+                f"Kernel for {self.weight_prefix!r} cannot apply {weight_prefix!r}."
+            )
+        weight = getattr(quant_info, f"{weight_prefix}_weight")
+        weight_scale = getattr(quant_info, f"{weight_prefix}_weight_scale")
+        if weight_scale is None:
+            raise RuntimeError(
+                f"{weight_prefix}_weight_scale is required for block-FP8 MoE."
+            )
+        bias_args = self._get_bias_args(quant_info, weight_prefix)
+        return fp8_grouped_matmul_npu(
+            input=hidden_states,
+            input_scale=pertoken_scale,
+            weight=weight,
+            weight_scale=weight_scale,
+            group_list_type=group_list_type,
+            group_list=expert_tokens,
+            output_dtype=output_dtype,
+            bias=bias_args.get("bias", [None])[0],
+        )
 
 
 # ---------------------------------------------------------------------------
