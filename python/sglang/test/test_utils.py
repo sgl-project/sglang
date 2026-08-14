@@ -482,8 +482,6 @@ def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
         "--device",
         type=str,
         default="auto",
-        # Mirror ServerArgs so a server-supported device is never rejected here.
-        # "rocm" is absent: PyTorch drives AMD GPUs via the "cuda" device type.
         choices=["auto"] + SUPPORTED_DEVICES,
         help=(
             "Device type ("
@@ -944,8 +942,7 @@ def popen_launch_server(
         other_args: Additional command line arguments
         env: Environment dict for subprocess
         return_stdout_stderr: Optional tuple for output capture
-        device: Device type ("auto" or any of SUPPORTED_DEVICES, e.g. "cuda",
-            "xpu", "cpu"). "auto" resolves the available platform.
+        device: Device type ("auto", "cuda", "rocm", "xpu" or "cpu")
         pd_separated: Whether to use PD separated mode
         num_replicas: Number of replicas for mixed PD mode
 
@@ -1631,8 +1628,9 @@ def run_bench_serving_multi(
 def run_bench_one_batch(model, other_args):
     """Launch a offline process with automatic device detection.
 
-    The device is always resolved from the running platform (cuda, xpu, npu,
-    cpu, ...) and appended as ``--device`` to ``other_args``.
+    Args:
+        device: Device type ("auto", "cuda", "rocm" or "cpu").
+            If "auto", will detect available platforms automatically.
     """
     device = auto_config_device()
     print(f"Auto-configed device: {device}", flush=True)
