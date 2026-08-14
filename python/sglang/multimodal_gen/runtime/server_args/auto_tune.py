@@ -302,6 +302,7 @@ class ServerArgsAutoTuner:
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference
             or args.layerwise_offload_components is not None
+            or args.dit_layerwise_offload is True
         ):
             return
 

@@ -43,6 +43,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
+    LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP,
+    LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
+    LAYERWISE_OFFLOAD_VAE_GROUP,
     RESIDENCY_POLICIES,
     RESIDENCY_POLICY_LEADING,
     cpu_offload_component_matches,
@@ -1511,6 +1514,61 @@ class ServerArgs(DisaggServerArgsMixin):
                 ]
 
         self.layerwise_offload_components = selected_component_names
+        self._clear_non_dit_component_offload_for_layerwise_groups(
+            selected_component_names or ()
+        )
+
+        has_explicit_dit_offload = bool(
+            self.canonical_residency_mode("transformer")
+            in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD)
+            or self.is_explicit_layerwise_offload_component("transformer")
+            or (
+                self.is_arg_explicitly_set("cpu_offload_components")
+                and cpu_offload_component_matches(
+                    "transformer", self.cpu_offload_components
+                )
+            )
+            or (self.is_arg_explicitly_set("dit_cpu_offload") and self.dit_cpu_offload)
+        )
+        if (
+            self.is_arg_explicitly_set("dit_layerwise_offload")
+            and not self.dit_layerwise_offload
+            and not has_explicit_dit_offload
+        ):
+            self.dit_cpu_offload = False
+
+    def _clear_non_dit_component_offload_for_layerwise_groups(
+        self, selected_component_names: tuple[str, ...] | list[str]
+    ) -> None:
+        selected = set(selected_component_names)
+        select_all = LAYERWISE_OFFLOAD_ALL_COMPONENTS in selected
+        disabled_explicit_flags: list[str] = []
+
+        if (select_all or LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP in selected) and (
+            self.text_encoder_cpu_offload is not False
+        ):
+            self.text_encoder_cpu_offload = False
+            if self.is_arg_explicitly_set("text_encoder_cpu_offload"):
+                disabled_explicit_flags.append("text_encoder_cpu_offload")
+        if (select_all or LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP in selected) and (
+            self.image_encoder_cpu_offload is not False
+        ):
+            self.image_encoder_cpu_offload = False
+            if self.is_arg_explicitly_set("image_encoder_cpu_offload"):
+                disabled_explicit_flags.append("image_encoder_cpu_offload")
+        if (select_all or LAYERWISE_OFFLOAD_VAE_GROUP in selected) and (
+            self.vae_cpu_offload is not False
+        ):
+            self.vae_cpu_offload = False
+            if self.is_arg_explicitly_set("vae_cpu_offload"):
+                disabled_explicit_flags.append("vae_cpu_offload")
+
+        if disabled_explicit_flags:
+            logger.info(
+                "Ignoring component-offload flags because layerwise offload "
+                "controls the same component groups: %s",
+                ", ".join(disabled_explicit_flags),
+            )
 
     def _adjust_autocast(self):
         if self.disable_autocast is None:

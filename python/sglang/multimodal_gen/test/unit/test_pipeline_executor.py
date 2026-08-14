@@ -5,6 +5,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    COMPONENT_OFFLOAD,
+    LAYERWISE_OFFLOAD,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.executors import pipeline_executor
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -35,18 +39,18 @@ def _batch():
     return SimpleNamespace(profile=False, is_warmup=False)
 
 
+class _TestServerArgs(SimpleNamespace):
+    def should_cpu_offload_component(self, component_name):
+        return self.component_modes.get(component_name) == COMPONENT_OFFLOAD
+
+
 def _server_args(**overrides):
     values = {
         "use_fsdp_inference": False,
-        "dit_cpu_offload": False,
-        "text_encoder_cpu_offload": False,
-        "image_encoder_cpu_offload": False,
-        "vae_cpu_offload": False,
-        "dit_layerwise_offload": False,
-        "layerwise_offload_components": (),
+        "component_modes": {},
     }
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return _TestServerArgs(**values)
 
 
 class _NoGradPlatform:
@@ -128,10 +132,19 @@ def test_group_payload_is_forwarded_to_component_residency_manager():
     ("server_args", "component_names"),
     [
         (_server_args(use_fsdp_inference=True), ("transformer",)),
-        (_server_args(dit_cpu_offload=True), ("transformer",)),
-        (_server_args(text_encoder_cpu_offload=True), ("text_encoder",)),
-        (_server_args(image_encoder_cpu_offload=True), ("image_encoder",)),
-        (_server_args(vae_cpu_offload=True), ("vae",)),
+        (
+            _server_args(component_modes={"transformer": COMPONENT_OFFLOAD}),
+            ("transformer",),
+        ),
+        (
+            _server_args(component_modes={"text_encoder": COMPONENT_OFFLOAD}),
+            ("text_encoder",),
+        ),
+        (
+            _server_args(component_modes={"image_encoder": COMPONENT_OFFLOAD}),
+            ("image_encoder",),
+        ),
+        (_server_args(component_modes={"vae": COMPONENT_OFFLOAD}), ("vae",)),
     ],
 )
 def test_stage_context_preserves_version_counters_when_needed(
@@ -151,16 +164,12 @@ def test_stage_context_preserves_version_counters_when_needed(
 @pytest.mark.parametrize(
     ("server_args", "component_names"),
     [
-        (_server_args(dit_layerwise_offload=True), ("transformer",)),
         (
-            _server_args(
-                text_encoder_cpu_offload=True,
-                layerwise_offload_components=("transformer",),
-            ),
+            _server_args(component_modes={"transformer": LAYERWISE_OFFLOAD}),
             ("transformer",),
         ),
         (
-            _server_args(layerwise_offload_components=("text_encoder",)),
+            _server_args(component_modes={"text_encoder": LAYERWISE_OFFLOAD}),
             ("text_encoder",),
         ),
     ],

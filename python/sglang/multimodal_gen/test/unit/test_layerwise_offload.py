@@ -177,6 +177,7 @@ class _LayerwiseComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
 class _TestServerArgs(SimpleNamespace):
     canonical_residency_mode = ServerArgs.canonical_residency_mode
     explicit_residency_mode = ServerArgs.explicit_residency_mode
+    _legacy_component_offload_flag = ServerArgs._legacy_component_offload_flag
     residency_mode = ServerArgs.residency_mode
     is_arg_explicitly_set = ServerArgs.is_arg_explicitly_set
     is_explicit_layerwise_offload_component = (
