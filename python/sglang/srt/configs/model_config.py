@@ -1466,7 +1466,7 @@ class ModelConfig:
             # so eligible MoE experts are requantized online.
             "modelopt_fp4": ["modelopt", "fp8"],
             "modelopt_mixed": ["modelopt"],
-            "nvfp4_online": ["fp8"],
+            "nvfp4_online": ["fp8", "modelopt_fp8"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],

@@ -190,7 +190,7 @@ class QuantizationConfig(ABC):
         # to the source format.
         from sglang.srt.configs.model_config import REQUANTIZATION_METHODS
 
-        if user_quant in REQUANTIZATION_METHODS:
+        if user_quant == "nvfp4_online" or user_quant in REQUANTIZATION_METHODS:
             return None
 
         # Check if this is a ModelOpt config
