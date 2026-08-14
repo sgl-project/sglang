@@ -103,7 +103,10 @@ def build_kernel_page_table(
         f"(bs={bs}, max_pages={max_pages})"
     )
     assert out.stride(1) == 1, "build_kernel_page_table: out rows must be packed"
-    assert max_pages * page_size <= req_to_token.shape[1], (
+    # The last page may be partial (req_to_token width need not be a page
+    # multiple); only its START must be in bounds — the kernel reads column
+    # c*ps for c < ceil(seq/ps) and seq is bounded by the table width.
+    assert (max_pages - 1) * page_size < req_to_token.shape[1], (
         f"build_kernel_page_table: max_pages={max_pages} x ps={page_size} "
         f"exceeds req_to_token width {req_to_token.shape[1]}"
     )

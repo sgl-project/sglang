@@ -31,11 +31,13 @@ import torch
 
 from sglang.srt.mem_cache.multi_ended_allocator import (
     MultiEndedAllocator,
+    UnifiedMambaTokenToKVPoolAllocator,
     UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MHASubPoolSpec,
+    MLASubPoolSpec,
     UnifiedKVPool,
 )
 
@@ -2654,6 +2656,80 @@ class TestSWACompositeDenseSurface(unittest.TestCase):
         self.assertTrue(bool((got >= 0).all().item()))
         in_tomb = v // self.PS == tomb_page
         self.assertTrue(bool((got[in_tomb] == 0).all().item()))
+
+
+class TestPs64MLACompositeFeasibility(unittest.TestCase):
+    """The Kimi/flashmla shape: MLA + mamba composite at page_size=64 (the
+    flashmla arg snap). Large pages stress every sizing derivation at once —
+    the 64-token sink-page floor, the ps*entry_bytes dense-view tail pad, and
+    the page-granular alloc — so this pins that the factory-shaped
+    construction stays FEASIBLE and the dense surface stays on-formula when
+    the page size jumps from the usual 1..4 to 64."""
+
+    PS = 64
+    LAYERS = 3
+
+    def _build(self):
+        full = MLASubPoolSpec(
+            name="full",
+            layer_num=self.LAYERS,
+            kv_lora_rank=64,
+            qk_rope_head_dim=16,
+            store_dtype=torch.float16,
+            grow_direction="down",
+        )
+        mamba = MambaSubPoolSpec(
+            name="mamba",
+            layer_num=2,
+            conv_state_shapes=((8, 16),),
+            conv_dtype=torch.bfloat16,
+            temporal_state_shape=(4, 8, 8),
+            temporal_dtype=torch.float32,
+            grow_direction="up",
+        )
+        n_full = 8 * self.PS  # 8 pages incl. the sink page
+        total = n_full * full.entry_bytes() + 16 * mamba.entry_bytes()
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=self.PS,
+        )
+        full_kv = _FakeKVCache(pool.max_slots("full"))
+        full_kv.attach_allocator = lambda allocator: None
+        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        mamba_kv.attach_allocator = lambda allocator: None
+        mamba_kv._copy_from_physical = lambda src, dst: None
+
+        class _FakeHybridLinearKVPool:
+            full_kv_pool = full_kv
+            mamba_pool = mamba_kv
+
+        return UnifiedMambaTokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=_FakeHybridLinearKVPool(),
+            device=_DEV,
+            page_size=self.PS,
+            need_sort=False,
+            forward_stream=None,
+            full_kernel_page_multiplier=self.LAYERS,
+        )
+
+    def test_construction_alloc_and_dense_formula(self):
+        a = self._build()
+        self.assertEqual(a.kernel_page_multiplier, self.LAYERS)
+        v = a.alloc(2 * self.PS)
+        self.assertIsNotNone(v, "2-page alloc infeasible at ps=64")
+        # Page-aligned virtual run (page-granular allocator invariant).
+        self.assertEqual(int(v[0].item()) % self.PS, 0)
+        # Dense translate follows the affine formula at ps=64, and every id
+        # fits int32 (the canonical narrows on store).
+        v2p = a.full_v2p_page_table
+        want = v2p[v // self.PS] * (self.PS * self.LAYERS) + v % self.PS
+        got = a.translate_kv_loc_dense(v)
+        self.assertTrue(torch.equal(got, want), "dense formula broke at ps=64")
+        self.assertTrue(bool((got < 2**31).all().item()))
 
 
 if __name__ == "__main__":
