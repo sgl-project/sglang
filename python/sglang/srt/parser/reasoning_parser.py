@@ -23,6 +23,17 @@ from sglang.srt.function_call.kimik3_format import (
     strip_partial_marker_suffix,
     strip_response_wrappers,
 )
+from sglang.srt.function_call.muse_glimmer_format import (
+    EOM,
+    EOT,
+    MAX_CHANNEL_MARKER,
+    MESSAGE,
+    RECIPIENT_RE,
+    START,
+    could_start_header,
+    has_atem_markers,
+    partial_marker_len,
+)
 from sglang.srt.parser.harmony_parser import HarmonyParser
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_INVOKE_TOOL_JSON,
@@ -194,6 +205,8 @@ class BaseReasoningFormatDetector:
         # Strip `<think>` token if present
         if not self.stripped_think_start and think_start_text in current_text:
             current_text = current_text.replace(think_start_text, "", 1)
+            # Write back, or stream_reasoning=False carries the token into finish().
+            self._buffer = current_text
             self.stripped_think_start = True
             self._in_reasoning = True
 
@@ -213,7 +226,8 @@ class BaseReasoningFormatDetector:
 
         # Continue with reasoning content
         if self._in_reasoning:
-            # Check for tool_start_token interruption
+            # Check for tool_start_token interruption. Streaming cannot see a
+            # think_end_token that has not arrived yet; see the chunk_dependent test.
             if self.tool_start_token and self.tool_start_token in current_text:
                 tool_idx = current_text.find(self.tool_start_token)
                 reasoning_text = current_text[:tool_idx]
@@ -225,9 +239,21 @@ class BaseReasoningFormatDetector:
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
             if self.stream_reasoning:
-                # Stream the content immediately
-                self._buffer = ""
-                return StreamingParseResult(reasoning_text=current_text)
+                # Minus any trailing slice that could be a token split across chunks.
+                holdback_tokens = [self.think_end_token]
+                if self.tool_start_token:
+                    holdback_tokens.append(self.tool_start_token)
+                if not self.stripped_think_start:
+                    # force_reasoning never saw the opening token; it can still split.
+                    holdback_tokens.append(think_start_text)
+                holdback = max(
+                    self._ends_with_partial_token(current_text, token)
+                    for token in holdback_tokens
+                )
+                self._buffer = current_text[len(current_text) - holdback :]
+                return StreamingParseResult(
+                    reasoning_text=current_text[: len(current_text) - holdback]
+                )
             else:
                 return StreamingParseResult()
 
@@ -244,15 +270,30 @@ class BaseReasoningFormatDetector:
             return text[len(think_start_text) :]
         return text
 
+    @staticmethod
+    def _ends_with_partial_token(buffer: str, token: str) -> int:
+        """Length of the longest trailing slice of `buffer` that is a strict prefix
+        of `token`. Longest, so a token whose prefix repeats inside itself does not
+        get cut short and leak the rest of the marker."""
+        for i in range(min(len(buffer), len(token) - 1), 0, -1):
+            if token.startswith(buffer[-i:]):
+                return i
+        return 0
+
     def finish(self) -> StreamingParseResult:
-        """Flush reasoning buffered under stream_reasoning=False when the stream ends
-        before the end token (e.g. max_tokens cut it short), instead of dropping it.
+        """Flush reasoning still buffered when the stream ends before the end token
+        (e.g. max_tokens cut it short), instead of dropping it: the whole block under
+        stream_reasoning=False, the held-back token suffix under stream_reasoning=True.
         force_nonempty_content emits it as normal_text, else as reasoning_text."""
         if not self._in_reasoning:
-            return StreamingParseResult()
+            # Same as the reasoning-side flush below: a held-back slice that never
+            # became a token is content.
+            leftover = self._buffer
+            self._buffer = ""
+            return StreamingParseResult(normal_text=leftover)
 
-        # stream_reasoning=False never clears _buffer, so the opening think token
-        # (stripped only from the base class's local view) survives here.
+        # Defensive: subclasses that fill _buffer themselves may not have stripped
+        # the opening think token that _parse_streaming_increment_impl removes.
         buffer = self._strip_leading_think_start(self._buffer)
         self._buffer = ""
 
@@ -263,7 +304,7 @@ class BaseReasoningFormatDetector:
                 return StreamingParseResult(normal_text=normal_text)
             return StreamingParseResult()
 
-        if not self.stream_reasoning and buffer:
+        if buffer:
             return StreamingParseResult(reasoning_text=buffer)
 
         return StreamingParseResult()
@@ -1116,6 +1157,8 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             dsv4_thinking_start_token,
             dsv4_thinking_end_token,
             think_excluded_tokens=[dsv4_eos_token, dsv4_dsml_token],
+            # Leading "<" included: has_tool_call() matches on it.
+            tool_start_token=f"<{dsv4_dsml_token}",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
@@ -1173,13 +1216,6 @@ class Apertus2509Detector(BaseReasoningFormatDetector):
         self._tool_end_token = "<|tools_suffix|>"
         self._reasoning_acc: str = ""
         self._in_inner_tool: bool = False
-
-    @staticmethod
-    def _ends_with_partial_token(buffer: str, token: str) -> int:
-        for i in range(1, min(len(buffer) + 1, len(token))):
-            if token.startswith(buffer[-i:]):
-                return i
-        return 0
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         blocks = self.detect_and_parse_block_sequence(text)
@@ -1614,6 +1650,213 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
         return self._maybe_apply_force_nonempty_content(ret)
 
 
+class MuseGlimmerDetector(BaseReasoningFormatDetector):
+    """Detector for Muse Glimmer's recipient-channel format.
+
+    The chat template ends the generation prompt at ``<|start|>assistant`` with no
+    recipient and no ``<|message|>``, so the model itself emits the channel header as
+    ordinary text. A full turn looks like::
+
+        " to=self<|message|>"    <reasoning>   "<|eom|>"
+        "<|start|>assistant to=user<|message|>"  <answer>  "<|eot|>"
+
+    Reasoning is the ``to=self`` channel; the answer is ``to=user``. Any other recipient
+    is a tool call (``to=functions.get_weather``), whose body is an ATEM block that must
+    reach the function-call detector with its markers intact — so those channels are
+    emitted as normal text including their header, following GptOssDetector's precedent
+    of preserving raw structural text for tool calls.
+
+    When a tool-call parser consumes this detector's normal text
+    (``tool_call_parser_active=True``), the ``to=user`` channel keeps its framing too,
+    so the downstream detector sees every channel boundary and can tell a real tool
+    channel from one merely *quoted* inside the answer — unwrapping here would make a
+    quoted ``<|start|>assistant to=<tool><|message|>`` indistinguishable from a real
+    header and turn quoted markup into a live call. The tool detector unwraps
+    ``to=user`` itself, so nothing framed leaks to the client. Non-streaming
+    additionally requires that a turn *without* any ATEM block come out unwrapped,
+    because serving bypasses the tool detector entirely when ``has_tool_call()`` is
+    false — hence the ATEM-presence branch in ``detect_and_parse``, mirroring the
+    vendor's reference reasoning parser.
+
+    Keying on ``<|message|>`` rather than the literal " to=self" mirrors the vendor's own
+    reference implementation (which slices past the last ``<|message|>`` token),
+    and is robust to the header varying with
+    the recipient. It does require the delimiters to survive detokenization, which is why
+    ``muse`` is registered in ``_patch_reasoning_skip_special_tokens``.
+
+    A single channel may also be cut short by the token cap, in which case there is no
+    terminator and the partial body is still attributed to whichever channel was open.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+        tool_call_parser_active: bool = False,
+    ):
+        super().__init__(
+            " to=self" + MESSAGE,
+            EOM,
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+        )
+        self._recipient: Optional[str] = None
+        self._in_body = False
+        self._at_stream_start = True
+        self._pending_reasoning = ""
+        self._tool_call_parser_active = tool_call_parser_active
+        self._saw_reasoning_block = False
+
+    def _sink(self, recipient: Optional[str]) -> str:
+        return "reasoning" if recipient == "self" else "normal"
+
+    def _consume(self, flush: bool, preserve_channels: bool = False) -> Tuple[str, str]:
+        """Drain self._buffer into (reasoning, normal).
+
+        With flush=False, holds back a short tail that could be the prefix of a marker
+        split across chunk boundaries; with flush=True, emits everything.
+
+        With preserve_channels=True, the ``to=user`` channel keeps its header and
+        terminator like tool channels do (see the class docstring for why the
+        function-call detector needs the framing intact); reasoning is always
+        extracted and never framed.
+        """
+        reasoning_parts: List[str] = []
+        normal_parts: List[str] = []
+
+        while self._buffer:
+            if not self._in_body:
+                # Without this, unframed prose never streams: it buffers
+                # forever waiting for a <|message|> that never arrives.
+                if not (self._at_stream_start and could_start_header(self._buffer)):
+                    ws = len(self._buffer) - len(self._buffer.lstrip())
+                    head = self._buffer[ws : ws + len(START)]
+                    if not START.startswith(head):
+                        self._in_body = True
+                        self._recipient = None
+                        self._at_stream_start = False
+                        continue
+                    if ws:
+                        normal_parts.append(self._buffer[:ws])
+                        self._buffer = self._buffer[ws:]
+                    if len(head) < len(START):
+                        break
+
+                idx = self._buffer.find(MESSAGE)
+                if idx == -1:
+                    if flush:
+                        normal_parts.append(self._buffer)
+                        self._buffer = ""
+                    break
+                self._at_stream_start = False
+                header = self._buffer[:idx]
+                m = RECIPIENT_RE.search(header)
+                self._recipient = m.group(1) if m else "user"
+                self._buffer = self._buffer[idx + len(MESSAGE) :]
+                self._in_body = True
+                if self._sink(self._recipient) == "reasoning":
+                    if self._saw_reasoning_block:
+                        reasoning_parts.append("\n")
+                    self._saw_reasoning_block = True
+                elif self._recipient != "user" or preserve_channels:
+                    # Keep the header so the function-call detector sees it.
+                    normal_parts.append(header + MESSAGE)
+                continue
+
+            end_idx, end_tok = -1, ""
+            for tok in (EOM, EOT):
+                i = self._buffer.find(tok)
+                if i != -1 and (end_idx == -1 or i < end_idx):
+                    end_idx, end_tok = i, tok
+
+            if end_idx != -1:
+                body = self._buffer[:end_idx]
+                self._buffer = self._buffer[end_idx + len(end_tok) :]
+                self._in_body = False
+                if self._sink(self._recipient) == "reasoning":
+                    reasoning_parts.append(body)
+                else:
+                    normal_parts.append(body)
+                    if self._recipient != "user" or preserve_channels:
+                        normal_parts.append(end_tok)
+                self._recipient = None
+                continue
+
+            # Hold back only a genuine marker prefix.
+            if flush:
+                body, self._buffer = self._buffer, ""
+            else:
+                keep = partial_marker_len(
+                    self._buffer, (EOM, EOT, START), MAX_CHANNEL_MARKER
+                )
+                if keep == len(self._buffer):
+                    break
+                body = self._buffer[: len(self._buffer) - keep]
+                self._buffer = self._buffer[len(self._buffer) - keep :]
+            if not body:
+                break
+            if self._sink(self._recipient) == "reasoning":
+                reasoning_parts.append(body)
+            else:
+                normal_parts.append(body)
+
+        return "".join(reasoning_parts), "".join(normal_parts)
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        self._buffer += text
+        raw = self._buffer
+        reasoning, normal = self._consume(flush=True)
+        if self._tool_call_parser_active and has_atem_markers(normal):
+            self._buffer = raw
+            self._recipient = None
+            self._in_body = False
+            self._at_stream_start = True
+            self._saw_reasoning_block = False
+            reasoning, normal = self._consume(flush=True, preserve_channels=True)
+        return self._maybe_apply_force_nonempty_content(
+            StreamingParseResult(normal_text=normal, reasoning_text=reasoning)
+        )
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        self._buffer += new_text
+        reasoning, normal = self._consume(
+            flush=False, preserve_channels=self._tool_call_parser_active
+        )
+        if not self.stream_reasoning:
+            self._pending_reasoning += reasoning
+            reasoning = ""
+            if not self._in_body and self._pending_reasoning:
+                reasoning, self._pending_reasoning = self._pending_reasoning, ""
+        if self._force_nonempty_content:
+            # Kept so finish() can promote it to content if the turn produces
+            # none. Dropped on real content, NOT when the channel closes --
+            # <|eom|> lands in the same chunk as the last reasoning text.
+            self._accumulated_reasoning += reasoning
+            if normal:
+                self._accumulated_reasoning = ""
+        return StreamingParseResult(normal_text=normal, reasoning_text=reasoning)
+
+    def finish(self) -> StreamingParseResult:
+        reasoning, normal = self._consume(
+            flush=True, preserve_channels=self._tool_call_parser_active
+        )
+        if self._pending_reasoning:
+            reasoning = self._pending_reasoning + reasoning
+            self._pending_reasoning = ""
+        if self._force_nonempty_content:
+            promoted = self._accumulated_reasoning + reasoning
+            self._accumulated_reasoning = ""
+            if not normal and promoted:
+                return StreamingParseResult(normal_text=promoted)
+        return StreamingParseResult(normal_text=normal, reasoning_text=reasoning)
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -1623,6 +1866,10 @@ class ReasoningParser:
         model_type (str): Type of model to parse reasoning from
         stream_reasoning (bool): If False, accumulates reasoning content until complete.
             If True, streams reasoning content as it arrives.
+        tool_call_parser_active (bool): True when this parser's normal text feeds a
+            function-call parser rather than going straight to the client. Passed on
+            to detectors that accept it (channel-framed formats keep tool framing
+            intact for the downstream detector).
     """
 
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
@@ -1637,6 +1884,7 @@ class ReasoningParser:
         "kimi_k2": KimiK2Detector,
         "kimi_k3": KimiK3Detector,
         "mimo": _MimoDetector,
+        "muse": MuseGlimmerDetector,
         "poolside_v1": _PoolsideV1Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
@@ -1660,6 +1908,7 @@ class ReasoningParser:
         force_reasoning: Optional[bool] = None,
         request: ChatCompletionRequest = None,
         tokenizer=None,
+        tool_call_parser_active: bool = False,
     ):
         if not model_type:
             raise ValueError("Model type must be specified")
@@ -1704,6 +1953,11 @@ class ReasoningParser:
             sig = inspect.signature(detector_class)
             if "tokenizer" in sig.parameters:
                 kwargs["tokenizer"] = tokenizer
+
+        if tool_call_parser_active:
+            sig = inspect.signature(detector_class)
+            if "tool_call_parser_active" in sig.parameters:
+                kwargs["tool_call_parser_active"] = True
 
         self.detector = detector_class(**kwargs)
 
