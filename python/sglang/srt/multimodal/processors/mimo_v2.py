@@ -18,6 +18,8 @@ import torch
 import torch.nn.functional as F
 from fastapi import HTTPException
 from PIL import Image
+
+from sglang.srt.multimodal.mm_utils import validate_resource_url
 from torchcodec.decoders import AudioDecoder
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
@@ -1446,12 +1448,15 @@ class MiMoProcessor:
             image_obj = image
         elif isinstance(image, str):
             if image.startswith("http://") or image.startswith("https://"):
+                validate_resource_url(image)
                 with requests.get(image, stream=True) as response:
                     response.raise_for_status()
                     with BytesIO(response.content) as bio:
                         image_obj = copy.deepcopy(Image.open(bio))
             elif image.startswith("file://"):
-                image_obj = Image.open(image[7:])
+                raise ValueError(
+                    "file:// protocol is not allowed for security reasons"
+                )
             elif image.startswith("data:image"):
                 if "base64," in image:
                     _, base64_data = image.split("base64,", 1)
