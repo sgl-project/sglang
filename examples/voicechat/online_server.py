@@ -203,7 +203,19 @@ def create_app(runtime: VoiceChatRuntime) -> FastAPI:
 
     app = FastAPI(title="SGLang NVIDIA NemotronLabs VoiceChat", lifespan=lifespan)
 
+    @app.get("/")
+    async def discovery():
+        return {
+            "service": "sglang-nemotron-voicechat",
+            "websocket": "/v1/realtime",
+            "websocket_alias": "/realtime",
+            "health": "/v1/realtime/health",
+            "input_sample_rate": INPUT_SAMPLE_RATE,
+            "output_sample_rate": OUTPUT_SAMPLE_RATE,
+        }
+
     @app.get("/health")
+    @app.get("/v1/realtime/health")
     async def health():
         return {
             "ready": runtime.ready,
@@ -223,6 +235,7 @@ def create_app(runtime: VoiceChatRuntime) -> FastAPI:
         }
 
     @app.websocket("/v1/realtime")
+    @app.websocket("/realtime")
     async def realtime(websocket: WebSocket):
         await websocket.accept()
         if runtime.connection_lock.locked():

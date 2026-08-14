@@ -119,3 +119,18 @@ def test_warmup_can_be_disabled():
 
     assert runtime.ready
     assert runtime.warmup_duration_ms is None
+
+
+def test_app_exposes_realtime_discovery_and_alias_routes():
+    app = online_server.create_app(make_runtime([]))
+    http_paths = {
+        route.path for route in app.routes if "GET" in getattr(route, "methods", set())
+    }
+    websocket_paths = {
+        route.path
+        for route in app.routes
+        if route.__class__.__name__ == "APIWebSocketRoute"
+    }
+
+    assert {"/", "/health", "/v1/realtime/health"} <= http_paths
+    assert {"/realtime", "/v1/realtime"} <= websocket_paths
