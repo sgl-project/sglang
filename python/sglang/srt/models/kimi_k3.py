@@ -36,6 +36,7 @@ from sglang.srt.layers import (
 )
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
+from sglang.srt.layers.attention.linear.utils import get_linear_attn_prefill_backend
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
@@ -1705,9 +1706,13 @@ class KimiK3DeltaAttention(nn.Module):
 
         if not forward_batch.forward_mode.is_decode():
             forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
-            if not forward_batch.forward_mode.is_target_verify():
-                # Only chunk_kda (extend) wants pre-activated beta; the verify
-                # kernel sigmoids it in-kernel like decode.
+            if (
+                not forward_batch.forward_mode.is_target_verify()
+                and not get_linear_attn_prefill_backend().is_cake()
+            ):
+                # Triton and the other chunk backends take probabilities. Cake
+                # fuses sigmoid and consumes the original (possibly strided)
+                # projection logits without a materializing conversion.
                 beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)

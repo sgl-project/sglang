@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
     CakePackedDecodeReason,
     CakePrefillAdmission,
     CakePrefillReason,
+    maybe_build_cake_checkpoint_plan,
 )
 from sglang.srt.mem_cache.allocator.mamba import (
     MambaSlotAllocator,
@@ -151,7 +152,7 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
         tensor.is_cuda = is_cuda
         return tensor
 
-    def test_empty_interior_checkpoint_keeps_prefill_selector_parity(self):
+    def test_native_checkpoint_plan_makes_interior_tracking_eligible(self):
         q = self._selector_tensor((1, 5, 12, 128))
         k = self._selector_tensor((1, 5, 12, 128))
         v = self._selector_tensor((1, 5, 12, 128))
@@ -222,11 +223,64 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
                 return_intermediate_states=True,
                 track_ssm_h_src=torch.ones(1, dtype=torch.int64),
             )
+            planned_interior_checkpoint = CakeKDAKernel._cake_prefill_is_supported(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                query_start_loc=query_start_loc,
+                lower_bound=-5.0,
+                is_spec_decode=False,
+                return_intermediate_states=True,
+                track_ssm_h_src=torch.ones(1, dtype=torch.int64),
+                state_checkpoint_cu_starts=torch.tensor([0, 1, 2]),
+                num_state_checkpoints=2,
+                state_checkpoint_every_n_tokens=64,
+            )
 
         self.assertTrue(without_checkpoint)
         self.assertEqual(aligned_checkpoint, without_checkpoint)
         self.assertFalse(missing_checkpoint_track)
         self.assertFalse(interior_checkpoint)
+        self.assertTrue(planned_interior_checkpoint)
+
+    def test_checkpoint_plan_matches_kda_preblock_rows(self):
+        forward_batch = SimpleNamespace(
+            extend_seq_lens=torch.tensor([65, 131], dtype=torch.int32)
+        )
+        metadata = SimpleNamespace(
+            track_ssm_h_src=torch.tensor([0, 4], dtype=torch.int64),
+            state_checkpoint_cu_starts=None,
+            num_state_checkpoints=0,
+            state_checkpoint_every_n_tokens=0,
+        )
+
+        with patch.object(kda_flashinfer, "mamba_cache_chunk_size", return_value=64):
+            maybe_build_cake_checkpoint_plan(forward_batch, metadata, "cpu")
+
+        self.assertEqual(metadata.state_checkpoint_cu_starts.tolist(), [0, 2, 5])
+        self.assertEqual(metadata.num_state_checkpoints, 5)
+        self.assertEqual(metadata.state_checkpoint_every_n_tokens, 64)
+
+    def test_triton_fallback_activates_raw_beta_once(self):
+        from sglang.srt.layers.attention.linear.kernels.kda_triton import (
+            TritonKDAKernel,
+        )
+
+        q = torch.empty(1, 2, 1, 1)
+        raw_beta = torch.tensor([[[-2.0], [2.0]]])
+        sentinel = object()
+        with patch.object(TritonKDAKernel, "extend", return_value=sentinel) as extend:
+            result = CakeKDAKernel._extend_triton(
+                q, q, q, q, raw_beta, marker="fallback"
+            )
+
+        self.assertIs(result, sentinel)
+        self.assertTrue(torch.equal(extend.call_args.args[5], torch.sigmoid(raw_beta)))
+        self.assertEqual(extend.call_args.kwargs["marker"], "fallback")
 
     @staticmethod
     def _prefill_inputs():
@@ -237,7 +291,7 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
             "k": torch.randn(1, tokens, 12, 128, dtype=torch.bfloat16),
             "v": torch.randn(1, tokens, 12, 128, dtype=torch.bfloat16),
             "g": torch.randn(1, tokens, 12, 128, dtype=torch.bfloat16),
-            "beta": torch.rand(1, tokens, 12, dtype=torch.float32),
+            "beta": torch.randn(1, tokens, 12, dtype=torch.bfloat16),
             "cache_indices": torch.tensor([2, 0], dtype=torch.int32),
             "query_start_loc": torch.tensor([0, 2, 5], dtype=torch.int32),
             "A_log": torch.randn(1, 1, 12, 1, dtype=torch.float32),
@@ -252,7 +306,7 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
 
         def fake_recurrent_kda(**kwargs):
             cake_calls.append(kwargs)
-            return kwargs["v"].clone(), kwargs["initial_state"] + 1
+            return torch.empty_like(kwargs["v"]), kwargs["initial_state"]
 
         inputs = self._prefill_inputs()
         state_false = torch.randn(4, 12, 128, 128, dtype=torch.bfloat16)
@@ -306,7 +360,80 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
         self.assertTrue(torch.equal(output_true, output_false))
         self.assertTrue(torch.equal(state_true, state_false))
         self.assertEqual(h_empty.shape, (1, 0, 12, 128, 128))
-        self.assertEqual(h_empty.dtype, torch.float32)
+        self.assertEqual(h_empty.dtype, torch.bfloat16)
+
+    def test_strided_beta_indexed_pool_and_checkpoints_are_forwarded_without_copy(self):
+        kernel = object.__new__(CakeKDAKernel)
+        kernel._backend = "cake"
+        kernel._gate_cache = {}
+        inputs = self._prefill_inputs()
+        beta_storage = torch.randn(1, 5, 32, dtype=torch.bfloat16)
+        inputs["beta"] = beta_storage[:, :, 8:20]
+        state_pool = torch.randn(4, 12, 128, 128, dtype=torch.bfloat16)
+        checkpoint_cu_starts = torch.tensor([0, 1, 2], dtype=torch.int64)
+        query_start_loc_i64 = inputs["query_start_loc"].to(torch.int64)
+        cake_calls = []
+
+        def fake_recurrent_kda(**kwargs):
+            cake_calls.append(kwargs)
+            checkpoints = kwargs["state_checkpoints"]
+            checkpoints.fill_(3)
+            return torch.empty_like(kwargs["v"]), kwargs["initial_state"], checkpoints
+
+        with (
+            patch.object(
+                kernel,
+                "_cake_prefill_admission",
+                return_value=CakePrefillAdmission(True, CakePrefillReason.ELIGIBLE),
+            ),
+            patch.object(
+                kernel,
+                "_prep_gate_params",
+                return_value=(inputs["A_log"].reshape(-1), inputs["dt_bias"]),
+            ),
+            patch.object(
+                kda_flashinfer,
+                "_get_flashinfer_kda_prefill_kernel",
+                return_value=(True, fake_recurrent_kda),
+            ),
+            patch.object(
+                torch.Tensor,
+                "index_select",
+                side_effect=AssertionError("Cake prefill gathered state"),
+            ),
+            patch.object(
+                torch.Tensor,
+                "index_copy_",
+                side_effect=AssertionError("Cake prefill scattered state"),
+            ),
+            patch.object(kda_flashinfer, "record_kda_terminal_route"),
+        ):
+            output, h = kernel.extend(
+                **inputs,
+                ssm_states=state_pool,
+                lower_bound=-5.0,
+                return_intermediate_states=True,
+                track_ssm_h_src=torch.tensor([0], dtype=torch.int64),
+                cake_query_start_loc=query_start_loc_i64,
+                state_checkpoint_cu_starts=checkpoint_cu_starts,
+                num_state_checkpoints=2,
+                state_checkpoint_every_n_tokens=64,
+                layer_id=7,
+            )
+
+        self.assertEqual(len(cake_calls), 1)
+        call = cake_calls[0]
+        for name in ("q", "k", "v", "g", "beta"):
+            self.assertIs(call[name], inputs[name])
+        self.assertIs(call["initial_state"], state_pool)
+        self.assertIs(call["ssm_state_indices"], inputs["cache_indices"])
+        self.assertIs(call["cu_seqlens"], query_start_loc_i64)
+        self.assertIs(call["checkpoint_cu_starts"], checkpoint_cu_starts)
+        self.assertEqual(call["beta"].stride(), (160, 32, 1))
+        self.assertTrue(call["beta_is_logit"])
+        self.assertEqual(output.shape, inputs["v"].shape)
+        self.assertEqual(h.shape, (1, 2, 12, 128, 128))
+        self.assertTrue(torch.equal(h, torch.full_like(h, 3)))
 
 
 class TestCakeKDAIndexedStateAdapter(CustomTestCase):

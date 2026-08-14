@@ -204,6 +204,14 @@ class KDAKernelDispatcher:
             f"packed_decode={self.supports_packed_decode}"
         )
 
+    @property
+    def extend_uses_state_checkpoints(self) -> bool:
+        return self.extend_kernel.uses_state_checkpoints
+
+    @property
+    def extend_uses_cake_prefill(self) -> bool:
+        return getattr(self.extend_kernel, "uses_cake_prefill", False)
+
     def packed_decode(
         self,
         mixed_qkv: torch.Tensor,
@@ -429,6 +437,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        if (
+            self.kernel_dispatcher.extend_uses_cake_prefill
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            self.forward_metadata.kda_cake_query_start_loc = (
+                self.forward_metadata.query_start_loc.to(torch.int64)
+            )
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
@@ -438,6 +455,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+            if self.kernel_dispatcher.extend_uses_state_checkpoints:
+                from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
+                    maybe_build_cake_checkpoint_plan,
+                )
+
+                maybe_build_cake_checkpoint_plan(
+                    forward_batch, self.forward_metadata, self.device
+                )
 
     def forward_decode(
         self,
@@ -715,6 +740,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # fast path when the snapshot only needs the final state.
             track_ssm_h_src=(
                 self.forward_metadata.track_ssm_h_src if track_ssm else None
+            ),
+            cake_query_start_loc=self.forward_metadata.kda_cake_query_start_loc,
+            state_checkpoint_cu_starts=(
+                self.forward_metadata.state_checkpoint_cu_starts
+            ),
+            num_state_checkpoints=self.forward_metadata.num_state_checkpoints,
+            state_checkpoint_every_n_tokens=(
+                self.forward_metadata.state_checkpoint_every_n_tokens
             ),
         )
         if track_ssm:

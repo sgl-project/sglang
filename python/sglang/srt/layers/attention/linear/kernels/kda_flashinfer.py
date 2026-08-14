@@ -15,16 +15,18 @@ Contract with the Triton KDA reference:
 The optional ``cake`` mode forwards SGLang's post-convolution packed Q/K/V,
 raw gate/beta, and indexed state pool directly to the exported CAKE decode
 contract. Unsupported shapes and ReplaySSM use the existing Triton packed
-path. Prefill consumes raw gate/beta logits and retains its gather/scatter
-adapter.
+path. Prefill consumes raw gate/beta logits, updates the indexed state pool in
+place, and can return radix-cache checkpoints without materializing inputs.
 """
+
+from __future__ import annotations
 
 import inspect
 import logging
 import math
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -43,7 +45,12 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
 from sglang.srt.mem_cache.allocator.mamba import MambaStateIndexContract
+from sglang.srt.runtime_context import mamba_cache_chunk_size
 from sglang.srt.utils import is_cuda
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +89,46 @@ class CakePrefillAdmission:
     eligible: bool
     reason: str
     detail: str = ""
+
+
+def maybe_build_cake_checkpoint_plan(
+    forward_batch: ForwardBatch,
+    forward_metadata: ForwardMetadata,
+    device: str,
+) -> None:
+    """Populate native Cake checkpoints for KDA radix-cache tracking.
+
+    Cake row zero is the sequence's initial state. Subsequent rows are states
+    after each full checkpoint interval strictly before the sequence end. This
+    is the packed indexing already produced by ``_init_track_ssm_indices`` for
+    KDA, so only the per-sequence cumulative starts are materialized here.
+    """
+    if (
+        forward_metadata.track_ssm_h_src is None
+        or forward_metadata.track_ssm_h_src.numel() == 0
+    ):
+        return
+
+    checkpoint_every_n_tokens = mamba_cache_chunk_size()
+    if checkpoint_every_n_tokens <= 0 or checkpoint_every_n_tokens % 32 != 0:
+        raise ValueError(
+            "Cake KDA checkpoint interval must be a positive multiple of 32, "
+            f"got {checkpoint_every_n_tokens}."
+        )
+    extend_seq_lens = forward_batch.extend_seq_lens.to(
+        device="cpu", dtype=torch.int64
+    )
+    checkpoint_counts = (extend_seq_lens - 1) // checkpoint_every_n_tokens + 1
+    checkpoint_cu_starts = torch.zeros(
+        checkpoint_counts.numel() + 1, dtype=torch.int64
+    )
+    checkpoint_cu_starts[1:] = torch.cumsum(checkpoint_counts, dim=0)
+
+    forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts.to(
+        device, non_blocking=True
+    )
+    forward_metadata.num_state_checkpoints = int(checkpoint_cu_starts[-1])
+    forward_metadata.state_checkpoint_every_n_tokens = checkpoint_every_n_tokens
 
 
 def _get_flashinfer_kda_kernel():
@@ -471,14 +518,28 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         is_spec_decode: bool,
         return_intermediate_states: bool,
         track_ssm_h_src: Optional[torch.Tensor],
+        state_checkpoint_cu_starts: Optional[torch.Tensor] = None,
+        num_state_checkpoints: int = 0,
+        state_checkpoint_every_n_tokens: int = 0,
     ) -> bool:
         """Check the public frozen-prefill contract without a device sync."""
-        has_explicit_empty_checkpoint_track = (
-            track_ssm_h_src is not None and track_ssm_h_src.numel() == 0
+        needs_checkpoints = bool(
+            return_intermediate_states
+            and track_ssm_h_src is not None
+            and track_ssm_h_src.numel() > 0
         )
         if (
             is_spec_decode
-            or (return_intermediate_states and not has_explicit_empty_checkpoint_track)
+            or (return_intermediate_states and track_ssm_h_src is None)
+            or (
+                needs_checkpoints
+                and (
+                    state_checkpoint_cu_starts is None
+                    or num_state_checkpoints <= 0
+                    or state_checkpoint_every_n_tokens <= 0
+                    or state_checkpoint_every_n_tokens % 32 != 0
+                )
+            )
             or lower_bound is None
             or not math.isfinite(float(lower_bound))
             or float(lower_bound) >= 0.0
@@ -524,6 +585,9 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         is_spec_decode: bool,
         return_intermediate_states: bool,
         track_ssm_h_src: Optional[torch.Tensor],
+        state_checkpoint_cu_starts: Optional[torch.Tensor] = None,
+        num_state_checkpoints: int = 0,
+        state_checkpoint_every_n_tokens: int = 0,
     ) -> CakePrefillAdmission:
         """Attach stable telemetry reasons without changing admission policy."""
         supported = CakeKDAKernel._cake_prefill_is_supported(
@@ -539,20 +603,34 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             is_spec_decode=is_spec_decode,
             return_intermediate_states=return_intermediate_states,
             track_ssm_h_src=track_ssm_h_src,
+            state_checkpoint_cu_starts=state_checkpoint_cu_starts,
+            num_state_checkpoints=num_state_checkpoints,
+            state_checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
         )
         if supported:
             return CakePrefillAdmission(True, CakePrefillReason.ELIGIBLE)
         if is_spec_decode:
             return CakePrefillAdmission(False, CakePrefillReason.SPEC_DECODE)
-        # ``None`` is included so telemetry remains correct when the separate
-        # admission fix treats a missing checkpoint source as non-aligned.
-        if return_intermediate_states and (
-            track_ssm_h_src is None or track_ssm_h_src.numel() > 0
-        ):
+        if return_intermediate_states and track_ssm_h_src is None:
             return CakePrefillAdmission(
                 False,
                 CakePrefillReason.INTERIOR_CHECKPOINT,
                 "track_ssm_h_src",
+            )
+        if (
+            return_intermediate_states
+            and track_ssm_h_src.numel() > 0
+            and (
+                state_checkpoint_cu_starts is None
+                or num_state_checkpoints <= 0
+                or state_checkpoint_every_n_tokens <= 0
+                or state_checkpoint_every_n_tokens % 32 != 0
+            )
+        ):
+            return CakePrefillAdmission(
+                False,
+                CakePrefillReason.INTERIOR_CHECKPOINT,
+                "state_checkpoint_plan",
             )
         if (
             lower_bound is None
@@ -609,7 +687,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             TritonKDAKernel,
         )
 
-        return TritonKDAKernel().extend(q, k, v, g, beta, **kwargs)
+        return TritonKDAKernel().extend(q, k, v, g, torch.sigmoid(beta), **kwargs)
 
     def extend(
         self,
@@ -627,10 +705,14 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         is_spec_decode: bool = False,
         return_intermediate_states: bool = False,
+        cake_query_start_loc: Optional[torch.Tensor] = None,
+        state_checkpoint_cu_starts: Optional[torch.Tensor] = None,
+        num_state_checkpoints: int = 0,
+        state_checkpoint_every_n_tokens: int = 0,
         layer_id: int,
         **kwargs,
     ) -> torch.Tensor:
-        """Run ordinary CAKE prefill, preserving Triton-only state semantics."""
+        """Run zero-copy CAKE prefill with native state checkpoints."""
         if self._backend != "cake":
             raise NotImplementedError(
                 "FlashInfer cute-dsl KDA only supports decode and target_verify"
@@ -645,6 +727,9 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             lower_bound=lower_bound,
             is_spec_decode=is_spec_decode,
             return_intermediate_states=return_intermediate_states,
+            state_checkpoint_cu_starts=state_checkpoint_cu_starts,
+            num_state_checkpoints=num_state_checkpoints,
+            state_checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
             **kwargs,
         )
         track_ssm_h_src = kwargs.get("track_ssm_h_src")
@@ -662,6 +747,9 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 is_spec_decode=is_spec_decode,
                 return_intermediate_states=return_intermediate_states,
                 track_ssm_h_src=track_ssm_h_src,
+                state_checkpoint_cu_starts=state_checkpoint_cu_starts,
+                num_state_checkpoints=num_state_checkpoints,
+                state_checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
             )
         except Exception as exc:
             record_kda_terminal_route(
@@ -720,50 +808,62 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                     "FlashInfer build containing the frozen recurrent prefill backend."
                 )
 
-            q_fi = q.to(torch.bfloat16).contiguous()
-            k_fi = k.to(torch.bfloat16).contiguous()
-            v_fi = v.to(torch.bfloat16).contiguous()
-            g_fi = g.to(torch.bfloat16).contiguous()
-            # SGLang pre-activates beta for ordinary extend. The frozen kernel fuses
-            # sigmoid, so reconstruct a logit in FP32 and round only at the handoff.
-            beta_fi = torch.logit(beta.float().clamp(1e-7, 1.0 - 1e-7)).to(
-                torch.bfloat16
-            )
-            beta_fi = beta_fi.contiguous()
             A_log_fi, dt_bias_fi = self._prep_gate_params(A_log, dt_bias)
-            query_start_loc_fi = query_start_loc.to(torch.int64).contiguous()
-
-            state_indices = cache_indices.clamp(min=0).to(torch.int64)
-            state_batch = ssm_states.index_select(0, state_indices).contiguous()
-            output, final_state = recurrent_kda(
-                q=q_fi,
-                k=k_fi,
-                v=v_fi,
-                g=g_fi,
-                beta=beta_fi,
+            query_start_loc_fi = (
+                cake_query_start_loc
+                if cake_query_start_loc is not None
+                else query_start_loc.to(torch.int64)
+            )
+            needs_checkpoints = bool(
+                return_intermediate_states
+                and track_ssm_h_src is not None
+                and track_ssm_h_src.numel() > 0
+            )
+            state_checkpoints = (
+                ssm_states.new_empty(
+                    (num_state_checkpoints, *ssm_states.shape[1:])
+                )
+                if needs_checkpoints
+                else None
+            )
+            recurrent_result = recurrent_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
                 A_log=A_log_fi,
                 dt_bias=dt_bias_fi,
                 scale=None,
-                initial_state=state_batch,
+                initial_state=ssm_states,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
                 use_gate_in_kernel=True,
                 lower_bound=lower_bound,
                 cu_seqlens=query_start_loc_fi,
+                ssm_state_indices=cache_indices,
                 beta_is_logit=True,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=(
+                    state_checkpoint_cu_starts if needs_checkpoints else None
+                ),
+                checkpoint_every_n_tokens=(
+                    state_checkpoint_every_n_tokens if needs_checkpoints else 0
+                ),
             )
+            if needs_checkpoints:
+                output, final_state, state_checkpoints = recurrent_result
+            else:
+                output, final_state = recurrent_result
             if final_state is None:
                 raise RuntimeError("FlashInfer CAKE prefill did not return final state")
-            ssm_states.index_copy_(0, state_indices, final_state)
             if return_intermediate_states:
-                # Boundary-aligned track: _track_mamba_state_extend consumes the
-                # final state already scattered above. With no interior h source,
-                # match NvidiaKDAKernel's empty stand-in while preserving the
-                # ordinary CAKE output/final-state path bit for bit.
-                h_empty = q.new_empty(
-                    (1, 0) + tuple(ssm_states.shape[1:]), dtype=torch.float32
+                h = (
+                    state_checkpoints.unsqueeze(0)
+                    if state_checkpoints is not None
+                    else ssm_states.new_empty((1, 0, *ssm_states.shape[1:]))
                 )
-                result = output, h_empty
+                result = output, h
             else:
                 result = output
         except Exception as exc:
@@ -1023,6 +1123,8 @@ class CakeKDAKernel(FlashInferKDAKernel):
     """Named SGLang backend for FlashInfer's exported CAKE KDA kernels."""
 
     supports_k3_fused_decode = False
+    uses_state_checkpoints = True
+    uses_cake_prefill = True
     supports_packed_decode = True
     supports_cake_route_telemetry = True
 

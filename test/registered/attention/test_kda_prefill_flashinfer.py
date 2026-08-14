@@ -71,11 +71,11 @@ def _make_inputs(seq_lens, num_heads):
         g=torch.randn(
             1, total_tokens, num_heads, K, device="cuda", dtype=torch.bfloat16
         ).contiguous(),
-        # SGLang ordinary extend passes post-sigmoid FP32 beta to its kernel
-        # backend (Kimi K3 computes sigmoid before dispatch).
-        beta=(
-            torch.rand(1, total_tokens, num_heads, device="cuda") * 0.8 + 0.1
-        ).contiguous(),
+        # Match Kimi K3's fused projection slice: raw BF16 logits with a wider
+        # physical token-row pitch and unit head stride.
+        beta=torch.randn(
+            1, total_tokens, 32, device="cuda", dtype=torch.bfloat16
+        )[:, :, 8 : 8 + num_heads],
         A_log=(
             torch.randn(1, 1, num_heads, 1, device="cuda", dtype=torch.float32) * 0.2
         ).contiguous(),
@@ -101,12 +101,15 @@ def _make_inputs(seq_lens, num_heads):
 def _extend(kernel, data, state, seq_lens, **kwargs):
     if getattr(kernel, "supports_cake_route_telemetry", False):
         kwargs["layer_id"] = 7
+    beta = data["beta"]
+    if isinstance(kernel, TritonKDAKernel):
+        beta = torch.sigmoid(beta)
     return kernel.extend(
         data["q"].clone(),
         data["k"].clone(),
         data["v"].clone(),
         data["g"].clone(),
-        data["beta"].clone(),
+        beta,
         ssm_states=state,
         cache_indices=data["cache_indices"],
         query_start_loc=data["cu_seqlens"],
@@ -174,14 +177,19 @@ def test_kda_prefill_cake_aligned_tracking_is_bitwise_identical():
     assert torch.equal(output_tracked, output_untracked)
     assert torch.equal(state_tracked, state_untracked)
     assert intermediate_tracked.shape == (1, 0, 12, V, K)
-    assert intermediate_tracked.dtype == torch.float32
+    assert intermediate_tracked.dtype == torch.bfloat16
     assert intermediate_tracked.numel() == 0
 
 
-def test_kda_prefill_cake_falls_back_for_interior_state_tracking():
-    seq_lens = [96]
+def test_kda_prefill_cake_returns_native_interior_state_tracking():
+    seq_lens = [65, 131]
     data = _make_inputs(seq_lens, 12)
-    interior_checkpoint_source = torch.zeros(1, device="cuda", dtype=torch.int64)
+    interior_checkpoint_source = torch.tensor(
+        [0, 4], device="cuda", dtype=torch.int64
+    )
+    checkpoint_cu_starts = torch.tensor(
+        [0, 2, 5], device="cuda", dtype=torch.int64
+    )
     state_ref = data["state"].clone()
     output_ref = _extend(
         TritonKDAKernel(),
@@ -191,21 +199,37 @@ def test_kda_prefill_cake_falls_back_for_interior_state_tracking():
         return_intermediate_states=True,
     )
     state_cake = data["state"].clone()
-    output_cake = _extend(
-        CakeKDAKernel(),
-        data,
-        state_cake,
-        seq_lens,
-        return_intermediate_states=True,
-        track_ssm_h_src=interior_checkpoint_source,
-    )
+    with patch.object(
+        CakeKDAKernel,
+        "_extend_triton",
+        side_effect=AssertionError("native checkpoints must not fall back to Triton"),
+    ):
+        output_cake = _extend(
+            CakeKDAKernel(),
+            data,
+            state_cake,
+            seq_lens,
+            return_intermediate_states=True,
+            track_ssm_h_src=interior_checkpoint_source,
+            cake_query_start_loc=data["cu_seqlens"].to(torch.int64),
+            state_checkpoint_cu_starts=checkpoint_cu_starts,
+            num_state_checkpoints=5,
+            state_checkpoint_every_n_tokens=64,
+        )
     torch.cuda.synchronize()
 
     out_cake, intermediate_cake = output_cake
     out_ref, intermediate_ref = output_ref
-    torch.testing.assert_close(out_cake, out_ref)
-    torch.testing.assert_close(intermediate_cake, intermediate_ref)
-    torch.testing.assert_close(state_cake, state_ref)
+    torch.testing.assert_close(
+        out_cake.float(), out_ref.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        intermediate_cake.float(), intermediate_ref.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        state_cake.float(), state_ref.float(), atol=1e-2, rtol=1e-2
+    )
+    assert data["beta"].stride(-2) == 32
 
 
 def test_kda_prefill_cake_falls_back_during_cuda_graph_capture():

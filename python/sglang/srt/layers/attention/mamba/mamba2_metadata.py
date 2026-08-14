@@ -64,6 +64,10 @@ class ForwardMetadata:
     state_checkpoint_cu_starts: Optional[torch.Tensor] = None
     num_state_checkpoints: int = 0
     state_checkpoint_every_n_tokens: int = 0
+    # Cake KDA prefill consumes int64 packed-sequence offsets. Keep one
+    # metadata-owned conversion shared by every KDA layer instead of converting
+    # the same int32 scheduler tensor at each kernel call.
+    kda_cake_query_start_loc: Optional[torch.Tensor] = None
 
     is_target_verify: bool = False
     draft_token_num: int = 1
