@@ -1,6 +1,9 @@
 import torch
 
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -15,6 +18,12 @@ class LTX2TextConnectorStage(PipelineStage):
     def __init__(self, connectors):
         super().__init__()
         self.connectors = connectors
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        return [ComponentUse(stage_name=stage_name, component_name="connectors")]
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         # Input: batch.prompt_embeds (from Gemma, [B, S, D])
@@ -68,7 +77,12 @@ class LTX2TextConnectorStage(PipelineStage):
                 dtype
             ) * torch.finfo(dtype).max
 
-            with set_forward_context(current_timestep=None, attn_metadata=None):
+            with (
+                set_forward_context(current_timestep=None, attn_metadata=None),
+                self.use_declared_component(
+                    component_name="connectors", module=self.connectors
+                ),
+            ):
                 pos_embeds, pos_audio_embeds, pos_mask = self.connectors(
                     prompt_embeds, pos_additive_mask, additive_mask=True
                 )
@@ -89,7 +103,12 @@ class LTX2TextConnectorStage(PipelineStage):
                 dtype
             ) * torch.finfo(dtype).max
 
-            with set_forward_context(current_timestep=None, attn_metadata=None):
+            with (
+                set_forward_context(current_timestep=None, attn_metadata=None),
+                self.use_declared_component(
+                    component_name="connectors", module=self.connectors
+                ),
+            ):
                 (
                     connector_prompt_embeds,
                     connector_audio_prompt_embeds,
