@@ -360,6 +360,8 @@ def _fwd_kernel(
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
     USE_COMPACT_TILE_GRID: tl.constexpr,
+    AOH_SINK_SIZE: tl.constexpr,
+    AOH_RECENT_SIZE: tl.constexpr,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
@@ -413,6 +415,16 @@ def _fwd_kernel(
     window_kv_offset = 0
     if USE_CUSTOM_MASK and SLIDING_WINDOW_SIZE > 0:
         window_kv_offset = tl.load(window_kv_offset_ptr + cur_seq)
+    aoh_tail_start = 0
+    aoh_abs_prefix_len = cur_seq_len_prefix
+    if AOH_RECENT_SIZE > 0:
+        aoh_tail_start = tl.load(window_kv_offset_ptr + cur_seq)
+        aoh_anchor_len = tl.minimum(cur_seq_len_prefix, AOH_SINK_SIZE)
+        aoh_abs_prefix_len = tl.where(
+            cur_seq_len_prefix <= AOH_SINK_SIZE,
+            cur_seq_len_prefix,
+            aoh_tail_start + cur_seq_len_prefix - aoh_anchor_len,
+        )
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
@@ -423,7 +435,7 @@ def _fwd_kernel(
     mask_dv = offs_dv < Lv
 
     if xai_temperature_len > 0:
-        offs_qidx = cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m
+        offs_qidx = aoh_abs_prefix_len + cur_block_m * BLOCK_M + offs_m
         xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
         xai_temperature_reg = tl.where(
             offs_qidx > xai_temperature_len,
@@ -484,9 +496,25 @@ def _fwd_kernel(
                 cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m[:, None]
             ) <= (start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE)
             final_mask &= window_mask
+        if AOH_RECENT_SIZE > 0:
+            q_abs_pos = aoh_abs_prefix_len + cur_block_m * BLOCK_M + offs_m[:, None]
+            compact_k_pos = start_n + offs_n[None, :]
+            k_abs_pos = tl.where(
+                compact_k_pos < aoh_anchor_len,
+                compact_k_pos,
+                aoh_tail_start + compact_k_pos - aoh_anchor_len,
+            )
+            aoh_mask = (k_abs_pos < AOH_SINK_SIZE) | (
+                k_abs_pos >= q_abs_pos - AOH_RECENT_SIZE + 1
+            )
+            final_mask &= aoh_mask
 
         SKIP_TILE = False
-        if (USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK) or SLIDING_WINDOW_SIZE > 0:
+        if (
+            (USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK)
+            or SLIDING_WINDOW_SIZE > 0
+            or AOH_RECENT_SIZE > 0
+        ):
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
@@ -550,10 +578,17 @@ def _fwd_kernel(
                 qk *= xai_temperature_reg[:, None]
 
             if SCORE_MOD is not None:
+                score_q_pos = (cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m)[
+                    :, None
+                ]
+                score_k_pos = start_n + offs_n[None, :]
+                if AOH_RECENT_SIZE > 0:
+                    score_q_pos = q_abs_pos
+                    score_k_pos = k_abs_pos
                 qk = SCORE_MOD(
                     qk,
-                    (cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m)[:, None],
-                    start_n + offs_n[None, :],
+                    score_q_pos,
+                    score_k_pos,
                     (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m)[
                         :, None
                     ],
@@ -642,9 +677,16 @@ def _fwd_kernel(
                 start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE
             )
             final_mask &= window_mask
+        if AOH_RECENT_SIZE > 0:
+            q_abs_pos = aoh_abs_prefix_len + cur_block_m * BLOCK_M + offs_m[:, None]
+            k_abs_pos = aoh_abs_prefix_len + start_n + offs_n[None, :]
+            aoh_mask = (k_abs_pos < AOH_SINK_SIZE) | (
+                k_abs_pos >= q_abs_pos - AOH_RECENT_SIZE + 1
+            )
+            final_mask &= aoh_mask
 
         SKIP_TILE = False
-        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
+        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0 or AOH_RECENT_SIZE > 0:
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
@@ -681,10 +723,17 @@ def _fwd_kernel(
                 qk *= xai_temperature_reg[:, None]
 
             if SCORE_MOD is not None:
+                score_q_pos = (cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m)[
+                    :, None
+                ]
+                score_k_pos = cur_seq_len_prefix + start_n + offs_n[None, :]
+                if AOH_RECENT_SIZE > 0:
+                    score_q_pos = q_abs_pos
+                    score_k_pos = k_abs_pos
                 qk = SCORE_MOD(
                     qk,
-                    (cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m)[:, None],
-                    cur_seq_len_prefix + start_n + offs_n[None, :],
+                    score_q_pos,
+                    score_k_pos,
                     (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m)[
                         :, None
                     ],
@@ -780,6 +829,8 @@ def extend_attention_fwd(
     score_mod=None,
     aux_tensors=None,
     extend_seq_lens_cpu=None,
+    aoh_sink_size: int = 0,
+    aoh_recent_size: int = 0,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -911,6 +962,8 @@ def extend_attention_fwd(
         HAS_SINK=HAS_SINK,
         STORE_TRANSPOSE=_is_hip,
         USE_COMPACT_TILE_GRID=use_compact_tile_grid,
+        AOH_SINK_SIZE=aoh_sink_size,
+        AOH_RECENT_SIZE=aoh_recent_size,
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
         Aux0=aux0,
@@ -1003,6 +1056,8 @@ def _fwd_kernel_unified(
     IS_CAUSAL: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    AOH_SINK_SIZE: tl.constexpr,
+    AOH_RECENT_SIZE: tl.constexpr,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
@@ -1035,6 +1090,15 @@ def _fwd_kernel_unified(
     cur_window_start = 0
     if SLIDING_WINDOW_SIZE > 0:
         cur_window_start = tl.load(window_start_pos + cur_seq)
+    aoh_abs_prefix_len = cur_seq_prefix_len
+    if AOH_RECENT_SIZE > 0:
+        aoh_tail_start = tl.load(window_start_pos + cur_seq)
+        aoh_anchor_len = tl.minimum(cur_seq_prefix_len, AOH_SINK_SIZE)
+        aoh_abs_prefix_len = tl.where(
+            cur_seq_prefix_len <= AOH_SINK_SIZE,
+            cur_seq_prefix_len,
+            aoh_tail_start + cur_seq_prefix_len - aoh_anchor_len,
+        )
 
     # Load custom mask start index if using custom mask (for speculative decoding)
     if USE_CUSTOM_MASK:
@@ -1049,7 +1113,7 @@ def _fwd_kernel_unified(
 
     # XAI temperature handling
     if xai_temperature_len > 0:
-        offs_qidx = cur_seq_prefix_len + cur_block_m * BLOCK_M + offs_m
+        offs_qidx = aoh_abs_prefix_len + cur_block_m * BLOCK_M + offs_m
         xai_temperature_reg = tl.where(
             offs_qidx < xai_temperature_len,
             1.0,
@@ -1134,10 +1198,28 @@ def _fwd_kernel_unified(
             # Sliding window: query can attend to keys within window_size
             window_mask = q_abs_pos <= (k_abs_pos + SLIDING_WINDOW_SIZE)
             final_mask &= window_mask
+        if AOH_RECENT_SIZE > 0:
+            q_abs_pos = aoh_abs_prefix_len + cur_block_m * BLOCK_M + offs_m[:, None]
+            compact_k_pos = start_n + offs_n[None, :]
+            prefix_k_abs_pos = tl.where(
+                compact_k_pos < aoh_anchor_len,
+                compact_k_pos,
+                aoh_tail_start + compact_k_pos - aoh_anchor_len,
+            )
+            k_abs_pos = tl.where(
+                compact_k_pos < cur_seq_prefix_len,
+                prefix_k_abs_pos,
+                aoh_abs_prefix_len + compact_k_pos - cur_seq_prefix_len,
+            )
+            aoh_mask = (k_abs_pos <= q_abs_pos) & (
+                (k_abs_pos < AOH_SINK_SIZE)
+                | (k_abs_pos >= q_abs_pos - AOH_RECENT_SIZE + 1)
+            )
+            final_mask &= aoh_mask
 
         # Check if we can skip this tile
         SKIP_TILE = False
-        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
+        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0 or AOH_RECENT_SIZE > 0:
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
@@ -1202,10 +1284,17 @@ def _fwd_kernel_unified(
                 qk *= xai_temperature_reg[:, None]
 
             if SCORE_MOD is not None:
+                score_q_pos = (cur_seq_prefix_len + cur_block_m * BLOCK_M + offs_m)[
+                    :, None
+                ]
+                score_k_pos = start_n + offs_n[None, :]
+                if AOH_RECENT_SIZE > 0:
+                    score_q_pos = q_abs_pos
+                    score_k_pos = k_abs_pos
                 qk = SCORE_MOD(
                     qk,
-                    (cur_seq_prefix_len + cur_block_m * BLOCK_M + offs_m)[:, None],
-                    start_n + offs_n[None, :],
+                    score_q_pos,
+                    score_k_pos,
                     (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m)[:, None],
                     cur_head,
                     final_mask,
@@ -1292,6 +1381,8 @@ def extend_attention_fwd_unified(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    aoh_sink_size: int = 0,
+    aoh_recent_size: int = 0,
 ):
     """
     Unified 1-stage extend attention for deterministic inference.
@@ -1398,6 +1489,8 @@ def extend_attention_fwd_unified(
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         HAS_SINK=HAS_SINK,
+        AOH_SINK_SIZE=aoh_sink_size,
+        AOH_RECENT_SIZE=aoh_recent_size,
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
         Aux0=aux0,

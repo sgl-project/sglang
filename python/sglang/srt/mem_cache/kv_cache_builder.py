@@ -259,6 +259,16 @@ def build_kv_cache(
             tp_group=tp_group,
         )
     )
+    if tp_worker.model_runner.is_aoh:
+        tree_cache.is_aoh = True
+        tree_cache.aoh_sink_size = server_args.aoh_sink_size
+        tree_cache.aoh_recent_size = server_args.aoh_recent_size
+        # Only anchors are content-stable in a shared radix tree. The moving
+        # AoH tail remains request-private and is re-prefilled after a match.
+        # Use the global sidecar decision so all TP ranks match the same prefix.
+        tree_cache.aoh_radix_anchor_only = (
+            tp_worker.model_runner.aoh_has_streaming and not disable_radix_cache
+        )
 
     if enable_hierarchical_cache and hicache_draft_plan is not None:
         maybe_register_hicache_draft(

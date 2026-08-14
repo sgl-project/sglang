@@ -220,6 +220,9 @@ class KVCacheConfigurator:
     req_to_token_pool: Optional[ReqToTokenPool]
     token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator]
     memory_pool_config: Optional[MemoryPoolConfig]
+    is_aoh: bool = False
+    aoh_streaming_layer_ids: list[int] = field(default_factory=list)
+    aoh_retrieval_layer_ids: list[int] = field(default_factory=list)
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
     mambaish_config: Optional[Any] = field(init=False)
@@ -1224,6 +1227,16 @@ class KVCacheConfigurator:
                 "swa_v_head_dim": self.model_config.swa_v_head_dim,
                 "v_head_dim": self.model_config.v_head_dim,
             }
+        swa_attention_layer_ids = (
+            self.aoh_streaming_layer_ids
+            if self.is_aoh
+            else self.model_config.swa_attention_layer_ids
+        )
+        full_attention_layer_ids = (
+            self.aoh_retrieval_layer_ids
+            if self.is_aoh
+            else self.model_config.full_attention_layer_ids
+        )
         token_to_kv_pool = SWAKVPool(
             size=full_max_total_num_tokens,
             size_swa=swa_max_total_num_tokens,
@@ -1234,8 +1247,8 @@ class KVCacheConfigurator:
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
             head_dim=self.model_config.head_dim,
-            swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
-            full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
             device=self.device,
             token_to_kv_pool_class=NPUMHATokenToKVPool,
             **kwargs,
@@ -1417,8 +1430,16 @@ class KVCacheConfigurator:
             if self.kv_cache_dtype_str == "mxfp8"
             else mha_pool_class
         )
-        swa_attention_layer_ids = self.model_config.swa_attention_layer_ids
-        full_attention_layer_ids = self.model_config.full_attention_layer_ids
+        swa_attention_layer_ids = (
+            self.aoh_streaming_layer_ids
+            if self.is_aoh
+            else self.model_config.swa_attention_layer_ids
+        )
+        full_attention_layer_ids = (
+            self.aoh_retrieval_layer_ids
+            if self.is_aoh
+            else self.model_config.full_attention_layer_ids
+        )
         if self.is_inkling_mtp_draft:
             if self.draft_swa_full_capacity:
                 # Banded 's' depth: route the draft's single layer into the SWA

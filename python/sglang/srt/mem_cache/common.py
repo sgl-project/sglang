@@ -102,6 +102,53 @@ def free_swa_out_of_window_slots(
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
+def get_aoh_evictable_end(
+    pre_len: int, *, sink_size: int, recent_size: int, page_size: int
+) -> int:
+    """Return the first token of the retained AoH tail, page aligned."""
+    anchor_end = min(sink_size, pre_len)
+    tail_start = max(anchor_end, pre_len - recent_size)
+    return (tail_start // page_size) * page_size
+
+
+def free_aoh_out_of_window_slots(
+    req: Req,
+    pre_len: int,
+    *,
+    sink_size: int,
+    recent_size: int,
+    page_size: int,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+) -> None:
+    """Release the middle of an AoH stream while keeping anchors and the tail."""
+    if req.kv is None:
+        return
+    anchor_end = min(sink_size, pre_len)
+    # free_swa expands every input token to its complete page. Restrict the
+    # range to pages wholly contained in the evicted middle so anchor/tail
+    # boundary pages remain valid for compact paged attention.
+    free_start = max(
+        req.kv.swa_evicted_seqlen,
+        anchor_end,
+        getattr(req, "cache_protected_len", 0),
+        getattr(req, "swa_evict_floor", 0),
+    )
+    free_start = ((free_start + page_size - 1) // page_size) * page_size
+    free_end = get_aoh_evictable_end(
+        pre_len,
+        sink_size=sink_size,
+        recent_size=recent_size,
+        page_size=page_size,
+    )
+    if free_end <= free_start:
+        return
+
+    free_slots = req_to_token_pool.req_to_token[req.req_pool_idx, free_start:free_end]
+    token_to_kv_pool_allocator.free_swa(free_slots)
+    req.kv.swa_evicted_seqlen = free_end
+
+
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
         return

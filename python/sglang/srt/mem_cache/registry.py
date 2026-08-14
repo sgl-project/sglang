@@ -81,6 +81,13 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     server_args = ctx.server_args
     params = ctx.params
 
+    if ctx.tp_worker.model_runner.is_aoh:
+        # AoH must retain the anchor even when radix reuse is disabled. The
+        # ordinary SWA chunk caches evict one contiguous prefix and therefore
+        # cannot represent an anchor-and-recent stream. Every TP rank uses the
+        # same AoH-aware cache so their prefix boundaries remain identical.
+        return _create_unified_radix_cache(ctx, server_args, params)
+
     if ctx.effective_chunked_prefill_size is not None and ctx.disable_radix_cache:
         if not ctx.is_hybrid_swa:
             from sglang.srt.mem_cache.chunk_cache import ChunkCache

@@ -890,6 +890,27 @@ class ServerArgs:
         Arg(help="The number of tokens in a page.", resolvable=True),
         NS("schedule"),
     ] = None
+    aoh_config: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Path to an AoH v1 JSON sidecar. AoH uses offline effective-rank "
+                "head labels to route full-attention KV groups into "
+                "retrieval or anchor-and-recent streaming pools."
+            )
+        ),
+        NS("schedule"),
+    ] = None
+    aoh_sink_size: A[
+        int,
+        Arg(help="Number of permanent AoH anchor tokens per streaming layer."),
+        NS("schedule"),
+    ] = 128
+    aoh_recent_size: A[
+        int,
+        Arg(help="Number of recent AoH tokens retained per streaming layer."),
+        NS("schedule"),
+    ] = 256
     swa_full_tokens_ratio: A[
         float,
         Arg(

@@ -1070,6 +1070,123 @@ class TestTritonAttention(CustomTestCase):
                     B, N_CTX, H_Q, H_KV, D
                 )
 
+    def test_extend_attention_aoh_rolling_window(self):
+        dtype = torch.bfloat16
+        device = get_device()
+        prefix_len, extend_len = 20, 8
+        sink_size, recent_size = 4, 6
+        h_q, h_kv, head_dim = 4, 2, 64
+
+        torch.manual_seed(0)
+        k_buffer = torch.randn(
+            prefix_len + extend_len,
+            h_kv,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        v_buffer = torch.randn_like(k_buffer)
+        q_extend = torch.randn(extend_len, h_q, head_dim, dtype=dtype, device=device)
+        k_extend = k_buffer[prefix_len:].contiguous()
+        v_extend = v_buffer[prefix_len:].contiguous()
+
+        tail_start = prefix_len - recent_size
+        compact_prefix = torch.tensor(
+            list(range(sink_size)) + list(range(tail_start, prefix_len)),
+            dtype=torch.int64,
+            device=device,
+        )
+        qo_indptr = torch.tensor([0, extend_len], dtype=torch.int32, device=device)
+        prefix_kv_indptr = torch.tensor(
+            [0, compact_prefix.numel()], dtype=torch.int32, device=device
+        )
+        window_start_pos = torch.tensor([tail_start], dtype=torch.int32, device=device)
+
+        regular_output = torch.empty_like(q_extend)
+        extend_attention_fwd(
+            q_extend,
+            k_extend,
+            v_extend,
+            regular_output,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            prefix_kv_indptr,
+            compact_prefix,
+            custom_mask=None,
+            is_causal=True,
+            mask_indptr=None,
+            max_len_extend=extend_len,
+            k_scale=1.0,
+            v_scale=1.0,
+            window_kv_offsets=window_start_pos,
+            aoh_sink_size=sink_size,
+            aoh_recent_size=recent_size,
+        )
+
+        extend_indices = torch.arange(
+            prefix_len,
+            prefix_len + extend_len,
+            dtype=torch.int64,
+            device=device,
+        )
+        unified_indices = torch.cat((compact_prefix, extend_indices))
+        unified_indptr = torch.tensor(
+            [0, unified_indices.numel()], dtype=torch.int32, device=device
+        )
+        unified_output = torch.empty_like(q_extend)
+        extend_attention_fwd_unified(
+            q_extend,
+            unified_output,
+            k_buffer,
+            v_buffer,
+            1.0,
+            1.0,
+            qo_indptr,
+            unified_indptr,
+            unified_indices,
+            torch.tensor([compact_prefix.numel()], dtype=torch.int32, device=device),
+            max_len_extend=extend_len,
+            window_start_pos=window_start_pos,
+            aoh_sink_size=sink_size,
+            aoh_recent_size=recent_size,
+        )
+
+        reference = torch.empty_like(q_extend)
+        group_size = h_q // h_kv
+        scale = head_dim**-0.5
+        for query_offset in range(extend_len):
+            query_pos = prefix_len + query_offset
+            visible_positions = torch.tensor(
+                list(range(sink_size))
+                + list(
+                    range(
+                        max(sink_size, query_pos - recent_size + 1),
+                        query_pos + 1,
+                    )
+                ),
+                dtype=torch.int64,
+                device=device,
+            )
+            keys = k_buffer[visible_positions].repeat_interleave(group_size, dim=1)
+            values = v_buffer[visible_positions].repeat_interleave(group_size, dim=1)
+            scores = torch.einsum(
+                "hd,khd->hk",
+                q_extend[query_offset].float(),
+                keys.float(),
+            )
+            probabilities = torch.softmax(scores * scale, dim=-1)
+            reference[query_offset] = torch.einsum(
+                "hk,khd->hd", probabilities, values.float()
+            ).to(dtype)
+
+        for output in (regular_output, unified_output):
+            self.assertTrue(
+                torch.allclose(output, reference, rtol=0.03, atol=0.03),
+                f"AoH rolling-window output differs from reference; "
+                f"max diff: {(output - reference).abs().max()}",
+            )
+
     def test_build_unified_kv_indices(self):
         """Test build_unified_kv_indices correctness."""
         B = 4
