@@ -1629,8 +1629,8 @@ def run_bench_one_batch(model, other_args):
     """Launch a offline process with automatic device detection.
 
     Args:
-        device: Device type ("auto", "cuda", "rocm" or "cpu").
-            If "auto", will detect available platforms automatically.
+        device: Device type ("auto", "cuda", "rocm", "xpu" or "cpu").
+                If "auto", will detect available platforms automatically.
     """
     device = auto_config_device()
     print(f"Auto-configed device: {device}", flush=True)
