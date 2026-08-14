@@ -120,6 +120,68 @@ def detect_jinja_template_content_format(chat_template: str) -> str:
         return "string"
 
 
+def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
+    """Return whether a template associates tool results by call ID.
+
+    A template that reads ``tool_call_id`` can emit tool results in an order
+    other than the request's message order (for example, by iterating the
+    assistant's ``tool_calls`` and looking up each matching result). Media is
+    collected from the request in message order, so those templates need a
+    rendered-order recovery pass to keep media and placeholders aligned.
+
+    Inspecting the parsed template is deliberately model-agnostic: custom and
+    future templates get the same behavior without a model-name allowlist or a
+    runtime environment switch, while templates that simply stream messages in
+    request order pay no per-request recovery cost.
+    """
+    if not isinstance(chat_template, str):
+        return False
+
+    jinja_ast = _try_extract_ast(chat_template)
+    if jinja_ast is None:
+        return False
+
+    def is_tool_call_id(node: jinja2.nodes.Node) -> bool:
+        return isinstance(node, jinja2.nodes.Const) and node.value == "tool_call_id"
+
+    if any(
+        node.attr == "tool_call_id" for node in jinja_ast.find_all(jinja2.nodes.Getattr)
+    ):
+        return True
+
+    if any(
+        is_tool_call_id(node.arg) for node in jinja_ast.find_all(jinja2.nodes.Getitem)
+    ):
+        return True
+
+    # ``message.get('tool_call_id')`` is another common spelling.
+    for call in jinja_ast.find_all(jinja2.nodes.Call):
+        if (
+            isinstance(call.node, jinja2.nodes.Getattr)
+            and call.node.attr == "get"
+            and call.args
+            and is_tool_call_id(call.args[0])
+        ):
+            return True
+
+    # Templates can look up or sort result messages without a direct field
+    # access, e.g. ``messages | selectattr('tool_call_id', 'equalto', id)`` or
+    # ``messages | sort(attribute='tool_call_id')``.
+    attribute_filters = {"groupby", "map", "rejectattr", "selectattr", "sort"}
+    for filter_node in jinja_ast.find_all(jinja2.nodes.Filter):
+        if filter_node.name not in attribute_filters:
+            continue
+        if filter_node.args and is_tool_call_id(filter_node.args[0]):
+            return True
+        if any(
+            keyword.key == "attribute" and is_tool_call_id(keyword.value)
+            for keyword in filter_node.kwargs
+        ):
+            return True
+
+    return False
+
+
 def process_content_for_template_format(
     msg_dict: dict,
     content_format: str,
