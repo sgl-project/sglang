@@ -45,15 +45,17 @@ class DiffusionModelCard(ModelCard):
     pipeline_class: Optional[str] = None
 
 
-def _build_model_card(server_args: ServerArgs, model_id: str) -> DiffusionModelCard:
+def _build_model_card(
+    server_args: ServerArgs, served_model_name: str
+) -> DiffusionModelCard:
     model_info = get_model_info(
         server_args.model_path,
         backend=server_args.backend,
         model_id=server_args.model_id,
     )
     card_kwargs: dict[str, Any] = {
-        "id": model_id,
-        "root": model_id,
+        "id": served_model_name,
+        "root": served_model_name,
         "num_gpus": server_args.num_gpus,
         "task_type": server_args.pipeline_config.task_type.name,
         "dit_precision": server_args.pipeline_config.dit_precision,
@@ -87,6 +89,7 @@ async def set_lora(
     target: Union[str, List[str]] = Body("all", embed=True),
     strength: Union[float, List[float]] = Body(1.0, embed=True),
     merge_mode: Optional[str] = Body(None, embed=True),
+    lora_alpha: Optional[Union[int, List[Optional[int]]]] = Body(None, embed=True),
 ):
     """
     Set LoRA adapter(s) for the specified transformer(s).
@@ -106,6 +109,7 @@ async def set_lora(
             If a list, must match the length of lora_nickname. Values < 1.0 reduce the effect,
             values > 1.0 amplify the effect.
         merge_mode: Optional LoRA merge mode: "auto", "merge", or "dynamic".
+        lora_alpha: Training alpha override for adapters that omit it from metadata.
     """
     req = SetLoraReq(
         lora_nickname=lora_nickname,
@@ -113,6 +117,7 @@ async def set_lora(
         target=target,
         strength=strength,
         merge_mode=merge_mode,
+        lora_alpha=lora_alpha,
     )
     nickname_str, target_str, strength_str = format_lora_message(
         lora_nickname, target, strength
@@ -203,7 +208,7 @@ async def available_models():
     if not server_args:
         raise HTTPException(status_code=500, detail="Server args not initialized")
 
-    model_card = _build_model_card(server_args, server_args.model_path)
+    model_card = _build_model_card(server_args, server_args.served_model_name)
 
     # Return dict directly to preserve extended fields (ModelList strips them)
     return {"object": "list", "data": [model_card.model_dump()]}
@@ -216,7 +221,7 @@ async def retrieve_model(model: str):
     if not server_args:
         raise HTTPException(status_code=500, detail="Server args not initialized")
 
-    if model != server_args.model_path:
+    if model != server_args.served_model_name:
         return orjson_response(
             {
                 "error": {
@@ -230,4 +235,4 @@ async def retrieve_model(model: str):
         )
 
     # Return dict to preserve extended fields
-    return _build_model_card(server_args, model).model_dump()
+    return _build_model_card(server_args, server_args.served_model_name).model_dump()

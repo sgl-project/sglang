@@ -509,6 +509,7 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
     from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
     from sglang.srt.multimodal.kimi_k3_image_processing import (
         DEFERRED_PREPROCESSING_KEY,
+        KimiK3DeferredPreprocessing,
     )
 
     model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
@@ -517,18 +518,19 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
     model.vision_tower = _K3TowerStub()
     model.mm_projector = lambda image_embeds: image_embeds
 
-    deferred_config = {
-        "image_mean": [0.5, 0.5, 0.5],
-        "image_std": [0.5, 0.5, 0.5],
-        "transparent_bg_config": None,
-        "resize_config": {
+    deferred_config = KimiK3DeferredPreprocessing(
+        backend="gpu",
+        image_mean=[0.5, 0.5, 0.5],
+        image_std=[0.5, 0.5, 0.5],
+        transparent_bg_config=None,
+        resize_config={
             "num_tokens": 1,
             "new_width": 2,
             "new_height": 2,
             "pad_width": 0,
             "pad_height": 0,
         },
-    }
+    )
     items = [
         MultimodalDataItem(
             modality=Modality.IMAGE,
