@@ -821,8 +821,6 @@ class HiCacheController:
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             ack_start_event.record()
-            # Once per transfer, not per layer: 24 MLA layers would otherwise
-            # launch 48 index ops on the load stream's critical path.
             kv_host_indices, kv_device_indices = (
                 self.mem_pool_host.dcp_localize_indices(host_indices, device_indices)
             )
@@ -861,8 +859,7 @@ class HiCacheController:
             ack_finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
-            # still alive when the load stream is executing. Localizing
-            # allocates new tensors, so they need the same treatment.
+            # still alive when the load stream is executing.
             for indices in live_indices:
                 if indices.is_cuda:
                     indices.record_stream(self.load_stream)

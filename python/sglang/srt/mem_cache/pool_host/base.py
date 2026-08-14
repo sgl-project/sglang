@@ -254,9 +254,6 @@ class HostKVCache(abc.ABC):
     ) -> None:
         """
         Load KV data from the host memory pool to the device memory pool for a specific layer.
-
-        ``dcp_localized``: the indices are already this rank's physical rows
-        (see ``dcp_localize_indices``), so skip the translation.
         """
         raise NotImplementedError()
 
@@ -363,12 +360,6 @@ class HostKVCache(abc.ABC):
     def dcp_localize_indices(
         self, host_indices: torch.Tensor, device_indices: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Translate a transfer's index pair once, ahead of a per-layer loop.
-
-        The result is the same for every layer, so a layer loop localizes here
-        and passes ``dcp_localized=True`` instead of paying two boolean-index
-        launches per layer on the transfer stream's critical path.
-        """
         return (
             self.dcp_kernel_indices(host_indices),
             self.dcp_kernel_indices(device_indices),

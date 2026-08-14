@@ -233,7 +233,6 @@ class TestTransferEntryPointsTranslate(CustomTestCase):
         torch.testing.assert_close(kwargs["dst_indices"], expected)
 
     def test_load_trusts_already_localized_indices(self):
-        # Translating again would filter the physical rows a second time.
         pool = _make_host_pool(dcp_rank=5)
         logical = torch.arange(2 * WIDENED_PAGE)
         localized = pool.dcp_localize_indices(logical, logical.clone())
@@ -267,8 +266,6 @@ class _FakeDeviceModule:
 
 
 class _CountingHostPool:
-    """Host pool stand-in that records how the load loop localizes indices."""
-
     size_per_token = 2
     layer_num = 24
 
@@ -295,12 +292,6 @@ class _CountingHostPool:
 
 
 class TestLoadLoopLocalizesOnce(CustomTestCase):
-    """The load loop must hoist the DCP translation out of the layer loop.
-
-    Per-layer translation costs 2 * layer_num index launches per transfer on
-    the load stream's critical path.
-    """
-
     def setUp(self):
         manager_cache_controller._timing_events_supported.cache_clear()
 
