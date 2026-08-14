@@ -42,6 +42,7 @@ dependencies = [
   "outlines",
   "packaging",
   "partial_json_parser",
+  "piecewise-cuda-graphs==0.1.0",
   "pillow",
   "prometheus-client>=0.20.0",
   "psutil",
