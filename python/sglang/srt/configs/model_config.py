@@ -142,14 +142,6 @@ def is_deepseek_v4(config) -> bool:
     )
 
 
-def is_nemotron_h(config) -> bool:
-    return _hf_arch(config) in (
-        "NemotronHForCausalLM",
-        "NemotronHPuzzleForCausalLM",
-        "NemotronHForCausalLMMTP",
-    )
-
-
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config) or is_deepseek_v4(config)
     return config.index_head_dim
@@ -1475,6 +1467,7 @@ class ModelConfig:
             "modelslim",
             "humming",
             "quark_mxfp4",
+            "auto-round",
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
@@ -1482,7 +1475,7 @@ class ModelConfig:
             # so eligible MoE experts are requantized online.
             "modelopt_fp4": ["modelopt", "fp8"],
             "modelopt_mixed": ["modelopt"],
-            "nvfp4_online": ["fp8"],
+            "nvfp4_online": ["fp8", "modelopt_fp8"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
