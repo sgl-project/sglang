@@ -4,11 +4,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.long_context_bench_kit import LongContextBenchServingMixin
 from sglang.test.server_fixtures.dsa_mtp_fixture import DsaMtpServerBase
 
-register_cuda_ci(
-    est_time=1800,
-    suite="nightly-4-gpu-gb300-glm5-nvfp4",
-    nightly=True,
-)
+register_cuda_ci(est_time=1800, stage="nightly", runner_config="4-gpu-gb300")
 
 
 class TestGLM52NVFP4TPMTPLongContext(DsaMtpServerBase, LongContextBenchServingMixin):

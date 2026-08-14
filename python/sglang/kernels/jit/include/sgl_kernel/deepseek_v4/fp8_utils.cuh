@@ -14,6 +14,8 @@
 // All functions are `SGL_DEVICE` (= `__forceinline__ __device__`) so
 // including this header in multiple translation units is ODR-safe.
 
+namespace sglang {
+
 namespace deepseek_v4::fp8 {
 
 // Round `x` to the nearest representable UE8M0 value. Returns the raw
@@ -118,3 +120,5 @@ SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
 #endif
 
 }  // namespace deepseek_v4::fp8
+
+}  // namespace sglang

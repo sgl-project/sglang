@@ -32,6 +32,17 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
+    # on by default; engages only on 2 ranks with peer-to-peer access and falls
+    # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
+    # the resolver below -- that is the value the runtime reads.
+    SGLANG_DIFFUSION_IPC_A2A: bool = True
+    # a deadlock backstop, not a per-step budget: a rank can legitimately stall
+    # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
+    # retires the transport on every rank and fails the request
+    SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS: float = 10000.0
+    # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
+    # slots and is never freed, so multi-resolution serving needs a cap
+    SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS: int = 16
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -58,6 +69,7 @@ if TYPE_CHECKING:
     SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES: int | None = None
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
+    SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
@@ -219,6 +231,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference
+    # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
+    "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
+    "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS": _lazy_float(
+        "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS", 10000.0
+    ),
+    "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
+        "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
+    ),
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
     # Number of first blocks to always compute (DBCache F parameter)
     "SGLANG_CACHE_DIT_FN": _lazy_int("SGLANG_CACHE_DIT_FN", 1),
@@ -267,6 +287,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When disabled, FP8 weights are dequantized to compute dtype before matmul.
     "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM": _lazy_bool(
         "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM"
+    ),
+    # Dequantize storage-only FP8 linear weights to the compute dtype once,
+    # at first use (bit-identical outputs; trades weight VRAM for skipping
+    # the per-forward dequant pass). Weights are kept FP8-resident when free
+    # memory is low or when this flag is disabled.
+    "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE": _lazy_bool(
+        "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE", "true"
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),

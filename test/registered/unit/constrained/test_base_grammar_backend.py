@@ -316,15 +316,21 @@ class TestCreateGrammarBackend(unittest.TestCase):
     @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
     def test_xgrammar_unsupported_tokenizer_falls_back_to_none(self, mock_xgrammar_cls):
         from sglang.srt.constrained.xgrammar_backend import TokenizerNotSupportedError
+        from sglang.srt.runtime_context import get_context, get_exec
 
         mock_xgrammar_cls.side_effect = TokenizerNotSupportedError(
             "unsupported tokenizer"
         )
-        args = self._make_server_args("xgrammar")
+        override = get_context().override_server_args(grammar_backend="xgrammar")
+        server_args = override.install()
+        self.addCleanup(override.restore)
 
-        result = create_grammar_backend(args, "tok", 32000, {1})
-        self.assertIsNone(result)
-        self.assertEqual(args.grammar_backend, "none")
+        self.assertIsNone(create_grammar_backend(server_args, "tok", 32000, {1}))
+        self.assertEqual(get_exec().kernel.grammar_backend, "none")
+        self.assertEqual(
+            get_context().resolved_server_args_dict()["grammar_backend"], "none"
+        )
+        self.assertEqual(server_args.grammar_backend, "xgrammar")
 
     @patch("sglang.srt.constrained.llguidance_backend.GuidanceBackend")
     def test_llguidance_backend(self, mock_guidance_cls):
@@ -359,30 +365,28 @@ class TestCreateGrammarBackend(unittest.TestCase):
         # encode must return a single-token list for think_start/end tokens
         tokenizer.encode.return_value = [42]
 
-        result = create_grammar_backend(args, tokenizer, 32000, think_end_id=42)
+        result = create_grammar_backend(args, tokenizer, 32000, think_end_ids=[42])
         self.assertIsInstance(result, ReasonerGrammarBackend)
         self.assertIs(result.grammar_backend, mock_backend)
 
     @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
-    def test_no_reasoner_wrapping_without_think_end_id(self, mock_outlines_cls):
-        """Without think_end_id passed in, no reasoner wrapping."""
+    def test_no_reasoner_wrapping_without_think_end_ids(self, mock_outlines_cls):
         mock_backend = MagicMock(spec=BaseGrammarBackend)
         mock_outlines_cls.return_value = mock_backend
         args = self._make_server_args("outlines", reasoning_parser="deepseek-r1")
-        tokenizer = MagicMock(spec=[])  # No think_end_id attribute
+        tokenizer = MagicMock(spec=[])
 
-        result = create_grammar_backend(args, tokenizer, 32000, think_end_id=None)
+        result = create_grammar_backend(args, tokenizer, 32000, think_end_ids=None)
         self.assertIs(result, mock_backend)
 
     @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
     def test_no_reasoner_wrapping_without_reasoning_parser(self, mock_outlines_cls):
-        """Without reasoning_parser, no reasoner wrapping even with think_end_id."""
         mock_backend = MagicMock(spec=BaseGrammarBackend)
         mock_outlines_cls.return_value = mock_backend
         args = self._make_server_args("outlines", reasoning_parser=None)
         tokenizer = MagicMock()
 
-        result = create_grammar_backend(args, tokenizer, 32000, think_end_id=42)
+        result = create_grammar_backend(args, tokenizer, 32000, think_end_ids=[42])
         self.assertIs(result, mock_backend)
 
     @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")

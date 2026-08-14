@@ -19,6 +19,7 @@ from typing import List, Optional
 from pydantic import BaseModel, Field, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionMessageContentImageURL,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -124,6 +125,17 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(request.temperature, None)  # default
         self.assertFalse(request.stream)  # default
         self.assertEqual(request.tool_choice, "none")  # default when no tools
+
+    def test_image_content_hash_validation(self):
+        digest = "sha256:" + "AB" * 32
+        image = ChatCompletionMessageContentImageURL(
+            url="https://example.com/image.jpg", content_hash=digest
+        )
+        self.assertEqual(image.content_hash, digest.lower())
+        with self.assertRaises(ValidationError):
+            ChatCompletionMessageContentImageURL(
+                url="https://example.com/image.jpg", content_hash="not-a-hash"
+            )
 
     def test_sampling_param_build(self):
         req = ChatCompletionRequest(
@@ -437,6 +449,68 @@ class TestChatCompletionRequest(unittest.TestCase):
         strict = json_format.strict
         self.assertEqual(name, "VoiceNote")
         self.assertEqual(strict, True)
+
+    def test_schema_derived_strict_false_constraint_gated_on_renderer(self):
+        """A `strict` field on the user's model doubles as the protocol switch.
+
+        set_json_schema pops `strict` out of the schema's properties and feeds
+        its default into response_format. strict=False drops the sampling
+        constraint only when the renderer forwards response_format to the
+        model; otherwise the schema would be silently ignored, so the
+        constraint stays installed.
+        """
+
+        class Note(BaseModel):
+            title: str
+            strict: bool = False
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Return JSON"}],
+            response_format={
+                "type": "json_schema",
+                "schema": Note.model_json_schema(),
+            },
+        )
+
+        self.assertIs(request.response_format.json_schema.strict, False)
+        self.assertNotIn(
+            "strict", request.response_format.json_schema.schema_["properties"]
+        )
+        sampling_params = request.to_sampling_params(
+            stop=[], model_generation_config={}
+        )
+        self.assertIn("json_schema", sampling_params)
+        sampling_params = request.to_sampling_params(
+            stop=[],
+            model_generation_config={},
+            renderer_handles_response_format=True,
+        )
+        self.assertNotIn("json_schema", sampling_params)
+
+    def test_non_strict_response_format_constraint_gated_on_renderer(self):
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Return JSON"}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object"},
+                    "strict": False,
+                },
+            },
+        )
+        sampling_params = request.to_sampling_params(
+            stop=[], model_generation_config={}
+        )
+        self.assertIn("json_schema", sampling_params)
+        sampling_params = request.to_sampling_params(
+            stop=[],
+            model_generation_config={},
+            renderer_handles_response_format=True,
+        )
+        self.assertNotIn("json_schema", sampling_params)
 
 
 class TestModelSerialization(unittest.TestCase):
