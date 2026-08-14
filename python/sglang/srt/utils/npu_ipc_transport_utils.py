@@ -8,7 +8,6 @@ import numpy as np
 import torch
 from torch.multiprocessing.reductions import reduce_tensor
 
-from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 logger = logging.getLogger(__name__)
@@ -34,9 +33,10 @@ class ShmSyncBuffer:
 
 
 class MmItemMemoryChunk:
-    def __init__(self, area: Tuple, sync_buffer: ShmSyncBuffer):
+    def __init__(self, area: Tuple, sync_buffer: ShmSyncBuffer, tp_size: int):
         self.area = area
         self.sync_flag = sync_buffer
+        self.tp_size = tp_size
 
     @property
     def mem_size(self):
@@ -51,18 +51,10 @@ class MmItemMemoryChunk:
         return self.area[1]
 
     def try_to_recycle(self) -> bool:
-        try:
-            tp_num = get_server_args().tp_size
-        except Exception:
-            logger.info(
-                "server_args has not been published yet, skip this turn's recycle"
-            )
-            return False
-
         val = float(self.sync_flag.buffer_wrapper.item())
-        logger.debug(f"[try_to_recycle] area={self.area}, flag={val}, tp_size={tp_num}")
+        logger.debug(f"[try_to_recycle] area={self.area}, flag={val}, tp_size={self.tp_size}")
 
-        if val == float(tp_num):
+        if val == float(self.tp_size):
             self.sync_flag.buffer_wrapper *= 0.0
             return True
 
@@ -70,7 +62,8 @@ class MmItemMemoryChunk:
 
 
 class MmItemMemoryPool:
-    def __init__(self, memory_size, recycle_interval, base_npu_id):
+    def __init__(self, memory_size, recycle_interval, base_npu_id, tp_size):
+        self.tp_size = tp_size
         self.memory_pool = torch.empty(
             memory_size, dtype=torch.int8, device=f"npu:{base_npu_id}"
         ).contiguous()
@@ -79,7 +72,7 @@ class MmItemMemoryPool:
 
         self.sync_flag_list = []
 
-        init_chunk = MmItemMemoryChunk((0, memory_size), self.pop_sync_buffer())
+        init_chunk = MmItemMemoryChunk((0, memory_size), self.pop_sync_buffer(), tp_size)
         self.available_chunks = [init_chunk]
         self.occupied_chunks = []
 
@@ -152,7 +145,7 @@ class MmItemMemoryPool:
         )
         occupied_chunk_sync_flag = selected_chunk.sync_flag
         new_occupied_chunk = MmItemMemoryChunk(
-            occupied_chunk_area, occupied_chunk_sync_flag
+            occupied_chunk_area, occupied_chunk_sync_flag, self.tp_size
         )
 
         self.occupied_chunks.append(new_occupied_chunk)
@@ -161,7 +154,7 @@ class MmItemMemoryPool:
         available_split_chunk_area = (new_occupied_chunk.end, selected_chunk.end)
         if available_split_chunk_area[0] != available_split_chunk_area[1]:
             split_available_chunk = MmItemMemoryChunk(
-                available_split_chunk_area, selected_chunk.sync_flag
+                available_split_chunk_area, selected_chunk.sync_flag, self.tp_size
             )
             self.available_chunks.append(split_available_chunk)
             self.occupied_chunks.pop()
@@ -243,7 +236,7 @@ class MmItemMemoryPool:
                     to_merge_chunk_sync = to_merge_chunk.sync_flag
                     merged_chunk_area = (to_merge_chunk.start, chunk.end)
                     merged_chunks.append(
-                        MmItemMemoryChunk(merged_chunk_area, to_merge_chunk_sync)
+                        MmItemMemoryChunk(merged_chunk_area, to_merge_chunk_sync, self.tp_size)
                     )
                     self.push_sync_buffer(chunk.sync_flag)
                 else:

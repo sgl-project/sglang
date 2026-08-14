@@ -423,6 +423,7 @@ class BaseMultimodalProcessor(ABC):
                     per_worker_pool_size,
                     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
                     self.server_args.base_gpu_id,
+                    self.server_args.tp_size,
                 )
             else:
                 self.cudaipc_mmfeature_pool = CudaMmItemMemoryPool(
