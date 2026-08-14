@@ -15,10 +15,6 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
-from sglang.kernels.ops.gemm.fused_a_gemm import (
-    dsv3_fused_a_gemm,
-    fused_a_gemm_weight_eligible,
-)
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
@@ -77,7 +73,6 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -1927,8 +1922,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # is the wrong group at attn_tp>1 and deadlocks against idle DP
             # ranks.
             self.o_proj.use_dp_attention_reduce = True
-        self._qkv_a_g_proj_weight = None
-        self._qkv_a_g_proj_sizes = None
         if self.use_output_gate:
             projection_size = config.num_attention_heads * config.v_head_dim
             # Shard by attn-TP to match the attention output (DSV2 MLA shards
@@ -1948,8 +1941,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # cores, so wrap its forward at the instance level; the module
             # itself (weights, reduce_results, loading path) is untouched.
             self._gate_hidden_states = None
-            # (gate, producer stream); the merged qkv-a GEMM uses None as its
-            # producer stream, while the fallback may issue on the alt stream.
+            # (gate, producer stream) issued on the alt stream by forward();
+            # None when the lazy path computes the gate here instead.
             self._gate_precomputed = None
             self._gate_alt_stream = gate_alt_stream
             # Above this token count the attention-core kernels fill the SMs
@@ -1967,7 +1960,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 self._gate_hidden_states = None
                 precomputed = self._gate_precomputed
                 self._gate_precomputed = None
-                if precomputed is not None and precomputed[1] is not None:
+                if precomputed is not None:
                     # Use wait_stream rather than an explicit event so the
                     # breakable-CUDA-graph runner can track the side-stream
                     # join across graph-segment boundaries.
@@ -1989,52 +1982,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
-
-    def _merge_qkv_a_g_proj_weights(self) -> None:
-        """Merge the same-input MLA qkv-a and TP-local output-gate weights."""
-        if not self.use_output_gate:
-            return
-        mods = [self.fused_qkv_a_proj_with_mqa, self.g_proj]
-        # K3's global MXFP4 config ignores attention; inspect the resolved
-        # methods instead of treating a non-None quant_config as quantized.
-        if any(
-            not isinstance(mod.quant_method, UnquantizedLinearMethod) for mod in mods
-        ):
-            return
-        dtypes = {mod.weight.dtype for mod in mods}
-        if len(dtypes) != 1 or dtypes.pop() not in (torch.bfloat16, torch.float16):
-            return
-        self._qkv_a_g_proj_weight, self._qkv_a_g_proj_sizes = _merge_weights_as_views(
-            mods
-        )
-
-    def prepare_qkv_latent(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
-    ):
-        weight = self._qkv_a_g_proj_weight
-        if (
-            weight is None
-            or not isinstance(hidden_states, torch.Tensor)
-            or getattr(self.fused_qkv_a_proj_with_mqa, "set_lora", False)
-            or getattr(self.g_proj, "set_lora", False)
-        ):
-            return super().prepare_qkv_latent(hidden_states, forward_batch)
-
-        if self._use_min_latency_fused_a_gemm is None:
-            self._use_min_latency_fused_a_gemm = (
-                not get_exec().deterministic.enable_deterministic_inference
-                and weight.shape[0] % 16 == 0
-                and fused_a_gemm_weight_eligible(self.fused_qkv_a_proj_with_mqa)
-            )
-        if self._use_min_latency_fused_a_gemm and 1 <= hidden_states.shape[0] <= 16:
-            fused = dsv3_fused_a_gemm(
-                hidden_states, weight.T, backend=self.fused_a_gemm_backend
-            )
-        else:
-            fused = _k3_bf16_gemm(hidden_states, weight)
-        qkv_latent, gate = torch.split(fused, self._qkv_a_g_proj_sizes, dim=-1)
-        self._gate_precomputed = (gate, None)
-        return qkv_latent
 
     def _precompute_output_gate(self, hidden_states: torch.Tensor) -> None:
         """Issue the output-gate GEMM on the alt stream so it overlaps the
@@ -2068,10 +2015,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     ):
         if self.use_output_gate:
             self._gate_hidden_states = hidden_states
-            if self._qkv_a_g_proj_weight is None:
-                self._precompute_output_gate(hidden_states)
-            else:
-                self._gate_precomputed = None
+            self._precompute_output_gate(hidden_states)
         return super().forward(
             positions, hidden_states, forward_batch, zero_allocator, **kwargs
         )
@@ -3118,8 +3062,6 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
-            elif isinstance(layer.self_attn, KimiK3MLAAttention):
-                layer.self_attn._merge_qkv_a_g_proj_weights()
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(
@@ -3334,8 +3276,8 @@ class KimiK3ForConditionalGeneration(nn.Module):
                         "Kimi-K3 cannot mix deferred and preprocessed image features"
                     )
                 first_config = deferred[0]
-                backend = first_config["backend"]
-                if any(config["backend"] != backend for config in deferred):
+                backend = first_config.backend
+                if any(config.backend != backend for config in deferred):
                     raise ValueError(
                         "Kimi-K3 cannot mix deferred preprocessing backends"
                     )
@@ -3345,17 +3287,17 @@ class KimiK3ForConditionalGeneration(nn.Module):
                     )
 
                     image_scale, image_bias = normalization_tensors(
-                        first_config["image_mean"], first_config["image_std"], device
+                        first_config.image_mean, first_config.image_std, device
                     )
                     pixel_values, _ = _gpu_preprocess_images(
                         [item.feature for item in selected_items],
-                        [config["resize_config"] for config in deferred],
+                        [config.resize_config for config in deferred],
                         image_scale,
                         image_bias,
                         self.vision_tower.patch_size,
                         to_chw=lambda image: to_chw_uint8(image, device=device),
                         post_resize=lambda x: fill_transparent_bg(
-                            x, first_config["transparent_bg_config"]
+                            x, first_config.transparent_bg_config
                         ),
                     )
                 elif backend == "cpu":
