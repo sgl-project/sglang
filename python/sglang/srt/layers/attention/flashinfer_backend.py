@@ -36,6 +36,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTable
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -310,6 +311,10 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.kv_index_translator = model_runner.kv_index_translator
+        # Set unconditionally: the read site evaluates it before the call,
+        # and a non-translating pool never looks at its value.
+        self.kv_read_tables = None
         self._swa_kv_pool: Optional[BaseSWAKVPool] = self._resolve_swa_kv_pool(
             model_runner
         )
@@ -721,6 +726,15 @@ class FlashInferAttnBackend(AttentionBackend):
             num_tokens = forward_batch.positions.numel()
             self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
 
+        # Canonical id source for the index builders below. All flashinfer
+        # gathers run OUT-of-graph (plan time), so only buffer reuse — not
+        # pointer stability — motivates the capture-stable canonical here.
+        kv_view = self.kv_index_translator.build_index_table(
+            req_pool_indices=req_pool_indices[:bs],
+            seq_lens=seq_lens[:bs],
+            into=self.kv_read_tables,
+        )
+
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 req_pool_indices[:bs],
@@ -732,6 +746,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
+                kv_view=kv_view,
             )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -744,6 +759,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+                kv_view=kv_view,
             )
         elif forward_mode.is_dllm_extend():
             self.indices_updater_prefill.update(
@@ -756,6 +772,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
+                kv_view=kv_view,
             )
         elif forward_mode.is_draft_extend_v2():
             self.indices_updater_prefill.update(
@@ -768,6 +785,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+                kv_view=kv_view,
             )
         elif forward_mode.is_extend():
             # Plain EXTEND under full prefill CUDA graph. plan() runs
@@ -786,6 +804,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
+                kv_view=kv_view,
             )
         else:
             raise ValueError("Invalid forward mode")
@@ -840,14 +859,22 @@ class FlashInferAttnBackend(AttentionBackend):
         # Refill the SWA write-target buffer from the live out_cache_loc before
         # replay (bound onto the metadata at capture below).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            assert self._swa_kv_pool is not None
             n = forward_batch.out_cache_loc.shape[0]
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
-            self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                self._swa_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
+            if in_capture and self.kv_index_translator.is_translating:
+                # A runner-built capture batch never went through `init_new`,
+                # so there is no prepared rail to resolve — and zeros are the
+                # page-0 sink in every id space. Replay refills below.
+                self.cuda_graph_swa_out_cache_loc[:n].zero_()
+            else:
+                # Unified: the rail the choke point resolved for this batch's
+                # (already kernel-facing) loc; static SWA: the legacy
+                # full->swa translate — one resolver for both.
+                self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                    self.kv_index_translator.sliding_window_write_loc_for(
+                        forward_batch.out_cache_loc
+                    )
                 )
-            )
             if in_capture:
                 self.forward_metadata.swa_out_cache_loc = (
                     self.cuda_graph_swa_out_cache_loc[:n]
@@ -934,10 +961,13 @@ class FlashInferAttnBackend(AttentionBackend):
         return layer.k_scale, layer.v_scale
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        kv_view = self.kv_index_translator.index_table_for_batch(forward_batch)
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            assert self._swa_kv_pool is not None
-            swa_out_cache_loc = self._swa_kv_pool.translate_loc_from_full_to_swa(
+            # Unified: the rail the choke point resolved for this batch's
+            # (already kernel-facing) loc; static SWA: the legacy full->swa
+            # translate — one resolver for both.
+            swa_out_cache_loc = self.kv_index_translator.sliding_window_write_loc_for(
                 forward_batch.out_cache_loc
             )
 
@@ -952,6 +982,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=forward_batch.spec_info,
                 fixed_split_size=self.decode_split_tile_size,
                 disable_split_kv=False,
+                kv_view=kv_view,
             )
             self.forward_metadata = DecodeMetadata(
                 self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
@@ -967,6 +998,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
+                kv_view=kv_view,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_verify,
@@ -1020,6 +1052,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
                 extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
                 custom_kv_indices=self.dq_page_table,
+                kv_view=kv_view,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -1035,6 +1068,9 @@ class FlashInferAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        self.kv_read_tables = self.kv_index_translator.make_capture_tables(
+            max_bs=max_bs, max_context_len=self.max_context_len
+        )
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
                 (max_num_tokens * self.max_context_len,),
@@ -1539,7 +1575,6 @@ class FlashInferIndicesUpdaterDecode:
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._swa_kv_pool = attn_backend._swa_kv_pool
 
         # Dispatch the update function
@@ -1562,6 +1597,8 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        *,
+        kv_view: KVIndexTable,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1577,6 +1614,8 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        *,
+        kv_view: KVIndexTable,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
@@ -1590,6 +1629,7 @@ class FlashInferIndicesUpdaterDecode:
             seq_lens_cpu,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            kv_view=kv_view,
         )
 
     def update_sliding_window(
@@ -1603,6 +1643,8 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        *,
+        kv_view: KVIndexTable,
     ):
         assert self.sliding_window_size is not None
         for wrapper_id in range(2):
@@ -1642,6 +1684,7 @@ class FlashInferIndicesUpdaterDecode:
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=disable_split_kv,
+                kv_view=kv_view,
             )
 
     def update_cross_attention(
@@ -1655,6 +1698,8 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        *,
+        kv_view: KVIndexTable,
     ):
         # Cache encoder_lens on CPU to avoid GPU→CPU transfer per call
         encoder_lens_cpu = encoder_lens.cpu() if encoder_lens is not None else None
@@ -1681,6 +1726,7 @@ class FlashInferIndicesUpdaterDecode:
                 seq_lens_cpu=kv_lens_cpu,
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=disable_split_kv,
+                kv_view=kv_view,
             )
 
     def call_begin_forward(
@@ -1696,7 +1742,13 @@ class FlashInferIndicesUpdaterDecode:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        *,
+        kv_view: KVIndexTable,
     ):
+        # Unified SWA wrapper-0: gather from the swa canonical directly — its
+        # entries are already swa-side kernel-facing ids, so the in-place
+        # full->swa translate below must not run on top of them.
+        use_swa_source = use_sliding_window_kv_pool and kv_view.is_translated
         if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -1710,20 +1762,26 @@ class FlashInferIndicesUpdaterDecode:
                     paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
                 )
 
+            if use_swa_source:
+                assert kv_view.sliding_window_ids is not None
+                src_table = kv_view.sliding_window_ids
+            else:
+                src_table = kv_view.ids
             create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
+                src_table,
+                kv_view.row_ids,
                 paged_kernel_lens,
                 kv_indptr,
                 kv_start_idx,
                 kv_indices,
-                self.req_to_token.shape[1],
+                kv_view.row_stride,
+                ENTRY_PAGE_SIZE=kv_view.entry_page_size,
             )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
 
-        if use_sliding_window_kv_pool:
+        if use_sliding_window_kv_pool and not use_swa_source:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
@@ -1811,6 +1869,9 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
+        # Kept ONLY for the spec-info branches (generate_attn_arg_prefill),
+        # which are static-pool-only: unified memory asserts spec off. The
+        # normal builders source from the per-batch KVIndexTable.
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._swa_kv_pool = attn_backend._swa_kv_pool
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
@@ -1840,6 +1901,8 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        *,
+        kv_view: KVIndexTable,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1860,6 +1923,8 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        *,
+        kv_view: KVIndexTable,
     ):
         if use_ragged:
             assert prefix_lens is not None
@@ -1890,6 +1955,7 @@ class FlashInferIndicesUpdaterPrefill:
             multi_item_params=multi_item_params,
             seq_lens_cpu=seq_lens_cpu,
             custom_kv_indices=custom_kv_indices,
+            kv_view=kv_view,
         )
 
     def update_sliding_window(
@@ -1908,6 +1974,8 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        *,
+        kv_view: KVIndexTable,
     ):
         if custom_kv_indices is not None:
             raise RuntimeError(
@@ -1983,6 +2051,7 @@ class FlashInferIndicesUpdaterPrefill:
                     if (wrapper_id == 0 and not use_ragged and spec_info is None)
                     else -1
                 ),
+                kv_view=kv_view,
             )
 
     def _build_swa_prefix_custom_mask(
@@ -2042,6 +2111,8 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        *,
+        kv_view: KVIndexTable,
     ):
         if custom_kv_indices is not None:
             raise RuntimeError(
@@ -2077,6 +2148,7 @@ class FlashInferIndicesUpdaterPrefill:
                 cross_attention_custom_mask=(
                     cross_attention_custom_mask if wrapper_id == 1 else None
                 ),
+                kv_view=kv_view,
             )
 
     def call_begin_forward(
@@ -2100,8 +2172,14 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_cpu: Optional[torch.Tensor] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
         window_left: int = -1,
+        *,
+        kv_view: KVIndexTable,
     ):
         bs = len(seq_lens)
+        # Unified SWA wrapper-0: gather from the swa canonical directly — its
+        # entries are already swa-side kernel-facing ids, so the in-place
+        # full->swa translate below must not run on top of them.
+        use_swa_source = use_sliding_window_kv_pool and kv_view.is_translated
         if spec_info is None:
             assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)
@@ -2127,14 +2205,20 @@ class FlashInferIndicesUpdaterPrefill:
                     dtype=torch.int32,
                     device=req_pool_indices.device,
                 )
+                if use_swa_source:
+                    assert kv_view.sliding_window_ids is not None
+                    src_table = kv_view.sliding_window_ids
+                else:
+                    src_table = kv_view.ids
                 create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices,
+                    src_table,
+                    kv_view.row_ids,
                     paged_kernel_lens,
                     kv_indptr,
                     kv_start_idx,
                     kv_indices,
-                    self.req_to_token.shape[1],
+                    kv_view.row_stride,
+                    ENTRY_PAGE_SIZE=kv_view.entry_page_size,
                 )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
@@ -2173,7 +2257,7 @@ class FlashInferIndicesUpdaterPrefill:
                 q_data_type=self.q_data_type,
             )
 
-        if use_sliding_window_kv_pool:
+        if use_sliding_window_kv_pool and not use_swa_source:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
