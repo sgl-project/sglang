@@ -139,6 +139,7 @@ class TritonRunnerCore(MoeRunnerCore):
             running_state["config"],
             running_state.get("down_config"),
             running_state.get("down_moe_use_tma", False),
+            running_state.get("up_moe_use_tma", False),
             b1=quant_info.b13,
             b2=quant_info.b2,
             use_fp8_w8a8=quant_info.use_fp8_w8a8,
@@ -289,6 +290,7 @@ def pre_permute_standard_to_triton(
         config,
         down_config,
         down_moe_use_tma,
+        up_moe_use_tma,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -308,6 +310,7 @@ def pre_permute_standard_to_triton(
     running_state["config"] = config
     running_state["down_config"] = down_config
     running_state["down_moe_use_tma"] = down_moe_use_tma
+    running_state["up_moe_use_tma"] = up_moe_use_tma
 
     return TritonRunnerInput(
         hidden_states=hidden_states,
