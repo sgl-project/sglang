@@ -544,15 +544,15 @@ class TestLoadBalanceMethod(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
             server_args._handle_pd_disaggregation()
 
-    def test_pd_prefill_dspark_rejects_hierarchical_cache(self):
+    def test_pd_prefill_dspark_allows_hierarchical_cache(self):
         server_args = ServerArgs(
             model_path="dummy",
             disaggregation_mode="prefill",
             speculative_algorithm="DSPARK",
             enable_hierarchical_cache=True,
         )
-        with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
-            server_args._handle_pd_disaggregation()
+        server_args._handle_pd_disaggregation()
+        self.assertTrue(server_args.enable_hierarchical_cache)
 
     def test_pd_prefill_dspark_rejects_prefill_context_parallel(self):
         server_args = ServerArgs(

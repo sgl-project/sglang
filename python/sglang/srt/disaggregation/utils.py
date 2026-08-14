@@ -1039,7 +1039,7 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
-    dspark_draft_kv: bool = False,
+    use_dspark_draft_kv_state: bool = False,
 ) -> None:
     """Populate ``kv_args`` state-buffer fields from the given pool.
     Shared by prefill and decode bootstrap paths so the state_type dispatch
@@ -1286,30 +1286,42 @@ def setup_state_kv_args(
                 slice_outer_counts,
             )
 
-    if dspark_draft_kv and draft_token_to_kv_pool is not None:
-        if not isinstance(draft_token_to_kv_pool, MHATokenToKVPool):
-            raise NotImplementedError(
-                "PD DSPARK draft KV transfer only supports MHATokenToKVPool drafts; "
-                f"got {type(draft_token_to_kv_pool).__name__}"
+    if use_dspark_draft_kv_state and draft_token_to_kv_pool is not None:
+        if isinstance(draft_token_to_kv_pool, MHATokenToKVPool):
+            draft_ptrs, draft_lens, draft_page_item_lens = (
+                draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
-        draft_ptrs, draft_lens, draft_page_item_lens = (
-            draft_token_to_kv_pool.get_contiguous_buf_infos()
-        )
-        if draft_ptrs:
-            draft_page_size = draft_token_to_kv_pool.page_size
-            if any(item_len % draft_page_size for item_len in draft_page_item_lens):
-                raise RuntimeError(
-                    "DSPARK draft KV page item length must be divisible by the "
-                    f"draft page size: item_lens={draft_page_item_lens}, "
-                    f"page_size={draft_page_size}"
+            if draft_ptrs:
+                draft_page_size = draft_token_to_kv_pool.page_size
+                if any(
+                    item_len % draft_page_size
+                    for item_len in draft_page_item_lens
+                ):
+                    raise RuntimeError(
+                        "DSPARK draft KV page item length must be divisible by the "
+                        f"draft page size: item_lens={draft_page_item_lens}, "
+                        f"page_size={draft_page_size}"
+                    )
+                draft_token_item_lens = [
+                    item_len // draft_page_size
+                    for item_len in draft_page_item_lens
+                ]
+                append_state_component(
+                    kv_args,
+                    StateType.DSPARK_DRAFT_KV,
+                    draft_ptrs,
+                    draft_lens,
+                    draft_token_item_lens,
+                    layer_ids=list(range(len(draft_ptrs))),
                 )
-            append_state_component(
-                kv_args,
-                StateType.DSPARK_DRAFT_KV,
-                draft_ptrs,
-                draft_lens,
-                [item_len // draft_page_size for item_len in draft_page_item_lens],
-                layer_ids=list(range(len(draft_ptrs))),
+        elif not (
+            isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            and isinstance(draft_token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        ):
+            raise NotImplementedError(
+                "Unsupported PD DSPARK draft KV pool combination: "
+                f"target={type(token_to_kv_pool).__name__}, "
+                f"draft={type(draft_token_to_kv_pool).__name__}"
             )
 
 

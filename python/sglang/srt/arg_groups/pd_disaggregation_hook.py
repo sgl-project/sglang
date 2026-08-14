@@ -47,19 +47,13 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     if (
         server_args.disaggregation_mode == "prefill"
         and server_args.speculative_algorithm == "DSPARK"
+        and server_args.enable_prefill_context_parallel
     ):
-        if server_args.enable_hierarchical_cache:
-            raise ValueError(
-                "PD prefill with DSPARK is incompatible with "
-                "--enable-hierarchical-cache: host-to-device prefix load-back "
-                "restores target KV only, leaving draft KV rows uninitialized."
-            )
-        if server_args.enable_prefill_context_parallel:
-            raise ValueError(
-                "PD prefill with DSPARK is incompatible with "
-                "--enable-prefill-context-parallel: each CP rank only writes "
-                "draft KV for its own token shard."
-            )
+        raise ValueError(
+            "PD prefill with DSPARK is incompatible with "
+            "--enable-prefill-context-parallel: each CP rank only writes "
+            "draft KV for its own token shard."
+        )
 
     if server_args.disaggregation_mode == "decode" and server_args.dcp_size > 1:
         if server_args.disaggregation_transfer_backend not in ("mooncake", "nixl"):

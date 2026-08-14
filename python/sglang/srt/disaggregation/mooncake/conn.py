@@ -2107,18 +2107,26 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 self.update_status(room, KVPoll.WaitingForInput)
 
+    @staticmethod
+    def _bootstrap_message_session_id(
+        waiting_req_bytes: List[bytes],
+    ) -> Optional[str]:
+        if not waiting_req_bytes or waiting_req_bytes[0] == b"ABORT":
+            return None
+        session_index = 6 if waiting_req_bytes[0] == b"STAGING_RSP" else 3
+        if len(waiting_req_bytes) <= session_index:
+            return None
+        return waiting_req_bytes[session_index].decode("ascii", errors="replace")
+
     def _fail_bootstrap_message(self, waiting_req_bytes: List[bytes]):
-        session_id = (
-            waiting_req_bytes[3].decode("ascii", errors="replace")
-            if len(waiting_req_bytes) > 3
-            else None
-        )
+        session_id = self._bootstrap_message_session_id(waiting_req_bytes)
+        if session_id is None:
+            logger.exception("Failed to handle bootstrap message without a session ID.")
+            return
         logger.exception(
             f"Failed to handle bootstrap message (session={session_id}). "
-            f"Marking the session failed so pending rooms abort instead of hanging."
+            "Marking the session failed so pending rooms abort instead of hanging."
         )
-        if session_id is None:
-            return
         with self.session_lock:
             self.session_failures[session_id] += 1
             self.failed_sessions.add(session_id)

@@ -224,14 +224,12 @@ class PrefillBootstrapQueue:
             else getattr(self.token_to_kv_pool, "end_layer", None)
         )
 
-        dspark_draft_kv = (
-            self.scheduler.spec_algorithm.is_dspark() and transfer_draft_cache
-        )
+        use_dspark_draft_kv_state = self.scheduler.spec_algorithm.is_dspark()
 
         if (
             self.draft_token_to_kv_pool is not None
             and transfer_draft_cache
-            and not dspark_draft_kv
+            and not use_dspark_draft_kv_state
         ):
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -247,7 +245,10 @@ class PrefillBootstrapQueue:
         kv_args.kv_item_lens = kv_item_lens
         kv_args.kv_layer_ids = (
             self.token_to_kv_pool.get_kv_layer_ids()
-            if (self.draft_token_to_kv_pool is None or dspark_draft_kv)
+            if (
+                self.draft_token_to_kv_pool is None
+                or use_dspark_draft_kv_state
+            )
             and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
             else []
         )
@@ -271,7 +272,7 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
-            dspark_draft_kv=dspark_draft_kv,
+            use_dspark_draft_kv_state=use_dspark_draft_kv_state,
         )
 
         if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
