@@ -2196,6 +2196,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     is_vlm = (
         bool(model_info.get("has_image_understanding", False))
         and not server_args.language_only
+        and not server_args.language_model_only
         and not is_mps()
     )
     if model_info["is_generation"]:
