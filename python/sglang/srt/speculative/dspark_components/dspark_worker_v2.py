@@ -229,7 +229,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and is_cuda()
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
-                max_bs=max(server_args.cuda_graph_config.decode.bs),
+                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
                 commit_ctx=CommitInjectCtx(
