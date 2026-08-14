@@ -245,8 +245,35 @@ class TestDisaggregationMooncakeSpec(
             "--dtype=float16",
         ]
         cls.extra_prefill_args = spec_args
-        cls.extra_decode_args = spec_args
+        cls.extra_decode_args = [
+            *spec_args,
+            "--disaggregation-decode-retraction-backup",
+            "host_pool",
+        ]
+        cls.extra_decode_env = {"SGLANG_TEST_RETRACT": "true"}
         cls.launch_all()
+
+    def test_host_pool_retraction_is_exercised(self):
+        prompts = [
+            f"Request {i}: explain how speculative decoding works. " * 4
+            for i in range(4)
+        ]
+        response = requests.post(
+            self.lb_url + "/generate",
+            json={
+                "text": prompts,
+                "sampling_params": {
+                    "temperature": 0,
+                    "ignore_eos": True,
+                    "max_new_tokens": 64,
+                },
+            },
+        )
+        response.raise_for_status()
+        retraction_count = sum(
+            result["meta_info"]["num_retractions"] for result in response.json()
+        )
+        self.assertGreater(retraction_count, 0)
 
     def test_gsm8k(self):
         args = SimpleNamespace(

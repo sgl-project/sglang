@@ -42,6 +42,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
                 origin_input_ids=[0] * fill_len,
                 output_ids=[],
                 is_retracted=True,
+                retraction_backup=None,
                 load_kv_cache=MagicMock(),
             )
             for i in range(4)
@@ -52,9 +53,13 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.num_reserved_decode_tokens = 0
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
         queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=page_size)
+        queue.tree_cache = MagicMock()
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,
-            server_args=SimpleNamespace(disable_radix_cache=True),
+            server_args=SimpleNamespace(
+                disable_radix_cache=True,
+                disaggregation_decode_retraction_backup="cpu_tensor",
+            ),
         )
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._swa_aware_allocatable_token_budgets = MagicMock(

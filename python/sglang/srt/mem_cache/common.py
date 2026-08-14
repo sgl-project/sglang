@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, cast
 
 import numpy as np
 import torch
@@ -15,6 +15,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
@@ -22,6 +23,7 @@ from sglang.srt.utils.common import ceil_align
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 # Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
 MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
@@ -30,6 +32,12 @@ MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
+
+
+class RetractionBackup(NamedTuple):
+    cpu_tensors: Any = None
+    host_indices: Optional[torch.Tensor] = None
+    pool_transfers: Optional[list[PoolTransfer]] = None
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
@@ -134,6 +142,60 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         available_size = allocator.available_size()
         if available_size < num_tokens:
             tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
+
+
+def retraction_backup(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    backend: str,
+) -> None:
+    if backend == "cpu_tensor":
+        req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        return
+    if backend != "host_pool":
+        raise ValueError(f"Unknown retraction backup backend: {backend}")
+    if req.seqlen <= 1:
+        return
+
+    unified_cache = cast("UnifiedRadixCache", tree_cache)
+    req.retraction_backup = unified_cache.retraction_backup(req)
+
+
+def retraction_restore(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    backend: str,
+) -> None:
+    if backend == "cpu_tensor":
+        req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        return
+    if backend != "host_pool":
+        raise ValueError(f"Unknown retraction backup backend: {backend}")
+    if req.seqlen <= 1:
+        return
+
+    unified_cache = cast("UnifiedRadixCache", tree_cache)
+    assert req.retraction_backup is not None
+    unified_cache.retraction_restore(req, req.retraction_backup)
+    req.retraction_backup = None
+
+
+def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> None:
+    if backend == "cpu_tensor":
+        req.retraction_backup = None
+        return
+    if backend != "host_pool":
+        raise ValueError(f"Unknown retraction backup backend: {backend}")
+    if req.retraction_backup is None:
+        return
+
+    unified_cache = cast("UnifiedRadixCache", tree_cache)
+    unified_cache.retraction_discard(req.retraction_backup)
+    req.retraction_backup = None
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):

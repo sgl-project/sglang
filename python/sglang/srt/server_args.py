@@ -2646,10 +2646,10 @@ class ServerArgs:
         False
     )
     hicache_ratio: A[
-        float,
-        "The ratio of the size of host KV cache memory pool to the size of device pool.",
+        Optional[float],
+        "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0, or 1.0 for host-pool decode retraction.",
         NS("memory"),
-    ] = 2.0
+    ] = None
     hicache_size: A[
         int,
         "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
@@ -3108,6 +3108,19 @@ class ServerArgs:
         "Enable async KV cache offloading on decode server (PD mode).",
         NS("disagg"),
     ] = False
+    disaggregation_decode_retraction_backup: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Storage backend for KV preserved across PD decode retraction. "
+                "'cpu_tensor' uses per-request CPU tensors. 'host_pool' uses "
+                "a reserved HiCache pool and does not fall back on exhaustion. "
+                "If omitted, the backend is inferred from the decode KV pool."
+            ),
+            choices=["cpu_tensor", "host_pool"],
+        ),
+        NS("disagg"),
+    ] = None
     num_reserved_decode_tokens: A[
         int,
         "Number of decode tokens that will have memory reserved when adding new request to the running batch.",
@@ -3582,6 +3595,7 @@ class ServerArgs:
         self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
+        self._handle_hicache_ratio_default()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -7320,6 +7334,10 @@ class ServerArgs:
                 "workloads and backends may be supported in a future change."
             )
 
+    def _handle_hicache_ratio_default(self):
+        if self.hicache_ratio is None and self.disaggregation_mode != "decode":
+            self.hicache_ratio = 2.0
+
     def _handle_hicache(self):
         """Normalize hicache-related knobs into a valid runtime configuration.
 
@@ -7331,6 +7349,10 @@ class ServerArgs:
         if not (
             self.enable_hierarchical_cache
             or self.disaggregation_decode_enable_offload_kvcache
+            or (
+                self.disaggregation_mode == "decode"
+                and self.disaggregation_decode_retraction_backup in (None, "host_pool")
+            )
         ):
             return
 
@@ -8069,6 +8091,32 @@ class ServerArgs:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
+        if (
+            self.disaggregation_decode_retraction_backup == "host_pool"
+            and self.disaggregation_mode != "decode"
+        ):
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=host_pool is only "
+                "supported on a PD decode server."
+            )
+        if (
+            self.disaggregation_decode_retraction_backup == "host_pool"
+            and self.dcp_size > 1
+        ):
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=host_pool does not "
+                "support --dcp-size > 1."
+            )
+        if (
+            self.disaggregation_decode_retraction_backup == "host_pool"
+            and self.enable_priority_scheduling
+            and not self.disable_priority_preemption
+        ):
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=host_pool requires "
+                "--disable-priority-preemption when priority scheduling is enabled."
+            )
+
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
