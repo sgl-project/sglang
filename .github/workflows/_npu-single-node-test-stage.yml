@@ -317,8 +317,35 @@ jobs:
           test_exit_code=0
           cd test
 
-          # Install python requirements
-          ${PYTHON_FOR_SGLANG} -m pip install tabulate
+          # Install missing python deps (add new ones to REQUIRED_PIP_PKGS).
+          # Retry on transient failures and fall back to the in-cluster PyPI cache.
+          PIP_INDEXES=(
+            "https://pypi.org/simple/"
+            "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          )
+          REQUIRED_PIP_PKGS=(tabulate)
+          for pkg in "${REQUIRED_PIP_PKGS[@]}"; do
+            if ${PYTHON_FOR_SGLANG} -c "import ${pkg}" >/dev/null 2>&1; then
+              echo "${pkg}: already available, skip"
+              continue
+            fi
+            ok=0
+            for attempt in 1 2 3; do
+              for index in "${PIP_INDEXES[@]}"; do
+                echo "${pkg}: install attempt ${attempt}/3 via ${index}"
+                if ${PYTHON_FOR_SGLANG} -m pip install "${pkg}" --retries 3 --timeout 60 \
+                    -i "${index}" --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local; then
+                  ok=1
+                  break 2
+                fi
+              done
+              [ "${attempt}" -lt 3 ] && sleep 15
+            done
+            if [ "${ok}" != "1" ]; then
+              echo "ERROR: failed to install ${pkg} after retries"
+              exit 1
+            fi
+          done
 
           # Append `--nightly` and `--continue-on-error` arguments when the job belongs to the nightly pipeline.
           # --nightly: Collect test cases registered for nightly runs.

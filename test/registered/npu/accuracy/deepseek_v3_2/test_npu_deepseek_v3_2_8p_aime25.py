@@ -7,7 +7,7 @@ from sglang.test.ascend.test_ascend_utils import DEEPSEEK_V3_2_EXP_W8A8_WEIGHTS_
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=3600,
+    est_time=4800,
     suite="nightly-acc-16-npu-a3",
     nightly=True,
 )
