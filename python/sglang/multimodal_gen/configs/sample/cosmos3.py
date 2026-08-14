@@ -140,6 +140,30 @@ class Cosmos3SamplingParams(SamplingParams):
     action_stats_path: str | None = None
     action_normalization: str = "quantile"
 
+    @classmethod
+    def video_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset(
+            {
+                "generate_sound",
+                "sound_duration",
+                "condition_frame_indexes",
+                "condition_frame_indexes_vision",
+                "condition_video_keep",
+                "control_path",
+                "control_hint",
+                "control_guidance",
+                "control_guidance_interval",
+                "action_mode",
+                "domain_id",
+                "domain_name",
+                "raw_action_dim",
+                "action_fps",
+                "action",
+                "action_view_point",
+                "action_normalization",
+            }
+        )
+
     def _resolve_control_paths(self) -> list[str]:
         cp = self.control_path
         if cp is None:

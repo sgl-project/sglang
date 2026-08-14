@@ -17,7 +17,10 @@ from sglang.multimodal_gen.configs.sample.cosmos3 import (
     COSMOS3_EDGE_SUPPORTED_RESOLUTIONS,
     Cosmos3SamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.registry import (
     _PIPELINE_REGISTRY,
     _discover_and_register_pipelines,
@@ -35,6 +38,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _cosmos3_sampling_param_kwargs,
+    _multipart_video_extras,
     _resolve_sound_duration,
     _resolve_video_path,
 )
@@ -677,7 +681,7 @@ class TestCosmos3ModelResolution(unittest.TestCase):
 
 
 class TestCosmos3OpenAIProtocol(unittest.TestCase):
-    """Verify Cosmos3 modality knobs are exposed by the video HTTP schema."""
+    """Verify Cosmos3 modality knobs stay model-specific video extras."""
 
     def test_cosmos3_template_fields_remain_extra_fields(self):
         for request_cls in (ImageGenerationsRequest, VideoGenerationsRequest):
@@ -689,15 +693,17 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
                 self.assertNotIn("use_system_prompt", request_cls.model_fields)
                 self.assertNotIn("use_guardrails", request_cls.model_fields)
 
-    def test_cosmos3_modal_fields_are_video_request_fields(self):
+    def test_cosmos3_modal_fields_are_model_specific_video_extras(self):
         for field_name in (
-            "video_path",
-            "video_url",
             "generate_sound",
             "sound_duration",
             "condition_frame_indexes",
             "condition_frame_indexes_vision",
             "condition_video_keep",
+            "control_path",
+            "control_hint",
+            "control_guidance",
+            "control_guidance_interval",
             "action_mode",
             "domain_id",
             "domain_name",
@@ -705,11 +711,20 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
             "action_fps",
             "action",
             "action_view_point",
-            "action_stats_path",
             "action_normalization",
         ):
             with self.subTest(field_name=field_name):
-                self.assertIn(field_name, VideoGenerationsRequest.model_fields)
+                self.assertNotIn(field_name, VideoGenerationsRequest.model_fields)
+                self.assertIn(
+                    field_name, Cosmos3SamplingParams.video_request_extra_fields()
+                )
+
+        self.assertIn("video_path", VideoGenerationsRequest.model_fields)
+        self.assertIn("video_url", VideoGenerationsRequest.model_fields)
+        self.assertNotIn("action_stats_path", VideoGenerationsRequest.model_fields)
+        self.assertNotIn(
+            "action_stats_path", Cosmos3SamplingParams.video_request_extra_fields()
+        )
 
     def test_cosmos3_http_aliases_map_to_sampling_params(self):
         req = VideoGenerationsRequest(
@@ -723,6 +738,10 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
             raw_action_dim=9,
             action_fps=30.0,
             action_view_point="ego_view",
+            control_path=["edge.mp4", "depth.mp4"],
+            control_hint=["edge", "depth"],
+            control_guidance=1.5,
+            control_guidance_interval=[0.0, 500.0],
         )
 
         self.assertEqual(_resolve_video_path(req), "https://example.com/input.mp4")
@@ -736,6 +755,41 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
         self.assertEqual(kwargs["raw_action_dim"], 9)
         self.assertEqual(kwargs["action_fps"], 30.0)
         self.assertEqual(kwargs["action_view_point"], "ego_view")
+        self.assertEqual(kwargs["control_path"], ["edge.mp4", "depth.mp4"])
+        self.assertEqual(kwargs["control_hint"], ["edge", "depth"])
+        self.assertEqual(kwargs["control_guidance"], 1.5)
+        self.assertEqual(kwargs["control_guidance_interval"], (0.0, 500.0))
+
+    def test_cosmos3_multipart_extras_are_model_specific(self):
+        raw_form = {
+            "generate_sound": "true",
+            "control_path": '["edge.mp4", "depth.mp4"]',
+            "control_hint": '["edge", "depth"]',
+            "action_mode": "policy",
+            "action_stats_path": "/tmp/action_stats.json",
+        }
+
+        generic = _multipart_video_extras(
+            raw_form,
+            extra_body=None,
+            extra_params=None,
+            sampling_params_cls=SamplingParams,
+        )
+        self.assertNotIn("generate_sound", generic)
+        self.assertNotIn("control_path", generic)
+        self.assertNotIn("action_mode", generic)
+
+        cosmos = _multipart_video_extras(
+            raw_form,
+            extra_body=None,
+            extra_params=None,
+            sampling_params_cls=Cosmos3SamplingParams,
+        )
+        self.assertIs(cosmos["generate_sound"], True)
+        self.assertEqual(cosmos["control_path"], ["edge.mp4", "depth.mp4"])
+        self.assertEqual(cosmos["control_hint"], ["edge", "depth"])
+        self.assertEqual(cosmos["action_mode"], "policy")
+        self.assertNotIn("action_stats_path", cosmos)
 
     def test_generate_sound_false_disables_sound_duration(self):
         req = VideoGenerationsRequest(

@@ -117,19 +117,6 @@ _MULTIPART_EXTRA_FORM_FIELDS = (
     "guardrails",
     "video_path",
     "video_url",
-    "generate_sound",
-    "sound_duration",
-    "condition_frame_indexes",
-    "action_mode",
-    "domain_id",
-    "domain_name",
-    "raw_action_dim",
-    "action_fps",
-    "action",
-    "action_view_point",
-    "action_normalization",
-    "condition_frame_indexes_vision",
-    "condition_video_keep",
     "quality",
 )
 
@@ -629,24 +616,6 @@ async def create_video(
     max_sequence_length: Optional[int] = Form(None),
     flow_shift: Optional[float] = Form(None),
     enable_teacache: Optional[bool] = Form(None),
-    generate_sound: Optional[bool] = Form(None),
-    sound_duration: Optional[float] = Form(None),
-    condition_frame_indexes: Optional[str] = Form(None),
-    condition_frame_indexes_vision: Optional[str] = Form(None),
-    condition_video_keep: Optional[str] = Form(None),
-    control_path: Optional[str] = Form(None),
-    control_hint: Optional[str] = Form(None),
-    control_guidance: Optional[float] = Form(None),
-    control_guidance_interval: Optional[str] = Form(None),
-    action_mode: Optional[str] = Form(None),
-    domain_id: Optional[int] = Form(None),
-    domain_name: Optional[str] = Form(None),
-    raw_action_dim: Optional[int] = Form(None),
-    action_fps: Optional[float] = Form(None),
-    action: Optional[str] = Form(None),
-    action_view_point: Optional[str] = Form(None),
-    action_stats_path: Optional[str] = Form(None),
-    action_normalization: Optional[str] = Form(None),
     enable_frame_interpolation: Optional[bool] = Form(None),
     frame_interpolation_exp: Optional[int] = Form(None),
     frame_interpolation_scale: Optional[float] = Form(None),
@@ -788,34 +757,6 @@ async def create_video(
             max_sequence_length=form_value("max_sequence_length", max_sequence_length),
             flow_shift=form_value("flow_shift", flow_shift),
             enable_teacache=form_value("enable_teacache", enable_teacache),
-            generate_sound=form_value("generate_sound", generate_sound),
-            sound_duration=form_value("sound_duration", sound_duration),
-            condition_frame_indexes=form_value(
-                "condition_frame_indexes", condition_frame_indexes
-            ),
-            condition_frame_indexes_vision=form_value(
-                "condition_frame_indexes_vision", condition_frame_indexes_vision
-            ),
-            condition_video_keep=form_value(
-                "condition_video_keep", condition_video_keep
-            ),
-            control_path=form_value("control_path", control_path),
-            control_hint=form_value("control_hint", control_hint),
-            control_guidance=form_value("control_guidance", control_guidance),
-            control_guidance_interval=form_value(
-                "control_guidance_interval", control_guidance_interval
-            ),
-            action_mode=form_value("action_mode", action_mode),
-            domain_id=form_value("domain_id", domain_id),
-            domain_name=form_value("domain_name", domain_name),
-            raw_action_dim=form_value("raw_action_dim", raw_action_dim),
-            action_fps=form_value("action_fps", action_fps),
-            action=form_value("action", action),
-            action_view_point=form_value("action_view_point", action_view_point),
-            action_stats_path=form_value("action_stats_path", action_stats_path),
-            action_normalization=form_value(
-                "action_normalization", action_normalization
-            ),
             enable_frame_interpolation=form_value(
                 "enable_frame_interpolation", enable_frame_interpolation
             ),
