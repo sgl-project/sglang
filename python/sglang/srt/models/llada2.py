@@ -24,8 +24,11 @@ from typing import Iterable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
+from triton.language.extra import libdevice
 
 from sglang.srt.distributed import (
     get_pp_group,
@@ -91,9 +94,30 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
-import triton
-import triton.language as tl
-from triton.language.extra import libdevice
+
+def _require_block_routing_ep1(moe_ep_size: int) -> None:
+    if moe_ep_size != 1:
+        raise ValueError(
+            "LLaDA2 block routing does not support expert parallelism; "
+            f"expected moe_ep_size=1, got moe_ep_size={moe_ep_size}"
+        )
+
+
+def _make_block_routing_triton_output(
+    ragged_metadata,
+    combine_indx: torch.Tensor,
+    gate_scal: torch.Tensor,
+    n_expts_act: int,
+) -> TritonKernelTopKOutput:
+    """Pack block-routing metadata using the current five-field ABI."""
+    gather_indx = torch.div(combine_indx, n_expts_act, rounding_mode="trunc")
+    return TritonKernelTopKOutput(
+        a_ragged_metadata=ragged_metadata,
+        gather_indx=gather_indx,
+        scatter_indx=combine_indx,
+        gate_scal=gate_scal,
+        n_expts_act=n_expts_act,
+    )
 
 
 @triton.jit
@@ -138,7 +162,7 @@ def _block_aggregation_kernel(
     logits = tl.load(logits_ptrs, mask=valid_2d, other=0.0)
     # Keep this formula identical to _token_topk_kernel: a mismatch can change
     # the selected expert at the block-capacity cutoff.
-    base_scores = libdevice.div_rn(
+    base_scores = tl.div_rn(
         1.0,
         1.0 + libdevice.exp(-logits.to(tl.float32)),
     )
@@ -221,9 +245,9 @@ def _token_topk_kernel(
         other=float("-inf"),
     )
 
-    # Keep this formula identical to _block_aggregation_kernel. libdevice exp
-    # plus round-to-nearest division also keeps routing weights in FP32.
-    base_scores = libdevice.div_rn(
+    # Keep this formula identical to _block_aggregation_kernel. Use Triton's
+    # portable round-to-nearest division so this compiles on CUDA and HIP.
+    base_scores = tl.div_rn(
         1.0,
         1.0 + libdevice.exp(-logits.to(tl.float32)),
     )
@@ -260,12 +284,7 @@ def _token_topk_kernel(
 
     out_mask = out_offs < top_k
     if top_k > 1:
-        safe = raw_sum > 1e-30
-        out_weights = tl.where(
-            safe,
-            out_raw / tl.where(safe, raw_sum, 1.0),
-            1.0 / top_k,
-        )
+        out_weights = tl.div_rn(out_raw, raw_sum + 1e-20)
     else:
         out_weights = out_raw
 
@@ -303,7 +322,8 @@ def block_topk_triton(
             f"({num_experts_total},), got {tuple(correction_bias.shape)}"
         )
     if (
-        not isinstance(block_size, int)
+        isinstance(block_size, bool)
+        or not isinstance(block_size, int)
         or block_size <= 0
         or block_size & (block_size - 1)
     ):
@@ -504,6 +524,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
 
         self.use_block_routing = getattr(config, "expert_capacity", None) is not None
         if self.use_block_routing:
+            _require_block_routing_ep1(get_parallel().moe_ep_size)
             if _is_npu:
                 raise ValueError(
                     "LLaDA2 block routing is not supported on NPU; "
@@ -556,7 +577,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         if self.use_block_routing:
             if get_moe_a2a_backend().is_deepep():
                 raise ValueError(
-                    "LLaDA2 block routing does not support " "--moe-a2a-backend deepep"
+                    "LLaDA2 block routing does not support --moe-a2a-backend deepep"
                 )
             if self.correction_bias is None:
                 raise ValueError(
@@ -568,7 +589,8 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                     f"{self.score_function!r}"
                 )
             if (
-                not isinstance(self.block_size, int)
+                isinstance(self.block_size, bool)
+                or not isinstance(self.block_size, int)
                 or self.block_size <= 0
                 or self.block_size & (self.block_size - 1)
             ):
@@ -598,7 +620,9 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                 self.score_function == "softmax" and self.correction_bias is None
             ) or (
                 self.score_function == "sigmoid" and self.correction_bias is not None
-            ), "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            ), (
+                "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            )
 
         self.topk = TopK(
             top_k=self.top_k,
@@ -702,6 +726,15 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
     ):
         """Convert block-routing results to the selected MoE runner format."""
         if not get_moe_runner_backend().is_triton_kernels():
+            if (
+                getattr(
+                    self.experts,
+                    "should_fuse_routed_scaling_factor_in_topk",
+                    False,
+                )
+                and self.routed_scaling_factor is not None
+            ):
+                topk_weights = topk_weights * self.routed_scaling_factor
             return StandardTopKOutput(
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
@@ -712,7 +745,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         # block router's selected expert ids via y_indx, but do not use the
         # values produced by triton_kernels_topk: block routing uses sigmoid
         # scores normalized over its own selected experts, not softmax scores.
-        from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
         from triton_kernels.tensor import make_ragged_tensor_metadata
         from triton_kernels.topk import topk as triton_kernels_topk
 
@@ -739,23 +771,15 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             dispatch_indx.shape[0],
         )
 
-        # combine_indx is the same token-major -> expert-major permutation
-        # used by sglang.srt.layers.moe.topk.routing(). Preserve block
-        # routing's FP32 weights while putting them in the runner's order.
+        # combine_indx maps expert-major entries back to flattened token-major
+        # top-k entries. Preserve block routing's FP32 weights while packing the
+        # five-field triton_kernels output expected by the current MoE runner.
         gate_scal = topk_weights.flatten()[combine_indx]
-        routing_data = RoutingData(
-            gate_scal,
-            ragged_metadata.slice_sizes,
-            self.num_experts,
-            self.top_k,
+        return _make_block_routing_triton_output(
             ragged_metadata,
-        )
-        gather_indx = GatherIndx(combine_indx, dispatch_indx)
-        scatter_indx = ScatterIndx(dispatch_indx, combine_indx)
-        return TritonKernelTopKOutput(
-            routing_data=routing_data,
-            gather_indx=gather_indx,
-            scatter_indx=scatter_indx,
+            combine_indx,
+            gate_scal,
+            self.top_k,
         )
 
     def _forward_router_experts(self, hidden_states: torch.Tensor):
@@ -1163,7 +1187,6 @@ class LLaDA2MoeBlock(nn.Module):
 
 
 class LLaDA2MoeModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

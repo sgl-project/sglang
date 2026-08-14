@@ -11,10 +11,11 @@ import unittest
 import torch
 
 from sglang.srt.models.llada2 import block_topk_triton
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
 def block_topk_reference(
@@ -69,9 +70,7 @@ def block_topk_reference(
     selected_base_scores = base_scores.gather(1, topk_ids)
     if top_k > 1:
         weight_sum = selected_base_scores.sum(dim=-1, keepdim=True)
-        normalized = selected_base_scores / weight_sum.clamp_min(1e-30)
-        uniform = torch.full_like(selected_base_scores, 1.0 / top_k)
-        topk_weights = torch.where(weight_sum > 1e-30, normalized, uniform)
+        topk_weights = selected_base_scores / (weight_sum + 1e-20)
     else:
         topk_weights = selected_base_scores
 
@@ -171,6 +170,22 @@ class TestBlockTopkTriton(CustomTestCase):
             weights, torch.full_like(weights, 1.0 / 8), rtol=0.0, atol=0.0
         )
 
+    def test_very_negative_logits_use_epsilon_normalization(self):
+        """Very small sigmoid scores must not fall back to uniform weights."""
+        logits = torch.full((32, 16), -90.0, dtype=torch.float32, device="cuda")
+        bias = torch.zeros((16,), dtype=torch.float32, device="cuda")
+
+        weights, ids = block_topk_triton(
+            logits, bias, block_size=32, expert_capacity=16, top_k=8
+        )
+
+        selected_scores = torch.sigmoid(logits.float()).gather(1, ids.long())
+        expected = selected_scores / (selected_scores.sum(dim=-1, keepdim=True) + 1e-20)
+        torch.testing.assert_close(weights, expected, rtol=1e-5, atol=1e-25)
+
+        # The old fallback returned 1 / top_k == 0.125 for this input.
+        self.assertTrue(torch.all(weights < 1e-10))
+
     def test_close_unequal_scores_are_not_reordered(self):
         logits = torch.full((32, 16), -20.0, dtype=torch.float32, device="cuda")
         bias = torch.zeros((16,), dtype=torch.float32, device="cuda")
@@ -207,8 +222,10 @@ class TestBlockTopkTriton(CustomTestCase):
     def test_rejects_non_power_of_two_block_size(self):
         logits = torch.zeros((6, 4), dtype=torch.float32, device="cuda")
         bias = torch.zeros((4,), dtype=torch.float32, device="cuda")
-        with self.assertRaisesRegex(ValueError, "positive power of two"):
-            block_topk_triton(logits, bias, 3, 2, 1)
+        for block_size in (3, True):
+            with self.subTest(block_size=block_size):
+                with self.assertRaisesRegex(ValueError, "positive power of two"):
+                    block_topk_triton(logits, bias, block_size, 2, 1)
 
     def test_empty_input_returns_fp32_weights(self):
         logits = torch.empty((0, 16), dtype=torch.bfloat16, device="cuda")
