@@ -57,8 +57,6 @@ if _is_cuda:
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
 elif _is_xpu:
-    # sgl-kernel-xpu registers these fp8 quant ops natively for XPU (unlike
-    # fp8_scaled_mm), just missing from this import block.
     from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
 
 if _is_musa:
