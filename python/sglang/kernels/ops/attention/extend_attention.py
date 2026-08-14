@@ -65,12 +65,24 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
 
     # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware
     if _is_hip:
-        if _is_gfx95 and 128 < Lq <= 256:
-            # gfx950 (CDNA4), 128 < head_dim <= 256: a larger query tile halves KV bytes
+        if _is_gfx95 and Lq <= 256:
+            # gfx950 (CDNA4), head_dim <= 256: a larger query tile halves KV bytes
             # streamed per call (each workgroup reads the whole prefix); 8 warps
-            # hide the loads. Measured on MI350X head_dim 256: -36% kernel time,
-            # 28% -> 44% MFU, numerically equivalent (BLOCK_N reduction order
-            # unchanged). Other AMD archs / head dims keep the default below.
+            # hide the loads, and BLOCK_M / num_warps = 16 rows per warp is exactly
+            # one matrix_instr_nonkdim=16 MFMA tile, so neither smaller nor larger
+            # BLOCK_M pays off. Measured on MI350X head_dim 256: -36% kernel time,
+            # 28% -> 44% MFU. Measured on MI350X head_dim 64 (gpt-oss-120b at TP4,
+            # 16 q / 2 kv heads, 8x8192-token prefill): -47% kernel time on
+            # full-attention layers (5.39 -> 2.88 ms) and -51% on sliding-window
+            # layers (5.49 -> 2.68 ms); head_dim 128 -32% (7.64 -> 5.22 ms).
+            # In situ on a served gpt-oss-120b at TP4, ISL 8192: _fwd_kernel
+            # 1309 -> 742 us/call, 36% -> 24% of prefill GPU time, prefill GPU
+            # total -14%, TTFT -14% at 8-way and -16% at 16-way concurrency.
+            # Bit-identical output at every head dim (BLOCK_N reduction order
+            # unchanged -- only the query tiling and warp count move). Costs a few
+            # microseconds on prefills too short to fill the grid (single request
+            # under ~2k tokens), which is noise next to the long-prompt win.
+            # Other AMD archs / larger head dims keep the default below.
             BLOCK_M, BLOCK_N = (128, 64)
             num_warps = 8
         else:
