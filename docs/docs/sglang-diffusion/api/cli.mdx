@@ -235,6 +235,8 @@ sglang generate \
   --prompt "A quiet city street after rain"
 ```
 
+Values passed to the compatibility option `--layerwise-offload-components` must match loaded component keys, such as `transformer`, `text_encoder`, `image_encoder`, `vae`, `condition_image_encoder`, `spatial_upsampler`, or `vocoder`. Its `default` group selects text encoders, image encoders, and VAEs. Use `all` to select every layerwise-offloadable component.
+
 Layerwise tuning options such as `--dit-offload-prefetch-size`, `--dit-layerwise-resident-layers`, and `--dit-layerwise-residency-policy` continue to control the streamed layer working set. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency.
 
 ## Serve
