@@ -28,12 +28,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - suite: nightly-stage-c-2-gpu-mi350
+          - suite: nightly-stage-c-2-gpu
             runner: linux-mi35x-gpu-2
           # Use 8-GPU MI35X pool for 4-GPU suite.
-          - suite: nightly-stage-c-4-gpu-mi350
+          - suite: nightly-stage-c-4-gpu
             runner: linux-mi35x-gpu-8
-          - suite: nightly-stage-c-8-gpu-mi350
+          - suite: nightly-stage-c-8-gpu
             runner: linux-mi35x-gpu-8
     runs-on: ${{ matrix.runner }}
     steps:
