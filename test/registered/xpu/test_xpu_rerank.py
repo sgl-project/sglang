@@ -1,0 +1,153 @@
+"""XPU decoder-only rerank model test (Qwen3-Reranker style).
+
+Usage:
+python3 -m unittest test_xpu_decoder_rerank.TestXPUDecoderRerank
+"""
+
+import math
+import multiprocessing as mp
+import unittest
+from pathlib import Path
+
+import torch
+from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.test.ci.ci_register import register_xpu_ci
+from sglang.test.runners import HFRunner, SRTRunner
+from sglang.test.test_utils import CustomTestCase
+
+register_xpu_ci(est_time=120, suite="stage-b-test-1-gpu-xpu")
+
+MODEL_PATH = "Qwen/Qwen3-Reranker-0.6B"
+TP_SIZE = 1
+SCORE_TOLERANCE = 1e-2
+ATTENTION_BACKEND = "intel_xpu"
+TORCH_DTYPE = torch.bfloat16
+CHAT_TEMPLATE_PATH = (
+    Path(__file__).resolve().parents[3] / "examples/chat_template/qwen3_reranker.jinja"
+)
+with CHAT_TEMPLATE_PATH.open("r", encoding="utf-8") as f:
+    QWEN3_RERANKER_TEMPLATE = f.read()
+
+JINJA_ENV = ImmutableSandboxedEnvironment(autoescape=False)
+QWEN3_RERANKER_JINJA = JINJA_ENV.from_string(QWEN3_RERANKER_TEMPLATE)
+
+# Decoder-reranker-friendly data (mirrors the Qwen3-Reranker cookbook example).
+# Chosen so yes/no scoring has a clear relevant vs. irrelevant contrast.
+
+RERANK_QUERY_DOCS = [
+    {
+        "query": "法国首都是哪里？",
+        "instruct": "Given a web search query, retrieve relevant passages that answer the query.",
+        "documents": [
+            "法国的首都是巴黎。",
+            "德国的首都是柏林。",
+            "香蕉是黄色的水果。",
+        ],
+    },
+]
+
+
+def format_prompt(query: str, document: str, instruct: str) -> str:
+    """Render the canonical Qwen3 reranker Jinja template used by serving."""
+    render_kwargs = {
+        "messages": [
+            {"role": "user", "content": query},
+            {"role": "user", "content": document},
+        ]
+    }
+    if instruct:
+        render_kwargs["instruct"] = instruct
+    return QWEN3_RERANKER_JINJA.render(**render_kwargs)
+
+
+def yes_no_token_ids(tokenizer) -> tuple[int, int]:
+    yes = tokenizer.encode("yes", add_special_tokens=False)
+    no = tokenizer.encode("no", add_special_tokens=False)
+    assert len(yes) == 1 and len(no) == 1, "yes/no must be single tokens"
+    return yes[0], no[0]
+
+
+def score_from_token_logprobs(logprob_yes: float, logprob_no: float) -> float:
+    """score = P(yes) / (P(yes) + P(no))."""
+    p_yes = math.exp(logprob_yes)
+    p_no = math.exp(logprob_no)
+    denom = p_yes + p_no
+    return p_yes / denom if denom > 0.0 else 0.0
+
+
+class TestXPUDecoderRerank(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        mp.set_start_method("spawn", force=True)
+        cls.tokenizer = get_tokenizer(MODEL_PATH)
+        cls.yes_id, cls.no_id = yes_no_token_ids(cls.tokenizer)
+
+    def _extract_scores(self, token_ids_output_logprobs) -> list[float]:
+        """token_ids_output_logprobs shape: [num_prompts][num_gen_tokens][num_token_ids].
+
+        We only generate 1 token and request exactly [yes_id, no_id], so we read
+        index [0] (first/only generated token) -> [yes_lp, no_lp].
+        """
+        scores = []
+        for per_prompt in token_ids_output_logprobs:
+            first_token_lps = per_prompt[0]  # logprobs for [yes_id, no_id]
+            yes_lp, no_lp = first_token_lps[0], first_token_lps[1]
+            scores.append(score_from_token_logprobs(yes_lp, no_lp))
+        return scores
+
+    def _assert_close_scores(self, prompts) -> None:
+        token_ids_logprob = [self.yes_id, self.no_id]
+
+        # --- HuggingFace reference (generation) ---
+        with HFRunner(
+            MODEL_PATH,
+            torch_dtype=TORCH_DTYPE,
+            model_type="generation",
+            output_str_only=False,
+        ) as hf_runner:
+            hf_out = hf_runner.forward(
+                prompts,
+                max_new_tokens=1,
+                token_ids_logprob=token_ids_logprob,
+            )
+        hf_scores = self._extract_scores(hf_out.token_ids_output_logprobs)
+
+        with SRTRunner(
+            MODEL_PATH,
+            tp_size=TP_SIZE,
+            torch_dtype=TORCH_DTYPE,
+            model_type="generation",
+            attention_backend=ATTENTION_BACKEND,
+        ) as srt_runner:
+            srt_out = srt_runner.forward(
+                prompts,
+                max_new_tokens=1,
+                token_ids_logprob=token_ids_logprob,
+            )
+        srt_scores = self._extract_scores(srt_out.token_ids_output_logprobs)
+
+        self.assertEqual(len(hf_scores), len(srt_scores))
+        for hf_score, srt_score in zip(hf_scores, srt_scores):
+            print(f"hf_score: {hf_score}")
+            print(f"srt_score: {srt_score}")
+            self.assertLess(
+                abs(hf_score - srt_score),
+                SCORE_TOLERANCE,
+                "decoder rerank scores are not all close",
+            )
+
+    def _preprocess_prompts(self, query_doc) -> list[str]:
+        query = query_doc["query"]
+        instruct = query_doc["instruct"]
+        return [format_prompt(query, doc, instruct) for doc in query_doc["documents"]]
+
+    def test_prefill_logits(self):
+        for query_doc in RERANK_QUERY_DOCS:
+            prompts = self._preprocess_prompts(query_doc)
+            self._assert_close_scores(prompts)
+
+
+if __name__ == "__main__":
+    unittest.main()
