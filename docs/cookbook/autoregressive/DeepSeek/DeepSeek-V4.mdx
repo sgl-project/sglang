@@ -598,7 +598,7 @@ sglang serve \
 
 Keep `--mem-fraction-static 0.90` on this topology to leave enough headroom for the batch-256 verify graph. The first cold start can take 10–15 minutes while FlashInfer autotunes and SGLang captures the draft and verify graphs; later starts reuse the cache. This path is verified end-to-end on 4×GB300 with SGLang v0.5.16.
 
-**Tune proposed draft tokens.** `--speculative-dspark-block-size N` asks DSpark to propose `N` tokens per step; the target verifies a window of `N + 1`. If the flag is omitted, SGLang reads the value from the checkpoint. The current 0731 checkpoint resolves to five proposed tokens, which is the verified default. Use the **DSpark Proposed Draft Tokens** slider in the [Playground](#playground) to sweep one through five.
+**Tune proposed draft tokens.** `--speculative-dspark-block-size N` asks DSpark to propose `N` tokens per step; the target verifies a window of `N + 1`. If the flag is omitted, SGLang reads the value from the checkpoint. Both the 0731 and 0813 checkpoints resolve to five proposed tokens (the startup log reports `gamma=5, verify_num_draft_tokens=6`), which is the verified default. Use the **DSpark Proposed Draft Tokens** slider in the [Playground](#playground) to sweep one through five.
 
 Larger blocks can improve decode latency when acceptance stays high, but they also increase verification work and graph memory. Start from the checkpoint default, then sweep downward under the real prompt-length and concurrency distribution. The gain is usually largest for short interactive traffic and narrows as prefill dominates. Track P50/P99 TTFT and TPOT, total throughput, accepted length, GPU memory, and stop rate rather than choosing from acceptance alone.
 

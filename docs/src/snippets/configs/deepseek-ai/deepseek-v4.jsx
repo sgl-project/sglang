@@ -291,11 +291,11 @@ sgl-eval run aime25 \\
         { id: "mtp-314",    label: "EAGLE / MTP 3-1-4",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"],
-          hide: { variant: ["flash-official"] } },
+          hide: { variant: ["flash-official", "pro-official"] } },
         { id: "mtp-112",    label: "EAGLE / MTP 1-1-2",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
-          hide: { variant: ["flash-official"] } },
+          hide: { variant: ["flash-official", "pro-official"] } },
         { id: "dspark",     label: "DSpark",
           flags: ["--speculative-algorithm DSPARK"],
           hide: { variant: ["flash", "pro"] },
@@ -423,7 +423,9 @@ sgl-eval run aime25 \\
       {
         id: "dsparkDraftTokens",
         title: "DSpark Proposed Draft Tokens",
-        showWhen: (base) => base.variant === "flash-official" && base.specAlgorithm === "DSPARK",
+        showWhen: (base) =>
+          (base.variant === "flash-official" || base.variant === "pro-official") &&
+          base.specAlgorithm === "DSPARK",
         control: "slider",
         stripPrefixes: ["--speculative-dspark-block-size"],
         options: [
