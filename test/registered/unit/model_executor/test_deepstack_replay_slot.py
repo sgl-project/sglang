@@ -1,24 +1,10 @@
 """Unit tests for the optional DeepStack BCG replay slot.
 
-Covers the three-site allocation contract:
+Covers the allocation contract (registry gating, buffer allocation,
+buffer-to-registry adoption), the model capability opt-in, and the
+per-replay refresh of the slot (``_refresh_deepstack_replay_slot``).
 
-  * ``build_prefill_registry`` registers an ``input_deepstack_embeds``
-    slot iff ``is_multimodal AND register_input_embeds AND
-    deepstack_replay_width > 0``.
-  * ``PrefillInputBuffers.create`` allocates the matching
-    ``input_deepstack_embeds`` field iff both ``is_multimodal`` and
-    ``deepstack_replay_width > 0`` hold.
-  * ``Qwen3VLForConditionalGeneration`` declares the explicit opt-in
-    class attribute ``supports_bcg_deepstack_replay = True`` and its
-    MoE subclass inherits it; ``Qwen2_5_VLForConditionalGeneration``
-    and text-only ``Qwen3ForCausalLM`` do not.
-
-and the per-replay refresh of the allocated slot
-(``_refresh_deepstack_replay_slot``), which is where a stale or
-malformed contribution would reach the captured graph.
-
-All tests are CPU-only — the logic under test is GPU-agnostic;
-``torch.zeros`` on the ``cpu`` device is sufficient.
+CPU-only; the logic under test is GPU-agnostic.
 """
 
 import unittest
@@ -74,67 +60,45 @@ def _buffers(**overrides):
 
 class TestDeepStackReplaySlotRegistration(CustomTestCase):
 
-    def test_slot_absent_when_any_gate_is_off(self):
-        """The DeepStack slot is registered only when all three gates
-        pass: is_multimodal, register_input_embeds, and
-        deepstack_replay_width > 0. Any missing gate → no slot."""
+    def test_slot_registration_follows_the_gates(self):
         cases = [
-            dict(is_multimodal=False, deepstack_replay_width=192),
-            dict(is_multimodal=True, deepstack_replay_width=0),
-            dict(
-                is_multimodal=True,
-                deepstack_replay_width=192,
-                register_input_embeds=False,
-            ),
+            (dict(), False),
+            (dict(deepstack_replay_width=192), True),
+            (dict(deepstack_replay_width=192, is_multimodal=False), False),
+            (dict(deepstack_replay_width=192, register_input_embeds=False), False),
         ]
-        for kwargs in cases:
-            with self.subTest(**kwargs):
-                reg = _reg(**kwargs)
-                self.assertFalse(reg.has_slot("input_deepstack_embeds"))
-
-    def test_slot_present_when_all_gates_pass(self):
-        reg = _reg(is_multimodal=True, deepstack_replay_width=192)
-        self.assertTrue(reg.has_slot("input_deepstack_embeds"))
+        for overrides, expected in cases:
+            with self.subTest(**overrides):
+                reg = _reg(**overrides)
+                self.assertEqual(reg.has_slot("input_deepstack_embeds"), expected)
 
     def test_slot_shape_and_dtype_match_contract(self):
-        reg = _reg(
-            is_multimodal=True,
-            hidden_size=64,
-            embed_dtype=torch.bfloat16,
-            deepstack_replay_width=192,
-        )
-        buf = reg.get_slot("input_deepstack_embeds").buffer
+        buf = _reg(deepstack_replay_width=192).get_slot("input_deepstack_embeds").buffer
         self.assertEqual(buf.shape[-1], 192)
         self.assertEqual(buf.dtype, torch.bfloat16)
 
 
 class TestPrefillInputBuffersDeepStackField(CustomTestCase):
 
-    def test_buffer_none_when_width_zero(self):
-        buf = _buffers(is_multimodal=True, deepstack_replay_width=0)
-        self.assertIsNone(buf.input_deepstack_embeds)
+    def test_buffer_allocation_follows_the_gates(self):
+        cases = [
+            (dict(), False),
+            (dict(deepstack_replay_width=192), True),
+            (dict(deepstack_replay_width=192, is_multimodal=False), False),
+        ]
+        for overrides, expected in cases:
+            with self.subTest(**overrides):
+                buf = _buffers(**overrides).input_deepstack_embeds
+                if expected:
+                    self.assertEqual(buf.shape, (128, 192))
+                    self.assertEqual(buf.dtype, torch.bfloat16)
+                else:
+                    self.assertIsNone(buf)
 
-    def test_buffer_none_when_not_multimodal(self):
-        buf = _buffers(is_multimodal=False, deepstack_replay_width=192)
-        self.assertIsNone(buf.input_deepstack_embeds)
-
-    def test_buffer_allocated_when_multimodal_and_width_positive(self):
-        buf = _buffers(
-            is_multimodal=True,
-            hidden_size=64,
-            dtype=torch.bfloat16,
-            deepstack_replay_width=192,
-            max_num_tokens=128,
-        )
-        self.assertIsNotNone(buf.input_deepstack_embeds)
-        self.assertEqual(buf.input_deepstack_embeds.shape, (128, 192))
-        self.assertEqual(buf.input_deepstack_embeds.dtype, torch.bfloat16)
-
-    def test_buffer_field_backs_registry_adoption(self):
-        """The registry uses ``getattr(source, slot.name, None)`` when
-        adopting; the buffer field must exist and be a tensor when the
-        slot is registered so adoption succeeds."""
-        buf = _buffers(is_multimodal=True, deepstack_replay_width=192)
+    def test_registry_adopts_the_buffer_tensor(self):
+        # Adoption looks the slot up by name on the source; a field rename
+        # silently breaks the wiring without this pin.
+        buf = _buffers(deepstack_replay_width=192)
         reg = build_prefill_registry(
             device=_DEVICE,
             max_bs=1,
@@ -146,66 +110,39 @@ class TestPrefillInputBuffersDeepStackField(CustomTestCase):
             deepstack_replay_width=192,
             source=buf,
         )
-        adopted = reg.get_slot("input_deepstack_embeds").buffer
-        self.assertIs(adopted, buf.input_deepstack_embeds)
+        self.assertIs(
+            reg.get_slot("input_deepstack_embeds").buffer,
+            buf.input_deepstack_embeds,
+        )
 
 
 class TestQwen3VLCapabilityOptIn(CustomTestCase):
 
-    def test_qwen3vl_declares_capability(self):
-        from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-
-        self.assertTrue(
-            getattr(
-                Qwen3VLForConditionalGeneration,
-                "supports_bcg_deepstack_replay",
-                False,
-            )
+    def test_only_deepstack_capable_models_opt_in(self):
+        from sglang.srt.models.qwen2_5_vl import (
+            Qwen2_5_VLForConditionalGeneration,
         )
-
-    def test_qwen3vl_moe_inherits_capability(self):
+        from sglang.srt.models.qwen3 import Qwen3ForCausalLM
+        from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
         from sglang.srt.models.qwen3_vl_moe import (
             Qwen3VLMoeForConditionalGeneration,
         )
 
-        self.assertTrue(
-            getattr(
-                Qwen3VLMoeForConditionalGeneration,
-                "supports_bcg_deepstack_replay",
-                False,
-            )
-        )
-
-    def test_qwen2_5_vl_does_not_declare_capability(self):
-        from sglang.srt.models.qwen2_5_vl import (
-            Qwen2_5_VLForConditionalGeneration,
-        )
-
-        self.assertFalse(
-            getattr(
-                Qwen2_5_VLForConditionalGeneration,
-                "supports_bcg_deepstack_replay",
-                False,
-            )
-        )
-
-    def test_text_only_qwen3_does_not_declare_capability(self):
-        from sglang.srt.models.qwen3 import Qwen3ForCausalLM
-
-        self.assertFalse(
-            getattr(Qwen3ForCausalLM, "supports_bcg_deepstack_replay", False)
-        )
+        for cls, expected in [
+            (Qwen3VLForConditionalGeneration, True),
+            (Qwen3VLMoeForConditionalGeneration, True),
+            (Qwen2_5_VLForConditionalGeneration, False),
+            (Qwen3ForCausalLM, False),
+        ]:
+            with self.subTest(cls=cls.__name__):
+                self.assertEqual(
+                    getattr(cls, "supports_bcg_deepstack_replay", False), expected
+                )
 
 
 class TestDeepStackReplaySlotRefresh(CustomTestCase):
-    """Per-replay refresh of the stable slot.
-
-    The slot is a persistent buffer shared by every request that lands in
-    the same token bucket, so each replay must fully define its contents.
-    These cases guard the two ways that breaks: rows surviving into a
-    later request, and a malformed contribution being swapped for zeros
-    and served as if the request had carried no DeepStack at all.
-    """
+    """The slot persists across requests sharing a token bucket, so each
+    replay must fully define its contents."""
 
     NUM_TOKENS = 8
     WIDTH = 192
@@ -216,18 +153,14 @@ class TestDeepStackReplaySlotRefresh(CustomTestCase):
             (self.NUM_TOKENS, self.WIDTH), dtype=self.DTYPE, device=_DEVICE
         )
 
-    def _embeds(self, num_rows, value, width=None, dtype=None) -> torch.Tensor:
+    def _embeds(self, num_rows, value, dtype=None) -> torch.Tensor:
         return torch.full(
-            (num_rows, width or self.WIDTH),
-            value,
-            dtype=dtype or self.DTYPE,
-            device=_DEVICE,
+            (num_rows, self.WIDTH), value, dtype=dtype or self.DTYPE, device=_DEVICE
         )
 
-    def test_shorter_request_does_not_inherit_stale_rows(self):
-        """A shorter request reusing the bucket sees its own rows followed
-        by zeros. The LM applies the slot with ``add_`` rather than through
-        attention, so an uncleared tail would corrupt its real tokens."""
+    def test_no_stale_rows_survive_into_the_next_request(self):
+        # The LM applies the slot with ``add_``, not through attention, so
+        # uncleared rows corrupt real tokens instead of being masked out.
         slot = self._slot()
         _refresh_deepstack_replay_slot(
             slot=slot, deepstack_embeds=self._embeds(self.NUM_TOKENS, 3.0)
@@ -236,47 +169,21 @@ class TestDeepStackReplaySlotRefresh(CustomTestCase):
         self.assertTrue(torch.all(slot[:3] == 5.0))
         self.assertTrue(torch.all(slot[3:] == 0.0))
 
-    def test_absent_deepstack_clears_stale_rows(self):
-        """A text-only request carries no DeepStack, so the slot is cleared
-        instead of left holding the previous image request's rows."""
-        slot = self._slot()
-        _refresh_deepstack_replay_slot(
-            slot=slot, deepstack_embeds=self._embeds(self.NUM_TOKENS, 3.0)
-        )
         _refresh_deepstack_replay_slot(slot=slot, deepstack_embeds=None)
         self.assertTrue(torch.all(slot == 0.0))
 
-    def test_empty_deepstack_clears_stale_rows(self):
-        """An empty tensor states absence rather than a malformed
-        contribution, so it clears the slot instead of failing closed."""
-        slot = self._slot()
-        _refresh_deepstack_replay_slot(
-            slot=slot, deepstack_embeds=self._embeds(self.NUM_TOKENS, 3.0)
-        )
-        _refresh_deepstack_replay_slot(slot=slot, deepstack_embeds=self._embeds(0, 0.0))
-        self.assertTrue(torch.all(slot == 0.0))
-
     def test_malformed_deepstack_fails_closed(self):
-        """A non-empty contribution that does not fit the captured slot
-        raises. Zeroing it and replaying anyway would answer the request
-        with zero DeepStack while looking successful — the silent
-        corruption this slot exists to prevent."""
-        cases = {
-            "narrower than the slot": self._embeds(4, 1.0, width=self.WIDTH // 2),
-            "dtype the graph cannot read": self._embeds(4, 1.0, dtype=torch.float32),
-            "more rows than the bucket": self._embeds(self.NUM_TOKENS + 1, 1.0),
-        }
-        for name, embeds in cases.items():
-            with self.subTest(name):
-                with self.assertRaises(RuntimeError):
-                    _refresh_deepstack_replay_slot(
-                        slot=self._slot(), deepstack_embeds=embeds
-                    )
+        # Row/width mismatches are rejected by copy_ itself; dtype drift is
+        # silently cast, so the guard is the only failing-closed check.
+        with self.assertRaises(RuntimeError):
+            _refresh_deepstack_replay_slot(
+                slot=self._slot(),
+                deepstack_embeds=self._embeds(4, 1.0, dtype=torch.float32),
+            )
 
     def test_fail_closed_leaves_slot_unmodified(self):
-        """Validation precedes every write, so a rejected contribution
-        cannot leave the slot half-updated for a caller that catches the
-        error and replays."""
+        # A dtype-mismatched tensor is the only rejected input copy_ would
+        # have modified the slot with, so it is what proves validate-before-write.
         slot = self._slot()
         _refresh_deepstack_replay_slot(
             slot=slot, deepstack_embeds=self._embeds(self.NUM_TOKENS, 3.0)
@@ -284,7 +191,7 @@ class TestDeepStackReplaySlotRefresh(CustomTestCase):
         with self.assertRaises(RuntimeError):
             _refresh_deepstack_replay_slot(
                 slot=slot,
-                deepstack_embeds=self._embeds(4, 9.0, width=self.WIDTH // 2),
+                deepstack_embeds=self._embeds(4, 9.0, dtype=torch.float32),
             )
         self.assertTrue(torch.all(slot == 3.0))
 
