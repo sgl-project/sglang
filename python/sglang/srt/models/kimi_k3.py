@@ -35,7 +35,6 @@ from sglang.srt.layers import (
     zero_copy_context,
 )
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
-from sglang.srt.layers.attention.linear.utils import get_linear_attn_prefill_backend
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
@@ -91,6 +90,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -1795,7 +1795,7 @@ class KimiK3DeltaAttention(nn.Module):
             forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
             if (
                 not forward_batch.forward_mode.is_target_verify()
-                and not get_linear_attn_prefill_backend().is_cake()
+                and not get_attn_backend().linear_attn_backend.kernel_dispatcher.extend_uses_cake_prefill
             ):
                 # Triton and the other chunk backends take probabilities. Cake
                 # fuses sigmoid and consumes the original (possibly strided)

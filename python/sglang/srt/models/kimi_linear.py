@@ -16,7 +16,6 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.attention.linear.utils import get_linear_attn_prefill_backend
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -40,6 +39,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -411,7 +411,7 @@ class KimiDeltaAttention(nn.Module):
             )  # [T, H*K] -> [T, H, K]
             if (
                 not forward_batch.forward_mode.is_target_verify()
-                and not get_linear_attn_prefill_backend().is_cake()
+                and not get_attn_backend().linear_attn_backend.kernel_dispatcher.extend_uses_cake_prefill
             ):
                 # Triton and the other chunk backends take probabilities. Cake
                 # fuses sigmoid and consumes the original (possibly strided)
