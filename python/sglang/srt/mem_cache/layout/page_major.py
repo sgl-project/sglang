@@ -153,7 +153,7 @@ def build_dense_mha_views(
     assert head_dim == v_head_dim, (
         f"build_dense_mha_views requires uniform rows (head_dim == v_head_dim); "
         f"got head_dim={head_dim}, v_head_dim={v_head_dim}. Asymmetric-KV "
-        "models keep the strided page-major layout (Triton-only)."
+        "models cannot use the unified pool (screened out at startup)."
     )
     itemsize = store_dtype.itemsize
     row_elems = head_num * head_dim

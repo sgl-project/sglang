@@ -29,17 +29,15 @@ from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
-import triton
 from torch.profiler import record_function
 
-from sglang.kernels.ops.kvcache.cache_move import store_cache_4d_kernel
 from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.layout.page_major import (
+    build_dense_mha_views,
     build_dense_mla_views,
     build_page_major_mamba_views,
-    build_page_major_mha_views,
 )
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -47,7 +45,6 @@ from sglang.srt.mem_cache.memory_pool import (
     MambaPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    move_kv_cache_native,
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -96,6 +93,17 @@ class SubPoolSpec(ABC):
         """Storage dtype (informational). Multi-dtype subclasses return the dominant buffer's."""
         raise NotImplementedError
 
+    def view_tail_pad_bytes(self, page_size: int) -> int:
+        """Bytes this sub-pool's views reach PAST its last page envelope.
+
+        Dense per-layer views are the same tensor shifted one page-row-block at
+        a time, so the last block's view overruns the final envelope by
+        `blocks - 1` page-rows; `UnifiedKVPool` over-allocates that much so the
+        views stay in bounds. One page envelope is the upper bound. 0 here for
+        sub-pools whose views end inside their own byte range (Mamba).
+        """
+        return 0
+
 
 @dataclass(frozen=True, kw_only=True)
 class MHASubPoolSpec(SubPoolSpec):
@@ -115,6 +123,15 @@ class MHASubPoolSpec(SubPoolSpec):
         assert (
             self.v_head_dim > 0
         ), f"v_head_dim must be positive; got {self.v_head_dim}"
+        # The unified pool exposes DENSE per-layer views only, and the dense
+        # block array exists only when K and V rows are equally wide. Callers
+        # must screen asymmetric-KV models out before building a spec (see
+        # ServerArgs._handle_page_major_kv_layout).
+        assert self.is_uniform_row(), (
+            f"sub-pool {self.name!r}: the unified pool requires uniform K/V "
+            f"rows; got k_row_bytes={self.k_row_bytes()} != "
+            f"v_row_bytes={self.v_row_bytes()}"
+        )
 
     def k_row_bytes(self) -> int:
         return self.head_num * self.head_dim * self.store_dtype.itemsize
@@ -145,16 +162,17 @@ class MHASubPoolSpec(SubPoolSpec):
         exposing this sub-pool as DENSE per-layer views (`build_dense_mha_views`):
         the page envelope is then a uniform array of `dense_blocks_per_page()`
         row-blocks, addressable by one shared block table. Asymmetric-KV models
-        (e.g. MiMoV2's 192/128) keep the strided layout."""
+        (e.g. MiMoV2's 192/128) cannot use the unified pool at all; they are
+        screened out at startup by `unified_memory_supported_for_model`."""
         return self.k_row_bytes() == self.v_row_bytes()
+
+    def view_tail_pad_bytes(self, page_size: int) -> int:
+        return page_size * self.entry_bytes()
 
     def dense_blocks_per_page(self) -> int:
         """Row-blocks per page in the dense id space (one K + one V per layer);
-        also this sub-pool's `kernel_page_multiplier` when dense."""
-        assert self.is_uniform_row(), (
-            f"sub-pool {self.name!r}: the dense id space requires uniform rows; "
-            f"got k_row_bytes={self.k_row_bytes()} != v_row_bytes={self.v_row_bytes()}"
-        )
+        also this sub-pool's `kernel_page_multiplier`. Uniform rows are
+        guaranteed by `__post_init__`, so the block array always exists."""
         return 2 * self.layer_num
 
     def get_dtype(self) -> torch.dtype:
@@ -190,6 +208,9 @@ class MLASubPoolSpec(SubPoolSpec):
 
     def entry_bytes(self) -> int:
         return self.layer_num * self.kv_cache_dim * self.store_dtype.itemsize
+
+    def view_tail_pad_bytes(self, page_size: int) -> int:
+        return page_size * self.entry_bytes()
 
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
@@ -227,13 +248,42 @@ class MambaSubPoolSpec(SubPoolSpec):
 
 
 # ---------------------------------------------------------------------------
-# UnifiedKVPool — the byte buffer + the strided per-sub-pool views
+# UnifiedKVPool — the byte buffer + the per-sub-pool views
 # ---------------------------------------------------------------------------
+
+
+def unified_memory_supported_for_model(model_config, *, use_mla_backend: bool) -> bool:
+    """Whether this model's KV geometry can back the unified memory pool.
+
+    The pool exposes DENSE per-layer views only. An MLA sub-pool stores ONE
+    latent row per layer, so its K/V head dims never have to agree and it
+    always qualifies. An MHA/SWA sub-pool's page envelope is a dense block
+    array only when K and V rows are equally wide — exactly
+    ``not has_asymmetric_kv``, which spans the full AND swa dims.
+
+    Evaluated at model-config level because the server_args gate runs before
+    any sub-pool spec exists; `MHASubPoolSpec.__post_init__` re-asserts the
+    same precondition where the spec is actually built.
+    """
+    return use_mla_backend or not model_config.has_asymmetric_kv
+
+
+def _assert_dense_id_bound(*, sub_pool_name: str, n_dense: int) -> None:
+    """Dense ids flow through int32 read-index buffers (flashinfer kv_indices,
+    block tables, the canonical page tables); the multiplier-scaled id space
+    must fit. Checked once at view construction — the single place the dense
+    size is decided — so no per-step path ever has to re-derive the bound."""
+    assert n_dense < 2**31, (
+        f"sub-pool {sub_pool_name!r}: dense id space has {n_dense} rows, "
+        f"exceeding the int32 bound (2^31) that read-index buffers assume. "
+        "Reduce max_total_num_tokens or the layer count."
+    )
 
 
 class UnifiedKVPool:
     """One physical `uint8` byte buffer shared by 2 sub-pools, each exposing
-    strided per-layer views. Allocators keep byte ranges disjoint; no usage tracking here.
+    per-layer views over its own byte range (dense for KV, strided for Mamba
+    state). Allocators keep byte ranges disjoint; no usage tracking here.
     """
 
     def __init__(
@@ -244,7 +294,6 @@ class UnifiedKVPool:
         device: str,
         enable_memory_saver: bool,
         page_size: int = 1,
-        view_tail_pad_bytes: int = 0,
     ):
         assert page_size >= 1, f"page_size must be >= 1; got {page_size}"
         assert len(sub_pool_specs) == 2, (
@@ -270,13 +319,17 @@ class UnifiedKVPool:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
-        # `view_tail_pad_bytes` extends the ALLOCATION only (dense MLA views are
-        # per-layer shifted, so the last layer's view reaches past the final page
-        # envelope); all slot/watermark math stays on the unpadded `total_bytes`.
-        self.view_tail_pad_bytes = view_tail_pad_bytes
+        # The dense views are per-block shifted, so the last block of whichever
+        # sub-pool ends the buffer reaches past the final page envelope. Derived
+        # from the specs rather than passed in, so no construction site can
+        # under-allocate it. Extends the ALLOCATION only — all slot/watermark
+        # math stays on the unpadded `total_bytes`.
+        self.view_tail_pad_bytes = max(
+            spec.view_tail_pad_bytes(page_size) for spec in sub_pool_specs
+        )
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self._raw = torch.empty(
-                total_bytes + view_tail_pad_bytes, dtype=torch.uint8, device=device
+                total_bytes + self.view_tail_pad_bytes, dtype=torch.uint8, device=device
             )
         if envs.SGLANG_DEBUG_POISON_POOL.get():
             # Debug: bf16-NaN-fill so NaN-unsafe reads of never-written bytes
@@ -422,7 +475,12 @@ class UnifiedKVPool:
         max_slots: int,
         page_size: int,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        return build_page_major_mha_views(
+        num_pages = max_slots // page_size
+        _assert_dense_id_bound(
+            sub_pool_name=spec.name,
+            n_dense=num_pages * spec.dense_blocks_per_page() * page_size,
+        )
+        return build_dense_mha_views(
             self._raw,
             layer_num=spec.layer_num,
             head_num=spec.head_num,
@@ -430,7 +488,7 @@ class UnifiedKVPool:
             v_head_dim=spec.v_head_dim,
             store_dtype=spec.store_dtype,
             page_size=page_size,
-            num_pages=max_slots // page_size,
+            num_pages=num_pages,
             anchor_bytes=anchor_bytes,
         )
 
@@ -441,13 +499,18 @@ class UnifiedKVPool:
         max_slots: int,
         page_size: int,
     ) -> List[torch.Tensor]:
+        num_pages = max_slots // page_size
+        _assert_dense_id_bound(
+            sub_pool_name=spec.name,
+            n_dense=num_pages * spec.layer_num * page_size,
+        )
         return build_dense_mla_views(
             self._raw,
             layer_num=spec.layer_num,
             kv_cache_dim=spec.kv_cache_dim,
             store_dtype=spec.store_dtype,
             page_size=page_size,
-            num_pages=max_slots // page_size,
+            num_pages=num_pages,
             anchor_bytes=anchor_bytes,
         )
 
@@ -467,10 +530,22 @@ class UnifiedKVPool:
 
 
 class UnifiedMHATokenToKVPool(MHATokenToKVPool):
-    """MHA KV pool whose `k_buffer`/`v_buffer` are strided views into a `UnifiedKVPool`.
+    """MHA KV pool whose per-layer `k_buffer`/`v_buffer` are DENSE views into a
+    `UnifiedKVPool` (`build_dense_mha_views`; requires uniform K/V rows,
+    which `MHASubPoolSpec` enforces).
 
-    Relocation uses the native move (strided views break the tiled Triton kernel that
-    assumes stride == row bytes). `set_kv_buffer` gets PHYSICAL slot ids; never translates.
+    Per-layer views are stock-shaped `(n_dense, head_num, head_dim)` contiguous
+    tensors and locs are DENSE ids
+
+        dense(t) = (t // ps) * (ps * 2 * layer_num) + t % ps
+
+    which are layer- AND K/V-independent (each view's storage_offset folds in
+    its block origin: layer l's K at block 2l, V at 2l+1). Every inherited
+    read/write method therefore works unmodified — the JIT `store_cache`
+    scatter is stride-driven off the views' own metadata and the views report
+    `is_contiguous()`. Relocation is the exception: compaction passes REAL
+    physical token ids, so it copies whole page envelopes on the raw buffer
+    (mirrors `UnifiedMLATokenToKVPool`).
     """
 
     def __init__(
@@ -484,17 +559,23 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         enable_alt_stream: bool = True,
     ):
         spec = unified_buffer.mha_spec(sub_pool_name)
-        k_buffer, v_buffer = unified_buffer.mha_views_for(sub_pool_name)
+        k_views, v_views = unified_buffer.mha_views_for(sub_pool_name)
         max_slots = unified_buffer.max_slots(sub_pool_name)
 
         self._unified_buffer = unified_buffer
         self._sub_pool_name = sub_pool_name
-        self._k_views = k_buffer
-        self._v_views = v_buffer
-        self._page_size = page_size
+        self._k_views = k_views
+        self._v_views = v_views
+        self._num_pages = max_slots // page_size
+        self._page_bytes = page_size * spec.entry_bytes()
+        # Dense row count per view; also the OOB bound for dense locs.
+        dense_size = self._num_pages * spec.dense_blocks_per_page() * page_size
 
         super().__init__(
-            size=max_slots - 1,  # -1 for reserved slot 0
+            # OOB checks (and the store kernel's device-side size_limit) bound
+            # locs by `size + page_size`; dense ids run to `dense_size`
+            # (page 0 is the reserved padding sink).
+            size=dense_size - page_size,
             page_size=page_size,
             dtype=spec.store_dtype,
             head_num=spec.head_num,
@@ -506,114 +587,47 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
             enable_alt_stream=enable_alt_stream,
-            enable_kv_cache_copy=False,  # strided views — force native move
+            # Relocation is overridden below; never use the inherited tiled
+            # copy kernel.
+            enable_kv_cache_copy=False,
         )
 
     def _create_buffers(self):
+        # Views only. The parent also builds `_kv_buffer_descs`
+        # and the `data_ptrs` / `data_strides` pointer tables, which feed the
+        # tiled slot-copy kernel and the host-transfer plane — neither of which
+        # this pool supports (`enable_kv_cache_copy=False`, and every transfer
+        # entry point below raises). Leaving them unset keeps a stray consumer
+        # failing loudly instead of reading a table nothing maintains.
         self.k_buffer = self._k_views
         self.v_buffer = self._v_views
-        # For external inspectors only; the native move path doesn't consume them.
-        self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_buffer],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-        self.v_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.v_buffer],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
-        self.data_strides = torch.tensor(
-            [x.stride(0) * x.dtype.itemsize for x in (self.k_buffer + self.v_buffer)],
-            device=self.device,
-        )
 
     def _clear_buffers(self):
         # Lifetime owned by UnifiedKVPool; do not delete the views.
         pass
 
-    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        # tgt_loc/src_loc are PHYSICAL slot ids; native move only (strided views).
-        if tgt_loc.numel() == 0:
-            return
-        with record_function("UnifiedMHA.move_kv_cache"):
-            move_kv_cache_native(
-                self.k_buffer,
-                self.v_buffer,
-                tgt_loc,
-                src_loc,
-                page_size=self._page_size,
-            )
-
     def get_kv_size_bytes(self):
         return 0, 0  # UnifiedKVPool logs the total; per-sub-pool would double-count
 
-    def set_kv_buffer(
-        self,
-        layer,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        k_scale=None,
-        v_scale=None,
-        layer_id_override: Optional[int] = None,
-        dcp_kv_mask: Optional[torch.Tensor] = None,
-    ):
-        # Decode context parallel (dcp_kv_mask) unsupported; fail loud.
-        assert dcp_kv_mask is None, (
-            "UnifiedMHATokenToKVPool.set_kv_buffer: decode context parallel "
-            "(dcp_kv_mask) is not supported with --enable-unified-memory."
-        )
-        # Bypass super().set_kv_buffer: the parent's `k_cache.view(-1, row_dim)` can't
-        # merge our 4-D layer-major view (stride[0]=page_bytes) at page_size>1. Call
-        # store_cache_4d_kernel directly. `loc` is PHYSICAL token ids — no v2p translate.
-        with record_function("UnifiedMHA.set_kv_buffer"):
-            if cache_k.dtype != self.dtype:
-                if k_scale is not None:
-                    cache_k.div_(k_scale)
-                if v_scale is not None:
-                    cache_v.div_(v_scale)
-                cache_k = cache_k.to(self.dtype)
-                cache_v = cache_v.to(self.dtype)
-            if self.store_dtype != self.dtype:
-                cache_k = cache_k.view(self.store_dtype)
-                cache_v = cache_v.view(self.store_dtype)
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Relocate slots by whole page envelope.
 
-            layer_id = (
-                layer.layer_id if layer_id_override is None else layer_id_override
-            ) - self.start_layer
-            k_view = self.k_buffer[layer_id]
-            v_view = self.v_buffer[layer_id]
-            ps = self._page_size
-            N = loc.numel()
-            if N == 0:
-                return
-            head_num = k_view.shape[2]
-            head_dim = k_view.shape[3]
-            v_head_dim = v_view.shape[3]
-            K_ROW_DIM = head_num * head_dim
-            V_ROW_DIM = head_num * v_head_dim
-            BLOCK = 128
-            row_dim_max = K_ROW_DIM if K_ROW_DIM > V_ROW_DIM else V_ROW_DIM
-            store_cache_4d_kernel[(N, triton.cdiv(row_dim_max, BLOCK), 2)](
-                k_view,
-                v_view,
-                cache_k,
-                cache_v,
-                loc,
-                k_view.stride(0),
-                k_view.stride(1),
-                v_view.stride(0),
-                v_view.stride(1),
-                cache_k.stride(0),
-                cache_v.stride(0),
-                K_ROW_DIM=K_ROW_DIM,
-                V_ROW_DIM=V_ROW_DIM,
-                PAGE_SIZE=ps,
-                BLOCK=BLOCK,
-                num_warps=4,
+        `tgt_loc`/`src_loc` are REAL physical token ids, not dense ids:
+        compaction expands page ids into page-major-ordered token runs
+        (`pages[:, None] * ps + offsets`), which is what lets us recover the
+        page lists here. One contiguous envelope copy per page — the inherited
+        per-layer move would apply those physical ids to the dense row space.
+        """
+        if tgt_loc.numel() == 0:
+            return
+        ps = self.page_size
+        tgt_pages = tgt_loc.view(-1, ps)[:, 0] // ps
+        src_pages = src_loc.view(-1, ps)[:, 0] // ps
+        with record_function("UnifiedMHA.move_kv_cache"):
+            env = self._unified_buffer._raw[: self._num_pages * self._page_bytes].view(
+                self._num_pages, self._page_bytes
             )
+            env[tgt_pages] = env[src_pages]
 
 
 class UnifiedMLATokenToKVPool(MLATokenToKVPool):
@@ -1181,16 +1195,12 @@ def init_unified_mamba_pools(
         max_total_num_tokens * full_spec.entry_bytes()
         + max_mamba_cache_size * mamba_spec.entry_bytes()
     )
-    # Dense MLA views are per-layer shifted, so the last layer's view reaches one
-    # page envelope past the final page — allocation-only tail pad (~page bytes).
-    view_tail_pad_bytes = page_size * full_spec.entry_bytes() if use_mla_backend else 0
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, mamba_spec],
         device=device,
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
-        view_tail_pad_bytes=view_tail_pad_bytes,
     )
     req_to_token_pool = UnifiedHybridReqToTokenPool(
         unified_buffer=shared_pool,
@@ -1251,7 +1261,9 @@ def init_unified_mamba_pools(
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
         full_kernel_page_multiplier=(
-            len(full_attention_layer_ids) if use_mla_backend else 1
+            len(full_attention_layer_ids)
+            if use_mla_backend
+            else full_spec.dense_blocks_per_page()
         ),
     )
 
@@ -1288,18 +1300,20 @@ def init_unified_mamba_pools(
             qk_rope_head_dim,
             page_size,
             len(full_attention_layer_ids),
-            view_tail_pad_bytes,
+            shared_pool.view_tail_pad_bytes,
         )
     else:
         logger.info(
             "[unified-memory-pool]   full_layers=%d, mamba_layers=%d, head_num=%d, head_dim=%d, "
-            "page_size=%d, is_draft_worker=%s",
+            "page_size=%d, is_draft_worker=%s (%s)",
             len(full_attention_layer_ids),
             len(mamba_layer_ids),
             head_num,
             head_dim,
             page_size,
             is_draft_worker,
+            "dense views, kernel_page_multiplier=%d, view_tail_pad=%d B"
+            % (full_spec.dense_blocks_per_page(), shared_pool.view_tail_pad_bytes),
         )
     logger.info(
         "[unified-memory-pool]   total_bytes=%d, max_total_num_tokens=%d, max_mamba_cache_size=%d, "
@@ -1435,8 +1449,7 @@ class UnifiedSWAKVPool(SWAKVPool):
         return  # no-op in shared mode (the swa-side v2p IS the mapping)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
-        """Virtual token ids -> swa kernel-facing ids (int64; physical until
-        the sub-pools expose dense views).
+        """Virtual token ids -> swa kernel-facing ids (int64, swa-DENSE).
 
         This is the surface the attention backends reach through
         `token_to_kv_pool`; `UnifiedSWATokenToKVPoolAllocator` exposes the same
@@ -1648,6 +1661,10 @@ def init_unified_swa_pools(
         full_max_total_num_tokens * full_spec.entry_bytes()
         + swa_max_total_num_tokens * swa_spec.entry_bytes()
     )
+    # Uniform-row full AND swa sub-pools get DENSE views (kept coherent: the
+    # backend allow-list gates on has_asymmetric_kv, which spans both). Stamp
+    # the decision onto both specs — the pool, the pool class and the allocator
+    # multipliers all read it from there.
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, swa_spec],
@@ -1674,12 +1691,23 @@ def init_unified_swa_pools(
         need_sort=need_sort,
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
+        full_kernel_page_multiplier=full_spec.dense_blocks_per_page(),
+        swa_kernel_page_multiplier=swa_spec.dense_blocks_per_page(),
     )
 
     logger.info(
         "[unified-memory-pool] ============================================================"
     )
     logger.info("[unified-memory-pool] UNIFIED MEMORY POOL ENABLED -- path=SWA hybrid")
+    logger.info(
+        "[unified-memory-pool]   %s",
+        "dense views, kernel_page_multiplier full=%d swa=%d, view_tail_pad=%d B"
+        % (
+            full_spec.dense_blocks_per_page(),
+            swa_spec.dense_blocks_per_page(),
+            shared_pool.view_tail_pad_bytes,
+        ),
+    )
     logger.info(
         "[unified-memory-pool]   full_layers=%d, swa_layers=%d, head_num=%d, head_dim=%d, "
         "v_head_dim=%d, swa_head_num=%d, swa_head_dim=%d, swa_v_head_dim=%d, "

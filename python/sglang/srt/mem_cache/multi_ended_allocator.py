@@ -139,7 +139,16 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # once page ids are scaled by layer_num — `translate_kv_loc_dense` emits
         # that space. 1 for sub-pools whose kernels take real physical ids.
         self.kernel_page_multiplier = kernel_page_multiplier
-        # Zero page envelopes on hand-out — see _maybe_zero_pages.
+        # Zero page envelopes on hand-out — see _maybe_zero_pages. MLA-only,
+        # and the dense MHA pool deliberately does NOT join it even though its
+        # per-layer views now use the same dense addressing MLA does. What
+        # decides this is the READ KERNEL, not the layout: MHA kernels bound
+        # their loads by seq_lens / cache_seqlens, so bytes past a sequence's
+        # end are never dereferenced and stale content is harmless. MLA kernels
+        # instead load a fixed tile and mask the rows past seq_len
+        # arithmetically, so a stale NaN/Inf survives the mask (NaN * 0 = NaN)
+        # and poisons the output — those bytes must read as finite. Widen this
+        # isinstance only for a pool whose read kernels mask arithmetically.
         self._zero_pages_on_alloc = isinstance(kvcache, UnifiedMLATokenToKVPool)
         # Overlap mode: `free` drops a wait_stream(forward_stream) barrier so its
         # v2p writes + move kernel serialize after the in-flight forward.
@@ -1952,8 +1961,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> DENSE (kernel-facing) ids. Falls back
-        to the physical translate when `kernel_page_multiplier == 1` (MHA)."""
+        """Full-pool virtual TOKEN ids -> DENSE (kernel-facing) ids."""
         return self.full_attn_allocator.translate_kv_loc_dense(loc, out=out)
 
     def translate_kv_indices_for_transfer(
@@ -2322,9 +2330,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     #
     # Mirrors the mamba composite: presence of `translate_kv_loc_dense` /
     # `full_v2p_page_table` is what flips the attention backends' dense-first
-    # probes. With both multipliers left at 1 (strided views) every entry point
-    # below collapses to the physical translate, byte-identical to the
-    # pre-dense composite.
+    # probes.
 
     @property
     def kernel_page_multiplier(self) -> int:
@@ -2342,8 +2348,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> DENSE (kernel-facing) ids. Falls back
-        to the physical translate when `kernel_page_multiplier == 1` (strided)."""
+        """Full-pool virtual TOKEN ids -> DENSE (kernel-facing) ids."""
         return self.full_attn_allocator.translate_kv_loc_dense(loc, out=out)
 
     @property

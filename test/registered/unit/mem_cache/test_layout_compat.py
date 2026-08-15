@@ -13,11 +13,18 @@
 # ==============================================================================
 """Unit tests for the page-major layer-major byte layout.
 
+The subject here is the ENVELOPE — the byte layout every page-major pool
+shares — described through the 4-D strided views ``build_page_major_mha_views``
+returns (what ``PageMajorMHATokenToKVPool`` exposes). The unified pool stores
+its KV in the same envelope but exposes DENSE 3-D views over it; those are
+covered by ``test_unified_mha_dense_views.py``, which also pins the two
+descriptions against each other byte for byte.
+
 Verifies that:
-1. The new 4-D ``_build_mha_views`` output exposes correct byte addresses
-   for each (layer, page, tok_in_page, head, dim) — under both the
-   degenerate ``page_size=1`` case (byte-identical to the old per-token
-   envelope) and the new ``page_size>1`` layer-major case.
+1. The 4-D views expose correct byte addresses for each
+   (layer, page, tok_in_page, head, dim) — under both the degenerate
+   ``page_size=1`` case (byte-identical to the per-token envelope) and the
+   ``page_size>1`` layer-major case.
 2. ``MHASubPoolSpec.layer_k_offset_in_page`` /
    ``layer_v_offset_in_page`` math matches the layout intent.
 3. ``set_kv_buffer`` round-trips correctly for both page sizes.
@@ -37,6 +44,7 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.layout.page_major import build_page_major_mha_views
 from sglang.srt.mem_cache.memory_pool import move_kv_cache_native
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
@@ -45,6 +53,26 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 )
 
 _DEV = "cpu"
+
+
+def _strided_views(pool, spec, page_size):
+    """The 4-D strided description of `spec`'s region of `pool`'s envelope.
+
+    Built directly from the builder rather than read off the pool: the unified
+    pool exposes DENSE 3-D views over these same bytes, and it is the ENVELOPE
+    the assertions below are about.
+    """
+    return build_page_major_mha_views(
+        pool._raw,
+        layer_num=spec.layer_num,
+        head_num=spec.head_num,
+        head_dim=spec.head_dim,
+        v_head_dim=spec.v_head_dim,
+        store_dtype=spec.store_dtype,
+        page_size=page_size,
+        num_pages=pool.max_slots(spec.name) // page_size,
+        anchor_bytes=pool.anchor_bytes(spec.name),
+    )
 
 
 def _make_mha_spec(name, grow, layer_num=2, head_num=2, head_dim=4):
@@ -138,7 +166,7 @@ class TestBuildMHAViews(unittest.TestCase):
     def test_view_shape_is_4d(self):
         for ps in [1, 8]:
             pool, spec = self._build(page_size=ps)
-            k_views, v_views = pool.mha_views_for("full")
+            k_views, v_views = _strided_views(pool, spec, ps)
             self.assertEqual(len(k_views), spec.layer_num)
             max_slots = pool.max_slots("full")
             for L in range(spec.layer_num):
@@ -156,7 +184,7 @@ class TestBuildMHAViews(unittest.TestCase):
         """At ps=1, the 4-D view's stride[0] equals what today's 3-D view's
         stride[0] would have been (= entry_bytes / itemsize)."""
         pool, spec = self._build(page_size=1, layer_num=4, head_num=3, head_dim=8)
-        k_views, _ = pool.mha_views_for("full")
+        k_views, _ = _strided_views(pool, spec, 1)
         itemsize = spec.store_dtype.itemsize
         for L in range(spec.layer_num):
             # stride[0] = page_bytes/itemsize = entry_bytes/itemsize at ps=1
@@ -170,7 +198,7 @@ class TestBuildMHAViews(unittest.TestCase):
 
     def test_strides_at_page_size_gt_1(self):
         pool, spec = self._build(page_size=8, layer_num=4, head_num=3, head_dim=8)
-        k_views, _ = pool.mha_views_for("full")
+        k_views, _ = _strided_views(pool, spec, 8)
         itemsize = spec.store_dtype.itemsize
         for L in range(spec.layer_num):
             # page_bytes = 8 * 4 * (k_row + v_row); stride[0] = that / itemsize
@@ -184,7 +212,7 @@ class TestBuildMHAViews(unittest.TestCase):
         """Writes to layer 0 must not affect layer 1's K/V values (under
         layer-major within-page layout)."""
         pool, spec = self._build(page_size=8, layer_num=3, head_num=2, head_dim=4)
-        k_views, v_views = pool.mha_views_for("full")
+        k_views, v_views = _strided_views(pool, spec, 8)
         # Set page 0, token 3, layer 0 K to a distinct pattern.
         target_val = 0.5
         k_views[0][0, 3] = target_val
@@ -198,7 +226,7 @@ class TestBuildMHAViews(unittest.TestCase):
     def test_distinct_pages_dont_alias_at_page_size_gt_1(self):
         """Writes to one page must not affect another page."""
         pool, spec = self._build(page_size=8, layer_num=3, head_num=2, head_dim=4)
-        k_views, _ = pool.mha_views_for("full")
+        k_views, _ = _strided_views(pool, spec, 8)
         # Set page 0, token 3, layer 0 K to a distinct pattern.
         k_views[0][0, 3] = 1.25
         # Page 1, token 3, layer 0 K should remain at default.
@@ -226,11 +254,13 @@ class TestMoveKVCacheNative4D(unittest.TestCase):
             enable_memory_saver=False,
             page_size=page_size,
         )
-        return pool
+        return pool, full
 
     def test_move_kv_cache_page_size_1(self):
-        pool = self._build_buffer(page_size=1, layer_num=2, head_num=2, head_dim=4)
-        k_views, v_views = pool.mha_views_for("full")
+        pool, spec = self._build_buffer(
+            page_size=1, layer_num=2, head_num=2, head_dim=4
+        )
+        k_views, v_views = _strided_views(pool, spec, 1)
         # Write distinct markers at source slots 5, 6.
         for L in range(2):
             k_views[L][5, 0] = float(L + 1)
@@ -253,8 +283,10 @@ class TestMoveKVCacheNative4D(unittest.TestCase):
 
     def test_move_kv_cache_page_size_gt_1(self):
         ps = 8
-        pool = self._build_buffer(page_size=ps, layer_num=2, head_num=2, head_dim=4)
-        k_views, v_views = pool.mha_views_for("full")
+        pool, spec = self._build_buffer(
+            page_size=ps, layer_num=2, head_num=2, head_dim=4
+        )
+        k_views, v_views = _strided_views(pool, spec, ps)
         # Write markers at token ids 5 and 14 (different pages).
         for L in range(2):
             # token 5 = (page 0, tok 5)
@@ -322,7 +354,7 @@ class TestByteIdentityAtPageSize1(unittest.TestCase):
             enable_memory_saver=False,
             page_size=ps,
         )
-        k_views, v_views = pool.mha_views_for("full")
+        k_views, v_views = _strided_views(pool, spec, ps)
         # For each (layer, slot), compute the expected byte address under
         # the envelope layout and verify the 4-D view's data_ptr +
         # advanced indexing agrees.

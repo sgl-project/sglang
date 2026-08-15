@@ -8286,6 +8286,28 @@ class ServerArgs:
             self.enable_page_major_kv_layout = True
         if not self.enable_page_major_kv_layout:
             return
+        # The unified pool exposes DENSE per-layer views only, so an MHA/SWA
+        # model whose K and V rows differ in width has no layout there at all
+        # — reject it up front rather than failing at pool construction. (MLA
+        # keeps one latent row per layer, so its head dims never have to agree.)
+        if self.enable_unified_memory:
+            from sglang.srt.mem_cache.unified_memory_pool import (
+                unified_memory_supported_for_model,
+            )
+
+            model_config = self.get_model_config()
+            assert unified_memory_supported_for_model(
+                model_config, use_mla_backend=self.use_mla_backend()
+            ), (
+                "--enable-unified-memory requires uniform K/V rows "
+                "(head_dim == v_head_dim); this model has "
+                f"head_dim={model_config.head_dim}, "
+                f"v_head_dim={model_config.v_head_dim}, "
+                f"swa_head_dim={model_config.swa_head_dim}, "
+                f"swa_v_head_dim={model_config.swa_v_head_dim}. The unified "
+                "pool's dense per-layer views require a uniform row width; run "
+                "this model without --enable-unified-memory."
+            )
         # Only the Triton attention kernels read the strided 4-D envelope K/V
         # views; FA3 / FlashInfer do not. EXCEPTION: the unified-memory MLA pool
         # exposes each layer as a DENSE contiguous per-layer view
