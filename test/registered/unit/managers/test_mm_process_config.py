@@ -87,6 +87,8 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         server_args.mm_preprocess_cache_size_mb = None
         server_args.tokenizer_worker_num = 1
         server_args.trust_mm_content_hashes = False
+        server_args.allowed_media_domains = []
+        server_args.media_url_max_file_size_mb = 64
 
         hf_config = MagicMock()
         mock_hf_processor = MagicMock()
@@ -184,6 +186,8 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
             base_gpu_id=2,
             tp_size=8,
             rl_on_policy_target=None,
+            allowed_media_domains=[],
+            media_url_max_file_size_mb=64,
         )
 
     @staticmethod
@@ -797,6 +801,8 @@ class TestDoubleBosGuard(CustomTestCase):
         server_args.mm_preprocess_cache_size_mb = None
         server_args.tokenizer_worker_num = 1
         server_args.trust_mm_content_hashes = False
+        server_args.allowed_media_domains = []
+        server_args.media_url_max_file_size_mb = 64
 
         mock_hf_processor = MagicMock()
         mock_hf_processor.__class__.__name__ = "TestProcessor"
