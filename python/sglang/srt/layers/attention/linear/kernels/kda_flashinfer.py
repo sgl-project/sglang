@@ -13,10 +13,12 @@ Contract with the Triton KDA reference:
   - state layout is ``[N, HV, V, K]`` for committed and speculative state.
 
 The optional ``cake`` mode forwards SGLang's post-convolution packed Q/K/V,
-raw gate/beta, and indexed state pool directly to the exported CAKE decode
-contract. Unsupported shapes and ReplaySSM use the existing Triton packed
-path. Prefill consumes raw gate/beta logits, updates the indexed state pool in
-place, and can return radix-cache checkpoints without materializing inputs.
+raw gate/beta, and indexed state pool directly to exported CAKE decode
+contracts. Kimi-Linear H32/D128 uses the native unbounded-softplus recurrent
+kernel without precomputing the gate or gathering the state pool. Unsupported
+bounded shapes and ReplaySSM use the existing Triton packed path. Prefill
+consumes raw gate/beta logits, updates the indexed state pool in place, and can
+return radix-cache checkpoints without materializing inputs.
 """
 
 from __future__ import annotations
@@ -71,6 +73,12 @@ _CAKE_PACKED_QKV_WIDTH = 3 * _CAKE_PACKED_NUM_HEADS * _CAKE_PACKED_HEAD_DIM
 _CAKE_PACKED_GATE_WIDTH = _CAKE_PACKED_NUM_HEADS * _CAKE_PACKED_HEAD_DIM
 _CAKE_PACKED_SCALE = _CAKE_PACKED_HEAD_DIM**-0.5
 _CAKE_PACKED_LOWER_BOUND = -5.0
+
+_CAKE_UNBOUNDED_NUM_HEADS = 32
+_CAKE_UNBOUNDED_HEAD_DIM = 128
+_CAKE_UNBOUNDED_QKV_WIDTH = 3 * _CAKE_UNBOUNDED_NUM_HEADS * _CAKE_UNBOUNDED_HEAD_DIM
+_CAKE_UNBOUNDED_GATE_WIDTH = _CAKE_UNBOUNDED_NUM_HEADS * _CAKE_UNBOUNDED_HEAD_DIM
+_CAKE_UNBOUNDED_SCALE = _CAKE_UNBOUNDED_HEAD_DIM**-0.5
 
 
 @dataclass(frozen=True)
@@ -448,16 +456,34 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             .to(torch.bfloat16)
             .contiguous()
         )
-        gate_fi = self._cake_precompute_gate(
-            a,
-            A_log,
-            dt_bias,
-            lower_bound,
-            batch_size,
-            num_heads,
-            num_v_heads,
-            head_k_dim,
+        native_unbounded_softplus = (
+            lower_bound is None
+            and num_heads == _CAKE_UNBOUNDED_NUM_HEADS
+            and num_v_heads == _CAKE_UNBOUNDED_NUM_HEADS
+            and head_k_dim == _CAKE_UNBOUNDED_HEAD_DIM
+            and head_v_dim == _CAKE_UNBOUNDED_HEAD_DIM
         )
+        if native_unbounded_softplus:
+            gate_fi = a.reshape(
+                batch_size,
+                1,
+                _CAKE_UNBOUNDED_NUM_HEADS,
+                _CAKE_UNBOUNDED_HEAD_DIM,
+            ).to(torch.bfloat16)
+            A_log_fi, dt_bias_fi = self._prep_gate_params(A_log, dt_bias)
+        else:
+            gate_fi = self._cake_precompute_gate(
+                a,
+                A_log,
+                dt_bias,
+                lower_bound,
+                batch_size,
+                num_heads,
+                num_v_heads,
+                head_k_dim,
+            )
+            A_log_fi = None
+            dt_bias_fi = None
         beta_fi = (
             torch.sigmoid(b.float())
             .to(torch.bfloat16)
@@ -475,6 +501,11 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             # updates active slots in the caller-owned pool in place.
             state = ssm_states
         else:
+            if native_unbounded_softplus:
+                raise ValueError(
+                    "native Kimi-Linear unbounded-softplus decode requires the "
+                    "direct indexed-state contract; refusing a gather/scatter adapter"
+                )
             # The current cubin addresses state slots with int32 element
             # offsets. Keep the previous dense adapter for larger envelope-
             # strided page-major/unified pools and other unsupported layouts.
@@ -487,11 +518,14 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             v=value_fi,
             g=gate_fi,
             beta=beta_fi,
+            A_log=A_log_fi,
+            dt_bias=dt_bias_fi,
             scale=None,
             initial_state=state,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=False,
+            use_gate_in_kernel=native_unbounded_softplus,
+            lower_bound=lower_bound if native_unbounded_softplus else None,
             ssm_state_indices=cache_indices if direct_indexed_state else None,
             backend="cake",
         )
@@ -536,9 +570,10 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                     or state_checkpoint_every_n_tokens % 32 != 0
                 )
             )
-            or lower_bound is None
-            or not math.isfinite(float(lower_bound))
-            or float(lower_bound) >= 0.0
+            or (
+                lower_bound is not None
+                and (not math.isfinite(float(lower_bound)) or float(lower_bound) >= 0.0)
+            )
         ):
             return False
         if (
@@ -559,6 +594,12 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             # Every packed sequence has T=1, which is decode rather than prefill.
             return False
         if q.shape[-1] != 128 or v.shape[-1] != 128:
+            return False
+        if lower_bound is None and (
+            q.shape[2] != _CAKE_UNBOUNDED_NUM_HEADS
+            or A_log.numel() != _CAKE_UNBOUNDED_NUM_HEADS
+            or dt_bias.numel() != _CAKE_UNBOUNDED_GATE_WIDTH
+        ):
             return False
         if k.shape != q.shape or v.shape != q.shape or g.shape != q.shape:
             return False
@@ -628,10 +669,8 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 CakePrefillReason.INTERIOR_CHECKPOINT,
                 "state_checkpoint_plan",
             )
-        if (
-            lower_bound is None
-            or not math.isfinite(float(lower_bound))
-            or float(lower_bound) >= 0.0
+        if lower_bound is not None and (
+            not math.isfinite(float(lower_bound)) or float(lower_bound) >= 0.0
         ):
             return CakePrefillAdmission(
                 False, CakePrefillReason.INVALID_LOWER_BOUND, "lower_bound"
@@ -652,6 +691,16 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         if q.shape[-1] != 128 or v.shape[-1] != 128:
             return CakePrefillAdmission(
                 False, CakePrefillReason.UNSUPPORTED_HEAD_DIM, "q_or_v"
+            )
+        if lower_bound is None and (
+            q.shape[2] != _CAKE_UNBOUNDED_NUM_HEADS
+            or A_log.numel() != _CAKE_UNBOUNDED_NUM_HEADS
+            or dt_bias.numel() != _CAKE_UNBOUNDED_GATE_WIDTH
+        ):
+            return CakePrefillAdmission(
+                False,
+                CakePrefillReason.UNSUPPORTED_CONTRACT,
+                "unbounded_softplus_shape",
             )
         if k.shape != q.shape or v.shape != q.shape or g.shape != q.shape:
             detail = next(
@@ -1533,6 +1582,171 @@ class CakeKDAKernel(FlashInferKDAKernel):
         ).eligible
 
     @staticmethod
+    def _cake_unbounded_recurrent_decode_admission(
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        scale: float,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        num_v_heads: int,
+        head_v_dim: int,
+        lower_bound: Optional[float],
+        cache_indices_cpu=None,
+        cache_index_contract=None,
+    ) -> CakePackedDecodeAdmission:
+        """Admit the exact Kimi-Linear H32/D128 raw-gate decode contract."""
+        batch_size = mixed_qkv.shape[0] if mixed_qkv.ndim == 2 else -1
+        state_inner_size = (
+            _CAKE_UNBOUNDED_NUM_HEADS
+            * _CAKE_UNBOUNDED_HEAD_DIM
+            * _CAKE_UNBOUNDED_HEAD_DIM
+        )
+        if (
+            lower_bound is not None
+            or not isinstance(scale, (int, float))
+            or not math.isclose(
+                scale, _CAKE_UNBOUNDED_SCALE, rel_tol=0.0, abs_tol=1e-12
+            )
+        ):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "scalars"
+            )
+        if (
+            batch_size <= 0
+            or batch_size > 65535
+            or tuple(mixed_qkv.shape) != (batch_size, _CAKE_UNBOUNDED_QKV_WIDTH)
+            or mixed_qkv.dtype != torch.bfloat16
+        ):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "mixed_qkv"
+            )
+
+        rejected, _ = CakeKDAKernel._cake_packed_row_admission(
+            mixed_qkv,
+            name="mixed_qkv",
+            batch_size=batch_size,
+            row_width=_CAKE_UNBOUNDED_QKV_WIDTH,
+        )
+        if rejected is not None:
+            return rejected
+        if a.dtype != torch.bfloat16:
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "raw_gate.dtype"
+            )
+        rejected, _ = CakeKDAKernel._cake_packed_row_admission(
+            a,
+            name="raw_gate",
+            batch_size=batch_size,
+            row_width=_CAKE_UNBOUNDED_GATE_WIDTH,
+        )
+        if rejected is not None:
+            return rejected
+        if b.dtype != torch.bfloat16:
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "raw_beta.dtype"
+            )
+        rejected, _ = CakeKDAKernel._cake_packed_row_admission(
+            b,
+            name="raw_beta",
+            batch_size=batch_size,
+            row_width=_CAKE_UNBOUNDED_NUM_HEADS,
+        )
+        if rejected is not None:
+            return rejected
+
+        if (
+            A_log.dtype != torch.float32
+            or dt_bias.dtype != torch.float32
+            or not A_log.is_contiguous()
+            or not dt_bias.is_contiguous()
+            or A_log.numel() != _CAKE_UNBOUNDED_NUM_HEADS
+            or dt_bias.numel() != _CAKE_UNBOUNDED_GATE_WIDTH
+        ):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "gate_params"
+            )
+        if (
+            ssm_states.dtype != torch.bfloat16
+            or ssm_states.ndim != 4
+            or tuple(ssm_states.shape[1:])
+            != (
+                _CAKE_UNBOUNDED_NUM_HEADS,
+                _CAKE_UNBOUNDED_HEAD_DIM,
+                _CAKE_UNBOUNDED_HEAD_DIM,
+            )
+            or ssm_states.shape[0] <= 0
+        ):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "state"
+            )
+        if ssm_states.stride()[1:] != (
+            _CAKE_UNBOUNDED_HEAD_DIM * _CAKE_UNBOUNDED_HEAD_DIM,
+            _CAKE_UNBOUNDED_HEAD_DIM,
+            1,
+        ):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.INNER_STRIDE, "state"
+            )
+        rejected = CakeKDAKernel._cake_row_stride_admission(
+            "state", ssm_states.stride(0), state_inner_size
+        )
+        if rejected is not None:
+            return rejected
+        int32_max = torch.iinfo(torch.int32).max
+        if (
+            ssm_states.stride(0) % 8 != 0
+            or ssm_states.stride(0) > int32_max
+            or ssm_states.shape[0] * ssm_states.stride(0) > int32_max
+            or ssm_states.data_ptr() % 16 != 0
+        ):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "state.direct_index"
+            )
+        if (
+            cache_indices.dtype != torch.int32
+            or not cache_indices.is_contiguous()
+            or tuple(cache_indices.shape) != (batch_size,)
+            or num_v_heads != _CAKE_UNBOUNDED_NUM_HEADS
+            or head_v_dim != _CAKE_UNBOUNDED_HEAD_DIM
+        ):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "indices_or_heads"
+            )
+
+        rejected = CakeKDAKernel._cake_packed_decode_cuda_device_reason(
+            mixed_qkv, (a, b, A_log, dt_bias, ssm_states, cache_indices)
+        )
+        if rejected is not None:
+            return rejected
+        for tensor_name, tensor in (
+            ("mixed_qkv", mixed_qkv),
+            ("raw_gate", a),
+            ("raw_beta", b),
+            ("A_log", A_log),
+            ("dt_bias", dt_bias),
+            ("state_indices", cache_indices),
+        ):
+            if CakeKDAKernel._cake_tensors_overlap(ssm_states, tensor):
+                return CakeKDAKernel._cake_reject(
+                    CakePackedDecodeReason.STORAGE_ALIAS, f"state:{tensor_name}"
+                )
+
+        rejected = CakeKDAKernel._cake_cache_index_source_admission(
+            cache_indices,
+            cache_indices_cpu=cache_indices_cpu,
+            cache_index_contract=cache_index_contract,
+            batch_size=batch_size,
+            state_slots=ssm_states.shape[0],
+        )
+        if rejected is not None:
+            return rejected
+        return CakePackedDecodeAdmission(True, CakePackedDecodeReason.ELIGIBLE)
+
+    @staticmethod
     def _packed_decode_triton(
         mixed_qkv: torch.Tensor,
         a: torch.Tensor,
@@ -1586,8 +1800,13 @@ class CakeKDAKernel(FlashInferKDAKernel):
         layer_id: int,
         **kwargs,
     ) -> torch.Tensor:
-        """Run CAKE's exact packed decode or explicitly retain Triton semantics."""
+        """Run an exact CAKE decode contract or retain bounded Triton semantics."""
         global _cake_packed_decode_route_logged
+        unbounded_softplus_candidate = (
+            lower_bound is None
+            and num_v_heads == _CAKE_UNBOUNDED_NUM_HEADS
+            and head_v_dim == _CAKE_UNBOUNDED_HEAD_DIM
+        )
         try:
             replay_requested = any(
                 kwargs.get(name) is not None
@@ -1602,6 +1821,22 @@ class CakeKDAKernel(FlashInferKDAKernel):
             if replay_requested:
                 admission = CakePackedDecodeAdmission(
                     False, CakePackedDecodeReason.REPLAYSSM_REQUESTED
+                )
+            elif unbounded_softplus_candidate:
+                admission = self._cake_unbounded_recurrent_decode_admission(
+                    mixed_qkv,
+                    a,
+                    b,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    scale=scale,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    num_v_heads=num_v_heads,
+                    head_v_dim=head_v_dim,
+                    lower_bound=lower_bound,
+                    cache_indices_cpu=cache_indices_cpu,
+                    cache_index_contract=cache_index_contract,
                 )
             elif self._packed_kda_decode is None:
                 admission = CakePackedDecodeAdmission(
@@ -1638,6 +1873,22 @@ class CakeKDAKernel(FlashInferKDAKernel):
             raise
         self._last_packed_decode_admission = admission
         if not admission.eligible:
+            if unbounded_softplus_candidate:
+                record_kda_terminal_route(
+                    mode="decode",
+                    layer_id=layer_id,
+                    eligible=False,
+                    attempted_cake=False,
+                    cake_success=False,
+                    triton_fallback=False,
+                    fatal=True,
+                    reason=admission.reason,
+                    detail=admission.detail,
+                )
+                raise RuntimeError(
+                    "native Kimi-Linear H32/D128 unbounded-softplus decode "
+                    f"contract rejected: {admission.reason} ({admission.detail})"
+                )
             try:
                 output = self._packed_decode_triton(
                     mixed_qkv,
@@ -1681,35 +1932,80 @@ class CakeKDAKernel(FlashInferKDAKernel):
 
         try:
             batch_size = mixed_qkv.shape[0]
-            # These are metadata-only views: positive disjoint row strides are
-            # forwarded to FlashInfer unchanged, including the production beta
-            # stride (144, 1). Neither call changes data_ptr/storage_offset.
-            raw_gate = self._cake_packed_row_view(
-                a, batch_size=batch_size, row_width=_CAKE_PACKED_GATE_WIDTH
-            )
-            raw_beta = self._cake_packed_row_view(
-                b, batch_size=batch_size, row_width=_CAKE_PACKED_NUM_HEADS
-            )
-            output = mixed_qkv.new_empty(
-                batch_size, 1, _CAKE_PACKED_NUM_HEADS, _CAKE_PACKED_HEAD_DIM
-            )
-            if not _cake_packed_decode_route_logged:
-                logger.info(
-                    "FlashInfer CAKE packed KDA decode route active: "
-                    "H=12, D=128, direct indexed BF16 state"
+            if unbounded_softplus_candidate:
+                qkv_rows = self._cake_packed_row_view(
+                    mixed_qkv,
+                    batch_size=batch_size,
+                    row_width=_CAKE_UNBOUNDED_QKV_WIDTH,
                 )
-                _cake_packed_decode_route_logged = True
-            self._packed_kda_decode(
-                mixed_qkv=mixed_qkv,
-                raw_gate=raw_gate,
-                raw_beta=raw_beta,
-                A_log=A_log.view(_CAKE_PACKED_NUM_HEADS),
-                dt_bias=dt_bias.view(_CAKE_PACKED_GATE_WIDTH),
-                state=ssm_states,
-                state_indices=cache_indices,
-                output=output,
-            )
-            result = output.transpose(0, 1)
+                head_width = _CAKE_UNBOUNDED_GATE_WIDTH
+                q = qkv_rows[:, :head_width].reshape(
+                    1,
+                    batch_size,
+                    _CAKE_UNBOUNDED_NUM_HEADS,
+                    _CAKE_UNBOUNDED_HEAD_DIM,
+                )
+                k = qkv_rows[:, head_width : 2 * head_width].reshape_as(q)
+                v = qkv_rows[:, 2 * head_width :].reshape_as(q)
+                raw_gate = self._cake_packed_row_view(
+                    a,
+                    batch_size=batch_size,
+                    row_width=_CAKE_UNBOUNDED_GATE_WIDTH,
+                )
+                raw_beta = self._cake_packed_row_view(
+                    b,
+                    batch_size=batch_size,
+                    row_width=_CAKE_UNBOUNDED_NUM_HEADS,
+                )
+                result = self._decode_cake(
+                    q,
+                    k,
+                    v,
+                    raw_gate,
+                    raw_beta,
+                    A_log=A_log.view(_CAKE_UNBOUNDED_NUM_HEADS),
+                    dt_bias=dt_bias.view(_CAKE_UNBOUNDED_GATE_WIDTH),
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    lower_bound=None,
+                )
+                if not _cake_packed_decode_route_logged:
+                    logger.info(
+                        "FlashInfer CAKE Kimi-Linear decode route active: "
+                        "H=32, D=128, native unbounded-softplus gate and direct "
+                        "indexed BF16 state"
+                    )
+                    _cake_packed_decode_route_logged = True
+            else:
+                # These are metadata-only views: positive disjoint row strides
+                # are forwarded unchanged, including production beta stride
+                # (144, 1). Neither call changes data_ptr/storage_offset.
+                raw_gate = self._cake_packed_row_view(
+                    a, batch_size=batch_size, row_width=_CAKE_PACKED_GATE_WIDTH
+                )
+                raw_beta = self._cake_packed_row_view(
+                    b, batch_size=batch_size, row_width=_CAKE_PACKED_NUM_HEADS
+                )
+                output = mixed_qkv.new_empty(
+                    batch_size, 1, _CAKE_PACKED_NUM_HEADS, _CAKE_PACKED_HEAD_DIM
+                )
+                if not _cake_packed_decode_route_logged:
+                    logger.info(
+                        "FlashInfer CAKE packed KDA decode route active: "
+                        "H=12, D=128, direct indexed BF16 state"
+                    )
+                    _cake_packed_decode_route_logged = True
+                self._packed_kda_decode(
+                    mixed_qkv=mixed_qkv,
+                    raw_gate=raw_gate,
+                    raw_beta=raw_beta,
+                    A_log=A_log.view(_CAKE_PACKED_NUM_HEADS),
+                    dt_bias=dt_bias.view(_CAKE_PACKED_GATE_WIDTH),
+                    state=ssm_states,
+                    state_indices=cache_indices,
+                    output=output,
+                )
+                result = output.transpose(0, 1)
         except Exception as exc:
             record_kda_terminal_route(
                 mode="decode",
@@ -1723,6 +2019,14 @@ class CakeKDAKernel(FlashInferKDAKernel):
                 detail=stable_kda_exception_detail(exc),
             )
             raise
+        copy_evidence = (
+            {}
+            if unbounded_softplus_candidate
+            else {
+                "copy_count": 0,
+                "copy_count_source": "static_zero_copy_row_view",
+            }
+        )
         record_kda_terminal_route(
             mode="decode",
             layer_id=layer_id,
@@ -1733,7 +2037,6 @@ class CakeKDAKernel(FlashInferKDAKernel):
             fatal=False,
             reason=admission.reason,
             detail=admission.detail,
-            copy_count=0,
-            copy_count_source="static_zero_copy_row_view",
+            **copy_evidence,
         )
         return result

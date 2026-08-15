@@ -84,9 +84,52 @@ def disable_kimi_k3_symm_mem(server_args: ServerArgs) -> None:
     )
 
 
-def apply_kimi_k3_linear_attn_defaults(server_args: ServerArgs) -> None:
-    """KDA decode-fallback default for Kimi hybrid models (spec-independent)."""
+def _uses_native_kimi_linear_unbounded_kda(
+    server_args: ServerArgs, *, model_arch=None, hf_config=None
+) -> bool:
+    """Return whether every TP rank has the native H32/D128 Cake contract."""
+    if model_arch != "KimiLinearForCausalLM" or hf_config is None:
+        return False
+    linear_attn_config = getattr(hf_config, "linear_attn_config", None)
+    if not isinstance(linear_attn_config, dict):
+        return False
+    num_heads = linear_attn_config.get("num_heads")
+    head_dim = linear_attn_config.get("head_dim")
+    tp_size = getattr(server_args, "tp_size", 1)
+    return (
+        isinstance(num_heads, int)
+        and isinstance(head_dim, int)
+        and isinstance(tp_size, int)
+        and tp_size > 0
+        and num_heads % tp_size == 0
+        and num_heads // tp_size == 32
+        and head_dim == 128
+    )
+
+
+def apply_kimi_k3_linear_attn_defaults(
+    server_args: ServerArgs, *, model_arch=None, hf_config=None
+) -> None:
+    """Apply architecture-specific KDA defaults for Kimi hybrid models."""
     from sglang.srt.utils import is_sm100_supported
+
+    native_kimi_linear = _uses_native_kimi_linear_unbounded_kda(
+        server_args, model_arch=model_arch, hf_config=hf_config
+    )
+    if (
+        native_kimi_linear
+        and server_args.mamba_ssm_dtype == "bfloat16"
+        and is_sm100_supported()
+    ):
+        if server_args.linear_attn_decode_backend is None:
+            server_args.linear_attn_decode_backend = "cake"
+        if server_args.linear_attn_prefill_backend is None:
+            server_args.linear_attn_prefill_backend = "cake"
+        logger.info(
+            "Kimi-Linear H32/D128 with bf16 SSM state: defaulting KDA prefill "
+            "and decode to Cake's native unbounded-softplus route."
+        )
+        return
 
     # Preempts the generic SM100+bf16 flashinfer switch (a GDN default): on
     # KDA shapes the triton packed decode measures ~35% faster than

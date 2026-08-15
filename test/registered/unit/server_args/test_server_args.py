@@ -542,6 +542,63 @@ class TestCakeLinearAttnBackend(unittest.TestCase):
         "sglang.srt.utils.is_sm100_supported",
         return_value=True,
     )
+    def test_kimi_linear_h32_d128_defaults_prefill_and_decode_to_cake(
+        self, _mock_sm100
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="bfloat16",
+            tp_size=1,
+        )
+        hf_config = SimpleNamespace(
+            linear_attn_config={"num_heads": 32, "head_dim": 128}
+        )
+
+        apply_kimi_k3_linear_attn_defaults(
+            server_args,
+            model_arch="KimiLinearForCausalLM",
+            hf_config=hf_config,
+        )
+
+        self.assertEqual(server_args.linear_attn_decode_backend, "cake")
+        self.assertEqual(server_args.linear_attn_prefill_backend, "cake")
+
+    @patch(
+        "sglang.srt.utils.is_sm100_supported",
+        return_value=True,
+    )
+    def test_kimi_linear_only_auto_routes_exact_per_rank_h32_contract(
+        self, _mock_sm100
+    ):
+        for tp_size, num_heads, head_dim in (
+            (2, 32, 128),
+            (1, 16, 128),
+            (1, 32, 64),
+        ):
+            with self.subTest(tp_size=tp_size, num_heads=num_heads, head_dim=head_dim):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    mamba_ssm_dtype="bfloat16",
+                    tp_size=tp_size,
+                )
+                apply_kimi_k3_linear_attn_defaults(
+                    server_args,
+                    model_arch="KimiLinearForCausalLM",
+                    hf_config=SimpleNamespace(
+                        linear_attn_config={
+                            "num_heads": num_heads,
+                            "head_dim": head_dim,
+                        }
+                    ),
+                )
+
+                self.assertEqual(server_args.linear_attn_decode_backend, "triton")
+                self.assertIsNone(server_args.linear_attn_prefill_backend)
+
+    @patch(
+        "sglang.srt.utils.is_sm100_supported",
+        return_value=True,
+    )
     def test_kimi_k3_default_keeps_triton_decode_for_other_shared_backend(
         self, _mock_sm100
     ):

@@ -126,8 +126,9 @@ def _make_packed_decode_inputs(
     # Production Kimi-K3 stores beta inside a 144-column projection backing
     # allocation.  Keep the interior offset and row pitch even for B=1, where
     # reshape/view would otherwise canonicalize the pitch to the logical width.
+    beta_row_width = max(144, 128 + num_value_heads)
     beta_storage = (
-        torch.randn(batch_size, 144, device=device, dtype=dtype) * 0.5
+        torch.randn(batch_size, beta_row_width, device=device, dtype=dtype) * 0.5
     ).contiguous()
     data["beta_storage"] = beta_storage
     data["b"] = beta_storage[:, 128 : 128 + num_value_heads]
@@ -389,6 +390,95 @@ def test_kda_decode_cake_matches_triton_kimi_k3_h12(batch_size):
     selected[idx] = True
     torch.testing.assert_close(
         st_cake[~selected], st_cake_before[~selected], atol=0, rtol=0
+    )
+
+
+@pytest.mark.skipif(
+    not CAKE_ARCH_SUPPORTED,
+    reason="CAKE KDA decode requires SM100 or SM103.",
+)
+@pytest.mark.parametrize("batch_size", [1, 8, 32])
+def test_kda_decode_cake_native_unbounded_kimi_linear_h32_matches_triton(
+    batch_size, monkeypatch
+):
+    """Production packed decode must use the raw-gate Cake route with no fallback."""
+    torch.manual_seed(32000 + batch_size)
+    d = _make_packed_decode_inputs(
+        batch_size,
+        num_heads=32,
+        num_value_heads=32,
+    )
+    gate_width = 32 * K
+    gate_storage = torch.empty(
+        batch_size,
+        gate_width + 64,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    gate_storage[:, 8 : 8 + gate_width].copy_(d["a"])
+    d["a"] = gate_storage[:, 8 : 8 + gate_width]
+    assert d["a"].stride() == (gate_width + 64, 1)
+    assert d["b"].shape == (batch_size, 32)
+    assert d["b"].stride() == (160, 1)
+    assert d["ssm"].stride(0) > 32 * V * K
+
+    pool_size = d["ssm"].shape[0]
+    d["cache_indices"] = d["allocated_cache_indices"][
+        torch.randperm(pool_size - 1, device="cuda")[:batch_size]
+    ].contiguous()
+    cake, triton = CakeKDAKernel(), TritonKDAKernel()
+    recurrent_calls = []
+    run_recurrent = cake._recurrent_kda
+
+    def track_recurrent_call(**kwargs):
+        recurrent_calls.append(kwargs)
+        return run_recurrent(**kwargs)
+
+    cake._recurrent_kda = track_recurrent_call
+    monkeypatch.setattr(
+        cake,
+        "_cake_precompute_gate",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Kimi-Linear route precomputed the gate")
+        ),
+    )
+    monkeypatch.setattr(
+        cake,
+        "_packed_decode_triton",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Kimi-Linear route fell back to Triton")
+        ),
+    )
+
+    state_ref = _clone_strided_state(d["ssm"])
+    output_ref = _packed_decode(triton, d, state_ref, lower_bound=None).float()
+    state_cake = _clone_strided_state(d["ssm"])
+    state_before = _clone_strided_state(state_cake)
+    output_cake = _packed_decode(cake, d, state_cake, lower_bound=None).float()
+    torch.cuda.synchronize()
+
+    assert len(recurrent_calls) == 1
+    call = recurrent_calls[0]
+    assert call["backend"] == "cake"
+    assert call["use_gate_in_kernel"]
+    assert call["lower_bound"] is None
+    assert call["g"].data_ptr() == d["a"].data_ptr()
+    assert call["g"].stride(0) == d["a"].stride(0)
+    assert call["initial_state"].data_ptr() == state_cake.data_ptr()
+    assert call["ssm_state_indices"].data_ptr() == d["cache_indices"].data_ptr()
+    torch.testing.assert_close(output_cake, output_ref, atol=1e-2, rtol=1e-2)
+
+    active_indices = d["cache_indices"].long()
+    torch.testing.assert_close(
+        state_cake[active_indices].float(),
+        state_ref[active_indices].float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    selected = torch.zeros(pool_size, dtype=torch.bool, device="cuda")
+    selected[active_indices] = True
+    torch.testing.assert_close(
+        state_cake[~selected], state_before[~selected], atol=0, rtol=0
     )
 
 

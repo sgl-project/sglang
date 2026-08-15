@@ -5239,7 +5239,9 @@ class ServerArgs:
                 apply_kimi_k3_spec_backend_defaults,
             )
 
-            apply_kimi_k3_linear_attn_defaults(self)
+            apply_kimi_k3_linear_attn_defaults(
+                self, model_arch=model_arch, hf_config=hf_config
+            )
             apply_kimi_k3_spec_backend_defaults(self)
 
         if model_arch in [

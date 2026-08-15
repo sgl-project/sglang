@@ -73,9 +73,13 @@ def _make_inputs(seq_lens, num_heads):
         ).contiguous(),
         # Match Kimi K3's fused projection slice: raw BF16 logits with a wider
         # physical token-row pitch and unit head stride.
-        beta=torch.randn(1, total_tokens, 32, device="cuda", dtype=torch.bfloat16)[
-            :, :, 8 : 8 + num_heads
-        ],
+        beta=torch.randn(
+            1,
+            total_tokens,
+            num_heads + 16,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )[:, :, 8 : 8 + num_heads],
         A_log=(
             torch.randn(1, 1, num_heads, 1, device="cuda", dtype=torch.float32) * 0.2
         ).contiguous(),
@@ -104,18 +108,23 @@ def _extend(kernel, data, state, seq_lens, **kwargs):
     beta = data["beta"]
     if isinstance(kernel, TritonKDAKernel):
         beta = torch.sigmoid(beta)
+    lower_bound = kwargs.pop("lower_bound", LOWER_BOUND)
+    clone_inputs = kwargs.pop("clone_inputs", True)
+    q, k, v, g = (data[name] for name in ("q", "k", "v", "g"))
+    if clone_inputs:
+        q, k, v, g = (tensor.clone() for tensor in (q, k, v, g))
     return kernel.extend(
-        data["q"].clone(),
-        data["k"].clone(),
-        data["v"].clone(),
-        data["g"].clone(),
+        q,
+        k,
+        v,
+        g,
         beta,
         ssm_states=state,
         cache_indices=data["cache_indices"],
         query_start_loc=data["cu_seqlens"],
         A_log=data["A_log"],
         dt_bias=data["dt_bias"],
-        lower_bound=LOWER_BOUND,
+        lower_bound=lower_bound,
         extend_seq_lens_cpu=seq_lens,
         **kwargs,
     )
@@ -224,6 +233,56 @@ def test_kda_prefill_cake_returns_native_interior_state_tracking():
         state_cake.float(), state_ref.float(), atol=1e-2, rtol=1e-2
     )
     assert data["beta"].stride(-2) == 32
+
+
+def test_kda_prefill_cake_native_unbounded_kimi_linear_h32_with_checkpoints():
+    seq_lens = [65, 131]
+    data = _make_inputs(seq_lens, 32)
+    assert data["beta"].stride(1) == 48
+
+    interior_checkpoint_source = torch.tensor([0, 4], device="cuda", dtype=torch.int64)
+    checkpoint_cu_starts = torch.tensor([0, 2, 5], device="cuda", dtype=torch.int64)
+    state_ref = data["state"].clone()
+    output_ref = _extend(
+        TritonKDAKernel(),
+        data,
+        state_ref,
+        seq_lens,
+        lower_bound=None,
+        clone_inputs=False,
+        return_intermediate_states=True,
+    )
+    state_cake = data["state"].clone()
+    with patch.object(
+        CakeKDAKernel,
+        "_extend_triton",
+        side_effect=AssertionError("H32 unbounded prefill fell back to Triton"),
+    ):
+        output_cake = _extend(
+            CakeKDAKernel(),
+            data,
+            state_cake,
+            seq_lens,
+            lower_bound=None,
+            clone_inputs=False,
+            return_intermediate_states=True,
+            track_ssm_h_src=interior_checkpoint_source,
+            cake_query_start_loc=data["cu_seqlens"].to(torch.int64),
+            state_checkpoint_cu_starts=checkpoint_cu_starts,
+            num_state_checkpoints=5,
+            state_checkpoint_every_n_tokens=64,
+        )
+    torch.cuda.synchronize()
+
+    out_cake, intermediate_cake = output_cake
+    out_ref, intermediate_ref = output_ref
+    torch.testing.assert_close(out_cake.float(), out_ref.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        intermediate_cake.float(), intermediate_ref.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        state_cake.float(), state_ref.float(), atol=1e-2, rtol=1e-2
+    )
 
 
 def test_kda_prefill_cake_falls_back_during_cuda_graph_capture():
