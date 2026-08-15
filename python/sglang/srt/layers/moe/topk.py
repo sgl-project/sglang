@@ -2183,13 +2183,11 @@ def select_experts(
                 biased_topk_jit_kernel_impl if use_jit_fused_gate else biased_topk_impl
             )
 
-            # Gate-side shared append (SGLANG_OPT_GATE_APPEND_SHARED): the
-            # Triton gate writes the constant-weight shared slots itself,
-            # replacing the fused_append_shared_experts launch in
-            # _post_process_topk_ids.
+            # Gate-side shared append: the Triton gate writes the
+            # constant-weight shared slots itself, replacing the
+            # fused_append_shared_experts launch in _post_process_topk_ids.
             gate_appended_shared = (
-                envs.SGLANG_OPT_GATE_APPEND_SHARED.get()
-                and use_jit_fused_gate
+                use_jit_fused_gate
                 and scoring_func == "sigmoid"
                 and _use_aiter
                 and num_fused_shared_experts > 0
