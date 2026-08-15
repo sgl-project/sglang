@@ -255,65 +255,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
-                index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
-                indexer_size_per_token = (
-                    index_head_dim
-                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4
-                )
-                element_size = torch._utils._element_size(
-                    DSATokenToKVPool.index_k_with_scale_buffer_dtype
-                )
-                indexer_ratio = 1
-                if kvc.server_args.enable_hisparse:
-                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
-
-                    indexer_ratio = parse_hisparse_config(
-                        kvc.server_args
-                    ).host_to_device_ratio
-                if (
-                    kvc.server_args.enable_hisparse
-                    or kvc.is_draft_worker
-                    or kvc.server_args.enable_hierarchical_cache
-                ):
-                    num_indexer_layers = num_layers
-                else:
-                    active_indexer_layers = [
-                        layer_id
-                        for layer_id in range(
-                            kvc.layer_info.start_layer, kvc.layer_info.end_layer
-                        )
-                        if not dsa_layer_skips_topk(model_config.hf_config, layer_id)
-                    ]
-                    from sglang.srt.layers.cp.utils import (
-                        get_glm_dsa_cp_layer_shard_info,
-                        get_layer_shard_range,
-                    )
-
-                    _, shard_size = get_glm_dsa_cp_layer_shard_info(kvc)
-                    if shard_size > 1:
-                        # Every CP rank sizes identically using the largest owned
-                        # active-layer partition, plus one remote read buffer.
-                        active_set = set(active_indexer_layers)
-                        max_owned = 0
-                        for rank in range(shard_size):
-                            start, end = get_layer_shard_range(
-                                rank, shard_size, num_layers
-                            )
-                            max_owned = max(
-                                max_owned,
-                                sum(
-                                    kvc.layer_info.start_layer + i in active_set
-                                    for i in range(start, end)
-                                ),
-                            )
-                        num_indexer_layers = max_owned + 1
-                    else:
-                        num_indexer_layers = len(active_indexer_layers)
-                cell_size += int(
-                    indexer_size_per_token
-                    * num_indexer_layers
-                    * element_size
-                    * indexer_ratio
+                cell_size += self._compute_dsa_indexer_cell_size(
+                    kvc=kvc,
+                    num_layers=num_layers,
                 )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
@@ -382,6 +326,66 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 ) // scale_block_size
 
         return cell_size
+
+    def _compute_dsa_indexer_cell_size(
+        self,
+        *,
+        kvc: KVCacheConfigurator,
+        num_layers: int,
+    ) -> int:
+        index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
+        indexer_size_per_token = (
+            index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+        )
+        element_size = torch._utils._element_size(
+            DSATokenToKVPool.index_k_with_scale_buffer_dtype
+        )
+        memory_config = get_memory()
+        indexer_ratio = 1
+        if memory_config.enable_hisparse:
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            indexer_ratio = parse_hisparse_config(kvc.server_args).host_to_device_ratio
+
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            _should_elide_dsa_index_k,
+        )
+
+        if not _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker):
+            num_indexer_layers = num_layers
+        else:
+            active_indexer_layers = [
+                layer_id
+                for layer_id in range(
+                    kvc.layer_info.start_layer, kvc.layer_info.end_layer
+                )
+                if not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+            ]
+            from sglang.srt.layers.cp.utils import (
+                get_glm_dsa_cp_layer_shard_info,
+                get_layer_shard_range,
+            )
+
+            _, shard_size = get_glm_dsa_cp_layer_shard_info(kvc)
+            if shard_size > 1:
+                active_set = set(active_indexer_layers)
+                max_owned = 0
+                for rank in range(shard_size):
+                    start, end = get_layer_shard_range(rank, shard_size, num_layers)
+                    max_owned = max(
+                        max_owned,
+                        sum(
+                            kvc.layer_info.start_layer + i in active_set
+                            for i in range(start, end)
+                        ),
+                    )
+                num_indexer_layers = max_owned + 1
+            else:
+                num_indexer_layers = len(active_indexer_layers)
+
+        return int(
+            indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio
+        )
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int

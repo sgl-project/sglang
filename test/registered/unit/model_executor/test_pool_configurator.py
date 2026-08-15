@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_memory, get_parallel, get_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -622,6 +622,91 @@ class TestEagleConfigurator(unittest.TestCase):
         total_layers = num_layers + eagle_draft_num_layers
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
+
+
+class TestDSAIndexerAllocationPolicy(unittest.TestCase):
+    @patch(
+        "sglang.srt.configs.model_config.is_deepseek_dsa",
+        return_value=True,
+    )
+    @patch(
+        "sglang.srt.model_executor.pool_configurator.get_dsa_index_head_dim",
+        return_value=128,
+    )
+    @patch(
+        "sglang.srt.model_executor.pool_configurator.is_deepseek_dsa",
+        return_value=True,
+    )
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_resolved_hicache_override_prices_every_indexer_layer(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+        _mock_is_dsa,
+        _mock_index_head_dim,
+        _mock_is_dsa_src,
+    ):
+        """Post-publish HiCache overrides must keep sizing and allocation aligned."""
+        num_layers = 6
+        mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        mr.model_config.hf_config.index_topk_freq = 4
+        mr.model_config.hf_config.index_skip_topk_offset = 3
+
+        with get_memory().override(enable_hierarchical_cache=True), mock_cpu_env(
+            kv_size=1
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            cfg = DefaultPoolConfigurator(mr)
+
+        self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
+
+    @patch(
+        "sglang.srt.configs.model_config.is_deepseek_dsa",
+        return_value=True,
+    )
+    @patch(
+        "sglang.srt.model_executor.pool_configurator.get_dsa_index_head_dim",
+        return_value=128,
+    )
+    @patch(
+        "sglang.srt.model_executor.pool_configurator.is_deepseek_dsa",
+        return_value=True,
+    )
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_pd_prices_every_indexer_layer(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+        _mock_is_dsa,
+        _mock_index_head_dim,
+        _mock_is_dsa_src,
+    ):
+        """PD must retain dense index-K metadata until transports support sparsity."""
+        num_layers = 6
+        mr = _make_model_runner(
+            self,
+            num_layers=num_layers,
+            use_mla_backend=True,
+            disaggregation_mode="prefill",
+        )
+        mr.model_config.hf_config.index_topk_freq = 4
+        mr.model_config.hf_config.index_skip_topk_offset = 3
+
+        with mock_cpu_env(kv_size=1):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            cfg = DefaultPoolConfigurator(mr)
+
+        self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
 
 
 class TestFactory(unittest.TestCase):
