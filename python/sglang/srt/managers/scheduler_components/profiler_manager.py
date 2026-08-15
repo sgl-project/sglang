@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import gc
+import gzip
 import logging
 import os
+import shutil
+import tempfile
 import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -49,13 +54,67 @@ elif _is_mps:
 logger = logging.getLogger(__name__)
 
 
+# Compress the trace a few MB at a time: see _export_trace.
+_TRACE_GZIP_CHUNK = 4 << 20
+
+# Traces are hundreds of MB each while they wait to be written, so a profile that
+# is restarted faster than they can be written out has to wait for one.
+_MAX_PENDING_FLUSHES = 2
+
+
+def _export_trace(profiler: Any, path: str) -> None:
+    """Write out a chrome trace, compressing it in large chunks.
+
+    torch's own gzip export copies the json into the archive line by line, so it
+    needs the GIL once per line. A thread competing with the scheduler loop for
+    the GIL gets it rarely enough to stretch a 20 s write into 130 s; handing
+    zlib megabytes per call keeps this thread inside long C calls instead.
+    Everything else is torch's own staging block: the json goes to the system temp
+    directory and the archive is written in place.
+    """
+    if not path.endswith(".gz") or _is_mps:
+        # On MPS a Metal trace is saved alongside this one under a name derived
+        # from the path below, so it has to be the one the profile advertises.
+        profiler.export_chrome_trace(path)
+        return
+
+    # Not in the directory the traces are collected in: the json is an order of
+    # magnitude larger than the archive, so that volume does not have to hold both.
+    # The name is torch's rather than the trace's, because a profile id is free to
+    # be long enough, or multi-byte enough, to push a derived name past the limit a
+    # filesystem puts on one.
+    with tempfile.NamedTemporaryFile("w+b", suffix=".json") as handle:
+        profiler.export_chrome_trace(handle.name)
+        with open(handle.name, "rb") as fin, gzip.open(path, "wb") as fout:
+            shutil.copyfileobj(fin, fout, _TRACE_GZIP_CHUNK)
+
+
+@dataclass
+class _PendingTraceFlush:
+    """A trace being written out by the flush thread, drained by check_pending_flush.
+
+    output_dir is captured instead of read back from the manager, because a new
+    profiling session may already be configured by the time the write finishes.
+    """
+
+    export: Future
+    output_dir: Path
+    # Set for an explicit /stop_profile, which is answered once the trace is on disk.
+    reply_to: Optional[ProfileReq]
+
+
 @dataclass(kw_only=True)
 class SchedulerProfilerManager:
     ps: Any
     dp_tp_cpu_group: Any
     get_forward_ct: Callable[[], int]
+    # called as send_response(output=..., recv_req=...) to answer a deferred request
+    send_response: Callable[[Any, Any], None]
 
     def __post_init__(self) -> None:
+        self._flush_executor: Optional[ThreadPoolExecutor] = None
+        self._pending_flushes: deque[_PendingTraceFlush] = deque()
+
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
                 ps=self.ps,
@@ -311,7 +370,7 @@ class SchedulerProfilerManager:
             return merge_message
 
     def _stop_profile(
-        self, stage: Optional[ForwardMode] = None
+        self, stage: Optional[ForwardMode] = None, reply_to: Optional[ProfileReq] = None
     ) -> ProfileReqOutput | None:
         if envs.SGLANG_PROFILE_V2.get():
             self._apply_detailed_annotations(False)
@@ -332,6 +391,7 @@ class SchedulerProfilerManager:
 
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
+        pending = None
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
             if not _is_npu:
@@ -352,10 +412,18 @@ class SchedulerProfilerManager:
                     + stage_suffix
                     + ".trace.json.gz"
                 )
+                path = os.path.join(self.torch_profiler_output_dir, filename)
 
-                self.torch_profiler.export_chrome_trace(
-                    os.path.join(self.torch_profiler_output_dir, filename)
-                )
+                if self.merge_profiles:
+                    # The merge below reads every trace whose name starts with this
+                    # profile id, so a trace this rank recorded earlier under the
+                    # same id has to be written first -- it publishes to the very
+                    # name the export below does. Then stay synchronous, because the
+                    # merge also reads the traces of the other ranks.
+                    self._drain_flushes(block=True)
+                    _export_trace(self.torch_profiler, path)
+                else:
+                    pending = self._flush_trace_async(path, reply_to)
             torch.distributed.barrier(self.dp_tp_cpu_group)
 
         if self.rpd_profiler is not None:
@@ -387,6 +455,15 @@ class SchedulerProfilerManager:
             if self.ps.gpu_id == get_device().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStop()
 
+        # The session itself ended when stop() returned, so profiling can be started
+        # again even while the trace of this one is still being written out.
+        self.profile_in_progress = False
+        self.profiler_start_forward_ct = None
+        self._apply_detailed_annotations(False)
+
+        if pending is not None:
+            return None  # answered by check_pending_flush() once the trace is written
+
         merge_message = self._merge_profile_traces()
 
         logger.info(
@@ -399,11 +476,110 @@ class SchedulerProfilerManager:
             self.torch_profiler = None
             gc.collect()
 
-        self.profile_in_progress = False
-        self.profiler_start_forward_ct = None
-
-        self._apply_detailed_annotations(False)
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
+
+    def _flush_trace_async(
+        self, path: str, reply_to: Optional[ProfileReq]
+    ) -> Optional[_PendingTraceFlush]:
+        """Hand the recorded trace to the flush thread and stop tracking it here.
+
+        Writing it out takes seconds per profiled second, which the scheduler thread
+        cannot afford to spend: requests in flight stall for the whole write, and a
+        health check that lands in the window fails, so the router drops the rank.
+
+        Returns None if the trace had to be written here after all, in which case
+        the caller answers its request itself.
+        """
+        if self._flush_executor is None:
+            # A single worker, so traces are written in the order they were recorded.
+            # Its thread is non-daemon, so interpreter exit joins it rather than
+            # truncating a trace that is still being written.
+            self._flush_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="sglang-trace-flush"
+            )
+
+        while len(self._pending_flushes) >= _MAX_PENDING_FLUSHES:
+            # Wait for the oldest rather than let recorded traces pile up: a stop
+            # that has to wait is what this code used to do for every stop.
+            self._drain_flushes(block=True, limit=1)
+
+        # The profiler object goes with it: this session is over, and the next one
+        # may well start before the write finishes.
+        holder = [self.torch_profiler]
+
+        def _export() -> None:
+            try:
+                _export_trace(holder[0], path)
+            finally:
+                # Free the trace here as well - it is hundreds of MB for a
+                # multi-second window, and reclaiming it is not cheap either. Also
+                # on the way out of a failed export, which would otherwise leave it
+                # for whenever a collection happens to come around.
+                holder[0] = None
+                gc.collect()
+
+        try:
+            export = self._flush_executor.submit(_export)
+        except RuntimeError:
+            # The flush thread is gone, which happens once shutdown has drained it.
+            # Write the trace here instead of dropping it, and leave torch_profiler
+            # in place for the caller to clean up as it did before.
+            _export()
+            return None
+
+        self.torch_profiler = None
+        pending = _PendingTraceFlush(
+            export=export,
+            output_dir=self.torch_profiler_output_dir,
+            reply_to=reply_to,
+        )
+        self._pending_flushes.append(pending)
+        return pending
+
+    def check_pending_flush(self) -> None:
+        """Drain trace writes that have finished. Called from the scheduler loop."""
+        self._drain_flushes()
+
+    def drain_pending_flushes(self) -> None:
+        """Finish traces that are still being written. Called on graceful shutdown.
+
+        The flush thread is not a daemon, so the process waits for the write during
+        interpreter teardown either way; waiting for it here means the /stop_profile
+        that asked for the trace still gets its answer.
+        """
+        self._drain_flushes(block=True)
+        if self._flush_executor is not None:
+            # Kept in place rather than cleared, so a stop that somehow arrives
+            # after this writes its trace inline instead of starting a thread that
+            # nothing would drain.
+            self._flush_executor.shutdown(wait=True)
+
+    def _drain_flushes(self, block: bool = False, limit: Optional[int] = None) -> None:
+        drained = 0
+        while self._pending_flushes and (limit is None or drained < limit):
+            if not block and not self._pending_flushes[0].export.done():
+                return
+            pending = self._pending_flushes.popleft()
+            error = pending.export.exception()
+            drained += 1
+            if error is None:
+                logger.info(
+                    "Profiling done. Traces are saved to: %s", pending.output_dir
+                )
+            else:
+                logger.error("Failed to export trace: %s", error, exc_info=error)
+            if pending.reply_to is not None:
+                self.send_response(
+                    output=ProfileReqOutput(
+                        success=error is None,
+                        message=(
+                            "Succeeded."
+                            if error is None
+                            else f"Failed to export trace: {error}"
+                        ),
+                    ),
+                    recv_req=pending.reply_to,
+                )
 
     def _profile_batch_predicate(self, batch: ScheduleBatch):
         if envs.SGLANG_PROFILE_V2.get():
@@ -478,4 +654,4 @@ class SchedulerProfilerManager:
                 )
                 return self._start_profile()
         else:
-            return self._stop_profile()
+            return self._stop_profile(reply_to=recv_req)
