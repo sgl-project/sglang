@@ -93,6 +93,7 @@ from sglang.srt.model_executor.runner_utils.capture_mode import (
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
+from sglang.srt.model_executor.runner_utils.war_event import make_external_event
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
@@ -208,7 +209,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         speculative_num_draft_tokens: Optional[int] = None,
     ):
         super().__init__(model_runner)
-        self.in_graph_metadata_prep_done = False
 
         # --- core state ------------------------------------------------
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
@@ -428,12 +428,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _record_in_graph_metadata_prep_done(self):
         # This is only a hook right after the in-graph metadata prep.
         # When the shared buffers are read done is decided by attn backend.
-        if (
-            self.model_runner.in_graph_metadata_prep_done is not None
-            and torch.cuda.is_current_stream_capturing()
-        ):
-            self.model_runner.in_graph_metadata_prep_done.record()
-            self.in_graph_metadata_prep_done = True
+        if not torch.cuda.is_current_stream_capturing():
+            # Warmup runs share this body; only a capturing run plants a node.
+            return
+        if self.model_runner.in_graph_metadata_prep_done is None:
+            self.model_runner.in_graph_metadata_prep_done = make_external_event(
+                self.device_module
+            )
+        event = self.model_runner.in_graph_metadata_prep_done
+        if event is not None:
+            # None here means no external-event support; stays None so the
+            # boundary resolution below never hands out an unrecorded event.
+            event.record()
 
     def _war_read_done_record(self, attn_backend, forward_mode) -> SharedReadBoundary:
         """Where this replay records its WAR read-done event; UNKNOWN records
@@ -444,9 +450,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         elif not forward_mode.is_decode():
             return SharedReadBoundary.UNKNOWN
         boundary = attn_backend.shared_read_boundary(forward_mode)
+
         if (
             boundary is SharedReadBoundary.IN_REPLAY
-            and not self.in_graph_metadata_prep_done
+            and not self.model_runner.in_graph_metadata_prep_done is not None
         ):
             # Non-capturing runs / no external-event support.
             return SharedReadBoundary.PRE_REPLAY
