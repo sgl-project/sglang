@@ -217,6 +217,19 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         tree_verify.assert_called_once()
         flashinfer_kernel.target_verify.assert_not_called()
 
+    def test_helion_backend_reports_kda_only(self):
+        cases = (
+            (LinearAttnKernelBackend.HELION, LinearAttnKernelBackend.TRITON),
+            (LinearAttnKernelBackend.TRITON, LinearAttnKernelBackend.HELION),
+        )
+        for decode_backend, prefill_backend in cases:
+            with self.subTest(
+                decode_backend=decode_backend,
+                prefill_backend=prefill_backend,
+            ):
+                with self.assertRaisesRegex(ValueError, "supports KDA only"):
+                    GDNKernelDispatcher(decode_backend, prefill_backend)
+
 
 if __name__ == "__main__":
     unittest.main()

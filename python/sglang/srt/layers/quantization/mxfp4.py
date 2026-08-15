@@ -1434,6 +1434,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self._fi_kernel == "cutlass_sm120":
             return self._apply_sm120_cutlass(layer, dispatch_output)
         if self.use_flashinfer:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                trtllm_moe_enable_pdl,
+            )
+
             # When bf16 mode is enabled, we don't need to quantize the input,
             # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
             # which can theoretically improve performance
@@ -1591,6 +1595,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
                         output=symm_output,
                         do_finalize=not defer_finalize,
+                        enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
                     )
                     if defer_finalize:
                         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -1650,6 +1655,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     local_num_experts=layer.num_local_experts,
                     tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
                     output=symm_output,
+                    enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
                 )
                 return StandardCombineInput(hidden_states=symm_output)
 
@@ -1682,6 +1688,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 True,  # do finalize
                 tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
                 output=symm_output,
+                enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
             )[0]
             return StandardCombineInput(hidden_states=trtllm_gen_output)
         if _use_aiter:

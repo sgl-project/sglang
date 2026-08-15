@@ -167,7 +167,7 @@ QUANTIZATION_CHOICES = [
     "mxfp_w4a8",  # for NPU W4A8 (MXFP4 weights + MXFP8 activations)
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
-    "quark_mxfp4",  # Online MOE + linear quantization.
+    "quark_mxfp4",  # Online MOE + linear quantization (incl. NVFP4 -> MXFP4 requantization).
     # Apple Silicon MLX backend — on-the-fly quantization of fp16 weights at load
     # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
     "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
@@ -377,6 +377,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "flashkda",
     "nvidia_kda",
     "ptx_kda",
+    "helion",
 ]
 
 
@@ -2030,7 +2031,7 @@ class ServerArgs:
     ] = False
 
     # -------------------------------------------------------------------------
-    # Torch compile and torchao
+    # Torch compile
     # -------------------------------------------------------------------------
     enable_torch_compile: A[
         bool,
@@ -2043,12 +2044,6 @@ class ServerArgs:
     torch_compile_max_bs: A[
         int, "Set the maximum batch size when using torch compile.", NS("exec.graph")
     ] = 32
-    torchao_config: A[
-        str,
-        "Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
-        NS("exec.graph"),
-    ] = ""
-
     # -------------------------------------------------------------------------
     # Speculative decoding
     # -------------------------------------------------------------------------
@@ -2582,7 +2577,7 @@ class ServerArgs:
     linear_attn_backend: A[
         str,
         Arg(
-            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend.",
+            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend. The Helion backend is KDA-only.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
         NS("exec.mamba"),
@@ -2617,11 +2612,10 @@ class ServerArgs:
         bool,
         "Enable the ReplaySSM buffered output-only linear-attn decode kernel. "
         "Primarily a GDN (scalar-gate) decode-bandwidth optimization (~1.2-1.5x "
-        "at batch >= 64). The unified kernel also supports KDA (per-K gate) and "
-        "is numerically correct, but KDA decode is SLOWER than the packed "
-        "baseline (the per-K g_cache is K x larger and the reconstruction "
-        "refolds the per-K decay every step), so it is not recommended for KDA "
-        "models. Requires the Triton linear-attn decode backend and "
+        "at batch >= 64). KDA uses its selected Triton or Helion implementation, "
+        "but its per-K gate ring is larger and ReplaySSM is typically slower "
+        "than packed KDA decode; benchmark before enabling it. Requires the "
+        "Triton linear-attn decode backend, or Helion for KDA, and "
         "--mamba-radix-cache-strategy no_buffer (the default).",
         NS("exec.mamba"),
     ] = False
@@ -5453,6 +5447,8 @@ class ServerArgs:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                if not envs.SGLANG_OPT_FUSE_MHC_POST_PRE.is_set():
+                    envs.SGLANG_OPT_FUSE_MHC_POST_PRE.set(True)
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
                 # Prefer TileLang over the Torch fallback.
@@ -6180,6 +6176,7 @@ class ServerArgs:
         # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
         if (
             self.linear_attn_decode_backend is None
+            and self.linear_attn_backend != "helion"
             and is_sm100_supported()
             and self.mamba_ssm_dtype == "bfloat16"
             # Stage 4: flashinfer's recurrent_kda compiles the state slot stride
@@ -6258,8 +6255,8 @@ class ServerArgs:
                 f"got CUDA {cuda_version or 'unknown'}"
             )
 
-        # GDN ReplaySSM buffered decode guards. Runs on the Triton GDN decode
-        # backend. cuda-graph is supported (slice 1b: CUDA-graph-safe static
+        # ReplaySSM buffered decode guards. Runs on Triton, or Helion for KDA.
+        # cuda-graph is supported (slice 1b: CUDA-graph-safe static
         # write-cursor buffers). The RADIX prefix cache is now supported (slice
         # 2b: the decode kernel force-flushes the ring into temporal[slot] on
         # the radix track boundary `seq_lens % mamba_track_interval == 0`, and
@@ -6273,10 +6270,10 @@ class ServerArgs:
         # cursor of the donated/kept slot would not be reset there. Handling
         # that donation path is a follow-up; for now require no_buffer.
         if self.enable_linear_replayssm:
-            if decode != "triton":
+            if decode not in {"triton", "helion"}:
                 raise ValueError(
-                    "--enable-linear-replayssm requires the Triton "
-                    "linear-attn decode backend, got "
+                    "--enable-linear-replayssm requires Triton, or Helion for "
+                    "KDA, as the linear-attn decode backend; got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
             from sglang.srt.arg_groups.overrides import (
@@ -8294,21 +8291,20 @@ class ServerArgs:
         # The Mamba/KDA state is stored in envelope-strided views; only
         # stride-audited kernels may read it (Stage 4 audit, per slot):
         # - decode: triton; flashinfer (recurrent_kda compiles the state slot
-        #   stride as a free int64 — natively strided); cutedsl (KDA fused
-        #   sigmoid-gating update made stride-safe) on KDA-hybrid models only —
-        #   cutedsl_gdn still compiles h0 against a contiguous dummy.
-        # - prefill: triton; flashkda (wrapper gathers/scatters a contiguous
-        #   per-slot copy, external kernel never sees the pool); cutedsl
-        #   (kernel_h compiles h0/ht with dynamic int64 strides), same
-        #   KDA-only caveat.
+        #   stride as a free int64); helion (specializes KDA state strides 0-3
+        #   and rejects a non-unit innermost stride); cutedsl (KDA fused sigmoid-
+        #   gating update is stride-safe) on KDA-hybrid models only.
+        # - prefill: triton; flashkda (the wrapper gathers/scatters a contiguous
+        #   per-slot copy); helion; cutedsl (kernel_h compiles h0/ht with dynamic
+        #   int64 strides), with the same KDA-only caveat.
         # - mamba (mamba2/short-conv state): triton only.
         # use_mla_backend() distinguishes the KDA-hybrid family (K3/KimiLinear
-        # are MLA-hybrid) from GDN models (GQA-hybrid) for the cutedsl caveat.
+        # are MLA-hybrid) from GDN models (GQA-hybrid) for the KDA-only caveat.
         decode_allowed = {"triton", "flashinfer"}
         prefill_allowed = {"triton", "flashkda"}
         if self.use_mla_backend():
-            decode_allowed.add("cutedsl")
-            prefill_allowed.add("cutedsl")
+            decode_allowed.update({"cutedsl", "helion"})
+            prefill_allowed.update({"cutedsl", "helion"})
         resolved_linear_decode = (
             self.linear_attn_decode_backend or self.linear_attn_backend
         )
@@ -9608,7 +9604,7 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
 # (sglang.srt.runtime_context). The two functions below are LEGACY shims kept
 # for the existing call-sites; they publish/read the same live object by
 # reference. Do not add new call-sites — the counts are ratcheted
-# (decrease-only) by scripts/lint/check_legacy_global_ratchet.py.
+# (decrease-only) by test/registered/unit/test_legacy_global_ratchet.py.
 # Imports are in-function so the two modules stay cycle-free at import time.
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
     """Legacy publish shim (role=scheduler) — prefer
