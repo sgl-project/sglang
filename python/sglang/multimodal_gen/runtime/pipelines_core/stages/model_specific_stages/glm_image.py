@@ -428,11 +428,12 @@ class GlmImageAR(PipelineStage):
         else:
             if image is not None:
                 source_grids = image_grid_thw[:-1]
-                prior_token_image_embed = pooled_image_features_to_tensor(
-                    self.vision_language_encoder.get_image_features(
-                        inputs["pixel_values"], source_grids
+                with set_forward_context(current_timestep=0, attn_metadata=None):
+                    prior_token_image_embed = pooled_image_features_to_tensor(
+                        self.vision_language_encoder.get_image_features(
+                            inputs["pixel_values"], source_grids
+                        )
                     )
-                )
                 prior_token_image_ids_d32 = (
                     self.vision_language_encoder.get_image_tokens(
                         prior_token_image_embed, source_grids
@@ -452,11 +453,12 @@ class GlmImageAR(PipelineStage):
                             int(source_w),
                         ).squeeze(0)
                     )
-            outputs = self.vision_language_encoder.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-            )
+            with set_forward_context(current_timestep=0, attn_metadata=None):
+                outputs = self.vision_language_encoder.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                )
             input_len = inputs["input_ids"].shape[-1]
             generated_ids = outputs[0][input_len:]
             usage = None

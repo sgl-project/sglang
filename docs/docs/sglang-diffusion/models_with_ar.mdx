@@ -1,11 +1,12 @@
 ---
 title: "Diffusion models with AR stage like GLM-Image"
-description: "Run diffusion pipelines that delegate an AR stage to a separate SGLang server, such as GLM-Image."
+description: "Run diffusion pipelines with a native in-process or external SGLang AR stage, such as GLM-Image."
 ---
 
 ## Quick Start
 
-Run model with transformers implementation for AR stage (default)
+Run the model with the in-process native AR stage (default):
+
 ```bash
 # Terminal 1 : launch server
 sglang serve --model-path zai-org/GLM-Image --port ${PORT}
@@ -20,7 +21,7 @@ curl http://${HOST}:${PORT}/v1/images/generations \
     "size": "widthxheight"
   }'
 ```
-Run model with SGLang srt implementation for AR stage (high performance)
+Run the model with a separate SGLang SRT server for the AR stage (high performance):
 ```bash
 # Terminal 1 : launch server with AR model
 sglang serve --model-path /path/to/zai-org/GLM-Image/vision_language_encoder/ \
@@ -54,8 +55,8 @@ curl http://${HOST}:${PORT}/v1/images/generations \
   <thead>
     <tr style={{borderBottom: "2px solid #d55816"}}>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Transformers backend</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang backend</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Native in-process AR</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang SRT server</th>
     </tr>
   </thead>
   <tbody>
@@ -67,10 +68,22 @@ curl http://${HOST}:${PORT}/v1/images/generations \
 </tbody>
 </table>
 
+For a memory-constrained in-process deployment, stream the native AR decoder and
+vision blocks from CPU:
+
+```bash
+sglang serve --model-path zai-org/GLM-Image \
+  --layerwise-offload-components vision_language_encoder \
+  --port ${PORT}
+```
+
+Layerwise offload lowers GPU memory usage at the cost of AR latency. It does not
+apply when `--srt-encoder-url` selects an external server.
+
 ## Deployment Assumptions & Limitations
 
 :::warning
-**Network Latency & Timeouts:** In SGLang backend mode, the Diffusion server sends an HTTP request to `--srt-encoder-url` for **every auto-regressive (AR) step**.
+**Network Latency & Timeouts:** In external SRT mode, the diffusion server sends the complete AR generation to `--srt-encoder-url` in one HTTP request.
 - To prevent requests from breaking during long model generations, increase `--srt-encoder-timeout` (e.g., set to 100 seconds).
 - To protect the system against temporary network delays or brief drops in connection, use `--srt-encoder-connection-timeout`.
 :::

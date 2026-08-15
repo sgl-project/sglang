@@ -6,6 +6,9 @@ import requests
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
+from sglang.multimodal_gen.runtime.models.encoders.glm_image import (
+    GlmImageForConditionalGeneration,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import get_hf_config
 
@@ -51,8 +54,6 @@ class VisionLanguageEncoderLoader(ComponentLoader):
                     raise RuntimeError(error_msg) from e
                 return server_args.srt_encoder_url
 
-            from transformers import GlmImageForConditionalGeneration
-
             config = get_hf_config(
                 component_model_path,
                 trust_remote_code=server_args.trust_remote_code,
@@ -61,12 +62,16 @@ class VisionLanguageEncoderLoader(ComponentLoader):
             target_device = self.target_device(
                 server_args.should_cpu_offload_component("vision_language_encoder")
             )
-            model = GlmImageForConditionalGeneration.from_pretrained(
-                component_model_path,
-                config=config,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-            ).to(target_device)
+            model = (
+                GlmImageForConditionalGeneration.from_pretrained(
+                    component_model_path,
+                    config=config,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                )
+                .to(target_device)
+                .eval()
+            )
             return model
         else:
             raise ValueError(
