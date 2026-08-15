@@ -456,7 +456,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     self,
                     run_once,
                     post_warmup_hook=post_warmup_hook,
-                    skip_logits=False,
+                    run_lm_head=True,
                 )
                 self.backend.capture_one(
                     shape_key,
@@ -590,7 +590,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
         # Snapshot built -- the forward is done reading the shared pool. Publish
-        # a read-done event the scheduler's WAR barrier waits on.
+        # a read-done event the scheduler's WAR barrier waits on (draft extend
+        # is the EAGLE-family war-publish phase; last write wins the mailbox).
         read_done = self.device_module.Event()
         read_done.record()
         self.model_runner.war_fastpath_read_done_event = read_done

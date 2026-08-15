@@ -186,18 +186,14 @@ class MiMoAudioPipeline:
                     dl_start = time.perf_counter()
                     timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
                     try:
-                        with common.get_mm_http_session().get(
-                            audio, stream=True, timeout=timeout
-                        ) as response:
-                            response.raise_for_status()
-                            dl_elapsed_ms = (time.perf_counter() - dl_start) * 1000
-                            if dl_elapsed_ms > 1000.0:
-                                content_len = len(response.content)
-                                logger.warning(
-                                    f"Slow audio download: {dl_elapsed_ms:.2f}ms, "
-                                    f"size={content_len / 1024:.1f}KB, url={audio}"
-                                )
-                            file = io.BytesIO(response.content)
+                        content = common.download_remote_media(audio, timeout=timeout)
+                        dl_elapsed_ms = (time.perf_counter() - dl_start) * 1000
+                        if dl_elapsed_ms > 1000.0:
+                            logger.warning(
+                                f"Slow audio download: {dl_elapsed_ms:.2f}ms, "
+                                f"size={len(content) / 1024:.1f}KB, url={audio}"
+                            )
+                        file = io.BytesIO(content)
                     except Exception as e:
                         dl_elapsed_ms = (time.perf_counter() - dl_start) * 1000
                         logger.error(

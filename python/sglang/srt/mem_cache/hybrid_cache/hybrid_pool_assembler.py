@@ -34,7 +34,6 @@ if TYPE_CHECKING:
     import torch
 
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
     from sglang.srt.server_args import ServerArgs
@@ -931,9 +930,15 @@ def build_full_draft_pools(
     server_args: ServerArgs,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build draft KV/DSA sidecars whose indices follow target full KV."""
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import (
+        DSATokenToKVPool,
+        HybridLinearKVPool,
+    )
 
     pool = draft_kv_pool
+    if isinstance(pool, HybridLinearKVPool):
+        # Hybrid draft runners keep their sole attention layer in this sub-pool.
+        pool = pool.full_kv_pool
     if pool.layer_num == 0:
         return [], []
 
@@ -1882,59 +1887,4 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
         )
     except Exception:
         logger.exception("attach_hybrid_dsa_pool_to_hiradix_cache failed")
-        raise
-
-
-def attach_hybrid_pool_to_mamba_cache(
-    mamba_cache: HiMambaRadixCache,
-    params: CacheInitParams,
-    server_args: ServerArgs,
-    *,
-    extra_config: dict,
-    prefetch_threshold: int,
-    load_cache_event,
-    enable_storage_metrics: bool = False,
-) -> None:
-    """Attach HostPoolGroup (KV + Mamba) + HybridCacheController for HiMambaRadixCache.
-
-    This entrypoint is currently intended only for HiMambaRadixCache.
-    """
-    try:
-        hybrid_kv = mamba_cache.hybrid_kv_cache
-        kvcache = mamba_cache.kvcache
-        full_layer_mapping = dict(hybrid_kv.full_attention_layer_id_mapping)
-        mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
-        host_pool_group, cache_controller = build_hybrid_mamba_stack(
-            params=params,
-            server_args=server_args,
-            kv_pool=kvcache,
-            mamba_pool=params.req_to_token_pool.mamba_pool,
-            full_layer_mapping=full_layer_mapping,
-            mamba_layer_mapping=mamba_layer_mapping,
-            load_cache_event=load_cache_event,
-            storage_backend=server_args.hicache_storage_backend,
-            use_mla=hybrid_kv.use_mla,
-            host_mamba_evict_fn=mamba_cache.evict_mamba_host,
-            device_mamba_evict_fn=mamba_cache.evict_mamba,
-            prefetch_threshold=prefetch_threshold,
-            model_name=server_args.served_model_name,
-            storage_backend_extra_config=extra_config,
-            enable_storage_metrics=enable_storage_metrics,
-        )
-        mamba_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
-        mamba_cache.mamba_pool_host = host_pool_group.get_pool(PoolName.MAMBA)
-        mamba_cache.transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
-        mamba_cache.host_pool_group = host_pool_group
-        mamba_cache.cache_controller = cache_controller
-        params.req_to_token_pool.register_layer_transfer_counter(
-            cache_controller.layer_done_counter
-        )
-        hybrid_kv.register_layer_transfer_counter(cache_controller.layer_done_counter)
-        logger.info(
-            "Attached hybrid Mamba pool stack to HiMambaRadixCache: pools=KV + MAMBA, "
-            "transfer_layer_num=%s",
-            mamba_cache.transfer_layer_num,
-        )
-    except Exception:
-        logger.exception("attach_hybrid_pool_to_mamba_cache failed")
         raise

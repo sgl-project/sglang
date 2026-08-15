@@ -136,7 +136,9 @@ cleanup_stale_shm() {
 install_apt_packages() {
     CI_APT_PACKAGES=(
         python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
+        build-essential cmake rdma-core infiniband-diags perftest libibumad3
         libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
+        libfabric-dev libnl-3-200 libnl-route-3-200 librdmacm1
         ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
     )
 
@@ -164,21 +166,73 @@ install_apt_packages() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-clean_site_packages() {
-    # Clear torch compilation cache from every location it can be in; sglang
-    # is not installed yet, so it cannot be asked which one is in use.
-    python3 -c '
-import getpass, os, shutil, tempfile
+install_gdrcopy() {
+    # DeepEP tests only run on 4+ GPU hosts. Keep GDRCopy in the shared CUDA
+    # bootstrap while avoiding a DKMS/package build on the 1- and 2-GPU jobs.
+    local gpu_count=0
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        gpu_count=$(
+            (nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true) |
+                awk 'NF {count++} END {print count + 0}'
+        )
+    fi
+    if [ "${gpu_count}" -lt 4 ]; then
+        echo "Skipping GDRCopy install on ${gpu_count}-GPU runner"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
 
-sglang_cache_dir = os.environ.get("SGLANG_CACHE_DIR") or "~/.cache/sglang"
-for cache_dir in (
-    os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
-    os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()),
-    os.path.join(os.path.expanduser(sglang_cache_dir), "inductor"),
-):
-    if cache_dir:
-        shutil.rmtree(cache_dir, ignore_errors=True)
-'
+    if ldconfig -p 2>/dev/null | grep 'libgdrapi\.so' >/dev/null; then
+        echo "GDRCopy userspace library is already installed"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    local gdrcopy_root=/opt/gdrcopy
+    local gdrcopy_version=2.5.1
+    local -a gdrcopy_packages=(
+        nvidia-dkms-580 devscripts debhelper fakeroot dkms
+        check libsubunit0 libsubunit-dev python3-venv
+    )
+
+    apt-get update || true
+    apt-get install -y --no-install-recommends "${gdrcopy_packages[@]}" || {
+        echo "Warning: apt-get failed while installing GDRCopy build dependencies; checking installed packages"
+        local package
+        for package in "${gdrcopy_packages[@]}"; do
+            if ! dpkg -l "${package}" 2>/dev/null | grep -q '^ii'; then
+                echo "ERROR: Required GDRCopy package ${package} is unavailable"
+                exit 1
+            fi
+        done
+    }
+
+    rm -rf "${gdrcopy_root}"
+    git clone --branch "v${gdrcopy_version}" --depth 1 \
+        https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}"
+    (
+        cd "${gdrcopy_root}/packages"
+        CUDA=/usr/local/cuda ./build-deb-packages.sh
+        dpkg -i gdrdrv-dkms_*.deb
+        dpkg -i libgdrapi_*.deb
+        dpkg -i gdrcopy-tests_*.deb
+        dpkg -i gdrcopy_*.deb
+    )
+
+    local lib_path="/usr/lib/${ARCH}-linux-gnu"
+    if [ ! -e "${lib_path}/libmlx5.so" ] && [ -e "${lib_path}/libmlx5.so.1" ]; then
+        ln -s "${lib_path}/libmlx5.so.1" "${lib_path}/libmlx5.so"
+    fi
+    ldconfig
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+clean_site_packages() {
+    # The torch compilation cache is deliberately NOT wiped here: entries are
+    # content-hash addressed so stale ones are never reused, and hosts packing
+    # several runners share one cache mount - a wipe unlinks files a concurrent
+    # job is compiling against.
 
     # Remove broken dist-info directories (missing METADATA per PEP 376)
     SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
@@ -259,6 +313,11 @@ setup_pip_toolchain() {
     PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
     PIP_UNINSTALL_CMD="uv pip uninstall"
     PIP_UNINSTALL_SUFFIX=""
+
+    # Remove both the legacy source distribution and the SGLang wheel before
+    # resolving the pyproject pin. They own the same deep_ep module files, so
+    # leaving either installed can make pip preserve a mixed installation.
+    $PIP_UNINSTALL_CMD deep-ep sgl-deep-ep $PIP_UNINSTALL_SUFFIX || true
 
     # sglang-kernel stays: install_sglang_kernel version-gates and reinstalls it.
     $PIP_UNINSTALL_CMD sgl-kernel sglang sgl-fa4 flash-attn-4 $PIP_UNINSTALL_SUFFIX || true
@@ -354,7 +413,7 @@ uninstall_stale_flashinfer() {
 
 install_pytorch_stack() {
     PYTORCH_SPECS=()
-    for package in torch torchaudio torchvision torchao torchcodec; do
+    for package in torch torchaudio torchvision torchcodec; do
         spec=$(grep -Po -m1 "\"${package}([<>=!~ ;][^\"]*)?\"" python/pyproject.toml | tr -d '"' || true)
         if [ -n "$spec" ]; then
             PYTORCH_SPECS+=("$spec")
@@ -364,6 +423,30 @@ install_pytorch_stack() {
     $PIP_CMD install \
         "${PYTORCH_SPECS[@]}" \
         --index-url "https://download.pytorch.org/whl/${CU_VERSION}"
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+install_cuda12_deepep_wheel() {
+    if [ "$CU_MAJOR" = "13" ]; then
+        echo "CUDA 13 uses the public sgl-deep-ep wheel declared in python/pyproject.toml"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    local version
+    version=$(grep -Po -m1 '"sgl-deep-ep==\K[^"]+' python/pyproject.toml || true)
+    if [ -z "$version" ]; then
+        echo "ERROR: python/pyproject.toml must pin sgl-deep-ep"
+        exit 1
+    fi
+
+    # CUDA 12 wheels intentionally live only on the SGLang wheel index. Their
+    # local version satisfies the public-version pyproject pin, so the later
+    # editable SGLang install keeps this CUDA-matched wheel.
+    $PIP_CMD install "sgl-deep-ep==${version}+${CU_VERSION}" \
+        --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" \
+        --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -599,12 +682,8 @@ stabilize_flashinfer_jit_paths() {
 install_extra_deps() {
     MOONCAKE_VERSION="0.3.12.post1"
     NIXL_VERSION="1.3.0"
-    # sgl-eval is git-only and cannot be declared in python/pyproject.toml (see
-    # the note there). The nightly GSM8K eval shells out to the sgl-eval CLI and
-    # fails without it. Bumping the SHA can change zero-shot \boxed{} grading, so
-    # re-baseline MODEL_SCORE_THRESHOLDS in
-    # test/registered/eval/test_text_models_gsm8k_eval.py first.
-    SGL_EVAL_REF="b2a2703c42cae379bbcb8b7ff092df6601a61694"
+    # shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
+    source "${SCRIPT_DIR}/../utils/sgl_eval_ref.sh"
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
@@ -640,7 +719,7 @@ install_extra_deps() {
             --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
     fi
 
-    $PIP_CMD install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@${SGL_EVAL_REF}" $PIP_INSTALL_SUFFIX
+    $PIP_CMD install "$SGL_EVAL_SPEC" $PIP_INSTALL_SUFFIX
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
@@ -708,6 +787,8 @@ verify_imports() {
     SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
 import torch
 print(torch.version.cuda)
+import deep_ep
+print(f"deep_ep loads from {deep_ep.__file__}")
 import cutlass
 import cutlass.cute
 
@@ -752,6 +833,7 @@ main() {
     kill_existing_processes
     cleanup_stale_shm
     install_apt_packages
+    install_gdrcopy
     clean_site_packages
     setup_cargo_cache
     require_prebuilt_rust_exts
@@ -759,6 +841,7 @@ main() {
     remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
     install_pytorch_stack
+    install_cuda12_deepep_wheel
     install_sglang
     # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
     # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.
