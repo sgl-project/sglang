@@ -30,7 +30,14 @@ from sglang.srt.layers.utils.cp_utils import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_model,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -49,8 +56,8 @@ from sglang.kernels.ops.attention.flash_attention import (
 )
 
 
-def _should_disable_scheduler_metadata_precompute(server_args) -> bool:
-    return bool(server_args.enable_prefill_cp or server_args.enable_dp_attention)
+def _should_disable_scheduler_metadata_precompute() -> bool:
+    return bool(get_parallel().enable_prefill_cp or get_parallel().enable_dp_attention)
 
 
 @dataclass
@@ -202,7 +209,7 @@ class FlashAttentionBackend(AttentionBackend):
             and model_runner.token_to_kv_pool.swa_layer_nums > 0
         )
 
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
@@ -214,7 +221,7 @@ class FlashAttentionBackend(AttentionBackend):
                 phase="target_verify",
                 server_args=model_runner.server_args,
                 spec_algorithm=SpeculativeAlgorithm.from_string(
-                    model_runner.server_args.speculative_algorithm
+                    get_spec().speculative_algorithm
                 ),
                 is_draft_worker=True,
                 num_draft_tokens=int(self.speculative_num_draft_tokens),
@@ -283,7 +290,7 @@ class FlashAttentionBackend(AttentionBackend):
                 self._get_fa_runtime_policy = None
 
             self._get_scheduler_metadata = None
-            if model_runner.server_args.enable_deterministic_inference:
+            if get_exec().deterministic.enable_deterministic_inference:
                 # Must precede the first kernel compile.
                 from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
                     set_batch_invariant,
@@ -311,7 +318,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.has_softcap = _softcapping is not None and _softcapping > 0.0
 
         # num_splits == 0 delegates SplitKV sizing to the selected FA runtime.
-        deterministic = model_runner.server_args.enable_deterministic_inference
+        deterministic = get_exec().deterministic.enable_deterministic_inference
         if self._get_fa_runtime_policy is None:
             self.num_splits = 1 if deterministic else 0
             self.decode_num_splits = self.num_splits
@@ -339,11 +346,10 @@ class FlashAttentionBackend(AttentionBackend):
         # guard wraps both set_kv_buffer and set_mla_kv_buffer. Without this
         # gate, MLA + is_embedding would skip the write but still read stale
         # cache via get_key_buffer in the absorbed-MLA path.
-        server_args = model_runner.server_args
         self.fa_skip_kv_cache = (
-            server_args.is_embedding
-            and server_args.chunked_prefill_size == -1
-            and server_args.disable_radix_cache
+            get_model().is_embedding
+            and get_schedule().chunked_prefill_size == -1
+            and get_memory().disable_radix_cache
             and not self.use_mla
         )
 
@@ -353,7 +359,7 @@ class FlashAttentionBackend(AttentionBackend):
         # combine kernel (flash_fwd_combine_launch_template.h:52). Leaving
         # scheduler_metadata unset uses the existing per-layer metadata path.
         self._disable_scheduler_metadata_precompute = (
-            _should_disable_scheduler_metadata_precompute(server_args)
+            _should_disable_scheduler_metadata_precompute()
         )
 
     def _compute_scheduler_metadata(

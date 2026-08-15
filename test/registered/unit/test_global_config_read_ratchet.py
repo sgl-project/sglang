@@ -57,6 +57,12 @@ _CONFIGURED_SIZE_CALL_SITES = {
         "point, since with PP off the group is never touched, which is what lets "
         "the Indexer be constructed before distributed init"
     ),
+    ("srt/managers/scheduler.py", "configured_pp_size"): (
+        "dispatch_event_loop picks the PP event loop; the MLX runner stub never "
+        "initializes torch.distributed, so the live property asserts before the "
+        "MLX loop can start -- the configured leaf answers the same value "
+        "wherever the live groups exist"
+    ),
     ("srt/mem_cache/kv_cache_configurator.py", "configured_pp_size"): (
         "decides whether the token capacity needs a cross-PP all-reduce at all; "
         "asking the configured size keeps that decision independent of whether a "
@@ -84,12 +90,6 @@ _CONFIGURED_SIZE_CALL_SITES = {
     ),
 }
 
-# A dynamic read whose name is set nowhere in the tree, so the predicate it
-# feeds is inert (the ``getattr`` default decides it). Converting it would mean
-# choosing what it should have named, which is the CP path's call, not this
-# sweep's -- so it is listed here rather than silently counted or "fixed".
-_INERT_DYNAMIC_READS = frozenset({("srt/layers/cp/base.py", "_is_dsa_model_arch")})
-
 _DIRECT_BASELINE = 0
 _ALIAS_BASELINE = 0
 
@@ -105,17 +105,9 @@ def _is_global_call(node) -> bool:
     return isinstance(func, ast.Attribute) and func.attr == "get_server_args"
 
 
-def _collect(rel: str, tree: ast.AST, inert: frozenset = frozenset()):
-    """The (direct, alias) field reads in one module.
-
-    ``inert`` names the fields listed in ``_INERT_DYNAMIC_READS`` for this file;
-    they are dropped here, at the point the read is recognized, so the filter
-    matches on the field name rather than on the rendered message.
-    """
+def _collect(rel: str, tree: ast.AST):
+    """The (direct, alias) field reads in one module."""
     direct, alias = [], []
-
-    def counted(attr: str) -> bool:
-        return attr not in inert
 
     def _getattr_name(node):
         """``getattr(<record>, "field")`` names a field just as ``.field`` does;
@@ -132,20 +124,15 @@ def _collect(rel: str, tree: ast.AST, inert: frozenset = frozenset()):
         return node.args[1].value
 
     for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Attribute)
-            and _is_global_call(node.value)
-            and counted(node.attr)
-        ):
+        if isinstance(node, ast.Attribute) and _is_global_call(node.value):
             direct.append(f"{rel}:{node.lineno}: get_server_args().{node.attr}")
 
         name = _getattr_name(node)
-        if name is not None and _is_global_call(node.args[0]) and counted(name):
+        if name is not None and _is_global_call(node.args[0]):
             direct.append(f"{rel}:{node.lineno}: getattr(get_server_args(), {name!r})")
 
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        params = {a.arg for a in list(node.args.args) + list(node.args.kwonlyargs)}
         bound = {}
         for inner in ast.walk(node):
             # ``sa = get_server_args()`` and its annotated form
@@ -193,7 +180,6 @@ def _collect(rel: str, tree: ast.AST, inert: frozenset = frozenset()):
                 and isinstance(inner.value, ast.Name)
                 and inner.value.id in bound
                 and inner.lineno >= bound[inner.value.id]
-                and counted(inner.attr)
             ):
                 alias.append(
                     f"{rel}:{inner.lineno}: {inner.value.id}.{inner.attr} "
@@ -205,7 +191,6 @@ def _collect(rel: str, tree: ast.AST, inert: frozenset = frozenset()):
                 and isinstance(inner.args[0], ast.Name)
                 and inner.args[0].id in bound
                 and inner.lineno >= bound[inner.args[0].id]
-                and counted(name)
             ):
                 alias.append(
                     f"{rel}:{inner.lineno}: getattr({inner.args[0].id}, {name!r}) "
@@ -301,7 +286,7 @@ def _collect(rel: str, tree: ast.AST, inert: frozenset = frozenset()):
                 ):
                     base, attr = node.args[0].id, attr_name
                     shown = f"getattr({base}, {attr!r})"
-            if base and not _shadowed(node, base) and counted(attr):
+            if base and not _shadowed(node, base):
                 alias.append(
                     f"{rel}:{node.lineno}: {shown} "
                     f"(module-level bind from get_server_args() at line "
@@ -349,13 +334,13 @@ def _collect(rel: str, tree: ast.AST, inert: frozenset = frozenset()):
             key = shown = None
             if isinstance(inner, ast.Attribute):
                 key = _bound_attr(inner.value)
-                if key is not None and counted(inner.attr):
+                if key is not None:
                     shown = f"{key[0]}.{key[1]}.{inner.attr}"
             else:
                 name = _getattr_name(inner)
                 if name is not None:
                     key = _bound_attr(inner.args[0])
-                    if key is not None and counted(name):
+                    if key is not None:
                         shown = f"getattr({key[0]}.{key[1]}, {name!r})"
             if shown is not None:
                 alias.append(
@@ -376,8 +361,7 @@ def _field_reads():
             tree = ast.parse(path.read_text())
         except SyntaxError:
             continue
-        inert = frozenset(name for path_, name in _INERT_DYNAMIC_READS if path_ == rel)
-        module_direct, module_alias = _collect(rel, tree, inert)
+        module_direct, module_alias = _collect(rel, tree)
         direct += module_direct
         alias += module_alias
     return direct, alias
