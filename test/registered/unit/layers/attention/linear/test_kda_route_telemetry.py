@@ -316,9 +316,7 @@ class TestKDATerminalRouteTelemetry(unittest.TestCase):
             )
         prefill_success = _event(mode="prefill")
         self.assertEqual(prefill_success.copy_count, 0)
-        self.assertEqual(
-            prefill_success.copy_count_source, "static_zero_copy_row_view"
-        )
+        self.assertEqual(prefill_success.copy_count_source, "static_zero_copy_row_view")
         with self.assertRaisesRegex(ValueError, "invalid KDA copy-count state"):
             _event(
                 mode="prefill",
