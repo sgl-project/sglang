@@ -9,6 +9,7 @@ import time
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     RequestMetrics,
@@ -26,10 +27,10 @@ def test_stage_entry_sync_excludes_previous_stage_tail(monkeypatch):
     metrics = RequestMetrics("stage-sync-test")
 
     # Calibrate ~0.5 s of queued GPU work.
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     t0 = time.perf_counter()
     torch.cuda._sleep(10_000_000)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     cycles = int(10_000_000 / max(time.perf_counter() - t0, 1e-9) * 0.5)
 
     # Producer stage queues work without awaiting it (a denoise tail).

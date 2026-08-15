@@ -26,6 +26,7 @@ from sglang.srt.layers.attention.dsv4.indexer import (
     fp8_paged_mqa_logits_torch,
     fp8_paged_mqa_logits_torch_sm120,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -255,7 +256,7 @@ class TestSM120PagedMqaLogitsTorch(CustomTestCase):
             _ = fp8_paged_mqa_logits_torch_sm120(
                 q, kv, w, sl, pt, None, max_seq_len=msl, clean_logits=False
             )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         # Pre-allocated output (graph replay reuses this buffer)
         static_logits_holder = {}
@@ -273,7 +274,7 @@ class TestSM120PagedMqaLogitsTorch(CustomTestCase):
         )
 
         graph.replay()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         torch.testing.assert_close(
             static_logits_holder["out"], ref, atol=1e-5, rtol=1e-5
         )
@@ -282,7 +283,7 @@ class TestSM120PagedMqaLogitsTorch(CustomTestCase):
         sl_new = torch.tensor([64, 256], dtype=torch.int32, device=self.device)
         sl.copy_(sl_new)
         graph.replay()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         ref_new = fp8_paged_mqa_logits_torch_sm120(
             q, kv, w, sl, pt, None, max_seq_len=msl, clean_logits=False
         )

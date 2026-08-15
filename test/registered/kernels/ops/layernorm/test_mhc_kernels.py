@@ -5,6 +5,7 @@ import torch
 
 import sglang.kernels.ops.layernorm.mhc as mhc
 from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_pre
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
@@ -95,7 +96,7 @@ def test_mhc_fused_post_pre_matches_unfused(
         norm_eps=norm_eps,
     )
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     if num_tokens == 0:
         assert residual_out.shape == residual.shape
         assert post_out.shape == (0, hc_mult, 1)

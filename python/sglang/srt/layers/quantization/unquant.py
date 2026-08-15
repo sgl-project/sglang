@@ -56,6 +56,7 @@ if TYPE_CHECKING:
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUUnquantMoEMethod,
 )
+from sglang.srt.platforms import current_platform
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cuda = is_cuda()
@@ -460,11 +461,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             copy_or_rebind_param(
                 layer, "w13_weight", shuffle_weight(layer.w13_weight.data, (16, 16))
             )
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
             copy_or_rebind_param(
                 layer, "w2_weight", shuffle_weight(layer.w2_weight.data, (16, 16))
             )
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
 
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:

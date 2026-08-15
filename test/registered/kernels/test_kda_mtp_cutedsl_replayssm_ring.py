@@ -18,6 +18,7 @@ in fp32 registers.
 import pytest
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
@@ -180,7 +181,7 @@ def test_cutedsl_fused_output_norm(N):
 @pytest.mark.parametrize("N", [4, 32], ids=["small-grid", "large-grid"])
 def test_cutedsl_cuda_graph_padding_slot_is_safe(N):
     _, ring = _run("ring", N=N, H=2, num_spec=2, seed=11, pad_last=True)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # The last logical request is graph padding. Its original physical slot N
     # is now unused and must remain untouched by all ReplaySSM ring stores.

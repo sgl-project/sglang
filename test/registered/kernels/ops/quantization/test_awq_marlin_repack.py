@@ -9,6 +9,7 @@ from sglang.kernels.ops.quantization.awq_marlin_repack import (
     awq_marlin_repack as jit_awq_marlin_repack,
 )
 from sglang.srt.layers.quantization.utils import pack_cols, quantize_weights
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import get_weight_perm, marlin_weights
 
@@ -69,7 +70,7 @@ def test_awq_marlin_repack_jit_vs_aot(num_bits, k_tiles, n_tiles, group_size):
         q_w_awq, size_k, size_n, num_bits
     )
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # Bitwise equality
     torch.testing.assert_close(out_jit, out_aot, rtol=0, atol=0)
@@ -101,7 +102,7 @@ def test_awq_marlin_repack_correct(num_bits, k_tiles, n_tiles, group_size):
     expected_cols = size_n * tile_k // pack_factor
     assert list(out_gpu.shape) == [size_k // tile_k, expected_cols]
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     torch.testing.assert_close(out_gpu, q_w_marlin)
 

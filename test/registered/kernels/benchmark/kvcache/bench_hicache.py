@@ -31,6 +31,7 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer,
     transfer_hicache_one_layer,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
@@ -239,7 +240,7 @@ def benchmark_one_layer_h2d(
         indices_src_gpu, mapping = indices_src_gpu.sort()
         indices_dst_gpu = indices_dst_gpu[mapping]
     indices_src_cpu = indices_src_gpu.cpu()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     element_bytes = element_size * k_cache_src.element_size()
 
@@ -342,7 +343,7 @@ def benchmark_all_layer_d2h(
         indices_dst_gpu, mapping = indices_dst_gpu.sort()
         indices_src_gpu = indices_src_gpu[mapping]
     indices_dst_cpu = indices_dst_gpu.cpu()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     element_bytes = element_size * k_caches_src.element_size()
 

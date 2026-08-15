@@ -20,6 +20,7 @@ from typing import Any, Dict, List
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.lora_utils import (
     MOE_BASE_MODEL_PATH,
@@ -89,7 +90,7 @@ class TestMoELoRATP2Logprobs(CustomTestCase):
         print(f"{'=' * 100}")
 
         tp1 = _run_sglang_moe_lora(tp_size=1, prompts=prompts)
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
         print(f"\n{'=' * 100}")
         print(f"  {label}: running TP=2")
@@ -160,7 +161,7 @@ class TestMoELoRATP2Logprobs(CustomTestCase):
         """
         prompts = MOE_LORA_TEST_PROMPTS[:3]
         baseline = _run_sglang_moe_lora(tp_size=2, prompts=prompts)
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
         with envs.SGLANG_LOGPROB_CHUNK_SIZE.override(16):
             chunked = _run_sglang_moe_lora(tp_size=2, prompts=prompts)
 
@@ -198,6 +199,5 @@ if __name__ == "__main__":
     try:
         unittest.main(warnings="ignore", verbosity=2)
     finally:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()

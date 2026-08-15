@@ -26,6 +26,7 @@ from sglang.kernels.ops.quantization.dsv32 import (
     fused_k_indexer_norm_rope,
     fused_k_indexer_norm_rope_store,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -84,7 +85,7 @@ def test_k_norm_rope_matches_reference():
     bias = torch.randn(HEAD_DIM, dtype=torch.float32, device=dev)
 
     out = fused_k_indexer_norm_rope(key, weight, bias, EPS, cos_sin_cache, positions)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     normed = torch.nn.functional.layer_norm(
         key.float(), (HEAD_DIM,), weight=weight, bias=bias, eps=EPS
@@ -133,7 +134,7 @@ def test_k_store_matches_unfused(strided):
     fused_k_indexer_norm_rope_store(
         key, buf_fused, loc, weight, bias, EPS, cos_sin_cache, positions, PAGE_SIZE
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert torch.equal(buf_ref, buf_fused)
 
@@ -154,7 +155,7 @@ def test_q_rope_quant_matches_reference(pos_dtype):
     q_fp8, weights_out = fused_q_indexer_rope_first_quant(
         q, weight, weight_scale, cos_sin_cache, positions
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     cp = cos[positions.long()][:, None, :]
     sp = sin[positions.long()][:, None, :]
@@ -197,7 +198,7 @@ def test_q_strided_weight_matches_contiguous():
     b_fp8, b_w = fused_q_indexer_rope_first_quant(
         q, w_contig, 0.137, cos_sin_cache, positions
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert torch.equal(a_fp8, b_fp8)
     assert torch.equal(a_w, b_w)
 
@@ -248,7 +249,7 @@ def test_indexer_uses_replaced_rope_cache_for_fused_kernels():
     q_fp8, weights_out = fused_q_indexer_rope_first_quant(
         q, q_weight, weight_scale, indexer._indexer_cos_sin_cache, positions
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     q_ref = _rope_first(
         q.float(), cos[positions.long()][:, None, :], sin[positions.long()][:, None, :]

@@ -12,6 +12,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     prepare_moe_nvfp4_layer_for_marlin,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
@@ -317,7 +318,7 @@ def test_moe_wna16_marlin_gemm(
         use_atomic_add,
     )
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # --- Check bitwise equality with AOT kernel ---
     c_aot = torch.empty((m * topk, 2 * n), dtype=dtype, device="cuda")
@@ -344,7 +345,7 @@ def test_moe_wna16_marlin_gemm(
         True,
         use_atomic_add,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.testing.assert_close(c_jit, c_aot, rtol=0, atol=0)
 
 
@@ -407,7 +408,7 @@ def test_fused_marlin_moe_non_gated_relu2():
             routed = intermediate @ w_ref2[expert_id].T
             output_ref[token_idx] += routed * topk_weights[token_idx, route_idx]
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.testing.assert_close(output, output_ref, rtol=0.04, atol=0.04)
 
 
@@ -482,7 +483,7 @@ def test_fused_marlin_moe_large_non_ep_schedule(m, has_bias):
             routed.float() * topk_weights[token_indices, route_indices, None],
         )
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     # The existing BF16/4-bit bias path has a few large-batch outliers just
     # above 0.04 even without the compile-time specialization.
     torch.testing.assert_close(output, output_ref.to(dtype), rtol=0.04, atol=0.06)
@@ -580,7 +581,7 @@ def test_fused_marlin_moe_nvfp4_non_gated_padded_intermediate_launches():
         is_gated=False,
     )
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert out.shape == (m, hidden_size)
 
 
@@ -680,7 +681,7 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
             output_ref[token_idx] += routed * topk_weights[token_idx, route_idx]
     output_ref *= routed_scaling_factor
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.25)
 
 

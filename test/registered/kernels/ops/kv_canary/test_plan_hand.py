@@ -11,6 +11,7 @@ from sglang.kernels.ops.kv_canary.plan_ref import (
 )
 from sglang.kernels.ops.kv_canary.verify import VerifyPlan
 from sglang.kernels.ops.kv_canary.write import WritePlan
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.kv_canary._differential import run_plan_diff
 from sglang.test.kernels.kv_canary._fixtures import (
@@ -107,7 +108,7 @@ def _run_label(
         req_to_verify_expected_tokens_valid_lens=None,
         kv_token_id_vs_position_offset=0,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     return verify_plan, write_plan
 
 
@@ -828,7 +829,7 @@ class TestMisc:
                 req_to_verify_expected_tokens_valid_lens=None,
                 kv_token_id_vs_position_offset=0,
             )
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             runner(
                 verify_plan_out=verify_plan,
                 write_plan_out=write_plan,
@@ -843,7 +844,7 @@ class TestMisc:
                 req_to_verify_expected_tokens_valid_lens=None,
                 kv_token_id_vs_position_offset=0,
             )
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             n_active = int(write_plan.write_num_valid_reqs[0].item())
             tail_offsets = (
                 write_plan.write_offsets[n_active + 1 : 8].detach().cpu().tolist()

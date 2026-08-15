@@ -34,6 +34,7 @@ from sglang.srt.cuda_vmm_utils import (
     map_chunk_into_span,
     release_mappings,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
@@ -230,7 +231,7 @@ def test_handle_roundtrip(transport: str, n_chunks: int) -> None:
         handles.append(handle)
         vas.append(va)
         sizes.append(size)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     posix_fds, peer_fds, mappings = [], {}, []
     try:

@@ -20,6 +20,7 @@ from sglang.kernels.ops.kv_canary.verify import (
 from sglang.kernels.ops.kv_canary.write import (
     launch_canary_write_kernel,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.kv_canary._canary_helpers import (
     FakeViolationLog,
@@ -273,7 +274,7 @@ class TestSeedSlot:
             plan=verify_plan,
             check_verify_expected_token=True,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         assert int(verify_log.write_index[0].item()) == 0
 
     def test_seed_slot_resume_5_step_hardcoded(self) -> None:
@@ -568,7 +569,7 @@ class TestMockMode:
             plan=verify_plan,
             check_verify_expected_token=True,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         assert int(verify_log.write_index[0].item()) == 0
 
     @pytest.mark.parametrize("bit_to_trigger", ["MOCK_TOKEN", "MOCK_POSITION"])
@@ -1001,7 +1002,7 @@ class TestRealKvHash:
                 expected_input_tokens=None,
                 expected_input_positions=None,
             )
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             return read_slot_fields(canary_buf=buf, slot_idx=2)
 
         fields_a = _run_with(sources_a)

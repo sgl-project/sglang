@@ -19,6 +19,7 @@ from sglang.kernels.ops.diffusion.triton.norm import norm_infer, rms_norm_fn
 from sglang.kernels.ops.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
 from sglang.kernels.ops.layernorm.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
 from sglang.kernels.ops.layernorm.norm import rmsnorm as jit_rmsnorm
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.utils import is_in_ci
 
@@ -224,7 +225,7 @@ def normalize_dtypes(text: str) -> list[torch.dtype]:
 def prewarm(fn: Callable[[], object], iters: int = 3) -> None:
     for _ in range(iters):
         fn()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
 
 def benchmark_provider(
@@ -237,7 +238,7 @@ def benchmark_provider(
         if setup_fn is not None:
             setup_fn()
         fn()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)

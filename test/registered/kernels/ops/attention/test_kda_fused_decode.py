@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
 )
 from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -199,7 +200,7 @@ def test_kda_fused_decode_matches_unfused_chain(heads: int, tp_size: int):
         scale=_HEAD_DIM**-0.5,
         onorm_eps=1e-6,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # JIT log breadcrumb for PR/CI evidence that the fused fixed-head branch ran.
     print(f"K3 fused KDA decode test used fused path: TP{tp_size}, H={heads}")

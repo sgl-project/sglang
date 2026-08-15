@@ -18,6 +18,7 @@ from sglang.srt.cuda_vmm_utils import (
     get_device_granularity,
     make_device_allocation_prop,
 )
+from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KvBufferDesc
@@ -196,7 +197,7 @@ class KvVmmArena:
             return
         self._closed = True
         try:
-            torch.cuda.synchronize()
+            current_platform.synchronize()
         except Exception as e:  # pragma: no cover
             logger.warning("KvVmmArena.close synchronize failed: %s", e)
         self._allocation.close()

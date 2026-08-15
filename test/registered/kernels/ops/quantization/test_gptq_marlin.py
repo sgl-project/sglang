@@ -15,6 +15,7 @@ from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     nvfp4_marlin_process_global_scale,
     prepare_nvfp4_layer_for_marlin,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
@@ -105,7 +106,7 @@ def test_gptq_marlin_gemm(
     )
 
     output_ref = torch.matmul(a_input, w_ref)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # JIT kernel should produce approximately correct results vs torch.matmul
     max_diff = torch.mean(torch.abs(output - output_ref)) / torch.mean(
@@ -182,7 +183,7 @@ def test_nvfp4_marlin_dense_matches_dequant_reference(dtype):
     )
 
     output_ref = torch.matmul(a_input, weight_ref.T)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     torch.testing.assert_close(output, output_ref, rtol=0.04, atol=0.04)
 

@@ -154,6 +154,7 @@ if not _is_hip:
         prepare_context_parallel_metadata,
     )
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -2921,10 +2922,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                 device=residual.device,
             ),
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         compile_secs = time.perf_counter() - tic
         # Runs before init_memory_pool(); don't let transients skew pool sizing.
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
         get_tp_group().barrier()
         logger.info(
             "DeepSeek V4 MHC prewarm at load: compile %.1fs, rank sync +%.1fs",

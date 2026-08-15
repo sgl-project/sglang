@@ -16,6 +16,7 @@ import unittest
 
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.lora_utils import (
     MOE_BASE_MODEL_PATH,
@@ -363,6 +364,5 @@ if __name__ == "__main__":
         unittest.main(warnings="ignore", verbosity=2)
     finally:
         # Final cleanup
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()

@@ -13,6 +13,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # CuteDSL prefill kernel only exists on Blackwell. Single-GPU kernel-unit suite,
@@ -78,7 +79,7 @@ def test_kda_chunk_cutedsl_correctness(num_seqs: int):
 
     # --- metadata helper must match the FLA chunkers the Triton path uses ---
     chunk_indices, chunk_offsets, _, total_chunks = prepare_metadata(cu_seqlens)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     expected_indices = prepare_chunk_indices(cu_seqlens, 64)
     expected_offsets = prepare_chunk_offsets(cu_seqlens, 64)
     torch.testing.assert_close(chunk_offsets, expected_offsets.to(torch.int32))
@@ -109,7 +110,7 @@ def test_kda_chunk_cutedsl_correctness(num_seqs: int):
         cu_seqlens,
         scale,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert torch.isfinite(o).all(), "cutedsl output has non-finite values"
     assert torch.isfinite(ht).all(), "cutedsl final state has non-finite values"
@@ -161,7 +162,7 @@ def test_kda_chunk_cutedsl_internal_gate_activation():
         A_log=A_log,
         dt_bias=dt_bias,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.testing.assert_close(o_int.float(), o_pre.float(), atol=2e-3, rtol=1e-2)
     torch.testing.assert_close(ht_int.float(), ht_pre.float(), atol=2e-3, rtol=1e-2)
 
@@ -215,7 +216,7 @@ def test_kda_chunk_cutedsl_realistic_gate():
         cu_seqlens,
         scale,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert torch.isfinite(o).all() and torch.isfinite(ht).all()
     assert (o.float() - ref_o[0].float()).abs().max().item() < 1e-2
 
@@ -282,7 +283,7 @@ def test_kda_chunk_cutedsl_pool_mode_matches_dense(state_dtype: torch.dtype):
         scale,
         h0_indices=slots,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # Same kernels and math; only the state addressing differs -> bit-identical.
     assert ht_pool is pool

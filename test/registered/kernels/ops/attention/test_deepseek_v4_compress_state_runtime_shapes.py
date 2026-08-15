@@ -94,6 +94,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     CompressorPrefillPlan,
     compress_forward,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.deepseek_v4.common import (
     make_legacy_context,
@@ -372,7 +373,7 @@ def _make_pair(spec: BenchSpec, seed: int) -> tuple[BenchInput, BenchInput]:
 def _time_us(fn: Callable[[], torch.Tensor], warmup: int, iters: int) -> float:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -380,7 +381,7 @@ def _time_us(fn: Callable[[], torch.Tensor], warmup: int, iters: int) -> float:
     for _ in range(iters):
         fn()
     end.record()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     return start.elapsed_time(end) * 1000.0 / iters
 
 
@@ -397,7 +398,7 @@ def _benchmark_spec(
     fp32_case, bf16_case = _make_pair(spec, seed)
     fp32_case.run()
     bf16_case.run()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     fp32_us = _time_us(fp32_case.run, warmup=warmup, iters=iters)
     bf16_us = _time_us(bf16_case.run, warmup=warmup, iters=iters)
@@ -407,7 +408,7 @@ def _benchmark_spec(
     fp32_diff_case, bf16_diff_case = _make_pair(spec, seed)
     fp32_out = fp32_diff_case.run()
     bf16_out = bf16_diff_case.run()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     out_diff = (fp32_out.float() - bf16_out.float()).abs().max().item()
     state_diff = (
@@ -843,7 +844,7 @@ def _benchmark_runtime_spec(
     fp32_case, bf16_case = _make_pair(spec, seed)
     fp32_case.run()
     bf16_case.run()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     fp32_us = _time_us(fp32_case.run, warmup=warmup, iters=iters)
     bf16_us = _time_us(bf16_case.run, warmup=warmup, iters=iters)
@@ -851,7 +852,7 @@ def _benchmark_runtime_spec(
     fp32_diff_case, bf16_diff_case = _make_pair(spec, seed)
     fp32_out = fp32_diff_case.run()
     bf16_out = bf16_diff_case.run()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     out_diff = _max_abs_diff(fp32_out, bf16_out)
     state_diff = _max_abs_diff(

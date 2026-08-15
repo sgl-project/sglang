@@ -49,6 +49,7 @@ from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
     _merge_partial_attn,
     flash_mla_sparse_decode_triton,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_resources
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -575,7 +576,7 @@ class TestTouchedPageSplit(CustomTestCase):
             _split_kv_pages_to_64(
                 k_cache.view(torch.uint8), _PBS_SRC, touched_indices=token_ids
             )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertFalse(
             buffers[mask_key].is_inference(),
             "persistent mask must not be an inference tensor",
@@ -589,7 +590,7 @@ class TestTouchedPageSplit(CustomTestCase):
         out_pages = _split_kv_pages_to_64(
             k_cache.view(torch.uint8), _PBS_SRC, touched_indices=token_ids
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         self.assertEqual(
             out_pages.shape, (num_pages * ratio, _PBS_DST, 1, _BYTES_PER_TOKEN)

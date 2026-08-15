@@ -14,6 +14,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0
 from sglang.srt.utils.common import is_sm120_supported
 
@@ -168,7 +169,7 @@ class Mxfp4FlashinferCutlassMoEMethod:
         )
         # SM90 creates full-size interleaved copies; release old layouts per layer.
         if not self._use_mxfp8_act_scaling:
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
 
     def apply(
         self,

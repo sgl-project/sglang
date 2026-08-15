@@ -8,6 +8,7 @@ from sglang.kernels.jit.benchmark.utils import run_benchmark
 from sglang.kernels.ops.quantization.awq_dequantize import (
     awq_dequantize as jit_awq_dequantize,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
@@ -62,7 +63,7 @@ def check_correctness():
 
     jit_out = jit_awq_dequantize(qweight, scales, qzeros)
     aot_out = aot_awq_dequantize(qweight, scales, qzeros)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.testing.assert_close(jit_out, aot_out, rtol=0, atol=0)
     print("Correctness check passed (JIT vs AOT)")
 

@@ -11,6 +11,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
 from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant as act_quant_triton
+from sglang.srt.platforms import current_platform
 
 
 def benchmark_kernel(
@@ -44,14 +45,14 @@ def benchmark_kernel(
     if not x.is_cuda or not use_cuda_graph:
         # Fallback to regular timing
         if x.is_cuda:
-            torch.cuda.synchronize()
+            current_platform.synchronize()
 
         start = time.perf_counter()
         for _ in range(repeat):
             y, s = fn(x, block_size=block_size, scale_fmt=scale_fmt)
 
         if x.is_cuda:
-            torch.cuda.synchronize()
+            current_platform.synchronize()
 
         end = time.perf_counter()
         avg_time_ms = (end - start) / repeat * 1000
@@ -59,7 +60,7 @@ def benchmark_kernel(
         return avg_time_ms, y, s
 
     # Use CUDA graph for more accurate timing
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # Allocate output buffers
     N = x.size(-1)
@@ -75,7 +76,7 @@ def benchmark_kernel(
     for _ in range(warmup):
         graph.replay()
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # Timing with CUDA graph
     start_event = torch.cuda.Event(enable_timing=True)
@@ -86,7 +87,7 @@ def benchmark_kernel(
         graph.replay()
     end_event.record()
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     avg_time_ms = start_event.elapsed_time(end_event) / repeat
 

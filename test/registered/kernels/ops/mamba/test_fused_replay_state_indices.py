@@ -28,6 +28,7 @@ import torch
 from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -96,7 +97,7 @@ class TestFusedReplayStateIndices(CustomTestCase):
             valid_bs=valid_bs,
             total_bs=total_bs,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         case = f"{total_bs=} {num_padding=} {seed=}"
         # 1. state indices bit-identical over [0, total_bs), sentinels included
@@ -183,7 +184,7 @@ class TestFusedReplayStateIndices(CustomTestCase):
             valid_bs=valid_bs,
             total_bs=total_bs,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertTrue(torch.equal(out_ref, out_fused))
         self.assertTrue(torch.equal(req_ref, req_fused))
 

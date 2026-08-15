@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.rope import rotary_embedding
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=18, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -333,7 +334,7 @@ def test_correctness(
     triton_burn(100.0, grid=(1024,))
 
     r_jit, r_torch = r.clone(), r.clone()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     with torch.cuda.stream(stream_jit):
         # Test if rotary_embedding runs on stream_jit
@@ -355,7 +356,7 @@ def test_correctness(
             positions=pos_ids, query=query_torch, key=key_torch
         )
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     compare_results(query_jit_out, query_torch_out, dtype)
     compare_results(key_jit_out, key_torch_out, dtype)
 
@@ -430,7 +431,7 @@ def test_performance(
     iteration = 100
 
     # Time JIT implementation
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     start_time = time.time()
     for _ in range(iteration):
         query_jit, key_jit = query.clone(), key.clone()
@@ -442,16 +443,16 @@ def test_performance(
             cos_sin_cache=cos_sin_cache,
             is_neox=is_neox_style,
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     jit_time = (time.time() - start_time) / iteration
 
     # Time SGL implementation
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     start_time = time.time()
     for _ in range(iteration):
         query_sgl, key_sgl = query.clone(), key.clone()
         sgl_rotary_emb.forward_cuda(positions=pos_ids, query=query_sgl, key=key_sgl)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     sgl_time = (time.time() - start_time) / iteration
 
     # Accuracy validation during performance test

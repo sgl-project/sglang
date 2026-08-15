@@ -37,6 +37,7 @@ from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
@@ -199,7 +200,7 @@ def test_custom_all_reduce(
                 for i in range(TEST_LAYERS):
                     outs.append(comm.custom_all_reduce(graph_inp[i]))
                 out_jit_stack = torch.stack(outs)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         def run(x: torch.Tensor) -> torch.Tensor:
             graph_inp.copy_(x)
@@ -213,7 +214,7 @@ def test_custom_all_reduce(
             outs = []
             for i in range(TEST_LAYERS):
                 outs.append(comm.custom_all_reduce(eager_inp[i]))
-                torch.cuda.synchronize()
+                current_platform.synchronize()
             return torch.stack(outs)
 
     for _ in range(TEST_LOOP):

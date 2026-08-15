@@ -48,6 +48,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -1006,7 +1007,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             del layer.w2_weight_scale
             layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def _process_weights_for_sm90_cutlass(self, layer):
         """De-interleave + pad + halving-swap + byte-interleave MXFP4 weights
@@ -1146,7 +1147,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.w13_weight_bias = Parameter(w13_bias_padded, requires_grad=False)
         layer.w2_weight_bias = Parameter(w2_bias_padded, requires_grad=False)
 
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def _process_weights_for_sm120_cutlass(self, layer):
         """Prepare GPT-OSS MXFP4 experts for FlashInfer CUTLASS on SM120.
@@ -1239,7 +1240,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         layer._mxfp4_backend = "flashinfer_cutlass_sm120"
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

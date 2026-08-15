@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from sglang.srt.lora.backend.base_backend import _compute_moe_lora_info
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
@@ -54,7 +55,7 @@ def test_compute_moe_lora_info_expands_segments(use_preallocated_buffers: bool):
         token_lora_mapping,
         max_len=int(seg_lens.max().item()),
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     expected_mapping = torch.repeat_interleave(weight_indices, seg_lens)
     expected_enabled = _expected_adapter_enabled(lora_ranks, weight_indices)

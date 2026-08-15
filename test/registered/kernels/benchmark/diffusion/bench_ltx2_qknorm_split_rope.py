@@ -7,6 +7,7 @@ import torch
 from sglang.kernels.ops.diffusion.ltx2_qknorm_split_rope import (
     ltx2_qknorm_split_rope_cuda,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
@@ -95,7 +96,7 @@ def _reference_pair(inputs):
 def cuda_event_us(fn, warmups: int, repeats: int, rounds: int) -> float:
     for _ in range(warmups):
         fn()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     samples = []
     for _ in range(rounds):
@@ -172,7 +173,7 @@ def benchmark() -> None:
             num_heads=workload.num_heads,
             head_dim=workload.head_dim,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         assert torch.equal(q_ref, q_out)
         assert torch.equal(k_ref, k_out)
 
@@ -201,7 +202,7 @@ def benchmark() -> None:
             f"| {workload.name} | {times['torch']:.2f} | "
             f"{times['cuda']:.2f} | {times['torch'] / times['cuda']:.3f}x |"
         )
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
 
 if __name__ == "__main__":

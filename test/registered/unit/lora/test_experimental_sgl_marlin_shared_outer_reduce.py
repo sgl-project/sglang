@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -171,7 +172,7 @@ def test_fused_base_shared_lora_reduce_cuda_graph_parity(
         for _ in range(3):
             invoke()
     torch.cuda.current_stream().wait_stream(warmup_stream)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -186,7 +187,7 @@ def test_fused_base_shared_lora_reduce_cuda_graph_parity(
         output.fill_(float("nan"))
 
         graph.replay()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         expected = _reference_reduce(
             routed_base,
@@ -275,7 +276,7 @@ def test_fused_base_mapped_shared_lora_reduce_cuda_graph_parity(
         for _ in range(3):
             invoke()
     torch.cuda.current_stream().wait_stream(warmup_stream)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -289,7 +290,7 @@ def test_fused_base_mapped_shared_lora_reduce_cuda_graph_parity(
     shared_b.mul_(0.875)
     output.fill_(float("nan"))
     graph.replay()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     expected = _mapped_reference_reduce(
         routed_base,

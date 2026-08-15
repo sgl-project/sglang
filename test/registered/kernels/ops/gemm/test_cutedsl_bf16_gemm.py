@@ -10,6 +10,7 @@ from sglang.kernels.jit.utils import (
     get_jit_cuda_arch,
     is_hip_runtime,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
@@ -74,7 +75,7 @@ def test_cutedsl_bf16_gemm_empty_batch(has_bias):
     bias = torch.randn(n, dtype=torch.bfloat16, device="cuda") if has_bias else None
 
     out = cutedsl_bf16_gemm(x, weight, bias)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert out.shape == (0, n)
     assert out.dtype == torch.bfloat16
 

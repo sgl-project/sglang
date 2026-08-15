@@ -30,6 +30,7 @@ from sglang.kernels.ops.kimi_k3 import all_reduce
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
@@ -166,7 +167,7 @@ def test_ar_fusion_push(bs: int, use_residual: bool):
     residual = _int_input(n, bs + 7, per_rank=False) if use_residual else None
     ref = _nccl_ref(x, residual)
     all_reduce.all_reduce_push_res(world, x, residual, ws_mc_base=comm.mc_base_ptr)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
 
@@ -183,7 +184,7 @@ def test_ar_fusion_pull_2shot(bs: int, use_residual: bool):
     residual = _int_input(n, bs + 17, per_rank=False) if use_residual else None
     ref = _nccl_ref(x, residual)
     all_reduce.all_reduce_pull_res(world, x, residual, input_mc_ptr=mc)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
 
@@ -204,7 +205,7 @@ def test_ar_fusion_pull_tuning_grid(num_blocks: int, unroll: int):
     all_reduce.all_reduce_pull_res(
         world, x, None, input_mc_ptr=mc, num_blocks=num_blocks, unroll=unroll
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
 
@@ -223,7 +224,7 @@ def test_ar_fusion_pull_norm(num_tokens: int, rows_per_token: int):
     all_reduce.all_reduce_pull_norm(
         world, x, weight, 1e-6, num_norm_rows=num_tokens, input_mc_ptr=mc
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     _assert_norm_close(x, ref, num_tokens)
 
 
@@ -243,7 +244,7 @@ def test_ar_fusion_push_norm(num_tokens: int, rows_per_token: int):
     all_reduce.all_reduce_push_norm(
         world, x, weight, 1e-6, num_norm_rows=num_tokens, ws_mc_base=comm.mc_base_ptr
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     _assert_norm_close(x, ref, num_tokens)
 
 
@@ -312,7 +313,7 @@ def test_ar_fusion_finalize_push_norm(bs: int):
     all_reduce.finalize_all_reduce_push_norm(
         world, out, gemm2, idx, weights, norm_w, eps, ws_mc_base=comm.mc_base_ptr
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
@@ -366,7 +367,7 @@ def test_ar_fusion_pull_norm_tuning_grid(num_blocks: int, unroll: int):
         num_blocks=num_blocks,
         unroll=unroll,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     _assert_norm_close(x, ref, num_tokens)
 
 
@@ -416,7 +417,7 @@ def test_ar_fusion_graph_capture():
     with torch.cuda.stream(stream):
         _run_all()
     torch.cuda.current_stream().wait_stream(stream)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     dist.barrier(group=cpu_group)
 
     graph = torch.cuda.CUDAGraph()
@@ -434,9 +435,9 @@ def test_ar_fusion_graph_capture():
         gy.copy_(vy)
         gz.copy_(vz)
         dist.barrier(group=cpu_group)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         graph.replay()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         torch.testing.assert_close(gx, ref_x, atol=0, rtol=0)
         torch.testing.assert_close(gy, ref_y, atol=0, rtol=0)
         torch.testing.assert_close(gz, ref_z, atol=0, rtol=0)

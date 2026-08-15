@@ -9,6 +9,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.models.kimi_k3 import KimiK3DeltaAttention
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -83,7 +84,7 @@ class TestKimiK3BfaOverlap(CustomTestCase):
                     with torch.cuda.graph(graph):
                         captured = KimiK3DeltaAttention.forward_qkvbfg_fused(owner, x)
                     graph.replay()
-                    torch.cuda.synchronize()
+                    current_platform.synchronize()
                 # note: owners share the same seeded weights
                 for got, ref, name in zip(
                     captured, serial, ("qkv", "beta", "forget_gate", "g")

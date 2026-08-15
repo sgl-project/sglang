@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -131,7 +132,7 @@ def _run_mha(element_dim: int, page_count: int) -> None:
     host_pool.backup_from_device_all_layer(
         device_pool, host_indices, device_indices, "kernel"
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     for layer_id in range(NUM_LAYERS):
         _assert_pages_equal(
@@ -161,7 +162,7 @@ def _run_mha(element_dim: int, page_count: int) -> None:
         host_pool.load_to_device_per_layer(
             device_pool, host_indices_device, load_indices, layer_id, "kernel"
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     for layer_id in range(NUM_LAYERS):
         _assert_pages_equal(
@@ -210,7 +211,7 @@ def _run_mla(element_dim: int, page_count: int) -> None:
     host_pool.backup_from_device_all_layer(
         device_pool, host_indices, device_indices, "kernel"
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     for layer_id in range(NUM_LAYERS):
         _assert_pages_equal(
@@ -232,7 +233,7 @@ def _run_mla(element_dim: int, page_count: int) -> None:
         host_pool.load_to_device_per_layer(
             device_pool, host_indices_device, load_indices, layer_id, "kernel"
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     for layer_id in range(NUM_LAYERS):
         _assert_pages_equal(

@@ -52,6 +52,7 @@ from sglang.kernels.ops.attention.flash_attn.cute.topk_gather_kv import (
     CpasyncGatherKVManager,
 )
 from sglang.kernels.ops.attention.flash_attn.cute.utils import smid
+from sglang.srt.platforms import current_platform
 
 
 class FlashAttentionMLAForwardSm100:
@@ -3592,7 +3593,7 @@ def test_mla_kernel(
 
 def timeit(fn, *args, **kwargs):
     # Synchronize before timing
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # Warmup
     for _ in range(10):

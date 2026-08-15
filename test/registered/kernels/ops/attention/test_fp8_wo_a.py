@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     quant_weight_ue8m0,
     transform_scale_ue8m0,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -65,7 +66,7 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
     def _assert_matches_flat_reference(self, o, o_fp8, o_s):
         T, G, D = o.shape
         q_ref, s_ref = self._flat_reference(o)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         self.assertEqual(o_fp8.shape, (T, G, D))
         self.assertEqual(o_fp8.dtype, fp8_dtype)
@@ -147,7 +148,7 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
         try:
             o = self._strided_tgd(3, 2, 256, torch.bfloat16, "cuda")
             sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             self.assertGreater(jit_module_calls, 0)
         finally:
             fp8_wo_a_module._jit_module = original_jit_module
@@ -191,7 +192,7 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
                     out,
                     recipe=(1, 1, _GROUP_SIZE),
                 )
-                torch.cuda.synchronize()
+                current_platform.synchronize()
 
                 o_dequant = q_dsv4.float().view(
                     T, G, D // _GROUP_SIZE, _GROUP_SIZE

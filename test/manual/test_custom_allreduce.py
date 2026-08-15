@@ -17,6 +17,7 @@ from sglang.srt.distributed.parallel_state import (
     graph_capture,
     initialize_model_parallel,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
@@ -112,7 +113,7 @@ class TestCustomAllReduce(CustomTestCase):
         data = torch.zeros(1)
         data = data.to(device=device)
         torch.distributed.all_reduce(data, group=group)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         del data
 
         for sz in self.TEST_SIZES:
@@ -134,7 +135,7 @@ class TestCustomAllReduce(CustomTestCase):
                             dtype=dtype,
                             device=torch.cuda.current_device(),
                         )
-                        torch.cuda.synchronize()
+                        current_platform.synchronize()
                         graph = torch.cuda.CUDAGraph()
                         with torch.cuda.graph(
                             graph, stream=graph_capture_context.stream

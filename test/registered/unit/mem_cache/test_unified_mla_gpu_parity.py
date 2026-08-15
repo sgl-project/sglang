@@ -34,6 +34,7 @@ import unittest
 
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
@@ -132,7 +133,7 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
             rope = torch.randn(n_loc, 1, _ROPE, dtype=_DTYPE, device=_DEV)
             unified.set_mla_kv_buffer(layer, _dense(locs, ps), nope, rope)
             ref.set_mla_kv_buffer(layer, locs, nope, rope)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self._assert_parity(unified, ref, locs, ps)
 
     def test_set_mla_kv_buffer_triton_fallback_ps1(self):
@@ -158,7 +159,7 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
                 k = torch.randn(n_loc, 1, _D, dtype=_DTYPE, device=_DEV)
                 unified.set_kv_buffer(layer, _dense(locs, ps), k, None)
                 ref.set_kv_buffer(layer, locs, k, None)
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             self._assert_parity(unified, ref, locs, ps, layers=(0, _L // 2, _L - 1))
 
     def test_get_mla_kv_buffer_roundtrip(self):
@@ -172,7 +173,7 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
             rope = torch.randn(n_loc, 1, _ROPE, dtype=_DTYPE, device=_DEV)
             unified.set_mla_kv_buffer(layer, _dense(locs, ps), nope, rope)
             got_nope, got_rope = unified.get_mla_kv_buffer(layer, _dense(locs, ps))
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             torch.testing.assert_close(got_nope, nope, rtol=0, atol=0)
             torch.testing.assert_close(got_rope, rope, rtol=0, atol=0)
 
@@ -193,7 +194,7 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
                 unified.get_key_buffer(l)[_dense(src_t, ps)].clone() for l in range(_L)
             ]
             unified.move_kv_cache(dst_t, src_t)
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             for l in range(_L):
                 got = unified.get_key_buffer(l)[_dense(dst_t, ps)]
                 torch.testing.assert_close(got, before[l], rtol=0, atol=0)

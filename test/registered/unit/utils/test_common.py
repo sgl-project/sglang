@@ -3,6 +3,7 @@ from array import array
 
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     flatten_arrays_to_int64_tensor,
     get_device_sm_nvidia_smi,
@@ -32,7 +33,7 @@ class TestFlattenArraysToInt64Tensor(CustomTestCase):
                 with self.subTest(device=device, pin=pin):
                     out = flatten_arrays_to_int64_tensor(parts, device, pin)
                     if device == "cuda":
-                        torch.cuda.synchronize()
+                        current_platform.synchronize()
                     self.assertEqual(out.dtype, torch.int64)
                     self.assertEqual(out.device.type, device)
                     self.assertEqual(out.shape, (len(expected),))

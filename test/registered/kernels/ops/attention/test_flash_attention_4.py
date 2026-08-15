@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_sm100_or_sm110_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -1722,7 +1723,7 @@ def test_flash_attn_qv_paged_decode_cuda_graph():
     q.copy_(q_replay)
     qv.copy_(qv_replay)
     graph.replay()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     replay_out, replay_lse = graph_out.clone(), graph_lse.clone()
 
     eager_out, eager_lse = run(q_replay, qv_replay)

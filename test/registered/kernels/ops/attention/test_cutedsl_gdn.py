@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 try:
@@ -81,7 +82,7 @@ def test_cutedsl_gdn_precision(B: int):
     _ = cutedsl_gdn.cutedsl_fused_sigmoid_gating_delta_rule_update(
         A_log, dt_bias, q, k, v, a, b, state_cutedsl.clone(), indices, scale=scale
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # Fresh state for actual test
     state_cutedsl = torch.randn(B, HV, K, V, dtype=torch.float32, device="cuda")
@@ -181,7 +182,7 @@ def test_cutedsl_gdn_performance(B: int):
 
     # Compile kernels
     compiled = cutedsl_gdn._get_compiled_kernel(N, H, HV, K, V, N, N < 32, is_varlen)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     for ri in range(run_iters):
         _ = run_triton_kernel(
@@ -196,7 +197,7 @@ def test_cutedsl_gdn_performance(B: int):
             indices,
             scale,
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     def run_cutedsl():
         for ri in range(run_iters):
@@ -233,9 +234,9 @@ def test_cutedsl_gdn_performance(B: int):
     # Warmup
     with torch.cuda.stream(torch_stream):
         run_cutedsl()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     run_triton()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # Capture CUDA graphs
     graph_triton = torch.cuda.CUDAGraph()
@@ -245,7 +246,7 @@ def test_cutedsl_gdn_performance(B: int):
             run_triton()
         with torch.cuda.graph(graph_cutedsl, stream=torch_stream):
             run_cutedsl()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
     except Exception:
         graph_triton = graph_cutedsl = None
 
@@ -256,13 +257,13 @@ def test_cutedsl_gdn_performance(B: int):
         else:
             with torch.cuda.stream(torch_stream):
                 run_cutedsl()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         if graph_triton:
             graph_triton.replay()
         else:
             run_triton()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
     # Benchmark
     triton_times, cutedsl_times = [], []
@@ -276,7 +277,7 @@ def test_cutedsl_gdn_performance(B: int):
         else:
             run_triton()
         end.record()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         triton_times.append(start.elapsed_time(end))
 
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
@@ -289,7 +290,7 @@ def test_cutedsl_gdn_performance(B: int):
             else:
                 run_cutedsl()
             end.record()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         cutedsl_times.append(start.elapsed_time(end))
 
     triton_mean = np.mean(triton_times) / run_iters * 1000

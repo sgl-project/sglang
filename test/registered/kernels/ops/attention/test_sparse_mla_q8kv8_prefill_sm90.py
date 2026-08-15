@@ -6,6 +6,7 @@ import sys
 import pytest
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -133,7 +134,7 @@ def _run_and_check(d_qk, with_sink, s_q=2, topk=TOPK, s_kv=S_KV):
         attn_sink=attn_sink,
         topk_length=topk_length,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     ref, ref_max_logits, ref_lse = _torch_sparse_attention_ref(
         q=q,
@@ -250,7 +251,7 @@ def test_sparse_mla_q8kv8_prefill_topk_length_only(
         attn_sink=None,
         topk_length=None,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert torch.equal(out, out_full)
     assert torch.equal(max_logits, max_logits_full)
@@ -311,7 +312,7 @@ def test_sparse_mla_q8kv8_prefill_precision(d_qk: int, s_q: int, topk: int, s_kv
         attn_sink=attn_sink,
         topk_length=topk_length,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     ref, ref_max_logits, ref_lse = _torch_sparse_attention_ref(
         q=q,
@@ -396,7 +397,7 @@ def test_sparse_mla_q8kv8_prefill_no_alias_between_calls():
         attn_sink=attn_sink,
         topk_length=topk_length,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert out1.data_ptr() != out2.data_ptr()
     assert ml1.data_ptr() != ml2.data_ptr()
@@ -437,7 +438,7 @@ def test_sparse_mla_q8kv8_prefill_caller_owned_buffers():
         max_logits=ml_buf,
         lse=lse_buf,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert out.data_ptr() == out_buf.data_ptr()
     assert ml.data_ptr() == ml_buf.data_ptr()
@@ -578,7 +579,7 @@ def test_sparse_mla_q8kv8_prefill_masked_sentinels(s_q: int):
     out, _, _ = sparse_mla_q8kv8_prefill_fwd(
         q=q, kv=kv, indices=idx, sm_scale=sm_scale, q_scale=one, kv_scale=one, d_v=D_V
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     worst_cos, worst_mag = 1.0, 1.0
     for s in range(0, s_q, band):
@@ -593,7 +594,7 @@ def test_sparse_mla_q8kv8_prefill_masked_sentinels(s_q: int):
         if mag < 1.0:
             worst_mag = min(worst_mag, mag)
         del ref, ob
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     print(
         f"\n  masked-sentinels s_q={s_q}: worst cos={worst_cos:.4f} "
@@ -628,7 +629,7 @@ def test_sparse_mla_q8kv8_prefill_sq_envelope(s_q: int):
     out, _, _ = sparse_mla_q8kv8_prefill_fwd(
         q=q, kv=kv, indices=idx, sm_scale=sm_scale, q_scale=one, kv_scale=one, d_v=D_V
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     has_nan = torch.isnan(out.float()).any().item()
     worst_cos = 1.0
@@ -640,7 +641,7 @@ def test_sparse_mla_q8kv8_prefill_sq_envelope(s_q: int):
         ).item()
         worst_cos = min(worst_cos, cos)
         del ref
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     print(f"\n  s_q-envelope s_q={s_q}: nan={has_nan} worst cos={worst_cos:.4f}")
     assert not has_nan, f"NaN in output at s_q={s_q} (is_kv_valid race)"
@@ -671,7 +672,7 @@ def test_sparse_mla_q8kv8_prefill_large_skv():
     out, _, _ = sparse_mla_q8kv8_prefill_fwd(
         q=q, kv=kv, indices=idx, sm_scale=sm_scale, q_scale=one, kv_scale=one, d_v=D_V
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     ref = _ref_masked_blocked(q, kv, idx, sm_scale, D_V, 0, 1024)
     cos = torch.nn.functional.cosine_similarity(

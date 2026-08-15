@@ -43,6 +43,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_permute_scales,
 )
 from sglang.srt.layers.quantization.marlin_utils_fp4 import mxfp4_marlin_process_scales
+from sglang.srt.platforms import current_platform
 
 GROUP_SIZE = 32
 
@@ -282,7 +283,7 @@ def time_call(fn: Callable, warmup: int = 5, iters: int = 30) -> Tuple[float, fl
     """Returns (median_ms, min_ms) across ``iters`` calls after ``warmup``."""
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
@@ -290,7 +291,7 @@ def time_call(fn: Callable, warmup: int = 5, iters: int = 30) -> Tuple[float, fl
         s.record()
         fn()
         e.record()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     times = sorted(s.elapsed_time(e) for s, e in zip(starts, ends))
     return times[len(times) // 2], times[0]
 

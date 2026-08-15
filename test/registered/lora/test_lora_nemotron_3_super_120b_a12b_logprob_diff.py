@@ -31,6 +31,7 @@ import torch
 from huggingface_hub import snapshot_download
 
 import sglang as sgl
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -146,6 +147,5 @@ if __name__ == "__main__":
     try:
         unittest.main(warnings="ignore", verbosity=2)
     finally:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()

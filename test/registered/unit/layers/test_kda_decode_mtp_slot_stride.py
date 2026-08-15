@@ -1,3 +1,4 @@
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
@@ -135,7 +136,7 @@ class TestKdaDecodeMtpSlotStride(unittest.TestCase):
                 intermediate_conv_v=iconv[2],
                 **common,
             )
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             return out
 
         ref = run(state_c, conv_c, inter_ssm.clone(), [c.clone() for c in inter_conv])

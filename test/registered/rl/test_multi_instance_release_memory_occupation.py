@@ -12,6 +12,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.engine import Engine as SglangEngine
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -242,7 +243,7 @@ def _run_sglang_subprocess(
             print(f"GPU{rank} before releasing HF model: {mem_before:.0f} MB")
             del hf_model
             gc.collect()
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
             mem_after = get_gpu_memory_mb(rank)
             assert_memory_decreased(mem_before, mem_after, "release HF model")
         dist.barrier(group=inference_device_mesh_cpu["tp"].get_group())

@@ -35,6 +35,7 @@ from PIL import Image
 from sglang.benchmark.serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
@@ -554,7 +555,7 @@ def _subprocess_popen_with_outputs(
     # Release allocator-cached GPU memory to the driver before spawning a
     # server: cached blocks stay cudaMalloc'd and shrink the child's memory.
     if torch.cuda.is_initialized():
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     if not return_stdout_stderr:
         return subprocess.Popen(command, stdout=None, stderr=None, env=env)
@@ -2397,23 +2398,11 @@ def get_gpu_count():
 
 def empty_gpu_cache():
     """
-    Unified empty_cache for PyTorch 2.8 (no torch.accelerator)
-    and PyTorch 2.9+ (where torch.accelerator.empty_cache() exists).
+    Unified empty_cache across devices. The platform picks the backend call
+    (torch.cuda / torch.xpu / a GC pass on CPU), so OOT plugins are covered
+    instead of falling through to a silent no-op.
     """
-    if hasattr(torch, "accelerator") and hasattr(torch.accelerator, "empty_cache"):
-        return torch.accelerator.empty_cache()
-
-    # CUDA
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        return
-
-    # XPU (Intel)
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        torch.xpu.empty_cache()
-        return
-
-    return
+    current_platform.empty_cache()
 
 
 def get_gpu_memory_gb():

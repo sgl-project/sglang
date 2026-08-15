@@ -24,6 +24,7 @@ import torch
 import torch.multiprocessing as mp
 
 import sglang as sgl
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
@@ -116,7 +117,7 @@ def init_process_seed(
 
     # Load model and get parameters
     torch.cuda.set_device(rank)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     url = DEFAULT_URL_FOR_TEST
     process = popen_launch_server(
@@ -131,7 +132,7 @@ def init_process_seed(
             "--remote-instance-weight-loader-start-seed-via-transfer-engine",
         ),
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     seed_params = []
     # Get the weights of seed instance for correctness check.
@@ -169,7 +170,7 @@ def init_process_dst(
     remote_instance_loader_backend,
 ):
     torch.cuda.set_device(rank * tp_size)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     base_gpu_id = rank * tp_size
 
     event_seed_ready.wait()
@@ -230,7 +231,7 @@ def init_process_dst(
                 str(6789 + rank),
             ),
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     event_dst_ready_list[rank - 1].set()
 
@@ -346,7 +347,7 @@ def test_load_weights_from_remote_instance(
     param_queue.close()
     param_queue.join_thread()
     gc.collect()
-    torch.cuda.empty_cache()
+    current_platform.empty_cache()
 
 
 class TestLoadWeightsFromRemoteInstance(CustomTestCase):

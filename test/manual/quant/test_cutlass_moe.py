@@ -9,6 +9,7 @@ from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.platforms import current_platform
 
 
 # Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
@@ -195,7 +196,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
     for _ in range(10):
         _ = cutlass_lambda()
         _ = triton_lambda()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # --- Benchmarking ---
     quantiles = [0.5, 0.2, 0.8]

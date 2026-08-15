@@ -12,6 +12,8 @@ from sgl_kernel.flash_mla import (
     get_mla_metadata,
 )
 
+from sglang.srt.platforms import current_platform
+
 # ================ prefill usage ================ #
 S_Q_PREFILL = [1, 62]
 KV_TOPK_PREFILL = [
@@ -304,7 +306,7 @@ def test_flashmla_prefill(
     kv_topk: Tuple[int, int],
 ):
 
-    torch.cuda.empty_cache()
+    current_platform.empty_cache()
 
     q = torch.randn((1, s_q, 128, 576), dtype=torch.bfloat16, device="cuda") / 10
     kv = torch.randn((1, kv_topk[0], 1, 576), dtype=torch.bfloat16, device="cuda") / 10
@@ -341,7 +343,7 @@ def test_flashmla_prefill(
     indices = indices.to(q.device)
 
     sm_scale = 1 / math.sqrt(576)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     ans_out, ans_max_logits, ans_lse = flash_mla_sparse_fwd(
         q.squeeze(0), kv.squeeze(0), indices.squeeze(0), sm_scale=sm_scale
@@ -353,11 +355,11 @@ def test_flashmla_prefill(
         ans_lse.float(),
     )
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     ref_max_logits, ref_lse, ref_out = reference_torch_prefill(
         s_q, kv_topk[0], kv_topk[1], indices, q, kv, sm_scale
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     torch.testing.assert_close(ans_out, ref_out, atol=8e-4, rtol=2.01 / 128)
     torch.testing.assert_close(
@@ -394,7 +396,7 @@ def test_flash_mla_decode(
     topk = causal_topk[1]
 
     # Generating test data
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     cache_seqlens_cpu = torch.full((b,), s_k, dtype=torch.int32, device="cpu")
     if is_varlen:
@@ -494,11 +496,11 @@ def test_flash_mla_decode(
         blocked_k = blocked_k_dequantized
 
     # Get schedule metadata
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     tile_scheduler_metadata, num_splits = get_mla_metadata(
         cache_seqlens, s_q * h_q // h_kv, h_kv, h_q, is_fp8, topk
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     out_ans, lse_ans = flash_mla_with_kvcache(
         q,

@@ -45,6 +45,7 @@ import unittest
 
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
@@ -242,7 +243,7 @@ class TestFa3MetadataDenseBlockTable(unittest.TestCase):
             v2p_page_table=v2p_arg,
             kernel_page_multiplier=mult,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         want = _reference(rt, rpi, sl, page_size, v2p=v2p_arg, mult=mult)
         return page_table, want, sl
 

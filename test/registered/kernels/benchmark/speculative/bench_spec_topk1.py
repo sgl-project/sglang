@@ -12,6 +12,7 @@ from sglang.kernels.jit.benchmark.utils import (
     run_benchmark,
 )
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
@@ -129,7 +130,7 @@ def benchmark_draft_postprocess(
     else:
         raise ValueError(f"Unknown provider: {provider}")
     fn()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     return run_benchmark(fn)
 
 
@@ -157,7 +158,7 @@ def benchmark_chain_materialize(
     else:
         raise ValueError(f"Unknown provider: {provider}")
     fn()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     return run_benchmark(fn)
 
 

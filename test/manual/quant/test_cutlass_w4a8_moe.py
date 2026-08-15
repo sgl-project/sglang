@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.srt.platforms import current_platform
 
 
 def pack_int4_values_to_int8(int4_values_interleaved: torch.Tensor) -> torch.Tensor:
@@ -162,7 +163,7 @@ def test_cutlass_w4a8_moe(M, N, K, E, tp_size, use_ep_moe, topk, group_size, dty
     )
 
     # compare
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # compare final output
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)

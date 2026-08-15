@@ -7,6 +7,7 @@ from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
     per_token_group_quant_8bit_v2,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -108,7 +109,7 @@ def test_v2_jit_matches_aot(dtype, num_tokens, hidden, fuse_silu_and_mul, scale_
         scale_ue8m0=scale_ue8m0,
         fuse_silu_and_mul=fuse_silu_and_mul,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), "fp8 codes differ"
     assert torch.equal(x_s, s_ref), "scales differ"
@@ -177,7 +178,7 @@ def test_v2_jit_masked_matches_aot(num_experts, hidden, tokens_pad):
         fuse_silu_and_mul=True,
         masked_m=masked_m,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert torch.equal(
         x_q.view(torch.int8), q_ref.view(torch.int8)

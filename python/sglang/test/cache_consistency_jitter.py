@@ -36,6 +36,8 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import globaltimer, smid
 
+from sglang.srt.platforms import current_platform
+
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.engine import Engine
 
@@ -99,7 +101,7 @@ def _run_scheduler_process_with_jitter(
     with torch.cuda.device(gpu_id):
         enabled = torch.zeros(1, dtype=torch.uint8, device="cuda")
         _random_jitter(enabled, probability, jitter_max_time_us)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
     def wrap_event(original: Any) -> Any:
         def with_jitter(
@@ -124,7 +126,7 @@ def _run_scheduler_process_with_jitter(
         success = original_flush_cache(self, empty_cache)
         if success and not jitter_active:
             enabled.fill_(1)
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             jitter_active = True
         return success
 
@@ -239,7 +241,7 @@ def get_jitter_engine(
             engine.shutdown()
             del engine
             gc.collect()
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
         for collector in set(_prom_registry._collector_to_names) - collectors_before:
             _prom_registry.unregister(collector)
         for name, value in original_test_env.items():

@@ -24,6 +24,7 @@ import unittest
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
 
 MODEL = "Qwen/Qwen2-0.5B"
 
@@ -89,12 +90,12 @@ class TestWeightLoaderV2Equiv(unittest.TestCase):
         model_v1 = _load_qwen2_native(v2=False)
         state_v1 = _state_dict_cpu(model_v1)
         del model_v1
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
         model_v2 = _load_qwen2_native(v2=True)
         state_v2 = _state_dict_cpu(model_v2)
         del model_v2
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
         self.assertEqual(set(state_v1.keys()), set(state_v2.keys()))
         for name in sorted(state_v1.keys()):

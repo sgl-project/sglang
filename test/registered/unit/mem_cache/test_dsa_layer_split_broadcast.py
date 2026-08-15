@@ -19,6 +19,7 @@ import unittest
 import torch
 import torch.multiprocessing as mp
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -87,7 +88,7 @@ def _run(rank: int, world: int, port: int):
         if pool._is_layer_owned(layer_id):
             pool.kv_buffer[layer_id].fill_(float(layer_id + 1))
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.distributed.barrier()
 
     # Every rank reads every layer; broadcast must surface the owner's value.
@@ -110,7 +111,7 @@ def _run(rank: int, world: int, port: int):
         )
         if pool._is_layer_owned(layer_id):
             store_buf.fill_(layer_id + 10)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.distributed.barrier()
     for layer_id in range(LAYER_NUM):
         # invalidate any cached remote copy so the read forces a fresh broadcast

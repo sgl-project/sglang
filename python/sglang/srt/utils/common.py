@@ -1395,7 +1395,7 @@ def mark_start(name, interval=0.1, color=0, indent=0):
     global time_infos, show_time_cost
     if not show_time_cost:
         return
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     if time_infos.get(name, None) is None:
         time_infos[name] = TimeInfo(name, interval, color, indent)
     time_infos[name].acc_time -= time.perf_counter()
@@ -1405,7 +1405,7 @@ def mark_end(name):
     global time_infos, show_time_cost
     if not show_time_cost:
         return
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     time_infos[name].acc_time += time.perf_counter()
     if time_infos[name].check():
         time_infos[name].pretty_print()
@@ -1414,11 +1414,11 @@ def mark_end(name):
 def calculate_time(show=False, min_cost_ms=0.0):
     def wrapper(func):
         def inner_func(*args, **kwargs):
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             if show:
                 start_time = time.perf_counter()
             result = func(*args, **kwargs)
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             if show:
                 cost_time = (time.perf_counter() - start_time) * 1000
                 if cost_time > min_cost_ms:

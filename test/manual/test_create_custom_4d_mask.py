@@ -34,6 +34,8 @@ import unittest
 
 import torch
 
+from sglang.srt.platforms import current_platform
+
 # ---------------------------------------------------------------------------
 # Global device selection – overridden by --device CLI flag before unittest.main
 # ---------------------------------------------------------------------------
@@ -146,12 +148,12 @@ def _bench_cuda_events(fn, n, **kwargs):
     # warmup
     for _ in range(5):
         fn(**kwargs)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     start.record()
     for _ in range(n):
         fn(**kwargs)
     end.record()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     return start.elapsed_time(end) / 1e3 / n  # seconds per iteration
 
 
@@ -476,13 +478,13 @@ def run_profiler_traces(output_dir: str = "./pt_traces", device: str = _DEVICE):
                 for _ in range(3):
                     fn(**kwargs)
             if use_cuda:
-                torch.cuda.synchronize()
+                current_platform.synchronize()
             # measured iterations — clearly labelled in the Chrome trace
             with torch.profiler.record_function(f"{label}_measured"):
                 for _ in range(20):
                     fn(**kwargs)
             if use_cuda:
-                torch.cuda.synchronize()
+                current_platform.synchronize()
 
         prof.export_chrome_trace(trace_path)
         print(f"[profiler/{device_tag}] {label} trace written → {trace_path}")

@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.platforms import current_platform
 
 
 @dataclass(frozen=True)
@@ -102,7 +103,7 @@ def check(case: WoACase, args: argparse.Namespace) -> None:
     bf16_ref = torch.einsum("tgd,grd->tgr", o.float(), weight.float()).to(
         torch.bfloat16
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     cb = cosine(out, bf16_ref)
     print(f"{case.name}: G={case.groups} T={case.tokens} cos_bf16={cb:.6f}")

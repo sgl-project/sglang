@@ -14,6 +14,7 @@ import time
 import pytest
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=100, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -767,15 +768,15 @@ def test_fused_metadata_copy_multi(bs, has_real_page_table, has_flashmla):
     }
 
     # Run reference implementation (for-loop)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     loop_start = time.perf_counter()
     reference_copy_for_loop(data["src"], [dst_ref_0, dst_ref_1, dst_ref_2], bs, max_len)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     loop_end = time.perf_counter()
     loop_time = loop_end - loop_start
 
     # Run fused kernel
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     fused_start = time.perf_counter()
     fused_metadata_copy_multi_cuda(
         # Source tensors
@@ -819,7 +820,7 @@ def test_fused_metadata_copy_multi(bs, has_real_page_table, has_flashmla):
         max_len,
         seqlens_expanded_size,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     fused_end = time.perf_counter()
     fused_time = fused_end - fused_start
 
@@ -1010,16 +1011,16 @@ def test_fused_metadata_copy_multi_large_batch(bs):
             max_len,
             seqlens_expanded_size,
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # Actual timing
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     loop_start = time.perf_counter()
     reference_copy_for_loop(data["src"], [dst_ref_0, dst_ref_1, dst_ref_2], bs, max_len)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     loop_time = time.perf_counter() - loop_start
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     fused_start = time.perf_counter()
     fused_metadata_copy_multi_cuda(
         data["src"]["cache_seqlens"],
@@ -1058,7 +1059,7 @@ def test_fused_metadata_copy_multi_large_batch(bs):
         max_len,
         seqlens_expanded_size,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     fused_time = time.perf_counter() - fused_start
 
     speedup = loop_time / fused_time if fused_time > 0 else 0
