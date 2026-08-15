@@ -1,7 +1,7 @@
 import contextlib
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -306,7 +306,9 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
         if not torch.cuda.is_available():
             self.skipTest("CUDA required for flashinfer custom op")
         world_size = 4
-        with self._patched_attn_workspace(self._make_manager(world_size)):
+        manager = self._make_manager(world_size)
+        manager.dtype = torch.bfloat16
+        with self._patched_attn_workspace(manager):
             input_ = torch.randn(8, 16, dtype=torch.bfloat16, device="cuda")
             expected = input_ * world_size
 
@@ -360,11 +362,21 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
             self.assertFalse(self._can_use(torch.randn(8, 16), world_size=2))
 
     def test_rejects_when_token_num_exceeds_workspace_capacity(self):
-        """Under Dynamo the capacity check replaces is_buffer_size_sufficient().
+        """Oversized all-reduces fall back without triggering a warning.
 
-        _FakeWorkspace.is_buffer_size_sufficient() always says yes, so this only
-        passes if the compiling branch consults the manager's own allocation.
+        FlashInfer warns whenever its size validator rejects an operation. The
+        local allocation metadata already proves that this operation cannot use
+        the workspace, so the validator must not be invoked.
         """
+        manager = self._make_manager(4)
+        manager.max_token_num = 8
+        manager.workspace.is_buffer_size_sufficient = MagicMock(return_value=True)
+        with self._patched_attn_workspace(manager):
+            self.assertFalse(self._can_use(torch.randn(9, 16)))
+
+        manager.workspace.is_buffer_size_sufficient.assert_not_called()
+
+    def test_compiling_rejects_when_token_num_exceeds_workspace_capacity(self):
         manager = self._make_manager(4)
         manager.max_token_num = 8
         with self._patched_attn_workspace(manager):

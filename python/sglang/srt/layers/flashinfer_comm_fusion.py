@@ -923,6 +923,19 @@ def can_use_flashinfer_allreduce(
             and workspace_manager.dtype == input_.dtype
         )
 
+    # Reject dimensions outside the allocation before asking FlashInfer to
+    # validate them. FlashInfer logs a warning for an insufficient workspace,
+    # but an oversized all-reduce is an expected fallback to another backend.
+    if (
+        workspace_manager.max_token_num is None
+        or workspace_manager.hidden_dim is None
+        or workspace_manager.dtype is None
+        or token_num > workspace_manager.max_token_num
+        or hidden_dim > workspace_manager.hidden_dim
+        or workspace_manager.dtype != input_.dtype
+    ):
+        return False
+
     return workspace_manager.is_buffer_size_sufficient(
         token_num=token_num,
         hidden_dim=hidden_dim,
