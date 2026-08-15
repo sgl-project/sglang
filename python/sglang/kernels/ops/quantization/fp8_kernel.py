@@ -576,6 +576,32 @@ def _run_per_token_group_quant_8bit_kernel(
         )
         return
 
+    if _is_hip:
+        if (
+            scale_ue8m0
+            or fuse_silu_and_mul
+            or masked_m is not None
+            or not x_s.is_contiguous()
+        ):
+            raise NotImplementedError(
+                "The ROCm Triton fallback supports only row-major FP8 group quantization"
+            )
+        block = triton.next_power_of_2(group_size)
+        _per_token_group_quant_8bit[(x.numel() // group_size,)](
+            x,
+            x_q,
+            x_s,
+            group_size,
+            group_size,
+            eps,
+            bit8_min=fp8_min,
+            bit8_max=fp8_max,
+            BLOCK=block,
+            num_warps=min(max(block // 256, 1), 8),
+            num_stages=1,
+        )
+        return
+
     assert (
         eps == 1e-10
     ), f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
