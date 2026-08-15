@@ -53,6 +53,7 @@ def free_swa_out_of_window_slots(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     is_chunk_cache: bool = False,
+    retain_floor: int | None = None,
 ) -> None:
     if req.kv is None:
         return
@@ -76,6 +77,12 @@ def free_swa_out_of_window_slots(
         # boundary (page_floor(seq_len)) so the last leaf is never all-tombstone.
         # No extra page margin is needed.
         evict_threshold = pre_len - max(sliding_window_size, page_size)
+    if retain_floor is not None and not is_chunk_cache:
+        # The caller owns where the floor is (see BasePrefixCache.swa_retain_floor);
+        # this only promises not to free past it. Chunk cache has no tree, so a
+        # retained checkpoint could never be matched and holding it is pure cost.
+        evict_threshold = min(evict_threshold, retain_floor)
+
     new_swa_evicted_seqlen = max(
         req.kv.swa_evicted_seqlen,
         evict_threshold,

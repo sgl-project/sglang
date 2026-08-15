@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -151,12 +152,12 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             track_ssm_h_dst=torch.empty(4),
         )
 
-        with patch(
-            "sglang.srt.layers.attention.linear.kernels.gdn_flashinfer."
-            "get_server_args",
-            return_value=SimpleNamespace(mamba_cache_chunk_size=64),
-        ):
-            maybe_build_flashinfer_checkpoint_plan(forward_batch, metadata, "cpu")
+        # The chunk size is a derived config member; seed its private cache on a
+        # published config rather than patching an import binding.
+        override = get_context().override_server_args(_mamba_cache_chunk_size=64)
+        override.install()
+        self.addCleanup(override.restore)
+        maybe_build_flashinfer_checkpoint_plan(forward_batch, metadata, "cpu")
 
         torch.testing.assert_close(
             metadata.state_checkpoint_cu_starts,
@@ -215,6 +216,19 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
 
         tree_verify.assert_called_once()
         flashinfer_kernel.target_verify.assert_not_called()
+
+    def test_helion_backend_reports_kda_only(self):
+        cases = (
+            (LinearAttnKernelBackend.HELION, LinearAttnKernelBackend.TRITON),
+            (LinearAttnKernelBackend.TRITON, LinearAttnKernelBackend.HELION),
+        )
+        for decode_backend, prefill_backend in cases:
+            with self.subTest(
+                decode_backend=decode_backend,
+                prefill_backend=prefill_backend,
+            ):
+                with self.assertRaisesRegex(ValueError, "supports KDA only"):
+                    GDNKernelDispatcher(decode_backend, prefill_backend)
 
 
 if __name__ == "__main__":
