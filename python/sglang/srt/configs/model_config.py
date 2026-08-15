@@ -1507,16 +1507,21 @@ class ModelConfig:
                 and self.quantization == "nvfp4_online"
                 and quant_method == "modelopt_fp4"
             )
-            # Detect which checkpoint is it
-            if not preserve_online_draft_quantization:
-                for _, method in QUANTIZATION_METHODS.items():
-                    quantization_override = method.override_quantization_method(
-                        quant_cfg, self.quantization
-                    )
-                    if quantization_override:
-                        quant_method = quantization_override
-                        self.quantization = quantization_override
-                        break
+            # An explicit online-requantization request (e.g. quark_mxfp4 on top
+            # of an NVFP4/mixed checkpoint) must not be overridden back to the
+            # source format
+            if self.quantization not in REQUANTIZATION_METHODS:
+
+                # Detect which checkpoint is it
+                if not preserve_online_draft_quantization:
+                    for _, method in QUANTIZATION_METHODS.items():
+                        quantization_override = method.override_quantization_method(
+                            quant_cfg, self.quantization
+                        )
+                        if quantization_override:
+                            quant_method = quantization_override
+                            self.quantization = quantization_override
+                            break
 
             # Verify quantization configurations.
             if self.quantization is None:

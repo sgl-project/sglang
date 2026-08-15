@@ -1,24 +1,47 @@
-"""Guard: business code never reads a config field off the process-global record.
+"""Ratchet guard: process-global config reads may only decrease.
 
-``get_server_args()`` returns the published ``ServerArgs`` -- one process's
+``get_server_args()`` returns the published ``ServerArgs`` — one process's
 startup record. Config decisions read the namespace accessors instead
-(``get_exec()`` / ``get_memory()`` / ...); per-runner values come from the
-runner that owns them. Both baselines are zero, over the whole package minus
-the modules that own the slot.
+(``get_exec()`` / ``get_memory()`` / …), which carry the resolved value
+including post-publish overrides, and per-runner values come from the runner
+that owns them.
 
-The scanners match ``get_server_args`` and ``configured_*_size`` by their
-literal names, which is why import-renaming them is banned below. A name
+Business code no longer reads the published record for a config value at all:
+both baselines are zero, over the whole package minus the modules that own the
+slot.
+
+The reads that remain live in ``runtime_context.py`` (exempt by module): the
+``@property`` / method members computed from several fields plus the HF config,
+which are not namespace leaves and have no home but ``ServerArgs``, and the
+``configured_*_size()`` accessors for the sizes ``get_parallel()`` shadows with
+the live topology. ``_CONFIGURED_SIZE_CALL_SITES`` registers every one of the
+latter with the reason the live property cannot serve it.
+
+What the scan sees: ``get_server_args().field``, an alias (``sa =
+get_server_args()`` then ``sa.field`` -- function-local, module-level, or parked
+on an instance attribute), a local copy of an alias (``cfg = sa``), and the
+``getattr(<either>, "field")`` spelling of each. It matches the accessors by
+their literal names, which is why import-renaming them is banned below. A name
 computed at runtime, or indirection deeper than a local name copy, is invisible
-here -- the census tool in the context repo audits that shape.
+here -- the census tool in the context repo audits that shape. A whole-object
+pass (``def f(server_args)``) is not a global read and is not counted: there the
+caller decided which instance to hand over.
 """
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
 import ast
-from functools import cache
+import unittest
 from pathlib import Path
+
+import sglang
+from sglang.test.test_utils import CustomTestCase
 
 # srt is the migrated surface; the rest of the package has no reads today and is
 # scanned so a new one cannot appear there unnoticed.
-_PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "python" / "sglang"
+_PACKAGE_ROOT = Path(next(iter(sglang.__path__)))
 
 # The modules that own the slot: runtime_context publishes it and exposes the
 # named accessors for the derived members, server_args/arg_groups ARE the
@@ -26,7 +49,7 @@ _PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "python" / "sglang"
 _SLOT_OWNERS = ("srt/runtime_context.py", "srt/server_args.py", "srt/arg_groups/")
 
 # Every call site of a ``configured_*_size()`` accessor, with the reason the
-# live topology cannot answer there. The checker below asserts this map is exactly
+# live topology cannot answer there. The test below asserts this map is exactly
 # the set of call sites, so the reasons cannot drift away from the code.
 _CONFIGURED_SIZE_CALL_SITES = {
     ("srt/layers/attention/dsa/dsa_indexer.py", "configured_pp_size"): (
@@ -343,23 +366,15 @@ def _collect(rel: str, tree: ast.AST, inert: frozenset = frozenset()):
     return direct, alias
 
 
-@cache
-def _parsed_modules():
-    """(rel, tree) per parseable module; the three scanners below share it."""
-    modules = []
+def _field_reads():
+    direct, alias = [], []
     for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
+        rel = path.relative_to(_PACKAGE_ROOT).as_posix()
+        if rel.startswith(_SLOT_OWNERS):
+            continue
         try:
             tree = ast.parse(path.read_text())
         except SyntaxError:
-            continue
-        modules.append((path.relative_to(_PACKAGE_ROOT).as_posix(), tree))
-    return modules
-
-
-def _field_reads():
-    direct, alias = [], []
-    for rel, tree in _parsed_modules():
-        if rel.startswith(_SLOT_OWNERS):
             continue
         inert = frozenset(name for path_, name in _INERT_DYNAMIC_READS if path_ == rel)
         module_direct, module_alias = _collect(rel, tree, inert)
@@ -368,61 +383,29 @@ def _field_reads():
     return direct, alias
 
 
-def _configured_size_call_sites():
-    found = set()
-    for rel, tree in _parsed_modules():
-        if rel.startswith(_SLOT_OWNERS):
-            continue
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            name = (
-                func.id
-                if isinstance(func, ast.Name)
-                else (func.attr if isinstance(func, ast.Attribute) else None)
+class TestGlobalConfigReadRatchet(CustomTestCase):
+    def _check(self, kind, reads, baseline):
+        if len(reads) > baseline:
+            self.fail(
+                f"{kind} process-global config field reads grew: {len(reads)} > "
+                f"baseline {baseline}. Read the namespace accessor for the "
+                "field's namespace, or the owning runner for a per-runner "
+                "field:\n" + "\n".join(reads)
             )
-            if name and name.startswith("configured_") and name.endswith("_size"):
-                found.add((rel, name))
-    return found
+        if len(reads) < baseline:
+            self.fail(
+                f"{kind} process-global config field reads shrank: {len(reads)} < "
+                f"baseline {baseline}. Lower the baseline in this file to lock "
+                "in the progress."
+            )
+
+    def test_global_field_reads_match_the_baseline(self):
+        direct, alias = _field_reads()
+        self._check("direct", direct, _DIRECT_BASELINE)
+        self._check("alias-form", alias, _ALIAS_BASELINE)
 
 
-def _renamed_accessor_imports():
-    offenders = []
-    for rel, tree in _parsed_modules():
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.ImportFrom, ast.Import)):
-                continue
-            for imported in node.names:
-                if imported.asname is None or imported.asname == imported.name:
-                    continue
-                base = imported.name.rsplit(".", 1)[-1]
-                if base == "get_server_args" or (
-                    base.startswith("configured_") and base.endswith("_size")
-                ):
-                    offenders.append(
-                        f"{rel}:{node.lineno}: {imported.name} as {imported.asname}"
-                    )
-    return offenders
-
-
-def _check_count(kind, reads, baseline):
-    if len(reads) > baseline:
-        raise AssertionError(
-            f"{kind} process-global config field reads grew: {len(reads)} > "
-            f"baseline {baseline}. Read the namespace accessor for the "
-            "field's namespace, or the owning runner for a per-runner "
-            "field:\n" + "\n".join(reads)
-        )
-
-
-def check_global_config_read_ratchet():
-    direct, alias = _field_reads()
-    _check_count("direct", direct, _DIRECT_BASELINE)
-    _check_count("alias-form", alias, _ALIAS_BASELINE)
-
-
-def check_configured_size_call_sites():
+class TestConfiguredSizeCallSites(CustomTestCase):
     """The configured-vs-live exceptions are enumerated, with reasons.
 
     ``configured_*_size()`` answers what the user asked for where
@@ -437,17 +420,38 @@ def check_configured_size_call_sites():
     what this catches -- in either call form (bare or module-qualified).
     """
 
-    found = _configured_size_call_sites()
-    documented = set(_CONFIGURED_SIZE_CALL_SITES)
-    if documented != found:
-        raise AssertionError(
+    def test_the_call_sites_match_the_documented_set(self):
+        found = set()
+        for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
+            rel = path.relative_to(_PACKAGE_ROOT).as_posix()
+            if rel.startswith(_SLOT_OWNERS):
+                continue
+            try:
+                tree = ast.parse(path.read_text())
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = (
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else (func.attr if isinstance(func, ast.Attribute) else None)
+                )
+                if name and name.startswith("configured_") and name.endswith("_size"):
+                    found.add((rel, name))
+        documented = set(_CONFIGURED_SIZE_CALL_SITES)
+        self.assertEqual(
+            documented,
+            found,
             "configured-size call sites drifted from their documented reasons.\n"
             f"  undocumented: {sorted(found - documented)}\n"
             f"  stale entries: {sorted(documented - found)}",
         )
 
 
-def check_no_renamed_accessor_imports():
+class TestNoRenamedAccessorImports(CustomTestCase):
     """The scanners above match ``get_server_args`` and ``configured_*_size``
     by their literal names, so an ``import ... as`` rename would walk a read
     straight past both the zero baseline and the call-site registry. Renaming
@@ -455,9 +459,30 @@ def check_no_renamed_accessor_imports():
     so it is banned outright — which is exactly what makes literal-name
     matching sound."""
 
-    offenders = _renamed_accessor_imports()
-    if offenders:
-        raise AssertionError(
+    def test_the_scanned_accessors_are_never_import_renamed(self):
+        offenders = []
+        for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
+            rel = path.relative_to(_PACKAGE_ROOT).as_posix()
+            try:
+                tree = ast.parse(path.read_text())
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.ImportFrom, ast.Import)):
+                    continue
+                for imported in node.names:
+                    if imported.asname is None or imported.asname == imported.name:
+                        continue
+                    base = imported.name.rsplit(".", 1)[-1]
+                    if base == "get_server_args" or (
+                        base.startswith("configured_") and base.endswith("_size")
+                    ):
+                        offenders.append(
+                            f"{rel}:{node.lineno}: {imported.name} as "
+                            f"{imported.asname}"
+                        )
+        self.assertFalse(
+            offenders,
             "get_server_args / configured_*_size imported under another name; "
             "the read ratchet and the configured-size registry match these "
             "accessors by their literal names, so a rename silently escapes "
@@ -466,6 +491,4 @@ def check_no_renamed_accessor_imports():
 
 
 if __name__ == "__main__":
-    check_global_config_read_ratchet()
-    check_configured_size_call_sites()
-    check_no_renamed_accessor_imports()
+    unittest.main()
