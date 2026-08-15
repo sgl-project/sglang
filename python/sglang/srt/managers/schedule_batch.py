@@ -919,6 +919,11 @@ class Req(ReqDllmMixin):
             if isinstance(sampling_params.custom_params, dict)
             else None
         )
+        self.radix_cache_prefix_limit = (
+            sampling_params.custom_params.get("__sglang_radix_cache_prefix_limit")
+            if isinstance(sampling_params.custom_params, dict)
+            else None
+        )
         if isinstance(sampling_params.custom_params, dict):
             sampling_params = copy.copy(sampling_params)
             sampling_params.custom_params = sampling_params.custom_params | {
@@ -1422,6 +1427,11 @@ class Req(ReqDllmMixin):
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
+        if self.radix_cache_prefix_limit is not None:
+            max_prefix_len = min(
+                max_prefix_len,
+                int(self.radix_cache_prefix_limit),
+            )
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         return max(max_prefix_len, 0)

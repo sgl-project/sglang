@@ -14,6 +14,12 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.neo_chat import NEOChatModel
+from sglang.srt.models.neo_chat_limits import (
+    U1_FLOW_CUSTOM_PARAM,
+    U1_IMAGE_CONDITIONING_CUSTOM_PARAM,
+    U1_IMAGE_CONDITIONING_MAX_PIXELS,
+    U1_IMAGE_CONDITIONING_MIN_PIXELS,
+)
 from sglang.srt.models.neo_chat_vision import build_abs_positions_from_grid_hw
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -204,6 +210,23 @@ class NEOChatMultimodalProcessor(BaseMultimodalProcessor):
             return f"{placeholders}\n{prompt}"
         return f"{prompt[:marker_index]}{placeholders}\n{prompt[marker_index:]}"
 
+    def _image_pixel_bounds(self, request_obj) -> tuple[int, int]:
+        sampling_params = request_obj.sampling_params or {}
+        custom_params = (
+            sampling_params.get("custom_params")
+            if isinstance(sampling_params, dict)
+            else sampling_params.custom_params
+        )
+        if isinstance(custom_params, dict) and (
+            custom_params.get(U1_IMAGE_CONDITIONING_CUSTOM_PARAM)
+            or U1_FLOW_CUSTOM_PARAM in custom_params
+        ):
+            return (
+                U1_IMAGE_CONDITIONING_MIN_PIXELS,
+                U1_IMAGE_CONDITIONING_MAX_PIXELS,
+            )
+        return self.min_pixels, self.max_pixels
+
     async def process_mm_data_async(
         self,
         image_data,
@@ -223,6 +246,7 @@ class NEOChatMultimodalProcessor(BaseMultimodalProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
+        min_pixels, max_pixels = self._image_pixel_bounds(request_obj)
         processed_images: list[tuple[torch.Tensor, torch.Tensor]] = []
         for image in base_output.images:
             if not isinstance(image, Image.Image):
@@ -232,8 +256,8 @@ class NEOChatMultimodalProcessor(BaseMultimodalProcessor):
                     image,
                     patch_size=self.patch_size,
                     downsample_ratio=self.downsample_ratio,
-                    min_pixels=self.min_pixels,
-                    max_pixels=self.max_pixels,
+                    min_pixels=min_pixels,
+                    max_pixels=max_pixels,
                 )
             )
 

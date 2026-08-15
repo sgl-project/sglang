@@ -1395,6 +1395,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             from sglang.srt.models.neo_chat_limits import (
                 U1_FLOW_BATCH_ISOLATION_PARAM,
                 U1_FLOW_CUSTOM_PARAM,
+                U1_FLOW_DISABLE_PREFILL_GRAPH_PARAM,
+                U1_FLOW_RADIX_PREFIX_LIMIT_PARAM,
                 normalize_u1_flow_request,
             )
 
@@ -1403,13 +1405,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if input_ids is None:
                     raise ValueError("SenseNova U1 flow requires input_ids")
                 custom_params = dict(sampling_params.custom_params)
-                custom_params[U1_FLOW_CUSTOM_PARAM] = normalize_u1_flow_request(
+                normalized_flow_spec = normalize_u1_flow_request(
                     flow_spec,
                     input_token_count=len(input_ids),
                 )
+                custom_params[U1_FLOW_CUSTOM_PARAM] = normalized_flow_spec
                 custom_params[U1_FLOW_BATCH_ISOLATION_PARAM] = (
                     f"sensenova_u1_flow:{obj.rid}"
                 )
+                custom_params[U1_FLOW_RADIX_PREFIX_LIMIT_PARAM] = (
+                    normalized_flow_spec["image_start"]
+                )
+                custom_params[U1_FLOW_DISABLE_PREFILL_GRAPH_PARAM] = True
                 sampling_params.custom_params = custom_params
 
         # Build return object

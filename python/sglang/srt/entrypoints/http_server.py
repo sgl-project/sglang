@@ -97,6 +97,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     TokenizeRequest,
     V1RerankReqInput,
 )
+from sglang.srt.entrypoints.openai.serving_sensenova_u1_images import (
+    serve_sensenova_u1_image_edit,
+    serve_sensenova_u1_image_generation,
+)
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
@@ -917,6 +921,74 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
+
+
+@app.post("/v1/images/generations")
+async def sensenova_u1_image_generations(request: Request):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+        ImageGenerationsRequest,
+    )
+
+    try:
+        body = await request.json()
+        image_request = ImageGenerationsRequest.model_validate(body)
+        return await serve_sensenova_u1_image_generation(
+            _global_state.tokenizer_manager,
+            image_request,
+        )
+    except (TypeError, ValueError) as error:
+        logger.error("[http_server] SenseNova U1 image error: %s", error)
+        return _create_error_response(error)
+
+
+@app.post("/v1/images/edits")
+async def sensenova_u1_image_edits(
+    image: UploadFile = File(...),
+    prompt: str = Form(...),
+    n: int = Form(1),
+    response_format: str = Form("b64_json"),
+    size: str = Form("1024x1024"),
+    output_format: Optional[str] = Form(None),
+    seed: Optional[int] = Form(None),
+    guidance_scale: Optional[float] = Form(None),
+    num_inference_steps: Optional[int] = Form(None),
+    mask: Optional[UploadFile] = File(None),
+):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+        ImageGenerationsRequest,
+    )
+
+    try:
+        if mask is not None:
+            raise ValueError("SenseNova U1 image masks are not yet supported")
+        image_bytes = await image.read()
+        max_bytes = (
+            _global_state.tokenizer_manager.server_args.media_url_max_file_size_mb
+            * 1024
+            * 1024
+        )
+        if not image_bytes:
+            raise ValueError("image upload is empty")
+        if len(image_bytes) > max_bytes:
+            raise ValueError(f"image upload exceeds the maximum {max_bytes} bytes")
+        image_request = ImageGenerationsRequest(
+            prompt=prompt,
+            n=n,
+            response_format=response_format,
+            size=size,
+            output_format=output_format,
+            seed=seed,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+        )
+        return await serve_sensenova_u1_image_edit(
+            _global_state.tokenizer_manager,
+            image_request,
+            image_data=[image_bytes],
+        )
+    except (TypeError, ValueError) as error:
+        logger.error("[http_server] SenseNova U1 image edit error: %s", error)
+        return _create_error_response(error)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])

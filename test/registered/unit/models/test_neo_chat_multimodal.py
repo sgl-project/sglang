@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from sglang.kernels.ops.attention.extend_attention import (
@@ -28,7 +30,10 @@ from sglang.srt.models.neo_chat_vision import (
     NEOVisionModel,
     build_abs_positions_from_grid_hw,
 )
-from sglang.srt.multimodal.processors.neo_chat import build_u1_mrope_positions
+from sglang.srt.multimodal.processors.neo_chat import (
+    NEOChatMultimodalProcessor,
+    build_u1_mrope_positions,
+)
 
 
 def test_neo_chat_mrope_positions_match_u1_layout() -> None:
@@ -304,6 +309,22 @@ def test_neo_chat_flow_request_normalizes_and_validates_suffix() -> None:
             {**normalized, "image_start": 23},
             input_token_count=28,
         )
+
+
+def test_neo_chat_flow_image_profile_uses_reference_pixel_bounds() -> None:
+    processor = object.__new__(NEOChatMultimodalProcessor)
+    processor.min_pixels = 65536
+    processor.max_pixels = 262144
+
+    assert processor._image_pixel_bounds(
+        SimpleNamespace(
+            sampling_params={"custom_params": {"sensenova_u1_image_conditioning": True}}
+        )
+    ) == (262144, 4194304)
+    assert processor._image_pixel_bounds(SimpleNamespace(sampling_params={})) == (
+        65536,
+        262144,
+    )
 
 
 def test_short_custom_mask_dense_attention_matches_reference() -> None:

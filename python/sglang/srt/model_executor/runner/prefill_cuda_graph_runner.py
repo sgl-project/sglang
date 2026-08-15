@@ -1079,6 +1079,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        custom_params = (
+            None
+            if forward_batch.sampling_info is None
+            else forward_batch.sampling_info.custom_params
+        )
+        if custom_params is not None and any(
+            isinstance(params, dict)
+            and params.get("__sglang_disable_prefill_cuda_graph")
+            for params in custom_params
+        ):
+            return False
+
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (

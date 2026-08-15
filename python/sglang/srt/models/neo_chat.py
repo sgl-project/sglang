@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import time
 from collections.abc import Iterable
 
 import torch
@@ -16,7 +17,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -25,6 +26,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
+    embed_mm_inputs,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -837,7 +839,9 @@ class NEOChatModel(nn.Module):
                 forward_batch.extend_prefix_lens_cpu,
                 flow_specs,
             )
-            image_token_tag = image_gen_indicators.clone()
+            image_token_tag = (
+                self._request_image_tags(forward_batch) | image_gen_indicators
+            )
             custom_mask, mask_indptr = build_u1_hybrid_backend_mask(
                 indexes,
                 image_token_tag,
@@ -1014,9 +1018,28 @@ class NEOChatModel(nn.Module):
             dtype=torch.long,
             device=device,
         )
-        base_input_embeds = self.get_input_embeddings()(input_ids)
+        if forward_batch.contains_mm_inputs():
+            mm_inputs_list = [
+                mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
+            ]
+            base_input_embeds, _ = embed_mm_inputs(
+                mm_inputs_list=mm_inputs_list,
+                extend_prefix_lens=forward_batch.extend_prefix_lens_cpu,
+                extend_seq_lens=forward_batch.extend_seq_lens_cpu,
+                input_ids=input_ids,
+                input_embedding=self.get_input_embeddings(),
+                multimodal_model=self,
+            )
+        else:
+            base_input_embeds = self.get_input_embeddings()(input_ids)
         final_hidden_states = None
         step_delta_l2 = []
+        flow_started = time.perf_counter()
+        start_event = end_event = None
+        if device.type == "cuda":
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
         for step_index in range(num_steps):
             timestep = timesteps[step_index]
             next_timestep = timesteps[step_index + 1]
@@ -1083,12 +1106,20 @@ class NEOChatModel(nn.Module):
             image_prediction = updated_prediction
 
         assert final_hidden_states is not None
-        output = self.language_model.logits_processor(
-            input_ids,
-            final_hidden_states,
-            self.language_model.lm_head,
-            forward_batch,
+        if end_event is not None:
+            end_event.record()
+            end_event.synchronize()
+            flow_compute_seconds = start_event.elapsed_time(end_event) / 1000.0
+        else:
+            flow_compute_seconds = time.perf_counter() - flow_started
+        next_token_logits = torch.full(
+            (1, self.config.llm_config.vocab_size),
+            -torch.inf,
+            dtype=torch.float32,
+            device=device,
         )
+        next_token_logits[0, 0] = 0
+        output = LogitsProcessorOutput(next_token_logits=next_token_logits)
         final_image = image_prediction.detach().to(torch.float16).cpu().contiguous()
         image_b64 = (
             base64.b64encode(final_image.numpy().tobytes()).decode("ascii")
@@ -1101,6 +1132,7 @@ class NEOChatModel(nn.Module):
             "sensenova_u1_flow_image_dtype": ["float16"],
             "sensenova_u1_flow_image_b64": [image_b64],
             "sensenova_u1_flow_noise_scale": [noise_scale],
+            "sensenova_u1_flow_compute_seconds": [flow_compute_seconds],
             "sensenova_u1_flow_step_delta_l2": [step_delta_l2],
             "sensenova_u1_flow_total_delta_l2": [
                 float((image_prediction - initial_prediction).float().norm().item())

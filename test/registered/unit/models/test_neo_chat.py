@@ -122,7 +122,10 @@ def test_neo_chat_flow_weight_targets_cover_native_vision() -> None:
 def test_neo_chat_flow_request_captures_batch_isolation_key() -> None:
     sampling_params = SamplingParams(
         max_new_tokens=1,
-        custom_params={"__sglang_batch_isolation_key": "u1-flow:test"},
+        custom_params={
+            "__sglang_batch_isolation_key": "u1-flow:test",
+            "__sglang_radix_cache_prefix_limit": 7,
+        },
     )
     req = Req(
         rid="u1-flow-test",
@@ -133,6 +136,7 @@ def test_neo_chat_flow_request_captures_batch_isolation_key() -> None:
     )
 
     assert req.batch_isolation_key == "u1-flow:test"
+    assert req._compute_max_prefix_len(20) == 7
 
 
 @pytest.mark.skipif(
