@@ -851,6 +851,10 @@ class MiniMaxH3AdalnCache(nn.Module):
                 "MiniMax H3 AdaLN cache takes exactly one of path (prebuilt "
                 "sidecar) or weight_files (rebuild from the checkpoint)"
             )
+        if max_plans < 1:
+            raise ValueError("MiniMax H3 AdaLN cache max_plans must be positive")
+        if max_plan_width < 1:
+            raise ValueError("MiniMax H3 AdaLN cache max_plan_width must be positive")
         self.path = path
         self.model_variant = model_variant
         self.weight_files = weight_files
@@ -983,12 +987,15 @@ class MiniMaxH3AdalnCache(nn.Module):
         missing = {k: v for k, v in wanted.items() if k not in self._slots}
         if not missing:
             return
-        if len(self._slots) + len(missing) > self.max_plans:
+        reset = len(self._slots) + len(missing) > self.max_plans
+        if reset:
             # Every plan a request looks up has to stay resident for the whole
             # denoise loop, so an overflow means the capacity is too small --
             # evicting part of it would only move the failure into lookup().
-            self._slots.clear()
-            self.plan_lengths.zero_()
+            # Rebuild the whole current request after clearing: some of its
+            # plans may have been hits before the clear and would otherwise be
+            # lost from the slab.
+            missing = wanted
         if len(missing) > self.max_plans:
             raise ValueError(
                 f"MiniMax H3 AdaLN rebuild needs {len(missing)} plans but "
@@ -1001,12 +1008,16 @@ class MiniMaxH3AdalnCache(nn.Module):
                 f"slab was allocated for {self.max_plan_width}; raise "
                 "--minimax-h3-adaln-plan-width (t2va needs 2, fl2va 3, ref2va 4)"
             )
+        if reset:
+            self._slots.clear()
+            self.plan_lengths.zero_()
 
         device = self.block_params.device
         slots = []
-        for key, timesteps in missing.items():
-            slot = len(self._slots)
-            self._slots[key] = slot
+        pending_slots: dict[tuple[int, ...], int] = {}
+        for offset, (key, timesteps) in enumerate(missing.items()):
+            slot = len(self._slots) + offset
+            pending_slots[key] = slot
             slots.append((slot, timesteps.numel(), embed(timesteps.to(device))))
             self.plan_timesteps[slot, : timesteps.numel()] = timesteps.to(device)
 
@@ -1054,6 +1065,10 @@ class MiniMaxH3AdalnCache(nn.Module):
 
         for slot, length, _ in slots:
             self.plan_lengths[slot] = length
+        # Commit host metadata only after every layer has been written. If a
+        # checkpoint read or projection raises, the zero-length slots remain
+        # invisible and a later request can retry the rebuild.
+        self._slots.update(pending_slots)
         self.rebuilds += 1
         logger.info(
             "MiniMax H3 AdaLN: rebuilt %d plan(s), %d/%d resident, pass #%d",
