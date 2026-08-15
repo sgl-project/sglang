@@ -7,51 +7,25 @@ including post-publish overrides, and per-runner values come from the runner
 that owns them.
 
 Business code no longer reads the published record for a config value at all:
-the baselines are zero for both shapes, over the whole package minus the two
-modules that own the slot.
+both baselines are zero, over the whole package minus the modules that own the
+slot.
 
-Where the remaining reads live (``runtime_context.py``, exempt by module):
+The reads that remain live in ``runtime_context.py`` (exempt by module): the
+``@property`` / method members computed from several fields plus the HF config,
+which are not namespace leaves and have no home but ``ServerArgs``, and the
+``configured_*_size()`` accessors for the sizes ``get_parallel()`` shadows with
+the live topology. ``_CONFIGURED_SIZE_CALL_SITES`` registers every one of the
+latter with the reason the live property cannot serve it.
 
-- **Derived members.** ``@property`` / method members of ``ServerArgs``
-  (``mamba_cache_chunk_size``, ``max_speculative_num_draft_tokens``,
-  ``use_mla_backend()``, ``get_attention_backends()``, ``get_model_config()``,
-  ``cutedsl_moe_max_num_tokens()``) are computed from several fields plus the HF
-  config, so they are not namespace leaves and ``ServerArgs`` is their only
-  home. ``runtime_context`` exposes each one as a named accessor
-  (``mamba_cache_chunk_size()`` …) and is the only module that reads the slot
-  for them.
-- **Config-intent reads of live-shadowed sizes.** ``get_parallel()`` shadows
-  ``tp/pp/dcp/attn_cp/moe_dp_size`` with the live topology, and a few call sites
-  need what was *configured*: the ``configured_*_size()`` accessors. Their
-  reasons, per call site:
-
-  - ``dsa_indexer.pp_size`` gates ``pp_size > 1 and not get_pp_group()...``, and
-    the short circuit is the point: with PP off the group is never touched, which
-    is what lets the ``Indexer`` be constructed before distributed init. The live
-    property would demand the group either way.
-  - ``dp_attention.attn_cp_size`` / ``moe_dp_size``: the configuration the
-    predicate detects (``attn_cp_size > moe_dp_size``) is the one where
-    ``initialize_model_parallel`` aliases ``_MOE_DP`` to ``_ATTN_CP``, so the live
-    sizes are equal there and a live comparison is always false.
-  - ``model_loader/loader.py`` reports both: the same dict carries the live
-    ``moe_dp_size`` under ``"dp"``, so this entry is the configured intent.
-
-What the ratchet sees, syntactically: ``get_server_args().field``,
-``sa = get_server_args()`` followed by ``sa.field`` (function-local, module-level,
-or parked on an instance attribute -- ``self._sa = get_server_args()`` read from
-another method of the same class), function-local copies of an alias to a
-fixpoint (``cfg = sa`` then ``cfg.field``), and the dynamic form of each --
-``getattr(<either>, "field")`` -- since a string-named read reaches the same
-slot. What it cannot see is a name computed at runtime (``getattr(sa, name)``)
-or indirection deeper than a local name copy (through a container, an
-attribute of another object, a cross-scope copy); the census tool in the
-context repo is what audits those.
-
-A whole-object pass (``def f(server_args)``) is not a global read and is not
-counted -- there the caller decided which instance to hand over. An optional
-parameter that falls back to the global (``f(server_args=None)``) hides one,
-so those fallbacks were removed; the ratchet cannot see them and the census
-tool in the context repo is what audits that shape.
+What the scan sees: ``get_server_args().field``, an alias (``sa =
+get_server_args()`` then ``sa.field`` -- function-local, module-level, or parked
+on an instance attribute), a local copy of an alias (``cfg = sa``), and the
+``getattr(<either>, "field")`` spelling of each. It matches the accessors by
+their literal names, which is why import-renaming them is banned below. A name
+computed at runtime, or indirection deeper than a local name copy, is invisible
+here -- the census tool in the context repo audits that shape. A whole-object
+pass (``def f(server_args)``) is not a global read and is not counted: there the
+caller decided which instance to hand over.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
