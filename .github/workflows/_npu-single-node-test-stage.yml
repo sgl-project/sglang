@@ -214,8 +214,8 @@ jobs:
           GDN_ATTN_BACKEND_TRITON: 1
         shell: bash
         run: |
-          # Set this parameter to ensure test failures are correctly reflected in the job status.
-          set -o pipefail
+          # Fail fast on any command error; GH default bash also applies -eo pipefail.
+          set -eo pipefail
 
           sglang_source_path=$(pwd)
           echo "Source code path: ${sglang_source_path}"
@@ -266,23 +266,52 @@ jobs:
           export TRANSFORMERS_VERSION_FOR_SGLANG="${{ inputs.transformers_version }}"
           PYTHON_FOR_SGLANG="python"
           PIP_FOR_SGLANG="pip"
+          # Shared pip index list (public PyPI, tsinghua mirror, then the in-cluster cache).
+          PIP_INDEXES=("https://pypi.org/simple/" "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple" "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple")
+          PIP_TRUSTED_HOST=cache-service.nginx-pypi-cache.svc.cluster.local
+
+          # Shared pip installer: retry the package across indexes (3 attempts), fail the job if all fail.
+          install_pkg() {
+            local pkg="$1"
+            ok=0
+            for attempt in 1 2 3; do
+              for index in "${PIP_INDEXES[@]}"; do
+                echo "${pkg}: attempt ${attempt}/3 via ${index}"
+                if ${PYTHON_FOR_SGLANG} -m pip install "${pkg}" --retries 3 --timeout 60 \
+                    -i "${index}" --trusted-host "${PIP_TRUSTED_HOST}"; then
+                  ok=1; break 2
+                fi
+              done
+              [ "${attempt}" -lt 3 ] && sleep 15
+            done
+            [ "${ok}" = "1" ] || { echo "ERROR: failed to install ${pkg}"; exit 1; }
+          }
+
+          # Transformers (pinned version): prefer the offline wheel cache, fall back to online install.
           if [ -n "${TRANSFORMERS_VERSION_FOR_SGLANG}" ];then
             echo "===== Install transformers for sglang - Begin ====="
             TRANSFORMERS_PKG_PATH_SOURCE=/root/.cache/.cache/transformers/${TRANSFORMERS_VERSION_FOR_SGLANG}
             if [ ! -d "${TRANSFORMERS_PKG_PATH_SOURCE}" ]; then
               echo "The dependent transformers package does not exist: ${TRANSFORMERS_PKG_PATH_SOURCE}."
               echo "Install transformers ${TRANSFORMERS_VERSION_FOR_SGLANG} online."
-              pip install transformers=="${TRANSFORMERS_VERSION_FOR_SGLANG}" -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+              install_pkg "transformers==${TRANSFORMERS_VERSION_FOR_SGLANG}"
             else
               echo "Install transformers ${TRANSFORMERS_VERSION_FOR_SGLANG} locally."
               TRANSFORMERS_PKG_PATH_TARGET=/tmp/transformers/${TRANSFORMERS_VERSION_FOR_SGLANG}
               mkdir -p "${TRANSFORMERS_PKG_PATH_TARGET}"
-              cp "${TRANSFORMERS_PKG_PATH_SOURCE}/*" "${TRANSFORMERS_PKG_PATH_TARGET}/"
-              pip install --no-index --find-links="${TRANSFORMERS_PKG_PATH_TARGET}" transformers=="${TRANSFORMERS_VERSION_FOR_SGLANG}"
+              cp "${TRANSFORMERS_PKG_PATH_SOURCE}/"* "${TRANSFORMERS_PKG_PATH_TARGET}/"
+              ${PYTHON_FOR_SGLANG} -m pip install --no-index --find-links="${TRANSFORMERS_PKG_PATH_TARGET}" transformers=="${TRANSFORMERS_VERSION_FOR_SGLANG}"
             fi
             echo "===== Install transformers for sglang in virtual env - End ====="
           fi
           echo "Transformers version for sglang: $(${PIP_FOR_SGLANG} show transformers | grep Version | cut -d: -f2)"
+
+          # Install missing python deps (skip if already importable)
+          REQUIRED_PIP_PKGS=(tabulate)
+          for pkg in "${REQUIRED_PIP_PKGS[@]}"; do
+            ${PYTHON_FOR_SGLANG} -c "import ${pkg}" 2>/dev/null && { echo "${pkg}: available, skip"; continue; }
+            install_pkg "${pkg}"
+          done
 
           echo "scaling_governor performance num: \
             $(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | grep performance | wc -l)"
@@ -311,34 +340,16 @@ jobs:
           if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
             log_path="/root/.cache/tests/logs/log/${branch_label}-${create_time}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}/${HOSTNAME}"
           else
+            current_date=$(date -u -d '+8 hours' +%Y%m%d)
             log_path="/root/.cache/tests/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
           fi
-          rm -rf ${log_path}
-          mkdir -p ${log_path}
+          rm -rf "${log_path}"
+          mkdir -p "${log_path}"
           echo "Log path: ${log_path}"
 
           echo "Running test: ${tc_name}"
           test_exit_code=0
           cd test
-
-          # Install missing python deps
-          PIP_INDEXES=("https://pypi.org/simple/" "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple")
-          REQUIRED_PIP_PKGS=(tabulate)
-          for pkg in "${REQUIRED_PIP_PKGS[@]}"; do
-            ${PYTHON_FOR_SGLANG} -c "import ${pkg}" 2>/dev/null && { echo "${pkg}: available, skip"; continue; }
-            ok=0
-            for attempt in 1 2 3; do
-              for index in "${PIP_INDEXES[@]}"; do
-                echo "${pkg}: attempt ${attempt}/3 via ${index}"
-                if ${PYTHON_FOR_SGLANG} -m pip install "${pkg}" --retries 3 --timeout 60 \
-                    -i "${index}" --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local; then
-                  ok=1; break 2
-                fi
-              done
-              [ "${attempt}" -lt 3 ] && sleep 15
-            done
-            [ "${ok}" = "1" ] || { echo "ERROR: failed to install ${pkg}"; exit 1; }
-          done
 
           # Append `--nightly` and `--continue-on-error` arguments when the job belongs to the nightly pipeline.
           # --nightly: Collect test cases registered for nightly runs.
