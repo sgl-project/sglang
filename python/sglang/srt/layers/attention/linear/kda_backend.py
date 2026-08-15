@@ -13,9 +13,6 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
-    get_linear_attn_decode_backend,
-    get_linear_attn_prefill_backend,
-    get_linear_attn_verify_backend,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
@@ -47,9 +44,25 @@ class KDAKernelDispatcher:
     ):
         self.verify_backend = verify_backend
         triton_kernel = TritonKDAKernel()
+        helion_kernel = None
+        if decode_backend.is_helion() or prefill_backend.is_helion():
+            if not is_cuda():
+                raise ValueError("KDA Helion backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.kda_helion import (
+                HelionKDAKernel,
+            )
+
+            helion_kernel = HelionKDAKernel(
+                triton_fallback=triton_kernel,
+                enable_decode=decode_backend.is_helion(),
+                enable_prefill=prefill_backend.is_helion(),
+            )
 
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
+        elif decode_backend.is_helion():
+            assert helion_kernel is not None
+            self.decode_kernel = helion_kernel
         elif decode_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("KDA CuTe DSL backend requires CUDA")
@@ -82,7 +95,8 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA decode backend: {decode_backend}. "
-                "KDA supports 'triton', 'cutedsl', 'flashinfer', or 'cake'."
+                "KDA supports 'triton', 'helion', 'cutedsl', 'flashinfer', "
+                "or 'cake'."
             )
 
         # target_verify kernel, selected via --linear-attn-verify-backend (defaults
@@ -132,6 +146,9 @@ class KDAKernelDispatcher:
                 )
 
                 self.extend_kernel = CakeKDAKernel()
+        elif prefill_backend.is_helion():
+            assert helion_kernel is not None
+            self.extend_kernel = helion_kernel
         elif prefill_backend.is_flashkda():
             from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
                 FlashKDAKernel,
@@ -188,9 +205,9 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
-                "KDA supports 'triton', 'cake', 'flashkda', 'cutedsl', "
-                "'nvidia_kda', or 'ptx_kda' (cake/cutedsl/nvidia_kda prefill "
-                "need SM100, ptx_kda SM103)."
+                "KDA supports 'triton', 'helion', 'cake', 'flashkda', "
+                "'cutedsl', 'nvidia_kda', or 'ptx_kda' "
+                "(cake/cutedsl/nvidia_kda prefill need SM100, ptx_kda SM103)."
             )
 
         self.supports_packed_decode = getattr(
@@ -397,9 +414,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             .transpose(-1, -2)
             .shape
         )
-        decode_backend = get_linear_attn_decode_backend()
-        prefill_backend = get_linear_attn_prefill_backend()
-        verify_backend = get_linear_attn_verify_backend()
+        backends = model_runner.linear_attn_backends
+        decode_backend = backends.decode
+        prefill_backend = backends.prefill
+        verify_backend = backends.verify
         # KDA FlashInfer target_verify (recurrent_kda) is chain-only (no tree-ancestor
         # traversal). Reject EAGLE tree verify (topk > 1) early at setup, keyed on the
         # verify backend (not decode). The kernel keeps a per-call

@@ -39,6 +39,7 @@ VAE_COMPONENT_NAMES = frozenset(
         "vocoder",
         "spatial_upsampler",
         "condition_image_encoder",
+        "diffusion_decoder",
     }
 )
 DEFAULT_LAYERWISE_VAE_COMPONENT_NAMES = frozenset(

@@ -338,15 +338,15 @@ class SchedulerMetricsReporter:
                 "num_draft_tokens": 0,
             }
 
-        # Fallback to server_args if draft_worker does not have the attributes.
-        server_args = self.scheduler.server_args
+        # Fallback to the published `spec` bag if draft_worker does not have
+        # the attributes.
         num_steps = getattr(
-            draft_worker, "speculative_num_steps", server_args.speculative_num_steps
+            draft_worker, "speculative_num_steps", get_spec().speculative_num_steps
         )
         num_draft_tokens = getattr(
             draft_worker,
             "speculative_num_draft_tokens",
-            server_args.speculative_num_draft_tokens,
+            get_spec().speculative_num_draft_tokens,
         )
 
         return {

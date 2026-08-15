@@ -599,6 +599,8 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
         mm_processor_worker_num=0,
         tokenizer_worker_num=1,
         base_gpu_id=0,
+        allowed_media_domains=[],
+        media_url_max_file_size_mb=64,
     )
     processor = processor_cls(
         hf_config=SimpleNamespace(media_placeholder_token_id=42),
