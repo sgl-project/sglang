@@ -192,7 +192,8 @@ class UnifiedRadixCache(BasePrefixCache):
             enable_session_radix_cache=self.enable_session_radix_cache,
         )
         self.kv_hint_manager = KvHintManager(
-            self.session_refs if self.enable_session_radix_cache else None
+            self.session_refs if self.enable_session_radix_cache else None,
+            self.metrics_collector,
         )
 
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
@@ -427,6 +428,7 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
+        self.kv_hint_manager.on_request_match(params.req)
         return result
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -545,6 +547,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 while (
                     node_id := self._evict_device_next_node(ct, tracker)
                 ) is not None:
+                    if ct is ComponentType.FULL:
+                        self._record_eviction_selection(node_id)
                     backup_kv = self._evict_device_leaf(node_id, tracker)
                     if backup_kv is not None:
                         # Deferred demote: run the D->H backup, demote only on success.
@@ -572,6 +576,19 @@ class UnifiedRadixCache(BasePrefixCache):
                             )
             finally:
                 self.tree_core.evict_device_end(ct)
+
+    def _record_eviction_selection(self, node_id: NodeId) -> None:
+        if self.metrics_collector is None:
+            return
+        node = self.tree_core.node_by_id(node_id)
+        full_data = node.component_data[ComponentType.FULL]
+        value = full_data.value
+        if value is None:
+            return
+        self.metrics_collector.record_eviction_selection(
+            session_ref="referenced" if full_data.session_ref > 0 else "unreferenced",
+            num_tokens=len(value),
+        )
 
     def _record_dropped_tokens(
         self,
@@ -2107,6 +2124,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def on_kv_hints(self, req: Req, hints: KvHints) -> None:
         self.kv_hint_manager.on_request(req, hints)
+
+    def on_kv_hint_prefill_ready(self, req: Req) -> None:
+        self.kv_hint_manager.on_request_prefill_ready(req)
 
     def open_radix_session(self, session_id: str) -> Optional[int]:
         return self.session_refs.open_radix_session(session_id)

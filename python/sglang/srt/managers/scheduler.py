@@ -3317,6 +3317,7 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
+            self.tree_cache.on_kv_hint_prefill_ready(req)
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,

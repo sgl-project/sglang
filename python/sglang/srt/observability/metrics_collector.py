@@ -2127,6 +2127,63 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["reason", "pool"],
         )
 
+        self.kv_hint_deref_total = Counter(
+            name="sglang:kv_hint_deref_total",
+            documentation="KV DEREF hint outcomes by handler result.",
+            labelnames=list(labels.keys()) + ["status"],
+        )
+
+        self.kv_hint_deref_duration_seconds = Histogram(
+            name="sglang:kv_hint_deref_duration_seconds",
+            documentation="CPU time spent applying a KV DEREF hint. This only "
+            "updates session-reference metadata; it does not evict device KV.",
+            labelnames=list(labels.keys()) + ["status"],
+            buckets=[0.000001, 0.00001, 0.0001, 0.001, 0.01, 0.1, 1.0],
+        )
+
+        self.kv_hint_deref_component_leaves = Counter(
+            name="sglang:kv_hint_deref_component_leaves_total",
+            documentation="Session-component frontier leaves released by successful "
+            "KV DEREF hints. This is logical session coverage, not freed KV slots.",
+            labelnames=labels.keys(),
+        )
+
+        self.kv_hint_deref_next_request_total = Counter(
+            name="sglang:kv_hint_deref_next_request_total",
+            documentation="First scheduled request observed after a successful KV DEREF "
+            "for the same session.",
+            labelnames=labels.keys(),
+        )
+
+        self.kv_hint_deref_next_request_input_tokens = Counter(
+            name="sglang:kv_hint_deref_next_request_input_tokens_total",
+            documentation="Input tokens on the first scheduled request after a successful "
+            "KV DEREF for the same session.",
+            labelnames=labels.keys(),
+        )
+
+        self.kv_hint_deref_next_request_cached_tokens = Counter(
+            name="sglang:kv_hint_deref_next_request_cached_tokens_total",
+            documentation="Cached prefix tokens on the first scheduled request after a "
+            "successful KV DEREF, split by the serving tier.",
+            labelnames=list(labels.keys()) + ["tier"],
+        )
+
+        self.eviction_selected_nodes = Counter(
+            name="sglang:eviction_selected_nodes_total",
+            documentation="Full-KV device eviction victims selected before eviction, split "
+            "by whether session references protected the victim.",
+            labelnames=list(labels.keys()) + ["session_ref"],
+        )
+
+        self.eviction_selected_tokens = Counter(
+            name="sglang:eviction_selected_tokens_total",
+            documentation="Full-KV device token slots in eviction victims selected before "
+            "eviction, split by whether session references protected the victim. "
+            "Selection does not guarantee a write-back victim was freed.",
+            labelnames=list(labels.keys()) + ["session_ref"],
+        )
+
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
 
@@ -2155,6 +2212,49 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.hicache_dropped_tokens.labels(**self.labels, reason=reason, pool=pool).inc(
             num_tokens
         )
+
+    def record_kv_hint_deref(
+        self, status: str, duration_seconds: float, indexed_component_leaves: int
+    ) -> None:
+        self.kv_hint_deref_total.labels(**self.labels, status=status).inc()
+        self.kv_hint_deref_duration_seconds.labels(
+            **self.labels, status=status
+        ).observe(duration_seconds)
+        if indexed_component_leaves > 0:
+            self.kv_hint_deref_component_leaves.labels(**self.labels).inc(
+                indexed_component_leaves
+            )
+
+    def record_kv_hint_deref_next_request(
+        self,
+        input_tokens: int,
+        device_tokens: int,
+        host_tokens: int,
+        storage_tokens: int,
+    ) -> None:
+        self.kv_hint_deref_next_request_total.labels(**self.labels).inc()
+        self.kv_hint_deref_next_request_input_tokens.labels(**self.labels).inc(
+            input_tokens
+        )
+        for tier, num_tokens in (
+            ("device", device_tokens),
+            ("host", host_tokens),
+            ("storage", storage_tokens),
+        ):
+            if num_tokens > 0:
+                self.kv_hint_deref_next_request_cached_tokens.labels(
+                    **self.labels, tier=tier
+                ).inc(num_tokens)
+
+    def record_eviction_selection(
+        self, session_ref: str, num_tokens: int
+    ) -> None:
+        self.eviction_selected_nodes.labels(
+            **self.labels, session_ref=session_ref
+        ).inc()
+        self.eviction_selected_tokens.labels(
+            **self.labels, session_ref=session_ref
+        ).inc(num_tokens)
 
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):

@@ -271,6 +271,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Pass request-scoped KV hints to the cache's hint manager."""
         pass
 
+    def on_kv_hint_prefill_ready(self, req: Req) -> None:
+        """Notify the cache after a request's prefix tiers are resolved."""
+        pass
+
     @abstractmethod
     def reset(self):
         pass

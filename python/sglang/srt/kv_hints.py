@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -16,10 +18,12 @@ if TYPE_CHECKING:
         SessionCacheEvictResult,
         UnifiedSessionRefTracker,
     )
+    from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
 
 logger = logging.getLogger(__name__)
 
 KV_HINT_DEREF_V1 = "kv_hint.deref.v1"
+_DEREF_NEXT_REQUEST_LIMIT = 8192
 
 
 class KvHintStruct(msgspec.Struct, kw_only=True):
@@ -39,8 +43,15 @@ class KvHints(KvHintStruct):
 class KvHintManager:
     """Owns supported KV hint handlers and their request lifecycle hooks."""
 
-    def __init__(self, session_refs: Optional[UnifiedSessionRefTracker] = None) -> None:
+    def __init__(
+        self,
+        session_refs: Optional[UnifiedSessionRefTracker] = None,
+        metrics_collector: Optional[RadixCacheMetricsCollector] = None,
+    ) -> None:
         self._session_refs = session_refs
+        self._metrics_collector = metrics_collector
+        self._deref_next_sessions: OrderedDict[str, int] = OrderedDict()
+        self._deref_next_requests: OrderedDict[str, str] = OrderedDict()
 
     def capabilities(self) -> list[str]:
         if self._session_refs is None:
@@ -72,9 +83,13 @@ class KvHintManager:
 
         deref = req.kv_hints.deref if req.kv_hints is not None else None
         if deref is not None:
+            start_time = time.perf_counter()
             result = self._session_refs.evict_radix_session(
                 req.session_id, req.session_generation
             )
+            self._record_deref_result(start_time, result)
+            if result.status == "evicted" and result.generation is not None:
+                self._remember_deref_session(req.session_id, result.generation)
             self._log_deref_result(req, result)
             return
 
@@ -82,6 +97,58 @@ class KvHintManager:
             return
 
         self._session_refs.register_session_ref(req)
+
+    def on_request_match(self, req: Optional[Req]) -> None:
+        """Track the first matching request after a successful DEREF."""
+        if req is None or req.session_id is None or req.session_generation is None:
+            return
+
+        generation = self._deref_next_sessions.get(req.session_id)
+        if generation != req.session_generation:
+            return
+
+        self._deref_next_sessions.move_to_end(req.session_id)
+        self._remember_deref_request(req.rid, req.session_id)
+
+    def on_request_prefill_ready(self, req: Req) -> None:
+        """Record the next DEREF session request after its L3 prefetch resolves."""
+        session_id = self._deref_next_requests.pop(req.rid, None)
+        if session_id is None:
+            return
+
+        self._deref_next_sessions.pop(session_id, None)
+        if self._metrics_collector is None:
+            return
+
+        self._metrics_collector.record_kv_hint_deref_next_request(
+            input_tokens=len(req.full_untruncated_fill_ids),
+            device_tokens=len(req.prefix_indices),
+            host_tokens=req.host_hit_length,
+            storage_tokens=req.storage_hit_length,
+        )
+
+    def _remember_deref_session(self, session_id: str, generation: int) -> None:
+        self._deref_next_sessions[session_id] = generation
+        self._deref_next_sessions.move_to_end(session_id)
+        while len(self._deref_next_sessions) > _DEREF_NEXT_REQUEST_LIMIT:
+            self._deref_next_sessions.popitem(last=False)
+
+    def _remember_deref_request(self, request_id: str, session_id: str) -> None:
+        self._deref_next_requests[request_id] = session_id
+        self._deref_next_requests.move_to_end(request_id)
+        while len(self._deref_next_requests) > _DEREF_NEXT_REQUEST_LIMIT:
+            self._deref_next_requests.popitem(last=False)
+
+    def _record_deref_result(
+        self, start_time: float, result: SessionCacheEvictResult
+    ) -> None:
+        if self._metrics_collector is None:
+            return
+        self._metrics_collector.record_kv_hint_deref(
+            status=result.status,
+            duration_seconds=time.perf_counter() - start_time,
+            indexed_component_leaves=result.indexed_component_leaves,
+        )
 
     @staticmethod
     def _log_deref_result(req: Req, result: SessionCacheEvictResult) -> None:
