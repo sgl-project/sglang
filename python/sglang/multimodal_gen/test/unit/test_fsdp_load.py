@@ -188,6 +188,7 @@ class TestOrdinaryWeightLoading(unittest.TestCase):
         rank_local_load.assert_not_called()
         weight_iterator.assert_called_once_with(
             ["model.safetensors"],
+            key_filter=None,
             weight_load_plan=load_plan,
         )
 

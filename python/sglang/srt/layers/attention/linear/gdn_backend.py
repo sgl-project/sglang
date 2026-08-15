@@ -137,6 +137,10 @@ class GDNKernelDispatcher:
 
             flashinfer_kernel = FlashInferGDNKernel()
             self.decode_kernel = flashinfer_kernel
+        elif decode_backend.is_helion():
+            raise ValueError(
+                "The Helion linear-attention backend supports KDA only, not GDN."
+            )
         else:
             raise ValueError(f"Unsupported GDN decode backend: {decode_backend}")
 
@@ -176,6 +180,10 @@ class GDNKernelDispatcher:
 
                 flashinfer_kernel = FlashInferGDNKernel()
                 self.extend_kernel = flashinfer_kernel
+        elif prefill_backend.is_helion():
+            raise ValueError(
+                "The Helion linear-attention backend supports KDA only, not GDN."
+            )
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
