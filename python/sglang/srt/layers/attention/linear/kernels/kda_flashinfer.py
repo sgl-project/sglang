@@ -630,6 +630,40 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         return torch.cuda.get_device_capability(q.device) in ((10, 0), (10, 3))
 
     @staticmethod
+    def _cake_prefill_token_views(
+        q: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Trim graph-bucket padding through aliasing token-prefix views.
+
+        Breakable prefill graphs pad projection outputs to the captured token
+        bucket, while causal-conv returns only the live packed-token prefix.
+        ``q`` is therefore authoritative for the logical token count.  Forming
+        prefix views keeps the original storage, offset, and row strides and
+        restores the exact public recurrent-KDA shape contract without a copy.
+        Other shape disagreements remain untouched so admission rejects them.
+        """
+        if q.ndim != 4:
+            return g, beta
+        num_tokens = q.shape[1]
+        if (
+            g.ndim == 4
+            and g.shape[0] == q.shape[0]
+            and g.shape[1] >= num_tokens
+            and g.shape[2:] == q.shape[2:]
+        ):
+            g = g[:, :num_tokens]
+        if (
+            beta.ndim == 3
+            and beta.shape[0] == q.shape[0]
+            and beta.shape[1] >= num_tokens
+            and beta.shape[2] == q.shape[2]
+        ):
+            beta = beta[:, :num_tokens]
+        return g, beta
+
+    @staticmethod
     def _cake_prefill_admission(
         q: torch.Tensor,
         k: torch.Tensor,
@@ -784,6 +818,8 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             raise NotImplementedError(
                 "FlashInfer cute-dsl KDA only supports decode and target_verify"
             )
+
+        g, beta = self._cake_prefill_token_views(q, g, beta)
 
         fallback_kwargs = dict(
             ssm_states=ssm_states,
@@ -954,6 +990,8 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             fatal=False,
             reason=admission.reason,
             detail=admission.detail,
+            copy_count=0,
+            copy_count_source="static_zero_copy_row_view",
         )
         return result
 

@@ -72,12 +72,12 @@ def _event(
 ):
     if eligible is None:
         eligible = outcome == "cake_success"
-    packed_zero_copy = mode == "decode" and outcome == "cake_success"
+    native_zero_copy = outcome == "cake_success"
     if copy_count_source is None:
-        copy_count = 0 if packed_zero_copy else None
+        copy_count = 0 if native_zero_copy else None
         copy_count_source = (
             "static_zero_copy_row_view"
-            if packed_zero_copy
+            if native_zero_copy
             else "unknown_requires_cupti"
         )
     return KDATerminalRouteEvent(
@@ -314,11 +314,16 @@ class TestKDATerminalRouteTelemetry(unittest.TestCase):
                 copy_count=7,
                 copy_count_source="static_zero_copy_row_view",
             )
+        prefill_success = _event(mode="prefill")
+        self.assertEqual(prefill_success.copy_count, 0)
+        self.assertEqual(
+            prefill_success.copy_count_source, "static_zero_copy_row_view"
+        )
         with self.assertRaisesRegex(ValueError, "invalid KDA copy-count state"):
             _event(
                 mode="prefill",
-                copy_count=0,
-                copy_count_source="static_zero_copy_row_view",
+                copy_count=None,
+                copy_count_source="unknown_requires_cupti",
             )
         with self.assertRaisesRegex(ValueError, "invalid KDA copy-count state"):
             replace(
@@ -494,15 +499,11 @@ class TestKDATerminalRouteTelemetry(unittest.TestCase):
                 telemetry,
                 mode="prefill",
                 layer_id=2,
-                copy_count=None,
-                copy_count_source="unknown_requires_cupti",
             )
             _success(
                 telemetry,
                 mode="prefill",
                 layer_id=6,
-                copy_count=None,
-                copy_count_source="unknown_requires_cupti",
             )
 
         def fail_replay():
@@ -544,8 +545,6 @@ class TestKDATerminalRouteTelemetry(unittest.TestCase):
                 telemetry,
                 mode="prefill",
                 layer_id=2,
-                copy_count=None,
-                copy_count_source="unknown_requires_cupti",
             )
 
         def replay():
@@ -553,8 +552,6 @@ class TestKDATerminalRouteTelemetry(unittest.TestCase):
                 telemetry,
                 mode="prefill",
                 layer_id=2,
-                copy_count=None,
-                copy_count_source="unknown_requires_cupti",
             )
             self.assertEqual(len(telemetry.raw_events_snapshot()), 1)
             return "ok"
@@ -586,16 +583,12 @@ class TestKDATerminalRouteTelemetry(unittest.TestCase):
             _success(
                 telemetry,
                 mode="prefill",
-                copy_count=None,
-                copy_count_source="unknown_requires_cupti",
             )
 
         def replay_then_fail():
             _success(
                 telemetry,
                 mode="prefill",
-                copy_count=None,
-                copy_count_source="unknown_requires_cupti",
             )
             raise RuntimeError("bridge failed after eager KDA seam")
 
@@ -628,8 +621,6 @@ class TestKDATerminalRouteTelemetry(unittest.TestCase):
             _success(
                 telemetry,
                 mode="prefill",
-                copy_count=None,
-                copy_count_source="unknown_requires_cupti",
             )
 
         def fatal_replay():

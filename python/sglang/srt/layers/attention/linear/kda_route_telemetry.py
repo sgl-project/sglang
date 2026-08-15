@@ -258,14 +258,12 @@ class KDATerminalRouteEvent:
             raise ValueError("copy_count must be a non-negative int or None")
         if self.copy_count_source not in _VALID_COPY_COUNT_SOURCES:
             raise ValueError(f"invalid copy_count_source: {self.copy_count_source!r}")
-        packed_zero_copy_success = bool(
-            self.mode == "decode"
-            and self.cake_success
-            and self.reason == CakePackedDecodeReason.ELIGIBLE
+        native_zero_copy_success = bool(
+            self.cake_success and self.reason == CakePackedDecodeReason.ELIGIBLE
         )
         expected_copy_state = (
             (0, "static_zero_copy_row_view")
-            if packed_zero_copy_success
+            if native_zero_copy_success
             else (None, "unknown_requires_cupti")
         )
         if (self.copy_count, self.copy_count_source) != expected_copy_state:

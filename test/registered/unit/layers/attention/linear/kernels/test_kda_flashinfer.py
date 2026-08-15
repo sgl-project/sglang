@@ -407,6 +407,10 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
             self.assertFalse(call.kwargs["triton_fallback"])
             self.assertFalse(call.kwargs["fatal"])
             self.assertEqual(call.kwargs["reason"], CakePrefillReason.ELIGIBLE)
+            self.assertEqual(call.kwargs["copy_count"], 0)
+            self.assertEqual(
+                call.kwargs["copy_count_source"], "static_zero_copy_row_view"
+            )
         self.assertTrue(torch.equal(output_true, output_false))
         self.assertTrue(torch.equal(state_true, state_false))
         self.assertEqual(h_empty.shape, (1, 0, 12, 128, 128))
@@ -484,6 +488,28 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
         self.assertEqual(output.shape, inputs["v"].shape)
         self.assertEqual(h.shape, (1, 2, 12, 128, 128))
         self.assertTrue(torch.equal(h, torch.full_like(h, 3)))
+
+    def test_graph_bucket_padding_uses_zero_copy_gate_and_beta_prefix_views(self):
+        q = torch.randn(1, 5, 32, 128, dtype=torch.bfloat16)
+        g_storage = torch.randn(1, 8, 32, 128, dtype=torch.bfloat16)
+        beta_storage = torch.randn(1, 8, 40, dtype=torch.bfloat16)
+        g = g_storage.as_strided(
+            (1, 8, 32, 128), g_storage.stride(), g_storage.storage_offset()
+        )
+        beta = beta_storage[:, :, 4:36]
+
+        g_view, beta_view = CakeKDAKernel._cake_prefill_token_views(q, g, beta)
+
+        self.assertEqual(g_view.shape, q.shape)
+        self.assertEqual(beta_view.shape, q.shape[:-1])
+        self.assertEqual(g_view.data_ptr(), g.data_ptr())
+        self.assertEqual(beta_view.data_ptr(), beta.data_ptr())
+        self.assertEqual(g_view.storage_offset(), g.storage_offset())
+        self.assertEqual(beta_view.storage_offset(), beta.storage_offset())
+        self.assertEqual(g_view.stride(), g.stride())
+        self.assertEqual(beta_view.stride(), beta.stride())
+        self.assertTrue(torch.equal(g_view, g[:, : q.shape[1]]))
+        self.assertTrue(torch.equal(beta_view, beta[:, : q.shape[1]]))
 
 
 class TestCakeKDAIndexedStateAdapter(CustomTestCase):
