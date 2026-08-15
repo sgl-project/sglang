@@ -431,8 +431,8 @@ class Qwen2_5VLVisionTransformer(nn.Module):
         rotary = rotary.reshape(seq_len, -1)
         rotary = torch.cat((rotary, rotary), dim=-1)
         position_embeddings = (
-            rotary.cos().to(hidden_states.dtype),
-            rotary.sin().to(hidden_states.dtype),
+            rotary.cos(),
+            rotary.sin(),
         )
 
         cu_seqlens = torch.repeat_interleave(

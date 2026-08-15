@@ -18,6 +18,8 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl import (
     _select_next_token,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_vision import (
+    Qwen2_5VLVisionRotaryEmbedding,
+    Qwen2_5VLVisionTransformer,
     _vision_position_ids,
     _vision_window_index,
 )
@@ -163,6 +165,51 @@ def test_native_vision_indices_preserve_merged_token_groups():
     assert sorted(window_index.tolist()) == list(range(8))
     assert cu_window_seqlens[0].item() == 0
     assert cu_window_seqlens[-1].item() == 32
+
+
+def test_native_vision_keeps_rotary_trigonometry_in_fp32():
+    class PatchEmbed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(1, 8, bias=False, dtype=torch.bfloat16)
+
+        def forward(self, hidden_states):
+            return self.proj(hidden_states)
+
+    class BlockRecorder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.position_embedding_dtypes = None
+
+        def forward(self, hidden_states, *, position_embeddings, **_kwargs):
+            self.position_embedding_dtypes = tuple(
+                embedding.dtype for embedding in position_embeddings
+            )
+            return hidden_states
+
+    class Merger(nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states.reshape(-1, 4, hidden_states.shape[-1])[:, 0]
+
+    model = Qwen2_5VLVisionTransformer.__new__(Qwen2_5VLVisionTransformer)
+    nn.Module.__init__(model)
+    model.spatial_merge_size = 2
+    model.spatial_merge_unit = 4
+    model.patch_size = 2
+    model.window_size = 8
+    model.full_attention_layers = frozenset({0})
+    model.patch_embed = PatchEmbed()
+    model.rotary_pos_emb = Qwen2_5VLVisionRotaryEmbedding(2)
+    block = BlockRecorder()
+    model.blocks = nn.ModuleList([block])
+    model.merger = Merger()
+    output = model(
+        torch.zeros(16, 1, dtype=torch.bfloat16),
+        grid_thw=torch.tensor([[1, 4, 4]]),
+    )
+
+    assert output.dtype == torch.bfloat16
+    assert block.position_embedding_dtypes == (torch.float32, torch.float32)
 
 
 def test_qwen_generation_pipelines_load_the_native_component():
