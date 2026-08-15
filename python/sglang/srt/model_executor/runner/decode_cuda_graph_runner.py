@@ -456,7 +456,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             boundary is SharedReadBoundary.IN_REPLAY
             and self.in_graph_metadata_prep_done is None
         ):
-            # Non-capturing runs / no external-event support.
+            # In-graph record not found, fall back to the pre-replay
             return SharedReadBoundary.PRE_REPLAY
         return boundary
 
