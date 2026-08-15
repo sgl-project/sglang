@@ -36,6 +36,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_cp_enabled,
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
+from sglang.srt.layers.cp.utils import is_mla_cp_active, is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -62,10 +63,6 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     materialize_bpreshuffle_fp8_scale_tuple,
-)
-from sglang.srt.layers.utils.cp_utils import (
-    is_mla_prefill_cp_enabled,
-    mla_use_prefill_cp,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -212,7 +209,7 @@ class ScatterMode(Enum):
     @staticmethod
     def model_input_output():
         """The scatter mode for model forward pass input and output data"""
-        if is_dsa_cp_enabled() or is_mla_prefill_cp_enabled():
+        if is_dsa_cp_enabled() or is_mla_cp_enabled():
             return ScatterMode.SCATTERED
 
         return ScatterMode.TP_ATTN_FULL
@@ -394,7 +391,7 @@ class LayerScatterModes:
                 return ScatterMode.SCATTERED
             # DSA CP and MLA CP both don't support MOE_FULL yet; fall back to FULL.
             if is_enable_moe_cp_allgather() and not (
-                is_dsa_cp_enabled() or is_mla_prefill_cp_enabled()
+                is_dsa_cp_enabled() or is_mla_cp_enabled()
             ):
                 return ScatterMode.MOE_FULL
             return ScatterMode.FULL
@@ -799,7 +796,7 @@ class LayerCommunicator:
                 return True
             if forward_batch.dp_padding_mode.is_max_len():
                 return True
-        if is_dsa_cp_active(forward_batch) or mla_use_prefill_cp(forward_batch):
+        if is_dsa_cp_active(forward_batch) or is_mla_cp_active(forward_batch):
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
             return True
