@@ -847,6 +847,15 @@ class Envs:
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
+    # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.
+    # Consults the tuned per-(N, K, M) Triton tile config table in
+    # apply_fp8_linear. When a tuned config exists for this GPU / weight shape /
+    # token count, run the Triton w8a8 FP8 GEMM with it; otherwise keep the
+    # default CUTLASS path. Only takes effect on a GPU with a matching
+    # dtype=fp8_w8a8_channelwise config JSON under
+    # kernels/ops/quantization/configs/ (currently L40S), so it is a no-op on
+    # any other GPU / untuned shape even when enabled.
+    SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
 
     # ===================================================================
     # Humming quantization
