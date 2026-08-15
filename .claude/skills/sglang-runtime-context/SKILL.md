@@ -10,7 +10,7 @@ One container owns process-static runtime state: `sglang.srt.runtime_context.Run
 
 | Tier | Accessor | Holds | Lifecycle |
 |------|----------|-------|-----------|
-| raw config seed | `get_server_args()` | the published `ServerArgs` — the startup record, for debugging, dumps and provenance. **Business code does not read fields off it**: the read ratchet pins that at zero, and "Reading config: the seed is off limits" below says what to read instead, which forms the ratchet sees, and what is outside it by construction (a runtime-computed name; a whole-object hand-off) | published at process entry; re-publish is **last-publish-wins** (in-process tokenizer build, multi-Engine) and re-projects the bags; read-only |
+| raw config seed | `get_server_args()` | the published `ServerArgs` — the startup record, for debugging, dumps and provenance. **Business code does not read fields off it**: "Reading config: the seed is off limits" below says what to read instead, and what is outside the contract by construction (a runtime-computed name; a whole-object hand-off) | published at process entry; re-publish is **last-publish-wins** (in-process tokenizer build, multi-Engine) and re-projects the bags; read-only |
 | resolved config | `get_exec()` `get_memory()` `get_schedule()` `get_model()` `get_spec()` `get_serving()` `get_observability()` `get_disagg()` `get_lora()` `get_mm()` `get_device()` | namespace **config bags** — the single source of truth for resolved config; leaves are real attributes (dynamo-traceable) | projected from `server_args` at `publish`; mutated only via `get_context().override` |
 | runtime flags | `get_flags()` | state that is *not* a pure function of config: `capture` (cuda-graph lifecycle), `moe` (ACTIVE backends, swappable), `dp` (DP-attention runtime flags) | materialized at subsystem init; groups offer `override()` for tests |
 | resources | `get_resources()`, `get_stream(name)`, `get_buffer(name, factory)` | process-level handles: graph pools, EPLB state, EP dispatcher state, named side streams, workspace buffers | lazy; cleared by `reset_context()` |
@@ -133,12 +133,11 @@ wins on the accessor, so a config-intent read of those goes through
 `False` — but report the *effective* topology, never the requested size;
 a config-intent read would need its own accessor, which no call site
 requires today). A process-global seed field-read of one of these
-sizes (`get_server_args().tp_size`, or an alias of it) is a read-ratchet failure; the
+sizes (`get_server_args().tp_size`, or an alias of it) violates this contract; the
 sites that legitimately go around the live property are the `configured_*_size()`
-readers, and those are what the ratchet registers, each with its reason
-(`_CONFIGURED_SIZE_CALL_SITES` in `scripts/lint/check_global_config_read_ratchet.py`). A
-`server_args` the object was *handed* is a different thing and not a ratchet
-matter — see "Reads that legitimately stay on a ServerArgs instance".
+readers, and each should carry the reason the live property cannot serve it. A
+`server_args` the object was *handed* is a different thing and outside the
+contract — see "Reads that legitimately stay on a ServerArgs instance".
 Fail-loud is narrower: before dist init, a live size/group read raises — except
 the DCP pair, which degrades instead (`dcp_enabled` → `False`,
 `attn_dcp_size` → `1` when no group is installed;
@@ -151,7 +150,7 @@ this).
 
 ### Reading config: the seed is off limits
 
-`get_server_args().field` in business code is a ratchet failure. Read:
+`get_server_args().field` in business code is off limits. Read:
 
 - **a resolved leaf** → its namespace bag (`get_exec().moe.moe_runner_backend`,
   `get_schedule().chunked_prefill_size`, …). Bag-backed reads — a leaf directly, or
@@ -188,14 +187,10 @@ this).
   `get_parallel().attn_dcp_size` / `.dcp_enabled`, which answer the effective
   topology (`1` / `False` when no group is installed). A site
   that must know the *requested* DCP size before dist init needs its own
-  `configured_dcp_size()` (and an entry in `_CONFIGURED_SIZE_CALL_SITES`, which lives
-  in the ratchet checker, not in this skill); note the live pair does not *need*
+  `configured_dcp_size()`; note the live pair does not *need*
   dist init — with no group it answers `1` / `False` — it just cannot answer
-  with the requested size. Every (file, accessor) pair is registered
-  with its reason in `scripts/lint/check_global_config_read_ratchet.py`
-  (`_CONFIGURED_SIZE_CALL_SITES`), and that checker fails if the code and the list
-  disagree — a new file, or a new accessor in a listed file, has to be added — so a new site needs both an answer the live property cannot give and
-  an entry saying what it is.
+  with the requested size. A new `configured_*_size()` call site needs both an
+  answer the live property cannot give and a comment saying what that is.
 - **this runner's resolved value** → the runner
   (`prefill_attention_backend_str`, `kv_cache_dtype_str`,
   `draft_attention_backend`, `num_fused_shared_experts` on the model).
@@ -378,39 +373,30 @@ ONE thread — do not design for TBO threads that don't exist.
    resolved config with `get_context().override`; hand a per-runner value to its
    runner as a constructor argument. Projected bags are sealed the same way (leaf
    assignment raises).
-2. **Mutation guard** (`scripts/lint/check_server_args_mutation_ratchet.py`, pinned at 0 over the whole
-   package minus the pipeline / multimodal_gen): textual scan for assignment forms. Never
-   raise the baseline.
-3. **No-copy contract** (`test_server_args_no_instance_mutation_entry.py`): neither
+2. **No-copy contract** (`test_server_args_no_instance_mutation_entry.py`): neither
    `ServerArgs.override` nor `ServerArgs.derive` exists, and nothing in the package
    calls either form. Rerouting a writer to the bags means flipping **all its readers
    in the same commit** (no transitional dual-write).
-4. **Legacy-accessor ratchet** (`scripts/lint/check_legacy_global_ratchet.py`): `get_global_server_args`
-   call sites must not grow. The replacement for a *decision* is a bag leaf, a named
-   accessor, or the owning runner's stamp — not `get_server_args().field`, which the
-   read ratchet below pins at zero. `runtime_context.get_server_args()` is only for the
-   whole-object shapes (dumps, provenance, a hand-off to a callee that takes a config).
-5. **Global config read ratchet** (`scripts/lint/check_global_config_read_ratchet.py`): baselines are
-   **0** for both the direct `get_server_args().field` and the alias form (function-local
-   — including local copies of an alias, `cfg = sa` — module-level, or parked on an
-   instance attribute, plus the `getattr(..., "field")` spelling of each; a name
-   computed at runtime or indirection deeper than a local name copy is census-tool
-   territory, per the checker's module docstring). The scanners match `get_server_args` and
-   `configured_*_size` by their literal names, and the same file *bans*
-   `import ... as` renames of them so that matching stays sound. Exempt by owner
-   module only (`runtime_context.py`, `server_args.py`, `arg_groups/`). The same file
-   carries `_CONFIGURED_SIZE_CALL_SITES`, the (file, accessor) map of every
-   `configured_*_size()` reader with the reason the live property cannot serve it — a new
-   file or a new accessor in a listed file must be added there.
-6. **Module-state ratchet** (`scripts/lint/check_module_state_ratchet.py`): `global` statements in the
-   flag-owning layers are pinned by name. A new module-level runtime global belongs on a
-   flags group / resources slot instead; migrating a pinned survivor must shrink the pin.
-7. **Namespace coverage** (`test_server_args_namespaces.py`,
+3. **Namespace coverage** (`test_server_args_namespaces.py`,
    `test_runtime_context_config_bags.py`): every `ServerArgs` field carries `NS(...)`
    metadata and the projected bags must cover the fields exactly (two-way).
 
-Never module-skip a test "until the migration settles" — seed the context instead
-(the deferral ratchet that once pinned this is retired; the rule stands).
+The remaining conventions are review-enforced; no checker pins them:
+
+- No new `get_global_server_args` / `set_global_server_args_for_*` call sites. The
+  replacement for a *decision* is a bag leaf, a named accessor, or the owning
+  runner's stamp. `runtime_context.get_server_args()` is only for the whole-object
+  shapes (dumps, provenance, a hand-off to a callee that takes a config).
+- No `get_server_args().field` reads in business code, in any spelling (a local
+  alias `cfg = sa`, a module-level or instance-parked copy, `getattr(..., "field")`).
+  The owner modules `runtime_context.py` / `server_args.py` / `arg_groups/` are where
+  such reads belong.
+- No new module-level runtime `global` in the flag-owning layers — it belongs on a
+  flags group / resources slot, which have lifecycle reset and a scoped override.
+- No server_args field assignment outside the resolution pipeline; the strict
+  `__setattr__` guard above already raises on the paths tests execute.
+
+Never module-skip a test "until the migration settles" — seed the context instead.
 
 ## Hard-won pitfalls (check these before/while refactoring)
 
@@ -456,9 +442,6 @@ Key source files: `python/sglang/srt/runtime_context.py` (the container, every t
 `publish`, `_ConfigBag`, `preserve_config`, `override_server_args`),
 `python/sglang/srt/arg_groups/overrides.py` (override registry, passes,
 `declare_late_resolution`), `python/sglang/srt/server_args.py` (`NS` metadata,
-`Arg(..., resolvable=True)`, `__setattr__` strict guard), the static guardrails under
-`scripts/lint/` (`check_server_args_mutation_ratchet.py`,
-`check_global_config_read_ratchet.py`, `check_legacy_global_ratchet.py`,
-`check_module_state_ratchet.py`), and the runtime guardrail tests under
+`Arg(..., resolvable=True)`, `__setattr__` strict guard), and the guardrail tests under
 `test/registered/unit/` (`test_server_args_namespaces.py`, `test_runtime_context.py` — the latter doubles
 as executable documentation of every tier's semantics).

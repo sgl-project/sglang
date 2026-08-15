@@ -10,9 +10,10 @@ constructor argument, and late launcher-stage resolution writes in place
 through ``arg_groups.overrides.declare_late_resolution``, which refuses the
 published instance.
 
-The textual half of this guard matters because the resolution pipeline's own file
-is exempt from the mutation ratchet: a ``self.override(...)`` there — exactly
-what the LoRA normalization used — is invisible to it.
+The textual half of this guard matters because the strict ``__setattr__`` check
+only fires on paths a test actually executes: a ``self.override(...)`` inside the
+resolution pipeline — exactly what the LoRA normalization used — would otherwise
+go unnoticed.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci

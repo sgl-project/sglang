@@ -972,8 +972,8 @@ class RuntimeContext:
 
         This is the sanctioned way for a test to get a published context, and
         it stays. The transitional reason it was introduced for — production
-        code branching on raw ``server_args`` fields at runtime — is gone (the
-        read ratchet pins business reads at zero), but a test that exercises
+        code branching on raw ``server_args`` fields at runtime — is gone, but
+        a test that exercises
         bag readers still needs bags, and the bag tree is projected *from an
         instance*: something has to publish one. Prefer the finer-grained
         scoped overrides (``get_exec().override(...)``, the flag groups'
@@ -1532,7 +1532,7 @@ def cutedsl_moe_max_num_tokens() -> int:
 # *configured* instead — before the groups exist, in a process that has none,
 # or where the live value is deliberately aliased to another dimension. Each
 # accessor below names that intent so no business call site has to reach for
-# the startup record; the per-site reasons live in the read ratchet.
+# the startup record.
 #
 # They read the published leaf rather than the record: the bag is what
 # ``override`` writes, and once the instance holds only the user's raw input
