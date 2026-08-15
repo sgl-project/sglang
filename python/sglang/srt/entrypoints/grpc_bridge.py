@@ -299,8 +299,12 @@ class RuntimeHandle:
             gen = self.tokenizer_manager.generate_request(obj, request=request)
             if stream:
                 completed_choices = set()
-                expected_choices = obj.batch_size * obj.parallel_sample_num
+                # `generate_request` normalizes `obj` when the async generator
+                # starts. Do not read its derived fields before then.
+                expected_choices = None
                 async for chunk in gen:
+                    if expected_choices is None:
+                        expected_choices = obj.batch_size * obj.parallel_sample_num
                     choice_finished = (
                         chunk.get("meta_info", {}).get("finish_reason") is not None
                     )
