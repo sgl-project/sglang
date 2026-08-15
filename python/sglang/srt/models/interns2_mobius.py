@@ -91,6 +91,10 @@ def _normalize_mobius_weight_name(name: str) -> str:
     return name
 
 
+def _is_optional_mobius_parameter(name: str) -> bool:
+    return name.endswith((".attn.k_scale", ".attn.v_scale"))
+
+
 def _load_fused_mobius_expert_weight(
     *,
     name: str,
@@ -99,8 +103,17 @@ def _load_fused_mobius_expert_weight(
     num_experts: int,
     record_slot,
 ) -> None:
-    if name.endswith("experts.gate_up_proj"):
-        parameter_name = name.replace("experts.gate_up_proj", "experts.w13_weight")
+    gate_up_suffixes = {
+        "experts.gate_up_proj": "experts.w13_weight",
+        "experts.gate_up_proj_scale_inv": "experts.w13_weight_scale_inv",
+    }
+    gate_up_suffix = next(
+        (suffix for suffix in gate_up_suffixes if name.endswith(suffix)), None
+    )
+    if gate_up_suffix is not None:
+        parameter_name = (
+            name.removesuffix(gate_up_suffix) + gate_up_suffixes[gate_up_suffix]
+        )
         if parameter_name not in params_dict:
             raise KeyError(
                 f"Mobius fused gate/up destination is missing: {parameter_name}"
@@ -127,8 +140,15 @@ def _load_fused_mobius_expert_weight(
                 )
         return
 
-    if name.endswith("experts.down_proj"):
-        parameter_name = name.replace("experts.down_proj", "experts.w2_weight")
+    down_suffixes = {
+        "experts.down_proj": "experts.w2_weight",
+        "experts.down_proj_scale_inv": "experts.w2_weight_scale_inv",
+    }
+    down_suffix = next(
+        (suffix for suffix in down_suffixes if name.endswith(suffix)), None
+    )
+    if down_suffix is not None:
+        parameter_name = name.removesuffix(down_suffix) + down_suffixes[down_suffix]
         if parameter_name not in params_dict:
             raise KeyError(
                 f"Mobius fused down destination is missing: {parameter_name}"
@@ -166,11 +186,15 @@ def _expected_mobius_load_slots(
         if parameter_id in seen_parameters:
             continue
         seen_parameters.add(parameter_id)
-        if ".meta_mlp." in name and name.endswith("experts.w13_weight"):
+        if ".meta_mlp." in name and name.endswith(
+            ("experts.w13_weight", "experts.w13_weight_scale_inv")
+        ):
             for expert_id in range(num_experts):
                 expected.add((name, "w1", expert_id))
                 expected.add((name, "w3", expert_id))
-        elif ".meta_mlp." in name and name.endswith("experts.w2_weight"):
+        elif ".meta_mlp." in name and name.endswith(
+            ("experts.w2_weight", "experts.w2_weight_scale_inv")
+        ):
             for expert_id in range(num_experts):
                 expected.add((name, "w2", expert_id))
         elif ".qkv_proj." in name and name.startswith("model.layers."):
@@ -185,6 +209,8 @@ def _expected_mobius_load_slots(
         elif ".in_proj_ba." in name:
             expected.add((name, 0, None))
             expected.add((name, 1, None))
+        elif _is_optional_mobius_parameter(name):
+            continue
         else:
             expected.add((name, None, None))
     return expected
@@ -215,7 +241,12 @@ def _load_mobius_weights_strict(
 
         name = _normalize_mobius_weight_name(source_name)
         if ".meta_mlp." in name and name.endswith(
-            ("experts.gate_up_proj", "experts.down_proj")
+            (
+                "experts.gate_up_proj",
+                "experts.down_proj",
+                "experts.gate_up_proj_scale_inv",
+                "experts.down_proj_scale_inv",
+            )
         ):
             _load_fused_mobius_expert_weight(
                 name=name,
@@ -250,6 +281,8 @@ def _load_mobius_weights_strict(
                 )
             parameter = params_dict[name]
             loader = getattr(parameter, "weight_loader", default_weight_loader)
+            if _is_optional_mobius_parameter(name):
+                expected_slots.add((name, None, None))
             record_slot(name)
             loader(parameter, loaded_weight)
 
@@ -802,6 +835,16 @@ class InternS2MobiusForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         prefix: str = "",
         language_model_cls=InternS2MobiusForCausalLM,
     ) -> None:
+        ignored_layers = getattr(quant_config, "ignored_layers", None)
+        if (
+            getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+            and ignored_layers
+        ):
+            # HF treats these parent entries as exact names; SGLang prefix matching
+            # would also skip their quantized qkv/z and output projections.
+            quant_config.ignored_layers = [
+                name for name in ignored_layers if not name.endswith(".linear_attn")
+            ]
         super().__init__(config, quant_config, prefix, language_model_cls)
 
     def should_apply_lora(self, module_name: str) -> bool:
