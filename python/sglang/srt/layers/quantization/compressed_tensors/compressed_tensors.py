@@ -200,6 +200,22 @@ class CompressedTensorsConfig(QuantizationConfig):
                     use_triton_kernels, use_flashinfer_trtllm_moe, use_deep_gemm
                 )
             return CompressedTensorsFusedMoEMethod(self)
+
+        # ParallelLMHead subclasses VocabParallelEmbedding but is a linear
+        # (logits = hidden @ weight.T); apply the matching linear scheme so a
+        # quantized lm_head (e.g. FP8 per-channel) is dequantized correctly
+        # instead of being consumed as a raw bf16 tensor.
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        if isinstance(layer, ParallelLMHead):
+            try:
+                scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
+            except ValueError:
+                scheme = None
+            if scheme is not None:
+                layer.scheme = scheme
+                return CompressedTensorsLinearMethod(self)
+
         return None
 
     def _add_fused_moe_to_target_scheme_map(self):
