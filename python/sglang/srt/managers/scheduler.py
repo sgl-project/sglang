@@ -188,6 +188,7 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
+    RecentPrefillBatchSizeTracker,
 )
 from sglang.srt.managers.rust_server import RustServer
 from sglang.srt.managers.schedule_batch import (
@@ -1211,7 +1212,10 @@ class Scheduler(
             self.schedule_low_priority_values_first,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
-        self.max_prefill_bs: float = 0.0
+        self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
+            window_size=envs.SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE.get()
+        )
+        self.max_prefill_bs: int = 0
         if get_schedule().enable_prefill_delayer:
             if get_disagg().disaggregation_mode == "decode":
                 logger.info(
@@ -3156,11 +3160,6 @@ class Scheduler(
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
-            # Decay the max-prefill-bs high-watermark once per pass so one
-            # unusually large admission burst does not permanently raise the
-            # slot_condition bar in the delayer (0.998/pass ~= half-life of
-            # ~350 forward passes).
-            self.max_prefill_bs *= 0.998
             # Get max usage across all pools for prefill delay decision
             max_pool_usage = (
                 self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
@@ -3175,7 +3174,13 @@ class Scheduler(
         )
 
         if self.prefill_delayer:
-            prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
+            observed_prefill_bs = prefill_delayer_single_pass.finalize(
+                actual_prefill_bs=ret.batch_size() if ret is not None else 0
+            )
+            if observed_prefill_bs > 0:
+                self.max_prefill_bs = self.prefill_bs_tracker.observe_attempt(
+                    observed_prefill_bs
+                )
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
@@ -3400,7 +3405,6 @@ class Scheduler(
             self.chunked_req is None or len(can_run_list) != 1
         )
 
-        self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
