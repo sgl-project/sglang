@@ -14,12 +14,16 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
+    QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import (
+    ModelSlimMXFP4MoEScheme,
     ModelSlimMXFP4Scheme,
+    ModelSlimMXFP4W4A8MoEScheme,
     ModelSlimMXFP4W4A8Scheme,
     ModelSlimMXFP8MoEScheme,
     ModelSlimMXFP8Scheme,
+    ModelSlimQFP8DynamicKVFP8Scheme,
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
     ModelSlimW4A8Int8MoE,
@@ -35,12 +39,45 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
-    from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
     from sglang.srt.layers.quantization.modelslim.schemes import (
+        ModelSlimKVSchemeBase,
         ModelSlimLinearScheme,
+        ModelSlimMoEScheme,
     )
 
 logger = logging.getLogger(__name__)
+
+
+class ModelSlimQFP8DynamicKVFP8Method(QuantizeMethodBase):
+    """Weight-only method: attention backends consume the registered scales."""
+
+    def __init__(self, scheme: ModelSlimQFP8DynamicKVFP8Scheme) -> None:
+        self.scheme = scheme
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_heads: Optional[int] = None,
+        num_kv_heads: Optional[int] = None,
+        **extra_weight_attrs,
+    ) -> None:
+        del extra_weight_attrs
+        if num_heads is None:
+            num_heads = layer.tp_q_head_num
+        if num_kv_heads is None:
+            num_kv_heads = layer.tp_k_head_num
+        self.scheme.create_weights(
+            layer, num_heads=num_heads, num_kv_heads=num_kv_heads
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.scheme.process_weights_after_loading(layer)
+
+    def apply(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
+        raise RuntimeError(
+            "ModelSlimQFP8DynamicKVFP8Method.apply is not a forward kernel; "
+            "the NPU attention backend must consume the registered scales."
+        )
 
 
 # func refers to RMSNorm.__init__
@@ -168,6 +205,12 @@ class ModelSlimConfig(QuantizationConfig):
                 return candidate
         return prefix
 
+    def _resolve_kv_prefix(self, prefix: str) -> str:
+        for candidate in self._quant_prefix_candidates(prefix):
+            if candidate + ".quant_type" in self.quant_description:
+                return candidate
+        return prefix
+
     def get_linear_method(self) -> ModelSlimLinearMethod:
         return ModelSlimLinearMethod(self)
 
@@ -200,7 +243,12 @@ class ModelSlimConfig(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
+        kv_method = self._maybe_get_kv_method(prefix)
+        if kv_method is not None:
+            return kv_method
+
         if isinstance(layer, LinearBase):
+            runtime_prefix = prefix
             # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
             key = "model"
             if "vision_model" in prefix:
@@ -225,6 +273,8 @@ class ModelSlimConfig(QuantizationConfig):
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
             if layer.scheme is None:
                 return UnquantizedLinearMethod()
+            if isinstance(layer.scheme, ModelSlimMXFP8Scheme):
+                layer.scheme.configure_runtime_prefix(runtime_prefix)
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
             moe_schemes = self.get_moe_scheme(layer, prefix)
@@ -237,6 +287,26 @@ class ModelSlimConfig(QuantizationConfig):
             )
             return ModelSlimFusedMoEMethod(self)
         return None
+
+    def get_kv_scheme(self, prefix: str, quant_type: str) -> ModelSlimKVSchemeBase:
+        if quant_type == "Q_FP8_DYNAMIC_KV_FP8":
+            return ModelSlimQFP8DynamicKVFP8Scheme(
+                quant_config=self.quant_description, prefix=prefix
+            )
+        raise NotImplementedError(
+            f"No ModelSlim KV scheme registered for quant_type={quant_type!r}."
+        )
+
+    def _maybe_get_kv_method(
+        self, prefix: str
+    ) -> Optional[ModelSlimQFP8DynamicKVFP8Method]:
+        resolved_prefix = self._resolve_kv_prefix(prefix)
+        kv_quant_type = self.quant_description.get(f"{resolved_prefix}.quant_type")
+        if kv_quant_type != "Q_FP8_DYNAMIC_KV_FP8":
+            return None
+        return ModelSlimQFP8DynamicKVFP8Method(
+            self.get_kv_scheme(resolved_prefix, kv_quant_type)
+        )
 
     def get_linear_scheme(
         self, layer: torch.nn.Module, prefix: Optional[str] = None
@@ -276,6 +346,8 @@ class ModelSlimConfig(QuantizationConfig):
     ):
         moe_quant_schemes = [
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
+            ("W4A4_MXFP4", ModelSlimMXFP4MoEScheme),
+            ("W4A8_MXFP", ModelSlimMXFP4W4A8MoEScheme),
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
             ("W8A8_MXFP8", ModelSlimMXFP8MoEScheme),
@@ -304,7 +376,10 @@ class ModelSlimConfig(QuantizationConfig):
                     for key in w13_keys
                     if key in self.quant_description
                 }
-                if w13_entries and w2_key in self.quant_description:
+                if (
+                    len(w13_entries) == len(w13_keys)
+                    and w2_key in self.quant_description
+                ):
                     w13_names = list(w13_entries.values())
                     # For w13, both projections must agree on the scheme
                     unique_w13 = set(w13_names)
@@ -330,12 +405,12 @@ class ModelSlimConfig(QuantizationConfig):
                         f"{candidate}.0.{up_name}.weight",
                     ]
                     w2_key = f"{candidate}.0.{down_name}.weight"
-                    w13_found = any(k in self.quant_description for k in w13_keys)
+                    w13_found = sum(k in self.quant_description for k in w13_keys)
                     w2_found = w2_key in self.quant_description
                     status = (
                         f"{candidate} "
                         f"({gate_name}/{up_name}="
-                        f"{'found' if w13_found else 'missing'}, "
+                        f"{w13_found}/{len(w13_keys)} found, "
                         f"{down_name}={'found' if w2_found else 'missing'})"
                     )
                     all_attempted.append(status)

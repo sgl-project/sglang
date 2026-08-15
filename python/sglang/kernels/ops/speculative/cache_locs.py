@@ -21,6 +21,9 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
 
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.utils import is_ascend_a5
+
 if _is_cpu:
     from sgl_kernel import assign_extend_cache_locs_cpu
 
@@ -462,13 +465,26 @@ def assign_extend_cache_locs_func(
             dtype=torch.int32,
             device=device,
         )
-        torch.ops.npu.cache_loc_update(
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-        )
+        if is_ascend_a5():
+            from sglang.kernels.ops.speculative.cache_locs_npu import (
+                read_cache_locations_npu,
+            )
+
+            read_cache_locations_npu(
+                req_pool_indices=req_pool_indices,
+                token_pool=req_to_token,
+                start_offset=start_offset,
+                end_offset=end_offset,
+                out_cache_loc=out_cache_loc,
+            )
+        else:
+            torch.ops.npu.cache_loc_update(
+                req_pool_indices,
+                req_to_token,
+                start_offset,
+                end_offset,
+                out_cache_loc,
+            )
 
         return out_cache_loc
 

@@ -28,11 +28,12 @@ from sglang.srt.layers.quantization.fp8_utils import (
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -77,6 +78,12 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
 
         if self.strategy == QuantizationStrategy.BLOCK:
             assert self.weight_block_size is not None
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                    validate_npu_block_fp8_model_dtype,
+                )
+
+                validate_npu_block_fp8_model_dtype(params_dtype)
             layer.weight_block_size = self.weight_block_size
             # Validate block quantization shapes
             validate_fp8_block_shape(
@@ -190,7 +197,31 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
 
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
-            if is_fp8_fnuz():
+            assert self.weight_block_size is not None
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                    _npu_is_a5_for_tensor,
+                    relayout_npu_block_fp8_weight,
+                )
+
+                if layer.weight.device.type != "npu" or (
+                    layer.weight_scale.device != layer.weight.device
+                ):
+                    raise RuntimeError(
+                        "Ascend compressed-tensors block-FP8 weights and scales "
+                        "must share one NPU device."
+                    )
+                weight, weight_scale = relayout_npu_block_fp8_weight(
+                    layer.weight.data,
+                    layer.weight_scale.data,
+                    self.weight_block_size,
+                    before_a5=not _npu_is_a5_for_tensor(layer.weight),
+                )
+                layer.weight.data = weight
+                layer.weight_scale.data = weight_scale
+                layer.weight.requires_grad_(False)
+                layer.weight_scale.requires_grad_(False)
+            elif is_fp8_fnuz():
                 weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                     weight=layer.weight, weight_scale=layer.weight_scale
                 )

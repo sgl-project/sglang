@@ -30,7 +30,7 @@ from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, is_sm100_supported, retry
+from sglang.srt.utils import is_hip, is_npu_atlas_a5, is_sm100_supported, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -209,6 +209,73 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
         return max(layer_id - offset + 1, 0) % freq != 0
 
     return max(layer_id - 1, 0) % freq != 0
+
+
+def resolve_dsa_indexer_layer_ids(
+    config: PretrainedConfig,
+    start_layer: int,
+    end_layer: int,
+    is_nextn: bool = False,
+) -> tuple[int, ...]:
+    """Return global layer ids that own a physical DSA Indexer.
+
+    Target layers marked ``skip_topk`` reuse a preceding result and do not
+    instantiate an Indexer.  NextN layers still instantiate one even though
+    they participate in top-k sharing with the target model.
+    """
+    assert is_deepseek_dsa(config)
+    assert (
+        0 <= start_layer <= end_layer
+    ), f"Invalid DSA layer range: [{start_layer}, {end_layer})"
+    if is_nextn:
+        return tuple(range(start_layer, end_layer))
+    index_cli_factor = _hf_attr(config, "cli_factor") or 1
+    if index_cli_factor > 1:
+        return tuple(
+            layer_id
+            for layer_id in range(start_layer, end_layer)
+            if layer_id % index_cli_factor == 0
+        )
+    return tuple(
+        layer_id
+        for layer_id in range(start_layer, end_layer)
+        if not dsa_layer_skips_topk(config, layer_id)
+    )
+
+
+def can_use_compact_npu_dsa_indexer_cache(server_args) -> bool:
+    """Whether Ascend transfer protocols support a non-uniform layer layout."""
+    return (
+        server_args.disaggregation_mode == "null"
+        and not server_args.enable_hierarchical_cache
+    )
+
+
+def can_use_npu_quant_lightning_indexer(
+    server_args,
+    config: PretrainedConfig,
+    kv_cache_dtype: torch.dtype,
+    device_id: int = 0,
+) -> bool:
+    """Whether the A5 quantized Indexer and its scale cache are usable."""
+    if (
+        is_deepseek_dsa(config)
+        and kv_cache_dtype == torch.float8_e4m3fn
+        and server_args.enable_hierarchical_cache
+    ):
+        raise ValueError(
+            "Ascend DSA with an FP8 KV cache does not support hierarchical "
+            "cache yet: HiCache does not transfer the Indexer FP32 scale "
+            "buffer required by npu_quant_lightning_indexer. Use BF16 KV "
+            "cache or disable hierarchical cache."
+        )
+    return (
+        is_deepseek_dsa(config)
+        and _hf_attr(config, "index_head_dim") == 128
+        and kv_cache_dtype == torch.float8_e4m3fn
+        and not server_args.enable_hierarchical_cache
+        and is_npu_atlas_a5(device_id)
+    )
 
 
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:

@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     eagle_use_aux_hidden_state: bool = False
     eagle_draft_num_layers: Optional[int] = None
+    eagle_draft_kv_cache_dtype: Any = None
     eagle_aux_hidden_state_layer_ids: Any = None
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
@@ -78,6 +79,21 @@ def _resolve_eagle_aux_hidden_state(
                     draft_model_config.num_attention_layers,
                 )
             )
+        from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+
+        _, config.eagle_draft_kv_cache_dtype = configure_kv_cache_dtype(
+            server_args_kv_cache_dtype=server_args.kv_cache_dtype,
+            speculative_draft_kv_cache_dtype=(
+                server_args.speculative_draft_kv_cache_dtype
+            ),
+            model=None,
+            model_dtype=draft_model_config.dtype,
+            is_draft_worker=True,
+            is_dflash=False,
+            speculative_draft_attention_backend=(
+                server_args.speculative_draft_attention_backend
+            ),
+        )
 
         if spec_algorithm.is_eagle3():
             config.eagle_use_aux_hidden_state = True

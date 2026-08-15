@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.spec_tree import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
+from sglang.srt.hardware_backend.npu.utils import is_ascend_a5
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.runtime_context import get_parallel, get_spec
@@ -219,7 +220,24 @@ def build_tree_kernel_efficient(
     # then, positions = [7, 8, 8, 9]
     positions = torch.empty((bs * num_verify_tokens,), device=device, dtype=torch.long)
 
-    if _is_npu:
+    if _is_npu and is_ascend_a5() and tree_mask_mode == TreeMaskMode.FULL_MASK:
+        from sglang.kernels.ops.speculative.spec_tree_npu import build_full_tree_npu
+
+        build_full_tree_npu(
+            parent_list=parent_list.to(dtype=torch.int64),
+            selected_index=top_scores_index,
+            verified_seq_len=seq_lens,
+            tree_mask=tree_mask,
+            positions=positions,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            topk=topk,
+            draft_token_num=num_verify_tokens,
+        )
+    elif _is_npu:
+        # The A5 vector-core kernel intentionally supports FULL_MASK only. Keep
+        # the established vendor op for QLEN_ONLY and bit-packed layouts.
         torch.ops.npu.build_tree_kernel_efficient(
             parent_list.to(dtype=torch.int64),
             top_scores_index,
@@ -411,6 +429,20 @@ def verify_tree_greedy_func(
             target_predict=target_predict,
         )
 
+    elif _is_npu and is_ascend_a5():
+        # The shared Triton verifier follows next-token/sibling links and is
+        # therefore correct for branching trees (topk > 1). Do not replace it
+        # with the old linear-chain A5 verifier.
+        verify_tree_greedy_triton(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            target_predict=target_predict,
+        )
     elif _is_npu:
         from sgl_kernel_npu.sample.verify_tree_greedy import verify_tree_greedy
 
@@ -723,13 +755,45 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
+    if sampling_info.is_all_greedy or _is_cpu or _is_hip or _is_xpu:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
             accept_token_num=num_correct_drafts,  # mutable
+            candidates=candidates,
+            retrieve_index=verify_input.retrieve_index,
+            retrieve_next_token=verify_input.retrieve_next_token,
+            retrieve_next_sibling=verify_input.retrieve_next_sibling,
+            target_predict=target_predict,
+            topk=verify_input.tree_topk,
+        )
+    elif _is_npu:
+        from sglang.srt.speculative.npu_sampling import sample_npu_target_tokens
+
+        target_predict = sample_npu_target_tokens(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            positions=verify_input.positions,
+            tree_topk=verify_input.tree_topk,
+            num_draft_tokens=verify_input.draft_token_num,
+            max_tree_depth=verify_input.max_tree_depth,
+            retrieve_index_shape=tuple(verify_input.retrieve_index.shape),
+            batch_size=bs,
+        ).to(candidates.dtype)
+        target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+        tp_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(target_predict, src=0)
+        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+            predicts=predict,
+            accept_index=accept_index,
+            accept_token_num=num_correct_drafts,
             candidates=candidates,
             retrieve_index=verify_input.retrieve_index,
             retrieve_next_token=verify_input.retrieve_next_token,

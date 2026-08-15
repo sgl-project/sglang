@@ -1,9 +1,13 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.attention.fp8_contracts import (
+    DSA_KV_QUANT_TILE_SIZE,
+    get_dsa_fp8_packed_cache_dim,
+)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -536,6 +540,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         index_head_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        indexer_layer_ids: Optional[Sequence[int]] = None,
+        enable_npu_quant_lightning_indexer: bool = False,
+        kv_cache_dim: Optional[int] = None,
     ):
         super(MLATokenToKVPool, self).__init__(
             size=size,
@@ -551,6 +558,81 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+        if self.index_head_dim is None:
+            if indexer_layer_ids:
+                raise ValueError(
+                    "indexer_layer_ids must be empty when index_head_dim is None"
+                )
+            resolved_indexer_layer_ids = ()
+        elif indexer_layer_ids is None:
+            # Keep the legacy uniform layout for callers and transfer paths
+            # that do not provide explicit logical-layer metadata.
+            resolved_indexer_layer_ids = tuple(
+                range(self.start_layer, self.start_layer + self.layer_num)
+            )
+        else:
+            resolved_indexer_layer_ids = tuple(indexer_layer_ids)
+            if len(set(resolved_indexer_layer_ids)) != len(resolved_indexer_layer_ids):
+                raise ValueError(
+                    "indexer_layer_ids must not contain duplicates: "
+                    f"{resolved_indexer_layer_ids}"
+                )
+            if resolved_indexer_layer_ids != tuple(sorted(resolved_indexer_layer_ids)):
+                raise ValueError(
+                    "indexer_layer_ids must be in increasing logical-layer order: "
+                    f"{resolved_indexer_layer_ids}"
+                )
+            layer_end = self.start_layer + self.layer_num
+            invalid_layer_ids = [
+                layer_id
+                for layer_id in resolved_indexer_layer_ids
+                if layer_id < self.start_layer or layer_id >= layer_end
+            ]
+            if invalid_layer_ids:
+                raise ValueError(
+                    "indexer_layer_ids must be absolute layer ids in the local "
+                    f"stage range [{self.start_layer}, {layer_end}), got "
+                    f"{invalid_layer_ids}"
+                )
+
+        if enable_npu_quant_lightning_indexer:
+            if self.index_head_dim != 128:
+                raise ValueError(
+                    "npu_quant_lightning_indexer requires index_head_dim=128"
+                )
+            if dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "npu_quant_lightning_indexer requires an FP8 E4M3 KV cache"
+                )
+        self.indexer_layer_ids = resolved_indexer_layer_ids
+        self.num_indexer_layers = len(self.indexer_layer_ids)
+        self.indexer_layer_id_to_slot = {
+            layer_id: slot for slot, layer_id in enumerate(self.indexer_layer_ids)
+        }
+        self.enable_npu_quant_lightning_indexer = enable_npu_quant_lightning_indexer
+        self.dsa_kv_cache_store_fp8 = (
+            enable_npu_quant_lightning_indexer
+            and kv_cache_dim is not None
+            and kv_cache_dim != kv_lora_rank + qk_rope_head_dim
+        )
+        self.kv_cache_dim = (
+            kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
+        )
+        self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
+        self.k_store_dtype = self.store_dtype
+        self.v_store_dtype = self.store_dtype
+        if self.dsa_kv_cache_store_fp8:
+            expected_cache_dim = get_dsa_fp8_packed_cache_dim(
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+            )
+            if self.kv_cache_dim != expected_cache_dim:
+                raise ValueError(
+                    f"Unexpected packed DSA KV width {self.kv_cache_dim}; "
+                    f"expected {expected_cache_dim}."
+                )
+            self.k_store_dtype = torch.float8_e4m3fn
+            self.v_store_dtype = torch.bfloat16
 
         self.custom_mem_pool = None
 
@@ -562,9 +644,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     self.size // self.page_size + 1,
                     self.page_size,
                     1,
-                    self.kv_lora_rank,
+                    self.kv_cache_dim,
                 ),
-                dtype=self.store_dtype,
+                dtype=self.k_store_dtype,
                 device=self.device,
             )
             self.v_buffer = torch.zeros(
@@ -573,26 +655,49 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     self.size // self.page_size + 1,
                     self.page_size,
                     1,
-                    self.qk_rope_head_dim,
+                    self.kr_cache_dim,
                 ),
-                dtype=self.store_dtype,
+                dtype=self.v_store_dtype,
                 device=self.device,
             )
             self.index_k_buffer = None
+            self.index_k_scale_buffer = None
             if self.index_head_dim is not None:
                 self.index_k_buffer = torch.zeros(
                     (
-                        layer_num,
+                        self.num_indexer_layers,
                         self.size // self.page_size + 1,
                         self.page_size,
                         1,
                         self.index_head_dim,
                     ),
-                    dtype=self.store_dtype,
+                    dtype=self.k_store_dtype,
                     device=self.device,
                 )
+                if self.enable_npu_quant_lightning_indexer:
+                    self.index_k_scale_buffer = torch.zeros(
+                        (
+                            self.num_indexer_layers,
+                            self.size // self.page_size + 1,
+                            self.page_size,
+                            1,
+                        ),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
 
         self._finalize_allocation_log(size)
+
+    def _get_indexer_slot(self, layer_id: int) -> int:
+        if self.index_head_dim is None:
+            raise RuntimeError("This KV pool does not have an Indexer cache")
+        try:
+            return self.indexer_layer_id_to_slot[layer_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"Layer {layer_id} is not a physical Indexer layer; configured "
+                f"Indexer layers: {self.indexer_layer_ids}"
+            ) from exc
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -606,6 +711,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             assert hasattr(self, "index_k_buffer")
             for index_k_cache in self.index_k_buffer:
                 kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+            if self.index_k_scale_buffer is not None:
+                for index_k_scale_cache in self.index_k_scale_buffer:
+                    kv_size_bytes += get_tensor_size_bytes(index_k_scale_cache)
         return kv_size_bytes
 
     def get_kv_buffer(self, layer_id: int):
@@ -619,16 +727,35 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_state_buf_infos(self):
         if self.index_head_dim is None:
             return [], [], []
-        data_ptrs = [self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)]
-        data_lens = [self.index_k_buffer[i].nbytes for i in range(self.layer_num)]
-        item_lens = [self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)]
+        data_ptrs = [
+            self.index_k_buffer[i].data_ptr() for i in range(self.num_indexer_layers)
+        ]
+        data_lens = [
+            self.index_k_buffer[i].nbytes for i in range(self.num_indexer_layers)
+        ]
+        item_lens = [
+            self.index_k_buffer[i][0].nbytes for i in range(self.num_indexer_layers)
+        ]
+        if self.index_k_scale_buffer is not None:
+            data_ptrs += [
+                self.index_k_scale_buffer[i].data_ptr()
+                for i in range(self.num_indexer_layers)
+            ]
+            data_lens += [
+                self.index_k_scale_buffer[i].nbytes
+                for i in range(self.num_indexer_layers)
+            ]
+            item_lens += [
+                self.index_k_scale_buffer[i][0].nbytes
+                for i in range(self.num_indexer_layers)
+            ]
         return data_ptrs, data_lens, item_lens
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-        if self.store_dtype != self.dtype:
+        if self.k_store_dtype != self.dtype:
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.k_buffer[layer_id - self.start_layer]
 
@@ -636,17 +763,29 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-        if self.store_dtype != self.dtype:
+        if self.v_store_dtype == self.store_dtype and self.store_dtype != self.dtype:
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.v_buffer[layer_id - self.start_layer]
 
     def get_index_k_buffer(self, layer_id: int):
+        indexer_slot = self._get_indexer_slot(layer_id)
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-        if self.store_dtype != self.dtype:
-            return self.index_k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.index_k_buffer[layer_id - self.start_layer]
+        if self.k_store_dtype != self.dtype:
+            return self.index_k_buffer[indexer_slot].view(self.dtype)
+        return self.index_k_buffer[indexer_slot]
+
+    def get_index_k_scale_buffer(self, layer_id: int):
+        indexer_slot = self._get_indexer_slot(layer_id)
+        if self.index_k_scale_buffer is None:
+            raise RuntimeError(
+                "Indexer scale cache is unavailable because the quantized "
+                "lightning Indexer is disabled"
+            )
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.index_k_scale_buffer[indexer_slot]
 
     # for disagg
     def get_contiguous_buf_infos(self):
@@ -662,15 +801,107 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         ]
         if self.index_head_dim is not None:
             kv_data_ptrs += [
-                self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)
+                self.index_k_buffer[i].data_ptr()
+                for i in range(self.num_indexer_layers)
             ]
             kv_data_lens += [
-                self.index_k_buffer[i].nbytes for i in range(self.layer_num)
+                self.index_k_buffer[i].nbytes for i in range(self.num_indexer_layers)
             ]
             kv_item_lens += [
-                self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)
+                self.index_k_buffer[i][0].nbytes for i in range(self.num_indexer_layers)
             ]
+            if self.index_k_scale_buffer is not None:
+                kv_data_ptrs += [
+                    self.index_k_scale_buffer[i].data_ptr()
+                    for i in range(self.num_indexer_layers)
+                ]
+                kv_data_lens += [
+                    self.index_k_scale_buffer[i].nbytes
+                    for i in range(self.num_indexer_layers)
+                ]
+                kv_item_lens += [
+                    self.index_k_scale_buffer[i][0].nbytes
+                    for i in range(self.num_indexer_layers)
+                ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def get_kv_layer_ids(self):
+        """Logical layer ids aligned with ``get_contiguous_buf_infos``."""
+        local_layer_ids = list(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
+        layer_ids = local_layer_ids * 2
+        if self.index_head_dim is not None:
+            layer_ids += list(self.indexer_layer_ids)
+            if self.index_k_scale_buffer is not None:
+                layer_ids += list(self.indexer_layer_ids)
+        return layer_ids
+
+    def get_state_layer_ids(self):
+        layer_ids = list(self.indexer_layer_ids)
+        if self.index_k_scale_buffer is not None:
+            layer_ids += list(self.indexer_layer_ids)
+        return layer_ids
+
+    def _pack_dsa_fp8_kv_cache(
+        self,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        expected_cache_dim = get_dsa_fp8_packed_cache_dim(
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+        )
+        if self.kv_cache_dim != expected_cache_dim:
+            raise RuntimeError(
+                f"Unexpected packed DSA KV width {self.kv_cache_dim}; "
+                f"expected {expected_cache_dim}."
+            )
+        if cache_k.numel() != num_tokens * self.kv_lora_rank:
+            raise RuntimeError(
+                f"Unexpected DSA k_nope shape {tuple(cache_k.shape)} for "
+                f"{num_tokens} cache locations."
+            )
+        if cache_v.numel() != num_tokens * self.qk_rope_head_dim:
+            raise RuntimeError(
+                f"Unexpected DSA k_rope shape {tuple(cache_v.shape)} for "
+                f"{num_tokens} cache locations."
+            )
+
+        num_tiles = self.kv_lora_rank // DSA_KV_QUANT_TILE_SIZE
+        k_nope_tiles = (
+            cache_k.to(torch.bfloat16)
+            .reshape(num_tokens * num_tiles, DSA_KV_QUANT_TILE_SIZE)
+            .contiguous()
+        )
+        k_nope_fp8, k_nope_scale = torch_npu.npu_dynamic_quant(
+            k_nope_tiles, dst_type=torch.float8_e4m3fn
+        )
+        k_nope_fp8 = k_nope_fp8.reshape(num_tokens, 1, self.kv_lora_rank).contiguous()
+        k_rope_bf16 = (
+            cache_v.to(torch.bfloat16)
+            .reshape(num_tokens, 1, self.qk_rope_head_dim)
+            .contiguous()
+        )
+        k_nope_scale = (
+            k_nope_scale.to(torch.float32)
+            .reshape(num_tokens, 1, num_tiles)
+            .contiguous()
+        )
+
+        packed = torch.empty(
+            (num_tokens, 1, self.kv_cache_dim),
+            dtype=torch.float8_e4m3fn,
+            device=cache_k.device,
+        )
+        packed_bytes = packed.view(torch.uint8)
+        rope_begin = self.kv_lora_rank
+        rope_end = rope_begin + self.qk_rope_head_dim * torch.bfloat16.itemsize
+        packed_bytes[..., :rope_begin].copy_(k_nope_fp8.view(torch.uint8))
+        packed_bytes[..., rope_begin:rope_end].copy_(k_rope_bf16.view(torch.uint8))
+        packed_bytes[..., rope_end:].copy_(k_nope_scale.view(torch.uint8))
+        return packed
 
     def set_kv_buffer(
         self,
@@ -681,6 +912,26 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
+        if self.dsa_kv_cache_store_fp8:
+            if cache_v is None:
+                cache_k, cache_v = cache_k.split(
+                    [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+                )
+            packed_cache = self._pack_dsa_fp8_kv_cache(cache_k, cache_v, loc.numel())
+            torch_npu.npu_scatter_nd_update_(
+                self.k_buffer[layer_id - self.start_layer].view(
+                    -1, 1, self.kv_cache_dim
+                ),
+                loc.view(-1, 1),
+                packed_cache,
+            )
+            return
+
+        if cache_v is None:
+            cache_k, cache_v = cache_k.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
@@ -688,11 +939,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
-
-        if cache_v is None:
-            cache_k, cache_v = cache_k.split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-            )
 
         torch_npu.npu_scatter_nd_update_(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
@@ -713,19 +959,60 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ):
+        indexer_slot = self._get_indexer_slot(layer_id)
         if index_k.dtype != self.dtype:
             index_k = index_k.to(self.dtype)
 
-        if self.store_dtype != self.dtype:
-            index_k = index_k.view(self.store_dtype)
+        if self.k_store_dtype != self.dtype:
+            index_k = index_k.view(self.k_store_dtype)
 
         torch_npu.npu_scatter_nd_update_(
-            self.index_k_buffer[layer_id - self.start_layer].view(
-                -1, 1, self.index_head_dim
-            ),
+            self.index_k_buffer[indexer_slot].view(-1, 1, self.index_head_dim),
             loc.view(-1, 1),
             index_k.view(-1, 1, self.index_head_dim),
         )
+
+    def set_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k_scale: torch.Tensor,
+    ):
+        indexer_slot = self._get_indexer_slot(layer_id)
+        if self.index_k_scale_buffer is None:
+            raise RuntimeError(
+                "Indexer scale cache is unavailable because the quantized "
+                "lightning Indexer is disabled"
+            )
+        torch_npu.npu_scatter_nd_update_(
+            self.index_k_scale_buffer[indexer_slot].view(-1, 1),
+            loc.view(-1, 1),
+            index_k_scale.to(torch.float32).view(-1, 1),
+        )
+
+    def _get_cpu_offload_layer_buffers(self, local_layer_id: int):
+        """Return the physical buffers owned by one logical transformer layer."""
+        num_slots = (
+            self.k_buffer[local_layer_id].shape[0]
+            * self.k_buffer[local_layer_id].shape[1]
+        )
+        buffers = [
+            self.k_buffer[local_layer_id].reshape(num_slots, 1, self.kv_cache_dim),
+            self.v_buffer[local_layer_id].reshape(num_slots, 1, self.kr_cache_dim),
+        ]
+        layer_id = self.start_layer + local_layer_id
+        indexer_slot = self.indexer_layer_id_to_slot.get(layer_id)
+        if indexer_slot is not None:
+            buffers.append(
+                self.index_k_buffer[indexer_slot].view(
+                    num_slots, 1, self.index_head_dim
+                )
+            )
+            if self.index_k_scale_buffer is not None:
+                buffers.append(
+                    self.index_k_scale_buffer[indexer_slot].view(num_slots, 1)
+                )
+        return buffers
 
     def _chunk_copy_npu_to_cpu(self, buf_of_layers, indices):
         chunk_size = self.cpu_offloading_chunk_size
@@ -746,17 +1033,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         torch.npu.synchronize()
-        buf_of_layers = []
-        has_ik = self.index_head_dim is not None
-        for local_layer_id in range(self.layer_num):
-            k_layer = self.k_buffer[local_layer_id].view(-1, 1, self.kv_lora_rank)
-            v_layer = self.v_buffer[local_layer_id].view(-1, 1, self.qk_rope_head_dim)
-            ik_layer = (
-                self.index_k_buffer[local_layer_id].view(-1, 1, self.index_head_dim)
-                if has_ik
-                else None
-            )
-            buf_of_layers.append([k_layer, v_layer, ik_layer])
+        buf_of_layers = [
+            self._get_cpu_offload_layer_buffers(local_layer_id)
+            for local_layer_id in range(self.layer_num)
+        ]
 
         kv_cache_cpu = self._chunk_copy_npu_to_cpu(buf_of_layers, indices)
         torch.npu.synchronize()
@@ -765,25 +1045,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
-        has_ik = self.index_head_dim is not None
         for local_layer_id in range(self.layer_num):
-            k_layer = self.k_buffer[local_layer_id].view(-1, 1, self.kv_lora_rank)
-            v_layer = self.v_buffer[local_layer_id].view(-1, 1, self.qk_rope_head_dim)
-            ik_layer = (
-                self.index_k_buffer[local_layer_id].view(-1, 1, self.index_head_dim)
-                if has_ik
-                else None
-            )
+            layer_buffers = self._get_cpu_offload_layer_buffers(local_layer_id)
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 chunk = kv_cache_cpu[local_layer_id][i // chunk_size]
-                k_cpu, v_cpu = chunk[0], chunk[1]
-                assert k_cpu.shape[0] == len(chunk_indices)
-                k_layer[chunk_indices] = k_cpu.to(k_layer.device, non_blocking=True)
-                v_layer[chunk_indices] = v_cpu.to(v_layer.device, non_blocking=True)
-                if has_ik:
-                    ik_cpu = chunk[2]
-                    ik_layer[chunk_indices] = ik_cpu.to(
-                        ik_layer.device, non_blocking=True
+                assert len(chunk) == len(layer_buffers)
+                for layer_buffer, cpu_buffer in zip(layer_buffers, chunk):
+                    assert cpu_buffer.shape[0] == len(chunk_indices)
+                    layer_buffer[chunk_indices] = cpu_buffer.to(
+                        layer_buffer.device, non_blocking=True
                     )
         torch.npu.synchronize()

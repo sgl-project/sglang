@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.hardware_backend.npu.utils import is_ascend_a5
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     alloc_extend_naive,
@@ -55,8 +56,6 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             return None
 
         if num_new_pages_item < 200:
-            from sgl_kernel_npu.mem_cache.allocator import alloc_extend_kernel
-
             out_indices = torch.empty(
                 (extend_num_tokens,),
                 dtype=torch.int64,
@@ -64,16 +63,31 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             )
             max_num_extend_tokens = next_power_of_2(extend_num_tokens)
             bs = prefix_lens.shape[0]
-            alloc_extend_kernel[(bs,)](
-                prefix_lens,
-                seq_lens,
-                last_loc,
-                self.free_pages,
-                out_indices,
-                next_power_of_2(bs),
-                self.page_size,
-                max_num_extend_tokens,
-            )
+            if is_ascend_a5():
+                from sglang.kernels.ops.memory.allocator_npu import alloc_extend_npu
+
+                alloc_extend_npu(
+                    prefix_lens=prefix_lens,
+                    seq_lens=seq_lens,
+                    last_loc=last_loc,
+                    free_pages=self.free_pages,
+                    out_indices=out_indices,
+                    page_size=self.page_size,
+                    max_num_extend_tokens=max_num_extend_tokens,
+                )
+            else:
+                from sgl_kernel_npu.mem_cache.allocator import alloc_extend_kernel
+
+                alloc_extend_kernel[(bs,)](
+                    prefix_lens,
+                    seq_lens,
+                    last_loc,
+                    self.free_pages,
+                    out_indices,
+                    next_power_of_2(bs),
+                    self.page_size,
+                    max_num_extend_tokens,
+                )
 
         else:
             out_indices = torch.empty(

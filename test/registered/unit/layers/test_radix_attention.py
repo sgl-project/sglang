@@ -231,6 +231,8 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
         key = torch.zeros((6, 2, 3))
         value = torch.zeros((6, 2, 3))
         k_rope = torch.zeros((6, 2, 1))
+        dequant_scale_q_nope = torch.arange(8, dtype=torch.float32).reshape(4, 2, 1)
+        fp8_kv_scale = torch.tensor([0.5], dtype=torch.float32)
         output = torch.empty_like(query)
 
         with (
@@ -254,6 +256,8 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                 True,
                 key_value_num_tokens=5,
                 k_rope=k_rope,
+                dequant_scale_q_nope=dequant_scale_q_nope,
+                fp8_kv_scale=fp8_kv_scale,
             )
 
         call_record = backend.calls[-1]
@@ -261,6 +265,8 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
         self.assertEqual(call_record.key.shape, (5, 2, 3))
         self.assertEqual(call_record.value.shape, (5, 2, 3))
         self.assertEqual(call_record.kwargs["k_rope"].shape, (5, 2, 1))
+        self.assertEqual(call_record.kwargs["dequant_scale_q_nope"].shape, (2, 2, 1))
+        self.assertIs(call_record.kwargs["fp8_kv_scale"], fp8_kv_scale)
         self.assertEqual(call_record.output.shape, (2, 2, 3))
         self.assertEqual(lse.shape, (4, 2))
         self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)

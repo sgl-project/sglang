@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import is_ascend_a5
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -554,22 +555,55 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # foreach copy (one foreach call per dtype pair) to cut launch overhead.
         # hidden_states is handled separately below (see note), and seq_lens_cpu
         # is handled further down since it lives on host.
-        copy_dsts = [
-            buffers.seq_lens[:raw_bs],
-            buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
-            buffers.positions[:raw_num_token],
-            buffers.topk_p[:raw_bs],
-            buffers.topk_index[:raw_bs],
-            buffers.req_pool_indices[:raw_bs],
-        ]
-        copy_srcs = [
-            forward_batch.seq_lens,
-            forward_batch.out_cache_loc,
-            forward_batch.positions,
-            forward_batch.spec_info.topk_p,
-            forward_batch.spec_info.topk_index,
-            forward_batch.req_pool_indices,
-        ]
+        copy_dsts = []
+        copy_srcs = []
+        if is_ascend_a5():
+            from sglang.kernels.ops.speculative.replay_pack_npu import (
+                draft_replay_pack_npu,
+            )
+
+            draft_replay_pack_npu(
+                dst_seq_lens=buffers.seq_lens[:bs],
+                src_seq_lens=forward_batch.seq_lens,
+                dst_out_cache_loc=buffers.out_cache_loc[
+                    : num_tokens * self.speculative_num_steps
+                ],
+                src_out_cache_loc=forward_batch.out_cache_loc,
+                dst_positions=buffers.positions[:num_tokens],
+                src_positions=forward_batch.positions,
+                dst_topk_p=buffers.topk_p[:bs],
+                src_topk_p=forward_batch.spec_info.topk_p,
+                dst_topk_index=buffers.topk_index[:bs],
+                src_topk_index=forward_batch.spec_info.topk_index,
+                dst_req_pool_indices=buffers.req_pool_indices[:bs],
+                src_req_pool_indices=forward_batch.req_pool_indices,
+                raw_bs=raw_bs,
+                bs=bs,
+                topk=self.topk,
+                speculative_num_steps=self.speculative_num_steps,
+                seq_len_fill_value=self.seq_len_fill_value,
+            )
+        else:
+            copy_dsts.extend(
+                [
+                    buffers.seq_lens[:raw_bs],
+                    buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
+                    buffers.positions[:raw_num_token],
+                    buffers.topk_p[:raw_bs],
+                    buffers.topk_index[:raw_bs],
+                    buffers.req_pool_indices[:raw_bs],
+                ]
+            )
+            copy_srcs.extend(
+                [
+                    forward_batch.seq_lens,
+                    forward_batch.out_cache_loc,
+                    forward_batch.positions,
+                    forward_batch.spec_info.topk_p,
+                    forward_batch.spec_info.topk_index,
+                    forward_batch.req_pool_indices,
+                ]
+            )
         if buffers.rids_int is not None and forward_batch.rids_int is not None:
             copy_dsts.append(buffers.rids_int[:raw_bs])
             copy_srcs.append(forward_batch.rids_int)
@@ -579,7 +613,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         ):
             copy_dsts.append(buffers.bootstrap_room_ids_int[:raw_bs])
             copy_srcs.append(forward_batch.bootstrap_room_ids_int)
-        _grouped_foreach_copy_(copy_dsts, copy_srcs)
+        if copy_dsts:
+            _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
         # DMA engine; foreach would force the ~3x slower compute-kernel copy.

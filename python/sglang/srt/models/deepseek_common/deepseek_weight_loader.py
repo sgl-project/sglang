@@ -71,6 +71,54 @@ logger = logging.getLogger(__name__)
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
 
+def _run_weight_loader_with_context(
+    weight_loader,
+    param,
+    loaded_weight,
+    *,
+    checkpoint_name: str,
+    parameter_name: str,
+    loader_args: tuple = (),
+    loader_kwargs: Optional[Dict] = None,
+):
+    """Run a weight loader without losing tensor identity in async failures.
+
+    DeepSeek/GLM weights are normally copied from CPU tensors in a thread pool.
+    Without this wrapper, an exception is re-raised later by ``future.result()``
+    after the checkpoint loop has moved on, so the traceback contains neither
+    the checkpoint tensor name nor the destination parameter name.
+    """
+
+    if loader_kwargs is None:
+        loader_kwargs = {}
+
+    try:
+        return weight_loader(param, loaded_weight, *loader_args, **loader_kwargs)
+    except Exception as exc:
+        loader_owner = getattr(weight_loader, "__self__", None)
+        owner_name = (
+            type(loader_owner).__name__ if loader_owner is not None else "<function>"
+        )
+        tp_rank = getattr(loader_owner, "tp_rank", None)
+        tp_size = getattr(loader_owner, "tp_size", None)
+        scheme = getattr(loader_owner, "scheme", None)
+        quant_method = getattr(loader_owner, "quant_method", None)
+        output_dim = getattr(param, "output_dim", None)
+        input_dim = getattr(param, "input_dim", None)
+        raise RuntimeError(
+            "Failed to load checkpoint tensor "
+            f"{checkpoint_name!r} into parameter {parameter_name!r}; "
+            f"param_shape={tuple(param.shape)}, "
+            f"loaded_shape={tuple(loaded_weight.shape)}, "
+            f"param_dtype={param.dtype}, loaded_dtype={loaded_weight.dtype}, "
+            f"output_dim={output_dim}, input_dim={input_dim}, "
+            f"loader_owner={owner_name}, tp_rank={tp_rank}, tp_size={tp_size}, "
+            f"scheme={type(scheme).__name__ if scheme is not None else None}, "
+            "quant_method="
+            f"{type(quant_method).__name__ if quant_method is not None else None}"
+        ) from exc
+
+
 def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
         return tensor.clone().detach()
@@ -206,6 +254,7 @@ class DeepseekV2WeightLoaderMixin:
             weight_names = []
 
             for name, loaded_weight in weights:
+                checkpoint_name = name
                 use_async_loading = should_async_load(loaded_weight)
                 layer_id = get_layer_id(name)
                 if (
@@ -294,8 +343,13 @@ class DeepseekV2WeightLoaderMixin:
                         executor=executor,
                         futures=futures,
                         use_async=use_async_loading,
-                        func=weight_loader,
-                        func_args=(param, loaded_weight, shard_id),
+                        func=_run_weight_loader_with_context,
+                        func_args=(weight_loader, param, loaded_weight),
+                        func_kwargs={
+                            "checkpoint_name": checkpoint_name,
+                            "parameter_name": name,
+                            "loader_args": (shard_id,),
+                        },
                     )
                     break
                 else:
@@ -314,15 +368,16 @@ class DeepseekV2WeightLoaderMixin:
                             executor=executor,
                             futures=futures,
                             use_async=use_async_loading,
-                            func=weight_loader,
-                            func_args=(
-                                param,
-                                loaded_weight,
-                                name,
-                            ),
+                            func=_run_weight_loader_with_context,
+                            func_args=(weight_loader, param, loaded_weight),
                             func_kwargs={
-                                "shard_id": shard_id,
-                                "expert_id": expert_id,
+                                "checkpoint_name": checkpoint_name,
+                                "parameter_name": name,
+                                "loader_args": (name,),
+                                "loader_kwargs": {
+                                    "shard_id": shard_id,
+                                    "expert_id": expert_id,
+                                },
                             },
                         )
                         break
@@ -397,8 +452,12 @@ class DeepseekV2WeightLoaderMixin:
                                     executor=executor,
                                     futures=futures,
                                     use_async=use_async_loading,
-                                    func=weight_loader,
-                                    func_args=(param, fused_weight),
+                                    func=_run_weight_loader_with_context,
+                                    func_args=(weight_loader, param, fused_weight),
+                                    func_kwargs={
+                                        "checkpoint_name": checkpoint_name,
+                                        "parameter_name": param_name,
+                                    },
                                 )
                                 cached_a_proj.pop(q_a_proj_name)
                                 cached_a_proj.pop(kv_a_proj_name)
@@ -427,8 +486,12 @@ class DeepseekV2WeightLoaderMixin:
                                 executor=executor,
                                 futures=futures,
                                 use_async=use_async_loading,
-                                func=weight_loader,
-                                func_args=(param, loaded_weight),
+                                func=_run_weight_loader_with_context,
+                                func_args=(weight_loader, param, loaded_weight),
+                                func_kwargs={
+                                    "checkpoint_name": checkpoint_name,
+                                    "parameter_name": name,
+                                },
                             )
 
             # Wait for all tasks to complete and raise any exceptions.
@@ -690,6 +753,8 @@ class DeepseekV2WeightLoaderMixin:
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
+
+            self_attn.refresh_fa_k_scale_params()
 
     @classmethod
     def generate_weight_name_filter(cls, logical_experts_map: Dict[int, List[int]]):

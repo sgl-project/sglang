@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 import torch
 
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+    MXFP_E8M0_NOT_LOADED,
     NPUMXFP8LinearMethod,
 )
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, ModelWeightParameter
@@ -30,11 +31,25 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
         quant_config: Optional[Dict[str, any]] = None,
         prefix: Optional[str] = None,
     ):
-        # quant_config / prefix are accepted to match the linear-scheme
-        # dispatch signature used by ModelSlimConfig.get_linear_scheme;
-        # MXFP8 needs no per-layer config beyond what create_weights derives.
-        del quant_config, prefix
+        # MLAProlog needs the checkpoint-layout source only for QKV-A and Q-B.
+        # Other MXFP8 linears must not retain a second full-size weight view.
+        del quant_config
         self.kernel = NPUMXFP8LinearMethod()
+        self.configure_runtime_prefix(prefix)
+
+    def configure_runtime_prefix(self, prefix: Optional[str]) -> None:
+        """Select the two runtime projections consumed by MLAProlog.
+
+        The quant-description prefix for fused QKV-A is usually rewritten to
+        ``q_a_proj`` by ``packed_modules_mapping``.  Selection must therefore
+        use the runtime module prefix, not the checkpoint lookup prefix.
+        """
+
+        module_name = "" if prefix is None else prefix.rsplit(".", 1)[-1]
+        self.kernel.preserve_mlaprolog_source = module_name in {
+            "fused_qkv_a_proj_with_mqa",
+            "q_b_proj",
+        }
 
     def create_weights(
         self,
@@ -67,8 +82,9 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
         # weight_scale_inv during process_weights_after_loading.
         scale_dim = input_size_per_partition // MXFP8_BLOCK_SIZE
         weight_scale = GroupQuantScaleParameter(
-            data=torch.empty(
+            data=torch.full(
                 (output_size_per_partition, scale_dim),
+                MXFP_E8M0_NOT_LOADED,
                 dtype=torch.uint8,
             ),
             input_dim=1,

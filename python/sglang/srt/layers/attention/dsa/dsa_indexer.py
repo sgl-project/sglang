@@ -16,7 +16,10 @@ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
-from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
+from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
+    DSANPUIndexerMixin,
+    create_npu_hadamard_128,
+)
 from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     GRAPH_WEIGHTS_PROJ_LORA_ERROR,
     _is_in_piecewise_or_breakable_cuda_graph,
@@ -235,6 +238,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
+        self.register_buffer(
+            "_npu_hadamard_128",
+            (
+                create_npu_hadamard_128(self.head_dim, get_device().device)
+                if _is_npu
+                else None
+            ),
+            persistent=False,
+        )
         self.use_dsa_indexer_fusion = (
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()

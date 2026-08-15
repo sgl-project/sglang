@@ -13,6 +13,13 @@ from unittest.mock import MagicMock, patch
 from transformers import PretrainedConfig
 from transformers.image_processing_utils import BaseImageProcessor
 
+try:
+    from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import (
+        GlmMoeDsaConfig,
+    )
+except ImportError:
+    GlmMoeDsaConfig = None
+
 import sglang.srt.utils.hf_transformers.processor as processor_utils
 from sglang.srt.utils import hf_transformers_patches
 from sglang.srt.utils.hf_transformers.common import (
@@ -27,10 +34,46 @@ from sglang.srt.utils.hf_transformers.common import (
     get_rope_config,
 )
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
-from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
+from sglang.srt.utils.hf_transformers_patches import (
+    _patch_glm_moe_dsa_attribute_map,
+    normalize_rope_scaling_compat,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+
+
+# ---------------------------------------------------------------------------
+# _patch_glm_moe_dsa_attribute_map
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipIf(GlmMoeDsaConfig is None, "Transformers lacks GlmMoeDsaConfig")
+class TestGlmMoeDsaAttributeMapPatch(unittest.TestCase):
+    def test_preserves_explicit_qk_rope_head_dim(self):
+        original_attribute_map = GlmMoeDsaConfig.attribute_map
+        try:
+            GlmMoeDsaConfig.attribute_map = dict(original_attribute_map)
+            GlmMoeDsaConfig.attribute_map["head_dim"] = "qk_rope_head_dim"
+
+            _patch_glm_moe_dsa_attribute_map()
+            _patch_glm_moe_dsa_attribute_map()
+
+            config = GlmMoeDsaConfig(
+                head_dim=192,
+                qk_nope_head_dim=192,
+                qk_rope_head_dim=64,
+                num_attention_heads=64,
+            )
+            self.assertNotIn("head_dim", GlmMoeDsaConfig.attribute_map)
+            self.assertEqual(config.qk_rope_head_dim, 64)
+            self.assertEqual(
+                config.num_attention_heads
+                * (config.qk_nope_head_dim + config.qk_rope_head_dim),
+                16384,
+            )
+        finally:
+            GlmMoeDsaConfig.attribute_map = original_attribute_map
 
 
 # ---------------------------------------------------------------------------

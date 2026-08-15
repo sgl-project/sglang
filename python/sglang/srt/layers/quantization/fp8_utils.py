@@ -46,6 +46,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_musa,
+    is_npu,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -63,6 +64,7 @@ _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
 _is_musa = is_musa()
+_is_npu = is_npu()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
@@ -522,6 +524,15 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
     1. The --fp8-gemm-backend server argument (preferred)
     2. Auto-detection based on hardware capabilities
     """
+    if _is_npu:
+        # This is the standard [128,128] block-FP8 path, not ModelSlim MXFP8.
+        # Resolve lazily so importing fp8_utils remains platform-neutral.
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            fp8_matmul_npu,
+        )
+
+        return fp8_matmul_npu
+
     backend = get_fp8_gemm_runner_backend()
 
     # Handle explicit backend selection via --fp8-gemm-backend

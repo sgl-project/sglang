@@ -139,6 +139,7 @@ __all__ = ["fp8_scaled_mm", "bmm_fp8", "dsv3_fused_a_gemm", "dsv3_router_gemm"]
 # LoRA SGMV Triton kernels migrated into this group (from lora/triton_ops);
 # registered for inventory. Import them from their modules.
 _TRITON_KERNELS = [
+    ("batch_matmul_transpose_npu", "batch_matmul_transpose_npu"),
     ("chunked_embedding_lora_a", "chunked_embedding_lora_a_forward"),
     ("chunked_sgmv_expand", "chunked_sgmv_lora_expand_forward"),
     ("chunked_sgmv_shrink", "chunked_sgmv_lora_shrink_forward"),

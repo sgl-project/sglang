@@ -467,6 +467,16 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
         self.weight_block_size = self.quant_config.weight_block_size
+        if (
+            _is_npu
+            and self.block_quant
+            and not self.use_mxfp8
+            and list(self.weight_block_size or ()) != [128, 128]
+        ):
+            raise ValueError(
+                "Standard FP8 linear layers on Ascend require "
+                f"weight_block_size=[128, 128], got {self.weight_block_size}."
+            )
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
         self.mxfp8_dense_backend = None
@@ -547,6 +557,13 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
+
+        if _is_npu and block_quant and not use_mxfp8:
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                validate_npu_block_fp8_model_dtype,
+            )
+
+            validate_npu_block_fp8_model_dtype(params_dtype)
 
         if block_quant:
             block_n, block_k = quant_config.weight_block_size
@@ -677,6 +694,29 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.requires_grad_(False)
             layer.weight_scale_inv.format_ue8m0 = True
             self._process_mxfp8_linear_weight_scale(layer)
+            return
+        elif _is_npu:
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                _npu_is_a5_for_tensor,
+                relayout_npu_block_fp8_weight,
+            )
+
+            if layer.weight.device.type != "npu" or (
+                layer.weight_scale_inv.device != layer.weight.device
+            ):
+                raise RuntimeError(
+                    "Ascend block-FP8 dense weights and scales must share one NPU device."
+                )
+            weight, weight_scale = relayout_npu_block_fp8_weight(
+                layer.weight.data,
+                layer.weight_scale_inv.data,
+                self.weight_block_size,
+                before_a5=not _npu_is_a5_for_tensor(layer.weight),
+            )
+            layer.weight.data = weight
+            layer.weight_scale_inv.data = weight_scale
+            layer.weight.requires_grad_(False)
+            layer.weight_scale_inv.requires_grad_(False)
             return
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
@@ -1085,6 +1125,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
+        if (
+            _is_npu
+            and self.block_quant
+            and not self.use_mxfp8
+            and list(self.weight_block_size or ()) != [128, 128]
+        ):
+            raise ValueError(
+                "Standard FP8 MoE layers on Ascend require "
+                f"weight_block_size=[128, 128], got {self.weight_block_size}."
+            )
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -1139,6 +1189,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         Registers weights into `layer`. This static method can be reused by other quantization methods that require loading FP8 checkpoints first (e.g. requantization to other formats as MXFP4).
         """
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        if _is_npu and block_quant and not use_mxfp8:
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                validate_npu_block_fp8_moe_config,
+            )
+
+            validate_npu_block_fp8_moe_config(params_dtype, with_bias=with_bias)
 
         if is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
@@ -1584,6 +1641,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._process_mxfp8_moe_weights(
                 layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
             )
+            return
+        elif _is_npu:
+            from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                NPUBlockFP8MoEMethod,
+            )
+
+            for weight_prefix in ("w13", "w2"):
+                kernel = getattr(layer, f"{weight_prefix}_kernel", None)
+                if not isinstance(kernel, NPUBlockFP8MoEMethod):
+                    raise RuntimeError(
+                        "Standard NPU block-FP8 MoE must use the modular "
+                        f"NPUBlockFP8MoEMethod for {weight_prefix}."
+                    )
+                kernel.process_weights_after_loading(layer, weight_prefix)
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
             return
 
         # If ROCm, normalize the weights and scales to e4m3fnuz
@@ -2149,7 +2222,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._prepare_hpc_ops_weights(layer)
 
         if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
+            dispatcher_quant_config = {"weight_dtype": layer.w13_weight.dtype}
+            if _is_npu and self.block_quant and not self.use_mxfp8:
+                dispatcher_quant_config["dispatcher_output_dtype"] = "bf16"
+            layer.dispatcher.set_quant_config(dispatcher_quant_config)
 
     def _prepare_flashinfer_trtllm_activation_params(self, layer: Module) -> None:
         """Materialize optional TRT-LLM SwiGLU parameters once per expert."""
@@ -2321,6 +2397,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
+
+        if _is_npu and self.block_quant and not self.use_mxfp8:
+            if list(self.weight_block_size or ()) != [128, 128]:
+                raise ValueError(
+                    "Standard FP8 MoE on Ascend requires "
+                    f"weight_block_size=[128, 128], got {self.weight_block_size}."
+                )
+            if not (moe_runner_backend.is_auto() or moe_runner_backend.is_ascend()):
+                raise ValueError(
+                    "Standard block-FP8 MoE on Ascend requires "
+                    "--moe-runner-backend 'auto' or 'ascend', got "
+                    f"{moe_runner_backend.value!r}."
+                )
+
+            from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                NPUBlockFP8MoEMethod,
+            )
+
+            layer.w13_kernel = NPUBlockFP8MoEMethod("w13")
+            layer.w2_kernel = NPUBlockFP8MoEMethod("w2")
+            moe_runner_config.layer = layer
+            self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
+            return
 
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
@@ -2496,7 +2595,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return StandardCombineInput(hidden_states=output)
 
-        if self.runner.runner_backend.is_deep_gemm():
+        if self.runner.runner_backend.is_ascend():
+            from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
+
+            quant_info = AscendQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_scale=layer.w13_weight_scale_inv,
+                w2_weight_scale=layer.w2_weight_scale_inv,
+                w13_weight_bias=getattr(layer, "w13_weight_bias", None),
+                w2_weight_bias=getattr(layer, "w2_weight_bias", None),
+            )
+        elif self.runner.runner_backend.is_deep_gemm():
 
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight

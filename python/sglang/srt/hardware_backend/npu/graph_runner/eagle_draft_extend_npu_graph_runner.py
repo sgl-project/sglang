@@ -18,7 +18,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    is_deepseek_dsa,
+    is_deepseek_v4,
+)
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
@@ -29,6 +33,10 @@ if TYPE_CHECKING:
 
 class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
     def __init__(self, eagle_worker: EagleDraftWorker):
+        self.use_fia_v2 = (
+            eagle_worker.draft_runner.model_config.attention_arch == AttentionArch.MLA
+            and eagle_worker.draft_runner.kv_cache_dtype == torch.float8_e4m3fn
+        )
         super().__init__(eagle_worker)
 
     def _cache_loc_dtype(self):
@@ -36,14 +44,18 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
 
     def _replay_graph(self, shape_key, forward_batch):
         hf_config = self.model_runner.model_config.hf_config
-        if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
+        if not is_deepseek_dsa(hf_config) and (
+            not is_deepseek_v4(hf_config) or self.use_fia_v2
+        ):
             seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
                 self.bs - self.raw_bs
             )
             return self.backend.replay_with_input_update(
                 shape_key,
                 seq_lens=seq_lens,
-                attr_name="actual_seq_lengths_kv",
+                attr_name=(
+                    "actual_seq_kvlen" if self.use_fia_v2 else "actual_seq_lengths_kv"
+                ),
                 attr_type=[],
             )
         else:

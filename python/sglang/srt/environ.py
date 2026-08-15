@@ -908,6 +908,7 @@ class Envs:
 
     # Overlap Spec V2
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    SGLANG_SPEC_V2_ZERO_BUBBLE = EnvBool(False)
 
     # Spec Config
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).

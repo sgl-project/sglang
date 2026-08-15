@@ -1,5 +1,6 @@
 import logging
-from typing import TYPE_CHECKING, Optional
+from functools import lru_cache
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
 import torch
 from torch.nn.parameter import Parameter
@@ -15,8 +16,12 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 MXFP8_BLOCK_SIZE = 32
+# OCP UE8M0 reserves 0xFF for NaN, so it is an unambiguous not-loaded
+# sentinel for ModelSlim block scales.
+MXFP_E8M0_NOT_LOADED = 0xFF
 # W4A8_MXFP block (group) size — fixed at 32 by the msmodelslim export format.
 MXFP4_BLOCK_SIZE = 32
+BLOCK_FP8_SIZE = (128, 128)
 
 
 # NPU ops are reached via torch.ops.npu.* (registered when torch_npu is imported
@@ -51,6 +56,353 @@ def _get_float4_e2m1fn_x2_dtype():
         if npu_dtype is not None:
             return npu_dtype
     return getattr(torch, "float4_e2m1fn_x2", None)
+
+
+def _get_npu_ops():
+    """Resolve the torch_npu op namespace lazily for CPU-only imports/tests."""
+    return torch.ops.npu
+
+
+def validate_npu_block_fp8_model_dtype(params_dtype: torch.dtype) -> None:
+    """Reject unsupported model dtypes before an Ascend block-FP8 forward."""
+    if params_dtype != torch.bfloat16:
+        raise ValueError(
+            "Standard block-FP8 on Ascend currently requires model dtype "
+            f"torch.bfloat16, got {params_dtype}."
+        )
+
+
+def validate_npu_block_fp8_moe_config(
+    params_dtype: torch.dtype, *, with_bias: bool
+) -> None:
+    validate_npu_block_fp8_model_dtype(params_dtype)
+    if with_bias:
+        raise ValueError(
+            "Standard block-FP8 MoE expert bias is not supported on Ascend."
+        )
+
+
+def _npu_device_index(tensor: torch.Tensor) -> int:
+    device_index = tensor.device.index
+    if device_index is not None:
+        return device_index
+
+    npu_module = vars(torch).get("npu")
+    if npu_module is None or not npu_module.is_available():
+        raise RuntimeError("An available Ascend NPU is required for block-FP8.")
+    return int(npu_module.current_device())
+
+
+@lru_cache(maxsize=None)
+def _npu_device_is_a5(device_index: int) -> bool:
+    from sglang.srt.utils import is_npu_atlas_a5
+
+    return is_npu_atlas_a5(device_index)
+
+
+def _npu_is_a5_for_tensor(tensor: torch.Tensor) -> bool:
+    """Probe only after an NPU tensor exists, then cache that stable device."""
+    return _npu_device_is_a5(_npu_device_index(tensor))
+
+
+def _require_same_npu_device(*tensors: Optional[torch.Tensor]) -> None:
+    devices = {tensor.device for tensor in tensors if tensor is not None}
+    if not devices or any(device.type != "npu" for device in devices):
+        raise RuntimeError(
+            "NPU block-FP8 operands must all be resident on an Ascend NPU."
+        )
+    if len(devices) != 1:
+        raise RuntimeError(
+            f"NPU block-FP8 operands must share one device, got {sorted(map(str, devices))}."
+        )
+
+
+def relayout_npu_block_fp8_weight(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size: Sequence[int],
+    *,
+    before_a5: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert checkpoint ``[..., N, K]`` block-FP8 tensors to NPU ``[..., K, N]``.
+
+    Atlas A2/A3 soft-FP8 kernels consume the FP8 payload as raw bytes, while A5
+    consumes the native ``float8_e4m3fn`` dtype. Scales remain FP32 and follow
+    the same last-two-dimension transpose as the weight block grid.
+    """
+    if tuple(block_size) != BLOCK_FP8_SIZE:
+        raise ValueError(
+            "Ascend block-FP8 only supports weight_block_size=[128, 128], "
+            f"got {list(block_size)}."
+        )
+    if weight.dtype != torch.float8_e4m3fn:
+        raise TypeError(
+            "Serialized Ascend block-FP8 weights must use "
+            f"torch.float8_e4m3fn, got {weight.dtype}."
+        )
+    if weight_scale.dtype != torch.float32:
+        raise TypeError(
+            f"Ascend block-FP8 weight scales must be float32, got {weight_scale.dtype}."
+        )
+    if weight.ndim not in (2, 3) or weight_scale.ndim != weight.ndim:
+        raise ValueError(
+            "Ascend block-FP8 expects dense [N, K] or expert [E, N, K] "
+            f"weights and matching-rank scales, got {weight.shape} and "
+            f"{weight_scale.shape}."
+        )
+
+    n_dim, k_dim = weight.shape[-2:]
+    block_n, block_k = BLOCK_FP8_SIZE
+    if n_dim % block_n or k_dim % block_k:
+        raise ValueError(
+            "Ascend block-FP8 weight dimensions must both be divisible by 128, "
+            f"got N={n_dim}, K={k_dim}."
+        )
+    expected_scale_shape = (*weight.shape[:-2], n_dim // block_n, k_dim // block_k)
+    if tuple(weight_scale.shape) != expected_scale_shape:
+        raise ValueError(
+            "Ascend block-FP8 checkpoint scale shape mismatch: expected "
+            f"{expected_scale_shape} for weight {tuple(weight.shape)}, got "
+            f"{tuple(weight_scale.shape)}."
+        )
+
+    if before_a5:
+        weight = weight.view(torch.uint8)
+    return (
+        weight.transpose(-1, -2).contiguous(),
+        weight_scale.transpose(-1, -2).contiguous(),
+    )
+
+
+def _validate_npu_block_fp8_runtime(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor],
+    *,
+    before_a5: bool,
+    expert: bool,
+) -> Tuple[int, int, int]:
+    expected_rank = 3 if expert else 2
+    if weight.ndim != expected_rank or weight_scale.ndim != expected_rank:
+        kind = "expert [E, K, N]" if expert else "dense [K, N]"
+        raise ValueError(
+            f"Ascend block-FP8 expects {kind} weights and matching-rank scales, "
+            f"got {weight.shape} and {weight_scale.shape}."
+        )
+    if input.ndim < 2 or (expert and input.ndim != 2):
+        raise ValueError(
+            "Ascend block-FP8 input must be at least 2D for dense GEMM and "
+            f"exactly 2D for grouped GEMM, got {input.shape}."
+        )
+
+    k_dim, n_dim = weight.shape[-2:]
+    if input.shape[-1] != k_dim:
+        raise ValueError(
+            f"Ascend block-FP8 K mismatch: input K={input.shape[-1]}, weight K={k_dim}."
+        )
+    if k_dim % 128 or n_dim % 128:
+        raise ValueError(
+            "Ascend block-FP8 runtime dimensions must both be divisible by 128, "
+            f"got K={k_dim}, N={n_dim}."
+        )
+    expected_scale_shape = (*weight.shape[:-2], k_dim // 128, n_dim // 128)
+    if tuple(weight_scale.shape) != expected_scale_shape:
+        raise ValueError(
+            "Ascend block-FP8 runtime scale shape mismatch: expected "
+            f"{expected_scale_shape}, got {tuple(weight_scale.shape)}."
+        )
+    if weight_scale.dtype != torch.float32:
+        raise TypeError(
+            f"Ascend block-FP8 weight scales must be float32, got {weight_scale.dtype}."
+        )
+
+    expected_weight_dtype = torch.uint8 if before_a5 else torch.float8_e4m3fn
+    if weight.dtype != expected_weight_dtype:
+        generation = "pre-A5" if before_a5 else "A5"
+        raise TypeError(
+            f"Ascend {generation} block-FP8 weight payload must use "
+            f"{expected_weight_dtype}, got {weight.dtype}."
+        )
+
+    rows = input.numel() // input.shape[-1]
+    if input_scale is None:
+        supported_input_dtypes = (
+            (torch.float16, torch.bfloat16)
+            if expert and not before_a5
+            else (torch.bfloat16,)
+        )
+        if input.dtype not in supported_input_dtypes:
+            raise TypeError(
+                "Unquantized Ascend block-FP8 activation dtype is unsupported: "
+                f"expected one of {supported_input_dtypes}, got {input.dtype}."
+            )
+    else:
+        if before_a5:
+            raise ValueError("Pre-A5 soft-FP8 does not accept pre-quantized inputs.")
+        if input.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                "Pre-quantized A5 block-FP8 activations must use "
+                f"torch.float8_e4m3fn, got {input.dtype}."
+            )
+        if input_scale.dtype != torch.float32:
+            raise TypeError(
+                "A5 block-FP8 activation scales must be float32, "
+                f"got {input_scale.dtype}."
+            )
+        expected_input_scale_numel = rows * (k_dim // 128)
+        if input_scale.numel() != expected_input_scale_numel:
+            raise ValueError(
+                "A5 block-FP8 activation scale shape mismatch: expected "
+                f"{(rows, k_dim // 128)} ({expected_input_scale_numel} values), "
+                f"got {tuple(input_scale.shape)}."
+            )
+    return rows, k_dim, n_dim
+
+
+def fp8_matmul_npu(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: Sequence[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run standard [128,128] block-FP8 dense GEMM on Ascend."""
+    if tuple(block_size) != BLOCK_FP8_SIZE:
+        raise ValueError(
+            "fp8_matmul_npu only supports block_size=[128, 128], "
+            f"got {list(block_size)}."
+        )
+    _require_same_npu_device(input, weight, weight_scale, input_scale, bias)
+    before_a5 = not _npu_is_a5_for_tensor(input)
+    rows, k_dim, n_dim = _validate_npu_block_fp8_runtime(
+        input,
+        weight,
+        weight_scale,
+        input_scale,
+        before_a5=before_a5,
+        expert=False,
+    )
+
+    if bias is not None:
+        if bias.ndim != 1 or bias.numel() != n_dim or bias.dtype != torch.bfloat16:
+            raise ValueError(
+                "Ascend block-FP8 bias must be bfloat16 [N], "
+                f"got shape={tuple(bias.shape)}, dtype={bias.dtype}."
+            )
+
+    input_shape = input.shape
+    input_2d = input.reshape(rows, k_dim).contiguous()
+    ops = _get_npu_ops()
+    if before_a5:
+        output_2d = ops.softfp8_w8a16_matmul(input_2d, weight, weight_scale, "bf16")
+    else:
+        if input_scale is None:
+            input_2d, input_scale = ops.npu_dynamic_block_quant(
+                input_2d,
+                dst_type=torch.float8_e4m3fn,
+                row_block_size=1,
+                col_block_size=128,
+            )
+        else:
+            input_scale = input_scale.reshape(rows, k_dim // 128).contiguous()
+        output_2d = ops.npu_quant_matmul(
+            input_2d,
+            weight,
+            scale=weight_scale,
+            pertoken_scale=input_scale,
+            output_dtype=torch.bfloat16,
+            group_sizes=(1, 128, 128),
+        )
+
+    if bias is not None:
+        output_2d = output_2d + bias
+    return output_2d.reshape(*input_shape[:-1], n_dim)
+
+
+def fp8_grouped_matmul_npu(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_list: torch.Tensor,
+    group_list_type: int,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Run one standard [128,128] block-FP8 expert grouped GEMM on Ascend."""
+    if group_list_type not in (0, 1):
+        raise ValueError(f"group_list_type must be 0 or 1, got {group_list_type}.")
+    _require_same_npu_device(input, weight, weight_scale, group_list, input_scale, bias)
+    before_a5 = not _npu_is_a5_for_tensor(input)
+    rows, k_dim, n_dim = _validate_npu_block_fp8_runtime(
+        input,
+        weight,
+        weight_scale,
+        input_scale,
+        before_a5=before_a5,
+        expert=True,
+    )
+    supported_output_dtypes = (
+        (torch.bfloat16,) if before_a5 else (torch.float16, torch.bfloat16)
+    )
+    if output_dtype not in supported_output_dtypes:
+        raise TypeError(
+            "Ascend block-FP8 grouped output dtype is unsupported: expected one "
+            f"of {supported_output_dtypes}, got {output_dtype}."
+        )
+    num_experts = weight.shape[0]
+    if group_list.ndim != 1 or group_list.numel() != num_experts:
+        raise ValueError(
+            "Ascend block-FP8 group_list must contain one entry per local expert, "
+            f"expected {num_experts}, got {tuple(group_list.shape)}."
+        )
+    if bias is not None and (
+        bias.shape != torch.Size((num_experts, n_dim)) or bias.dtype != output_dtype
+    ):
+        raise ValueError(
+            "Ascend block-FP8 grouped bias must be [E, N] in the output dtype, "
+            f"got shape={tuple(bias.shape)}, dtype={bias.dtype}."
+        )
+
+    ops = _get_npu_ops()
+    group_list = group_list.to(torch.int64)
+    if before_a5:
+        if bias is not None:
+            raise ValueError("Pre-A5 soft-FP8 grouped GEMM does not support bias.")
+        if group_list_type == 1:
+            group_list = group_list.cumsum(dim=0)
+        return ops.softfp8_w8a16_grouped_matmul(
+            input, weight, weight_scale, group_list, "bf16"
+        )
+
+    if input_scale is None:
+        input, input_scale = ops.npu_dynamic_block_quant(
+            input,
+            dst_type=torch.float8_e4m3fn,
+            row_block_size=1,
+            col_block_size=128,
+        )
+    else:
+        input_scale = input_scale.reshape(rows, k_dim // 128).contiguous()
+
+    scale_args = {
+        "scale": [weight_scale],
+        "per_token_scale": [input_scale],
+    }
+    if bias is not None:
+        scale_args["bias"] = [bias]
+    return ops.npu_grouped_matmul(
+        x=[input],
+        weight=[weight],
+        **scale_args,
+        split_item=2,
+        group_type=0,
+        group_list=group_list,
+        group_list_type=group_list_type,
+        output_dtype=output_dtype,
+    )[0]
 
 
 class _NPULinearMethodBase(LinearMethodBase):
@@ -166,6 +518,15 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
     MXFP8 matmul (block_size=32).
     """
 
+    def __init__(
+        self,
+        quant_config=None,
+        *,
+        preserve_mlaprolog_source: bool = False,
+    ) -> None:
+        self.quant_config = quant_config
+        self.preserve_mlaprolog_source = preserve_mlaprolog_source
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -202,11 +563,31 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight.data
         if weight.dtype == torch.float8_e4m3fn:
+            weight_scale_param = layer._parameters.get("weight_scale")
+            if weight_scale_param is None:
+                raise RuntimeError(
+                    "weight_scale is required for ModelSlim MXFP8 linear; "
+                    "unit-scale fallback is not allowed."
+                )
+            weight_scale = weight_scale_param.data
+            if (weight_scale == MXFP_E8M0_NOT_LOADED).any():
+                raise RuntimeError(
+                    "ModelSlim MXFP8 weight_scale was not fully loaded "
+                    "(found the UE8M0 NaN sentinel 0xFF)."
+                )
+            if self.preserve_mlaprolog_source:
+                # MLAProlog consumes the checkpoint's [out, in] payload and
+                # flat [out, in/32] scale, while the ordinary linear path below
+                # consumes transposed views.  Keep plain Tensor views so both
+                # paths share storage; registering cloned Parameters here would
+                # duplicate several giant attention projections per layer.
+                layer.mlaprolog_weight_source = weight
+                layer.mlaprolog_weight_scale_source = weight_scale
             # Offline (ModelSlim) path: weight is already MXFP8-quantised and
             # layer.weight_scale holds the uint8 block scales [out, in/32]. Only
             # re-layout to [in, out] / [in//64, out, 2] strided views below.
-            n_dim, k_dim = layer.weight_scale.data.shape
-            scale = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
+            n_dim, k_dim = weight_scale.shape
+            scale = weight_scale.reshape(n_dim, k_dim // 2, 2)
             layer.weight = Parameter(weight.transpose(0, 1), requires_grad=False)
             layer.weight_scale_inv = Parameter(
                 scale.transpose(0, 1), requires_grad=False
@@ -260,22 +641,85 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        original_dtype = x.dtype
-        if original_dtype not in (torch.float16, torch.bfloat16):
-            x = x.to(torch.bfloat16)
+        e8m0_dtype = _get_float8_e8m0fnu_dtype()
+        if e8m0_dtype is None:
+            raise RuntimeError("NPU MXFP8 linear requires torch float8 E8M0 support.")
+
+        if isinstance(x, tuple):
+            # MLAProlog returns its query norm already quantized as MXFP8 plus
+            # the matching UE8M0 block scale. Re-quantizing it would both lose
+            # the supplied scale and add a redundant kernel in every DSA layer.
+            qx, input_scale = x
+            if qx.dtype != torch.float8_e4m3fn:
+                raise RuntimeError(
+                    "Pre-quantized MXFP8 input must use torch.float8_e4m3fn, "
+                    f"got {qx.dtype}."
+                )
+
+            input_shape = qx.shape
+            qx = qx.reshape(-1, qx.shape[-1]).contiguous()
+            if qx.shape[-1] % (2 * MXFP8_BLOCK_SIZE) != 0:
+                raise RuntimeError(
+                    "Pre-quantized MXFP8 input hidden size must be divisible "
+                    f"by {2 * MXFP8_BLOCK_SIZE}, got {qx.shape[-1]}."
+                )
+
+            if input_scale.dtype == torch.uint8:
+                input_scale = input_scale.view(e8m0_dtype)
+            elif input_scale.dtype != e8m0_dtype:
+                raise RuntimeError(
+                    "Pre-quantized MXFP8 input scale must use E8M0 or its "
+                    f"uint8 bit representation, got {input_scale.dtype}."
+                )
+
+            paired_shape = (
+                qx.shape[0],
+                qx.shape[1] // (2 * MXFP8_BLOCK_SIZE),
+                2,
+            )
+            block_shape = (qx.shape[0], qx.shape[1] // MXFP8_BLOCK_SIZE)
+            source_block_shape = (
+                *input_shape[:-1],
+                input_shape[-1] // MXFP8_BLOCK_SIZE,
+            )
+            source_paired_shape = (
+                *input_shape[:-1],
+                input_shape[-1] // (2 * MXFP8_BLOCK_SIZE),
+                2,
+            )
+            flat_shape = (qx.numel() // MXFP8_BLOCK_SIZE,)
+            actual_scale_shape = tuple(input_scale.shape)
+            if actual_scale_shape not in {
+                flat_shape,
+                block_shape,
+                paired_shape,
+                source_block_shape,
+                source_paired_shape,
+            }:
+                raise RuntimeError(
+                    "Unexpected pre-quantized MXFP8 input scale shape: got "
+                    f"{actual_scale_shape}; expected flat {flat_shape}, block "
+                    f"{block_shape}, or paired {paired_shape}."
+                )
+            input_scale = input_scale.reshape(paired_shape).contiguous()
             original_dtype = torch.bfloat16
+        else:
+            original_dtype = x.dtype
+            if original_dtype not in (torch.float16, torch.bfloat16):
+                x = x.to(torch.bfloat16)
+                original_dtype = torch.bfloat16
 
-        # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant
-        input_shape = x.shape
-        x_2d = x.reshape(-1, x.shape[-1])
+            # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant
+            input_shape = x.shape
+            x_2d = x.reshape(-1, x.shape[-1])
 
-        # Dynamic MXFP8 activation quantisation
-        qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            x_2d, dst_type=torch.float8_e4m3fn
-        )
+            # Dynamic MXFP8 activation quantisation
+            qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                x_2d, dst_type=torch.float8_e4m3fn
+            )
 
         # MXFP8 matmul (weight & scale already transposed at load time)
         # Use the cached FP32 bias from process_weights_after_loading; fall back
@@ -290,7 +734,6 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         else:
             quant_bias = bias.to(torch.float32)
 
-        e8m0_dtype = _get_float8_e8m0fnu_dtype()
         output = torch.ops.npu.npu_quant_matmul(
             qx,
             layer.weight,
