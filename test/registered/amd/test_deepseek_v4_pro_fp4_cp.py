@@ -50,7 +50,7 @@ FP4_ENV_VARS = {
 
 
 class TestDeepseekV4ProFp4CPInterleave(CustomTestCase):
-    """DeepSeek-V4-Pro FP4 unified_kv prefill CP, interleave (round-robin-split), tp=8."""
+    """DeepSeek-V4-Pro FP4 unified_kv prefill CP, interleave, tp=8."""
 
     @classmethod
     def setUpClass(cls):

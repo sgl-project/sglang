@@ -120,8 +120,8 @@ do
         --disaggregation-transfer-backend ascend \
         --disable-cuda-graph \
         --moe-dense-tp-size 1 \
-        --enable-nsa-prefill-context-parallel \
-        --nsa-prefill-cp-mode in-seq-split \
+        --enable-prefill-cp \
+        --cp-strategy zigzag \
         --attn-cp-size 32 \
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
@@ -318,8 +318,8 @@ do
         --disaggregation-transfer-backend ascend \
         --disable-cuda-graph \
         --moe-dense-tp-size 1 \
-        --enable-nsa-prefill-context-parallel \
-        --nsa-prefill-cp-mode in-seq-split \
+        --enable-prefill-cp \
+        --cp-strategy zigzag \
         --attn-cp-size 32 \
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
@@ -516,8 +516,8 @@ do
         --disaggregation-transfer-backend ascend \
         --disable-cuda-graph \
         --moe-dense-tp-size 1 \
-        --enable-nsa-prefill-context-parallel \
-        --nsa-prefill-cp-mode in-seq-split \
+        --enable-prefill-cp \
+        --cp-strategy zigzag \
         --attn-cp-size 32 \
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \

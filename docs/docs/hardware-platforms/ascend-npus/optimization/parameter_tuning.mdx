@@ -187,14 +187,14 @@ These arguments and environment variables are critical for tuning prefill perfor
       <td>true</td>
     </tr>
     <tr>
-      <td>`--enable-dsa-prefill-context-parallel`</td>
+      <td>`--enable-prefill-cp`</td>
       <td><strong>(DeepSeek V3.2 DSA-specific)</strong> Enables context parallelism for the long-sequence prefill phase of DeepSeek V3.2 with DSA (DeepSeek Sparse Attention). Distributes the sequence across CP ranks to parallelize the computationally expensive DSA prefill for ultra-long contexts.</td>
       <td>Enabled</td>
     </tr>
     <tr>
-      <td>`--dsa-prefill-cp-mode`</td>
-      <td><strong>(DeepSeek V3.2 DSA-specific)</strong> Controls how the long sequence is split across context parallel ranks: `in-seq-split` divides each sequence uniformly across CP ranks, optimal for single-request prefill. `round-robin-split` (code default) distributes tokens by index mod CP size, supporting multi-batch prefill. Only effective when `--enable-dsa-prefill-context-parallel` is enabled.</td>
-      <td>`in-seq-split`</td>
+      <td>`--cp-strategy`</td>
+      <td>Controls how the long sequence is split across context parallel ranks. Use `zigzag` for balanced causal-attention work or `interleave` for token-interleaved sharding.</td>
+      <td>`zigzag`</td>
     </tr>
     <tr>
       <td>`--attn-cp-size`</td>

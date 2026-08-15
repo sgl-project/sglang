@@ -29,7 +29,6 @@ SERVER_LAUNCH_TIMEOUT = 3600
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
 _DEEPEP_ENV = {
-    "SGLANG_ENABLE_CP_V2": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
     # The draft-extend graph pool costs ~4.5 GB here (DeepEP MoE workspace is
     # captured at full dispatch capacity), which starves the eager prefill
@@ -39,7 +38,6 @@ _DEEPEP_ENV = {
 }
 
 _MEGAMOE_ENV = {
-    "SGLANG_ENABLE_CP_V2": "1",
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "8320",
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": "1",
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": "1",
@@ -189,7 +187,6 @@ class TestDSV4FlashFP4B200Balanced_CP_NonDeepEP(
                 "--moe-runner-backend",  # for fp4 checkpoint
                 "flashinfer_mxfp4",
             ],
-            env={"SGLANG_ENABLE_CP_V2": "1"},
         )
 
     @classmethod
@@ -207,7 +204,7 @@ class TestDSV4FlashFP4B200_CP_DSpark(
     GSM8KMixin,
     CustomTestCase,
 ):
-    """DSPARK speculation + prefill CP (interleave, CP_V2, attn_cp=tp)."""
+    """DSPARK speculation + prefill CP (interleave, attn_cp=tp)."""
 
     gsm8k_accuracy_thres = 0.90
 
@@ -233,7 +230,6 @@ class TestDSV4FlashFP4B200_CP_DSpark(
                 "--moe-runner-backend",  # for fp4 checkpoint
                 "flashinfer_mxfp4",
             ],
-            env={"SGLANG_ENABLE_CP_V2": "1"},
         )
 
     @classmethod

@@ -432,7 +432,7 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     # cover the brackets real /generate hits (smallest decode shape,
     # mid-low, two mid, and n_splits=1 for ~5K+ token prefill). Ceil-align
     # bs to the CP padding alignment (cp_size, or 2*cp_size for DSA
-    # in-seq-split). _dummy_run does not pad q/hidden like the real flow, so
+    # zigzag CP). _dummy_run does not pad q/hidden like the real flow, so
     # an unaligned bs makes DSA's padded num_splits longer than the q tokens
     # and trips FlashMLA's "num_splits must have shape (b+1)" check.
     from sglang.srt.layers.cp.padding import get_cp_padding_align_size

@@ -18,7 +18,7 @@ GLM52_MODEL_PATH = "zai-org/GLM-5.2-FP8"
 SERVER_LAUNCH_TIMEOUT = max(DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH, 1800)
 
 
-class TestDSACPV2Interleave(CustomTestCase):
+class TestDSACPInterleave(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = GLM52_MODEL_PATH
@@ -54,7 +54,6 @@ class TestDSACPV2Interleave(CustomTestCase):
             cls.base_url,
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=other_args,
-            env={"SGLANG_ENABLE_CP_V2": "1"},
         )
 
     @classmethod
@@ -79,8 +78,7 @@ class TestDSACPV2Interleave(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_a_gsm8k (dsa-cp-v2-interleave)\n"
-                f'{metrics["score"]=:.3f}\n'
+                f"### test_a_gsm8k (dsa-cp-interleave)\n" f'{metrics["score"]=:.3f}\n'
             )
             self.assertGreater(metrics["score"], 0.935)
 

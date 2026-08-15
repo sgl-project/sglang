@@ -27,7 +27,7 @@ v0.5.16 or a later version.
 | Tensor Parallelism            | `--tp-size 16`                                                                    |
 | Data Parallelism              | `--dp-size 16`                                                                    |
 | Expert Parallelism            | `--ep-size 16 \`<br/>`--moe-a2a-backend deepep \`<br/>`--deepep-mode auto`         |
-| Context Parallelism           | `--enable-nsa-prefill-context-parallel \`<br/>`--nsa-prefill-cp-mode in-seq-split \`<br/>`--attn-cp-size 4` |
+| Context Parallelism           | `--enable-prefill-cp \`<br/>`--cp-strategy zigzag \`<br/>`--attn-cp-size 4` |
 | PD Disaggregation             | `--disaggregation-mode prefill \`<br/>`--disaggregation-transfer-backend ascend`  |
 | Quantization                  | `--quantization modelslim`                                                        |
 | Chunked Prefill               | auto based on device memory, or set explicit value;<br/>disable with `--chunked-prefill-size -1`; e.g., `--chunked-prefill-size 16384` |

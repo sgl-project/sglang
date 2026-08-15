@@ -39,7 +39,9 @@ class TestQwen330BAttnCP(GSM8KAscendMixin, CustomTestCase):
         "2",
         "--cuda-graph-max-bs-decode",
         "32",
-        "--enable-prefill-context-parallel",
+        "--enable-prefill-cp",
+        "--cp-strategy",
+        "zigzag",
     ]
 
     env = {**os.environ, "ASCEND_USE_FIA": "1"}

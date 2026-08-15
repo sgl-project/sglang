@@ -1109,7 +1109,7 @@ class ServerArgs:
     cp_strategy: A[
         Optional[str],
         Arg(
-            help="Sharding strategy for prefill CP. 'zigzag' is the former in-seq-split mode; 'interleave' is the former round-robin-split mode.",
+            help="Sharding strategy for prefill CP.",
             choices=("zigzag", "interleave"),
         ),
         NS("parallel"),
@@ -5318,9 +5318,7 @@ class ServerArgs:
                 ):
                     raise ValueError(
                         "--enable-dsa-cache-layer-split requires "
-                        "--enable-prefill-cp and --cp-strategy interleave "
-                        "(or legacy --enable-nsa-prefill-context-parallel with "
-                        "--nsa-prefill-cp-mode round-robin-split)."
+                        "--enable-prefill-cp and --cp-strategy interleave."
                     )
                 # Layer split relies on the mooncake all-CP-rank KV/indexer
                 # transfer path. mori/nixl support is a temporary limitation
