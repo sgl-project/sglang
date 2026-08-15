@@ -340,8 +340,9 @@ def test_dp_helper_supports_moonvit3d_packed_embeddings_on_tp1():
 
     # The IPC consumer count asks for the *configured* TP size (matching
     # MmItemMemoryPool.try_to_recycle), so the double publishes one too.
-    with get_context().override_server_args(tp_size=1), get_parallel().override(
-        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+    with (
+        get_context().override_server_args(tp_size=1),
+        get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0),
     ):
         output = run_dp_sharded_mrope_vision_model(
             tower, pixel_values, [[1, 2, 2]], rope_type="rope_2d_packed"
@@ -358,8 +359,9 @@ def test_dp_helper_can_lazily_load_kimi_features_on_tp1():
 
     # The IPC consumer count asks for the *configured* TP size (matching
     # MmItemMemoryPool.try_to_recycle), so the double publishes one too.
-    with get_context().override_server_args(tp_size=1), get_parallel().override(
-        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+    with (
+        get_context().override_server_args(tp_size=1),
+        get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0),
     ):
         output = run_dp_sharded_mrope_vision_model(
             tower,
@@ -510,8 +512,9 @@ def test_kimi_non_dp_keeps_grid_thws_on_the_host():
 
     # The IPC consumer count asks for the *configured* TP size (matching
     # MmItemMemoryPool.try_to_recycle), so the double publishes one too.
-    with get_context().override_server_args(tp_size=1), get_parallel().override(
-        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+    with (
+        get_context().override_server_args(tp_size=1),
+        get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0),
     ):
         model.get_image_feature(items)
 
@@ -937,7 +940,7 @@ def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
     async def prepare(_entries):
         return [new]
 
-    processor._run_artifact_batch = prepare
+    processor._run_preprocess_and_build_artifact_batch = prepare
     try:
         with pytest.raises(ValueError, match="feature hash changed"):
             asyncio.run(processor.prepare_media_artifacts([image]))
@@ -1002,7 +1005,7 @@ def test_kimi_k3_untrusted_path_change_is_a_cache_miss():
             for entry in entries
         ]
 
-    processor._run_artifact_batch = prepare
+    processor._run_preprocess_and_build_artifact_batch = prepare
     try:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mutable.png"
@@ -1049,7 +1052,7 @@ def test_kimi_k3_partial_hits_deduplicate_misses_and_preserve_order():
             for entry in entries
         ]
 
-    processor._run_artifact_batch = prepare
+    processor._run_preprocess_and_build_artifact_batch = prepare
     try:
         artifacts = asyncio.run(
             processor.prepare_media_artifacts(
@@ -1099,7 +1102,7 @@ def test_kimi_k3_cancelled_artifact_owner_does_not_fail_joiner():
             for entry in entries
         ]
 
-    processor._run_artifact_batch = prepare
+    processor._run_preprocess_and_build_artifact_batch = prepare
 
     async def run():
         owner = asyncio.create_task(processor.prepare_media_artifacts([image]))

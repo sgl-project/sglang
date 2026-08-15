@@ -84,7 +84,7 @@ class KimiK3ResizeConfig:
 
 @dataclass(frozen=True)
 class KimiK3ImagePreprocessArtifact:
-    """K3's prompt-independent preprocess result for one image.
+    """K3's prompt-independent preprocess result for one image, containing the feature and everything
 
     ``original_size`` and ``resize_config`` rebuild the K3 image tokens for
     each prompt; ``grid_thw`` becomes encoder metadata; ``feature`` is either

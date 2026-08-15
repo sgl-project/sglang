@@ -403,6 +403,9 @@ class KimiK3ImageProcessor(
         self.mm_tokens = mm_tokens
 
     def _should_defer_gpu_preprocessing(self, images) -> bool:
+        """
+        when raw_bytes <= processed_bytes, preprocess first would introduce larger payload, so deferring gpu preprocessing would benefit
+        """
         if (
             not images
             or self.mm_feature_transport != "cpu"
@@ -503,6 +506,7 @@ class KimiK3ImageProcessor(
         deferred: Optional[KimiK3DeferredPreprocessing] = None,
     ) -> KimiK3ImagePreprocessArtifact:
         """Freeze one image's prompt-independent preprocessing result."""
+        # get the hash with feature
         feature_hash = resolve_multimodal_item_hash(
             feature=feature, namespace=artifact_key
         )
@@ -525,19 +529,22 @@ class KimiK3ImageProcessor(
         *,
         processor=None,
     ) -> list[KimiK3ImagePreprocessArtifact]:
-        """Preprocess cache-miss images into reusable per-image artifacts."""
+        """Preprocess cache-miss images into reusable per-image artifacts.
+
+        Return the processed artifacts with processed feature
+        """
         processor = processor or self._processor
         artifacts: list[Optional[KimiK3ImagePreprocessArtifact]] = [None] * len(entries)
         # 1. collect inputs preprocessed now instead of deferred to the GPU path
-        eager_indices = []
-        eager_images = []
+        deferred_entry_indices = []
+        deferred_images = []
 
         config = processor.preprocess_config
         for index, entry in enumerate(entries):
             image = entry.media
             if not self._should_defer_gpu_preprocessing([image]):
-                eager_indices.append(index)
-                eager_images.append(image)
+                deferred_entry_indices.append(index)
+                deferred_images.append(image)
                 continue
 
             width, height = _get_image_dimensions(image)
@@ -568,13 +575,13 @@ class KimiK3ImageProcessor(
                 ),
             )
 
-        # 2. preprocess eager inputs as one batch
-        if eager_images:
+        # 2. preprocess CPU eager inputs as one batch
+        if deferred_images:
             features, sizes, configs, grids = processor.prepare_image_features(
-                eager_images
+                deferred_images
             )
             for index, feature, size, resize_config, grid in zip(
-                eager_indices, features, sizes, configs, grids
+                deferred_entry_indices, features, sizes, configs, grids
             ):
                 entry = entries[index]
                 artifacts[index] = self._make_artifact(

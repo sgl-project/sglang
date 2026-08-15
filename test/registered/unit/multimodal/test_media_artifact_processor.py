@@ -184,7 +184,7 @@ class TestMediaArtifactProcessor(unittest.TestCase):
             artifact = processor.prepare_artifact_batch(entries)[0]
             return [replace(artifact, artifact_key="sha256:" + "0" * 64)]
 
-        processor._run_artifact_batch = wrong_identity
+        processor._run_preprocess_and_build_artifact_batch = wrong_identity
         try:
             with self.assertRaisesRegex(ValueError, "changed the media artifact key"):
                 asyncio.run(processor.prepare_media_artifacts([b"image"]))

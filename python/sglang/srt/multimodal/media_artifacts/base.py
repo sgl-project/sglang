@@ -82,9 +82,12 @@ class MediaArtifactInput:
     it is not itself stored in the cache.
     """
 
+    # hash of the media content
     content_digest: str
+    # cache key containing the processor fingerprint, preprocess kwargs, media content
     artifact_key: str
     modality: Modality
+    # the original media input that has been loaded and decoded (e.g., PIL.Image)
     media: Any
 
 
@@ -211,10 +214,10 @@ class MediaArtifactCacheMixin:
                 "Media artifact feature_hash must be a non-negative integer"
             )
 
-    async def _run_artifact_batch(
+    async def _run_preprocess_and_build_artifact_batch(
         self, entries: Sequence[MediaArtifactInput]
     ) -> list[MediaArtifact]:
-        """Run model preprocessing locally or on the processor worker pool."""
+        """Run model preprocessing locally or on the processor worker pool, return the artifact"""
         if self.mm_processor_executor is None:
             return self.prepare_artifact_batch(entries)
         return await self.mm_processor_executor.run(
@@ -261,7 +264,7 @@ class MediaArtifactCacheMixin:
         featureless_hit_mask: Optional[Sequence[bool]] = None,
         modality: Optional[Modality] = None,
     ) -> list[MediaArtifact]:
-        """Resolve one preprocess-cache artifact for each processor input.
+        """Try resolving one preprocess-cache artifact for each processor input.
 
         Each media input is looked up independently, and results preserve the
         input order. A cache hit returns the stored artifact (the cache item).
@@ -295,7 +298,12 @@ class MediaArtifactCacheMixin:
         snapshots: list[Optional[MediaSnapshot]] = [None] * media_count
         keys: list[Optional[str]] = [None] * media_count
 
-        # 1. resolve trusted-hash hits without reading media
+        # 1. fast path: resolve trusted provided hash hits without reading media
+        # e.g., an image could be submitted with a provided hash:
+        # "image_url": {
+        #    "url": "https://example.com/image.jpg",
+        #    "content_hash": "sha256:<64-hex>"
+        # }
         load_indices = []
         for index, (source, caller_hash, allow_featureless) in enumerate(
             zip(media_data, content_hashes, featureless_hit_mask)
@@ -314,7 +322,7 @@ class MediaArtifactCacheMixin:
                     continue
             load_indices.append(index)
 
-        # 2. snapshot remaining media once and resolve verified hits
+        # 2. read cache: build artifact key from media snapshot then try reading cache
         snapshot_futures = {
             index: self.io_executor.submit(
                 self.snapshot_media_source, media_data[index], modality
@@ -356,7 +364,8 @@ class MediaArtifactCacheMixin:
                     previous_metadata[key] = previous
 
         unique_keys = list(first_index_by_key)
-        # 4. claim one computation for each unique miss
+
+        # 4. submit one computation (preprocess) for each unique miss
         cache_results = self.mm_preprocess_cache.lookup_or_claim_many(
             unique_keys,
             predicate=lambda key, artifact: self.artifact_usable(
@@ -373,7 +382,7 @@ class MediaArtifactCacheMixin:
                 misses_to_compute.append(result)
 
         if misses_to_compute:
-            miss_task = self.mm_preprocess_cache.create_background_task(
+            missed_task = self.mm_preprocess_cache.create_background_task(
                 self._compute_cache_misses(
                     misses_to_compute,
                     first_index_by_key,
@@ -384,7 +393,7 @@ class MediaArtifactCacheMixin:
                 )
             )
             # shared work outlives cancellation of this request
-            await asyncio.shield(miss_task)
+            await asyncio.shield(missed_task)
 
         # 5. wait for misses already claimed by another request
         for key, result in zip(unique_keys, cache_results):
@@ -419,10 +428,10 @@ class MediaArtifactCacheMixin:
         CPU cache. The two values differ when a CUDA feature must not be cached.
         """
         try:
-            # 1. decode each unique miss
-            miss_entries = []
-            for miss in misses_to_compute:
-                index = first_index_by_key[miss.key]
+            # 1. decode (load media) each unique miss
+            missed_media = []
+            for missed in misses_to_compute:
+                index = first_index_by_key[missed.key]
                 snapshot = snapshots[index]
                 assert snapshot is not None
                 media = await asyncio.wrap_future(
@@ -430,45 +439,47 @@ class MediaArtifactCacheMixin:
                         self.decode_media_snapshot, snapshot, modality
                     )
                 )
-                miss_entries.append(
+                missed_media.append(
                     MediaArtifactInput(
                         content_digest=snapshot.content_digest,
-                        artifact_key=miss.key,
+                        artifact_key=missed.key,
                         modality=modality,
                         media=media,
                     )
                 )
 
             # 2. preprocess all decoded misses as one model batch
-            miss_artifacts = await self._run_artifact_batch(miss_entries)
-            if len(miss_artifacts) != len(misses_to_compute):
+            missed_artifacts = await self._run_preprocess_and_build_artifact_batch(
+                missed_media
+            )
+            if len(missed_artifacts) != len(misses_to_compute):
                 raise ValueError(
                     "prepare_artifact_batch must return one artifact per cache miss"
                 )
-            for miss, entry, artifact in zip(
-                misses_to_compute, miss_entries, miss_artifacts
+            for missed, entry, artifact in zip(
+                misses_to_compute, missed_media, missed_artifacts
             ):
                 self.validate_artifact(artifact, entry)
-                previous = previous_metadata.get(miss.key)
+                previous = previous_metadata.get(missed.key)
                 if (
                     previous is not None
                     and previous.feature_hash != artifact.feature_hash
                 ):
                     raise ValueError(
                         "Cached media artifact feature hash changed for identical "
-                        f"identity {miss.key}"
+                        f"identity {missed.key}"
                     )
                 cache_value = artifact.cache_value()
                 self.validate_artifact(cache_value, entry)
                 # 3. return full artifacts and retain cache-safe copies
                 self.mm_preprocess_cache.complete_miss(
-                    miss,
+                    missed,
                     artifact,
                     cache_value=cache_value,
                 )
-                resolved_by_key[miss.key] = artifact
+                resolved_by_key[missed.key] = artifact
         except BaseException as error:
-            for miss in misses_to_compute:
-                if not miss.future.done():
-                    self.mm_preprocess_cache.fail_miss(miss, error)
+            for missed in misses_to_compute:
+                if not missed.future.done():
+                    self.mm_preprocess_cache.fail_miss(missed, error)
             raise

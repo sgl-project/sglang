@@ -329,10 +329,11 @@ def resolve_multimodal_item_hash(
     precomputed_embeddings: Any = None,
     namespace: Optional[str] = None,
 ) -> int:
-    """Resolve an item cache hash, optionally scoped to an artifact identity.
+    """Unified helper for resolving a hash for MultimodalDataItem cache, optionally scoped to an artifact identity.
 
-    The namespace covers processor metadata that can affect encoder output even
-    when two feature tensors contain the same bytes.
+    Args:
+        namespace: Optional SHA-256 identity covering every input that can change the preprocessing result.
+            It scopes the feature hash so downstream caches cannot reuse embeddings across different preprocessing settings.
     """
     from sglang.srt.environ import envs
 
@@ -341,8 +342,10 @@ def resolve_multimodal_item_hash(
 
         item_hash = uuid.uuid4().int
     elif existing_hash is not None:
+        # if exists, reuse
         item_hash = existing_hash
     else:
+        # hash from feature
         from sglang.srt.managers.mm_utils import hash_feature
 
         value = feature if feature is not None else precomputed_embeddings
