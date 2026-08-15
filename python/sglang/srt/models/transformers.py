@@ -1600,18 +1600,13 @@ class MultiModalMixin:
 
         mm_kwargs = self._collect_mm_kwargs(forward_batch)
 
-        hidden_states = self._run_hf_backbone(
+        return self._run_hf_backbone(
             input_ids=input_ids,
             input_embeds=None,
             positions=positions,
             forward_batch=forward_batch,
             **mm_kwargs,
         )
-
-        if mm_kwargs and torch.xpu.is_available():
-            torch.xpu.empty_cache()
-
-        return hidden_states
 
 
 class TransformersForCausalLM(CausalMixin, TransformersBase):
