@@ -30,6 +30,17 @@ class SharedReadBoundary(Enum):
     UNKNOWN = auto()  # not audited -> coarse whole-forward fence
 
 
+def can_write_kv_buffer_from_projection(forward_batch: ForwardBatch) -> bool:
+    """Whether a model-side fused projection may write the KV cache directly.
+
+    Distributed attention layouts own cache materialization in the attention
+    backend, so projection-side writes are only safe for an ordinary batch.
+    """
+    from sglang.srt.layers.cp.utils import is_cp_active
+
+    return not is_cp_active(forward_batch)
+
+
 class AttentionBackend(ABC):
     """The base class of attention backends.
 

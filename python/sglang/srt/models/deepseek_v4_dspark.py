@@ -339,8 +339,8 @@ class DSparkV4MarkovHead(nn.Module):
                 f"num_embeddings_per_partition({per_partition}) * tp_size({tp_size}) != "
                 f"num_embeddings_padded({num_padded})."
             )
-        # Follow lm_head's group choice; attn_tp_group degenerates to size 1
-        # under prefill CP while lm_head still shards over the full TP group.
+        # Follow lm_head's group choice because attention and output-head
+        # partitioning can use different process groups.
         parallel = get_parallel()
         shard_group = (
             parallel.attn_tp_group

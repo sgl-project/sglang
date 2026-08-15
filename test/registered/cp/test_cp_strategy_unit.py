@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
     get_cp_strategy,
@@ -33,6 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -291,6 +293,60 @@ class TestCPZigzagStrategy(CustomTestCase):
 
         self.assertTrue(is_cp_active(active_batch))
         self.assertFalse(is_cp_active(inactive_batch))
+
+    def test_index_topk_share_materializes_global_order_before_publish(self):
+        local_topk = torch.tensor([[1, 2], [3, 4]])
+        global_topk = torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8]])
+        forward_batch = SimpleNamespace(
+            input_ids=torch.arange(8),
+            forward_mode=_ExtendMode(),
+            extend_seq_lens_cpu=[8],
+            reuse_dsa_topk_indices=True,
+            spec_info=SimpleNamespace(dsa_topk_indices=None),
+        )
+        state = IndexTopKShareState(forward_batch, None)
+
+        with patch(
+            "sglang.srt.layers.attention.index_topk_share.cp_gather_after_forward",
+            return_value=global_topk,
+        ):
+            state.update(local_topk)
+
+        self.assertTrue(torch.equal(state.topk_indices, global_topk))
+
+    def test_eager_runner_passes_rank_local_input_ids_to_model_body(self):
+        metadata = self._metadata_for_rank(
+            0,
+            cp_size=4,
+            seq_lens=[8],
+            extend_seq_lens=[8],
+        )
+        forward_batch = self._forward_batch(metadata, [8])
+        forward_batch.positions = torch.arange(8)
+        forward_batch.spec_info = None
+        observed = {}
+
+        class Body:
+            def __call__(self, input_ids, positions, forward_batch, **kwargs):
+                observed["input_ids"] = input_ids
+                return kwargs["input_embeds"]
+
+        model = SimpleNamespace(
+            model=Body(),
+            pp_group=SimpleNamespace(is_last_rank=False),
+            capture_aux_hidden_states=False,
+            get_input_embeddings=lambda: lambda input_ids: input_ids[:, None].float(),
+        )
+        runner = EagerRunner.__new__(EagerRunner)
+        runner.model_runner = SimpleNamespace(model=model)
+
+        with get_parallel().override(attn_cp_rank=0, attn_cp_size=4):
+            expected = get_cp_strategy().shard_hidden_states(
+                forward_batch.input_ids, forward_batch
+            )
+            runner._execute_extend_cp(forward_batch, {})
+
+        self.assertTrue(torch.equal(observed["input_ids"], expected))
 
     def _expected_metadata(self, *, rank, cp_size, seq_lens, extend_seq_lens):
         bs = len(extend_seq_lens)

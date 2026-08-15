@@ -20,9 +20,8 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -33,7 +32,6 @@ from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
-from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
 )
@@ -49,7 +47,6 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla imp
     _select_local_dcp_heads_for_autotune,
     is_dcp_mla_decode_phase,
     is_mla_dcp_lse_base_on_e,
-    should_defer_dsa_cp_kv_gather,
 )
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
@@ -526,31 +523,13 @@ class DeepseekMLARocmForwardMixin:
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
-        mla_prefill_cp = mla_use_prefill_cp(forward_batch)
-        defer_kv_gather_until_after_rope = should_defer_dsa_cp_kv_gather(
-            dsa_prefill_cp=dsa_prefill_cp,
-            fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
+        k_nope, k_pe = prepare_kv_for_attention(
+            self,
+            forward_batch,
+            k_nope,
+            k_pe,
+            defer_materialization=fuse_rope_for_trtllm_mla,
         )
-        if dsa_prefill_cp and not defer_kv_gather_until_after_rope:
-            from sglang.srt.layers.attention.dsa_backend import materialize_full_kv_cp
-
-            k_nope, k_pe = materialize_full_kv_cp(
-                self,
-                forward_batch,
-                latent_cache,
-                k_nope,
-                k_pe,
-            )
-        elif mla_prefill_cp and not is_cp_active(forward_batch):
-            # CP-v1 gathers the latent here; CP-v2 gathers it in the attention
-            # backend via the strategy (materialize_full_mla_kv).
-            k_nope, k_pe = self.rebuild_cp_kv_cache(
-                latent_cache,
-                forward_batch,
-                k_nope,
-                k_pe,
-            )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:
