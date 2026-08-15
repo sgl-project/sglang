@@ -1092,7 +1092,15 @@ class MQALayer(MqaAttentionBase):
 
         unified = is_unified_kv_triton()
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
-        do_fused_store = (unified and is_decode) or (
+        # The kernel is token-indexed (q, kv and positions are all length M), so
+        # a verify batch carrying several draft tokens per request is a shape it
+        # already handles. Only the cache store differs between decode and
+        # verify, and that half is left off below.
+        fuse_verify = (
+            envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY.get()
+            and forward_batch.forward_mode.is_target_verify()
+        )
+        do_fused_store = (unified and (is_decode or fuse_verify)) or (
             not unified and self.use_fused_qk_norm_rope
         )
 
@@ -1115,7 +1123,23 @@ class MQALayer(MqaAttentionBase):
             )
 
             token_to_kv_pool = get_token_to_kv_pool()
-            if unified:
+            if unified and fuse_verify:
+                # Target-verify is a 2-source consumer: attention reads history
+                # from the ring and takes the current chunk as k/v so the draft
+                # tokens stay causally masked against each other. Writing the
+                # ring here would make them look like history to every draft
+                # position, so fuse only the norm+RoPE and let the backend store
+                # after attention. swa_loc is not computed -- it exists solely to
+                # address a store this path no longer performs.
+                #
+                # kv is a strided slice of qkv_a and the ring store requires a
+                # contiguous buffer, so materialise it before the kernel norms
+                # it in place. The unfused path pays the same copy inside
+                # _compute_kv_bf16.
+                kv = kv.contiguous()
+                swa_cache, swa_loc = None, None
+                swa_page_size, bf16_store = 1, True
+            elif unified:
                 swa_cache = token_to_kv_pool.get_unified_kv(self.layer_id)
                 # swa_loc is layer-independent; computed once per forward by the
                 # backend and cached on the metadata (read here by every layer).
@@ -1151,7 +1175,11 @@ class MQALayer(MqaAttentionBase):
                 dtype=x.dtype,
                 bf16_store=bf16_store,
             )
-            kv = None
+            # On the verify path the kernel normed + RoPE'd kv in place and wrote
+            # nothing, so hand it back: the caller feeds it to attention and
+            # stores it afterwards (save_kv_cache = kv is not None).
+            if not (unified and fuse_verify):
+                kv = None
 
             if not unified and use_cp:
                 # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
