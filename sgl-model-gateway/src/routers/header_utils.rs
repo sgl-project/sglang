@@ -7,6 +7,7 @@ use http::header::HeaderName;
 
 static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-worker");
 static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
+static HEADER_WORKER_ID: HeaderName = HeaderName::from_static("x-smg-worker-id");
 
 fn extract_header_value<'a>(headers: Option<&'a HeaderMap>, name: &HeaderName) -> Option<&'a str> {
     headers
@@ -53,6 +54,14 @@ pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
     }
 
     headers
+}
+
+pub(crate) fn insert_worker_id(headers: &mut HeaderMap, worker_url: &str) {
+    let worker_id = blake3::hash(worker_url.as_bytes()).to_hex();
+    headers.insert(
+        HEADER_WORKER_ID.clone(),
+        HeaderValue::from_str(worker_id.as_str()).expect("BLAKE3 hex is a valid header value"),
+    );
 }
 
 /// Determine if a header should be forwarded without allocating (case-insensitive)
@@ -295,5 +304,23 @@ mod tests {
         assert!(!should_forward_request_header("cookie"));
         assert!(!should_forward_request_header("x-custom-header"));
         assert!(!should_forward_request_header("x-api-key"));
+    }
+
+    #[test]
+    fn test_insert_worker_id_is_stable_and_opaque() {
+        let mut headers = HeaderMap::new();
+        insert_worker_id(&mut headers, "http://10.0.0.1:30000@2");
+
+        let worker_id = headers["x-smg-worker-id"].to_str().unwrap();
+        assert_eq!(worker_id.len(), 64);
+        assert!(worker_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!worker_id.contains("10.0.0.1"));
+
+        let mut repeated_headers = HeaderMap::new();
+        insert_worker_id(&mut repeated_headers, "http://10.0.0.1:30000@2");
+        assert_eq!(
+            repeated_headers["x-smg-worker-id"],
+            headers["x-smg-worker-id"]
+        );
     }
 }

@@ -595,7 +595,7 @@ impl Router {
             // For non-streaming requests, preserve headers
             let response_headers = header_utils::preserve_response_headers(res.headers());
 
-            let response = match res.bytes().await {
+            let mut response = match res.bytes().await {
                 Ok(body) => {
                     let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
@@ -607,6 +607,7 @@ impl Router {
                     error::internal_error("read_response_body_failed", error_msg)
                 }
             };
+            header_utils::insert_worker_id(response.headers_mut(), worker_url);
 
             // load_guard dropped here automatically after response body is read
             response
@@ -640,6 +641,7 @@ impl Router {
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
+            header_utils::insert_worker_id(response.headers_mut(), worker_url);
 
             // Attach load guard to response body for proper RAII lifecycle
             // Guard is dropped when response body is consumed or client disconnects
