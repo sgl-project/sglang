@@ -153,6 +153,7 @@ def get_attn_backend(
     supported_attention_backends: set[AttentionBackendEnum] | None = None,
     selected_attention_backend: AttentionBackendEnum | None = None,
     attention_requirements: AttentionRequirements | None = None,
+    default_attention_backend: AttentionBackendEnum | None = None,
 ) -> type[AttentionBackend]:
     if supported_attention_backends is None:
         be_tuple = tuple()
@@ -177,6 +178,8 @@ def get_attn_backend(
                     f"Invalid attention backend '{server_args.attention_backend}' specified via command line. "
                     f"Available options are: {[e.name.lower() for e in AttentionBackendEnum]}"
                 )
+    if selected_backend is None:
+        selected_backend = default_attention_backend
 
     constraint_backend = None
     if selected_backend is None and len(be_tuple) == 1:

@@ -11,6 +11,9 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEConfig,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import MiniMaxH3VideoVAE
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_audio_vae.audio_vae import (
+    CausalAttention,
+)
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
     AutoencoderKLLegacy,
 )
@@ -18,6 +21,7 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention im
     Attention,
     _apply_qk_norm,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 def _init_kwargs(config: MiniMaxH3VideoVAEConfig):
@@ -77,3 +81,37 @@ def test_vit_qk_norm_supports_affine_free_rmsnorm():
     output = _apply_qk_norm(norm, hidden_states)
 
     assert output.shape == hidden_states.shape
+
+
+def test_audio_vae_attention_defaults_to_local_sdpa_and_allows_fa():
+    class RecordingFA(nn.Module):
+        backend = AttentionBackendEnum.FA
+        dtype = torch.bfloat16
+
+        def forward(self, query, key, value):
+            self.input_dtype = query.dtype
+            return query
+
+    module = (
+        "sglang.multimodal_gen.runtime.models.vaes." "minimax_h3_audio_vae.audio_vae"
+    )
+    recording_fa = RecordingFA()
+    with (
+        mock.patch(f"{module}.current_platform.is_cuda", return_value=True),
+        mock.patch(
+            f"{module}.USPAttention", autospec=True, return_value=recording_fa
+        ) as usp_attention,
+    ):
+        attention = CausalAttention(in_dim=64, out_dim=32, num_heads=2)
+        output = attention(torch.randn(1, 4, 64))
+
+    kwargs = usp_attention.call_args.kwargs
+    assert kwargs["causal"] is True
+    assert kwargs["skip_sequence_parallel"] is True
+    assert kwargs["default_attention_backend"] == AttentionBackendEnum.TORCH_SDPA
+    assert kwargs["supported_attention_backends"] == {
+        AttentionBackendEnum.FA,
+        AttentionBackendEnum.TORCH_SDPA,
+    }
+    assert recording_fa.input_dtype == torch.bfloat16
+    assert output.dtype == torch.float32

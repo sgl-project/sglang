@@ -681,6 +681,7 @@ class USPAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        default_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         dropout_rate: float = 0.0,
         skip_sequence_parallel: bool = False,
@@ -689,6 +690,8 @@ class USPAttention(nn.Module):
     ) -> None:
         """
         Args:
+            default_attention_backend:
+              fallback used only when no global or component override is active.
             skip_sequence_parallel:
               when KV is replicated across all SP ranks (e.g. cross-attention to
               text/image encoder outputs), the full USP pipeline is redundant:
@@ -706,7 +709,10 @@ class USPAttention(nn.Module):
 
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            default_attention_backend=default_attention_backend,
         )
         if not skip_sequence_parallel and get_ring_parallel_world_size() > 1:
             if not attn_backend.supports_ring_rotation():
