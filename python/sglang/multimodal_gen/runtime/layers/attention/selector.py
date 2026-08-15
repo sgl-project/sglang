@@ -17,7 +17,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionRequirements,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import STR_BACKEND_ENV_VAR, resolve_obj_by_qualname
 
@@ -184,64 +184,82 @@ def get_attn_backend(
                     f"Invalid attention backend '{server_args.attention_backend}' specified via command line. "
                     f"Available options are: {[e.name.lower() for e in AttentionBackendEnum]}"
                 )
-            selection_is_explicit = server_args.is_arg_explicitly_set(
-                "attention_backend"
-            )
+            selection_is_explicit = isinstance(
+                server_args, ServerArgs
+            ) and server_args.is_arg_explicitly_set("attention_backend")
 
     allowed_fallback_reason = None
-    if selected_backend is not None:
-        if is_cross_attention and selected_backend.is_sparse:
-            allowed_fallback_reason = "dense cross-attention fallback"
-        elif not selection_is_explicit:
-            allowed_fallback_reason = "platform default fallback"
-
-    fallback_reason = None
-    if (
-        selected_backend is not None
-        and be_tuple
-        and not _is_backend_supported(selected_backend, set(be_tuple))
-        and allowed_fallback_reason is not None
-    ):
-        selected_backend = None
-        fallback_reason = allowed_fallback_reason
+    if selected_backend is None:
+        allowed_fallback_reason = "platform default fallback"
+    elif is_cross_attention and selected_backend.is_sparse:
+        allowed_fallback_reason = "dense cross-attention fallback"
+    elif not selection_is_explicit:
+        allowed_fallback_reason = "platform default fallback"
 
     constraint_backend = None
     if selected_backend is None and len(be_tuple) == 1:
         constraint_backend = be_tuple[0].name.lower()
 
-    attention_backend_cls = _cached_get_attn_backend(
-        head_size,
-        dtype,
-        be_tuple,
-        selected_backend,
-    )
+    candidate_backends = [selected_backend]
+    if allowed_fallback_reason is not None:
+        for candidate in (None, *be_tuple):
+            if candidate not in candidate_backends:
+                candidate_backends.append(candidate)
+
+    supported_backends = set(be_tuple)
+    attention_backend_cls = None
+    fallback_reason = None
+    selection_error = None
+    unsupported_backend_name = None
+    unsupported_requirements = ()
+    for candidate_index, candidate in enumerate(candidate_backends):
+        try:
+            candidate_cls = _cached_get_attn_backend(
+                head_size,
+                dtype,
+                be_tuple,
+                candidate,
+            )
+        except ValueError as error:
+            if selection_error is None:
+                selection_error = error
+            continue
+
+        candidate_name = candidate_cls.get_enum().name.lower()
+        if supported_backends and not _is_backend_supported(
+            candidate_cls.get_enum(), supported_backends
+        ):
+            if selection_error is None:
+                selection_error = ValueError(
+                    f"Attention backend '{candidate_name}' is not supported by this "
+                    f"attention layer; supported backends: "
+                    f"{[str(backend) for backend in be_tuple]}"
+                )
+            continue
+
+        missing_requirements = candidate_cls.unsupported_requirements(requirements)
+        if missing_requirements:
+            if not unsupported_requirements:
+                unsupported_backend_name = candidate_name
+                unsupported_requirements = missing_requirements
+            continue
+
+        attention_backend_cls = candidate_cls
+        if candidate_index > 0:
+            fallback_reason = allowed_fallback_reason
+        break
+
+    if attention_backend_cls is None:
+        if unsupported_requirements:
+            raise ValueError(
+                f"Attention backend '{unsupported_backend_name}' does not implement "
+                f"{', '.join(unsupported_requirements)}"
+            )
+        if selection_error is not None:
+            raise selection_error
+        raise ValueError("No compatible attention backend is available")
 
     backend_name = attention_backend_cls.get_enum().name.lower()
-    unsupported_requirements = attention_backend_cls.unsupported_requirements(
-        requirements
-    )
-    if (
-        unsupported_requirements
-        and selected_backend is not None
-        and allowed_fallback_reason is not None
-    ):
-        selected_backend = None
-        fallback_reason = allowed_fallback_reason
-        attention_backend_cls = _cached_get_attn_backend(
-            head_size,
-            dtype,
-            be_tuple,
-            selected_backend,
-        )
-        backend_name = attention_backend_cls.get_enum().name.lower()
-        unsupported_requirements = attention_backend_cls.unsupported_requirements(
-            requirements
-        )
-    if unsupported_requirements:
-        raise ValueError(
-            f"Attention backend '{backend_name}' does not implement "
-            f"{', '.join(unsupported_requirements)}"
-        )
     reason = fallback_reason
     if reason is None and backend_name == constraint_backend:
         reason = "component constraint"

@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -11,23 +12,31 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
     get_attn_backend,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 _SELECTOR = "sglang.multimodal_gen.runtime.layers.attention.selector"
 
 
-class _ServerArgs:
+class _ServerArgs(ServerArgs):
     def __init__(self, backend: str, *, explicit: bool) -> None:
         self.attention_backend = backend
-        self._explicit = explicit
-
-    def is_arg_explicitly_set(self, arg_name: str) -> bool:
-        return arg_name == "attention_backend" and self._explicit
+        self._explicit_arg_names = {"attention_backend"} if explicit else set()
 
 
 class _FakeSDPABackend:
     @classmethod
     def get_enum(cls) -> AttentionBackendEnum:
         return AttentionBackendEnum.TORCH_SDPA
+
+    @classmethod
+    def unsupported_requirements(cls, _requirements) -> tuple[str, ...]:
+        return ()
+
+
+class _FakeFABackend:
+    @classmethod
+    def get_enum(cls) -> AttentionBackendEnum:
+        return AttentionBackendEnum.FA
 
     @classmethod
     def unsupported_requirements(cls, _requirements) -> tuple[str, ...]:
@@ -55,7 +64,16 @@ class _FakePlatform:
         cls.selected_backend = selected_backend
         if selected_backend == AttentionBackendEnum.AITER:
             return "fake.AITERBackend"
+        if selected_backend in (None, AttentionBackendEnum.FA):
+            return "fake.FABackend"
         return "fake.SDPABackend"
+
+
+_FAKE_BACKENDS = {
+    "fake.AITERBackend": _FakeAITERBackend,
+    "fake.FABackend": _FakeFABackend,
+    "fake.SDPABackend": _FakeSDPABackend,
+}
 
 
 class TestAttentionBackendFallback(unittest.TestCase):
@@ -71,8 +89,10 @@ class TestAttentionBackendFallback(unittest.TestCase):
         is_cross_attention: bool,
         supported: set[AttentionBackendEnum],
         attention_requirements: AttentionRequirements | None = None,
+        server_args: object | None = None,
     ):
-        server_args = _ServerArgs(backend.name.lower(), explicit=explicit)
+        if server_args is None:
+            server_args = _ServerArgs(backend.name.lower(), explicit=explicit)
         with (
             patch(f"{_SELECTOR}.get_global_forced_attn_backend", return_value=None),
             patch(f"{_SELECTOR}.get_component_forced_attn_backend", return_value=None),
@@ -83,11 +103,7 @@ class TestAttentionBackendFallback(unittest.TestCase):
             ),
             patch(
                 f"{_SELECTOR}.resolve_obj_by_qualname",
-                side_effect=lambda name: (
-                    _FakeAITERBackend
-                    if name == "fake.AITERBackend"
-                    else _FakeSDPABackend
-                ),
+                side_effect=_FAKE_BACKENDS.__getitem__,
             ),
         ):
             return get_attn_backend(
@@ -106,7 +122,7 @@ class TestAttentionBackendFallback(unittest.TestCase):
             supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
         )
 
-        self.assertIs(backend, _FakeSDPABackend)
+        self.assertIs(backend, _FakeFABackend)
         self.assertIsNone(_FakePlatform.selected_backend)
 
     def test_implicit_preference_falls_back_for_missing_capability(self):
@@ -119,7 +135,20 @@ class TestAttentionBackendFallback(unittest.TestCase):
         )
 
         self.assertIs(backend, _FakeSDPABackend)
-        self.assertIsNone(_FakePlatform.selected_backend)
+        self.assertEqual(
+            _FakePlatform.selected_backend, AttentionBackendEnum.TORCH_SDPA
+        )
+
+    def test_lightweight_server_args_are_treated_as_implicit(self):
+        backend = self._resolve(
+            AttentionBackendEnum.AITER,
+            explicit=False,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            server_args=SimpleNamespace(attention_backend="aiter"),
+        )
+
+        self.assertIs(backend, _FakeFABackend)
 
     def test_explicit_dense_mismatch_fails_closed(self):
         with self.assertRaisesRegex(
@@ -140,7 +169,7 @@ class TestAttentionBackendFallback(unittest.TestCase):
             supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
         )
 
-        self.assertIs(backend, _FakeSDPABackend)
+        self.assertIs(backend, _FakeFABackend)
         self.assertIsNone(_FakePlatform.selected_backend)
 
     def test_sparse_backend_mismatch_fails_for_self_attention(self):
