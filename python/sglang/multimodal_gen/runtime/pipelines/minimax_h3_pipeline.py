@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
@@ -49,18 +50,21 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def __init__(self, *args, **kwargs):
-        missing_media_tools = [
-            executable
-            for executable in ("ffmpeg", "ffprobe")
-            if shutil.which(executable) is None
-        ]
-        if missing_media_tools:
-            raise RuntimeError(
-                "MiniMax H3 requires ffmpeg and ffprobe for media processing "
-                "and validated output delivery; missing executables: "
-                f"{', '.join(missing_media_tools)}. Install the ffmpeg system "
-                "package before starting SGLang."
-            )
+        # TODO: Enable this check on ROCm after adding ffmpeg to the AMD Docker
+        # image and CI dependency installer.
+        if not current_platform.is_rocm():
+            missing_media_tools = [
+                executable
+                for executable in ("ffmpeg", "ffprobe")
+                if shutil.which(executable) is None
+            ]
+            if missing_media_tools:
+                raise RuntimeError(
+                    "MiniMax H3 requires ffmpeg and ffprobe for media processing "
+                    "and validated output delivery; missing executables: "
+                    f"{', '.join(missing_media_tools)}. Install the ffmpeg system "
+                    "package before starting SGLang."
+                )
         super().__init__(*args, **kwargs)
 
     @staticmethod
