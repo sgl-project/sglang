@@ -27,6 +27,10 @@ class SharedReadEnds(Enum):
     POST_REPLAY = auto()  # Metadata snapshot not implemented
     UNKNOWN = auto()  # not audited -> coarse whole-forward fence
 
+    @staticmethod
+    def max_of(items: list[SharedReadEnds]) -> SharedReadEnds:
+        return max(items, key=lambda x: x.value)
+
 
 class AttentionBackend(ABC):
     """The base class of attention backends.
