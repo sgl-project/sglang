@@ -44,6 +44,7 @@ from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     mamba_extra_buffer_lazy_of,
     mamba_extra_buffer_of,
+    remote_instance_transfer_engine_of,
     resolved_view,
 )
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
@@ -3526,6 +3527,9 @@ class ServerArgs:
     ] = None
 
     def __post_init__(self):
+        self._run_resolution_pipeline()
+
+    def _run_resolution_pipeline(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
 
@@ -9470,20 +9474,7 @@ class ServerArgs:
     def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
         """``load_format`` overrides the seed's: a draft runner loading under
         ``--speculative-draft-load-format`` needs its own transfer engine."""
-        # Use TransferEngine as seed backend.
-        if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
-            return True
-        # Use TransferEngine as client backend.
-        if (load_format or self.load_format) == "remote_instance" and (
-            self.remote_instance_weight_loader_backend == "transfer_engine"
-            or (
-                self.remote_instance_weight_loader_backend == "modelexpress"
-                and self.modelexpress_transport == "transfer_engine"
-            )
-        ):
-            return True
-        else:
-            return False
+        return remote_instance_transfer_engine_of(self, load_format)
 
     def describe_kv_events_publisher(self) -> Optional[dict]:
         """Return a structured description of this server's KV-event
@@ -9599,7 +9590,7 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
 # (sglang.srt.runtime_context). The two functions below are LEGACY shims kept
 # for the existing call-sites; they publish/read the same live object by
 # reference. Do not add new call-sites — the counts are ratcheted
-# (decrease-only) by scripts/lint/check_legacy_global_ratchet.py.
+# (decrease-only) by test/registered/unit/test_legacy_global_ratchet.py.
 # Imports are in-function so the two modules stay cycle-free at import time.
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
     """Legacy publish shim (role=scheduler) — prefer
