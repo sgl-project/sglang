@@ -549,13 +549,11 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
             )
             return self.scheduler.timesteps
 
-        training_steps = int(self.scheduler.config["num_train_timesteps"])
-        schedule_steps = 30
-        step_ratio = training_steps // schedule_steps
-        schedule = torch.arange(1, schedule_steps + 1) * step_ratio - 1
-        indices = torch.arange(schedule_steps - 1, -1, -3)
-        timesteps = schedule[indices]
-        self.scheduler.set_timesteps(timesteps=timesteps, device=device)
+        self.scheduler.set_timesteps(
+            num_inference_steps=10,
+            original_inference_steps=30,
+            device=device,
+        )
         return self.scheduler.timesteps
 
     def _prepare_denoising_inputs(self, batch: Req) -> PaintDenoisingInputs:

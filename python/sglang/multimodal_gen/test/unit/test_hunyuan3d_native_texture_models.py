@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import torch
 from diffusers import AutoencoderKL as DiffusersAutoencoderKL
-from diffusers import UNet2DConditionModel
+from diffusers import LCMScheduler, UNet2DConditionModel
 
 from sglang.multimodal_gen.configs.models.vaes.stable_diffusion import (
     StableDiffusionVAEConfig,
@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.models.dits.stable_diffusion import (
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan3d.paint import (
     Hunyuan3DPaintPostprocessStage,
+    Hunyuan3DPaintTexGenStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan3d.shape import (
     Hunyuan3DShapeSaveStage,
@@ -185,6 +186,24 @@ class TestHunyuan3DWarmupOutput(unittest.TestCase):
         output = stage.forward(self._batch(), SimpleNamespace())
 
         self.assertEqual(output.output_file_paths, [])
+
+
+class TestHunyuan3DPaintTurboSchedule(unittest.TestCase):
+    def test_uses_standard_lcm_schedule_without_custom_timesteps(self):
+        stage = Hunyuan3DPaintTexGenStage.__new__(Hunyuan3DPaintTexGenStage)
+        stage.config = Hunyuan3D2PipelineConfig(paint_turbo_mode=True)
+        stage.scheduler = LCMScheduler(
+            num_train_timesteps=1000,
+            original_inference_steps=50,
+        )
+
+        timesteps = stage._timesteps(torch.device("cpu"))
+
+        self.assertEqual(
+            timesteps.tolist(),
+            [989, 890, 791, 692, 593, 494, 395, 296, 197, 98],
+        )
+        self.assertFalse(stage.scheduler.custom_timesteps)
 
 
 if __name__ == "__main__":
