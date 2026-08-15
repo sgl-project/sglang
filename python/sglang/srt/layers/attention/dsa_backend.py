@@ -113,21 +113,29 @@ def _all_gather_dsa_trtllm_fp8_kv(
     return kv.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
 
 
-def materialize_full_kv_cp(
+def prepare_kv_for_attention(
     attn_mla,
     forward_batch: ForwardBatch,
-    latent_cache: torch.Tensor,
     k_nope: torch.Tensor,
     k_pe: torch.Tensor,
+    *,
+    defer_materialization: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if is_cp_active(forward_batch):
-        return get_cp_strategy().materialize_full_mla_kv(
-            forward_batch,
-            attn_mla.attn_mqa,
-            k_nope,
-            k_pe,
-        )
-    return attn_mla.rebuild_cp_kv_cache(latent_cache, forward_batch, k_nope, k_pe)
+    """Materialize KV needed before attention for the active layout."""
+    if (
+        defer_materialization
+        or not dsa_use_prefill_cp(forward_batch)
+        or not is_cp_active(forward_batch)
+    ):
+        return k_nope, k_pe
+    strategy = get_cp_strategy()
+    assert strategy is not None
+    return strategy.materialize_full_mla_kv(
+        forward_batch,
+        attn_mla.attn_mqa,
+        k_nope,
+        k_pe,
+    )
 
 
 _is_hip = is_hip()
