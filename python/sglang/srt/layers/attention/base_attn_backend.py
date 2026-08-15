@@ -127,7 +127,7 @@ class AttentionBackend(ABC):
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
-    def shared_read_boundary(self, fm: ForwardMode) -> SharedReadEnds:
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode."""
         if fm.is_decode() or fm.is_target_verify():
             # Default to IN_REPLAY, we assume shared data still reads after the in-graph hook

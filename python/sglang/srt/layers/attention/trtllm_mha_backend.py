@@ -103,11 +103,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     supports_ragged_verify_graph: bool = True
 
-    def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadEnds:
+    def shared_read_ends(self, forward_mode: ForwardMode) -> SharedReadEnds:
         # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
         if forward_mode == ForwardMode.EXTEND:
             return SharedReadEnds.PRE_REPLAY
-        return super().shared_read_boundary(forward_mode)
+        return super().shared_read_ends(forward_mode)
 
     def __init__(
         self,
