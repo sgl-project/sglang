@@ -3,8 +3,12 @@
 import unittest
 
 import torch
+from diffusers import AutoencoderKL as DiffusersAutoencoderKL
 from diffusers import UNet2DConditionModel
 
+from sglang.multimodal_gen.configs.models.vaes.stable_diffusion import (
+    StableDiffusionVAEConfig,
+)
 from sglang.multimodal_gen.runtime.models.dits.hunyuan3d_paint import (
     Hunyuan3DPaintUNet,
 )
@@ -12,6 +16,7 @@ from sglang.multimodal_gen.runtime.models.dits.stable_diffusion import (
     StableDiffusionUNet2DConditionModel,
     StableDiffusionUNetConfig,
 )
+from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
 
 
 def _unet_config() -> dict:
@@ -101,6 +106,45 @@ class TestNativeStableDiffusionUNet(unittest.TestCase):
 
         self.assertEqual(output.shape, (2, 4, 8, 8))
         self.assertTrue(condition_cache)
+
+
+class TestNativeStableDiffusionVAE(unittest.TestCase):
+    def test_old_diffusers_config_defaults_and_forward(self):
+        raw_config = {
+            "in_channels": 3,
+            "out_channels": 3,
+            "latent_channels": 4,
+            "sample_size": 8,
+            "block_out_channels": (32, 32),
+            "layers_per_block": 1,
+            "act_fn": "silu",
+            "norm_num_groups": 8,
+            "down_block_types": ("DownEncoderBlock2D", "DownEncoderBlock2D"),
+            "up_block_types": ("UpDecoderBlock2D", "UpDecoderBlock2D"),
+        }
+        reference = DiffusersAutoencoderKL(**raw_config).eval()
+        config = StableDiffusionVAEConfig()
+        config.update_model_arch(raw_config)
+        native = AutoencoderKL(config).eval()
+        native.load_state_dict(reference.state_dict(), strict=True)
+
+        image = torch.randn(1, 3, 8, 8)
+        latent = torch.randn(1, 4, 4, 4)
+        with torch.inference_mode():
+            expected_posterior = reference.encode(image).latent_dist
+            actual_posterior = native.encode(image).latent_dist
+            expected_decoded = reference.decode(latent).sample
+            actual_decoded = native.decode(latent)
+
+        torch.testing.assert_close(
+            actual_posterior.parameters,
+            expected_posterior.parameters,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(
+            actual_decoded, expected_decoded, rtol=1e-5, atol=1e-5
+        )
 
 
 if __name__ == "__main__":

@@ -22,7 +22,9 @@ from huggingface_hub import snapshot_download
 from safetensors.torch import load_file as load_safetensors
 from transformers import AutoTokenizer
 
-from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
+from sglang.multimodal_gen.configs.models.vaes.stable_diffusion import (
+    StableDiffusionVAEConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
@@ -368,12 +370,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         device: torch.device,
     ) -> StableDiffusionAutoencoderKL:
         config_data = cls._read_json(os.path.join(component_dir, "config.json"))
-        vae_config = FluxVAEConfig(
-            use_tiling=False,
-            use_temporal_tiling=False,
-            use_parallel_tiling=False,
-            use_parallel_decode=False,
-        )
+        vae_config = StableDiffusionVAEConfig()
         vae_config.update_model_arch(config_data)
         with set_default_torch_dtype(dtype):
             vae = StableDiffusionAutoencoderKL(vae_config)
