@@ -2973,6 +2973,7 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
         recv = [None]
         if rank == source_rank:
             with contextlib.suppress(OSError):
+                # create a shared memory segment
                 shm = shared_memory.SharedMemory(
                     create=True, size=128, name=make_shm_name("nodecheck")
                 )
@@ -2989,6 +2990,7 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
                 is_in_the_same_node[rank] = 1
         elif name is not None:
             with contextlib.suppress(OSError):
+                # try to open the shared memory segment
                 # fix to https://stackoverflow.com/q/62748654/9191338
                 # Python incorrectly tracks shared memory even if it is not
                 # created by the process. The following patch is a workaround.
