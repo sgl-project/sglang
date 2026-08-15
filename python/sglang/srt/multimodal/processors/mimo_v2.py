@@ -5,6 +5,7 @@ import base64
 import copy
 import json
 import math
+import os
 import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,7 +14,6 @@ from io import BytesIO
 from typing import List, Literal, Optional, Union
 
 import numpy as np
-import requests
 import torch
 import torch.nn.functional as F
 from fastapi import HTTPException
@@ -40,6 +40,7 @@ from sglang.srt.multimodal.processors.mimo_audio import (
 )
 from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
 from sglang.srt.utils import ImageData, VideoData
+from sglang.srt.utils.common import download_remote_media
 from sglang.utils import logger
 
 
@@ -485,12 +486,14 @@ class MiMoProcessor:
 
     @staticmethod
     def has_audio_track(path_or_data) -> bool:
-        # In-process probe via torchcodec for bytes/path; ffprobe range
-        # request for HTTP URLs so we do not pre-download the blob here.
+        # Never hand a client-supplied URL to ffprobe: its internal HTTP client
+        # would bypass the shared domain and redirect policy. Resolve it through
+        # the guarded downloader first, then probe the resulting bytes in-process.
         if isinstance(path_or_data, str) and path_or_data.startswith(
             ("http://", "https://")
         ):
-            return _ffprobe_has_audio(path_or_data, stdin=None, label=path_or_data)
+            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            path_or_data = download_remote_media(path_or_data, timeout=timeout)
 
         if isinstance(path_or_data, bytes):
             source = BytesIO(path_or_data)
@@ -1446,10 +1449,8 @@ class MiMoProcessor:
             image_obj = image
         elif isinstance(image, str):
             if image.startswith("http://") or image.startswith("https://"):
-                with requests.get(image, stream=True) as response:
-                    response.raise_for_status()
-                    with BytesIO(response.content) as bio:
-                        image_obj = copy.deepcopy(Image.open(bio))
+                with BytesIO(download_remote_media(image, timeout=3)) as bio:
+                    image_obj = copy.deepcopy(Image.open(bio))
             elif image.startswith("file://"):
                 image_obj = Image.open(image[7:])
             elif image.startswith("data:image"):
