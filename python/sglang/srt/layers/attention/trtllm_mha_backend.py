@@ -38,6 +38,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_utils import capture_mode as _capture_mode
 from sglang.srt.runtime_context import get_buffer, get_spec
 from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
@@ -103,6 +104,28 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     supports_ragged_verify_graph: bool = True
 
+    def _sinks_float32(self, sinks: torch.Tensor) -> torch.Tensor:
+        """The exact float32 upcast of a bfloat16 sinks weight.
+
+        Cached per source tensor and re-derived when the weight is updated in
+        place (version bump). Under true graph capture the conversion is
+        emitted unconditionally: the captured kernel re-reads the weight on
+        every replay, which is what keeps an in-place weight update visible to
+        the graph. The breakable-cuda-graph scope runs attention eagerly
+        between segments, so it takes the cache like any eager step.
+        """
+        if _capture_mode.is_capture_mode:
+            return sinks.to(torch.float32)
+        # `Tensor._version` (private): autograd's in-place counter, the one
+        # per-tensor signal that ticks on copy_-style weight updates.
+        key = id(sinks)
+        cached = self._sinks_fp32_cache.get(key)
+        if cached is not None and cached[0] == sinks._version:
+            return cached[1]
+        converted = sinks.to(torch.float32)
+        self._sinks_fp32_cache[key] = (sinks._version, converted)
+        return converted
+
     def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
         # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
         if forward_mode == ForwardMode.EXTEND:
@@ -117,6 +140,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
         speculative_step_id: int = 0,
     ):
+        self._sinks_fp32_cache: dict[int, tuple[int, torch.Tensor]] = {}
         # Capture workspace size before super().__init__() to preserve user's
         # SGLANG_FLASHINFER_WORKSPACE_SIZE setting (may be overridden by parent)
         env_var = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE
@@ -1157,6 +1181,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
         attention_sink = kwargs.get("sinks", None)
+        if attention_sink is not None and attention_sink.dtype != torch.float32:
+            # The sinks weight is bfloat16; this kernel consumes float32.
+            attention_sink = self._sinks_float32(attention_sink)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
@@ -1266,6 +1293,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
+        if attention_sink is not None and attention_sink.dtype != torch.float32:
+            # The sinks weight is bfloat16; this kernel consumes float32.
+            attention_sink = self._sinks_float32(attention_sink)
         bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
