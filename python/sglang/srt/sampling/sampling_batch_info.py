@@ -144,6 +144,9 @@ class SamplingBatchInfo:
             get_exec().features.enable_custom_logit_processor
             and any(r.custom_logit_processor for r in reqs)  # check the flag first.
         )  # then check the requests.
+        custom_params = [r.sampling_params.custom_params for r in reqs]
+        if not any(params is not None for params in custom_params):
+            custom_params = None
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
         sampling_mask_max_top_k = max(
             (r.sampling_params.top_k for r in reqs if r.return_sampling_mask),
@@ -172,10 +175,8 @@ class SamplingBatchInfo:
                 )
                 for processor_str, true_indices in processor_dict.items()
             }
-            custom_params = [r.sampling_params.custom_params for r in reqs]
         else:
             merged_custom_logit_processor = None
-            custom_params = None
 
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
         # the sampling_params of the requests (See {_is_required()} of each penalizers). So this
@@ -304,6 +305,8 @@ class SamplingBatchInfo:
 
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices, keep_indices_device)
+        if self.custom_params is not None:
+            self.custom_params = [self.custom_params[i] for i in keep_indices]
 
         for item in [
             "temperatures",
@@ -336,13 +339,9 @@ class SamplingBatchInfo:
                 mask[keep_indices_device]
             )  # ignore the custom logit processor whose mask is all False
         }
-        self.custom_params = [self.custom_params[i] for i in keep_indices]
-
-        # If the custom logit processor is an empty dict, set the flag to False,
-        # and set the custom logit processor and custom params to None.
+        # If the custom logit processor is empty, clear only the processor state.
         if len(self.custom_logit_processor) == 0:
             self.custom_logit_processor = None
-            self.custom_params = None
             self.has_custom_logit_processor = False
 
     @staticmethod
@@ -388,7 +387,7 @@ class SamplingBatchInfo:
     def merge_batch(self, other: SamplingBatchInfo):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
-        # Merge the custom logit processors and custom params lists
+        # Merge the custom logit processors.
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
             # Merge the custom logit processors
             self.custom_logit_processor = (
@@ -400,16 +399,15 @@ class SamplingBatchInfo:
                     self.device,
                 )
             )
-            # Merge the custom params lists
-            self.custom_params = self.custom_params or [None] * len(self)
-            other.custom_params = other.custom_params or [None] * len(other)
-            self.custom_params.extend(other.custom_params)
-
             # Set the flag to True if any of the two has custom logit processor
             self.has_custom_logit_processor = True
 
         self_len = len(self)
         other_len = len(other)
+        if self.custom_params is not None or other.custom_params is not None:
+            self.custom_params = (
+                self.custom_params or [None] * self_len
+            ) + (other.custom_params or [None] * other_len)
 
         # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
         # See note below on len(self) and len(other).

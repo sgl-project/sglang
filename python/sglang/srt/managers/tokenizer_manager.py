@@ -1387,6 +1387,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
+        if (
+            isinstance(obj, GenerateReqInput)
+            and self.model_config.hf_config.model_type == "neo_chat"
+            and isinstance(sampling_params.custom_params, dict)
+        ):
+            from sglang.srt.models.neo_chat_limits import (
+                U1_FLOW_BATCH_ISOLATION_PARAM,
+                U1_FLOW_CUSTOM_PARAM,
+                normalize_u1_flow_request,
+            )
+
+            flow_spec = sampling_params.custom_params.get(U1_FLOW_CUSTOM_PARAM)
+            if flow_spec is not None:
+                if input_ids is None:
+                    raise ValueError("SenseNova U1 flow requires input_ids")
+                custom_params = dict(sampling_params.custom_params)
+                custom_params[U1_FLOW_CUSTOM_PARAM] = normalize_u1_flow_request(
+                    flow_spec,
+                    input_token_count=len(input_ids),
+                )
+                custom_params[U1_FLOW_BATCH_ISOLATION_PARAM] = (
+                    f"sensenova_u1_flow:{obj.rid}"
+                )
+                sampling_params.custom_params = custom_params
 
         # Build return object
         if isinstance(obj, GenerateReqInput):

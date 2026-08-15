@@ -3303,6 +3303,12 @@ class Scheduler(
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
+            if (
+                adder.can_run_list
+                and req.batch_isolation_key
+                != adder.can_run_list[0].batch_isolation_key
+            ):
+                continue
 
             running_bs = len(running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
@@ -3441,6 +3447,8 @@ class Scheduler(
             and not (new_batch.return_logprob or running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
+            and all(req.batch_isolation_key is None for req in new_batch.reqs)
+            and all(req.batch_isolation_key is None for req in running_batch.reqs)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()

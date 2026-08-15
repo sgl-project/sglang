@@ -3,11 +3,14 @@
 import json
 import os
 import sys
+from array import array
 from pathlib import Path
 
 import pytest
 from sglang.srt.configs.neo_chat import NEOChatConfig
-from sglang.srt.models.neo_chat import _stacked_weight_target
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.models.neo_chat import _flow_weight_target, _stacked_weight_target
+from sglang.srt.sampling.sampling_params import SamplingParams
 from transformers import AutoConfig
 
 _MODEL_PATH_VALUE = os.environ.get("SENSENOVA_U1_MODEL_PATH")
@@ -103,6 +106,35 @@ def test_neo_chat_qkv_weight_targets_cover_both_towers() -> None:
         assert _stacked_weight_target(source) == expected
 
 
+def test_neo_chat_flow_weight_targets_cover_native_vision() -> None:
+    assert (
+        _flow_weight_target(
+            "fm_modules.vision_model_mot_gen.embeddings.patch_embedding.weight"
+        )
+        == "fm_modules.vision_model_mot_gen.patch_embedding.weight"
+    )
+    assert (
+        _flow_weight_target("fm_modules.timestep_embedder.mlp.0.weight")
+        == "fm_modules.timestep_embedder.mlp.0.weight"
+    )
+
+
+def test_neo_chat_flow_request_captures_batch_isolation_key() -> None:
+    sampling_params = SamplingParams(
+        max_new_tokens=1,
+        custom_params={"__sglang_batch_isolation_key": "u1-flow:test"},
+    )
+    req = Req(
+        rid="u1-flow-test",
+        origin_input_text="",
+        origin_input_ids=array("q", [1]),
+        sampling_params=sampling_params,
+        vocab_size=32,
+    )
+
+    assert req.batch_isolation_key == "u1-flow:test"
+
+
 @pytest.mark.skipif(
     MODEL_PATH is None or not (MODEL_PATH / "model.safetensors.index.json").exists(),
     reason="SENSENOVA_U1_MODEL_PATH must point to a local checkpoint",
@@ -116,6 +148,12 @@ def test_neo_chat_checkpoint_language_weight_inventory() -> None:
         key for key in index["weight_map"] if key.startswith("language_model.")
     )
     native_targets = {_stacked_weight_target(key)[0] for key in language_keys}
+    flow_keys = sorted(
+        key for key in index["weight_map"] if key.startswith("fm_modules.")
+    )
+    flow_targets = {_flow_weight_target(key) for key in flow_keys}
 
     assert len(language_keys) == 1096
     assert len(native_targets) == 928
+    assert len(flow_keys) == 16
+    assert len(flow_targets) == 16

@@ -7,6 +7,19 @@ from sglang.kernels.ops.attention.extend_attention import (
     extend_attention_fwd,
 )
 from sglang.srt.configs.neo_chat import NEOVisionConfig
+from sglang.srt.models.neo_chat_flow import (
+    NEOChatTimestepEmbedder,
+    apply_u1_time_schedule,
+    build_u1_flow_batch_layout,
+    compute_u1_noise_scale,
+    patchify_images,
+    unpatchify_images,
+)
+from sglang.srt.models.neo_chat_limits import (
+    normalize_u1_flow_request,
+    validate_u1_flow_steps,
+    validate_u1_image_size,
+)
 from sglang.srt.models.neo_chat_mask import (
     build_u1_hybrid_allowed_matrix,
     build_u1_hybrid_backend_mask,
@@ -148,6 +161,149 @@ def test_neo_chat_vision_refreshes_fp32_rope_cache_after_cast() -> None:
     model._ensure_fp32_rope_cache()
     assert model.cos_cached_x.dtype == torch.float32
     assert model.sin_cached_y.dtype == torch.float32
+
+
+def test_neo_chat_timestep_embedding_matches_frequency_layout() -> None:
+    timesteps = torch.tensor([0.0, 1.0])
+    embedding = NEOChatTimestepEmbedder.timestep_embedding(timesteps, 4)
+
+    torch.testing.assert_close(
+        embedding[0],
+        torch.tensor([1.0, 1.0, 0.0, 0.0]),
+    )
+    torch.testing.assert_close(
+        embedding[1],
+        torch.tensor(
+            [
+                torch.cos(torch.tensor(1.0)),
+                torch.cos(torch.tensor(0.01)),
+                torch.sin(torch.tensor(1.0)),
+                torch.sin(torch.tensor(0.01)),
+            ]
+        ),
+    )
+
+
+def test_neo_chat_flow_patchify_round_trip() -> None:
+    images = torch.arange(3 * 8 * 8, dtype=torch.float32).reshape(1, 3, 8, 8)
+    patches = patchify_images(images, 4)
+    restored = unpatchify_images(patches, 4, 8, 8)
+
+    assert torch.equal(restored, images)
+    assert patchify_images(images, 4, channel_first=True).shape == (1, 4, 48)
+
+
+def test_neo_chat_flow_schedule_and_noise_scale_match_u1_defaults() -> None:
+    timesteps = torch.tensor([0.0, 0.5, 1.0])
+    shifted = apply_u1_time_schedule(
+        timesteps,
+        image_seq_len=256,
+        timestep_shift=2.0,
+        time_schedule="dynamic",
+        time_shift_type="exponential",
+        base_shift=0.5,
+        max_shift=1.15,
+        base_image_seq_len=64,
+        max_image_seq_len=4096,
+    )
+
+    torch.testing.assert_close(
+        shifted,
+        torch.tensor([0.0, 1.0 / 3.0, 1.0]),
+    )
+    assert (
+        compute_u1_noise_scale(
+            grid_height=32,
+            grid_width=32,
+            merge_size=2,
+            noise_scale=1.0,
+            noise_scale_mode="resolution",
+            base_image_seq_len=64,
+            max_value=8.0,
+        )
+        == 2.0
+    )
+
+
+def test_neo_chat_flow_layout_keeps_text_prefix_and_builds_image_grid() -> None:
+    indexes, indicators = build_u1_flow_batch_layout(
+        torch.arange(5, 10),
+        [5],
+        [5],
+        [
+            {
+                "image_start": 6,
+                "image_tokens": 4,
+                "image_t_index": 6,
+                "token_height": 2,
+                "token_width": 2,
+            }
+        ],
+    )
+
+    assert indicators.tolist() == [False, True, True, True, True]
+    assert indexes.tolist() == [
+        [5, 6, 6, 6, 6],
+        [0, 0, 0, 1, 1],
+        [0, 0, 1, 0, 1],
+    ]
+
+
+def test_neo_chat_flow_layout_rejects_cached_dynamic_image_tokens() -> None:
+    with pytest.raises(RuntimeError, match="unique extra_key"):
+        build_u1_flow_batch_layout(
+            torch.arange(2),
+            [2],
+            [7],
+            [
+                {
+                    "image_start": 6,
+                    "image_tokens": 2,
+                    "image_t_index": 6,
+                    "token_height": 1,
+                    "token_width": 2,
+                }
+            ],
+        )
+
+
+def test_neo_chat_flow_request_limits_reject_oversized_work() -> None:
+    assert validate_u1_image_size(1024, 1024) == (1024, 1024)
+    assert validate_u1_flow_steps(64) == 64
+    with pytest.raises(ValueError, match="divisible by 32"):
+        validate_u1_image_size(65, 64)
+    with pytest.raises(ValueError, match="pixel count"):
+        validate_u1_image_size(2048, 1024)
+    with pytest.raises(ValueError, match="maximum 64"):
+        validate_u1_flow_steps(65)
+    with pytest.raises(TypeError, match="not a boolean"):
+        validate_u1_flow_steps(True)
+
+
+def test_neo_chat_flow_request_normalizes_and_validates_suffix() -> None:
+    normalized = normalize_u1_flow_request(
+        {
+            "width": 64,
+            "height": 64,
+            "num_steps": 2,
+            "seed": 7,
+            "image_start": 24,
+            "image_tokens": 4,
+            "image_t_index": 24,
+            "token_height": 2,
+            "token_width": 2,
+            "return_image_tensor": True,
+        },
+        input_token_count=28,
+    )
+
+    assert normalized["image_tokens"] == 4
+    assert normalized["timestep_shift"] == 1.0
+    with pytest.raises(ValueError, match="final input token span"):
+        normalize_u1_flow_request(
+            {**normalized, "image_start": 23},
+            input_token_count=28,
+        )
 
 
 def test_short_custom_mask_dense_attention_matches_reference() -> None:

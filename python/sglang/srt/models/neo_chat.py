@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 from collections.abc import Iterable
 
@@ -33,6 +34,19 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.neo_chat_flow import (
+    NEOChatFlowModules,
+    apply_u1_time_schedule,
+    build_u1_flow_batch_layout,
+    compute_u1_noise_scale,
+    patchify_images,
+    unpatchify_images,
+)
+from sglang.srt.models.neo_chat_limits import (
+    U1_FLOW_CUSTOM_PARAM,
+    validate_u1_flow_steps,
+    validate_u1_image_size,
+)
 from sglang.srt.models.neo_chat_mask import build_u1_hybrid_backend_mask
 from sglang.srt.models.neo_chat_vision import NEOVisionModel
 from sglang.srt.utils import add_prefix
@@ -99,6 +113,16 @@ def _stacked_weight_target(name: str) -> tuple[str, str | None]:
         if source in name:
             return name.replace(source, target), shard_id
     return name, None
+
+
+def _flow_weight_target(name: str) -> str:
+    if name.startswith("fm_modules.vision_model_mot_gen.embeddings."):
+        return name.replace(
+            "fm_modules.vision_model_mot_gen.embeddings.",
+            "fm_modules.vision_model_mot_gen.",
+            1,
+        )
+    return name
 
 
 def _apply_u1_rope(
@@ -718,6 +742,7 @@ class NEOChatModel(nn.Module):
             prefix=add_prefix("language_model", prefix),
         )
         self.vision_model = NEOVisionModel(config.vision_config)
+        self.fm_modules = NEOChatFlowModules(config)
         self.is_mrope_enabled = True
         self.last_load_report: dict[str, object] | None = None
 
@@ -739,6 +764,29 @@ class NEOChatModel(nn.Module):
         pixel_values = torch.cat([item.feature for item in items], dim=0)
         grid_hw = torch.cat([item.grid_hw for item in items], dim=0)
         return self.vision_model(pixel_values, grid_hw)
+
+    @staticmethod
+    def _flow_specs(forward_batch: ForwardBatch) -> list[dict] | None:
+        sampling_info = forward_batch.sampling_info
+        custom_params = None if sampling_info is None else sampling_info.custom_params
+        if custom_params is None:
+            return None
+
+        specs = []
+        for params in custom_params:
+            spec = (
+                None
+                if not isinstance(params, dict)
+                else params.get(U1_FLOW_CUSTOM_PARAM)
+            )
+            specs.append(spec)
+        if not any(spec is not None for spec in specs):
+            return None
+        if any(spec is None for spec in specs):
+            raise NotImplementedError(
+                "SenseNova U1 flow requests cannot share a batch with text requests"
+            )
+        return specs
 
     @staticmethod
     def _request_image_tags(
@@ -776,6 +824,37 @@ class NEOChatModel(nn.Module):
 
     def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
         forward_batch.model_specific_states = None
+
+        flow_specs = (
+            self._flow_specs(forward_batch)
+            if forward_batch.forward_mode.is_extend()
+            else None
+        )
+        if flow_specs is not None:
+            indexes, image_gen_indicators = build_u1_flow_batch_layout(
+                forward_batch.positions,
+                forward_batch.extend_seq_lens_cpu,
+                forward_batch.extend_prefix_lens_cpu,
+                flow_specs,
+            )
+            image_token_tag = image_gen_indicators.clone()
+            custom_mask, mask_indptr = build_u1_hybrid_backend_mask(
+                indexes,
+                image_token_tag,
+                forward_batch.extend_seq_lens_cpu,
+                forward_batch.extend_prefix_lens_cpu,
+                force_custom_mask=True,
+            )
+            forward_batch.mrope_positions = indexes
+            forward_batch.model_specific_states = {
+                "indexes": indexes,
+                "image_token_tag": image_token_tag,
+                "image_gen_indicators": image_gen_indicators,
+                "custom_mask": custom_mask,
+                "mask_indptr": mask_indptr,
+                "flow_specs": flow_specs,
+            }
+            return
 
         indexes = forward_batch.mrope_positions
         if indexes is None:
@@ -846,6 +925,197 @@ class NEOChatModel(nn.Module):
         metadata.custom_mask = states["custom_mask"]
         metadata.mask_indptr = states["mask_indptr"]
 
+    def _forward_flow(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        states = forward_batch.model_specific_states
+        flow_specs = states["flow_specs"]
+        if forward_batch.batch_size != 1:
+            raise NotImplementedError(
+                "SenseNova U1 bounded flow currently supports batch_size=1"
+            )
+        spec = flow_specs[0]
+        image_gen_indicators = states["image_gen_indicators"]
+        image_token_count = int(image_gen_indicators.sum().item())
+
+        width, height = validate_u1_image_size(
+            spec["width"],
+            spec["height"],
+        )
+        num_steps = validate_u1_flow_steps(spec.get("num_steps", 2))
+        seed = int(spec.get("seed", 0))
+        logger.info(
+            "SenseNova U1 bounded flow start: prefix_tokens=%d image_tokens=%d "
+            "steps=%d size=%dx%d",
+            forward_batch.extend_prefix_lens_cpu[0],
+            image_token_count,
+            num_steps,
+            width,
+            height,
+        )
+
+        patch_size = int(self.config.patch_size)
+        merge_size = int(1 / float(self.config.downsample_ratio))
+        token_height = height // (patch_size * merge_size)
+        token_width = width // (patch_size * merge_size)
+        grid_height = height // patch_size
+        grid_width = width // patch_size
+        if image_token_count != token_height * token_width:
+            raise ValueError("SenseNova U1 flow image token count is inconsistent")
+
+        parameter = next(self.fm_modules.parameters())
+        device = parameter.device
+        dtype = parameter.dtype
+        noise_scale = compute_u1_noise_scale(
+            grid_height=grid_height,
+            grid_width=grid_width,
+            merge_size=merge_size,
+            noise_scale=float(getattr(self.config, "noise_scale", 1.0)),
+            noise_scale_mode=str(getattr(self.config, "noise_scale_mode", "constant")),
+            base_image_seq_len=int(
+                getattr(self.config, "noise_scale_base_image_seq_len", 64)
+            ),
+            max_value=float(getattr(self.config, "noise_scale_max_value", 1.0)),
+        )
+        generator = torch.Generator(device=device).manual_seed(seed)
+        image_prediction = noise_scale * torch.randn(
+            (1, 3, height, width),
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        )
+        initial_prediction = image_prediction.clone()
+        timesteps = torch.linspace(
+            0.0,
+            1.0,
+            num_steps + 1,
+            device=device,
+        )
+        if bool(spec.get("enable_timestep_shift", True)):
+            timesteps = apply_u1_time_schedule(
+                timesteps,
+                image_seq_len=image_token_count,
+                timestep_shift=float(spec.get("timestep_shift", 1.0)),
+                time_schedule=str(getattr(self.config, "time_schedule", "standard")),
+                time_shift_type=str(
+                    getattr(self.config, "time_shift_type", "exponential")
+                ),
+                base_shift=float(getattr(self.config, "base_shift", 0.5)),
+                max_shift=float(getattr(self.config, "max_shift", 1.15)),
+                base_image_seq_len=int(getattr(self.config, "base_image_seq_len", 64)),
+                max_image_seq_len=int(getattr(self.config, "max_image_seq_len", 4096)),
+            )
+
+        grid_hw = torch.tensor(
+            [[grid_height, grid_width]],
+            dtype=torch.long,
+            device=device,
+        )
+        base_input_embeds = self.get_input_embeddings()(input_ids)
+        final_hidden_states = None
+        step_delta_l2 = []
+        for step_index in range(num_steps):
+            timestep = timesteps[step_index]
+            next_timestep = timesteps[step_index + 1]
+            latent_patches = patchify_images(
+                image_prediction,
+                patch_size * merge_size,
+            )
+            image_patches = patchify_images(
+                image_prediction,
+                patch_size,
+                channel_first=True,
+            )
+            image_embeds = self.fm_modules.vision_model_mot_gen(
+                image_patches.reshape(grid_height * grid_width, -1),
+                grid_hw,
+            )
+            expanded_timestep = timestep.expand(image_token_count)
+            timestep_embeds = self.fm_modules.timestep_embedder(expanded_timestep)
+            if self.fm_modules.add_noise_scale_embedding:
+                normalized_noise_scale = noise_scale / float(
+                    getattr(self.config, "noise_scale_max_value", 1.0)
+                )
+                timestep_embeds = (
+                    timestep_embeds
+                    + self.fm_modules.noise_scale_embedder(
+                        torch.full_like(
+                            expanded_timestep,
+                            normalized_noise_scale,
+                        )
+                    )
+                )
+            image_embeds = image_embeds + timestep_embeds.to(image_embeds.dtype)
+
+            input_embeds = base_input_embeds.clone()
+            input_embeds[image_gen_indicators] = image_embeds
+            final_hidden_states = self.language_model.model(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds=input_embeds,
+                image_gen_indicators=image_gen_indicators,
+            )
+            image_hidden_states = final_hidden_states[image_gen_indicators].reshape(
+                1,
+                image_token_count,
+                -1,
+            )
+            image_prediction_target = self.fm_modules.fm_head(
+                image_hidden_states
+            ).reshape_as(latent_patches)
+            velocity = (image_prediction_target - latent_patches) / (
+                1 - timestep
+            ).clamp_min(float(getattr(self.config, "t_eps", 0.05)))
+            updated_patches = latent_patches + (next_timestep - timestep) * velocity
+            updated_prediction = unpatchify_images(
+                updated_patches,
+                patch_size * merge_size,
+                height,
+                width,
+            )
+            step_delta_l2.append(
+                float((updated_prediction - image_prediction).float().norm().item())
+            )
+            image_prediction = updated_prediction
+
+        assert final_hidden_states is not None
+        output = self.language_model.logits_processor(
+            input_ids,
+            final_hidden_states,
+            self.language_model.lm_head,
+            forward_batch,
+        )
+        final_image = image_prediction.detach().to(torch.float16).cpu().contiguous()
+        image_b64 = (
+            base64.b64encode(final_image.numpy().tobytes()).decode("ascii")
+            if bool(spec.get("return_image_tensor", False))
+            else None
+        )
+        output.customized_info = {
+            "sensenova_u1_flow_steps": [num_steps],
+            "sensenova_u1_flow_image_shape": [list(final_image.shape)],
+            "sensenova_u1_flow_image_dtype": ["float16"],
+            "sensenova_u1_flow_image_b64": [image_b64],
+            "sensenova_u1_flow_noise_scale": [noise_scale],
+            "sensenova_u1_flow_step_delta_l2": [step_delta_l2],
+            "sensenova_u1_flow_total_delta_l2": [
+                float((image_prediction - initial_prediction).float().norm().item())
+            ],
+            "sensenova_u1_flow_timesteps": [
+                [float(value) for value in timesteps.detach().cpu().tolist()]
+            ],
+        }
+        logger.info(
+            "SenseNova U1 bounded flow complete: steps=%d total_delta_l2=%.6f",
+            num_steps,
+            output.customized_info["sensenova_u1_flow_total_delta_l2"][0],
+        )
+        return output
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -859,6 +1129,12 @@ class NEOChatModel(nn.Module):
             image_gen_indicators = forward_batch.model_specific_states[
                 "image_gen_indicators"
             ]
+            if "flow_specs" in forward_batch.model_specific_states:
+                return self._forward_flow(
+                    input_ids,
+                    positions,
+                    forward_batch,
+                )
 
         if (
             not forward_batch.forward_mode.is_decode()
@@ -891,12 +1167,31 @@ class NEOChatModel(nn.Module):
         expected_vision_params = {
             name for name in params if name.startswith("vision_model.")
         }
+        expected_flow_params = {
+            name for name in params if name.startswith("fm_modules.")
+        }
         loaded_params: set[str] = set()
         loaded_checkpoint_tensors = 0
         skipped_non_language_tensors = 0
         unknown_language_weights: list[str] = []
         unknown_vision_weights: list[str] = []
+        unknown_flow_weights: list[str] = []
         for name, loaded_weight in weights:
+            if name.startswith("fm_modules."):
+                loaded_checkpoint_tensors += 1
+                target_name = _flow_weight_target(name)
+                if target_name not in params:
+                    unknown_flow_weights.append(name)
+                    continue
+                param = params[target_name]
+                weight_loader = getattr(
+                    param,
+                    "weight_loader",
+                    default_weight_loader,
+                )
+                weight_loader(param, loaded_weight)
+                loaded_params.add(target_name)
+                continue
             if name.startswith("vision_model.embeddings."):
                 loaded_checkpoint_tensors += 1
                 target_name = name.replace(
@@ -936,20 +1231,25 @@ class NEOChatModel(nn.Module):
 
         missing_language_params = sorted(expected_language_params - loaded_params)
         missing_vision_params = sorted(expected_vision_params - loaded_params)
+        missing_flow_params = sorted(expected_flow_params - loaded_params)
         self.last_load_report = {
             "loaded_checkpoint_tensors": loaded_checkpoint_tensors,
             "loaded_native_parameters": len(loaded_params),
             "skipped_non_language_tensors": skipped_non_language_tensors,
             "missing_language_parameters": missing_language_params,
             "missing_vision_parameters": missing_vision_params,
+            "missing_flow_parameters": missing_flow_params,
             "unknown_language_weights": sorted(unknown_language_weights),
             "unknown_vision_weights": sorted(unknown_vision_weights),
+            "unknown_flow_weights": sorted(unknown_flow_weights),
         }
         if (
             missing_language_params
             or missing_vision_params
+            or missing_flow_params
             or unknown_language_weights
             or unknown_vision_weights
+            or unknown_flow_weights
         ):
             raise RuntimeError(
                 f"NEOChatModel weight load is incomplete: {self.last_load_report}"
@@ -964,5 +1264,6 @@ EntryClass = NEOChatModel
 __all__ = [
     "EntryClass",
     "NEOChatModel",
+    "_flow_weight_target",
     "_stacked_weight_target",
 ]

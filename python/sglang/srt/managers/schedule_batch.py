@@ -914,6 +914,11 @@ class Req(ReqDllmMixin):
         self._think_end_match_len = 0
 
         # Sampling info
+        self.batch_isolation_key = (
+            sampling_params.custom_params.get("__sglang_batch_isolation_key")
+            if isinstance(sampling_params.custom_params, dict)
+            else None
+        )
         if isinstance(sampling_params.custom_params, dict):
             sampling_params = copy.copy(sampling_params)
             sampling_params.custom_params = sampling_params.custom_params | {
