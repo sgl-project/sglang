@@ -20,6 +20,7 @@ import copy
 import dataclasses
 import json
 import logging
+import math
 import os
 import pickle
 import signal
@@ -34,6 +35,7 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
+from numbers import Integral, Real
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
 
 import fastapi
@@ -149,6 +151,11 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
+from sglang.srt.utils.shm_transport_utils import (
+    is_shm_ref,
+    validate_shm_tensor_buffer,
+    validate_shm_tensor_ref,
+)
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -157,6 +164,9 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+_FLOAT32_MAX = float(np.finfo(np.float32).max)
+_INT64_MAX = int(np.iinfo(np.int64).max)
 
 
 def _reject_missing_dispatched_encoder_embedding(server_args, request_obj, mm_inputs):
@@ -356,6 +366,67 @@ def _build_flat_input_top_logprobs_fields_from_arrays(
     fields["input_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
     fields["input_top_logprobs_null_prefix"] = null_prefix
     return fields
+
+
+def _is_finite_number(value: Real) -> bool:
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def _input_embeds_shape(input_embeds: Any) -> Tuple[int, int]:
+    """Validate one request's embeds and return its rectangular 2D shape."""
+    if is_shm_ref(input_embeds):
+        shape, _ = validate_shm_tensor_ref(input_embeds, ndim=2)
+        return shape[0], shape[1]
+    if not isinstance(input_embeds, (list, tuple)):
+        raise ValueError("input_embeds must be a 2D array")
+    if not input_embeds:
+        return 0, 0
+    if not all(isinstance(row, (list, tuple)) for row in input_embeds):
+        raise ValueError("input_embeds must be a 2D array")
+    width = len(input_embeds[0])
+    if any(len(row) != width for row in input_embeds):
+        raise ValueError("input_embeds must have equal-length rows")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, Real)
+        or not _is_finite_number(value)
+        or abs(value) > _FLOAT32_MAX
+        for row in input_embeds
+        for value in row
+    ):
+        raise ValueError(
+            "input_embeds values must be finite numbers representable as float32"
+        )
+    return len(input_embeds), width
+
+
+def _validate_token_positions(token_positions: Any) -> List[List[int]]:
+    """Validate the accepted [n] or [dims][n] position layouts."""
+    if not isinstance(token_positions, list) or not token_positions:
+        raise ValueError("token_positions must be a non-empty 1D or 2D array")
+    if isinstance(token_positions[0], list):
+        if not all(isinstance(dim, list) and dim for dim in token_positions):
+            raise ValueError("token_positions must be a non-empty 1D or 2D array")
+        dims = token_positions
+    else:
+        dims = [token_positions]
+    if any(len(dim) != len(dims[0]) for dim in dims):
+        raise ValueError("token_positions must have equal-length dims")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, Integral)
+        or value < 0
+        or value > _INT64_MAX
+        for dim in dims
+        for value in dim
+    ):
+        raise ValueError(
+            "token_positions values must be non-negative signed 64-bit integers"
+        )
+    return dims
 
 
 class InputFormat(Enum):
@@ -982,6 +1053,120 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             input_ids, token_type_ids, input_format, original_batch_size
         )
 
+    def _validate_context_forward_fields(
+        self, obj: GenerateReqInput
+    ) -> Optional[Tuple[int, int]]:
+        """Pin the context-forward v1 envelope at the API boundary so
+        unsupported paths reject loudly instead of running subtly wrong."""
+        embeds_shape = (
+            _input_embeds_shape(obj.input_embeds)
+            if obj.input_embeds is not None
+            else None
+        )
+        if obj.query_attention is not None:
+            if obj.query_attention != "bidirectional":
+                raise ValueError(
+                    f"unsupported query_attention: {obj.query_attention!r} "
+                    "(only 'bidirectional' exists)"
+                )
+            if obj.input_embeds is None:
+                raise ValueError("query_attention requires input_embeds")
+            if obj.session_id is not None or obj.session_params is not None:
+                raise ValueError("query_attention context forwards are sessionless")
+            model_config = self.model_config
+            if (
+                model_config.is_local_attention_model
+                or model_config.is_hybrid_swa
+                or model_config.sliding_window_size not in (None, 0, -1)
+                or model_config.attention_chunk_size not in (None, 0, -1)
+            ):
+                raise ValueError(
+                    "query_attention is unsupported on sliding-window or "
+                    "local-attention models"
+                )
+            if (obj.sampling_params or {}).get("max_new_tokens") != 0:
+                raise ValueError(
+                    "query_attention requires max_new_tokens=0 "
+                    "(context forwards are prefill-only)"
+                )
+            prefill_backend = self.server_args.get_attention_backends()[0]
+            if prefill_backend not in ("fa3", "fa4"):
+                raise ValueError(
+                    "query_attention requires a flashattention prefill "
+                    f"backend, got {prefill_backend!r}"
+                )
+            if self.server_args.tp_size != 1:
+                raise ValueError(
+                    "query_attention requires tp_size=1, got "
+                    f"{self.server_args.tp_size}"
+                )
+            if self.server_args.pp_size != 1:
+                raise ValueError(
+                    "query_attention requires pp_size=1, got "
+                    f"{self.server_args.pp_size}"
+                )
+            if self.server_args.disaggregation_mode != "null":
+                raise ValueError("query_attention is unsupported under disaggregation")
+            if self.server_args.speculative_algorithm is not None:
+                raise ValueError(
+                    "query_attention is unsupported with speculative decoding"
+                )
+            if self.server_args.page_size > 1:
+                raise ValueError(
+                    "query_attention requires page_size=1 (page-aligned radix "
+                    "matching cannot satisfy tail coverage)"
+                )
+            embeds_len = embeds_shape[0]
+            if embeds_len > self.server_args.chunked_prefill_size > 0:
+                # Bidirectional spans must not be chunk-split.
+                raise ValueError(
+                    f"query span of {embeds_len} exceeds chunked_prefill_size "
+                    f"{self.server_args.chunked_prefill_size}"
+                )
+        if obj.hidden_states_buffer is not None:
+            if obj.query_attention is None:
+                raise ValueError(
+                    "hidden_states_buffer requires a query_attention context forward"
+                )
+            if obj.return_hidden_states is not True:
+                raise ValueError(
+                    "hidden_states_buffer requires return_hidden_states=true"
+                )
+            sampling = obj.sampling_params or {}
+            if sampling.get("max_new_tokens") != 0:
+                raise ValueError(
+                    "hidden_states_buffer requires max_new_tokens=0 "
+                    "(prefill-only requests)"
+                )
+            if sampling.get("n", 1) != 1:
+                raise ValueError("hidden_states_buffer requires n=1")
+            try:
+                validate_shm_tensor_buffer(
+                    obj.hidden_states_buffer,
+                    shape=(embeds_shape[0], self.model_config.hidden_size),
+                    dtype="float32",
+                )
+            except (OSError, ValueError) as error:
+                raise ValueError(f"invalid hidden_states_buffer: {error}") from error
+        if obj.token_positions is not None:
+            if obj.query_attention is None:
+                raise ValueError(
+                    "token_positions require query_attention and input_embeds"
+                )
+            dims = _validate_token_positions(obj.token_positions)
+            if len(dims[0]) != embeds_shape[0]:
+                raise ValueError(
+                    "token_positions must cover exactly the embeds span "
+                    f"({len(dims[0])} positions, "
+                    f"{embeds_shape[0]} embeds)"
+                )
+            if any(position >= self.context_len for dim in dims for position in dim):
+                raise ValueError(
+                    "token_positions values must be less than the model's "
+                    f"context length ({self.context_len})"
+                )
+        return embeds_shape
+
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -994,12 +1179,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
+        # Context-forward fields are on GenerateReqInput only.
+        is_context_forward = (
+            isinstance(obj, GenerateReqInput) and obj.query_attention is not None
+        )
+        embeds_shape = None
+        if isinstance(obj, GenerateReqInput):
+            embeds_shape = self._validate_context_forward_fields(obj)
         if obj.input_embeds is not None:
-            if not self.server_args.disable_radix_cache:
+            # Context forwards skip radix insert. Plain embeds still need cache off.
+            if not self.server_args.disable_radix_cache and not is_context_forward:
                 raise ValueError(
                     "input_embeds is provided while disable_radix_cache is False. "
                     "Please add `--disable-radix-cache` when you launch the server "
                     "if you want to use input_embeds as inputs."
+                )
+            if embeds_shape is None:
+                embeds_shape = _input_embeds_shape(obj.input_embeds)
+            embeds_len, embeds_width = embeds_shape
+            if embeds_len == 0:
+                raise ValueError("input_embeds must be non-empty when provided")
+            if obj.input_ids is not None and embeds_len > len(obj.input_ids):
+                raise ValueError(
+                    "input_embeds cannot be longer than input_ids "
+                    f"({embeds_len} > {len(obj.input_ids)})"
+                )
+            hidden_size = self.model_config.hidden_size
+            if embeds_width != hidden_size:
+                # Reject wrong-width rows before they hit the model.
+                raise ValueError(
+                    f"input_embeds width {embeds_width} does not match the "
+                    f"model hidden size {hidden_size}"
                 )
             input_embeds = obj.input_embeds
             input_ids = obj.input_ids
@@ -1421,12 +1631,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room=bootstrap_room,
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
+                query_attention=obj.query_attention,
+                token_positions=obj.token_positions,
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
+                hidden_states_buffer=obj.hidden_states_buffer,
                 return_routed_experts=obj.return_routed_experts,
                 routed_experts_start_len=obj.routed_experts_start_len,
                 return_indexer_topk=obj.return_indexer_topk,

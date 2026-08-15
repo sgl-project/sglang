@@ -27,6 +27,8 @@ from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
+import numpy as np
+
 from sglang.srt.runtime_context import (
     attention_backends,
     configured_pp_size,
@@ -323,6 +325,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+from sglang.srt.utils.shm_transport_utils import is_shm_ref, read_shm_tensor
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -338,6 +341,29 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _tail_coverage_intact(req: Req) -> bool:
+    """True if the uncovered head of a tail-embed request is still cached."""
+    if req.input_embeds is None or req.query_attention is None:
+        return True
+    embeds_start = len(req.origin_input_ids) - len(req.input_embeds)
+    return len(req.prefix_indices) + req.host_hit_length >= embeds_start
+
+
+def _token_positions_dims(req: Req) -> Optional[int]:
+    """Explicit token_positions dimensionality, or None."""
+    if req.token_positions is None:
+        return None
+    return len(req.token_positions) if isinstance(req.token_positions[0], list) else 1
+
+
+def _read_shm_input_embeds(ref: Dict[str, Any]) -> np.ndarray:
+    with np.errstate(over="ignore", invalid="ignore"):
+        embeds = read_shm_tensor(ref).astype(np.float32, copy=False)
+    if not np.isfinite(embeds).all():
+        raise ValueError("shm input_embeds values must be finite numbers")
+    return embeds
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -2382,7 +2408,7 @@ class Scheduler(
 
         if session_id is None or radix_native_session:
             # Normal non-session request, or a radix-native session request
-            if recv_req.input_embeds is not None:
+            if recv_req.input_embeds is not None and not recv_req.input_ids:
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
                 recv_req.input_ids = array("q", [1]) * seq_length
@@ -2405,11 +2431,14 @@ class Scheduler(
                 lora_id=recv_req.lora_id,
                 session_id=recv_req.session_id,
                 input_embeds=recv_req.input_embeds,
+                query_attention=recv_req.query_attention,
+                token_positions=recv_req.token_positions,
                 positional_embed_overrides=recv_req.positional_embed_overrides,
                 token_type_ids=recv_req.token_type_ids,
                 custom_logit_processor=recv_req.custom_logit_processor,
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
+                hidden_states_buffer=recv_req.hidden_states_buffer,
                 return_routed_experts=recv_req.return_routed_experts,
                 routed_experts_start_len=recv_req.routed_experts_start_len,
                 return_indexer_topk=recv_req.return_indexer_topk,
@@ -2436,6 +2465,16 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
+
+            if is_shm_ref(req.input_embeds):
+                try:
+                    req.input_embeds = _read_shm_input_embeds(req.input_embeds)
+                except (OSError, KeyError, TypeError, ValueError) as e:
+                    error_msg = f"unreadable shm input_embeds ref: {e}"
+                    logger.error(error_msg)
+                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                    self.output_streamer.stream_output([req], req.return_logprob)
+                    return
 
             if radix_native_session:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -3299,9 +3338,18 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        evicted_context_reqs = []
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+                continue
+
+            if adder.can_run_list and (
+                req.query_attention != adder.can_run_list[0].query_attention
+                or _token_positions_dims(req)
+                != _token_positions_dims(adder.can_run_list[0])
+            ):
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -3331,6 +3379,9 @@ class Scheduler(
                     req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
+            if not _tail_coverage_intact(req):
+                evicted_context_reqs.append(req)
+                continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -3370,6 +3421,8 @@ class Scheduler(
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+
+        self._abort_evicted_context_forwards(evicted_context_reqs)
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -3455,6 +3508,33 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch, running_batch
+
+    def _abort_evicted_context_forwards(self, reqs: List[Req]) -> None:
+        if not reqs:
+            return
+
+        aborted = set(reqs)
+        self.waiting_queue = [req for req in self.waiting_queue if req not in aborted]
+        for req in reqs:
+            req.mamba_cow_src_index = None
+            req.mamba_needs_clear = False
+            if req.mamba_pool_idx is not None and not getattr(req, "session", None):
+                self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                    req.mamba_pool_idx.unsqueeze(-1)
+                )
+                req.mamba_pool_idx = None
+            req.input_embeds = None
+            req.token_positions = None
+            req.return_hidden_states = False
+            req.hidden_states_buffer = None
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+            prepare_abort(
+                req,
+                "context forward prefix was evicted; resubmit to re-prefill",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+            self.output_streamer.stream_output([req], req.return_logprob)
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]

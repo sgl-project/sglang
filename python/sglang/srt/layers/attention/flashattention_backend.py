@@ -1275,6 +1275,9 @@ class FlashAttentionBackend(AttentionBackend):
             if is_swa_layer
             else (-1, -1)
         )
+        if forward_batch.query_attention == "bidirectional":
+            causal = False
+            window_size = (-1, -1)
         fa_k_descale, fa_v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,

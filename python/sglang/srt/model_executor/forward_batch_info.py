@@ -451,6 +451,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
+    # None (causal) or "bidirectional".
+    query_attention: Optional[str] = None
+    # Multi-dim positions [dims, n]. `positions` stays 1D for the runtime.
+    token_positions: Optional[torch.Tensor] = None
     # For token embedding overrides (sparse replacement at specific positions)
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
@@ -813,6 +817,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens=batch.encoder_lens,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             input_embeds=batch.input_embeds,
+            query_attention=batch.query_attention,
             replace_embeds=batch.replace_embeds,
             replace_positions=batch.replace_positions,
             # Scalar config / flags
@@ -929,8 +934,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_seq_lens,
                 ret.extend_num_tokens,
             )
-            if ret.positions is None:
+            if batch.token_positions is not None and batch.token_positions.dim() == 1:
+                ret.positions = batch.token_positions
+            elif ret.positions is None:
                 ret.positions = positions
+            ret.token_positions = batch.token_positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 
         if model_runner.ngram_embedding_manager.enabled:
