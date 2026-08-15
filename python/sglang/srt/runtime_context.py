@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 import os
 import sys
 from contextlib import contextmanager
@@ -1433,6 +1434,14 @@ def mamba_cache_chunk_size() -> int:
     """The caching point granularity for mamba state: ``max(the model's mamba
     chunk size, page_size)``. Cached on the config after the first call."""
     return get_server_args().mamba_cache_chunk_size
+
+
+def mamba_checkpoint_grid(tree_page: int) -> int:
+    """The granularity a donated mamba checkpoint's depth must land on so the
+    radix tree can name it. Pass the page the tree actually allocates on: DCP
+    widens it past ``mamba_cache_chunk_size``, and deriving that here would be a
+    second copy of a predicate that already lives in the cache builder."""
+    return math.lcm(mamba_cache_chunk_size(), tree_page)
 
 
 def max_speculative_num_draft_tokens() -> int | None:

@@ -2025,7 +2025,7 @@ class ServerArgs:
     ] = False
 
     # -------------------------------------------------------------------------
-    # Torch compile and torchao
+    # Torch compile
     # -------------------------------------------------------------------------
     enable_torch_compile: A[
         bool,
@@ -2038,12 +2038,6 @@ class ServerArgs:
     torch_compile_max_bs: A[
         int, "Set the maximum batch size when using torch compile.", NS("exec.graph")
     ] = 32
-    torchao_config: A[
-        str,
-        "Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
-        NS("exec.graph"),
-    ] = ""
-
     # -------------------------------------------------------------------------
     # Speculative decoding
     # -------------------------------------------------------------------------
@@ -3172,6 +3166,16 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     # Model weight update and weight loading
     # -------------------------------------------------------------------------
+    startup_weight_load_mode: A[
+        Literal["serial", "overlap"],
+        (
+            "Control startup weight loading relative to CUDA graph capture. "
+            "'serial' preserves the existing startup order; 'overlap' stages "
+            "checkpoint files while CUDA graphs are captured and commits the "
+            "real weights afterward."
+        ),
+        NS("model"),
+    ] = "serial"
     custom_weight_loader: A[
         Optional[List[str]],
         Arg(
@@ -5438,6 +5442,8 @@ class ServerArgs:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                if not envs.SGLANG_OPT_FUSE_MHC_POST_PRE.is_set():
+                    envs.SGLANG_OPT_FUSE_MHC_POST_PRE.set(True)
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
                 # Prefer TileLang over the Torch fallback.
@@ -6660,9 +6666,9 @@ class ServerArgs:
         if view.moe_runner_backend == "flashinfer_cutedsl":
             # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
             assert (
-                view.quantization in ["modelopt_fp4", "modelopt_mixed"]
+                view.quantization in ["modelopt_fp4", "modelopt_mixed", "nvfp4_online"]
                 or self.get_model_config().nvfp4_moe_meta is not None
-            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), or hybrid NVFP4 models."
+            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), 'nvfp4_online', or hybrid NVFP4 models."
             assert view.ep_size in [
                 1,
                 self.tp_size,
@@ -6675,6 +6681,14 @@ class ServerArgs:
                 f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
                 f"got '{view.moe_a2a_backend}'."
             )
+            if view.moe_a2a_backend == "deepep" and (
+                view.quantization == "nvfp4_online"
+                or envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+            ):
+                raise ValueError(
+                    "flashinfer_cutedsl per-token NVFP4 activation requires "
+                    "moe_a2a_backend='none' or 'flashinfer'."
+                )
 
         if view.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
             assert view.quantization in [
@@ -7973,6 +7987,8 @@ class ServerArgs:
             "1" if self.enable_deterministic_inference else "0"
         )
         self._handle_custom_all_reduce_v2_multinode()
+        if self.enable_deterministic_inference:
+            envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
         if self.debug_cuda_graph:
             if not (is_cuda() or is_hip()):
                 logger.warning(
@@ -8811,6 +8827,10 @@ class ServerArgs:
     def is_ep_scale_joiner(self) -> bool:
         return self.ep_join_mode == "scale"
 
+    @property
+    def is_startup_weight_load_overlap(self) -> bool:
+        return self.startup_weight_load_mode == "overlap"
+
     def ssl_verify(self):
         """Return the value for the requests library's verify= parameter.
 
@@ -9579,7 +9599,7 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
 # (sglang.srt.runtime_context). The two functions below are LEGACY shims kept
 # for the existing call-sites; they publish/read the same live object by
 # reference. Do not add new call-sites — the counts are ratcheted
-# (decrease-only) by test/registered/unit/test_legacy_global_ratchet.py.
+# (decrease-only) by scripts/lint/check_legacy_global_ratchet.py.
 # Imports are in-function so the two modules stay cycle-free at import time.
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
     """Legacy publish shim (role=scheduler) — prefer
