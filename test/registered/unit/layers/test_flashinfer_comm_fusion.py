@@ -16,9 +16,10 @@ register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-gb300")
 
 
 class _FakeWorkspace:
-    def __init__(self, backend, world_size):
+    def __init__(self, backend, world_size, dtype=torch.bfloat16):
         self.backend = backend
         self.world_size = world_size
+        self.metadata = {"use_fp32_lamport": dtype == torch.float32}
 
     def is_buffer_size_sufficient(self, **_kwargs):
         return True
@@ -34,7 +35,9 @@ class _FakeFlashInferComm:
 
     def create_allreduce_fusion_workspace(self, **kwargs):
         self.calls.append(kwargs)
-        return _FakeWorkspace(kwargs["backend"], kwargs["world_size"])
+        return _FakeWorkspace(
+            kwargs["backend"], kwargs["world_size"], dtype=kwargs["dtype"]
+        )
 
     def allreduce_fusion(
         self,
@@ -363,6 +366,43 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
     def test_rejects_when_workspace_world_size_differs(self):
         with self._patched_attn_workspace(self._make_manager(4)):
             self.assertFalse(self._can_use(torch.randn(8, 16), world_size=2))
+
+    def test_fp32_initialization_caches_allocated_lamport_mode(self):
+        """FP32 startup allocation must remain eligible for FP32 all-reduce.
+
+        The initialization API's legacy use_fp32_lamport argument defaults to
+        False, while FlashInfer derives the allocated TRT-LLM mode from dtype.
+        Eligibility must follow the workspace metadata rather than that input.
+        """
+        fake_comm = _FakeFlashInferComm()
+        manager = fusion.FlashInferWorkspaceManager()
+        with (
+            patch.object(fusion, "_flashinfer_comm", fake_comm),
+            patch.object(
+                fusion,
+                "_create_allreduce_fusion_workspace",
+                fake_comm.create_allreduce_fusion_workspace,
+            ),
+            patch.object(
+                fusion, "_preflight_check_workspace_memory", return_value=True
+            ),
+        ):
+            manager.initialize(
+                world_size=4,
+                rank=0,
+                max_token_num=8,
+                hidden_dim=4096,
+                backend="trtllm",
+                dtype=torch.float32,
+            )
+
+        self.assertTrue(manager.use_fp32_lamport)
+        with self._patched_attn_workspace(manager):
+            self.assertTrue(
+                self._can_use(
+                    torch.randn(8, 16, dtype=torch.float32), group_key=(None, None)
+                )
+            )
 
     def test_rejects_when_token_num_exceeds_workspace_capacity(self):
         """Oversized all-reduces fall back without triggering a warning.

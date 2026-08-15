@@ -526,7 +526,11 @@ class FlashInferWorkspaceManager:
             self.hidden_dim = alloc_hidden_dim
             self.dtype = dtype or torch.bfloat16
             self.backend = self.workspace.backend
-            self.use_fp32_lamport = use_fp32_lamport
+            self.use_fp32_lamport = (
+                self.workspace.metadata["use_fp32_lamport"]
+                if self.backend == "trtllm"
+                else None
+            )
             self.initialized = True
 
             if not self._logged_init:
