@@ -20,13 +20,11 @@ if TYPE_CHECKING:
 
 
 class SharedReadEnds(Enum):
-    """Where a backend's scheduler-shared reads end, relative to the replay;
-    the shared-read-done record must land at or after this point. IN_REPLAY
-    means at the captured (in-graph) metadata init."""
+    """Where an attention backend finishes reading the shared data"""
 
-    PRE_REPLAY = auto()
-    IN_REPLAY = auto()
-    POST_REPLAY = auto()
+    PRE_REPLAY = auto()  # After the init_forward_metadata_out_graph
+    IN_REPLAY = auto()  # After the init_forward_metadata_in_graph
+    POST_REPLAY = auto()  # Metadata snapshot not implemented
     UNKNOWN = auto()  # not audited -> coarse whole-forward fence
 
 
