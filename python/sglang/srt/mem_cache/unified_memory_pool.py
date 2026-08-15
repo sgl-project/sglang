@@ -590,6 +590,13 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             # Relocation is overridden below; never use the inherited tiled
             # copy kernel.
             enable_kv_cache_copy=False,
+            # Pin the layout label so the env-driven selectors (HND /
+            # vectorized_5d) cannot put this pool into a mode whose code paths
+            # do not match the buffers it builds itself. Those selectors also
+            # decide the parent's buffer SHAPE, which we override — so under
+            # SGLANG_USE_HND_KVCACHE=1 the store would raise IndexError at the
+            # first write (HND indexes 4-D buffers; the dense views are 3-D).
+            kv_cache_layout="page_major_dense",
         )
 
     def _create_buffers(self):

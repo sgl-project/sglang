@@ -43,6 +43,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.layout.page_major import (
     build_dense_mha_views,
     build_page_major_mha_views,
@@ -378,6 +379,16 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
             torch.equal(kv._raw[:live], want),
             "envelope move did not relocate exactly the named pages",
         )
+
+    def test_hnd_env_cannot_hijack_layout(self):
+        """SGLANG_USE_HND_KVCACHE=1 used to flip the inherited env-driven
+        layout selector, putting the pool in a mode whose code paths do not
+        match its buffers (HND indexes 4-D; the dense views are 3-D). The
+        pinned label must win."""
+        with envs.SGLANG_USE_HND_KVCACHE.override(True):
+            _, pool = _make_pool_and_kv(1)
+            self.assertFalse(pool.use_hnd)
+            self.assertEqual(pool.kv_cache_layout, "page_major_dense")
 
 
 class TestFactoryDenseViews(unittest.TestCase):
