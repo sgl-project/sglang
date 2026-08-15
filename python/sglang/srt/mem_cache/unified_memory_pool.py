@@ -547,6 +547,7 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             end_layer=end_layer,
             enable_alt_stream=enable_alt_stream,
             enable_kv_cache_copy=False,
+            kv_cache_layout="page_major_dense",
         )
 
     def _create_buffers(self):
