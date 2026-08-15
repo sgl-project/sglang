@@ -1240,7 +1240,6 @@ class Envs:
     # ===================================================================
     # DeepSeek V4 - model and quantization
     # ===================================================================
-    SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
     SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
     SGLANG_OPT_USE_TRITON_SWA_PREPARE = EnvBool(True)
     SGLANG_OPT_USE_AITER_MHC_PRE = EnvBool(True)
