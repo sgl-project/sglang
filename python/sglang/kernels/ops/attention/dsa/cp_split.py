@@ -8,7 +8,7 @@ import triton.language as tl
 
 
 @triton.jit
-def dsa_cp_round_robin_split_q_seqs_kernel(
+def dsa_cp_interleave_q_seqs_kernel(
     in_seqs_ptr,
     out_seqs_ptr,
     bs_idx_ptr,

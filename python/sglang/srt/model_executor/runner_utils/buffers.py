@@ -229,7 +229,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         seq_len_fill_value: int,
         require_gathered_buffer: bool,
         num_tokens_per_req: int,
-        dsa_enable_prefill_cp: bool,
+        enable_prefill_cp: bool,
         enable_num_token_non_padded_flag: bool,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
@@ -302,7 +302,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_req)
 
         if enable_num_token_non_padded_flag:
-            if require_gathered_buffer and not dsa_enable_prefill_cp:
+            if require_gathered_buffer and not enable_prefill_cp:
                 num_tokens_per_dp = bs * num_tokens_per_req
                 local = compute_local_num_token_non_padded(
                     global_num_token_non_padded=forward_batch.num_token_non_padded,

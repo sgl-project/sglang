@@ -622,17 +622,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             max_rank_len=[7, 7],
         )
 
-        with (
-            get_parallel().override(attn_cp_size=cp_size),
-            patch(
-                "sglang.srt.layers.utils.cp_utils.is_prefill_cp_in_seq_split",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_in_seq_split",
-                return_value=False,
-            ),
-        ):
+        with get_parallel().override(attn_cp_size=cp_size):
             align_size = get_cp_padding_align_size()
             pad_logical_token_to_physical(metadata)
 

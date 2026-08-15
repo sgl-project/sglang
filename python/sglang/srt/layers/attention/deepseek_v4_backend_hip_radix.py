@@ -1305,9 +1305,7 @@ class DeepseekV4HipRadixBackend(
         # Slice the per-query fields to this rank's tokens so their length matches
         # the local query count T; values stay global so each local query still
         # attends over the full all-gathered KV.
-        from sglang.srt.layers.attention.dsa.utils import (
-            is_dsa_prefill_cp_round_robin_split,
-        )
+        from sglang.srt.layers.cp.base import is_interleave
 
         # NOTE (AMD/HIP only): this whole DSA-CP prefill handling lives in the
         # HIP backend (DeepseekV4HipRadixBackend, selected only when is_hip()).
@@ -1316,7 +1314,7 @@ class DeepseekV4HipRadixBackend(
         _cp_size = get_parallel().attn_cp_size
         _cp_active = (
             _cp_size > 1
-            and is_dsa_prefill_cp_round_robin_split()
+            and is_interleave()
             and kv.shape[0] == _cp_size * T
             and state_slot.shape[0] != T
         )

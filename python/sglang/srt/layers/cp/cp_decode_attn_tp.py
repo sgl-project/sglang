@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import is_dsa_cp_active
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.runtime_context import get_parallel
@@ -77,7 +77,7 @@ class CpDecodeAttnTpContext:
         # other forward, which includes decode.
         self.use_decode_attn_tp = not is_cp_active(
             forward_batch
-        ) and not dsa_use_prefill_cp(forward_batch)
+        ) and not is_dsa_cp_active(forward_batch)
 
     def _slice(self, tensor: torch.Tensor, dim: int) -> torch.Tensor:
         assert dim in (0, 1)

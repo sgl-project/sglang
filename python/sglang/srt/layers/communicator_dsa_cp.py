@@ -19,8 +19,7 @@ from typing import Callable, Optional
 import torch
 
 from sglang.srt.layers.attention.dsa.utils import (
-    dsa_use_prefill_cp,
-    is_dsa_enable_prefill_cp,
+    is_dsa_cp_active,
 )
 from sglang.srt.layers.communicator import (
     CommunicateContext,
@@ -42,13 +41,6 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_parallel
 
 
-def dsa_enable_prefill_cp():
-    # After using cp, the communication mode of this part changes.
-    # The three parts of prepare_attn, prepare_mlp, and postprocess_layer
-    # no longer require additional communication for reduce, scatter, etc.
-    return is_dsa_enable_prefill_cp()
-
-
 def maybe_prefetch_next_full_attention_kv(
     forward_batch: ForwardBatch,
     next_full_attention_layer_id: Optional[int],
@@ -60,7 +52,7 @@ def maybe_prefetch_next_full_attention_kv(
     ``LayerSplitDSATokenToKVPool``). Kicking the broadcast off one layer ahead
     overlaps it with the current layer's attention compute.
     """
-    if next_full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
+    if next_full_attention_layer_id is None or not is_dsa_cp_active(forward_batch):
         return
 
     prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
@@ -197,7 +189,7 @@ class DSACPCommunicateWithAllReduceAndLayerNormFn(
             hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+        if is_dsa_cp_active(forward_batch) or mla_use_prefill_cp(forward_batch):
             hidden_states = dsa_cp_gather_hidden_states(hidden_states)
         return hidden_states, residual
 
@@ -242,6 +234,6 @@ class DSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
     ):
         # for prefill: full -> attn tp scattered
         # for decode: full -> attn tp full
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+        if is_dsa_cp_active(forward_batch) or mla_use_prefill_cp(forward_batch):
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         return hidden_states, residual
