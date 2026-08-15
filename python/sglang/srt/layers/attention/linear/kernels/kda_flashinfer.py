@@ -650,14 +650,14 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         if (
             g.ndim == 4
             and g.shape[0] == q.shape[0]
-            and g.shape[1] >= num_tokens
+            and g.shape[1] > num_tokens
             and g.shape[2:] == q.shape[2:]
         ):
             g = g[:, :num_tokens]
         if (
             beta.ndim == 3
             and beta.shape[0] == q.shape[0]
-            and beta.shape[1] >= num_tokens
+            and beta.shape[1] > num_tokens
             and beta.shape[2] == q.shape[2]
         ):
             beta = beta[:, :num_tokens]
