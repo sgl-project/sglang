@@ -371,35 +371,15 @@ export const Playground = ({ config }) => {
     ANCHOR_NEAR_DPATTN, ANCHOR_NEAR_MOE,
   };
 
-  // -------- Prefill-CP flag family (shared by the attention axis) --------
-  // Every flag head that toggles/parameterizes prefill context parallelism:
-  // the canonical pair plus all per-family legacy spellings.
-  const CP_ENABLE_HEADS = [
-    "--enable-prefill-cp",
-    "--enable-nsa-prefill-context-parallel",
-    "--enable-dsa-prefill-context-parallel",
-    "--enable-prefill-context-parallel",
-  ];
-  const CP_MODE_HEADS = [
-    "--nsa-prefill-cp-mode", "--dsa-prefill-cp-mode", "--prefill-cp-mode",
-  ];
+  // -------- Prefill-CP flags (shared by the attention axis) ---------------
+  const CP_ENABLE_HEADS = ["--enable-prefill-cp"];
   const CP_OWNED_HEADS = [
-    ...CP_ENABLE_HEADS, ...CP_MODE_HEADS, "--cp-strategy", "--attn-cp-size",
+    ...CP_ENABLE_HEADS, "--cp-strategy", "--attn-cp-size",
   ];
-  // Legacy mode spellings → new-style --cp-strategy values.
-  const CP_MODE_TO_STRATEGY = {
-    "in-seq-split": "zigzag",
-    "round-robin-split": "interleave",
-  };
   const cpEnabledIn = (flags) =>
     CP_ENABLE_HEADS.some((head) => hasFlag(flags, head));
-  // Strategy a cell's flags carry: --cp-strategy first, else a mapped legacy
-  // mode flag, else null (no strategy baked).
   const bakedCpStrategy = (flags) =>
     findFlagArg(flags, "--cp-strategy")
-    || CP_MODE_TO_STRATEGY[findFlagArg(flags, "--nsa-prefill-cp-mode")]
-    || CP_MODE_TO_STRATEGY[findFlagArg(flags, "--dsa-prefill-cp-mode")]
-    || CP_MODE_TO_STRATEGY[findFlagArg(flags, "--prefill-cp-mode")]
     || null;
 
   // ==========================================================================
@@ -420,15 +400,13 @@ export const Playground = ({ config }) => {
     // combined: a numeric value emits `--dp N --enable-dp-attention`, `false`
     // strips both. An optional `cpStrategy` knob (values from --cp-strategy:
     // "zigzag" / "interleave") picks the CP layout; without it the strategy
-    // baked in the base is preserved, defaulting to "interleave" (the legacy
-    // knob's round-robin-split).
+    // baked in the base is preserved, defaulting to "interleave".
     attention: {
       initState: () => ({ tp: null, cp: null, cpStrategy: null, dpAttn: null }),
 
       // DP-Attention: `--dp N --enable-dp-attention` → N; neither → false;
-      // bare `--enable-dp-attention` → 1. CP: any enable spelling →
-      // `--attn-cp-size N` (bare enable → 2, the legacy convention), plus the
-      // baked strategy (legacy mode flags mapped to zigzag/interleave).
+      // bare `--enable-dp-attention` → 1. CP: `--enable-prefill-cp` →
+      // `--attn-cp-size N` (bare enable → 2), plus the baked strategy.
       deriveFromBase: (cell, fc, h) => {
         const flags = (cell && cell.flags) || [];
         const dpVal = h.parseIntFlag(flags, "--dp");
@@ -499,7 +477,7 @@ export const Playground = ({ config }) => {
         }
         // CP override: an explicit size pick, or a strategy-only pick on a
         // base that already carries CP. Strategy precedence: explicit knob >
-        // baked-in-base > "interleave" (the legacy knob's round-robin-split).
+        // baked-in-base > "interleave".
         const cpStrategyOverride =
           (value.cpStrategy && !blocked("cpStrategy", value.cpStrategy))
             ? value.cpStrategy : null;
@@ -511,9 +489,8 @@ export const Playground = ({ config }) => {
         const cpStrategyPick =
           cpStrategyOverride || bakedCpStrategy(flags) || "interleave";
         if (cpPick !== null && !blocked("cp", cpPick)) {
-          // Own the whole CP flag family (canonical + every legacy spelling)
-          // so an override fully replaces (or removes) whatever the base
-          // recipe baked in.
+          // Own the complete canonical CP flag set so an override fully
+          // replaces (or removes) whatever the base recipe baked in.
           flags = h.stripFlagsByFirstToken(flags, CP_OWNED_HEADS);
           if (cpPick > 1) {
             flags = h.insertAfter(flags, h.ANCHOR_NEAR_DPATTN, [

@@ -17,8 +17,8 @@
 The strategy implementation is split across:
 
 * ``base.py``: base ABC, base metadata dataclass, enums, and singleton helpers.
-* ``zigzag.py``: former in-seq-split strategy and zigzag metadata.
-* ``interleave.py``: former round-robin-split strategy and interleave metadata.
+* ``zigzag.py``: zigzag strategy and metadata.
+* ``interleave.py``: interleave strategy and metadata.
 * ``utils.py``: public re-exports for import convenience.
 """
 

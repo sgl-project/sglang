@@ -116,8 +116,8 @@ sgl-eval run aime25 \\
     // CP is single-machine only (tp_size <= 8). Interleave CP + DP-Attention
     // currently fails the runtime's dp_size == 1 assert but is allowed here
     // with a warning (combined support is planned upstream).
-    // Strategy knob: interleave (ex round-robin-split) is the layout verified
-    // here and the default; zigzag (ex in-seq-split) is exposed as an
+    // Strategy knob: interleave is the layout verified here and the default;
+    // zigzag is exposed as an
     // experiment — the runtime auto-configures deepep + ep=tp for it and
     // restricts it to batch_size=1 (long-context single-request runs).
     attention: {
