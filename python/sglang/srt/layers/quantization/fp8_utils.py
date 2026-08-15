@@ -111,9 +111,11 @@ def set_force_ck_w8a8(enabled: bool = True) -> None:
 # instead of transposing its output afterwards. The post-kernel transpose moves
 # only a few hundred scale elements but costs a full kernel launch, and it fired
 # 213 times per decode step. Gated so both paths live in one binary and can be
-# A/B'd by env var alone; the two layouts were verified bit-identical.
+# A/B'd by env var alone; the two layouts were verified bit-identical. Default
+# off pending isolated validation, including a non-DSV4 gfx95 smoke test since
+# this path also affects generic gfx95 AITER call sites; set to 1 to enable.
 _NATIVE_BPRESHUFFLE_SCALE: bool = (
-    os.environ.get("SGLANG_OPT_NATIVE_BPRESHUFFLE_SCALE", "1") == "1"
+    os.environ.get("SGLANG_OPT_NATIVE_BPRESHUFFLE_SCALE", "0") == "1"
 )
 
 

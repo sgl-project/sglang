@@ -141,7 +141,7 @@ def _linear_bf16_fp32_hpc(
     )
 
 
-_KV_SCORE_BF16 = get_bool_env_var("SGLANG_OPT_KV_SCORE_BF16", "true")
+_KV_SCORE_BF16 = get_bool_env_var("SGLANG_OPT_KV_SCORE_BF16", "false")
 
 
 def linear_kv_score(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
