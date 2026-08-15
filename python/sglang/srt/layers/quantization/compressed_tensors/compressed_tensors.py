@@ -164,8 +164,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
-        if isinstance(layer, LinearBase):
+        if isinstance(layer, (LinearBase, ParallelLMHead)):
             # If linear_fp8_config is set, use FP8 for linear layers
             # This allows mixed quantization: experts with int4, linear layers with fp8
             if self.linear_fp8_config is not None:

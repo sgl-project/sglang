@@ -17,6 +17,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    apply_fp4_marlin_linear,
+    prepare_nvfp4_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     enable_flashinfer_fp4_gemm,
     fp4_gemm,
@@ -35,7 +39,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 100
+        return 80 if get_fp4_gemm_runner_backend().is_marlin() else 100
 
     def create_weights(
         self,
@@ -50,6 +54,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
+        layer.params_dtype = params_dtype
 
         # Weight
         weight = ModelWeightParameter(
@@ -99,6 +104,17 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
             layer.weight_global_scale.max().to(torch.float32), requires_grad=False
         )
 
+        if get_fp4_gemm_runner_backend().is_marlin():
+            layer.weight = Parameter(layer.weight_packed.data, requires_grad=False)
+            del layer.weight_packed
+            # Compressed Tensors stores global scales as divisors.
+            layer.weight_global_scale = Parameter(
+                1 / layer.weight_global_scale, requires_grad=False
+            )
+            layer.quant_config.group_size = self.group_size
+            prepare_nvfp4_layer_for_marlin(layer)
+            return
+
         if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
@@ -137,6 +153,18 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if get_fp4_gemm_runner_backend().is_marlin():
+            return apply_fp4_marlin_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                weight_global_scale=layer.weight_global_scale,
+                workspace=layer.workspace,
+                size_n=layer.output_size_per_partition,
+                size_k=layer.input_size_per_partition,
+                bias=bias,
+            )
+
         output_dtype = x.dtype
         w_n, _ = layer.weight_packed.shape
         output_shape = [x.shape[0], w_n]

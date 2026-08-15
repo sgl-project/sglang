@@ -25,7 +25,26 @@ ScalarType, scalar_types = get_scalar_types()
 logger = logging.getLogger(__name__)
 
 
-def nvfp4_marlin_process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:
+def _nvfp4_compute_scale_factor(
+    marlin_scales: torch.Tensor, a_dtype: torch.dtype | None = None
+) -> float:
+    if a_dtype == torch.half:
+        return 1.0
+
+    scaled = marlin_scales.float() * (2**7)
+    nonzero = scaled > 0
+    if nonzero.any():
+        max_val = scaled[nonzero].max()
+        if max_val < 448 * (2**7):
+            return ((448 * (2**7) / max_val).log2().floor().exp2()).item()
+    return 1.0
+
+
+def nvfp4_marlin_process_scales(
+    marlin_scales: torch.Tensor,
+    scale_factor: float | None = None,
+    a_dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, float]:
     if not (marlin_scales >= 0).all():
         # NVFP4 ModelOpt scales are expected to be non-negative. Keep this as
         # a warning so unusual checkpoints can still load for diagnosis.
@@ -38,9 +57,15 @@ def nvfp4_marlin_process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:
     marlin_scales = marlin_scales.view(-1, 4)[:, [0, 2, 1, 3]].view(
         marlin_scales.size(0), -1
     )
-    marlin_scales = (marlin_scales * (2**7)).view(torch.int16) << 1
+    if scale_factor is None:
+        scale_factor = _nvfp4_compute_scale_factor(marlin_scales, a_dtype)
+    if scale_factor > 1.0:
+        marlin_scales = (marlin_scales.float() * scale_factor).to(torch.half)
+    marlin_scales = marlin_scales * (2**7)
+    marlin_scales[marlin_scales < 2] = 0
+    marlin_scales = marlin_scales.view(torch.int16) << 1
     marlin_scales = marlin_scales.view(torch.float8_e4m3fn)
-    return marlin_scales[:, 1::2].contiguous()
+    return marlin_scales[:, 1::2].contiguous(), scale_factor
 
 
 def nvfp4_marlin_process_global_scale(global_scale: torch.Tensor) -> torch.Tensor:
@@ -196,11 +221,14 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         size_n=padded_size_n,
         group_size=16,
     )
-    weight_scale = nvfp4_marlin_process_scales(weight_scale)
+    weight_scale, scale_factor = nvfp4_marlin_process_scales(
+        weight_scale, a_dtype=param_dtype
+    )
     layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 
     weight_global_scale = layer.weight_global_scale.to(param_dtype)
     weight_global_scale = nvfp4_marlin_process_global_scale(weight_global_scale)
+    weight_global_scale = weight_global_scale / scale_factor
     layer.weight_global_scale = torch.nn.Parameter(
         weight_global_scale, requires_grad=False
     )
@@ -500,8 +528,11 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             tensor_list.append(marlin_qweight)
         return torch.stack(tensor_list)
 
-    def _permute_scales(scales: torch.Tensor, is_w13: bool) -> torch.Tensor:
+    def _permute_scales(
+        scales: torch.Tensor, is_w13: bool
+    ) -> tuple[torch.Tensor, float]:
         scales = scales.to(param_dtype)
+        scale_factor = _nvfp4_compute_scale_factor(scales, param_dtype)
         if is_w13:
             size_n, size_k = intermediate_size * num_shards, hidden_size
         else:
@@ -516,8 +547,11 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
                 size_n=size_n,
                 group_size=16,
             )
-            tensor_list.append(nvfp4_marlin_process_scales(marlin_scales))
-        return torch.stack(tensor_list)
+            marlin_scales, _ = nvfp4_marlin_process_scales(
+                marlin_scales, scale_factor=scale_factor, a_dtype=param_dtype
+            )
+            tensor_list.append(marlin_scales)
+        return torch.stack(tensor_list), scale_factor
 
     def _process_global_scale(global_scale: torch.Tensor) -> torch.Tensor:
         return nvfp4_marlin_process_global_scale(global_scale.to(param_dtype))
@@ -534,17 +568,17 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         _repack_weight(w13, True), requires_grad=False
     )
     layer.w2_weight = torch.nn.Parameter(_repack_weight(w2, False), requires_grad=False)
-    layer.w13_weight_scale = torch.nn.Parameter(
-        _permute_scales(w13_scale, True), requires_grad=False
-    )
-    layer.w2_weight_scale = torch.nn.Parameter(
-        _permute_scales(w2_scale, False), requires_grad=False
-    )
+    w13_scale, w13_scale_factor = _permute_scales(w13_scale, True)
+    w2_scale, w2_scale_factor = _permute_scales(w2_scale, False)
+    layer.w13_weight_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
     layer.w13_weight_scale_2 = torch.nn.Parameter(
-        _process_global_scale(w13_global_scale), requires_grad=False
+        _process_global_scale(w13_global_scale) / w13_scale_factor,
+        requires_grad=False,
     )
     layer.w2_weight_scale_2 = torch.nn.Parameter(
-        _process_global_scale(w2_global_scale), requires_grad=False
+        _process_global_scale(w2_global_scale) / w2_scale_factor,
+        requires_grad=False,
     )
 
     if w13_bias is not None:
