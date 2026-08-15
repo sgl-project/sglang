@@ -845,14 +845,10 @@ class HiCacheController:
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.
-            for indices in (
-                host_indices,
-                device_indices,
-                kv_host_indices,
-                kv_device_indices,
-            ):
-                if indices.is_cuda:
-                    indices.record_stream(self.load_stream)
+            if host_indices.is_cuda:
+                host_indices.record_stream(self.load_stream)
+            if device_indices.is_cuda:
+                device_indices.record_stream(self.load_stream)
 
         self.ack_load_queue.append(
             HiCacheAck(
