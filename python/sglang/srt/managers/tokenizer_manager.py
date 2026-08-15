@@ -2250,9 +2250,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
-            if self.enable_metrics:
-                if recv_obj.time_stats is not None:
-                    scheduler_time_stats = recv_obj.time_stats[i]
+            if recv_obj.time_stats is not None:
+                scheduler_time_stats = recv_obj.time_stats[i]
+                if self.enable_metrics or scheduler_time_stats.has_timing_data:
                     meta_info.update(scheduler_time_stats.convert_to_output_meta_info())
 
             if getattr(state.obj, "return_logprob", False):
@@ -2464,12 +2464,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
-                if self.enable_metrics:
-                    scheduler_time_stats = (
-                        recv_obj.time_stats[i]
-                        if recv_obj.time_stats is not None
-                        else None
-                    )
+                scheduler_time_stats = (
+                    recv_obj.time_stats[i]
+                    if recv_obj.time_stats is not None
+                    else None
+                )
+                if self.enable_metrics or (
+                    scheduler_time_stats is not None
+                    and scheduler_time_stats.has_timing_data
+                ):
                     completion_tokens = (
                         recv_obj.completion_tokens[i]
                         if not isinstance(recv_obj, BatchEmbeddingOutput)

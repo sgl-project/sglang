@@ -13,7 +13,7 @@ is exercised as the real method, no mock.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import msgspec.structs
 
@@ -51,6 +51,7 @@ def _make_controller(dp_size: int) -> DataParallelController:
     ctl._active_workers = list(range(dp_size))
     ctl.round_robin_counter = 0
     ctl.dp_budget = DPBudget(dp_size=dp_size)
+    ctl.server_args = SimpleNamespace(enable_request_time_stats_logging=False)
     return ctl
 
 
@@ -60,6 +61,7 @@ def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],
+        rid="test-rid",
     )
 
 
@@ -207,6 +209,24 @@ class TestRoundRobinScheduler(CustomTestCase):
         # Subsequent round-robin req still lands on worker 0
         ctl.round_robin_scheduler(_req())
         ctl.workers[0].send_pyobj.assert_called_once()
+
+    def test_logs_slow_worker_send_when_timing_is_enabled(self):
+        ctl = _make_controller(dp_size=2)
+        ctl.server_args.enable_request_time_stats_logging = True
+        with (
+            patch(
+                "sglang.srt.managers.data_parallel_controller.time.perf_counter",
+                side_effect=[10.0, 10.25],
+            ),
+            self.assertLogs(
+                "sglang.srt.managers.data_parallel_controller", level="WARNING"
+            ) as logs,
+        ):
+            ctl.round_robin_scheduler(_req())
+
+        self.assertIn("rank=0", logs.output[0])
+        self.assertIn("rid=test-rid", logs.output[0])
+        self.assertIn("duration_ms=250.00", logs.output[0])
 
 
 class TestFollowBootstrapRoomScheduler(CustomTestCase):

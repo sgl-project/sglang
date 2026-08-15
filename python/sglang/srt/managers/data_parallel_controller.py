@@ -74,6 +74,7 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 SCHEDULER_PIDS_ARG = "scheduler_pids"
+_SLOW_WORKER_SEND_SECONDS = 0.1
 
 
 class LoadBalanceMethod(Enum):
@@ -321,6 +322,9 @@ class DataParallelController:
 
         time_stats = DPControllerReqTimeStats.new_from_obj(
             unwrap_from_pickle(req.time_stats)
+        )
+        time_stats.has_timing_data = (
+            self.server_args.enable_request_time_stats_logging
         )
 
         time_stats.set_dp_dispatch_time()
@@ -747,9 +751,25 @@ class DataParallelController:
             ):
                 raise ValueError(f"DP rank {rank} is not active.")
             logger.debug(f"Direct routing to DP rank {rank}")
-            sock_send(self.workers[rank], req)
+            self._send_to_worker(rank, req)
             return True
         return False
+
+    def _send_to_worker(self, rank: int, req: Req) -> None:
+        if not self.server_args.enable_request_time_stats_logging:
+            sock_send(self.workers[rank], req)
+            return
+
+        start = time.perf_counter()
+        sock_send(self.workers[rank], req)
+        elapsed = time.perf_counter() - start
+        if elapsed >= _SLOW_WORKER_SEND_SECONDS:
+            logger.warning(
+                "Slow DP controller worker send: rank=%d rid=%s duration_ms=%.2f",
+                rank,
+                getattr(req, "rid", None),
+                elapsed * 1000,
+            )
 
     def round_robin_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -764,7 +784,7 @@ class DataParallelController:
             self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
             if self.status[slot]:
                 logger.debug(f"Choose worker {slot}")
-                sock_send(self.workers[slot], req)
+                self._send_to_worker(slot, req)
                 return
             attempts += 1
         raise RuntimeError(
@@ -781,13 +801,13 @@ class DataParallelController:
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
-        sock_send(self.workers[target_rank], req)
+        self._send_to_worker(target_rank, req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        sock_send(self.workers[target_worker], req)
+        self._send_to_worker(target_worker, req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -796,7 +816,7 @@ class DataParallelController:
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
-        sock_send(self.workers[target_worker], req)
+        self._send_to_worker(target_worker, req)
 
     def event_loop(self):
         while True:
