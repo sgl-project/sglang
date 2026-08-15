@@ -821,14 +821,14 @@ class HiCacheController:
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             ack_start_event.record()
-            kv_host_indices, kv_device_indices = (
-                self.mem_pool_host.dcp_localize_indices(host_indices, device_indices)
+            host_rows, device_rows = self.mem_pool_host.dcp_localize_indices(
+                host_indices, device_indices
             )
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
-                    kv_host_indices,
-                    kv_device_indices,
+                    host_rows,
+                    device_rows,
                     i,
                     self.io_backend,
                 )

@@ -426,15 +426,14 @@ class HiSparseCoordinator:
     def _preload_to_device_buffer(self, req: Req) -> None:
         """Preload all tokens from host pool into the device buffer."""
         n = self.host_token_len(req.kv.kv_allocated_len)
-        host_rows, device_rows = self.mem_pool_host.dcp_localize_indices(
-            self.req_to_host_pool[req.req_pool_idx, :n],
-            self.req_to_device_buffer[req.req_pool_idx, :n],
-        )
+        host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
+        device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
+
         for layer_id in range(self.mem_pool_device.layer_num):
             self.mem_pool_host.load_to_device_per_layer(
                 self.mem_pool_device,
-                host_rows,
-                device_rows,
+                host_indices,
+                device_locs,
                 layer_id,
                 io_backend="kernel",
             )
@@ -837,13 +836,10 @@ class HiSparseCoordinator:
                     buffer_locs = self.req_to_device_buffer[req_idx, :num_to_load]
                     device_indices[needs_host_load] = buffer_locs
 
-                    host_rows, device_rows = self.mem_pool_host.dcp_localize_indices(
-                        host_locs, buffer_locs
-                    )
                     self.mem_pool_host.load_to_device_per_layer(
                         self.mem_pool_device,
-                        host_rows,
-                        device_rows,
+                        host_locs,
+                        buffer_locs,
                         layer_id,
                         io_backend="kernel",
                     )
