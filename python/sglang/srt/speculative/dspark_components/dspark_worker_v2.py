@@ -62,6 +62,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
+    commit_mamba_states_after_verify,
     draft_tp_context,
     prepare_mamba_track_for_verify,
 )
@@ -707,6 +708,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+        )
+        # Qwen3.5/3.6 hybrid linear-attention layers keep speculative
+        # recurrent state in per-step buffers during target verification.  The
+        # accepted state must be committed before the next draft/verify step;
+        # unlike KV injection below, this is target-model state.
+        accept_index = (
+            torch.arange(self.gamma + 1, device=device, dtype=torch.int64)
+            .unsqueeze(0)
+            .expand(bs, -1)
+        )
+        commit_mamba_states_after_verify(
+            target_worker=self.target_worker,
+            batch=batch,
+            accept_lens=accept.commit_lens,
+            accept_index=accept_index,
+            draft_token_num=self.gamma,
         )
         if on_publish is not None:
             if confidence is not None:
