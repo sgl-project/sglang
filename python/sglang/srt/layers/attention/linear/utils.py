@@ -20,6 +20,7 @@ class LinearAttnKernelBackend(Enum):
     FLASHKDA = "flashkda"
     NVIDIA_KDA = "nvidia_kda"
     PTX_KDA = "ptx_kda"
+    FLASHQLA = "flashqla"
     CUSTOM = "custom"
 
     @classmethod
@@ -46,6 +47,9 @@ class LinearAttnKernelBackend(Enum):
 
     def is_ptx_kda(self):
         return self == LinearAttnKernelBackend.PTX_KDA
+
+    def is_flashqla(self):
+        return self == LinearAttnKernelBackend.FLASHQLA
 
     def is_custom(self):
         return self == LinearAttnKernelBackend.CUSTOM

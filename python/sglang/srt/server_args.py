@@ -377,6 +377,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "flashkda",
     "nvidia_kda",
     "ptx_kda",
+    "flashqla",
 ]
 
 
@@ -6204,6 +6205,23 @@ class ServerArgs:
             logger.info(
                 "FlashKDA is prefill-only; using triton for KDA decode "
                 "(FlashKDA stays on prefill)."
+            )
+
+        # FlashQLA is likewise a prefill-only GDN kernel (no decode kernel):
+        # error on an explicit decode choice, fall back to triton decode when
+        # it was only inherited from base=flashqla (prefill keeps FlashQLA).
+        if decode == "flashqla":
+            if self.linear_attn_decode_backend == "flashqla":
+                raise ValueError(
+                    "--linear-attn-decode-backend flashqla is not supported: "
+                    "FlashQLA is prefill-only. Use "
+                    "--linear-attn-prefill-backend flashqla (decode stays on triton)."
+                )
+            self.linear_attn_decode_backend = "triton"
+            decode = "triton"
+            logger.info(
+                "FlashQLA is prefill-only; using triton for GDN decode "
+                "(FlashQLA stays on prefill)."
             )
 
         if (
