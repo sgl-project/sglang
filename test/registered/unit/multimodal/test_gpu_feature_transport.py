@@ -490,6 +490,13 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
 
 class TestSchedulerMmTransportBoundary(unittest.TestCase):
+    def _publish(self, **fields):
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args(**fields)
+        override.install()
+        self.addCleanup(override.restore)
+
     @staticmethod
     def _prepare_scheduler(scheduler):
         scheduler.session_controller = SimpleNamespace(maybe_reap=MagicMock())
@@ -501,7 +508,9 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
         from sglang.srt.managers import scheduler as scheduler_module
 
         scheduler = object.__new__(scheduler_module.Scheduler)
-        scheduler.server_args = SimpleNamespace(
+        # The transport gate reads the published bags, so the case publishes
+        # the configuration under test.
+        self._publish(
             mm_feature_transport="cuda_vmm",
             enable_broadcast_mm_inputs_process=True,
         )
@@ -548,7 +557,7 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
                 return iter(self.batch)
 
         scheduler = object.__new__(scheduler_module.Scheduler)
-        scheduler.server_args = SimpleNamespace(mm_feature_transport="cuda_vmm")
+        self._publish(mm_feature_transport="cuda_vmm")
         self._prepare_scheduler(scheduler)
         raw_inputs = [object(), object()]
         materialized = [object(), object()]
