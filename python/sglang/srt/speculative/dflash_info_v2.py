@@ -124,6 +124,7 @@ class DFlashDraftInputV2(SpecInput):
         bs = batch.batch_size()
         if bs == 0:
             return
+        batch.maybe_evict_swa()
         self._ensure_prepare_length_buffers(bs, batch.device)
         assert self._prepare_batch_seq_lens_cpu_buf is not None
         assert self._prepare_cur_kv_lens_cpu_buf is not None
@@ -161,6 +162,7 @@ class DFlashDraftInputV2(SpecInput):
             committed_seq_lens_sum += committed_len
             reserved_seq_lens_sum += reserved_len
             num_needed_tokens += reserved_len - cur_alloc_len
+            req.decode_batch_idx += 1
 
             if top_k > max_top_k:
                 max_top_k = top_k
