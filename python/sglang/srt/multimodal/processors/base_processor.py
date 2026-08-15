@@ -201,8 +201,8 @@ class BaseMultimodalProcessor(ABC):
         self.server_args = server_args
         self.transport_mode = transport_mode
         configure_media_url_security(
-            getattr(server_args, "allowed_media_domains", None),
-            getattr(server_args, "media_url_max_file_size_mb", 64),
+            server_args.allowed_media_domains,
+            server_args.media_url_max_file_size_mb,
         )
         configured_mm_feature_transport = getattr(
             server_args, "mm_feature_transport", "cpu"

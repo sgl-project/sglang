@@ -310,8 +310,8 @@ class MMEncoder:
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
         configure_media_url_security(
-            getattr(server_args, "allowed_media_domains", None),
-            getattr(server_args, "media_url_max_file_size_mb", 64),
+            server_args.allowed_media_domains,
+            server_args.media_url_max_file_size_mb,
         )
         publish(server_args, role="encoder")
         self.rank = rank
