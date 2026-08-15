@@ -61,8 +61,8 @@ from sglang.srt.layers.communicator_dsa_cp import (
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
-    cp_round_robin_input_ids_v2,
-    is_cp_v2_active,
+    cp_round_robin_input_ids,
+    is_cp_active,
 )
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
@@ -2789,7 +2789,7 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        cp_v2_active = is_cp_v2_active(forward_batch)
+        cp_active = is_cp_active(forward_batch)
         use_prefill_cp = dsa_use_prefill_cp(forward_batch)
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -2829,8 +2829,8 @@ class DeepseekV4Model(nn.Module):
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
         run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
         if use_prefill_cp and not run_tbo:
-            if cp_v2_active:
-                input_ids = cp_round_robin_input_ids_v2(input_ids, forward_batch)
+            if cp_active:
+                input_ids = cp_round_robin_input_ids(input_ids, forward_batch)
             else:
                 if self.pp_group.is_first_rank:
                     hidden_states = cp_split_and_rebuild_data(
@@ -2892,7 +2892,7 @@ class DeepseekV4Model(nn.Module):
         if (
             self.pp_group.is_last_rank
             and use_prefill_cp
-            and not cp_v2_active
+            and not cp_active
             and not run_tbo
         ):
             stream = torch.cuda.current_stream()

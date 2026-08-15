@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
@@ -981,7 +981,7 @@ class FlashAttentionBackend(AttentionBackend):
             # (req_to_token is zero-init) and outputs for padding queries are
             # discarded downstream.
             if (
-                not is_cp_v2_active(forward_batch)
+                not is_cp_active(forward_batch)
                 and self.attn_cp_size > 1
                 and forward_batch.global_num_tokens_cpu is not None
                 and forward_batch.extend_num_tokens is not None
@@ -1200,7 +1200,7 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if self.use_mla:
-                    if is_cp_v2_active(forward_batch):
+                    if is_cp_active(forward_batch):
                         # CP-v2: k/k_rope are rank-local; the strategy gathers
                         # the latent to full sequence and writes it.
                         cp_strategy = get_cp_strategy()
@@ -1226,7 +1226,7 @@ class FlashAttentionBackend(AttentionBackend):
                         if self.use_sliding_window_kv_pool
                         else None
                     )
-                    if is_cp_v2_active(forward_batch):
+                    if is_cp_active(forward_batch):
                         cp_strategy = get_cp_strategy()
                         assert cp_strategy is not None
                         cp_strategy.materialize_full_kv(
@@ -1420,7 +1420,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
 
                 q_cp = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-                if is_cp_v2_active(forward_batch):
+                if is_cp_active(forward_batch):
                     cp_strategy = get_cp_strategy()
                     assert cp_strategy is not None
                     result = cp_strategy.run_attention(
@@ -1683,7 +1683,7 @@ class FlashAttentionBackend(AttentionBackend):
                             ver=self.fa_impl_ver,
                         )
 
-                    if is_cp_v2_active(forward_batch):
+                    if is_cp_active(forward_batch):
                         cp_strategy = get_cp_strategy()
                         assert cp_strategy is not None
                         o = cp_strategy.run_attention(

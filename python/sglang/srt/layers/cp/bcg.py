@@ -26,7 +26,6 @@ from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_split_before_forward,
-    enable_cp_v2,
     prepare_cp_forward,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
@@ -52,9 +51,9 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     )
 
 
-def enable_cp_v2_bcg_capture(server_args: ServerArgs) -> bool:
-    """Return whether CP-v2 breakable prefill capture is enabled."""
-    return enable_cp_v2() and supports_prefill_cp_bcg(server_args)
+def enable_cp_bcg_capture(server_args: ServerArgs) -> bool:
+    """Return whether CP breakable prefill capture is enabled."""
+    return supports_prefill_cp_bcg(server_args)
 
 
 def filter_prefill_cp_bcg_capture_num_tokens(

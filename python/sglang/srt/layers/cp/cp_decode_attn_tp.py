@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.runtime_context import get_parallel
 
@@ -75,7 +75,7 @@ class CpDecodeAttnTpContext:
             return
         # Skip during prefill context parallel (needs all heads); apply on every
         # other forward, which includes decode.
-        self.use_decode_attn_tp = not is_cp_v2_active(
+        self.use_decode_attn_tp = not is_cp_active(
             forward_batch
         ) and not dsa_use_prefill_cp(forward_batch)
 
