@@ -185,10 +185,33 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
-                self._cell_size = int(
-                    self._cell_size
-                    * (1 + int(eagle_draft_num_layers) / int(num_layers))
-                )
+                draft_num_layers = int(eagle_draft_num_layers)
+                if is_deepseek_dsa(kvc.model_config.hf_config):
+                    target_indexer_size = self._compute_dsa_indexer_cell_size(
+                        kvc=kvc,
+                        num_layers=num_layers,
+                    )
+                    target_kv_size = self._cell_size - target_indexer_size
+                    from sglang.srt.layers.cp.utils import (
+                        get_glm_dsa_layer_split_effective_num_layers,
+                    )
+
+                    target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
+                        kvc, num_layers
+                    )
+                    draft_kv_size = int(
+                        target_kv_size * draft_num_layers / target_kv_num_layers
+                    )
+                    draft_indexer_size = self._compute_dsa_indexer_cell_size(
+                        kvc=kvc,
+                        num_layers=draft_num_layers,
+                        allocate_all_layers=True,
+                    )
+                    self._cell_size += draft_kv_size + draft_indexer_size
+                else:
+                    self._cell_size = int(
+                        self._cell_size * (1 + draft_num_layers / int(num_layers))
+                    )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
         if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
@@ -332,6 +355,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         *,
         kvc: KVCacheConfigurator,
         num_layers: int,
+        allocate_all_layers: bool = False,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
         indexer_size_per_token = (
@@ -351,7 +375,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             _should_elide_dsa_index_k,
         )
 
-        if not _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker):
+        if allocate_all_layers or not _should_elide_dsa_index_k(
+            is_draft_worker=kvc.is_draft_worker
+        ):
             num_indexer_layers = num_layers
         else:
             active_indexer_layers = [

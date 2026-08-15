@@ -623,6 +623,62 @@ class TestEagleConfigurator(unittest.TestCase):
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
 
+    @patch(
+        "sglang.srt.configs.model_config.is_deepseek_dsa",
+        return_value=True,
+    )
+    @patch(
+        "sglang.srt.model_executor.pool_configurator.get_dsa_index_head_dim",
+        return_value=128,
+    )
+    @patch(
+        "sglang.srt.model_executor.pool_configurator.is_deepseek_dsa",
+        return_value=True,
+    )
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_dsa_draft_full_indexer_cost_does_not_exceed_budget(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+        _mock_is_dsa,
+        _mock_index_head_dim,
+        _mock_is_dsa_src,
+    ):
+        """A sharing-enabled target must not discount the draft's full index-K."""
+        available = 10_000_000
+        num_layers = 78
+        draft_num_layers = 1
+        active_indexer_layers = 21
+        indexer_bytes_per_token = 132
+
+        mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        mr.model_config.hf_config.index_topk_freq = 4
+        mr.model_config.hf_config.index_skip_topk_offset = 3
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = draft_num_layers
+
+        with mock_cpu_env(kv_size=1):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=1)
+
+        actual_bytes_per_token = (
+            576 * num_layers
+            + indexer_bytes_per_token * active_indexer_layers
+            + (576 + indexer_bytes_per_token) * draft_num_layers
+        )
+        self.assertEqual(cfg._cell_size, actual_bytes_per_token)
+        self.assertLessEqual(
+            config.max_total_num_tokens * actual_bytes_per_token,
+            available,
+        )
+
 
 class TestDSAIndexerAllocationPolicy(unittest.TestCase):
     @patch(
