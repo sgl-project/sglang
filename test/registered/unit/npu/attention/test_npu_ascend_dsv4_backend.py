@@ -181,7 +181,6 @@ class TestApplyHadamard(unittest.TestCase):
         self.assertTrue(torch.equal(out, expected))
 
 
-
 class TestGetKvIndices(unittest.TestCase):
     _PATCH_TARGET = (
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.get_attn_backend"
