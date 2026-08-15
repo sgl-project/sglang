@@ -137,7 +137,6 @@ if _is_hip:
     except ImportError:
         _has_rocm_triton_gemma_rms_norm = False
 
-_FUSE_NORM_FP8_QUANT = envs.SGLANG_OPT_FUSE_NORM_FP8_QUANT.get()
 # Only decode-sized batches take the ptpc GEMM that consumes the fused quant.
 _FUSE_NORM_FP8_MAX_M = envs.SGLANG_OPT_MXFP8_DENSE_PTPC_DECODE_M.get()
 
@@ -381,7 +380,7 @@ def _forward_with_allreduce_fusion_quant_per_token(
 
     Returns ``(normed_bf16, residual)`` where the bf16 output carries the
     quantized pair as ``out._fp8_qinput = (fp8, scale)`` -- the same handoff
-    the Triton fused-add-RMSNorm uses under SGLANG_OPT_FUSE_NORM_FP8_QUANT --
+    the Triton fused-add-RMSNorm uses --
     or ``None`` when the fused kernel cannot service the request.
     """
     if residual is None or not _use_aiter:
@@ -1121,8 +1120,7 @@ class GemmaRMSNorm(BaseFusedOp):
                     residual,
                     self.weight.data,
                     self.variance_epsilon,
-                    emit_fp8=_FUSE_NORM_FP8_QUANT
-                    and x.numel() // x.shape[-1] <= _FUSE_NORM_FP8_MAX_M,
+                    emit_fp8=x.numel() // x.shape[-1] <= _FUSE_NORM_FP8_MAX_M,
                 )
             return rocm_triton_gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
 

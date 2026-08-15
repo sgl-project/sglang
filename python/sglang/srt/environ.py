@@ -704,11 +704,10 @@ class Envs:
     # block-fp8 GEMM (fast at large M). Takes precedence over the BF16 hybrid.
     # Costs one rowwise-fp8 copy of each dense linear weight; coarsens the
     # 1x32 weight scales to per-row for batches at or below the threshold.
+    # Also gates fusing that per-token fp8 quant into the producing norm kernel:
+    # at or below this M the consumer GEMM picks the (fp8, scale) pair off the
+    # norm output instead of re-quantizing.
     SGLANG_OPT_MXFP8_DENSE_PTPC_DECODE_M = EnvInt(128)
-    # Fuse the per-token fp8 quant of the ptpc decode path above into the
-    # producing Gemma fused-add-RMSNorm Triton kernel; the consumer GEMM picks
-    # the (fp8, scale) pair off the norm output instead of re-quantizing.
-    SGLANG_OPT_FUSE_NORM_FP8_QUANT = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 

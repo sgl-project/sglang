@@ -88,8 +88,9 @@ def _gemma_fused_add_rmsnorm_kernel(
     if EMIT_FP8:
         q_src = out_cast.to(tl.float32)
         amax = tl.max(tl.abs(q_src), axis=0)
-        scale = tl.maximum(amax, 1e-12) / 448.0
-        q = tl.clamp(q_src / scale, -448.0, 448.0)
+        amax = tl.maximum(amax, 1e-12)
+        scale = amax * tl.full((), 1.0 / 448.0, tl.float32)
+        q = tl.clamp(q_src * (1.0 / scale), -448.0, 448.0)
         tl.store(
             q8_ptr + row * n_cols + cols,
             q.to(q8_ptr.dtype.element_ty),
