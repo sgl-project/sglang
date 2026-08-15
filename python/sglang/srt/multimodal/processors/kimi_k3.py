@@ -528,6 +528,7 @@ class KimiK3ImageProcessor(
         """Preprocess cache-miss images into reusable per-image artifacts."""
         processor = processor or self._processor
         artifacts: list[Optional[KimiK3ImagePreprocessArtifact]] = [None] * len(entries)
+        # inputs preprocessed now instead of deferred to the GPU path
         eager_indices = []
         eager_images = []
 
