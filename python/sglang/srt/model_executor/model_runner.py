@@ -784,7 +784,6 @@ class ModelRunner:
         if self.spec_algorithm.is_speculative():
             return resolve_num_tokens_per_req(
                 phase="target_verify",
-                server_args=self.server_args,
                 spec_algorithm=self.spec_algorithm,
                 is_draft_worker=self.is_draft_worker,
                 num_draft_tokens=num_draft_tokens,
