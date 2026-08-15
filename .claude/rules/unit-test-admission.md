@@ -26,18 +26,14 @@ A new unit test case must fall into one of these categories:
 3. **Critical-path bookkeeping.** Defends conventions that are easy to break by
    forgetting to sync -- registry completeness, field lifecycle, serialization
    compatibility. Enumerating assertions are fine here; the guarded failure
-   mode is "someone extended X without updating Y". Example: the namespace
-   coverage tests (`test/registered/unit/test_server_args_namespaces.py`).
+   mode is "someone extended X without updating Y". Example: the ratchet tests
+   (`test/registered/unit/test_module_state_ratchet.py`).
 
 Not admissible:
 
 - Happy-path tautologies that re-assert what the implementation trivially does.
 - Mirror tests that restate the implementation logic as assertions.
 - Probabilistic stress that cannot reproduce the failure it claims to guard.
-- Source-scanning ratchets -- AST or regex scans over the package that pin a
-  call-site count, a per-scope mutation count, or an allowlist of files. They go
-  red on harmless refactors, the fix is always "update the pin", and they decay
-  into rubber-stamping. Enforce these conventions in review instead.
 
 **Distinguishing test — does deletion leave a silent-failure path?** A case
 that *looks* like a tautology/mirror is still admissible when it guards a

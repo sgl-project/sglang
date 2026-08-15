@@ -235,7 +235,7 @@ def _is_dsa_active() -> bool:
     # `_is_dsa_model_arch` is set nowhere in the tree, so this predicate is
     # inert today (the getattr default makes it False). Kept verbatim rather
     # than "fixed" here, because deciding what it should name is the CP path's
-    # call.
+    # call; the ratchet exempts it with that reason.
     return bool(
         get_parallel().enable_prefill_cp
         and getattr(get_server_args(), "_is_dsa_model_arch", False)
