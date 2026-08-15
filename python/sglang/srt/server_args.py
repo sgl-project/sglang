@@ -265,6 +265,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "marlin",
     "humming",
     "experimental_sgl_marlin",
+    "lora",  # MoE LoRA runner; requires --enable-lora
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
     "megamoe",
 ]
@@ -9168,6 +9169,75 @@ class ServerArgs:
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
+
+        if (
+            self.speculative_algorithm is not None
+            and self.speculative_moe_runner_backend == "lora"
+        ):
+            # The draft model has no LoRA adapters, and the speculative
+            # backend context swaps the global runner backend for the draft's
+            # whole build/capture/forward.
+            raise ValueError(
+                "--speculative-moe-runner-backend lora is not supported: the "
+                "LoRA MoE runner serves adapter traffic on the target model"
+            )
+
+        if self.moe_runner_backend == "lora":
+            # The LoRA MoE runner has no base-model-only mode of its own; it is
+            # selected per server and only ever runs on a LoRA-enabled engine.
+            if not (self.enable_lora or self.lora_paths):
+                raise ValueError(
+                    "--moe-runner-backend lora requires --enable-lora "
+                    "(or --lora-paths)"
+                )
+            # These two mirror the engine's layer-attach admission checks
+            # (unquantized BF16 experts, Standard dispatch); assert them at
+            # startup so the failure names the flag instead of surfacing as a
+            # NotImplementedError during layer construction.
+            if self.quantization is not None:
+                raise ValueError(
+                    "--moe-runner-backend lora currently supports unquantized "
+                    f"BF16 MoE only, got --quantization {self.quantization}"
+                )
+            if self.moe_a2a_backend != "none":
+                raise ValueError(
+                    "--moe-runner-backend lora requires Standard dispatch, "
+                    f"got --moe-a2a-backend {self.moe_a2a_backend}"
+                )
+            if self.ep_join_mode is not None:
+                raise ValueError(
+                    "--moe-runner-backend lora does not yet support elastic EP"
+                )
+            if self.enable_dp_attention and self.dp_size > 1:
+                raise ValueError(
+                    "--moe-runner-backend lora does not yet support DP-attention "
+                    "with dp_size > 1"
+                )
+            if (
+                self.enable_eplb
+                or self.init_expert_location != "trivial"
+                or self.ep_num_redundant_experts > 0
+            ):
+                raise ValueError(
+                    "--moe-runner-backend lora currently requires trivial expert "
+                    "placement "
+                    "without EPLB or redundant experts"
+                )
+            if self.enable_pdmux:
+                raise ValueError(
+                    "--moe-runner-backend lora does not yet support PD-multiplexing: its "
+                    "fused-align routing scratch is cached per "
+                    "(device, num_buckets) and is not safe under concurrent "
+                    "prefill/decode streams"
+                )
+            if self.enable_two_batch_overlap:
+                raise ValueError(
+                    "--moe-runner-backend lora does not yet support two-batch "
+                    "overlap: its "
+                    "batch metadata and graph-stable MoE workspace are shared "
+                    "across layers and are not safe for concurrent child "
+                    "forwards"
+                )
 
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:

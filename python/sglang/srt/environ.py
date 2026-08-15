@@ -790,6 +790,17 @@ class Envs:
     SGLANG_DEEPGEMM_PDL = EnvBool(True)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
+    # LoRA (MoE LoRA engine)
+    # Root of the MoE LoRA config tree (see
+    # sglang/srt/lora/moe/configs/README.md): per-architecture
+    # <arch>.json kernel tables at the top level, M-bucketed base-GEMM
+    # launch tables under gemm/. Files here take precedence over the
+    # packaged configs/ directory; unset = the packaged sweep winners.
+    # This is the deployment surface for configs produced by
+    # benchmark/kernels/lora_moe/tune_lora_config.py when onboarding a
+    # model whose geometry the shipped files do not cover.
+    SGLANG_LORA_MOE_CONFIG_DIR = EnvStr(None)
+
     # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)

@@ -316,7 +316,13 @@ class FusedMoE(torch.nn.Module):
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
-        self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
+        # The LoRA MoE runner reads the base experts through DeepGEMM's
+        # resident layout ([E, 2I, H] gate-first BF16, EP-local expert ids),
+        # so it needs the same weight prep and the same base runner.
+        self.use_deep_gemm = (
+            get_moe_runner_backend().is_deep_gemm()
+            or get_moe_runner_backend().is_lora()
+        )
 
         # flashinfer_trtllm kernel requires intermediate_size to be a multiple of 128
         # Pad the intermediate_size_per_partition if necessary

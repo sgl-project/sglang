@@ -1,0 +1,368 @@
+{
+ "arch": "default",
+ "domain": {
+  "max_hidden": 0,
+  "max_local_experts": 0
+ },
+ "scenarios": [],
+ "fallback": [
+  {
+   "name": "fallback.serial",
+   "when": {
+    "phase": "decode"
+   },
+   "provider": "deepgemm",
+   "plan": {
+    "gate_a_family": "grouped",
+    "down_a_family": "grouped",
+    "gate_b_family": "one_launch_sliced",
+    "down_b_family": "one_launch_sliced",
+    "middle_family": "materialized",
+    "finalize_family": "materialized"
+   },
+   "config": {
+    "b_activation": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_W": 64,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 3,
+     "num_warps": 4
+    },
+    "down_a": {
+     "BLOCK_SIZE_K": 64,
+     "BLOCK_SIZE_N": 32,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "down_b": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_M": 16,
+     "BLOCK_SIZE_N": 64,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "gate_a": {
+     "BLOCK_SIZE_K": 64,
+     "BLOCK_SIZE_N": 32,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "gate_a_routing_block_size": 16,
+    "gate_b": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_M": 16,
+     "BLOCK_SIZE_N": 64,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "routing_block_size": 16,
+    "shared_finalize": {
+     "reduce": {
+      "BLOCK_SIZE_T": 32,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "tail": {
+      "BLOCK_SIZE_H": 128,
+      "BLOCK_SIZE_K": 32,
+      "num_stages": 3,
+      "num_warps": 4
+     }
+    }
+   },
+   "provenance": "conservative serial reference (never-worse-than-stock)"
+  },
+  {
+   "name": "fallback.serial_prefill",
+   "when": {
+    "phase": "prefill",
+    "layout": "per_expert",
+    "activation": "swiglu"
+   },
+   "provider": "deepgemm_contiguous",
+   "plan": {
+    "gate_a_family": "grouped",
+    "down_a_family": "grouped",
+    "down_b_family": "one_launch_sliced",
+    "middle_family": "b_activation",
+    "finalize_family": "materialized",
+    "down_b_scatter": true
+   },
+   "config": {
+    "b_activation": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_W": 64,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 3,
+     "num_warps": 4
+    },
+    "down_a": {
+     "BLOCK_SIZE_K": 64,
+     "BLOCK_SIZE_N": 32,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "down_b": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_M": 16,
+     "BLOCK_SIZE_N": 64,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "gate_a": {
+     "BLOCK_SIZE_K": 64,
+     "BLOCK_SIZE_N": 32,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "gate_a_routing_block_size": 16,
+    "gate_b": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_M": 16,
+     "BLOCK_SIZE_N": 64,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "routing_block_size": 16,
+    "shared_finalize": {
+     "reduce": {
+      "BLOCK_SIZE_T": 32,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "tail": {
+      "BLOCK_SIZE_H": 128,
+      "BLOCK_SIZE_K": 32,
+      "num_stages": 3,
+      "num_warps": 4
+     }
+    }
+   },
+   "provenance": "conservative serial reference (never-worse-than-stock)"
+  },
+  {
+   "name": "fallback.serial_prefill",
+   "when": {
+    "phase": "prefill",
+    "layout": "per_expert",
+    "activation": "relu2"
+   },
+   "provider": "deepgemm_contiguous",
+   "plan": {
+    "gate_a_family": "grouped",
+    "down_a_family": "grouped",
+    "gate_b_family": "one_launch_sliced",
+    "down_b_family": "one_launch_sliced",
+    "middle_family": "materialized",
+    "finalize_family": "materialized",
+    "down_b_scatter": true
+   },
+   "config": {
+    "b_activation": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_W": 64,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 3,
+     "num_warps": 4
+    },
+    "down_a": {
+     "BLOCK_SIZE_K": 64,
+     "BLOCK_SIZE_N": 32,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "down_b": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_M": 16,
+     "BLOCK_SIZE_N": 64,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "gate_a": {
+     "BLOCK_SIZE_K": 64,
+     "BLOCK_SIZE_N": 32,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "gate_a_routing_block_size": 16,
+    "gate_b": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_M": 16,
+     "BLOCK_SIZE_N": 64,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "routing_block_size": 16,
+    "shared_finalize": {
+     "reduce": {
+      "BLOCK_SIZE_T": 32,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "tail": {
+      "BLOCK_SIZE_H": 128,
+      "BLOCK_SIZE_K": 32,
+      "num_stages": 3,
+      "num_warps": 4
+     }
+    }
+   },
+   "provenance": "conservative serial reference (never-worse-than-stock)"
+  },
+  {
+   "name": "fallback.serial_prefill",
+   "when": {
+    "phase": "prefill",
+    "layout": "shared",
+    "activation": "swiglu"
+   },
+   "provider": "deepgemm",
+   "plan": {
+    "gate_a_family": "grouped",
+    "down_a_family": "grouped",
+    "down_b_family": "one_launch_sliced",
+    "middle_family": "b_activation",
+    "finalize_family": "materialized"
+   },
+   "config": {
+    "b_activation": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_W": 64,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 3,
+     "num_warps": 4
+    },
+    "down_a": {
+     "BLOCK_SIZE_K": 64,
+     "BLOCK_SIZE_N": 32,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "down_b": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_M": 16,
+     "BLOCK_SIZE_N": 64,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "gate_a": {
+     "BLOCK_SIZE_K": 64,
+     "BLOCK_SIZE_N": 32,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "gate_a_routing_block_size": 16,
+    "gate_b": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_M": 16,
+     "BLOCK_SIZE_N": 64,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "routing_block_size": 16,
+    "shared_finalize": {
+     "reduce": {
+      "BLOCK_SIZE_T": 32,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "tail": {
+      "BLOCK_SIZE_H": 128,
+      "BLOCK_SIZE_K": 32,
+      "num_stages": 3,
+      "num_warps": 4
+     }
+    }
+   },
+   "provenance": "conservative serial reference (never-worse-than-stock)"
+  },
+  {
+   "name": "fallback.serial_prefill",
+   "when": {
+    "phase": "prefill",
+    "layout": "shared",
+    "activation": "relu2"
+   },
+   "provider": "deepgemm",
+   "plan": {
+    "gate_a_family": "grouped",
+    "down_a_family": "grouped",
+    "gate_b_family": "one_launch_sliced",
+    "down_b_family": "one_launch_sliced",
+    "middle_family": "materialized",
+    "finalize_family": "materialized"
+   },
+   "config": {
+    "b_activation": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_W": 64,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 3,
+     "num_warps": 4
+    },
+    "down_a": {
+     "BLOCK_SIZE_K": 64,
+     "BLOCK_SIZE_N": 32,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "down_b": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_M": 16,
+     "BLOCK_SIZE_N": 64,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "gate_a": {
+     "BLOCK_SIZE_K": 64,
+     "BLOCK_SIZE_N": 32,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "gate_a_routing_block_size": 16,
+    "gate_b": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_M": 16,
+     "BLOCK_SIZE_N": 64,
+     "GROUP_SIZE_M": 8,
+     "num_stages": 2,
+     "num_warps": 4
+    },
+    "routing_block_size": 16,
+    "shared_finalize": {
+     "reduce": {
+      "BLOCK_SIZE_T": 32,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "tail": {
+      "BLOCK_SIZE_H": 128,
+      "BLOCK_SIZE_K": 32,
+      "num_stages": 3,
+      "num_warps": 4
+     }
+    }
+   },
+   "provenance": "conservative serial reference (never-worse-than-stock)"
+  }
+ ]
+}

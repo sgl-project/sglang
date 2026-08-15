@@ -97,7 +97,15 @@ class LoRAManager:
         self._experts_shared_outer_override: Optional[bool] = (
             server_args.experts_shared_outer_loras
         )
+        # The MoE LoRA runner is selected by --moe-runner-backend; keeping a
+        # resolved copy avoids re-reading global state per layer/batch.
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        self.moe_lora_runner_backend = get_moe_runner_backend()
         self.lora_use_virtual_experts: bool = server_args.lora_use_virtual_experts
+        self.prefill_cuda_graph_backend: str = (
+            server_args.cuda_graph_config.prefill.backend
+        )
         self.lora_strict_loading: bool = getattr(
             server_args, "lora_strict_loading", False
         )
@@ -149,14 +157,22 @@ class LoRAManager:
         self.lora_backend.init_prefill_cuda_graph_batch_info(
             max_num_tokens=max_num_tokens
         )
+        self.lora_backend.init_prefill_cuda_graph_moe_buffers(
+            max_num_tokens=max_num_tokens
+        )
 
     @property
     def supports_prefill_cuda_graph(self) -> bool:
-        """Whether LoRA kernels can be captured into the prefill CUDA graph;
-        excludes MoE LoRA and DP attention."""
+        """Whether this LoRA configuration can enter a prefill CUDA graph."""
         return (
             self.lora_backend.supports_prefill_cuda_graph
-            and not self.lora_backend.is_moe_lora
+            # "full" is decode-only and tc_piecewise cannot host LoRA
+            # (Dynamo guards break on per-batch LoRABatchInfo rebinds).
+            and self.prefill_cuda_graph_backend == "breakable"
+            and (
+                not self.lora_backend.is_moe_lora
+                or self.moe_lora_runner_backend.is_lora()
+            )
             and not self.enable_dp_attention
         )
 
@@ -192,7 +208,12 @@ class LoRAManager:
         )
 
     def init_cuda_graph_moe_buffers(
-        self, max_bs: int, max_loras: int, compute_dtype, moe_layer
+        self,
+        max_bs: int,
+        max_loras: int,
+        compute_dtype,
+        moe_layer,
+        include_legacy_kernel_buffers: bool = True,
     ):
         """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
 
@@ -204,6 +225,7 @@ class LoRAManager:
             max_loras=max_loras,
             compute_dtype=compute_dtype,
             moe_layer=moe_layer,
+            include_legacy_kernel_buffers=include_legacy_kernel_buffers,
         )
 
     def create_lora_update_result(
@@ -463,6 +485,10 @@ class LoRAManager:
         )
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices
+        )
+        self.lora_backend.batch_info.is_prefill = (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_cuda_graph()
         )
 
     def update_lora_info(self):
@@ -1034,9 +1060,19 @@ def init_lora_cuda_graph_moe_buffers(
     max_loras = server_args.max_loras_per_batch
     for module in model.modules():
         if isinstance(module, FusedMoEWithLoRA):
-            lora_manager.init_cuda_graph_moe_buffers(max_bs, max_loras, dtype, module)
+            # Every engine needs the graph-stable batch metadata; only the
+            # legacy fused Triton path needs the kernel scratch alongside it.
+            include_legacy = not module._lora_runner_backend.is_lora()
+            lora_manager.init_cuda_graph_moe_buffers(
+                max_bs,
+                max_loras,
+                dtype,
+                module,
+                include_legacy_kernel_buffers=include_legacy,
+            )
             logger.info(
                 f"Pre-allocated shared MoE LoRA CUDA graph buffers "
-                f"(max_bs={max_bs}, max_loras={max_loras})"
+                f"(max_bs={max_bs}, max_loras={max_loras}, "
+                f"legacy_kernel_buffers={include_legacy})"
             )
             break
