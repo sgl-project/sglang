@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.runtime_context import get_memory, get_parallel, get_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -163,6 +164,13 @@ def _make_model_runner(
     return mr
 
 
+def _configure_dsa_model(model_runner):
+    hf_config = model_runner.model_config.hf_config
+    hf_config.architectures = ["GlmMoeDsaForCausalLM"]
+    hf_config.index_topk = 2048
+    hf_config.index_head_dim = 128
+
+
 KV_SIZE = 2  # bf16
 
 
@@ -192,7 +200,7 @@ def _actual_memory_used(mr, config):
         return config.max_total_num_tokens * full_pt * (nf + ns)
 
 
-class TestDefaultConfigurator(unittest.TestCase):
+class TestDefaultConfigurator(CustomTestCase):
     """Default (MHA): available_bytes -> tokens, memory invariant holds."""
 
     def _run(self, available_bytes, page_size=1, **kwargs):
@@ -237,20 +245,6 @@ class TestDefaultConfigurator(unittest.TestCase):
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
 
-    # dsa_layer_skips_topk re-checks the DSA precondition against the real
-    # helper, so patch it at the source too, not just in the caller's namespace.
-    @patch(
-        "sglang.srt.configs.model_config.is_deepseek_dsa",
-        return_value=True,
-    )
-    @patch(
-        "sglang.srt.model_executor.pool_configurator.get_dsa_index_head_dim",
-        return_value=128,
-    )
-    @patch(
-        "sglang.srt.model_executor.pool_configurator.is_deepseek_dsa",
-        return_value=True,
-    )
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         side_effect=(576, 656),
@@ -258,9 +252,6 @@ class TestDefaultConfigurator(unittest.TestCase):
     def test_dsa_mla_cell_size_uses_backend_kv_layout(
         self,
         mock_calculate_mla_kv_cache_dim,
-        _mock_is_dsa,
-        _mock_index_head_dim,
-        _mock_is_dsa_src,
     ):
         num_layers = 2
         raw = _make_model_runner(
@@ -273,6 +264,8 @@ class TestDefaultConfigurator(unittest.TestCase):
             num_layers=num_layers,
             use_mla_backend=True,
         )
+        _configure_dsa_model(raw)
+        _configure_dsa_model(packed)
 
         with mock_cpu_env(kv_size=1):
             from sglang.srt.model_executor.pool_configurator import (
@@ -288,7 +281,7 @@ class TestDefaultConfigurator(unittest.TestCase):
         self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
 
 
-class TestHybridSWAConfigurator(unittest.TestCase):
+class TestHybridSWAConfigurator(CustomTestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""
 
     def _make_swa_runner(self, full_layers=16, swa_layers=16, ratio=0.5, page_size=1):
@@ -546,7 +539,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
 
-class TestAllSWAConfigurator(unittest.TestCase):
+class TestAllSWAConfigurator(CustomTestCase):
     """All-SWA (full_layers=0): special case."""
 
     def _run(self, available_bytes, ratio=0.5, page_size=1, **kwargs):
@@ -595,7 +588,7 @@ class TestAllSWAConfigurator(unittest.TestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 500)
 
 
-class TestEagleConfigurator(unittest.TestCase):
+class TestEagleConfigurator(CustomTestCase):
     """EAGLE: draft KV cache must be accounted for so total allocation fits in budget."""
 
     def test_eagle_does_not_exceed_budget(self):
@@ -624,27 +617,12 @@ class TestEagleConfigurator(unittest.TestCase):
         self.assertLessEqual(used, available)
 
     @patch(
-        "sglang.srt.configs.model_config.is_deepseek_dsa",
-        return_value=True,
-    )
-    @patch(
-        "sglang.srt.model_executor.pool_configurator.get_dsa_index_head_dim",
-        return_value=128,
-    )
-    @patch(
-        "sglang.srt.model_executor.pool_configurator.is_deepseek_dsa",
-        return_value=True,
-    )
-    @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
     )
     def test_dsa_draft_full_indexer_cost_does_not_exceed_budget(
         self,
         _mock_calculate_mla_kv_cache_dim,
-        _mock_is_dsa,
-        _mock_index_head_dim,
-        _mock_is_dsa_src,
     ):
         """A sharing-enabled target must not discount the draft's full index-K."""
         available = 10_000_000
@@ -654,6 +632,7 @@ class TestEagleConfigurator(unittest.TestCase):
         indexer_bytes_per_token = 132
 
         mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
         mr.model_config.hf_config.index_topk_freq = 4
         mr.model_config.hf_config.index_skip_topk_offset = 3
         mr.spec_algorithm.is_eagle.return_value = True
@@ -680,19 +659,7 @@ class TestEagleConfigurator(unittest.TestCase):
         )
 
 
-class TestDSAIndexerAllocationPolicy(unittest.TestCase):
-    @patch(
-        "sglang.srt.configs.model_config.is_deepseek_dsa",
-        return_value=True,
-    )
-    @patch(
-        "sglang.srt.model_executor.pool_configurator.get_dsa_index_head_dim",
-        return_value=128,
-    )
-    @patch(
-        "sglang.srt.model_executor.pool_configurator.is_deepseek_dsa",
-        return_value=True,
-    )
+class TestDSAIndexerAllocationPolicy(CustomTestCase):
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
@@ -700,13 +667,11 @@ class TestDSAIndexerAllocationPolicy(unittest.TestCase):
     def test_resolved_hicache_override_prices_every_indexer_layer(
         self,
         _mock_calculate_mla_kv_cache_dim,
-        _mock_is_dsa,
-        _mock_index_head_dim,
-        _mock_is_dsa_src,
     ):
         """Post-publish HiCache overrides must keep sizing and allocation aligned."""
         num_layers = 6
         mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
         mr.model_config.hf_config.index_topk_freq = 4
         mr.model_config.hf_config.index_skip_topk_offset = 3
 
@@ -722,27 +687,12 @@ class TestDSAIndexerAllocationPolicy(unittest.TestCase):
         self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
 
     @patch(
-        "sglang.srt.configs.model_config.is_deepseek_dsa",
-        return_value=True,
-    )
-    @patch(
-        "sglang.srt.model_executor.pool_configurator.get_dsa_index_head_dim",
-        return_value=128,
-    )
-    @patch(
-        "sglang.srt.model_executor.pool_configurator.is_deepseek_dsa",
-        return_value=True,
-    )
-    @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
     )
     def test_pd_prices_every_indexer_layer(
         self,
         _mock_calculate_mla_kv_cache_dim,
-        _mock_is_dsa,
-        _mock_index_head_dim,
-        _mock_is_dsa_src,
     ):
         """PD must retain dense index-K metadata until transports support sparsity."""
         num_layers = 6
@@ -752,6 +702,7 @@ class TestDSAIndexerAllocationPolicy(unittest.TestCase):
             use_mla_backend=True,
             disaggregation_mode="prefill",
         )
+        _configure_dsa_model(mr)
         mr.model_config.hf_config.index_topk_freq = 4
         mr.model_config.hf_config.index_skip_topk_offset = 3
 
@@ -765,7 +716,7 @@ class TestDSAIndexerAllocationPolicy(unittest.TestCase):
         self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
 
 
-class TestFactory(unittest.TestCase):
+class TestFactory(CustomTestCase):
     def test_default_for_non_swa(self):
         mr = _make_model_runner(self, is_hybrid_swa=False)
         with mock_cpu_env():
@@ -823,7 +774,7 @@ class TestFactory(unittest.TestCase):
         self.assertNotIsInstance(_cfg(None), SWAChunkCapPoolConfigurator)
 
 
-class TestDflashDraftKvBudget(unittest.TestCase):
+class TestDflashDraftKvBudget(CustomTestCase):
     """DFLASH draft KV pool as a flat bytes/token term on the target's budget."""
 
     def test_bytes_per_token_from_draft_geometry(self):
