@@ -1066,11 +1066,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ],
             }
         if msg_type == "function_call_output":
-            # ``output`` may be a string or an array of content parts (OpenAI
-            # allows both); the chat tool message needs a string, so flatten.
+            # ``output`` may be a string or an array of content parts. Preserve
+            # multimodal tool results by translating Responses parts to their
+            # Chat Completions equivalents, just as we do for message items.
             out = message.get("output", "")
             if isinstance(out, list):
-                out = "".join(p.get("text", "") for p in out if isinstance(p, dict))
+                out = [
+                    cls._normalize_response_content_part_for_chat(part) for part in out
+                ]
             return {
                 "role": "tool",
                 "tool_call_id": message.get("call_id"),

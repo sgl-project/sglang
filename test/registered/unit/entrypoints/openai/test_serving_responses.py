@@ -123,6 +123,80 @@ class InputMessageConstructionTestCase(CustomTestCase):
             ],
         )
 
+    def test_function_call_output_image_reaches_chat_processing(self):
+        serving = make_serving(is_multimodal=True)
+        captured = {}
+
+        def fake_process(chat_request, is_multimodal):
+            captured["chat_request"] = chat_request
+            captured["is_multimodal"] = is_multimodal
+            return MessageProcessingResult(
+                prompt="rendered tool image",
+                prompt_ids=[1, 2, 3],
+                image_data=["https://example.com/image.png"],
+                audio_data=None,
+                video_data=None,
+                modalities=["image"],
+                stop=[],
+            )
+
+        serving._process_messages = Mock(side_effect=fake_process)
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_image",
+                    "output": [
+                        {"type": "input_text", "text": "tool result"},
+                        {
+                            "type": "input_image",
+                            "image_url": "https://example.com/image.png",
+                            "detail": "high",
+                        },
+                    ],
+                }
+            ],
+            store=False,
+        )
+
+        messages, request_prompts, engine_prompts, _ = asyncio.run(
+            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        )
+
+        self.assertEqual(
+            messages,
+            [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_image",
+                    "content": [
+                        {"type": "text", "text": "tool result"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://example.com/image.png",
+                                "detail": "high",
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(request_prompts, ["rendered tool image"])
+        self.assertEqual(engine_prompts, ["rendered tool image"])
+        self.assertTrue(captured["is_multimodal"])
+        chat_message = captured["chat_request"].messages[0]
+        self.assertEqual(chat_message.role, "tool")
+        self.assertEqual(chat_message.content[0].type, "text")
+        self.assertEqual(chat_message.content[0].text, "tool result")
+        self.assertEqual(chat_message.content[1].type, "image_url")
+        self.assertEqual(
+            chat_message.content[1].image_url.url,
+            "https://example.com/image.png",
+        )
+        self.assertEqual(chat_message.content[1].image_url.detail, "high")
+
     def test_previous_response_id_input_list_does_not_call_copy_module(self):
         serving = make_serving()
         serving.use_harmony = True
