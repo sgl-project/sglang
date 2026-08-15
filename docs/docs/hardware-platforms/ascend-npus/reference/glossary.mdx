@@ -82,13 +82,13 @@ PD disaggregation separates inference into two stages running on different nodes
 
 | Shorthand | Meaning                         |
 | --------- | ------------------------------- |
-| **1P1D**  | 1 prefill node + 1 decode node  |
-| **2P1D**  | 2 prefill nodes + 1 decode node |
-| **1P2D**  | 1 prefill node + 2 decode nodes |
+| **1P1D**  | 1 prefill instance + 1 decode instance  |
+| **2P1D**  | 2 prefill instances + 1 decode instance |
+| **1P2D**  | 1 prefill instance + 2 decode instances |
 
 You will see these in [Best Practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1)
-section headings, e.g., `W8A8 2P1D 32P` means "W8A8 quantization, 2 prefill nodes +
-1 decode node, 32 cards total."
+section headings, e.g., `W8A8 2P1D 32P` means "W8A8 quantization, 2 prefill instances +
+1 decode instance, 32 cards total."
 
 ### Parallelism strategies
 
