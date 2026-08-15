@@ -378,7 +378,7 @@ class Engine(EngineScoreMixin, EngineBase):
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
-        lora_path: Optional[List[Optional[str]]] = None,
+        lora_path: Optional[Union[str, List[Optional[str]]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         require_reasoning: bool = False,
         return_hidden_states: Union[
@@ -491,7 +491,7 @@ class Engine(EngineScoreMixin, EngineBase):
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
-        lora_path: Optional[List[Optional[str]]] = None,
+        lora_path: Optional[Union[str, List[Optional[str]]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         require_reasoning: bool = False,
         return_hidden_states: Union[

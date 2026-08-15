@@ -50,13 +50,19 @@ def normalize_lora_paths(
         return None
     if isinstance(value, str):
         return value if is_single else [value] * (batch_size * expansion_factor)
-    if not isinstance(value, list):
-        raise ValueError("lora_path should be a list or a string.")
+    if not isinstance(value, list) or not all(
+        path is None or isinstance(path, str) for path in value
+    ):
+        raise ValueError(
+            "lora_path should be a string or a list containing strings or None."
+        )
     expected_size = 1 if is_single else batch_size
     if len(value) != expected_size:
         raise ValueError(
             f"lora_path list length ({len(value)}) must match batch size ({expected_size})"
         )
+    if all(path is None for path in value):
+        return None
     return value[0] if is_single else value * expansion_factor
 
 

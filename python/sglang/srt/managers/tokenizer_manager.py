@@ -3320,7 +3320,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(obj.lora_path, str):
             unique_lora_paths = set([obj.lora_path])
         else:
-            unique_lora_paths = set(obj.lora_path)
+            unique_lora_paths = {
+                lora_path for lora_path in obj.lora_path if lora_path is not None
+            }
 
         if (
             self.server_args.max_loaded_loras is not None
