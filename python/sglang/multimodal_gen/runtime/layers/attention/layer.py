@@ -685,6 +685,7 @@ class USPAttention(nn.Module):
         dropout_rate: float = 0.0,
         skip_sequence_parallel: bool = False,
         enable_packed_qkv_input_a2a: bool = False,
+        is_cross_attention: bool = False,
         **extra_impl_args,
     ) -> None:
         """
@@ -694,6 +695,9 @@ class USPAttention(nn.Module):
               text/image encoder outputs), the full USP pipeline is redundant:
               each rank's local Q shard can attend directly to the locally-held
               full KV without any collective communication.
+            is_cross_attention:
+              sparse backend preferences may select a compatible dense backend
+              for cross-attention while remaining strict for self-attention.
         """
         super().__init__()
         if softmax_scale is None:
@@ -706,7 +710,10 @@ class USPAttention(nn.Module):
 
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            is_cross_attention=is_cross_attention,
         )
         if get_ring_parallel_world_size() > 1:
             if not attn_backend.supports_ring_rotation():
