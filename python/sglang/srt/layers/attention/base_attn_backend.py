@@ -125,6 +125,17 @@ class AttentionBackend(ABC):
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
+    # Whether this backend's DRAFT-EXTEND metadata plan may be redone by the
+    # forward path after DP padding reshapes the batch (see
+    # ForwardBatch.mark_forward_metadata_ready). Default False: DSA's indexer
+    # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
+    # (#27091), so pre-pad metadata is used as-is and pad-row overhang is
+    # tolerated by the kernels. Backends whose draft-extend plan is a plain
+    # init_forward_metadata with no such constraint (e.g. DSV4: SWA-only,
+    # need_compress=False) opt in so the plan is redone against the padded
+    # shapes and metadata rows always match the forward's rows.
+    draft_extend_replan_equivalent: bool = False
+
     def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
         """Declare where this backend's scheduler-shared reads end per mode.
 

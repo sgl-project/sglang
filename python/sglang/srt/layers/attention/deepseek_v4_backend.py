@@ -112,6 +112,55 @@ def _get_trtllm_workspace_buffer(device: torch.device) -> torch.Tensor:
     return _trtllm_workspace_buffer_global
 
 
+_trtllm_semaphore_installed = False
+
+
+def _install_persistent_trtllm_semaphores() -> None:
+    """WAR for flashinfer's trtllm-gen multi-CTA KV counter (semaphore)
+    buffer handling. flashinfer sizes it batch_size (= requests) x heads and
+    allocates it per call, but the kernel indexes semaphores as
+    [batch, numCtasForAllHeads, maxNumCtasQ] with maxNumCtasQ == seqLenQ for
+    the DSv4 sparse kernels (trtllm-gen TmemCorr.h counterOffset) -- i.e.
+    under-allocated for any multi-token launch. Remove once flashinfer
+    accepts a caller-provided persistent buffer with tile-aware sizing."""
+    global _trtllm_semaphore_installed
+    if _trtllm_semaphore_installed:
+        return
+    import flashinfer.mla._core as _fi_core
+
+    _orig = _fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer
+    # Single persistent counter buffer, allocated once OUTSIDE any graph
+    # capture and shared by every launch -- the same design TRT-LLM uses
+    # (AttentionOp::mMultiBlockSemaphores). The kernel self-resets counters
+    # at the end of each launch and launches are stream-ordered, so sharing
+    # is safe. This removes both failure modes of per-call allocation:
+    # (a) under-sizing for VarSeq multi-token launches (kernel indexes
+    # counters per q-tile, TmemCorr.h counterOffset formula), sized here for
+    # 16384 query rows; (b) capture-pool lifetime bugs (a buffer allocated
+    # inside capture whose reference dies is recycled by later captures,
+    # letting replays scribble counters over other graphs' tensors).
+    state: dict = {}
+
+    def _patched(batch_size, num_qo_heads, sm_count, device):
+        buf = state.get("buf")
+        if buf is None or buf.device != device:
+            assert not torch.cuda.is_current_stream_capturing(), (
+                "persistent trtllm semaphore buffer must be created outside "
+                "graph capture (first call is expected during eager warmup)"
+            )
+            buf = _orig(16384, num_qo_heads, sm_count, device)
+            state["buf"] = buf
+        return buf
+
+    _fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer = _patched
+    _fi_core._trtllm_semaphore_state = state
+    _trtllm_semaphore_installed = True
+    logger.info(
+        "trtllm-gen multi-CTA semaphores: single persistent 16384-row buffer "
+        "shared across launches (flashinfer sizing WAR)."
+    )
+
+
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
     # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
@@ -470,27 +519,50 @@ class DSV4AttnMetadata:
 
         num_tokens = self.seq_lens_casual.shape[0]
         assert self.swa_page_indices.shape == (num_tokens, SWA_WINDOW)
-        self.trtllm_swa_lens = torch.full(
-            (num_tokens,), SWA_WINDOW, **self.cuda_int32_kwargs
-        )
+
+        # TILE OVERRUN GUARD: the trtllm-gen VarSeq kernel processes query
+        # rows in 64-token tiles and reads per-token table rows up to the
+        # tile boundary, i.e. up to 63 rows past num_tokens. Allocate every
+        # per-token tensor it reads as a 64-row-aligned parent filled with
+        # INERT values (-1 indices, SWA-only lens, seq_len 1) and keep
+        # [:num_tokens] views, so over-reads land in mapped inert memory
+        # instead of past the allocation (observed as segment-boundary MMU
+        # faults / silent garbage depending on allocator layout).
+        n_pad = (num_tokens + 63) // 64 * 64
+
+        def _tile_padded(fill, src=None, width=None):
+            shape = (n_pad,) if width is None else (n_pad, width)
+            buf = torch.full(shape, fill, **self.cuda_int32_kwargs)
+            if src is not None:
+                buf[:num_tokens].copy_(src)
+            return buf[:num_tokens]
+
+        if n_pad != num_tokens:
+            self.seq_lens_casual = _tile_padded(1, self.seq_lens_casual)
+            self.swa_page_indices = _tile_padded(
+                -1, self.swa_page_indices, width=SWA_WINDOW
+            )
+        self.trtllm_swa_lens = _tile_padded(SWA_WINDOW)
         if self.c4_sparse_page_indices is not None:
             w4 = self.c4_sparse_page_indices.shape[-1]
             assert w4 % 4 == 0, f"{w4=}"
-            self.trtllm_c4_indices = torch.empty(
-                (num_tokens, SWA_WINDOW + w4), **self.cuda_int32_kwargs
-            )
+            # The c4 tail + lens are per-layer values written by the decode
+            # forward. Initialize them INERT (-1 = invalid index, lens =
+            # SWA-only) rather than torch.empty: any row the per-layer fill
+            # does not cover must not hand the kernel allocator garbage as
+            # indices/lengths.
+            self.trtllm_c4_indices = _tile_padded(-1, width=SWA_WINDOW + w4)
             self.trtllm_c4_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
-            self.trtllm_c4_lens = torch.empty((num_tokens,), **self.cuda_int32_kwargs)
+            self.trtllm_c4_lens = _tile_padded(SWA_WINDOW)
         if self.c128_page_indices is not None:
             w128 = self.c128_page_indices.shape[-1]
             assert w128 % 4 == 0, f"{w128=}"
-            self.trtllm_c128_indices = torch.empty(
-                (num_tokens, SWA_WINDOW + w128), **self.cuda_int32_kwargs
-            )
+            self.trtllm_c128_indices = _tile_padded(-1, width=SWA_WINDOW + w128)
             self.trtllm_c128_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
             self.trtllm_c128_indices[:, SWA_WINDOW:].copy_(self.c128_page_indices)
-            self.trtllm_c128_lens = (self.c128_topk_lengths_clamp1 + SWA_WINDOW).to(
-                torch.int32
+            self.trtllm_c128_lens = _tile_padded(
+                SWA_WINDOW,
+                (self.c128_topk_lengths_clamp1 + SWA_WINDOW).to(torch.int32),
             )
 
 
@@ -604,6 +676,12 @@ class DeepseekV4AttnBackend(
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
+    # Draft-extend metadata is SWA-only (need_compress=False, no indexer /
+    # deep_gemm schedule), so a post-DP-padding re-plan is safe and keeps
+    # metadata rows equal to the padded forward's rows. Required for the
+    # trtllm path, whose decode kernel takes exact-row tables (a pre-pad
+    # plan under MAX_LEN padding leaves q rows > metadata rows).
+    draft_extend_replan_equivalent: bool = True
 
     def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
         # Breakable-graph verify rereads shared state across segments.
@@ -683,6 +761,8 @@ class DeepseekV4AttnBackend(
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
         self.trtllm_attn: bool = get_exec().kernel.dsv4_attn_backend == "trtllm"
+        if self.trtllm_attn:
+            _install_persistent_trtllm_semaphores()
         # trtllm + speculative + DP attention prepares metadata on the host:
         # in-graph prep degrades draft acceptance under DP's padded/idle-rank
         # batches. Otherwise prep metadata in-graph.
@@ -1236,6 +1316,12 @@ class DeepseekV4AttnBackend(
                 req_pool_indices=req_pool_indices,
             )
         )
+        # DP-padded rows carry the graph seq-len fill value (1); expanding a
+        # 1-length row over num_tokens_per_req query tokens yields 0 (or
+        # negative) per-token lens for its leading tokens. Keep the >=1 floor
+        # kernels assume (same convention as *_topk_lengths_clamp1) -- real
+        # rows are unaffected (their first token's KV length is >= 1).
+        seq_lens_casual = seq_lens_casual.clamp(min=1)
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -1277,7 +1363,12 @@ class DeepseekV4AttnBackend(
         # page_table, which also feeds the indexer, turning the corruption
         # into silently wrong top-k KV selection). Holding one reference per
         # captured graph prevents the pool from ever reusing these blocks.
-        if was_raw and torch.cuda.is_current_stream_capturing():
+        # Pin regardless of was_raw: under host-side prep (PREP_IN_CUDA_GRAPH
+        # off / the trtllm+MTP+DP exception) the metadata reaching capture is
+        # already Full, but tensors created below (swa_out_cache_loc) still
+        # come from the capture pool and are reference-replaced on the pinned
+        # object by copy_'s assign_fields on every replay-prep.
+        if torch.cuda.is_current_stream_capturing():
             self._captured_full_metadata_refs.append(self.forward_metadata)
 
         # Compute the SWA KV-store write target once per forward and cache it on
@@ -1309,6 +1400,17 @@ class DeepseekV4AttnBackend(
                     torch.int32
                 )
             )
+            if torch.cuda.is_current_stream_capturing():
+                # The recorded translate/store ops address THIS tensor at
+                # every replay, but copy_'s assign_fields replace the field
+                # on the (pinned) captured metadata each replay-prep,
+                # dropping the only python reference. Pin the tensor itself
+                # so the capture pool can never release its block (a released
+                # block unmaps -> replay MMU-faults at the baked address;
+                # a recycled block silently corrupts).
+                self._captured_full_metadata_refs.append(
+                    metadata.core_attn_metadata.swa_out_cache_loc
+                )
 
             if self.is_dspark_draft and forward_batch.forward_mode.is_target_verify():
                 block_size = int(forward_batch.spec_info.draft_token_num)
@@ -2043,6 +2145,29 @@ class DeepseekV4AttnBackend(
         bs, num_heads, head_dim = q.shape
         assert head_dim == 512
 
+        # Pre-pad-planned metadata: draft-extend plans its metadata BEFORE
+        # prepare_mlp_sync_batch DP-pads the batch (prepare_for_draft_extend
+        # marks the plan non-replannable, see #27091), so under DP MAX_LEN
+        # padding q can carry MORE rows than the metadata. The extra rows are
+        # padding whose outputs are discarded downstream; run the kernel on
+        # the metadata-covered rows only and zero-fill the tail (finite, so
+        # nothing NaN-propagates) -- same recipe as the padded-prefill path.
+        # FlashMLA tolerates this overhang implicitly; the trtllm tables are
+        # exact-rows, hence the explicit slice.
+        n_meta_rows = core_attn_metadata.seq_lens_casual.shape[0]
+        out_pad_tail = None
+        if n_meta_rows < bs:
+            out_pad_tail = torch.zeros(
+                (bs, num_heads, 512), dtype=torch.bfloat16, device=q.device
+            )
+            q = q[:n_meta_rows]
+            swa_page_indices = swa_page_indices[:n_meta_rows]
+            if extra_indices is not None:
+                extra_indices = extra_indices[:n_meta_rows]
+            if extra_topk_lengths is not None:
+                extra_topk_lengths = extra_topk_lengths[:n_meta_rows]
+            bs = n_meta_rows
+
         # Per-ratio tables: layer-invariant content (SWA columns, the whole
         # c128 table, the c0 lens) was written once per step by
         # init_trtllm_sparse_buffers; only the c4 tail + lens (indexer
@@ -2050,8 +2175,12 @@ class DeepseekV4AttnBackend(
         assert swa_page_indices.shape == (bs, SWA_WINDOW)
         if compress_ratio == 0:
             # swa_page_indices is itself a valid combined table (capacity
-            # 128, all-SWA); no fill needed.
-            sparse_indices = swa_page_indices
+            # 128, all-SWA); no fill needed. Use the METADATA's table (a
+            # [:n] view of a 64-row-aligned inert parent), not the
+            # match_num_queries-processed argument: the arg is an exact-row
+            # tensor and the VarSeq kernel reads rows to the 64-token tile
+            # boundary (tile-overrun guard, see init_trtllm_sparse_buffers).
+            sparse_indices = core_attn_metadata.swa_page_indices
             sparse_topk_lens = core_attn_metadata.trtllm_swa_lens
         elif compress_ratio == 128:
             sparse_indices = core_attn_metadata.trtllm_c128_indices
@@ -2114,6 +2243,9 @@ class DeepseekV4AttnBackend(
             sinks=attn_sink,
             kv_layout="HND",
         )
+        if out_pad_tail is not None:
+            out_pad_tail[:bs] = out.view(bs, num_heads, 512)
+            return out_pad_tail
         return out.view(bs, num_heads, 512)
 
     def _forward_trtllm_prefill(
@@ -2178,28 +2310,42 @@ class DeepseekV4AttnBackend(
         # lens, the c4 table's SWA half (per-layer: the indexer top-k tail +
         # lens), and the whole c128 table + lens (its page list is
         # metadata-level).
-        swa_indices = swa_page_indices[:sum_q]
+        # TILE OVERRUN GUARD (see init_trtllm_sparse_buffers): the VarSeq
+        # kernel reads per-token table rows up to the 64-token tile boundary,
+        # so allocate every per-token tensor as a 64-row-aligned inert parent
+        # and hand the kernel [:sum_q] views.
+        sum_q_pad = (sum_q + 63) // 64 * 64
+
+        def _tile_padded_pf(fill, src=None, width=None):
+            shape = (sum_q_pad,) if width is None else (sum_q_pad, width)
+            buf = torch.full(shape, fill, **self.cuda_int32_kwargs)
+            if src is not None:
+                buf[:sum_q].copy_(src)
+            return buf[:sum_q]
+
+        swa_indices = _tile_padded_pf(
+            -1, swa_page_indices[:sum_q], width=SWA_WINDOW
+        )
         assert swa_indices.shape == (sum_q, SWA_WINDOW), f"{swa_indices.shape=}"
         if extra_indices is None:
             # SWA-only (compress_ratio == 0) layer. SWA_WINDOW satisfies the
             # kernel's capacity constraints (>= 128, % 4 == 0).
-            sparse_indices = swa_indices.contiguous()
+            sparse_indices = swa_indices
             if core.trtllm_prefill_swa_lens is None:
-                core.trtllm_prefill_swa_lens = torch.full(
-                    (sum_q,), SWA_WINDOW, **self.cuda_int32_kwargs
-                )
+                core.trtllm_prefill_swa_lens = _tile_padded_pf(SWA_WINDOW)
             sparse_topk_lens = core.trtllm_prefill_swa_lens
         elif compress_ratio == 128:
             if core.trtllm_prefill_c128 is None:
                 width = extra_indices.shape[-1]
                 assert width % 4 == 0, f"{width=}"
-                table = torch.empty(
-                    (sum_q, SWA_WINDOW + width), **self.cuda_int32_kwargs
-                )
+                table = _tile_padded_pf(-1, width=SWA_WINDOW + width)
                 table[:, :SWA_WINDOW].copy_(swa_indices)
                 table[:, SWA_WINDOW:].copy_(extra_indices[:sum_q])
                 assert extra_topk_lengths is not None
-                lens = extra_topk_lengths[:sum_q].to(torch.int32) + SWA_WINDOW
+                lens = _tile_padded_pf(
+                    SWA_WINDOW,
+                    extra_topk_lengths[:sum_q].to(torch.int32) + SWA_WINDOW,
+                )
                 core.trtllm_prefill_c128 = (table, lens)
             sparse_indices, sparse_topk_lens = core.trtllm_prefill_c128
         else:
@@ -2209,8 +2355,8 @@ class DeepseekV4AttnBackend(
             # (_pad_last_dim), so the combined capacity satisfies % 4 == 0.
             assert width % 4 == 0, f"{width=}"
             if core.trtllm_prefill_c4_indices is None:
-                core.trtllm_prefill_c4_indices = torch.empty(
-                    (sum_q, SWA_WINDOW + width), **self.cuda_int32_kwargs
+                core.trtllm_prefill_c4_indices = _tile_padded_pf(
+                    -1, width=SWA_WINDOW + width
                 )
                 core.trtllm_prefill_c4_indices[:, :SWA_WINDOW].copy_(swa_indices)
             sparse_indices = core.trtllm_prefill_c4_indices
@@ -2221,7 +2367,10 @@ class DeepseekV4AttnBackend(
             sparse_indices[:, SWA_WINDOW:].copy_(extra_indices[:sum_q])
             # Total lens include the fixed 128 SWA slots; SWA validity itself
             # is derived from seq_lens/cum_seq_lens_q inside the kernel.
-            sparse_topk_lens = extra_topk_lengths[:sum_q].to(torch.int32) + SWA_WINDOW
+            sparse_topk_lens = _tile_padded_pf(
+                SWA_WINDOW,
+                extra_topk_lengths[:sum_q].to(torch.int32) + SWA_WINDOW,
+            )
 
         # FP8 query: RoPE already applied upstream; per-tensor scale 1.0 makes
         # quantization a plain e4m3 cast (same recipe as the decode branch).

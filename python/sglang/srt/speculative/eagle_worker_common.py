@@ -196,16 +196,26 @@ def prepare_for_draft_extend(
     )
     if not batch.forward_mode.is_idle() and not can_run_decode_cuda_graph:
         draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
-        # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
-        # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
-        # (the `_batch_size == batch_size` assertion, see #27091); the
-        # marked pre-pad metadata is used as-is, matching the proven
-        # skip_attn_backend_init=True behavior.
+        # Planned pre-pad. By default do NOT opt into the post-pad re-plan:
+        # DSA's indexer cannot rebuild its deep_gemm schedule_meta on a
+        # DP-padded batch (the `_batch_size == batch_size` assertion, see
+        # #27091); the marked pre-pad metadata is used as-is, matching the
+        # proven skip_attn_backend_init=True behavior. Backends without that
+        # constraint (draft_extend_replan_equivalent, e.g. DSV4's SWA-only
+        # draft-extend plan) opt in so DP MAX_LEN padding cannot leave the
+        # forward with more rows than the metadata (the trtllm decode kernel
+        # takes exact-row tables).
         # On NPU with --disable-cuda-graph, block_table shape won't match
         # after prepare_mlp_sync_batch padding; defer re-init to
         # forward_extend (post-pad) instead.
         if not is_npu() or can_run_decode_cuda_graph:
-            forward_batch.mark_forward_metadata_ready()
+            forward_batch.mark_forward_metadata_ready(
+                replan_equivalent=getattr(
+                    draft_model_runner.attn_backend,
+                    "draft_extend_replan_equivalent",
+                    False,
+                )
+            )
     return forward_batch
 
 

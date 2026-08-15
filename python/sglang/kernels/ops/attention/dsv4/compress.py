@@ -136,6 +136,14 @@ def _jit_compress_plan_module() -> Module:
 # ----------------------------------------------------------------------------
 _PREFILL_PLAN_BYTES = 24
 
+# Keep recently used pinned plan-staging buffers alive for a few iterations so
+# their raw-cudaMemcpyAsync H2D reads cannot be raced by a CPU reuse of the
+# recycled block (see CompressorPrefillPlan.generate). Depth 8 comfortably
+# exceeds the overlap scheduler's CPU run-ahead.
+from collections import deque as _deque
+
+_PIN_BUFFER_KEEPALIVE: _deque = _deque(maxlen=8)
+
 
 # ----------------------------------------------------------------------------
 # Plan dataclasses. The element at index 1 is the consumer for
@@ -254,6 +262,16 @@ class CompressorPrefillPlan(NamedTuple):
             dtype=torch.uint8,
             pin_memory=not is_gpu_input,
         )
+        if not is_gpu_input:
+            # LIFETIME: the JIT planner fills pin_buffer on the CPU and pushes
+            # it to the device with a RAW cudaMemcpyAsync, which does not
+            # record a CachingHostAllocator event on the block. If this plan's
+            # only reference dies early (the cuda-graph path content-copies
+            # the temp metadata and drops it), the block is recycled and the
+            # next iteration's CPU writes race the still-in-flight DMA --
+            # poisoned plan entries (KV page ids) under the overlap scheduler.
+            # Pin the block for a few iterations to outlive any CPU run-ahead.
+            _PIN_BUFFER_KEEPALIVE.append(pin_buffer)
         # DP-safe empty-batch guard: a TBO ubatch (or tail batch) can have 0
         # query tokens (num_q_tokens==0) on THIS rank while other DP ranks are
         # non-empty. The global TBO decision must stay uniform across ranks, so
@@ -309,6 +327,8 @@ class CompressorPrefillPlan(NamedTuple):
             dtype=torch.uint8,
             pin_memory=True,
         )
+        # Same raw-cudaMemcpyAsync lifetime hazard as generate(); see there.
+        _PIN_BUFFER_KEEPALIVE.append(pin_buffer)
         if _is_xpu:
             fn = plan_compress_prefill_legacy
         else:
@@ -348,6 +368,8 @@ class CompressorPrefillPlan(NamedTuple):
         pin_buffer = torch.empty(
             (2, num_q_tokens, 16), dtype=torch.uint8, pin_memory=True
         )
+        # Same raw-cudaMemcpyAsync lifetime hazard as generate(); see there.
+        _PIN_BUFFER_KEEPALIVE.append(pin_buffer)
         plan_c_pin, plan_w_pin = pin_buffer[0], pin_buffer[1]
         device = req_pool_indices.device
         plan_c_dev = torch.empty((num_q_tokens, 16), dtype=torch.uint8, device=device)
