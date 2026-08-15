@@ -677,8 +677,9 @@ def load_token_map(token_map_path: str) -> List[int]:
 
 @contextmanager
 def draft_pp_context():
-    # The draft model is one layer and never spans pipeline stages; give it a
-    # single-member pp group so it initializes as if pp were off.
+    # The draft model never spans pipeline stages (multi-layer drafts stay
+    # whole on the last stage); give it a single-member pp group so it
+    # initializes as if pp were off.
     with patch_pipeline_parallel_group(get_self_pp_group()):
         yield
 

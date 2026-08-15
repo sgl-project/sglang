@@ -1101,6 +1101,10 @@ def build_staging_slot_metadata(
         return None
 
     ids = list(kv_layer_ids or [])
+    # With no per-layer ids (e.g. a whole-envelope pool) num_target goes
+    # negative; the slices below then come out empty, which is exactly the
+    # desired positional fallback: buffers still include the draft's, the id
+    # list stays empty, and pp_size==1 peers stage everything positionally.
     num_target = len(ids) - num_draft_entries
     half = num_target // 2
     k_buffers, k_ids = list(kv_pool.k_buffer), ids[:half]

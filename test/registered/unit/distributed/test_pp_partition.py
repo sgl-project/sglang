@@ -114,5 +114,185 @@ class TestBalancedPartition(CustomTestCase):
             _set_auto_pp_partition(None)
 
 
+class TestEngagementAdapter(CustomTestCase):
+    """maybe_set_auto_pp_partition: gates, hybrid detection, spec charging."""
+
+    def setUp(self):
+        import types
+        from unittest import mock
+
+        torch = __import__("torch")
+        self._patches = []
+        full_ids = list(range(3, 60, 4))
+        linear_ids = [i for i in range(60) if i not in full_ids]
+        fake_mamba = types.SimpleNamespace(
+            full_attention_layer_ids=full_ids,
+            mamba2_cache_params=types.SimpleNamespace(
+                layers=linear_ids, mamba_cache_per_req=len(linear_ids) * (1 << 20)
+            ),
+        )
+        self.fake_model_config = types.SimpleNamespace(
+            full_attention_layer_ids=None,
+            num_hidden_layers=60,
+            hf_text_config=types.SimpleNamespace(
+                hidden_size=4096,
+                num_experts=512,
+                moe_intermediate_size=1024,
+                intermediate_size=None,
+                v_head_dim=None,
+                vocab_size=248320,
+                mtp_num_hidden_layers=1,
+                num_nextn_predict_layers=None,
+            ),
+            hf_config=types.SimpleNamespace(tie_word_embeddings=False),
+            dtype=torch.bfloat16,
+            get_num_kv_heads=lambda tp: max(1, 8 // tp),
+            head_dim=128,
+            num_attention_heads=64,
+            hidden_size=4096,
+        )
+        self.spec = types.SimpleNamespace(
+            speculative_algorithm=None,
+            speculative_draft_model_path=None,
+            speculative_draft_model_revision=None,
+            speculative_draft_kv_cache_dtype=None,
+        )
+
+        import sglang.srt.distributed.pp_partition as pp
+        import sglang.srt.runtime_context as rc
+
+        self._patches.append(
+            mock.patch.object(pp, "mambaish_config", lambda mc: fake_mamba)
+        )
+        self._patches.append(
+            mock.patch.object(
+                rc, "get_model", lambda: types.SimpleNamespace(kv_cache_dtype="auto")
+            )
+        )
+        self._patches.append(
+            mock.patch.object(
+                rc,
+                "get_schedule",
+                lambda: types.SimpleNamespace(mem_fraction_static=0.9),
+            )
+        )
+        self._patches.append(mock.patch.object(rc, "get_spec", lambda: self.spec))
+        for p in self._patches:
+            p.start()
+        self.ps = types.SimpleNamespace(pp_size=2, attn_tp_size=2)
+        self._gpu_bytes = 280 << 30
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        _set_auto_pp_partition(None)
+
+    def _run(self):
+        from sglang.srt.distributed.pp_partition import (
+            get_auto_pp_partition,
+            maybe_set_auto_pp_partition,
+        )
+
+        maybe_set_auto_pp_partition(
+            self.fake_model_config, self.ps, total_gpu_bytes=self._gpu_bytes
+        )
+        return get_auto_pp_partition()
+
+    def test_engages_for_hybrid_model(self):
+        partition = self._run()
+        self.assertIsNotNone(partition)
+        self.assertEqual(len(partition), 2)
+        self.assertEqual(sum(partition), 60)
+
+    def test_skips_at_pp_size_1(self):
+        self.ps.pp_size = 1
+        self.assertIsNone(self._run())
+
+    def test_env_var_wins(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"SGLANG_PP_LAYER_PARTITION": "30,30"}):
+            self.assertIsNone(self._run())
+
+    def test_skips_non_hybrid(self):
+        self.fake_model_config.num_hidden_layers = 15
+        import types
+        from unittest import mock
+
+        import sglang.srt.distributed.pp_partition as pp
+
+        # 15/15 full-attention layers: not a hybrid.
+        with mock.patch.object(
+            pp,
+            "mambaish_config",
+            lambda mc: types.SimpleNamespace(
+                full_attention_layer_ids=list(range(15)),
+                mamba2_cache_params=types.SimpleNamespace(
+                    layers=[], mamba_cache_per_req=0
+                ),
+            ),
+        ):
+            self.assertIsNone(self._run())
+
+    def test_spec_lightens_last_stage(self):
+        plain = self._run()
+        _set_auto_pp_partition(None)
+        self.spec.speculative_algorithm = "EAGLE"
+        # Two embedded MTP layers are heavy enough to force a strict shift.
+        self.fake_model_config.hf_text_config.mtp_num_hidden_layers = 2
+        with_spec = self._run()
+        self.assertLess(with_spec[-1], plain[-1])
+
+    def test_draft_model_path_branch(self):
+        # External draft model + explicit draft KV dtype: covers the geometry
+        # and dtype resolution of the speculative_draft_model_path branch.
+        import types
+        from unittest import mock
+
+        torch = __import__("torch")
+
+        self.spec.speculative_algorithm = "EAGLE"
+        self.spec.speculative_draft_model_path = "/fake/draft"
+        self.spec.speculative_draft_kv_cache_dtype = "fp8_e4m3"
+        fake_draft_cfg = types.SimpleNamespace(
+            num_hidden_layers=3,
+            head_dim=64,
+            hidden_size=2048,
+            num_attention_heads=16,
+            hf_text_config=types.SimpleNamespace(v_head_dim=None),
+            get_num_kv_heads=lambda tp: 4,
+            dtype=torch.bfloat16,
+        )
+        with (
+            mock.patch(
+                "sglang.srt.configs.model_config.ModelConfig.from_server_args",
+                classmethod(lambda cls, *a, **k: fake_draft_cfg),
+            ),
+            mock.patch("sglang.srt.runtime_context.get_server_args", lambda: object()),
+        ):
+            partition = self._run()
+        self.assertIsNotNone(partition)
+        _set_auto_pp_partition(None)
+        self.spec.speculative_draft_model_path = None
+        self.spec.speculative_draft_kv_cache_dtype = None
+        self.spec.speculative_algorithm = None
+        baseline = self._run()
+        # The point of this test is the fp8 dtype-resolution path (previously a
+        # KeyError); the small fp8 draft need not force a partition shift.
+        self.assertLessEqual(partition[-1], baseline[-1])
+
+    def test_mtp_layer_count_attribute_fallback(self):
+        # mtp_num_hidden_layers wins; num_nextn_predict_layers is the fallback.
+        # Three draft layers are heavy enough to force a strict shift.
+        self.spec.speculative_algorithm = "EAGLE"
+        first = self._run()
+        _set_auto_pp_partition(None)
+        self.fake_model_config.hf_text_config.mtp_num_hidden_layers = None
+        self.fake_model_config.hf_text_config.num_nextn_predict_layers = 3
+        second = self._run()
+        self.assertLess(second[-1], first[-1])
+
+
 if __name__ == "__main__":
     unittest.main()

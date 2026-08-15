@@ -638,7 +638,7 @@ class ModelRunner:
                 maybe_set_auto_pp_partition,
             )
 
-            maybe_set_auto_pp_partition(self.model_config, self.server_args, self.ps)
+            maybe_set_auto_pp_partition(self.model_config, self.ps)
         self.load_model()
         prepare_moe_topk(
             model=self.model,

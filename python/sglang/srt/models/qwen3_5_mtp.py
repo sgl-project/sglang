@@ -220,11 +220,16 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             # arrive at this chunk's real height. Place the real rows into a slot
             # of the same height; the padding rows are never read downstream.
             if hidden_states.shape[0] != input_embeds.shape[0]:
-                rows = min(hidden_states.shape[0], input_embeds.shape[0])
+                # Real rows must never outnumber the slot -- that would mean the
+                # graph's static shape is wrong, not something to truncate away.
+                assert hidden_states.shape[0] <= input_embeds.shape[0], (
+                    f"target hidden states ({hidden_states.shape[0]} rows) exceed "
+                    f"the draft's static token slot ({input_embeds.shape[0]} rows)"
+                )
                 slot = hidden_states.new_zeros(
                     (input_embeds.shape[0], hidden_states.shape[1])
                 )
-                slot[:rows] = hidden_states[:rows]
+                slot[: hidden_states.shape[0]] = hidden_states
                 hidden_states = slot
 
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
