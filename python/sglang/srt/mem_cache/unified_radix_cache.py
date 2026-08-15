@@ -802,16 +802,10 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # Take the indices from the path the insert landed on, not from a
-        # rematch: match_prefix is a policy query and a component may refuse a
-        # node that a *new* request cannot safely reuse (SWA rejects one whose
-        # in-window KV was freed). Ownership already moved to the tree here, so
-        # a refusal would under-report it and the next insert would free the
-        # tree's own KV as a duplicate.
-        new_last_node = result.last_device_node
-        new_indices = self.tree_core.collect_full_device_indices(
-            new_last_node, self.tree_core.root_node_handle()
-        )
+        # Match prefix
+        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        new_indices = match_result.device_indices
+        new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
         assert (
             req.cache_protected_len <= len(new_indices) + self.page_size - 1

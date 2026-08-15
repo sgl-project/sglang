@@ -281,7 +281,11 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             )
             frontiers.append(req.kv.swa_evicted_seqlen)
 
-        expected = (seq_len - 1 - max(window, page_size)) // page_size * page_size
+        expected = (
+            (seq_len - 1 - max(window, page_size) - (page_size - 1))
+            // page_size
+            * page_size
+        )
         self.assertEqual(frontiers[0], expected)
         self.assertEqual(frontiers[1], expected)
 
@@ -308,7 +312,11 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             retain_floor=seq_len,
         )
 
-        expected = (seq_len - 1 - max(window, page_size)) // page_size * page_size
+        expected = (
+            (seq_len - 1 - max(window, page_size) - (page_size - 1))
+            // page_size
+            * page_size
+        )
         self.assertEqual(req.kv.swa_evicted_seqlen, expected)
 
     def test_retain_floor_does_not_unfree(self):
@@ -550,6 +558,72 @@ class TestSWAEvictionBoundary(unittest.TestCase):
                 req, is_insert=True, kv_len_to_handle=req._kv_committed_len
             )
             tree.sanity_check()
+
+
+class TestSWAWindowMarginForBigramKey(unittest.TestCase):
+    """The leaf an insert creates must keep a full sliding window of live SWA,
+    otherwise the match that follows the insert refuses it and the request's
+    protected length never advances (which later makes the insert free KV the
+    tree already owns).
+
+    An EAGLE bigram key holds seq_len - 1 entries, so that leaf ends at
+    page_floor(seq_len - 1), up to a page below the page_floor(seq_len) a raw
+    key would reach. The frontier has to account for the lower boundary.
+    """
+
+    def _frontier(self, *, page_size, window, seq_len):
+        tree, allocator, pool = _build_swa_tree(
+            page_size=page_size, sliding_window_size=window
+        )
+        # _swa_alloc hands out whole pages, so round up and slice back down.
+        alloc_len = -(-seq_len // page_size) * page_size
+        kv = _swa_alloc(allocator, alloc_len)
+        pool.write((0, slice(0, seq_len)), kv[:seq_len])
+        req = _make_req(0, list(range(seq_len)), 0, tree)
+        batch = _make_batch(tree, allocator, pool)
+        free_swa_out_of_window_slots(
+            req,
+            seq_len - 1,
+            sliding_window_size=window,
+            page_size=page_size,
+            req_to_token_pool=batch.req_to_token_pool,
+            token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
+        )
+        return req.kv.swa_evicted_seqlen
+
+    def test_bigram_leaf_keeps_a_full_window(self):
+        """Regression: window not a multiple of page_size and a page-aligned
+        seq_len put the bigram boundary a full page below page_floor(seq_len),
+        which used to leave the leaf an 8-token tail against a 15-token window."""
+        page_size, window, seq_len = 8, 15, 128
+        frontier = self._frontier(page_size=page_size, window=window, seq_len=seq_len)
+        boundary = (seq_len - 1) // page_size * page_size
+        self.assertGreaterEqual(boundary - frontier, window)
+
+    def test_window_survives_every_page_offset(self):
+        """The deficit depends on seq_len mod page_size, so sweep the offsets."""
+        page_size, window = 8, 15
+        for seq_len in range(120, 136):
+            frontier = self._frontier(
+                page_size=page_size, window=window, seq_len=seq_len
+            )
+            boundary = (seq_len - 1) // page_size * page_size
+            self.assertGreaterEqual(
+                boundary - frontier,
+                window,
+                f"{seq_len=} {frontier=} {boundary=}",
+            )
+
+    def test_raw_key_boundary_also_holds(self):
+        """A non-bigram key ends at page_floor(seq_len), so it always had margin.
+        Pinned here so the frontier is never tightened back to that assumption."""
+        page_size, window = 8, 15
+        for seq_len in range(120, 136):
+            frontier = self._frontier(
+                page_size=page_size, window=window, seq_len=seq_len
+            )
+            boundary = seq_len // page_size * page_size
+            self.assertGreaterEqual(boundary - frontier, window)
 
 
 if __name__ == "__main__":
