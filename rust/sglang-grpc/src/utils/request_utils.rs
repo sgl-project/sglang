@@ -45,9 +45,14 @@ fn sampling_params_to_map(
             if let Some(v) = p.repetition_penalty {
                 map.insert("repetition_penalty".into(), serde_json::json!(v));
             }
-            if let Some(v) = p.max_new_tokens {
-                map.insert("max_new_tokens".into(), serde_json::json!(v));
-            }
+            // An omitted protobuf field is distinct from SGLang's Python
+            // constructor default (128). Preserve that distinction so callers
+            // that omit the limit use the engine's context-aware default.
+            map.insert(
+                "max_new_tokens".into(),
+                p.max_new_tokens
+                    .map_or(serde_json::Value::Null, serde_json::Value::from),
+            );
             if let Some(v) = p.min_new_tokens {
                 map.insert("min_new_tokens".into(), serde_json::json!(v));
             }
@@ -182,11 +187,14 @@ fn insert_kv_hints(
     request: &mut HashMap<String, serde_json::Value>,
     hints: &Option<proto::KvHints>,
 ) {
-    let Some(_deref) = hints.as_ref().and_then(|hints| hints.deref.as_ref()) else {
+    let Some(deref) = hints.as_ref().and_then(|hints| hints.deref.as_ref()) else {
         return;
     };
 
-    request.insert("kv_hints".into(), serde_json::json!({"deref": {}}));
+    request.insert(
+        "kv_hints".into(),
+        serde_json::json!({"deref": {"action_id": deref.action_id}}),
+    );
 }
 
 fn now_timestamp() -> f64 {
@@ -417,7 +425,9 @@ mod tests {
     #[test]
     fn generate_dicts_include_typed_deref_hint() {
         let kv_hints = Some(proto::KvHints {
-            deref: Some(proto::DerefHint {}),
+            deref: Some(proto::DerefHint {
+                action_id: "session-1:turn-1:window-1".to_string(),
+            }),
         });
         let text_req = proto::TextGenerateRequest {
             kv_hints: kv_hints.clone(),
@@ -432,7 +442,30 @@ mod tests {
             build_text_generate_dict("text-request", &text_req).unwrap(),
             build_generate_dict("token-request", &token_req).unwrap(),
         ] {
-            assert_eq!(mapped["kv_hints"], serde_json::json!({"deref": {}}));
+            assert_eq!(
+                mapped["kv_hints"],
+                serde_json::json!({"deref": {"action_id": "session-1:turn-1:window-1"}})
+            );
+        }
+    }
+
+    #[test]
+    fn generate_dicts_preserve_an_omitted_output_limit() {
+        let sampling_params = Some(proto::SamplingParams::default());
+        let text_req = proto::TextGenerateRequest {
+            sampling_params: sampling_params.clone(),
+            ..Default::default()
+        };
+        let token_req = proto::GenerateRequest {
+            sampling_params,
+            ..Default::default()
+        };
+
+        for mapped in [
+            build_text_generate_dict("text-request", &text_req).unwrap(),
+            build_generate_dict("token-request", &token_req).unwrap(),
+        ] {
+            assert!(mapped["sampling_params"]["max_new_tokens"].is_null());
         }
     }
 

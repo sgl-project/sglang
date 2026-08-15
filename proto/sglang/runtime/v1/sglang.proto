@@ -53,7 +53,9 @@ message KvHints {
   optional DerefHint deref = 1;
 }
 
-message DerefHint {}
+message DerefHint {
+  string action_id = 1;
+}
 
 // Sampling parameters shared across text and tokenized RPCs.
 message SamplingParams {

@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 KV_HINT_DEREF_V1 = "kv_hint.deref.v1"
 _DEREF_NEXT_REQUEST_LIMIT = 8192
+_DEREF_ACTION_LIMIT = 8192
 
 
 class KvHintStruct(msgspec.Struct, kw_only=True):
@@ -33,7 +34,7 @@ class KvHintStruct(msgspec.Struct, kw_only=True):
 
 
 class DerefHint(KvHintStruct):
-    pass
+    action_id: str = ""
 
 
 class KvHints(KvHintStruct):
@@ -52,6 +53,7 @@ class KvHintManager:
         self._metrics_collector = metrics_collector
         self._deref_next_sessions: OrderedDict[str, int] = OrderedDict()
         self._deref_next_requests: OrderedDict[str, str] = OrderedDict()
+        self._applied_deref_actions: OrderedDict[tuple[str, str], None] = OrderedDict()
 
     def capabilities(self) -> list[str]:
         if self._session_refs is None:
@@ -83,12 +85,26 @@ class KvHintManager:
 
         deref = req.kv_hints.deref if req.kv_hints is not None else None
         if deref is not None:
+            action_key = self._deref_action_key(req, deref)
+            if action_key is not None and action_key in self._applied_deref_actions:
+                self._applied_deref_actions.move_to_end(action_key)
+                self._record_duplicate_deref()
+                logger.info(
+                    "Skipped duplicate KV DEREF session_id=%s generation=%s action_id=%s",
+                    req.session_id,
+                    req.session_generation,
+                    deref.action_id,
+                )
+                return
+
             start_time = time.perf_counter()
             result = self._session_refs.evict_radix_session(
                 req.session_id, req.session_generation
             )
             self._record_deref_result(start_time, result)
             if result.status == "evicted" and result.generation is not None:
+                if action_key is not None:
+                    self._remember_deref_action(action_key)
                 self._remember_deref_session(req.session_id, result.generation)
             self._log_deref_result(req, result)
             return
@@ -139,6 +155,18 @@ class KvHintManager:
         while len(self._deref_next_requests) > _DEREF_NEXT_REQUEST_LIMIT:
             self._deref_next_requests.popitem(last=False)
 
+    @staticmethod
+    def _deref_action_key(req: Req, deref: DerefHint) -> Optional[tuple[str, str]]:
+        if not deref.action_id:
+            return None
+        return (req.session_id, deref.action_id)
+
+    def _remember_deref_action(self, action_key: tuple[str, str]) -> None:
+        self._applied_deref_actions[action_key] = None
+        self._applied_deref_actions.move_to_end(action_key)
+        while len(self._applied_deref_actions) > _DEREF_ACTION_LIMIT:
+            self._applied_deref_actions.popitem(last=False)
+
     def _record_deref_result(
         self, start_time: float, result: SessionCacheEvictResult
     ) -> None:
@@ -148,6 +176,15 @@ class KvHintManager:
             status=result.status,
             duration_seconds=time.perf_counter() - start_time,
             indexed_component_leaves=result.indexed_component_leaves,
+        )
+
+    def _record_duplicate_deref(self) -> None:
+        if self._metrics_collector is None:
+            return
+        self._metrics_collector.record_kv_hint_deref(
+            status="duplicate",
+            duration_seconds=0.0,
+            indexed_component_leaves=0,
         )
 
     @staticmethod
