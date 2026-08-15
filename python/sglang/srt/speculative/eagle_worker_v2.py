@@ -50,6 +50,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
+    get_schedule,
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
@@ -320,7 +321,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_extend_attn_backend = None
 
         draft_backend_factory = DraftBackendFactory(
-            self.server_args,
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
@@ -1025,7 +1025,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )

@@ -816,6 +816,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        if request.return_sampling_mask and not request.return_meta_info:
+            return "return_sampling_mask requires return_meta_info=true."
+
         media_error = self._validate_media_content(request)
         if media_error:
             return media_error
@@ -1004,6 +1007,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_logprob=request.logprobs,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
+            return_sampling_mask=request.return_sampling_mask,
             stream=request.stream,
             return_text_in_logprobs=True,
             modalities=processed_messages.modalities,
