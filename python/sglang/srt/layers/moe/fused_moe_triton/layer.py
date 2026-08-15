@@ -228,6 +228,12 @@ class FusedMoE(torch.nn.Module):
     # backend resolution distinguish them from routed experts.
     is_shared_fused_moe = False
 
+    # Set by quant methods that attach a per-layer scheme to this MoE layer,
+    # eagerly (compressed-tensors, AWQ) or lazily in create_weights()
+    # (gptq_marlin). See `LinearBase.scheme` for why the default exists and why
+    # a scheme must not be an `nn.Module`.
+    scheme = None
+
     _skip_aiter_moe_shuffle: bool = False
 
     def __init__(
@@ -1082,7 +1088,7 @@ class FusedMoE(torch.nn.Module):
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
         method = self.quant_method
-        if hasattr(self, "scheme"):
+        if self.scheme is not None:
             method = self.scheme
         if method.__class__.__name__ == "KTEPWrapperMethod":
             method = method.gpu_method
@@ -1349,7 +1355,7 @@ class FusedMoE(torch.nn.Module):
         # TODO: check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
         method = self.quant_method
-        if hasattr(self, "scheme"):
+        if self.scheme is not None:
             method = self.scheme
         if isinstance(method, Fp8MoEMethod) and (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
