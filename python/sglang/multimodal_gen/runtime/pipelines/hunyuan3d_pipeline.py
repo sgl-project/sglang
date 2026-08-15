@@ -217,7 +217,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
                     "Download the model or check network connectivity."
                 )
 
-        logger.info("Resolved Hunyuan3D model directory: %s", local_path)
+        logger.debug("Resolved Hunyuan3D model directory: %s", local_path)
         return local_path
 
     @staticmethod

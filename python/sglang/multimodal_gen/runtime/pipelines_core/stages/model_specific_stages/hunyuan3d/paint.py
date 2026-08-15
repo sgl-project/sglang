@@ -792,7 +792,7 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         del server_args
-        if batch.extra.get("_mesh_failed"):
+        if batch.is_warmup or batch.extra.get("_mesh_failed"):
             return OutputBatch(output_file_paths=[], metrics=batch.metrics)
 
         renderer = batch.extra["renderer"]

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 from diffusers import AutoencoderKL as DiffusersAutoencoderKL
@@ -8,6 +9,9 @@ from diffusers import UNet2DConditionModel
 
 from sglang.multimodal_gen.configs.models.vaes.stable_diffusion import (
     StableDiffusionVAEConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
+    Hunyuan3D2PipelineConfig,
 )
 from sglang.multimodal_gen.runtime.models.dits.hunyuan3d_paint import (
     Hunyuan3DPaintUNet,
@@ -17,6 +21,12 @@ from sglang.multimodal_gen.runtime.models.dits.stable_diffusion import (
     StableDiffusionUNetConfig,
 )
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan3d.paint import (
+    Hunyuan3DPaintPostprocessStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan3d.shape import (
+    Hunyuan3DShapeSaveStage,
+)
 
 
 def _unet_config() -> dict:
@@ -145,6 +155,36 @@ class TestNativeStableDiffusionVAE(unittest.TestCase):
         torch.testing.assert_close(
             actual_decoded, expected_decoded, rtol=1e-5, atol=1e-5
         )
+
+
+class TestHunyuan3DWarmupOutput(unittest.TestCase):
+    @staticmethod
+    def _batch():
+        return SimpleNamespace(
+            extra={"shape_meshes": [object()]},
+            is_warmup=True,
+            metrics=None,
+        )
+
+    def test_shape_save_does_not_require_output_path_during_paint_warmup(self):
+        batch = self._batch()
+        stage = Hunyuan3DShapeSaveStage(Hunyuan3D2PipelineConfig(paint_enable=True))
+
+        self.assertIs(stage.forward(batch, SimpleNamespace()), batch)
+
+    def test_shape_only_warmup_returns_no_files(self):
+        stage = Hunyuan3DShapeSaveStage(Hunyuan3D2PipelineConfig(paint_enable=False))
+
+        output = stage.forward(self._batch(), SimpleNamespace())
+
+        self.assertEqual(output.output_file_paths, [])
+
+    def test_paint_postprocess_skips_export_during_warmup(self):
+        stage = Hunyuan3DPaintPostprocessStage(Hunyuan3D2PipelineConfig())
+
+        output = stage.forward(self._batch(), SimpleNamespace())
+
+        self.assertEqual(output.output_file_paths, [])
 
 
 if __name__ == "__main__":
