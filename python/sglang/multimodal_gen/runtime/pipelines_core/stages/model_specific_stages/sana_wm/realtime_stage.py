@@ -32,7 +32,6 @@ from .base import (
 from .refiner import (
     STAGE_2_DISTILLED_SIGMA_VALUES,
     SanaWMLTX2RefinerStage,
-    _unwrap_diffusers_ltx2_refiner,
 )
 from .streaming_refiner import (
     RefinerChunkRunner,
@@ -410,14 +409,8 @@ class SanaWMRealtimeStage(RealtimeDiffusionStage):
         rs = self.refiner_stage
         if rs is None:
             raise RuntimeError("SANA-WM realtime refiner stage is not initialized")
-        # Keep refiner sub-modules resident: the realtime stage runs the refiner
-        # directly, outside the offline stage's use_declared_component context.
-        for _mod in (rs.text_encoder, rs.connectors, rs.transformer):
-            if _mod is not None:
-                _mod.to(device)
         prompt_embeds, prompt_mask = rs._encode_prompt(state.prompt, device)
-        unwrapped = _unwrap_diffusers_ltx2_refiner(rs.transformer)
-        core = _RefinerCore(unwrapped, device, rs.dtype)
+        core = _RefinerCore(rs.transformer, device, rs.dtype)
         sigmas = torch.tensor(
             STAGE_2_DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=device
         )

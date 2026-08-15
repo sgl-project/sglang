@@ -4,7 +4,9 @@ import os
 
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
-from sglang.multimodal_gen.runtime.loader.utils import get_memory_usage_of_component
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    PipelineComponentLoader,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -19,8 +21,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     SanaWMTextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.refiner import (
-    OfficialDiffusersLTX2RefinerModule,
-    OfficialGemma3TextEncoderModule,
     SanaWMLTX2RefinerStage,
     SanaWMRefinerDecodingStage,
     default_sana_wm_refiner_dtype,
@@ -149,15 +149,12 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
 
     pipeline_name = "SanaWMTwoStagePipeline"
 
-    # Stage-2 refiner sub-modules and their on-disk layout. Loaded through the
-    # official Diffusers/Transformers classes because NVlabs' reference refiner
-    # is a narrow video-only wrapper around those modules.
-    _REFINER_SUB_MODULES: tuple[tuple[str, str], ...] = (
-        ("transformer_2", "refiner/transformer"),
-        ("connectors", "refiner/connectors"),
-        ("text_encoder_2", "refiner/text_encoder"),
+    _REFINER_SUB_MODULES: tuple[tuple[str, str, str], ...] = (
+        ("transformer_2", "refiner/transformer", "diffusers"),
+        ("connectors", "refiner/connectors", "diffusers"),
+        ("text_encoder_2", "refiner/text_encoder", "transformers"),
         # The refiner Gemma-3 ships its tokenizer files alongside the encoder.
-        ("tokenizer_2", "refiner/text_encoder"),
+        ("tokenizer_2", "refiner/text_encoder", "transformers"),
     )
 
     def initialize_pipeline(self, server_args: ServerArgs) -> None:
@@ -204,79 +201,18 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
         return os.path.join(refiner_root, rel_subpath)
 
     def _load_refiner_modules(self, server_args: ServerArgs) -> None:
-        for module_name, subpath in self._REFINER_SUB_MODULES:
+        for module_name, subpath, library in self._REFINER_SUB_MODULES:
             component_path = self._resolve_refiner_component_path(
                 server_args, module_name, subpath
             )
-            logger.info(
-                "SANA-WM loading refiner component %s from %s",
-                module_name,
-                component_path,
-            )
-            module, memory_usage = self._load_official_refiner_component(
-                module_name,
-                component_path,
-                server_args,
+            module, memory_usage = PipelineComponentLoader.load_component(
+                component_name=module_name,
+                component_model_path=component_path,
+                transformers_or_diffusers=library,
+                server_args=server_args,
             )
             self.modules[module_name] = module
             self.memory_usages[module_name] = memory_usage
-
-    @staticmethod
-    def _load_official_refiner_component(
-        module_name: str,
-        component_path: str,
-        server_args: ServerArgs,
-    ):
-        """Load SANA-WM refiner modules through the same libraries as NVlabs.
-
-        The upstream wrapper (``diffusion/refiner/diffusers_ltx2_refiner.py``)
-        keeps the LTX-2 transformer/connectors as Diffusers modules and only
-        customizes the video-only forward surface; use that path for the
-        quality-critical stage-2 refiner instead of the experimental native port.
-        """
-
-        dtype = default_sana_wm_refiner_dtype(server_args)
-        if module_name == "transformer_2":
-            from diffusers.models.transformers.transformer_ltx2 import (
-                LTX2VideoTransformer3DModel,
-            )
-
-            module = LTX2VideoTransformer3DModel.from_pretrained(
-                component_path,
-                torch_dtype=dtype,
-            ).eval()
-            module = OfficialDiffusersLTX2RefinerModule(module)
-        elif module_name == "connectors":
-            from diffusers.pipelines.ltx2 import LTX2TextConnectors
-
-            module = LTX2TextConnectors.from_pretrained(
-                component_path,
-                torch_dtype=dtype,
-            ).eval()
-        elif module_name == "text_encoder_2":
-            from transformers import Gemma3ForConditionalGeneration
-
-            module = Gemma3ForConditionalGeneration.from_pretrained(
-                component_path,
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True,
-            ).eval()
-            module = OfficialGemma3TextEncoderModule(module)
-        elif module_name == "tokenizer_2":
-            from transformers import AutoTokenizer
-
-            module = AutoTokenizer.from_pretrained(component_path)
-        else:
-            raise ValueError(f"Unsupported SANA-WM refiner component: {module_name}")
-
-        memory_usage = get_memory_usage_of_component(module)
-        logger.info(
-            "Loaded %s: %s (official native version). model size: %s GB",
-            module_name,
-            module.__class__.__name__,
-            memory_usage if memory_usage is not None else "NA",
-        )
-        return module, memory_usage or 0.0
 
     def _maybe_add_refiner_stage(self, server_args: ServerArgs) -> None:
         if sana_wm_skip_refiner_enabled():

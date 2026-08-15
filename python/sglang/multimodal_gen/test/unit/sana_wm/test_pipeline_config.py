@@ -1,8 +1,6 @@
 import argparse
 import os
-import sys
 import tempfile
-import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -46,13 +44,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     sana_wm_action_to_camera_to_world,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.refiner import (
-    OfficialDiffusersLTX2RefinerModule,
-    OfficialGemma3TextEncoderModule,
     SanaWMLTX2RefinerStage,
     SanaWMRefinerDecodingStage,
-    _refiner_config_value,
-    _streaming_diffusers_self_attention,
-    _uses_diffusers_ltx2_refiner,
     sana_wm_skip_refiner_enabled,
 )
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
@@ -148,6 +141,27 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         )
         self.assertTrue(self.config.text_encoder_extra_args[0]["return_attention_mask"])
         self.assertTrue(self.config.chi_prompt)
+
+    def test_refiner_checkpoint_architectures_resolve_to_native_models(self) -> None:
+        dit_config, architecture = self.config.resolve_dit_component(
+            "transformer_2",
+            self.config.dit_config,
+            "LTX2VideoTransformer3DModel",
+        )
+        self.assertIs(dit_config, self.config.refiner_dit_config)
+        self.assertEqual(architecture, "SanaWMLTX2VideoRefiner")
+        self.assertEqual(
+            self.config.resolve_text_encoder_architectures(
+                "text_encoder_2", ["Gemma3ForConditionalGeneration"]
+            ),
+            ["Gemma3TextEncoder"],
+        )
+
+    def test_refiner_components_disable_external_module_fallback(self) -> None:
+        self.assertEqual(
+            self.config.native_only_components,
+            ("transformer_2", "connectors", "text_encoder_2"),
+        )
 
     def test_inference_flow_shift_matches_official_reference(self) -> None:
         self.assertEqual(self.config.flow_shift, 9.95)
@@ -410,14 +424,14 @@ class TestSanaWMTwoStagePipeline(unittest.TestCase):
         self.assertEqual(refiner_root, "/custom/refiner")
         self.assertEqual(refiner_gemma_root, "/custom/refiner/text_encoder")
 
-    def test_refiner_modules_are_loaded_from_official_subtrees(self) -> None:
+    def test_refiner_modules_use_unified_component_loaders(self) -> None:
         self.assertEqual(
             SanaWMTwoStagePipeline._REFINER_SUB_MODULES,
             (
-                ("transformer_2", "refiner/transformer"),
-                ("connectors", "refiner/connectors"),
-                ("text_encoder_2", "refiner/text_encoder"),
-                ("tokenizer_2", "refiner/text_encoder"),
+                ("transformer_2", "refiner/transformer", "diffusers"),
+                ("connectors", "refiner/connectors", "diffusers"),
+                ("text_encoder_2", "refiner/text_encoder", "transformers"),
+                ("tokenizer_2", "refiner/text_encoder", "transformers"),
             ),
         )
 
@@ -1255,35 +1269,6 @@ class TestSanaWMNativeDiTChunking(unittest.TestCase):
 
 
 class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
-    def test_diffusers_refiner_detection_uses_official_class_name(self) -> None:
-        class LTX2VideoTransformer3DModel(torch.nn.Module):
-            pass
-
-        self.assertTrue(_uses_diffusers_ltx2_refiner(LTX2VideoTransformer3DModel()))
-        self.assertTrue(
-            _uses_diffusers_ltx2_refiner(
-                OfficialDiffusersLTX2RefinerModule(LTX2VideoTransformer3DModel())
-            )
-        )
-
-    def test_refiner_config_value_prefers_diffusers_config(self) -> None:
-        module = SimpleNamespace(
-            patch_size=999,
-            config=SimpleNamespace(patch_size=1),
-        )
-
-        self.assertEqual(_refiner_config_value(module, "patch_size"), 1)
-
-    def test_official_refiner_wrappers_expose_layerwise_blocks(self) -> None:
-        self.assertEqual(
-            OfficialDiffusersLTX2RefinerModule.layer_names,
-            ["module.transformer_blocks"],
-        )
-        self.assertIn(
-            "module.model.language_model.layers",
-            OfficialGemma3TextEncoderModule.layer_names,
-        )
-
     def test_refiner_component_uses_follow_execution_order(self) -> None:
         stage = SanaWMLTX2RefinerStage(
             transformer=torch.nn.Identity(),
@@ -1347,75 +1332,6 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
 
         self.assertEqual(uses, [])
 
-    def test_streaming_diffusers_attention_accepts_ungated_ltx2_attention(self) -> None:
-        """Diffusers 0.37 LTX2Attention omits `to_gate_logits` for ungated configs."""
-
-        class IdentityLinear(torch.nn.Module):
-            def forward(self, x):
-                return x
-
-        class FakeProcessor:
-            _attention_backend = None
-            _parallel_config = None
-
-        class UngatedAttention(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.to_q = IdentityLinear()
-                self.to_k = IdentityLinear()
-                self.to_v = IdentityLinear()
-                self.norm_q = IdentityLinear()
-                self.norm_k = IdentityLinear()
-                self.to_out = torch.nn.ModuleList(
-                    [IdentityLinear(), torch.nn.Identity()]
-                )
-                self.heads = 2
-                self.rope_type = "split"
-                self.processor = FakeProcessor()
-
-        def dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=False,
-            backend=None,
-            parallel_config=None,
-        ):
-            return query
-
-        attention_dispatch = types.ModuleType("diffusers.models.attention_dispatch")
-        attention_dispatch.dispatch_attention_fn = dispatch_attention_fn
-        transformer_ltx2 = types.ModuleType(
-            "diffusers.models.transformers.transformer_ltx2"
-        )
-        transformer_ltx2.apply_interleaved_rotary_emb = lambda x, _rope: x
-        transformer_ltx2.apply_split_rotary_emb = lambda x, _rope: x
-
-        with patch.dict(
-            sys.modules,
-            {
-                "diffusers": types.ModuleType("diffusers"),
-                "diffusers.models": types.ModuleType("diffusers.models"),
-                "diffusers.models.attention_dispatch": attention_dispatch,
-                "diffusers.models.transformers": types.ModuleType(
-                    "diffusers.models.transformers"
-                ),
-                "diffusers.models.transformers.transformer_ltx2": transformer_ltx2,
-            },
-        ):
-            hidden_states = torch.randn(1, 3, 4)
-            rotary = (torch.empty(0), torch.empty(0))
-            out = _streaming_diffusers_self_attention(
-                attn=UngatedAttention(),
-                hidden_states=hidden_states,
-                query_rotary_emb=rotary,
-                n_context_tokens=1,
-            )
-
-        self.assertEqual(out.shape, hidden_states.shape)
-
     def test_skip_refiner_flag_accepts_request_extra(self) -> None:
         batch = SimpleNamespace(extra={"diffusers_kwargs": {"skip_refiner": True}})
         self.assertTrue(sana_wm_skip_refiner_enabled(batch))
@@ -1430,7 +1346,7 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
         prompts = SanaWMLTX2RefinerStage._prompts_for_batch(batch, batch_size=2)
         self.assertEqual(prompts, ["left", "right"])
 
-    def test_refiner_prompt_encoding_uses_hf_gemma_backbone(self) -> None:
+    def test_refiner_prompt_encoding_uses_native_text_encoder(self) -> None:
         class DummyTokenizer:
             padding_side = "right"
             pad_token = None
@@ -1442,7 +1358,7 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
                     attention_mask=torch.tensor([[1, 1, 0, 0]]),
                 )
 
-        class DummyBackbone:
+        class DummyTextEncoder:
             def __init__(self):
                 self.called = False
 
@@ -1451,17 +1367,6 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
                 hidden0 = torch.arange(8, dtype=torch.float32).reshape(1, 4, 2)
                 hidden1 = hidden0 + 10
                 return SimpleNamespace(hidden_states=(hidden0, hidden1))
-
-        class DummyTextEncoder:
-            def __init__(self):
-                self.called = False
-                self.model = DummyBackbone()
-
-            def __call__(self, **kwargs):
-                self.called = True
-                raise AssertionError(
-                    "Gemma3ForConditionalGeneration.model was not used"
-                )
 
         class DummyConnectors:
             def __call__(self, prompt_embeds, attention_mask):
@@ -1480,8 +1385,7 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
             "drive forward", torch.device("cpu")
         )
 
-        self.assertTrue(stage.text_encoder.model.called)
-        self.assertFalse(stage.text_encoder.called)
+        self.assertTrue(stage.text_encoder.called)
         self.assertEqual(prompt_embeds.shape, (1, 4, 4))
         self.assertTrue(torch.equal(attention_mask, torch.tensor([[1, 1, 0, 0]])))
 

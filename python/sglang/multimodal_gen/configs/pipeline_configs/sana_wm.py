@@ -8,9 +8,13 @@ import torch
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.sana_wm import SanaWMConfig
+from sglang.multimodal_gen.configs.models.dits.sana_wm_refiner import (
+    SanaWMRefinerConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.base import EncoderConfig
 from sglang.multimodal_gen.configs.models.encoders.gemma2 import Gemma2Config
+from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
@@ -56,6 +60,7 @@ class SanaWMPipelineConfig(PipelineConfig):
     optional 6-DoF camera trajectory, optional Stage-2 LTX-2 refiner)."""
 
     task_type: ModelTaskType = ModelTaskType.TI2V
+    native_only_components = ("transformer_2", "connectors", "text_encoder_2")
 
     # SanaWMBeforeDenoisingStage._splice_first_frame handles condition-image
     # resize + VAE-encode itself, so bypass the framework's generic TI2V
@@ -94,6 +99,7 @@ class SanaWMPipelineConfig(PipelineConfig):
 
     # --- DiT ---
     dit_config: DiTConfig = field(default_factory=SanaWMConfig)
+    refiner_dit_config: DiTConfig = field(default_factory=SanaWMRefinerConfig)
 
     # --- VAE: LTX-2 (128ch, 8× temporal, 32× spatial) ---
     vae_config: VAEConfig = field(default_factory=LTXVideoVAEConfig)
@@ -121,11 +127,13 @@ class SanaWMPipelineConfig(PipelineConfig):
             self.vae_tile_sample_min_num_frames - self.vae_tile_sample_stride_num_frames
         )
 
-    # --- Text encoder: Gemma-2-2b-it (single encoder, same as SANA T2I) ---
+    # --- Text encoders: stage-1 Gemma-2 and stage-2 refiner Gemma-3 ---
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
-        default_factory=lambda: (Gemma2Config(),)
+        default_factory=lambda: (Gemma2Config(), Gemma3Config())
     )
-    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
+    text_encoder_precisions: tuple[str, ...] = field(
+        default_factory=lambda: ("bf16", "bf16")
+    )
     text_encoder_extra_args: list[dict] = field(
         default_factory=lambda: [
             {
@@ -133,16 +141,53 @@ class SanaWMPipelineConfig(PipelineConfig):
                 # branches must have the same token dimension for CFG concat.
                 "padding": "max_length",
                 "return_attention_mask": True,
-            }
+            },
+            {},
         ]
     )
     chi_prompt: tuple[str, ...] = SANA_WM_CHI_PROMPT
     preprocess_text_funcs: tuple[Callable | None, ...] = field(
-        default_factory=lambda: (None,)
+        default_factory=lambda: (None, None)
     )
     postprocess_text_funcs: tuple[Callable, ...] = field(
-        default_factory=lambda: (sana_wm_postprocess_text,)
+        default_factory=lambda: (sana_wm_postprocess_text, sana_wm_postprocess_text)
     )
+
+    def resolve_dit_component(
+        self,
+        component_name: str,
+        default_config: DiTConfig,
+        default_model_class_name: str,
+    ) -> tuple[DiTConfig, str]:
+        if component_name != "transformer_2":
+            return super().resolve_dit_component(
+                component_name,
+                default_config,
+                default_model_class_name,
+            )
+        if default_model_class_name != "LTX2VideoTransformer3DModel":
+            raise ValueError(
+                "SANA-WM transformer_2 must use LTX2VideoTransformer3DModel "
+                f"weights, got {default_model_class_name}."
+            )
+        return self.refiner_dit_config, "SanaWMLTX2VideoRefiner"
+
+    def resolve_text_encoder_architectures(
+        self,
+        component_name: str,
+        default_architectures: list[str],
+    ) -> list[str]:
+        if component_name != "text_encoder_2":
+            return super().resolve_text_encoder_architectures(
+                component_name,
+                default_architectures,
+            )
+        if "Gemma3ForConditionalGeneration" not in default_architectures:
+            raise ValueError(
+                "SANA-WM text_encoder_2 must use Gemma3ForConditionalGeneration "
+                f"weights, got {default_architectures}."
+            )
+        return ["Gemma3TextEncoder"]
 
     # --- Scheduler ---
     # linear_flow training schedule from the released config.yaml.

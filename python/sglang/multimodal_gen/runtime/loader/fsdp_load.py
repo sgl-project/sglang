@@ -60,6 +60,15 @@ logger = init_logger(__name__)
 _DTYPE_MISMATCH_EXAMPLE_LIMIT = 3
 
 
+def _unexpected_checkpoint_keys(
+    model: nn.Module, skipped_checkpoint_keys: list[str]
+) -> list[str]:
+    is_expected = getattr(model, "is_expected_unloaded_checkpoint_key", None)
+    if not callable(is_expected):
+        return skipped_checkpoint_keys
+    return [key for key in skipped_checkpoint_keys if not is_expected(key)]
+
+
 def _is_bitsandbytes_quant_config(quant_config: Any | None) -> bool:
     if quant_config is None:
         return False
@@ -825,19 +834,31 @@ def load_model_from_full_model_state_dict(
             local_main_process_only=True,
         )
 
-    if skipped_checkpoint_keys:
+    unexpected_checkpoint_keys = _unexpected_checkpoint_keys(
+        model, skipped_checkpoint_keys
+    )
+    expected_skipped_count = len(skipped_checkpoint_keys) - len(
+        unexpected_checkpoint_keys
+    )
+    if expected_skipped_count:
+        logger.debug(
+            "Skipped %d checkpoint keys declared unused by %s.",
+            expected_skipped_count,
+            model.__class__.__name__,
+        )
+    if unexpected_checkpoint_keys:
         logger.warning(
             "Checkpoint keys not loaded (no matching model parameter) %s",
             (
-                skipped_checkpoint_keys[:20]
-                if len(skipped_checkpoint_keys) > 20
-                else skipped_checkpoint_keys
+                unexpected_checkpoint_keys[:20]
+                if len(unexpected_checkpoint_keys) > 20
+                else unexpected_checkpoint_keys
             ),
         )
-        if len(skipped_checkpoint_keys) > 20:
+        if len(unexpected_checkpoint_keys) > 20:
             logger.warning(
                 "... and %d more skipped keys.",
-                len(skipped_checkpoint_keys) - 20,
+                len(unexpected_checkpoint_keys) - 20,
             )
 
     # parameters in nn.Module that doesn't exist in safetensor files

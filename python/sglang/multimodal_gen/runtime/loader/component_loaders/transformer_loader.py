@@ -154,6 +154,7 @@ class TransformerLoader(ComponentLoader):
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         """Load the transformer based on the model path, and inference args."""
+        requested_component_name = component_name
         component_server_args = _server_args_for_transformer_component(
             server_args, component_name
         )
@@ -172,18 +173,26 @@ class TransformerLoader(ComponentLoader):
 
         # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
-        component_name = _normalize_component_type(component_name)
-        server_args.model_paths[component_name] = component_model_path
-        if component_name in ("transformer", "unconditional_transformer", "video_dit"):
+        normalized_component_name = _normalize_component_type(component_name)
+        server_args.model_paths[requested_component_name] = component_model_path
+        if normalized_component_name in (
+            "transformer",
+            "unconditional_transformer",
+            "video_dit",
+        ):
             pipeline_dit_config_attr = "dit_config"
-        elif component_name in ("audio_dit",):
+        elif normalized_component_name == "audio_dit":
             pipeline_dit_config_attr = "audio_dit_config"
         else:
-            raise ValueError(f"Invalid module name: {component_name}")
+            raise ValueError(f"Invalid module name: {requested_component_name}")
         dit_config = getattr(server_args.pipeline_config, pipeline_dit_config_attr)
+        source_cls_name = config.pop("_class_name")
+        dit_config, cls_name = server_args.pipeline_config.resolve_dit_component(
+            requested_component_name,
+            dit_config,
+            source_cls_name,
+        )
         dit_config.update_model_arch(config)
-
-        cls_name = config.pop("_class_name")
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
         quant_spec = resolve_transformer_quant_load_spec(
@@ -275,7 +284,7 @@ class TransformerLoader(ComponentLoader):
             logger.warning(
                 "Direct GPU weight loading is enabled for %s; the complete checkpoint "
                 "state dict and materialized model weights may coexist on GPU during startup",
-                component_name,
+                requested_component_name,
             )
 
         quantized_attn_backend = _default_quantized_attention_backend(
@@ -288,7 +297,7 @@ class TransformerLoader(ComponentLoader):
             )
         attn_backend_context = (
             component_attn_backend_context_manager(
-                quantized_attn_backend, component_name=component_name
+                quantized_attn_backend, component_name=requested_component_name
             )
             if quantized_attn_backend is not None
             else nullcontext()

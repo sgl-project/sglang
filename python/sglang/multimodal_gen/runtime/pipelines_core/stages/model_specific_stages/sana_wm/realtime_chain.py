@@ -450,6 +450,13 @@ class SanaWMChunkedRefinerChainStage(SanaWMRealtimeStage):
     """Chunked LTX-2 refiner on the uniform ``sink + i*block`` grid — refines
     COMPLETE blocks only (option b) and hands the refined buffer downstream."""
 
+    def set_component_residency_manager(self, manager) -> None:
+        super().set_component_residency_manager(manager)
+        self.refiner_stage.set_component_residency_manager(manager)
+
+    def component_uses(self, server_args: ServerArgs, stage_name: str | None = None):
+        return self.refiner_stage.component_uses(server_args, stage_name)
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
@@ -479,30 +486,34 @@ class SanaWMChunkedRefinerChainStage(SanaWMRealtimeStage):
                     ),
                 )
 
-            frontier = st.refined_full.shape[2]
-            end_f = stage1.shape[2]
-            while True:
-                block_start = frontier
-                block_end = block_start + st.block_size  # complete blocks only
-                if block_end > end_f:
-                    break
-                sink_seed = (
-                    stage1[:, :, : st.sink_size]
-                    if block_start == st.sink_size
-                    else None
-                )
-                refined = st.runner.refine_block(
-                    block_idx=st.next_ref_idx,
-                    clean_block=stage1[:, :, block_start:block_end].contiguous(),
-                    block_start=block_start,
-                    block_end=block_end,
-                    sink_seed_frames=sink_seed,
-                )
-                st.refined_full = torch.cat(
-                    [st.refined_full, refined.to(st.refined_full.dtype)], dim=2
-                )
-                st.next_ref_idx += 1
-                frontier = block_end
+            with self.use_declared_component(
+                component_name="transformer_2",
+                module=self.refiner_stage.transformer,
+            ):
+                frontier = st.refined_full.shape[2]
+                end_f = stage1.shape[2]
+                while True:
+                    block_start = frontier
+                    block_end = block_start + st.block_size
+                    if block_end > end_f:
+                        break
+                    sink_seed = (
+                        stage1[:, :, : st.sink_size]
+                        if block_start == st.sink_size
+                        else None
+                    )
+                    refined = st.runner.refine_block(
+                        block_idx=st.next_ref_idx,
+                        clean_block=stage1[:, :, block_start:block_end].contiguous(),
+                        block_start=block_start,
+                        block_end=block_end,
+                        sink_seed_frames=sink_seed,
+                    )
+                    st.refined_full = torch.cat(
+                        [st.refined_full, refined.to(st.refined_full.dtype)], dim=2
+                    )
+                    st.next_ref_idx += 1
+                    frontier = block_end
 
         batch.latents = st.refined_full
         return batch

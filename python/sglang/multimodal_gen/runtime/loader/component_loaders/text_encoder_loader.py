@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed import init_device_mesh
+from transformers import PretrainedConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
@@ -345,17 +346,20 @@ class TextEncoderLoader(ComponentLoader):
         encoder_config = server_args.pipeline_config.text_encoder_configs[encoder_index]
         encoder_config.update_model_arch(model_config)
 
-        if encoder_index == 0:
-            for key, value in diffusers_pretrained_config.__dict__.items():
+        for key, value in diffusers_pretrained_config.__dict__.items():
+            if encoder_index == 0 or isinstance(value, PretrainedConfig):
                 setattr(encoder_config.arch_config, key, value)
         post_diffusers_config_update = getattr(
             encoder_config, "post_diffusers_config_update", None
         )
         if post_diffusers_config_update is not None:
             post_diffusers_config_update()
-        model_cls, _ = ModelRegistry.resolve_model_cls(
-            getattr(encoder_config, "architectures", [])
+        architectures = server_args.pipeline_config.resolve_text_encoder_architectures(
+            component_name,
+            list(getattr(encoder_config, "architectures", [])),
         )
+        encoder_config.arch_config.architectures = architectures
+        model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
         # real dims are populated now; resolve fold vs replicate
         finalize_encoder_folding(
             encoder_config,

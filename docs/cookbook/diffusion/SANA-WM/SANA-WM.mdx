@@ -65,7 +65,7 @@ Both repo ids are registered in SGLang's **built-in model-overlay registry**, so
 
 The materialized checkpoint is a Diffusers directory whose `model_index.json` declares the loadable components:
 
-| Component (`model_index.json`) | Class |
+| Component (`model_index.json`) | Checkpoint class |
 |---|---|
 | `transformer` (Stage-1 DiT) | `diffusers.SanaWMTransformer3DModel` |
 | `vae` | `diffusers.AutoencoderKLCausalLTX2Video` |
@@ -78,7 +78,7 @@ How loading works:
 - The server resolves the checkpoint via `maybe_download_model(model_path, force_diffusers_model=True)` and verifies it contains a `model_index.json` plus the required component subdirectories (`transformer/`, `vae/`).
 - If `text_encoder` / `tokenizer` are not provided as component paths, the pipeline falls back to the default Stage-1 text encoder **`Efficient-Large-Model/gemma-2-2b-it`** (`DEFAULT_SANA_WM_TEXT_ENCODER`).
 - **Pick the path with `--pipeline-class-name`.** The checkpoint's `model_index.json` `_class_name` selects the default pipeline (`SanaWMTwoStagePipeline`). Pin it explicitly to choose: `--pipeline-class-name SanaWMTwoStagePipeline` for the `/v1/videos` paths (§4–5) or `--pipeline-class-name SanaWMRealtimePipeline` for live realtime (§6). Pinning is also required if you point `--model-path` at a bare safetensors file instead of a Diffusers directory.
-- **The Stage-2 LTX-2 refiner** lives under `refiner/` in the checkpoint: `refiner/transformer` (`transformer_2`), `refiner/connectors` (`connectors`), and `refiner/text_encoder` (the Gemma-3 encoder for `text_encoder_2`, whose tokenizer also serves as `tokenizer_2`). The refiner is **optional**: it is skipped (Stage-1-only output) when the env flag `SGLANG_SANA_WM_SKIP_REFINER` (or a `skip_refiner` request extra) is set, or when no `refiner/` is present (`transformer_2` unloaded). On the batch path it runs chunk-wise with `--refiner-chunked` (the official streaming path, default on) or whole-clip without it; on the realtime path the pipeline builds a `SanaWMChunkedRefinerChainStage` only when a refiner is available, and otherwise streams Stage-1 frames.
+- **The Stage-2 LTX-2 refiner** lives under `refiner/` in the checkpoint: `refiner/transformer` (`transformer_2`), `refiner/connectors` (`connectors`), and `refiner/text_encoder` (the Gemma-3 encoder for `text_encoder_2`, whose tokenizer also serves as `tokenizer_2`). These directories keep their Diffusers/Transformers checkpoint formats, but SGLang loads native refiner, connector, and text-only Gemma-3 modules; the unused Gemma-3 vision tower is not materialized. All three weighted refiner components support layerwise offload. The refiner is skipped (Stage-1-only output) when `SGLANG_SANA_WM_SKIP_REFINER` or a `skip_refiner` request extra is set. On the batch path it runs chunk-wise with `--refiner-chunked` (the official streaming path, default on) or whole-clip without it.
 
 <Note>
 Throughout this cookbook, `<checkpoint>` stands for the appropriate SANA-WM repo id from the table above (or a local materialized Diffusers directory).
@@ -180,11 +180,11 @@ sglang serve \
 Common launch variants:
 
 ```bash Command
-# recommended multi-GPU realtime profile
+# multi-GPU weight sharding
 sglang serve \
   --model-path Efficient-Large-Model/SANA-WM_streaming \
   --pipeline-class-name SanaWMRealtimePipeline \
-  --num-gpus 8 --sp-degree 8 \
+  --num-gpus 8 --use-fsdp-inference \
   --host 127.0.0.1 --port 30000
 
 # single GPU
@@ -193,20 +193,20 @@ sglang serve \
   --pipeline-class-name SanaWMRealtimePipeline \
   --num-gpus 1 --host 127.0.0.1 --port 30000
 
-# offload DiT + text encoder to CPU (tight VRAM)
+# layerwise offload the large Stage-2 refiner components (tight VRAM)
 sglang serve \
   --model-path Efficient-Large-Model/SANA-WM_streaming \
   --pipeline-class-name SanaWMRealtimePipeline \
   --host 127.0.0.1 --port 30000 \
-  --dit-cpu-offload --text-encoder-cpu-offload
+  --layerwise-offload-components transformer_2 text_encoder_2 connectors
 ```
 
 Notes on launch behavior:
 
 - **Default endpoint** is `127.0.0.1:30000` (`--host` / `--port` override).
-- **CPU offload flags are optional.** `--dit-cpu-offload`, `--text-encoder-cpu-offload`, and `--image-encoder-cpu-offload` are available; defaults are auto-adjusted from GPU memory (GPUs under 30 GB get more aggressive offloading).
-- **Multi-GPU realtime.** Prefer explicit sequence parallelism (`--sp-degree` equal to the number of GPUs for a single session). Do not enable CFG parallel for the realtime profile: the default realtime request uses `guidance_scale=1.0`, while CFG parallel requires active cond/uncond branches.
-- **FSDP.** Use `--use-fsdp-inference` only when you specifically need weight sharding for memory. For the low-latency realtime profile, prefer keeping components resident and using SP first.
+- **Residency controls are optional.** `--layerwise-offload-components` accepts every weighted refiner component shown above. The legacy `--dit-cpu-offload` and `--text-encoder-cpu-offload` flags remain supported; `--cpu-offload-components` is the explicit component-level alternative.
+- **Multi-GPU realtime.** SANA-WM currently rejects tensor and sequence parallelism. Use FSDP when weight sharding is required. Do not enable CFG parallel for the realtime profile: its default `guidance_scale=1.0` has no cond/uncond branches.
+- **FSDP.** Use `--use-fsdp-inference` only when weight sharding is required. For the low-latency realtime profile, keep components resident when memory allows.
 - **Warmup.** Server warmup is **automatically skipped** for the realtime pipeline — a synthetic warmup request has no WebSocket session, so the server detects the registered realtime adapter and skips it. No explicit `--warmup-mode` setting is needed.
 
 Once up, the realtime WebSocket endpoint lives at `ws://127.0.0.1:30000/v1/realtime_video/generate` (use the Python client in §7 to connect — plain `curl` does not speak the `ws://` upgrade).

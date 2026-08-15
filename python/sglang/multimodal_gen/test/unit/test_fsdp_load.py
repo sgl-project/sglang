@@ -44,6 +44,33 @@ class _CustomEntrypointModel(_UniformDtypeModel):
         pass
 
 
+class _PartialCheckpointModel(_UniformDtypeModel):
+    @staticmethod
+    def is_expected_unloaded_checkpoint_key(name: str) -> bool:
+        return name.startswith("unused.")
+
+
+class TestExpectedCheckpointKeys(unittest.TestCase):
+    def test_model_declared_unused_keys_do_not_hide_unexpected_keys(self):
+        model = _PartialCheckpointModel()
+
+        self.assertEqual(
+            fsdp_load._unexpected_checkpoint_keys(
+                model,
+                ["unused.audio.weight", "unexpected.weight"],
+            ),
+            ["unexpected.weight"],
+        )
+
+    def test_models_without_declaration_keep_all_skipped_keys(self):
+        keys = ["unexpected.weight"]
+
+        self.assertIs(
+            fsdp_load._unexpected_checkpoint_keys(_UniformDtypeModel(), keys),
+            keys,
+        )
+
+
 class TestFSDPMixedPrecisionPolicy(unittest.TestCase):
     def _load_and_capture_policy(
         self,

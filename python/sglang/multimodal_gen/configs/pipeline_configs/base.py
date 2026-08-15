@@ -267,6 +267,25 @@ class PipelineConfig:
         # return the model-specific config for optimal deployment setting
         return ModelDeploymentConfig()
 
+    def resolve_dit_component(
+        self,
+        component_name: str,
+        default_config: DiTConfig,
+        default_model_class_name: str,
+    ) -> tuple[DiTConfig, str]:
+        """Resolve the config and native implementation for a DiT component."""
+        del component_name
+        return default_config, default_model_class_name
+
+    def resolve_text_encoder_architectures(
+        self,
+        component_name: str,
+        default_architectures: list[str],
+    ) -> list[str]:
+        """Resolve the native implementation for a text-encoder component."""
+        del component_name
+        return default_architectures
+
     def validate_server_args(self, server_args: Any) -> None:
         """Validate model-owned constraints after server args are normalized."""
 

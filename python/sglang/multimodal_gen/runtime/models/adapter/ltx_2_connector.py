@@ -6,12 +6,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.models.attention import FeedForward
 
 from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
     LTX2ConnectorConfig,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
@@ -341,6 +343,35 @@ class LTX2RotaryPosEmbed1d(nn.Module):
         return cos_freqs, sin_freqs
 
 
+class LTX2ConnectorGELU(nn.Module):
+    def __init__(self, dim_in: int, dim_out: int):
+        super().__init__()
+        self.proj = nn.Linear(dim_in, dim_out)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return F.gelu(self.proj(hidden_states), approximate="tanh")
+
+
+class LTX2ConnectorFeedForward(nn.Module):
+    def __init__(self, dim: int, activation_fn: str):
+        super().__init__()
+        if activation_fn != "gelu-approximate":
+            raise ValueError(f"Unsupported connector activation: {activation_fn}")
+        inner_dim = dim * 4
+        self.net = nn.ModuleList(
+            [
+                LTX2ConnectorGELU(dim, inner_dim),
+                nn.Dropout(0.0),
+                nn.Linear(inner_dim, dim),
+            ]
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        for layer in self.net:
+            hidden_states = layer(hidden_states)
+        return hidden_states
+
+
 class LTX2TransformerBlock1d(nn.Module):
     def __init__(
         self,
@@ -365,7 +396,7 @@ class LTX2TransformerBlock1d(nn.Module):
         )
 
         self.norm2 = torch.nn.RMSNorm(dim, eps=eps, elementwise_affine=False)
-        self.ff = FeedForward(dim, activation_fn=activation_fn)
+        self.ff = LTX2ConnectorFeedForward(dim, activation_fn=activation_fn)
 
     def forward(
         self,
@@ -509,7 +540,6 @@ class LTX2ConnectorTransformer1d(nn.Module):
             batch_size,
             seq_len,
             device=hidden_states.device,
-            dtype=hidden_states.dtype,
         )
 
         # 3. Run 1D transformer blocks
@@ -528,11 +558,17 @@ class LTX2ConnectorTransformer1d(nn.Module):
         return hidden_states, attention_mask
 
 
-class LTX2TextConnectors(nn.Module):
+class LTX2TextConnectors(nn.Module, LayerwiseOffloadableModuleMixin):
     """
     Text connector stack used by LTX 2.0 to process the packed text encoder hidden states for both the video and audio
     streams.
     """
+
+    layerwise_offload_dit_group_enabled = False
+    layer_names = [
+        "video_connector.transformer_blocks",
+        "audio_connector.transformer_blocks",
+    ]
 
     def __init__(
         self,

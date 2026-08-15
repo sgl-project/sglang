@@ -17,11 +17,7 @@ from sglang.multimodal_gen.configs.models.fsdp import (
 
 @dataclass
 class Gemma3ArchConfig(TextEncoderArchConfig):
-    """Minimal Gemma text-encoder config for tokenizer kwargs.
-
-    Note: runtime will load the actual `text_encoder/` module from the model repo
-    (e.g. Gemma3Model) via transformers; this config mainly controls tokenization.
-    """
+    """Gemma-3 text and vision architecture metadata."""
 
     vocab_size: int = 32000
     hidden_size: int = 4096

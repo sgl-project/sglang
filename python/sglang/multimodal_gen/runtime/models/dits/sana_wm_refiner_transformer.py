@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Optional
 
 import torch
@@ -26,6 +27,8 @@ from sglang.multimodal_gen.runtime.models.dits.ltx_2 import (
     LTX2AudioVideoRotaryPosEmbed,
     LTX2FeedForward,
     LTX2TextProjection,
+    apply_interleaved_rotary_emb,
+    apply_split_rotary_emb,
 )
 
 
@@ -66,56 +69,165 @@ def unpack_latents(
     )
 
 
-def _slice_rope(
-    rope: tuple[torch.Tensor, torch.Tensor], start: int, end: Optional[int] = None
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Slice along token axis for either interleaved (rank-3) or split (rank-4)."""
-    cos, sin = rope
-    end_ = end if end is not None else cos.shape[-2 if cos.ndim == 4 else 1]
-    if cos.ndim == 3:
-        return cos[:, start:end_], sin[:, start:end_]
-    if cos.ndim == 4:
-        return cos[:, :, start:end_, :], sin[:, :, start:end_, :]
-    raise ValueError(f"Unexpected RoPE rank: {cos.ndim}")
+def _apply_refiner_rope(
+    hidden_states: torch.Tensor,
+    rotary_emb: tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    if rotary_emb[0].ndim == 3:
+        return apply_interleaved_rotary_emb(hidden_states, rotary_emb).to(
+            hidden_states.dtype
+        )
+    if rotary_emb[0].ndim == 4:
+        return apply_split_rotary_emb(hidden_states, rotary_emb)
+    raise ValueError(f"Unexpected refiner RoPE rank: {rotary_emb[0].ndim}")
 
 
-def _streaming_self_attention(
-    attn: LTX2Attention,
+class SanaWMRefinerSelfAttention(LTX2Attention):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.capture_kv_before_rope = False
+        self.capture_kv_after_rope = False
+        self.kv_prefix: dict[str, Any] | None = None
+        self.captured_kv_before_rope: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.captured_kv_after_rope: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def set_kv_capture(self, mode: str, enabled: bool) -> None:
+        if mode == "pre_rope":
+            self.capture_kv_before_rope = enabled
+            if enabled:
+                self.captured_kv_before_rope = None
+            return
+        if mode == "post_rope":
+            self.capture_kv_after_rope = enabled
+            if enabled:
+                self.captured_kv_after_rope = None
+            return
+        raise ValueError(f"Unsupported KV capture mode: {mode}")
+
+    def take_captured_kv(self, mode: str) -> tuple[torch.Tensor, torch.Tensor]:
+        if mode == "pre_rope":
+            captured = self.captured_kv_before_rope
+            self.captured_kv_before_rope = None
+        elif mode == "post_rope":
+            captured = self.captured_kv_after_rope
+            self.captured_kv_after_rope = None
+        else:
+            raise ValueError(f"Unsupported KV capture mode: {mode}")
+        if captured is None:
+            raise RuntimeError(f"Missing captured KV for mode {mode}")
+        return captured
+
+
+def refiner_self_attention(
+    attn: SanaWMRefinerSelfAttention,
     hidden_states: torch.Tensor,
     video_rotary_emb: tuple[torch.Tensor, torch.Tensor],
     n_context_tokens: int,
 ) -> torch.Tensor:
-    """Streaming SLA: context attends to context only, current attends to context+current.
-
-    Mirrors NVlabs `inference_sana_wm.py::_streaming_self_attention`.
-    """
-    seq_len = hidden_states.shape[1]
-    if n_context_tokens <= 0 or n_context_tokens >= seq_len:
-        return attn(hidden_states, context=None, pe=video_rotary_emb)
-
-    ctx_rope = _slice_rope(video_rotary_emb, 0, n_context_tokens)
-    out_ctx = attn(
-        hidden_states[:, :n_context_tokens],
-        context=None,
-        pe=ctx_rope,
+    """Run sink/current attention and the optional streaming KV-cache hooks."""
+    has_streaming_hooks = (
+        attn.capture_kv_before_rope
+        or attn.capture_kv_after_rope
+        or attn.kv_prefix is not None
     )
+    sequence_length = hidden_states.shape[1]
+    if not has_streaming_hooks and (
+        n_context_tokens <= 0 or n_context_tokens >= sequence_length
+    ):
+        return attn(
+            hidden_states,
+            pe=video_rotary_emb,
+            skip_sequence_parallel_override=True,
+        )
 
-    cur_rope = _slice_rope(video_rotary_emb, n_context_tokens, seq_len)
-    out_cur = attn(
-        hidden_states[:, n_context_tokens:],
-        context=hidden_states,
-        pe=cur_rope,
-        k_pe=video_rotary_emb,
-    )
-    return torch.cat([out_ctx, out_cur], dim=1)
+    gate_logits = None
+    if attn.to_gate_logits is not None:
+        gate_logits, _ = attn.to_gate_logits(hidden_states)
+
+    query, _ = attn.to_q(hidden_states)
+    key, _ = attn.to_k(hidden_states)
+    value, _ = attn.to_v(hidden_states)
+    if attn.qk_norm:
+        assert attn.q_norm is not None and attn.k_norm is not None
+        query_dtype, key_dtype = query.dtype, key.dtype
+        with torch.autocast(device_type=query.device.type, enabled=False):
+            query = attn.q_norm(query).to(query_dtype)
+            key = attn.k_norm(key).to(key_dtype)
+
+    if attn.capture_kv_before_rope:
+        attn.captured_kv_before_rope = (
+            key.detach().clone(),
+            value.detach().clone(),
+        )
+
+    query = _apply_refiner_rope(query, video_rotary_emb)
+    key = _apply_refiner_rope(key, video_rotary_emb)
+    if attn.capture_kv_after_rope:
+        attn.captured_kv_after_rope = (
+            key.detach().clone(),
+            value.detach().clone(),
+        )
+
+    prefix_length = 0
+    prefix = attn.kv_prefix
+    if isinstance(prefix, dict) and prefix.get("mode") == "rf_shifted_sink":
+        prefix_keys = []
+        prefix_values = []
+        sink_key = prefix.get("sink_k_pre")
+        sink_value = prefix.get("sink_v")
+        if sink_key is not None and sink_value is not None and sink_key.shape[1] > 0:
+            sink_rope = prefix.get("sink_pe")
+            if sink_rope is None:
+                raise ValueError("rf_shifted_sink prefix requires sink_pe")
+            prefix_keys.append(_apply_refiner_rope(sink_key.to(key.dtype), sink_rope))
+            prefix_values.append(sink_value.to(value.dtype))
+        history_key = prefix.get("history_k")
+        history_value = prefix.get("history_v")
+        if (
+            history_key is not None
+            and history_value is not None
+            and history_key.shape[1] > 0
+        ):
+            prefix_keys.append(history_key.to(key.dtype))
+            prefix_values.append(history_value.to(value.dtype))
+        if prefix_keys:
+            prefix_length = sum(prefix_key.shape[1] for prefix_key in prefix_keys)
+            key = torch.cat((*prefix_keys, key), dim=1)
+            value = torch.cat((*prefix_values, value), dim=1)
+
+    query = query.view(*query.shape[:2], attn.local_heads, attn.dim_head)
+    key = key.view(*key.shape[:2], attn.local_heads, attn.dim_head)
+    value = value.view(*value.shape[:2], attn.local_heads, attn.dim_head)
+    if n_context_tokens <= 0 or n_context_tokens >= sequence_length:
+        output = attn.attn(
+            query,
+            key,
+            value,
+            skip_sequence_parallel_override=True,
+        )
+    else:
+        context = attn.attn(
+            query[:, :n_context_tokens],
+            key[:, prefix_length : prefix_length + n_context_tokens],
+            value[:, prefix_length : prefix_length + n_context_tokens],
+            skip_sequence_parallel_override=True,
+        )
+        current = attn.attn(
+            query[:, n_context_tokens:],
+            key,
+            value,
+            skip_sequence_parallel_override=True,
+        )
+        output = torch.cat((context, current), dim=1)
+
+    if gate_logits is not None:
+        output = output * (2.0 * torch.sigmoid(gate_logits).unsqueeze(-1))
+    output, _ = attn.to_out[0](output.flatten(2))
+    return attn.to_out[1](output)
 
 
 class SanaWMRefinerBlock(nn.Module):
-    """Video-only LTX-2 transformer block.
-
-    Diffusers-compatible layout: `norm1 -> attn1 (self) -> norm2 -> attn2 (cross) -> norm3 -> ff`,
-    each modulated via per-block `scale_shift_table` + token-wise `temb`.
-    """
+    """Video-only LTX-2 transformer block with released-checkpoint key layout."""
 
     def __init__(
         self,
@@ -133,7 +245,7 @@ class SanaWMRefinerBlock(nn.Module):
         self.dim = int(dim)
 
         self.norm1 = nn.RMSNorm(self.dim, eps=norm_eps, elementwise_affine=False)
-        self.attn1 = LTX2Attention(
+        self.attn1 = SanaWMRefinerSelfAttention(
             query_dim=self.dim,
             heads=num_attention_heads,
             dim_head=attention_head_dim,
@@ -183,7 +295,7 @@ class SanaWMRefinerBlock(nn.Module):
         )
 
         normed = self.norm1(hidden_states) * (1 + scale_msa) + shift_msa
-        attn_out = _streaming_self_attention(
+        attn_out = refiner_self_attention(
             self.attn1,
             normed,
             video_rotary_emb,
@@ -209,8 +321,7 @@ class SanaWMLTX2VideoRefiner(CachableDiT, LayerwiseOffloadableModuleMixin):
     """SANA-WM stage-2 LTX-2 video-only refiner.
 
     Loads Diffusers-format refiner weights from `<model_path>/refiner/transformer/`.
-    Audio params present in the checkpoint are silently dropped by the loader's
-    `strict=False` state_dict load.
+    Audio and cross-modal params in that checkpoint are intentionally unused.
     """
 
     _fsdp_shard_conditions = [is_blocks_or_transformer_blocks]
@@ -218,6 +329,20 @@ class SanaWMLTX2VideoRefiner(CachableDiT, LayerwiseOffloadableModuleMixin):
     param_names_mapping = SanaWMRefinerArchConfig().param_names_mapping
     reverse_param_names_mapping: dict = {}
     lora_param_names_mapping: dict = {}
+    layer_names = ["transformer_blocks"]
+
+    @staticmethod
+    def is_expected_unloaded_checkpoint_key(name: str) -> bool:
+        if name.startswith(("audio_", "av_cross_attn_")):
+            return True
+        parts = name.split(".", 3)
+        if len(parts) < 3 or parts[0] != "transformer_blocks":
+            return False
+        branch = parts[2]
+        return branch.startswith("audio_") or branch in {
+            "video_a2v_cross_attn_scale_shift_table",
+            "video_to_audio_attn",
+        }
 
     def __init__(
         self,
@@ -295,13 +420,6 @@ class SanaWMLTX2VideoRefiner(CachableDiT, LayerwiseOffloadableModuleMixin):
             quant_config=quant_config,
         )
 
-        # LTX2AudioVideoRotaryPosEmbed expects `dim` to be the *total* hidden
-        # size (num_heads * head_dim), not the per-head dim. It internally
-        # reshapes cos/sin to (B, T, num_heads, head_dim/2). Passing
-        # `attention_head_dim` here would size the RoPE to head_dim/num_heads
-        # and produce a (1, num_heads, L, 2) cos/sin that won't match
-        # LTX2Attention's q/k. See LTX2Transformer3DAVModel.__init__ in
-        # ltx_2.py for the canonical convention (`dim=self.hidden_size`).
         self.rope = LTX2AudioVideoRotaryPosEmbed(
             dim=self.hidden_size,
             patch_size=self.patch_size,
@@ -318,82 +436,66 @@ class SanaWMLTX2VideoRefiner(CachableDiT, LayerwiseOffloadableModuleMixin):
             num_attention_heads=self.num_attention_heads,
         )
 
-        self.layer_names = ["transformer_blocks"]
-
     def _scale_timestep_for_adaln(self, timestep: torch.Tensor) -> torch.Tensor:
         return timestep * self.timestep_scale_multiplier
 
-    def forward(
+    def set_streaming_kv_prefixes(
+        self, prefixes: Sequence[dict[str, Any] | None] | None
+    ) -> None:
+        if prefixes is None:
+            self.clear_streaming_kv_prefixes()
+            return
+        if len(prefixes) != len(self.transformer_blocks):
+            raise ValueError(
+                "Expected one KV prefix per refiner block, got "
+                f"{len(prefixes)} for {len(self.transformer_blocks)} blocks."
+            )
+        for block, prefix in zip(self.transformer_blocks, prefixes, strict=True):
+            block.attn1.kv_prefix = prefix
+
+    def clear_streaming_kv_prefixes(self) -> None:
+        for block in self.transformer_blocks:
+            block.attn1.kv_prefix = None
+
+    def set_streaming_kv_capture(self, mode: str, enabled: bool) -> None:
+        for block in self.transformer_blocks:
+            block.attn1.set_kv_capture(mode, enabled)
+
+    def take_streaming_kv(self, mode: str) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        return [block.attn1.take_captured_kv(mode) for block in self.transformer_blocks]
+
+    def forward_tokens(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         timestep: torch.Tensor,
-        encoder_hidden_states_image=None,
+        video_rotary_emb: tuple[torch.Tensor, torch.Tensor],
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        num_frames: Optional[int] = None,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        fps: float = 24.0,
         n_context_tokens: int = 0,
-        guidance=None,
-        **kwargs,
     ) -> torch.Tensor:
-        # Accept either packed (B, L, in_dim) or raw 5D (B, C, T, H, W).
-        if hidden_states.dim() == 5:
-            B_, _, T_, H_, W_ = hidden_states.shape
-            if num_frames is None:
-                num_frames = T_
-            if height is None:
-                height = H_
-            if width is None:
-                width = W_
-            hidden_states = pack_latents(
-                hidden_states,
-                patch_size=self.patch_size,
-                patch_size_t=self.patch_size_t,
-            )
-            packed_input = True
-        else:
-            if num_frames is None or height is None or width is None:
-                raise ValueError(
-                    "num_frames/height/width are required when hidden_states is pre-packed."
-                )
-            packed_input = False
-
-        B = hidden_states.size(0)
-
-        video_coords = self.rope.prepare_video_coords(
-            batch_size=B,
-            num_frames=num_frames,
-            height=height,
-            width=width,
-            device=hidden_states.device,
-            fps=fps,
-        )
-        video_rotary_emb = self.rope(
-            video_coords,
-            device=hidden_states.device,
-            out_dtype=hidden_states.dtype,
-        )
-
+        """Forward packed latent tokens with caller-provided absolute-position RoPE."""
+        batch_size = hidden_states.size(0)
         hidden_states, _ = self.proj_in(hidden_states)
 
-        scaled_t = self._scale_timestep_for_adaln(timestep)
+        if timestep.ndim == 3:
+            if timestep.shape[-1] != 1:
+                raise ValueError(
+                    "A rank-3 refiner timestep must have a singleton last dimension."
+                )
+            timestep = timestep.squeeze(-1)
         temb, embedded_timestep = self.time_embed(
-            scaled_t.flatten(), hidden_dtype=hidden_states.dtype
+            self._scale_timestep_for_adaln(timestep).flatten(),
+            hidden_dtype=hidden_states.dtype,
         )
-        if timestep.dim() >= 2:
-            temb = temb.view(B, -1, temb.size(-1))
-            embedded_timestep = embedded_timestep.view(
-                B, -1, embedded_timestep.size(-1)
-            )
-        else:
-            temb = temb.view(B, 1, temb.size(-1))
-            embedded_timestep = embedded_timestep.view(B, 1, embedded_timestep.size(-1))
+        temb = temb.view(batch_size, -1, temb.size(-1))
+        embedded_timestep = embedded_timestep.view(
+            batch_size, -1, embedded_timestep.size(-1)
+        )
 
         encoder_hidden_states = self.caption_projection(encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states.view(B, -1, self.hidden_size)
-
+        encoder_hidden_states = encoder_hidden_states.view(
+            batch_size, -1, self.hidden_size
+        )
         for block in self.transformer_blocks:
             hidden_states = block(
                 hidden_states=hidden_states,
@@ -410,8 +512,71 @@ class SanaWMLTX2VideoRefiner(CachableDiT, LayerwiseOffloadableModuleMixin):
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
         hidden_states = self.norm_out(hidden_states) * (1 + scale) + shift
         hidden_states, _ = self.proj_out(hidden_states)
+        return hidden_states
 
-        if packed_input:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states_image=None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        num_frames: Optional[int] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        fps: float = 24.0,
+        n_context_tokens: int = 0,
+        guidance=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        input_is_packed = hidden_states.dim() == 3
+        if not input_is_packed:
+            if hidden_states.dim() != 5:
+                raise ValueError(
+                    "Refiner hidden_states must be packed 3D tokens or a 5D latent."
+                )
+            B_, _, T_, H_, W_ = hidden_states.shape
+            if num_frames is None:
+                num_frames = T_
+            if height is None:
+                height = H_
+            if width is None:
+                width = W_
+            hidden_states = pack_latents(
+                hidden_states,
+                patch_size=self.patch_size,
+                patch_size_t=self.patch_size_t,
+            )
+        else:
+            if num_frames is None or height is None or width is None:
+                raise ValueError(
+                    "num_frames/height/width are required when hidden_states is pre-packed."
+                )
+        batch_size = hidden_states.size(0)
+
+        video_coords = self.rope.prepare_video_coords(
+            batch_size=batch_size,
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            device=hidden_states.device,
+            fps=fps,
+        )
+        video_rotary_emb = self.rope(
+            video_coords,
+            device=hidden_states.device,
+            out_dtype=hidden_states.dtype,
+        )
+
+        hidden_states = self.forward_tokens(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            timestep=timestep,
+            video_rotary_emb=video_rotary_emb,
+            encoder_attention_mask=encoder_attention_mask,
+            n_context_tokens=n_context_tokens,
+        )
+        if input_is_packed:
             return hidden_states
         return unpack_latents(
             hidden_states,

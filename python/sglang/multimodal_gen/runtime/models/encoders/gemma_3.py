@@ -31,6 +31,24 @@ from sglang.multimodal_gen.runtime.utils.common import add_prefix
 
 logger = logging.getLogger(__name__)
 
+_GEMMA3_TEXT_WEIGHT_PREFIXES = (
+    "model.language_model.model.",
+    "language_model.model.",
+    "model.language_model.",
+    "language_model.",
+)
+
+
+def gemma3_text_weights(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Select the language backbone from a multimodal Gemma-3 checkpoint."""
+    for name, weight in weights:
+        for prefix in _GEMMA3_TEXT_WEIGHT_PREFIXES:
+            if name.startswith(prefix):
+                yield name.removeprefix(prefix), weight
+                break
+
 
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
@@ -940,6 +958,16 @@ class Gemma3TextModel(nn.Module):
         return loaded_params
 
 
+class Gemma3TextEncoder(Gemma3TextModel, LayerwiseOffloadableModuleMixin):
+    """Text-only Gemma-3 encoder for checkpoints that include an unused vision tower."""
+
+    layerwise_offload_dit_group_enabled = False
+    layer_names = ["layers"]
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        return super().load_weights(gemma3_text_weights(weights))
+
+
 class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin):
     # transformers 5.6.0 flattened SiglipVisionModel, dropping the
     # `vision_model` intermediate wrapper. Our reimpl keeps it, so remap
@@ -1247,4 +1275,4 @@ class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin)
         return int(sliding_window) - 1
 
 
-EntryClass = Gemma3ForConditionalGeneration
+EntryClass = [Gemma3TextEncoder, Gemma3ForConditionalGeneration]
