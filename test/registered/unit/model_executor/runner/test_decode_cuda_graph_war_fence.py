@@ -23,18 +23,12 @@ class _SpecAlgorithm:
         return self._target_verify_war and forward_mode.is_target_verify()
 
 
-def _attn_backend(*, breakable_metadata=False):
-    def shared_read_boundary(forward_mode):
-        if breakable_metadata and forward_mode.is_target_verify():
-            return SharedReadBoundary.POST_REPLAY
-        if forward_mode.is_decode() or forward_mode.is_target_verify():
-            return SharedReadBoundary.IN_REPLAY
-        return SharedReadBoundary.UNKNOWN
-
-    return SimpleNamespace(shared_read_boundary=shared_read_boundary)
+def _attn_backend(boundary=SharedReadBoundary.IN_REPLAY):
+    """Backend stub declaring one fixed read-end boundary for every mode."""
+    return SimpleNamespace(shared_read_boundary=lambda _forward_mode: boundary)
 
 
-def _runner(*, target_verify_war: bool = False, planted: bool = False):
+def _runner(*, target_verify_war: bool = False, has_marker: bool = False):
     runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
     runner.model_runner = SimpleNamespace(
         spec_algorithm=_SpecAlgorithm(target_verify_war),
@@ -42,59 +36,31 @@ def _runner(*, target_verify_war: bool = False, planted: bool = False):
         is_draft_worker=False,
         war_fastpath_read_done_event=None,
     )
-    runner.in_graph_metadata_prep_done = object() if planted else None
+    runner.in_graph_metadata_prep_done = object() if has_marker else None
     return runner
 
 
-def test_war_read_done_record():
-    # Planted node: the graph re-arms it every replay.
+def test_unrelated_modes_never_publish():
+    # The decode runner owns the fence for decode / target verify only. Any
+    # other mode must leave the scheduler on the coarse whole-forward wait,
+    # even when a marker is available.
     assert (
-        _runner(planted=True)._war_read_done_record(_attn_backend(), ForwardMode.DECODE)
-        is SharedReadBoundary.IN_REPLAY
-    )
-    # No planted node: fall back to a pre-replay record.
-    assert (
-        _runner()._war_read_done_record(_attn_backend(), ForwardMode.DECODE)
-        is SharedReadBoundary.PRE_REPLAY
-    )
-    # Unrelated modes never publish from the decode graph runner.
-    assert (
-        _runner(planted=True)._war_read_done_record(_attn_backend(), ForwardMode.EXTEND)
-        is SharedReadBoundary.UNKNOWN
-    )
-    # The algorithm gate precedes the backend declaration.
-    assert (
-        _runner(planted=True)._war_read_done_record(
-            _attn_backend(breakable_metadata=True), ForwardMode.TARGET_VERIFY
+        _runner(has_marker=True)._war_read_done_record(
+            _attn_backend(), ForwardMode.EXTEND
         )
         is SharedReadBoundary.UNKNOWN
     )
-    # Captured-metadata verify keeps reading throughout the graph, even planted.
+
+
+def test_post_replay_declaration_is_not_advanced():
+    # A backend that keeps reading shared state across the whole graph declares
+    # POST_REPLAY. Having an in-graph marker must not pull the fence earlier.
     assert (
-        _runner(target_verify_war=True, planted=True)._war_read_done_record(
-            _attn_backend(breakable_metadata=True), ForwardMode.TARGET_VERIFY
+        _runner(target_verify_war=True, has_marker=True)._war_read_done_record(
+            _attn_backend(SharedReadBoundary.POST_REPLAY), ForwardMode.TARGET_VERIFY
         )
         is SharedReadBoundary.POST_REPLAY
     )
-
-
-def test_publish_war_read_done():
-    runner = _runner()
-    graph_event = object()
-    runner.in_graph_metadata_prep_done = graph_event
-    runner._publish_read_done(in_graph=True)
-    assert runner.model_runner.war_fastpath_read_done_event is graph_event
-
-    recorded = []
-
-    class Event:
-        def record(self):
-            recorded.append(self)
-
-    runner.device_module = SimpleNamespace(Event=Event)
-    runner._publish_read_done(in_graph=False)
-    published = runner.model_runner.war_fastpath_read_done_event
-    assert isinstance(published, Event) and recorded == [published]
 
 
 def _execute_harness(runner, calls, mode=ForwardMode.DECODE):
@@ -117,10 +83,9 @@ def _execute_harness(runner, calls, mode=ForwardMode.DECODE):
     return SimpleNamespace(forward_mode=mode, batch_size=1)
 
 
-def test_execute_publishes_the_planted_graph_event():
-    runner = _runner(planted=True)
-    graph_event = object()
-    runner.in_graph_metadata_prep_done = graph_event
+def test_execute_publishes_the_in_graph_marker():
+    runner = _runner(has_marker=True)
+    marker = runner.in_graph_metadata_prep_done
     runner.attn_backend = _attn_backend()
     runner.device_module = SimpleNamespace(
         Event=lambda: (_ for _ in ()).throw(
@@ -133,10 +98,10 @@ def test_execute_publishes_the_planted_graph_event():
     result = runner.execute(forward_batch)
 
     assert result.tensors["hidden_states"].shape == (1, 1)
-    assert runner.model_runner.war_fastpath_read_done_event is graph_event
+    assert runner.model_runner.war_fastpath_read_done_event is marker
 
 
-def test_execute_records_pre_replay_for_snapshot_backends():
+def test_execute_falls_back_to_pre_replay_without_marker():
     runner = _runner()
     runner.attn_backend = _attn_backend()
     calls = []
@@ -157,15 +122,14 @@ def test_execute_records_pre_replay_for_snapshot_backends():
 
 @pytest.mark.parametrize("supported", [False, True])
 def test_target_verify_requires_war_capability(supported):
-    runner = _runner(target_verify_war=supported, planted=True)
-    graph_event = object()
-    runner.in_graph_metadata_prep_done = graph_event
+    runner = _runner(target_verify_war=supported, has_marker=True)
+    marker = runner.in_graph_metadata_prep_done
     runner.attn_backend = _attn_backend()
     runner.device_module = SimpleNamespace(Event=lambda: None)
 
     runner.execute(_execute_harness(runner, [], ForwardMode.TARGET_VERIFY))
 
-    expected = graph_event if supported else None
+    expected = marker if supported else None
     assert runner.model_runner.war_fastpath_read_done_event is expected
 
 
