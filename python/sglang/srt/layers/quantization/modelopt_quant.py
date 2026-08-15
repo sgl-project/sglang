@@ -609,6 +609,26 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Applies FP8 linear transformation."""
+        # `_accepts_prequantized_fp8` is the explicit opt-in so an accidental
+        # tuple from unrelated code can't silently bypass quantization.
+        if getattr(layer, "_accepts_prequantized_fp8", False) and isinstance(x, tuple):
+            qinput, x_scale = x
+            weight_scale = layer.weight_scale
+            if x_scale.ndim == 0:
+                x_scale = x_scale.reshape(1)
+            if weight_scale.ndim == 0:
+                weight_scale = weight_scale.reshape(1)
+            out = torch._scaled_mm(
+                qinput,
+                layer.weight,
+                out_dtype=layer.params_dtype,
+                scale_a=x_scale,
+                scale_b=weight_scale,
+                bias=bias,
+            )
+            if isinstance(out, tuple):
+                out = out[0]
+            return out
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,

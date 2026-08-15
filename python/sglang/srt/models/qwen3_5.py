@@ -158,6 +158,70 @@ def _disable_shared_experts_fusion() -> bool:
     return is_shared_experts_fusion_disabled()
 
 
+class _PostLnFp4QuantGemmaRMSNorm(GemmaRMSNorm):
+    """Post-attention GemmaRMSNorm fused with the gate_up NVFP4 input quant.
+
+    For large-M (prefill) forwards, runs FlashInfer's fused
+    add+rmsnorm+fp4-quant kernel and hands gate_up_proj a prequantized
+    (fp4, swizzled_scale) tuple via the `_accepts_prequantized_fp4` path,
+    removing the standalone block-quantize kernel and one full activation
+    read. Gemma's (1 + weight) scaling is folded into a precomputed weight.
+    Small-M forwards (decode / CUDA-graph capture) keep the original path.
+    """
+
+    _FUSE_MIN_TOKENS = 64
+
+    def _lazy_init(self, mlp: nn.Module) -> None:
+        object.__setattr__(self, "_fp4_gate_up", mlp.gate_up_proj)
+        self._weight_plus_one = None
+
+    def forward(self, x, residual=None, post_residual_addition=None):
+        gate_up = getattr(self, "_fp4_gate_up", None)
+        if (
+            residual is None
+            or gate_up is None
+            or post_residual_addition is not None
+            or x.shape[0] < self._FUSE_MIN_TOKENS
+            or os.environ.get("SGLANG_DISABLE_POST_LN_FP4_QUANT_FUSION", "0") == "1"
+        ):
+            return super().forward(x, residual, post_residual_addition)
+        from flashinfer import add_rmsnorm_fp4quant
+
+        if self._weight_plus_one is None:
+            self._weight_plus_one = (self.weight.float() + 1.0).to(x.dtype)
+        y_fp4, y_sf = add_rmsnorm_fp4quant(
+            x,
+            residual,
+            self._weight_plus_one,
+            global_scale=gate_up.input_scale_inv.reshape(1),
+            eps=self.variance_epsilon,
+            is_sf_swizzled_layout=True,
+        )
+        # cuDNN mm_fp4 validates the block-scale shape: expose the swizzled
+        # buffer as the logical 2D (m_padded, K/16) view fp4_quantize returns.
+        y_sf = y_sf.view(-1, x.shape[-1] // 16)
+        return (y_fp4.view(torch.uint8), y_sf), residual
+
+
+def _maybe_fuse_post_ln_fp4_quant(layer: nn.Module) -> None:
+    """Swap post_attention_layernorm for the fused fp4-quant variant."""
+    mlp = layer.mlp
+    if not getattr(mlp, "_enable_silu_fp4_quant_fusion", False):
+        return
+    if os.environ.get("SGLANG_DISABLE_POST_LN_FP4_QUANT_FUSION", "0") == "1":
+        return
+    try:
+        from flashinfer import add_rmsnorm_fp4quant  # noqa: F401
+    except ImportError:
+        return
+    old = layer.post_attention_layernorm
+    fused = _PostLnFp4QuantGemmaRMSNorm(old.weight.shape[0], eps=old.variance_epsilon)
+    fused._lazy_init(mlp)
+    layer.post_attention_layernorm = fused
+    mlp.gate_up_proj._accepts_prequantized_fp4 = True
+    logger.info("Enabled fused post-LN GemmaRMSNorm+FP4-quant for gate_up input.")
+
+
 def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
     """Fuse SiLU+mul with the down_proj NVFP4 input quantization.
 
@@ -659,6 +723,30 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_ba, _ = self.in_proj_ba(hs_bf16)
         return projected_states_qkvz, projected_states_ba
 
+    def _gated_norm_fp8_enabled(self) -> bool:
+        """Prefill-only fusion of the gated output norm with the out_proj
+        static-fp8 input quantization (kill switch:
+        SGLANG_DISABLE_GATED_NORM_FP8_QUANT_FUSION=1)."""
+        state = getattr(self, "_gated_norm_fp8_state", None)
+        if state is None:
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                ModelOptFp8LinearMethod,
+            )
+
+            state = (
+                os.environ.get("SGLANG_DISABLE_GATED_NORM_FP8_QUANT_FUSION", "0") != "1"
+                and isinstance(self.out_proj.quant_method, ModelOptFp8LinearMethod)
+                and getattr(self.out_proj, "input_scale", None) is not None
+                and self.out_proj.input_scale.numel() == 1
+                and self.norm.bias is None
+                and self.norm.activation in ("swish", "silu")
+            )
+            if state:
+                self.out_proj._accepts_prequantized_fp8 = True
+                logger.info("Enabled fused gated-RMSNorm+FP8-quant for out_proj input.")
+            self._gated_norm_fp8_state = state
+        return state
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -722,6 +810,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
+        if core_attn_out.shape[0] >= 2048 and self._gated_norm_fp8_enabled():
+            from sglang.kernels.ops.attention.fla.layernorm_gated import (
+                rms_norm_gated_static_fp8,
+            )
+
+            q = rms_norm_gated_static_fp8(
+                x=core_attn_out,
+                z=z,
+                weight=self.norm.weight,
+                eps=self.norm.eps,
+                scale=self.out_proj.input_scale,
+                activation=self.norm.activation,
+            )
+            q = q.reshape(z_shape_og).reshape(*z_shape_og[:-2], -1)
+            output, _ = self.out_proj((q, self.out_proj.input_scale))
+            return output
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(
@@ -806,6 +910,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             _enable_qwen35_fused_ar_quant()
             and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
         )
+        _maybe_fuse_post_ln_fp4_quant(self)
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
@@ -982,6 +1087,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
             )
+            _maybe_enable_silu_fp4_quant_fusion(self.mlp)
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False
@@ -1026,6 +1132,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         enable_fused_ar_quant = (
             _enable_qwen35_fused_ar_quant() and _linear_accepts_fp8_tuple(self.qkv_proj)
         )
+        _maybe_fuse_post_ln_fp4_quant(self)
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,

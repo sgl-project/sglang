@@ -94,6 +94,9 @@ def _layer_norm_fwd_1pass_kernel(
     IS_RMS_NORM: tl.constexpr,
     ACTIVATION: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    Q=None,  # pointer to fp8 output (STORE_FP8 mode)
+    SCALE=None,  # pointer to the per-tensor static scale (STORE_FP8 mode)
+    STORE_FP8: tl.constexpr = False,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -177,7 +180,16 @@ def _layer_norm_fwd_1pass_kernel(
             y *= tl.sigmoid(z)
 
     # Write output
-    tl.store(Y_base, y, mask=mask)
+    if STORE_FP8:
+        # Quantize with the consumer's per-tensor static scale and store fp8
+        # directly, skipping the bf16 intermediate write entirely.
+        srecip = 1.0 / tl.load(SCALE).to(tl.float32)
+        q = y * srecip
+        q = tl.minimum(tl.maximum(q, -448.0), 448.0)
+        Q_base = Q + rows[:, None] * stride_y_row + col_offsets
+        tl.store(Q_base, q.to(tl.float8e4nv), mask=mask)
+    else:
+        tl.store(Y_base, y, mask=mask)
 
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
@@ -216,6 +228,7 @@ def _layer_norm_fwd(
     norm_before_gate=True,
     is_rms_norm=False,
     activation: str = "swish",
+    fp8_out_scale=None,
 ):
     M, N = x.shape
     if group_size is None:
@@ -232,7 +245,10 @@ def _layer_norm_fwd(
         assert bias.stride(-1) == 1
         assert bias.shape == (N,)
     # allocate output
-    if out is not None:
+    if fp8_out_scale is not None:
+        assert out is None
+        out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    elif out is not None:
         assert out.shape == x.shape
     else:
         out = torch.empty_like(x)
@@ -292,6 +308,9 @@ def _layer_norm_fwd(
             IS_RMS_NORM=is_rms_norm,
             num_warps=num_warps,
             ACTIVATION=activation,
+            Q=out if fp8_out_scale is not None else None,
+            SCALE=fp8_out_scale,
+            STORE_FP8=fp8_out_scale is not None,
             **pdl_kwargs,
         )
     return out, mean, rstd
@@ -342,6 +361,41 @@ def rms_norm_gated(
         activation=activation,
     )
     return y.reshape(x_shape_og)
+
+
+def rms_norm_gated_static_fp8(
+    *,
+    x,
+    weight,
+    z,
+    eps,
+    scale,
+    activation: str = "swish",
+):
+    """RMSNorm(x) * silu(z), quantized to fp8_e4m3 with a per-tensor static
+    scale inside the norm kernel (skips the bf16 intermediate round-trip).
+
+    Returns a 2D fp8 tensor with the same leading shape as ``x`` flattened.
+    """
+    x2 = x.reshape(-1, x.shape[-1])
+    if x2.stride(-1) != 1:
+        x2 = x2.contiguous()
+    z2 = z.reshape(-1, z.shape[-1])
+    if z2.stride(-1) != 1:
+        z2 = z2.contiguous()
+    q, _, _ = _layer_norm_fwd(
+        x2,
+        weight.contiguous(),
+        None,
+        eps,
+        z=z2,
+        group_size=None,
+        norm_before_gate=True,
+        is_rms_norm=True,
+        activation=activation,
+        fp8_out_scale=scale,
+    )
+    return q
 
 
 class LayerNormFn(torch.autograd.Function):
