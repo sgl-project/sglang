@@ -229,20 +229,10 @@ install_gdrcopy() {
 }
 
 clean_site_packages() {
-    # Clear torch compilation cache from every location it can be in; sglang
-    # is not installed yet, so it cannot be asked which one is in use.
-    python3 -c '
-import getpass, os, shutil, tempfile
-
-sglang_cache_dir = os.environ.get("SGLANG_CACHE_DIR") or "~/.cache/sglang"
-for cache_dir in (
-    os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
-    os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()),
-    os.path.join(os.path.expanduser(sglang_cache_dir), "inductor"),
-):
-    if cache_dir:
-        shutil.rmtree(cache_dir, ignore_errors=True)
-'
+    # The torch compilation cache is deliberately NOT wiped here: entries are
+    # content-hash addressed so stale ones are never reused, and hosts packing
+    # several runners share one cache mount - a wipe unlinks files a concurrent
+    # job is compiling against.
 
     # Remove broken dist-info directories (missing METADATA per PEP 376)
     SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
@@ -423,7 +413,7 @@ uninstall_stale_flashinfer() {
 
 install_pytorch_stack() {
     PYTORCH_SPECS=()
-    for package in torch torchaudio torchvision torchao torchcodec; do
+    for package in torch torchaudio torchvision torchcodec; do
         spec=$(grep -Po -m1 "\"${package}([<>=!~ ;][^\"]*)?\"" python/pyproject.toml | tr -d '"' || true)
         if [ -n "$spec" ]; then
             PYTORCH_SPECS+=("$spec")
@@ -692,12 +682,8 @@ stabilize_flashinfer_jit_paths() {
 install_extra_deps() {
     MOONCAKE_VERSION="0.3.12.post1"
     NIXL_VERSION="1.3.0"
-    # sgl-eval is git-only and cannot be declared in python/pyproject.toml (see
-    # the note there). The nightly GSM8K eval shells out to the sgl-eval CLI and
-    # fails without it. Bumping the SHA can change zero-shot \boxed{} grading, so
-    # re-baseline MODEL_SCORE_THRESHOLDS in
-    # test/registered/eval/test_text_models_gsm8k_eval.py first.
-    SGL_EVAL_REF="b2a2703c42cae379bbcb8b7ff092df6601a61694"
+    # shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
+    source "${SCRIPT_DIR}/../utils/sgl_eval_ref.sh"
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
@@ -733,7 +719,7 @@ install_extra_deps() {
             --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
     fi
 
-    $PIP_CMD install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@${SGL_EVAL_REF}" $PIP_INSTALL_SUFFIX
+    $PIP_CMD install "$SGL_EVAL_SPEC" $PIP_INSTALL_SUFFIX
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git

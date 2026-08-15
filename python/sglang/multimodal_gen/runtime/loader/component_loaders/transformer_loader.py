@@ -1,5 +1,6 @@
 import copy
 import logging
+from collections.abc import Callable
 from contextlib import nullcontext
 from typing import Any
 
@@ -37,6 +38,21 @@ from sglang.srt.utils import is_npu
 _is_npu = is_npu()
 
 logger = init_logger(__name__)
+
+
+def _resolve_checkpoint_load_device(
+    runtime_device: torch.device,
+    *,
+    component_cpu_offload: bool,
+    runtime_quant_config: object | None,
+) -> torch.device:
+    if component_cpu_offload and runtime_quant_config is None:
+        return torch.device("cpu")
+    return runtime_device
+
+
+def _minimax_h3_adaln_cache_key_filter(name: str) -> bool:
+    return ".adaln_proj.linear." not in name
 
 
 def _default_quantized_attention_backend(
@@ -141,6 +157,11 @@ class TransformerLoader(ComponentLoader):
         component_server_args = _server_args_for_transformer_component(
             server_args, component_name
         )
+        if server_args.cpu_offload_components is not None:
+            component_server_args = copy.copy(component_server_args)
+            component_server_args.dit_cpu_offload = (
+                server_args.should_cpu_offload_component(component_name)
+            )
 
         # 1. hf config
         config = get_diffusers_component_config(component_path=component_model_path)
@@ -187,6 +208,40 @@ class TransformerLoader(ComponentLoader):
             "hf_config": config,
             "quant_config": quant_spec.runtime_quant_config,
         }
+        checkpoint_key_filter: Callable[[str], bool] | None = None
+        adaln_cache_path = component_server_args.minimax_h3_adaln_cache_path
+        if adaln_cache_path is not None:
+            if cls_name != "MiniMaxH3DiTModel":
+                raise ValueError(
+                    "--minimax-h3-adaln-cache-path is only supported by MiniMax H3"
+                )
+            if component_server_args.model_variant not in ("fl2va", "ref2va"):
+                raise ValueError(
+                    "MiniMax H3 AdaLN cache requires --model-variant fl2va or ref2va"
+                )
+            init_params["adaln_cache_path"] = adaln_cache_path
+            init_params["adaln_cache_model_variant"] = (
+                component_server_args.model_variant
+            )
+            checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
+        if component_server_args.minimax_h3_adaln_online:
+            if cls_name != "MiniMaxH3DiTModel":
+                raise ValueError(
+                    "--minimax-h3-adaln-online is only supported by MiniMax H3"
+                )
+            if adaln_cache_path is not None:
+                raise ValueError(
+                    "--minimax-h3-adaln-online and --minimax-h3-adaln-cache-path "
+                    "are mutually exclusive"
+                )
+            # Keep the weights off-device; the model rebuilds the AdaLN
+            # outputs from the checkpoint for each request's timestep plan.
+            init_params["adaln_weight_files"] = safetensors_list
+            init_params["adaln_plan_width"] = (
+                component_server_args.minimax_h3_adaln_plan_width
+            )
+            checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
+
         if (
             init_params["quant_config"] is None
             and component_server_args.transformer_weights_path is not None
@@ -198,11 +253,30 @@ class TransformerLoader(ComponentLoader):
             logger.debug("quantization config: %s", init_params["quant_config"])
 
         local_torch_device = get_local_torch_device()
+        checkpoint_load_device = _resolve_checkpoint_load_device(
+            local_torch_device,
+            component_cpu_offload=bool(component_server_args.dit_cpu_offload),
+            runtime_quant_config=quant_spec.runtime_quant_config,
+        )
+        direct_gpu_weight_loading = bool(
+            component_server_args.direct_gpu_weight_loading
+        )
+        if direct_gpu_weight_loading and quant_spec.runtime_quant_config is not None:
+            raise ValueError(
+                "--direct-gpu-weight-loading supports only unquantized DiT checkpoints"
+            )
         weight_load_plan = WeightLoadPlan.for_component(
-            checkpoint_load_device=local_torch_device,
+            checkpoint_load_device=checkpoint_load_device,
             needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
             component_cpu_offload=bool(component_server_args.dit_cpu_offload),
+            load_full_state_dict_on_device=direct_gpu_weight_loading,
         )
+        if direct_gpu_weight_loading:
+            logger.warning(
+                "Direct GPU weight loading is enabled for %s; the complete checkpoint "
+                "state dict and materialized model weights may coexist on GPU during startup",
+                component_name,
+            )
 
         quantized_attn_backend = _default_quantized_attention_backend(
             quant_spec, component_server_args
@@ -238,6 +312,7 @@ class TransformerLoader(ComponentLoader):
                 output_dtype=None,
                 strict=False,
                 weight_load_plan=weight_load_plan,
+                checkpoint_key_filter=checkpoint_key_filter,
             )
 
         # post-hooks (e.g., patch scales (nunchaku))

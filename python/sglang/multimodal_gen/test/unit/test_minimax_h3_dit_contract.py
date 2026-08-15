@@ -25,8 +25,10 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MINIMAX_H3_FP32_BUFFER_NAMES,
     MINIMAX_H3_FP32_PARAM_NAMES,
+    MiniMaxH3DiTBlock,
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
+    _modulate_gate,
     _reorder_grouped_qkv_to_qkv,
 )
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
@@ -43,7 +45,6 @@ def _ensure_single_process_parallel_runtime() -> None:
 
 def test_native_weight_names_and_grouped_qkv_reorder():
     arch = MiniMaxH3DiTArchConfig()
-    assert arch.param_names_mapping == {}
     assert arch.reverse_param_names_mapping == {}
     mapping = get_param_names_mapping(arch.param_names_mapping)
     for key in (
@@ -53,6 +54,35 @@ def test_native_weight_names_and_grouped_qkv_reorder():
         "final_layer.audio_out.weight",
     ):
         assert mapping(key) == (key, None, None)
+
+    assert mapping(
+        "base_model.model.transformer.transformer_blocks.7.attn.to_k.lora_A.default"
+    ) == ("blocks.7.attn.qkv_proj.lora_A", 1, 3)
+    assert mapping("token_refiner.refiner_blocks.1.ff.net.0.proj.lora_B") == (
+        "token_refiner.blocks.1.mlp.fc1.lora_B",
+        None,
+        None,
+    )
+    assert mapping("transformer.transformer_blocks.3.adaln_proj.linear.lora_A") == (
+        "blocks.3.adaln_proj.linear.lora_A",
+        None,
+        None,
+    )
+    assert mapping("transformer.audio_proj_out.lora_B") == (
+        "final_layer.audio_out.lora_B",
+        None,
+        None,
+    )
+    assert mapping("blocks.3.attn.out_proj.lora_A") == (
+        "blocks.3.attn.out_proj.lora_A",
+        None,
+        None,
+    )
+    assert mapping("transformer.blocks.0.attn.qkv_proj.weight") == (
+        "transformer.blocks.0.attn.qkv_proj.weight",
+        None,
+        None,
+    )
 
     weight = torch.arange(12, dtype=torch.float32).reshape(12, 1)
     actual = _reorder_grouped_qkv_to_qkv(
@@ -97,6 +127,97 @@ def test_native_weight_names_and_grouped_qkv_reorder():
             assert torch.equal(
                 param.view(torch.int16), expected_shard.view(torch.int16)
             )
+
+
+class _KwargIdentity(torch.nn.Module):
+    def forward(self, x, **_kwargs):
+        return x
+
+
+def test_cache_dit_preservation_only_makes_first_gate_out_of_place():
+    block = MiniMaxH3DiTBlock.__new__(MiniMaxH3DiTBlock)
+    torch.nn.Module.__init__(block)
+    block.norm1 = torch.nn.Identity()
+    block.norm2 = torch.nn.Identity()
+    block.attn = _KwargIdentity()
+    block.mlp = torch.nn.Identity()
+    gate_modes = []
+
+    def fake_gate(residual, _gate, _other, _indices, *, dtype, allow_inplace=True):
+        gate_modes.append(allow_inplace)
+        return residual.to(dtype)
+
+    def run(preserve):
+        block.preserve_input_for_cache_dit = preserve
+        gate_modes.clear()
+        block(
+            torch.zeros(2, 4),
+            adaln_input=torch.zeros(1, 4),
+            combined_indices=torch.zeros(2, dtype=torch.long),
+            rope_cache=None,
+            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+            max_seqlen=2,
+            adaln_params=tuple(torch.zeros(1, 4) for _ in range(6)),
+        )
+        return list(gate_modes)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_scale_shift",
+            side_effect=lambda value, *_args, **_kwargs: value,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_gate",
+            side_effect=fake_gate,
+        ),
+    ):
+        assert run(preserve=False) == [True, True]
+        # Only the first gated residual can alias the block input Cache-DiT
+        # holds by reference, so only it goes out-of-place. The second works on
+        # a block-local buffer and keeps the fused in-place kernel.
+        assert run(preserve=True) == [False, True]
+
+
+def test_cache_dit_input_preservation_toggles_every_block():
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    model.blocks = torch.nn.ModuleList([torch.nn.Identity() for _ in range(5)])
+
+    model.set_cache_dit_input_preservation(True)
+    assert all(block.preserve_input_for_cache_dit for block in model.blocks)
+
+    model.set_cache_dit_input_preservation(False)
+    assert not any(block.preserve_input_for_cache_dit for block in model.blocks)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cache_dit_out_of_place_gate_preserves_cuda_input():
+    x = torch.randn(4, 16, device="cuda", dtype=torch.bfloat16)
+    original = x.clone()
+    gate = torch.randn(2, 16, device="cuda", dtype=torch.bfloat16)
+    other = torch.randn_like(x)
+    indices = torch.tensor([0, 1, 0, 1], device="cuda", dtype=torch.long)
+    expected = _modulate_gate(
+        x.clone(),
+        gate,
+        other,
+        indices,
+        dtype=torch.bfloat16,
+        allow_inplace=True,
+    )
+
+    output = _modulate_gate(
+        x,
+        gate,
+        other,
+        indices,
+        dtype=torch.bfloat16,
+        allow_inplace=False,
+    )
+
+    assert output.data_ptr() != x.data_ptr()
+    torch.testing.assert_close(x, original, rtol=0, atol=0)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 def test_tp_and_ulysses_admission_uses_tp_local_shapes():
@@ -164,6 +285,8 @@ def test_meta_model_enforces_mixed_precision_weight_contract():
         )
 
     assert model._fsdp_mixed_dtype_params
+    qkv_weight = model.blocks[0].attn.qkv_proj.weight
+    assert callable(qkv_weight.rank_local_weight_transform)
     for name, tensor in model.state_dict().items():
         if name in expected_fp32:
             assert tensor.dtype == torch.float32, name
