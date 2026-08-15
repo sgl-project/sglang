@@ -36,17 +36,49 @@ not the per-rank group membership logic.
 
 from __future__ import annotations
 
+import socket
 import sys
+from datetime import timedelta
 from unittest.mock import Mock, patch
 
 import pytest
-
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 # Import the actual parallel_state module
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
+
+
+def _find_available_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _run_probe_with_unavailable_shm(rank: int, port: int) -> None:
+    """Run the real Gloo collective while only rank 0 cannot create shm."""
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=10),
+    )
+    try:
+        if rank == 0:
+            with patch(
+                "sglang.srt.distributed.parallel_state.shared_memory.SharedMemory",
+                side_effect=OSError("shared memory unavailable"),
+            ):
+                result = parallel_state.in_the_same_node_as(dist.group.WORLD)
+        else:
+            result = parallel_state.in_the_same_node_as(dist.group.WORLD)
+        assert result == [False, False]
+    finally:
+        dist.destroy_process_group()
 
 
 def test_parallel_group_construction_tp8_attn_cp2():
@@ -335,6 +367,15 @@ def test_group_desc_none_normalized_to_anonymous():
     assert _read_group_descs(None) == ("anonymous:device", "anonymous:cpu")
 
 
+def test_shm_creation_failure_keeps_all_ranks_in_the_collective():
+    mp.spawn(
+        _run_probe_with_unavailable_shm,
+        args=(_find_available_port(),),
+        nprocs=2,
+        join=True,
+    )
+
+
 if __name__ == "__main__":
     # Run tests without requiring GPUs
     import sys
@@ -345,6 +386,7 @@ if __name__ == "__main__":
         test_group_desc_propagated_via_real_new_group("tp")
         test_group_desc_propagated_via_real_new_group("pp")
         test_group_desc_none_normalized_to_anonymous()
+        test_shm_creation_failure_keeps_all_ranks_in_the_collective()
 
         sys.exit(0)
     except AssertionError as e:
