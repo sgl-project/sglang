@@ -11,10 +11,7 @@ from diffusers.utils import logging
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.platforms import (
-    AttentionBackendEnum,
-    current_platform,
-)
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 from .vit_utils import _env_flag, apply_rotary_pos_emb_qk
 
@@ -46,8 +43,8 @@ def _apply_qk_norm(module, hidden_states):
     if (
         _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1")
         and isinstance(module, (nn.LayerNorm, nn.RMSNorm))
-        and getattr(module, "weight", None) is None
-        and getattr(module, "bias", None) is None
+        and module.weight is None
+        and module.bias is None
         and hidden_states.is_cuda
         and hidden_states.dtype in (torch.float16, torch.bfloat16)
         and not torch.is_grad_enabled()
@@ -108,14 +105,15 @@ class Attention(nn.Module):
         self.to_out = nn.Linear(self.attn_inner_dim, self.embed_dim, bias=out_bias)
         # Decode ranks process independent complete tiles. Reuse USPAttention's
         # backend dispatch, while deliberately bypassing its sequence collectives.
-        self.attn = USPAttention(
-            num_heads=heads,
-            head_size=dim_head,
-            causal=False,
-            selected_attention_backend=(
-                AttentionBackendEnum.TORCH_SDPA if current_platform.is_rocm() else None
-            ),
-            skip_sequence_parallel=True,
+        self.attn = (
+            USPAttention(
+                num_heads=heads,
+                head_size=dim_head,
+                causal=False,
+                skip_sequence_parallel=True,
+            )
+            if current_platform.is_cuda()
+            else None
         )
 
         if len(kwargs) > 0 and (not dist.is_initialized() or dist.get_rank() == 0):
@@ -140,7 +138,7 @@ class Attention(nn.Module):
         if rotary_pos_emb is not None:
             query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
 
-        if query.dtype in (torch.float16, torch.bfloat16) and not _FORCE_ROCM_MATH_SDPA:
+        if self.attn is not None and query.dtype in (torch.float16, torch.bfloat16):
             hidden_states = self.attn(query, key, value)
         else:
             # FlashAttention kernels do not accept FP32. Preserve the explicit

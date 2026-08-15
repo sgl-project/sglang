@@ -55,11 +55,13 @@ def test_unvalidated_decode_modes_are_rejected(mode):
 
 
 def test_vit_attention_uses_local_usp_backend_dispatch():
-    attention_module = (
-        "sglang.multimodal_gen.runtime.models.vaes."
-        "minimax_h3_video_vae.attention.USPAttention"
+    module = (
+        "sglang.multimodal_gen.runtime.models.vaes." "minimax_h3_video_vae.attention"
     )
-    with mock.patch(attention_module, autospec=True) as usp_attention:
+    with (
+        mock.patch(f"{module}.current_platform.is_cuda", return_value=True),
+        mock.patch(f"{module}.USPAttention", autospec=True) as usp_attention,
+    ):
         Attention(heads=2, dim_head=64)
 
     assert usp_attention.call_args.kwargs["skip_sequence_parallel"] is True

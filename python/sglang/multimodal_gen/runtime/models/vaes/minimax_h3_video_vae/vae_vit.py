@@ -105,12 +105,6 @@ class ViTBase(ModelMixin, ConfigMixin):
             self.max_mask_ratio = mask_config.get("max_mask_ratio", 0.75)
         self.aspect_ratio_range = mask_config.get("aspect_ratio_range", (0.75, 1.5))
         self.max_retries = mask_config.get("max_retries", 100)
-        if (
-            self.mask_enabled
-            and self.mask_style == "drop"
-            and getattr(self, "t_causal", False)
-        ):
-            logger.warning("mask_style='drop' with t_causal may cause issues")
         if self.mask_enabled and "mask_token" in self._buffers:
             del self._buffers["mask_token"]
             self.mask_token = nn.Parameter(torch.randn(1, 1, self._mask_dim) * 0.02)
