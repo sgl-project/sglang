@@ -413,6 +413,28 @@ def compute_spec_v2_logprobs(
         )
 
 
+def compute_spec_v2_chain_logprobs(batch, logits_output, out_tokens: torch.Tensor):
+    """Compute logprobs for a linear (chain) verify block.
+
+    Chain verify (DFLASH / DSPARK) emits one output token per verify row in
+    order, so row j of ``next_token_logits`` is the distribution
+    ``out_tokens[:, j]`` came from and the tree accept-index gather reduces to
+    identity. Rows past the request's commit length carry unemitted drafts;
+    downstream slices them off by accept_lens.
+    """
+    bs, chain_len = out_tokens.shape
+    output_indices = torch.arange(
+        bs * chain_len, dtype=torch.int64, device=out_tokens.device
+    ).view(bs, chain_len)
+    compute_spec_v2_logprobs(
+        batch,
+        logits_output,
+        out_tokens.reshape(-1),
+        output_indices,
+        chain_len - 1,
+    )
+
+
 def _deterministic_inference_enabled() -> bool:
     """True when serving with --enable-deterministic-inference.
 
