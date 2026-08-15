@@ -14,15 +14,13 @@
 """Size of the AITER paged-decode split workspace.
 
 The buffer is allocated by ``AiterAttnBackend`` *after* the KV pool exists, so
-it has to be paid for out of the non-static slack that ``mem_fraction_static``
-leaves behind. Arg resolution therefore needs the same number the backend will
-later allocate, which is why the formula lives here instead of inline at the
-``torch.empty`` call: two copies would drift, and the reserve silently going
-stale is exactly the failure this replaces.
+``KVCacheConfigurator`` has to charge it against the pool budget. Both callers
+share this formula rather than inlining it at the ``torch.empty``: the charge
+and the allocation must be the same number, and any gap between them is lost
+memory, linear in the gap.
 """
 
 AITER_PARTITION_SIZE_ROCM = 256
-AITER_MAX_AUTO_NUM_REQS = 4096
 
 _FP32_BYTES = 4
 

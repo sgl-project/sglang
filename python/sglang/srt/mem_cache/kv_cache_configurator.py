@@ -26,6 +26,9 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.aiter_workspace import (
+    aiter_attn_workspace_bytes,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
@@ -1739,6 +1742,35 @@ class KVCacheConfigurator:
 
         return int(rest_memory * (1 << 30))  # return in bytes
 
+    def _aiter_workspace_bytes(self, max_num_reqs: int) -> int:
+        """Bytes ``AiterAttnBackend`` will allocate for its paged-decode split
+        workspace, or 0 when it allocates none.
+
+        The buffer is created after the KV pool, is fp32 and linear in context
+        length (tens of GB at long context), and no generic reserve covers it.
+        Charging it here rather than against ``mem_fraction_static`` is what
+        keeps the number exact: it is sized from ``req_to_token_pool.size``,
+        i.e. the ``max_num_reqs`` resolved just above, which arg resolution
+        cannot know because it is derived from the pool being sized.
+        """
+        prefill_backend, decode_backend = self.server_args.get_attention_backends()
+        if "aiter" not in (prefill_backend, decode_backend):
+            return 0
+        # Mirrors the three skips at the backend's own `torch.empty`.
+        if (
+            self.use_mla_backend
+            or self.is_hybrid_swa
+            or envs.SGLANG_USE_AITER_UNIFIED_ATTN.get()
+        ):
+            return 0
+        return aiter_attn_workspace_bytes(
+            max_num_reqs=max_num_reqs,
+            num_head=self.model_config.num_attention_heads
+            // get_parallel().attn_tp_size,
+            head_dim=self.model_config.head_dim,
+            context_len=self.model_config.context_len,
+        )
+
     def _calculate_mamba_ratio(self) -> int:
         if get_memory().disable_radix_cache:
             return 1
@@ -1867,6 +1899,17 @@ class KVCacheConfigurator:
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
+        workspace_bytes = self._aiter_workspace_bytes(config.max_running_requests)
+        if workspace_bytes:
+            # Second pass: the workspace is sized from the request count, which
+            # is itself derived from the first pass's capacity. Re-solving once
+            # with the charge applied is what makes the reserve equal the later
+            # allocation -- an estimate here would over- or under-shoot by its
+            # full size, and the buffer is tens of GB at long context.
+            config = self.config_from_budget(available_bytes - workspace_bytes)
+            config.max_running_requests = self.resolve_max_num_reqs(
+                config.max_total_num_tokens
+            )
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = get_schedule().mem_fraction_static
