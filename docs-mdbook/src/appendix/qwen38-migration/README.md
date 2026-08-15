@@ -122,7 +122,7 @@ CUDA_VISIBLE_DEVICES=6 python3.12 -m sglang.launch_server \
     --enable-metrics --log-level info
 ```
 
-约束：① `--context-length` 先 512K（1M 时再调，prefill 5~15 分钟）；② **不要挂在 10s 超时代理后**，客户端直连 8001 并放宽超时（prefill 分钟级）；③ 预热必须含代表性长 prompt（100K+），否则首个真实请求 JIT/autotune + 可能 OOM；④ 定位为异步批量任务服务（小时级吞吐），`--max-running-requests 2` 起步。
+约束：① `--context-length` ~~先 512K~~ **改为 320K**（2026-08-15 精算修正：512K 的 KV 超单卡容量，见 9.2；1M 时再调，prefill 5~15 分钟）；② **不要挂在 10s 超时代理后**，客户端直连 8001 并放宽超时（prefill 分钟级）；③ 预热必须含代表性长 prompt（100K+），否则首个真实请求 JIT/autotune + 可能 OOM；④ 定位为异步批量任务服务（小时级吞吐），`--max-running-requests 2` 起步。
 
 ## 7. 执行记录（权重开放后填写）
 
@@ -178,7 +178,7 @@ CUDA_VISIBLE_DEVICES=6 python3.12 -m sglang.launch_server \
   若 index 中无任何 `mtp.` 键 → BF16 变体无 MTP（Qwen3.6 实测 MTP 带来 E2E 约 2.2x 收益，长输出场景影响明显）；
 - **权重精度与显存**：**生产首选 FP8 变体**（含 MTP，显存账与 Qwen3.6-27B-FP8 相当：TP2 下每卡权重 ~14GB，96K + DP3 + mem 0.85 可直接沿用）。BF16 全量（≈55.6GB，约 27.8B 参数含 vision）在 TP2 下每卡权重约 **27.8GB**，6×L40S 上会显著挤压 KV/state 容量，仅作对照或需收紧 context/并发；
 - **为什么 BF16 不适合生产（L40S TP2 评估）**：① 显存——BF16 每卡权重 27.8GB vs FP8 ~14GB，mem 0.85 预算下 KV/state 池大约腰斩，96K + 12 并发/worker 的稳态配置保不住；② 带宽——L40S 是带宽受限卡（864GB/s），decode 每步读取字节翻倍（55.6GB vs 27.8GB），ITL 量级翻倍（FP8 实测 92ms，BF16 预计 130ms 以上）；③ MTP——BF16 无独立 mtp 权重，即使 index 内嵌，verify 同样吃双倍带宽。结论：**BF16 只用于质量对照（低并发、不追求延迟），生产用 FP8**；
-- **上下文扩展到 1M（官方 README YaRN 方案）**：`--json-model-override-args` + `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` + `rope_type: yarn / factor 4.0` 在 **0.5.17 全部支持**（server_args/environ/rotary factory 均已核对，含 mrope+yarn 的 `YaRNScalingMRotaryEmbedding`）。6 卡 L40S 上 1M 是另一个运行体系：单序列 KV（fp8）≈2GB、prefill 分钟级、并发个位数、一次性长文档 radix 命中趋近 0。**单卡 L40S 评估**：FP8 可装（权重 ~28GB，池子 ~4~5M token，1M 序列可同时放 2~5 条），BF16 装不下（55.6GB）；但单卡 1M prefill 约 5~15 分钟、decode 92ms/步——**只适合离线批量长文档分析，不适合交互**。仅当确有 >100K 需求时，开独立低并发服务实测（100K/500K/1M 的 prefill 耗时、YaRN 质量衰减、池子并发上限），不要动现有 98K 生产配置；
+- **上下文扩展到 1M（官方 README YaRN 方案）**：`--json-model-override-args` + `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` + `rope_type: yarn / factor 4.0` 在 **0.5.17 全部支持**（server_args/environ/rotary factory 均已核对，含 mrope+yarn 的 `YaRNScalingMRotaryEmbedding`）。6 卡 L40S 上 1M 是另一个运行体系：单序列 KV（fp8）≈2GB、prefill 分钟级、并发个位数、一次性长文档 radix 命中趋近 0。**单卡 L40S 评估**：FP8 可装（权重 ~28GB），BF16 装不下（55.6GB）；但单卡 1M prefill 约 5~15 分钟、decode 92ms/步——**只适合离线批量长文档分析，不适合交互**。（2026-08-15 修正：此处"池子 ~4~5M token、1M 序列可同时放 2~5 条"及上文"单序列 KV(fp8)≈2GB"系估算错误，精算见 9.2——1M 序列 fp8 KV 实为 ~32GB，单卡纯显存放不下。）仅当确有 >100K 需求时，开独立低并发服务实测（100K/500K/1M 的 prefill 耗时、YaRN 质量衰减、池子并发上限），不要动现有 98K 生产配置；
 - **L40S 组合**：沿用 `--mamba-radix-cache-strategy extra_buffer` / `--mamba-backend triton` / `--disable-cuda-graph`；建议显式 `--mamba-ssm-dtype bfloat16`（config 默认 float32，测试与 Qwen3.6 经验均用 bfloat16，需验证精度）；
 - **Parser**：`--reasoning-parser qwen3` / `--tool-call-parser qwen3_coder` 大概率沿用，冒烟时验证（Qwen3.8 主打 coding/cowork，工具调用格式可能微调）。
 
@@ -189,3 +189,57 @@ CUDA_VISIBLE_DEVICES=6 python3.12 -m sglang.launch_server \
 3. 权重目录核对：FP8 变体目录内确认 `mtp.safetensors` 存在（生产路径前提）；BF16 变体仅对照，如需用再查 index 内嵌 `mtp.*` 键；
 4. FP8 变体单卡冒烟，实测显存占用，确认 96K + DP3 + mem 0.85 沿用无压力；
 5. 按清单 3~6 完成质量、MTP、parser、性能对比后填第 7 节执行记录。
+
+## 9. 上游 sync 盘点与单卡显存精算修正（2026-08-15）
+
+### 9.1 上游同步盘点
+
+fork main 已合并 sgl-project/sglang 最新 main（behind 0）。Qwen3.8-27B 发布前后，上游针对该模型的提交**只有文档，无模型层定制**：
+
+| 提交 | 内容 | 对我们的意义 |
+|------|------|-------------|
+| #34860 | 新增 Qwen3.8-27B cookbook | 官方部署配方可参考；明确"serving 相关架构与 Qwen3.6-27B 一致"，印证第 8 节判定 |
+| #34863 | GB300 benchmark 数据 | 与我们硬件无关 |
+| **#34560** | **修复 Qwen3.5 架构家族 MTP + HiCache 同开启动失败** | 9.4 的 HiCache 路线或生产开分层缓存的**前提**，必须确认代码含此提交 |
+
+官方 cookbook 补充信息：checkpoint 共三档——BF16 / FP8（blockwise）/ NVFP4（RadixArk 出，**Blackwell 专属，SM89 不可用**）；官方定位单卡可跑（H200 / RTX PRO 6000 级）；唯一需要重新核算的 sizing 参数是 `--mamba-full-memory-ratio`（cookbook 附计算器）。
+
+### 9.2 单卡显存精算（修正第 6 节 512K 与第 8.4 节池子估算）
+
+hybrid GDN 架构中，48 层 GDN 的状态定长（~146MB/req，不占 KV 池），**只有 16 层 full attention 产生随上下文线性增长的 KV**：
+
+```
+每 token KV = 16 层 × 2(K+V) × 4 KV头 × 256 head_dim = 32,768 元素
+  fp8 KV → 32 KB/token；bf16 KV → 64 KB/token
+单卡 L40S（46GB）：静态池（mem-fraction 0.85）≈ 39GB − FP8 权重 ~28GB ≈ 11GB
+  → KV 池上限 ≈ 34 万 token
+```
+
+| 目标上下文 | FP8 KV 占用 | + 权重 28GB | 单卡 L40S 判定 |
+|---|---|---|---|
+| 1,000,000 | 32 GB | 60 GB | **不可行**（纯显存路线） |
+| 524,288（512K） | 16 GB | 44 GB | **不可行**（修正第 6 节命令） |
+| 327,680（320K） | 10 GB | 38 GB | **可行（推荐验证目标）** |
+| 262,144（原生） | 8 GB | 36 GB | 可行，但走不到 YaRN 扩展路径 |
+
+**修正两处既有估算**：① 第 6 节命令的 `--context-length 524288` 超单卡容量，已改为 320K；② 第 8.4 节"池子 ~4~5M token、1M 序列可同时放 2~5 条"与"单序列 KV(fp8)≈2GB"均系估算错误——1M 序列 fp8 KV 实为 ~32GB，单卡纯显存连一条都放不下。
+
+### 9.3 长上下文验证设计（大海捞针对照实验）
+
+验证 YaRN 扩展是否真实生效，做对照实验，各发一次 ~30 万 token 的"大海捞针"请求（拼接长文档，埋入随机事实后提问）：
+
+1. **针必须埋在 262K 之后**——埋在原生训练范围内则实验无区分度；
+2. 带 YaRN override 启动 → 答对，扩展路径工作正常；
+3. （对照）只加 `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`、不加 `--json-model-override-args` → RoPE 直接外推到未训练区域，预期答错或乱码，反向证明第 2 步不是蒙的。
+
+预期管理：GDN 层 prefill 是串行 scan，30 万 token 输入单卡 TTFT 为分钟级，属架构特性而非故障；decode 有 MTP，体验与生产一致。
+
+### 9.4 单卡挑战 1M 的唯一路径：HiCache 卸载（探索性）
+
+纯显存路线物理不可行（60GB > 46GB），唯一路径是 **HiCache 分层缓存把 KV 卸载到主机内存**（`--enable-hierarchical-cache --hicache-ratio 2`），GPU 只保留热窗口：
+
+- **前提**：代码须含 #34560（MTP + HiCache 启动修复）；hybrid GDN（mamba state）+ HiCache 的组合**无官方验证记录**，mamba 定长状态与 KV 分层能否协同要实测；
+- **资源**：主机内存 ≥32GB 余量承接卸载的 KV；`--max-running-requests` 压到 1；
+- **代价**：1M token prefill 的 full-attn O(n²) 开销主导，单卡 TTFT 预计 10 分钟级；decode 命中冷 KV 需从内存搬回，ITL 抖动。
+
+务实路线：先按 9.3 跑通 320K 验证（显存内可完成、有区分度），再视实际需求决定是否投入 1M 探索；**生产级 1M 建议 TP=2 起步**，不在单卡上硬扛。
