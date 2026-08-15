@@ -1,6 +1,6 @@
 """Unit tests for the optional DeepStack BCG replay slot.
 
-Covers the three-site contract:
+Covers the three-site allocation contract:
 
   * ``build_prefill_registry`` registers an ``input_deepstack_embeds``
     slot iff ``is_multimodal AND register_input_embeds AND
@@ -13,8 +13,12 @@ Covers the three-site contract:
     MoE subclass inherits it; ``Qwen2_5_VLForConditionalGeneration``
     and text-only ``Qwen3ForCausalLM`` do not.
 
-All tests are CPU-only — the registry / dataclass logic under test is
-GPU-agnostic; ``torch.zeros`` on the ``cpu`` device is sufficient.
+and the per-replay refresh of the allocated slot
+(``_refresh_deepstack_replay_slot``), which is where a stale or
+malformed contribution would reach the captured graph.
+
+All tests are CPU-only — the logic under test is GPU-agnostic;
+``torch.zeros`` on the ``cpu`` device is sufficient.
 """
 
 import unittest
@@ -23,6 +27,9 @@ import torch
 
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
+)
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    _refresh_deepstack_replay_slot,
 )
 from sglang.srt.model_executor.runner_utils.buffers import PrefillInputBuffers
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -188,6 +195,98 @@ class TestQwen3VLCapabilityOptIn(CustomTestCase):
         self.assertFalse(
             getattr(Qwen3ForCausalLM, "supports_bcg_deepstack_replay", False)
         )
+
+
+class TestDeepStackReplaySlotRefresh(CustomTestCase):
+    """Per-replay refresh of the stable slot.
+
+    The slot is a persistent buffer shared by every request that lands in
+    the same token bucket, so each replay must fully define its contents.
+    These cases guard the two ways that breaks: rows surviving into a
+    later request, and a malformed contribution being swapped for zeros
+    and served as if the request had carried no DeepStack at all.
+    """
+
+    NUM_TOKENS = 8
+    WIDTH = 192
+    DTYPE = torch.bfloat16
+
+    def _slot(self) -> torch.Tensor:
+        return torch.zeros(
+            (self.NUM_TOKENS, self.WIDTH), dtype=self.DTYPE, device=_DEVICE
+        )
+
+    def _embeds(self, num_rows, value, width=None, dtype=None) -> torch.Tensor:
+        return torch.full(
+            (num_rows, width or self.WIDTH),
+            value,
+            dtype=dtype or self.DTYPE,
+            device=_DEVICE,
+        )
+
+    def test_shorter_request_does_not_inherit_stale_rows(self):
+        """A shorter request reusing the bucket sees its own rows followed
+        by zeros. The LM applies the slot with ``add_`` rather than through
+        attention, so an uncleared tail would corrupt its real tokens."""
+        slot = self._slot()
+        _refresh_deepstack_replay_slot(
+            slot=slot, deepstack_embeds=self._embeds(self.NUM_TOKENS, 3.0)
+        )
+        _refresh_deepstack_replay_slot(slot=slot, deepstack_embeds=self._embeds(3, 5.0))
+        self.assertTrue(torch.all(slot[:3] == 5.0))
+        self.assertTrue(torch.all(slot[3:] == 0.0))
+
+    def test_absent_deepstack_clears_stale_rows(self):
+        """A text-only request carries no DeepStack, so the slot is cleared
+        instead of left holding the previous image request's rows."""
+        slot = self._slot()
+        _refresh_deepstack_replay_slot(
+            slot=slot, deepstack_embeds=self._embeds(self.NUM_TOKENS, 3.0)
+        )
+        _refresh_deepstack_replay_slot(slot=slot, deepstack_embeds=None)
+        self.assertTrue(torch.all(slot == 0.0))
+
+    def test_empty_deepstack_clears_stale_rows(self):
+        """An empty tensor states absence rather than a malformed
+        contribution, so it clears the slot instead of failing closed."""
+        slot = self._slot()
+        _refresh_deepstack_replay_slot(
+            slot=slot, deepstack_embeds=self._embeds(self.NUM_TOKENS, 3.0)
+        )
+        _refresh_deepstack_replay_slot(slot=slot, deepstack_embeds=self._embeds(0, 0.0))
+        self.assertTrue(torch.all(slot == 0.0))
+
+    def test_malformed_deepstack_fails_closed(self):
+        """A non-empty contribution that does not fit the captured slot
+        raises. Zeroing it and replaying anyway would answer the request
+        with zero DeepStack while looking successful — the silent
+        corruption this slot exists to prevent."""
+        cases = {
+            "narrower than the slot": self._embeds(4, 1.0, width=self.WIDTH // 2),
+            "dtype the graph cannot read": self._embeds(4, 1.0, dtype=torch.float32),
+            "more rows than the bucket": self._embeds(self.NUM_TOKENS + 1, 1.0),
+        }
+        for name, embeds in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(RuntimeError):
+                    _refresh_deepstack_replay_slot(
+                        slot=self._slot(), deepstack_embeds=embeds
+                    )
+
+    def test_fail_closed_leaves_slot_unmodified(self):
+        """Validation precedes every write, so a rejected contribution
+        cannot leave the slot half-updated for a caller that catches the
+        error and replays."""
+        slot = self._slot()
+        _refresh_deepstack_replay_slot(
+            slot=slot, deepstack_embeds=self._embeds(self.NUM_TOKENS, 3.0)
+        )
+        with self.assertRaises(RuntimeError):
+            _refresh_deepstack_replay_slot(
+                slot=slot,
+                deepstack_embeds=self._embeds(4, 9.0, width=self.WIDTH // 2),
+            )
+        self.assertTrue(torch.all(slot == 3.0))
 
 
 if __name__ == "__main__":

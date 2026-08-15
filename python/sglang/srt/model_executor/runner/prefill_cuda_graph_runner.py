@@ -191,6 +191,45 @@ def _slice_output_rows(output: Any, num_tokens: int) -> Any:
     raise TypeError(f"Unsupported full prefill CUDA graph output: {type(output)}")
 
 
+def _refresh_deepstack_replay_slot(
+    slot: torch.Tensor, deepstack_embeds: Optional[torch.Tensor]
+) -> None:
+    """Point the captured DeepStack slot at this request's contribution.
+
+    ``slot`` is the token-row slice the captured graph reads. Absence —
+    ``None`` or an empty tensor — zeroes it, so a previous replay's rows
+    cannot bleed into a text-only or shorter request through the LM's
+    ``add_``.
+
+    A non-empty tensor that does not fit the slot is a contract violation,
+    not an absence: zeroing and replaying anyway would serve a silently
+    zero-DeepStack answer, the failure this slot exists to prevent. Raise
+    instead, before touching the slot.
+    """
+    if deepstack_embeds is None or deepstack_embeds.numel() == 0:
+        slot.zero_()
+        return
+
+    num_tokens = slot.shape[0]
+    if (
+        deepstack_embeds.shape[0] > num_tokens
+        or deepstack_embeds.shape[1:] != slot.shape[1:]
+        or deepstack_embeds.dtype != slot.dtype
+        or deepstack_embeds.device != slot.device
+    ):
+        raise RuntimeError(
+            "input_deepstack_embeds does not fit the captured BCG replay slot: "
+            f"got shape={tuple(deepstack_embeds.shape)}, "
+            f"dtype={deepstack_embeds.dtype}, device={deepstack_embeds.device}; "
+            f"slot holds up to {num_tokens} rows of {tuple(slot.shape[1:])} "
+            f"{slot.dtype} on {slot.device}."
+        )
+
+    num_rows = deepstack_embeds.shape[0]
+    slot[:num_rows].copy_(deepstack_embeds)
+    slot[num_rows:].zero_()
+
+
 @dataclass(frozen=True)
 class _ChunkedPrefixCaptureBuffers:
     """Runner-owned tensors shared by every prefix and token-bucket variant.
@@ -1670,39 +1709,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.buffer_registry.get_slot("input_embeds").slice_for(
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
-            # DeepStack replay slot: same lifecycle as ``input_embeds``
-            # above. The else branch zeros the slice so a stale image
-            # contribution cannot bleed into a text-only or smaller
-            # request that reuses this bucket — the LM applies the
-            # slot via ``add_`` (not through attention), so unmasked
-            # padded rows would corrupt real tokens otherwise.
+            # DeepStack replay slot: same lifecycle as ``input_embeds`` above.
             if self.buffer_registry.has_slot("input_deepstack_embeds"):
-                slot = self.buffer_registry.get_slot(
-                    "input_deepstack_embeds"
-                ).slice_for(1, static_num_tokens)
-                de = layer_kwargs.get("input_deepstack_embeds")
-                if (
-                    de is not None
-                    and de.numel() > 0
-                    and de.shape[0] <= static_num_tokens
-                    and de.shape[1:] == slot.shape[1:]
-                    and de.dtype == slot.dtype
-                    and de.device == slot.device
-                ):
-                    slot[: de.shape[0]].copy_(de)
-                    if de.shape[0] < static_num_tokens:
-                        slot[de.shape[0] :].zero_()
-                else:
-                    if de is not None:
-                        logger.warning(
-                            "DeepStack replay slot rejected a non-empty "
-                            "input_deepstack_embeds (shape=%s, dtype=%s, device=%s); "
-                            "replaying with zero contribution.",
-                            tuple(de.shape),
-                            de.dtype,
-                            de.device,
-                        )
-                    slot.zero_()
+                _refresh_deepstack_replay_slot(
+                    slot=self.buffer_registry.get_slot(
+                        "input_deepstack_embeds"
+                    ).slice_for(1, static_num_tokens),
+                    deepstack_embeds=layer_kwargs.get("input_deepstack_embeds"),
+                )
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
