@@ -1240,8 +1240,6 @@ class Envs:
     # ===================================================================
     # DeepSeek V4 - model and quantization
     # ===================================================================
-    SGLANG_OPT_USE_FUSED_COMPRESS = EnvBool(False)
-    SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
     SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
     SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION = EnvBool(True)
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
@@ -1302,6 +1300,7 @@ class Envs:
     # DeepSeek V4 - Flags for AMD GPUs
     # ===================================================================
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
+    SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
 
     # ===================================================================
     # Inkling

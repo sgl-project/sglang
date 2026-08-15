@@ -5450,7 +5450,6 @@ class ServerArgs:
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
             elif is_hip():
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-                envs.SGLANG_OPT_USE_FUSED_COMPRESS.set(True)
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)

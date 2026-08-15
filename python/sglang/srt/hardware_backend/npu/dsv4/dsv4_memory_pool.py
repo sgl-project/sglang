@@ -21,8 +21,7 @@ The subclass overrides only:
     must consume ``out_cache_loc_dsv4.out_c{4,128}_state_loc`` from the
     allocator bundle instead. Currently the only NPU caller that still
     invokes translate is the unfused Python compressor decode path
-    (``layers/attention/dsv4/compressor.py``); with USE_FUSED_COMPRESSOR=1
-    that path is dead. If someone disables the fused compressor, they hit
+    (``layers/attention/dsv4/compressor.py``); If someone disables the fused compressor, they hit
     the raise with a clear message.
 """
 
