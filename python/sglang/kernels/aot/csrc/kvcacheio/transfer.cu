@@ -1,5 +1,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/util/irange.h>
 #include <cuda_runtime.h>
 
@@ -730,6 +731,157 @@ void transfer_kv_direct(
     }
     start_index = end_index;
   }
+}
+
+void transfer_embedding_ranges_direct(
+    const at::Tensor& src,
+    at::Tensor& dst,
+    const std::vector<int64_t>& src_starts,
+    const std::vector<int64_t>& dst_starts,
+    const std::vector<int64_t>& lengths) {
+  TORCH_CHECK(src.dim() == 2, "Source embedding tensor must be 2D");
+  TORCH_CHECK(dst.dim() == 2, "Destination embedding tensor must be 2D");
+  TORCH_CHECK(src.scalar_type() == dst.scalar_type(), "Source and destination dtypes must match");
+  TORCH_CHECK(src.size(1) == dst.size(1), "Source and destination embedding dims must match");
+  TORCH_CHECK(src.is_contiguous() && dst.is_contiguous(), "Embedding tensors must be contiguous");
+  TORCH_CHECK(src.is_cuda() != dst.is_cuda(), "Exactly one embedding tensor must be on CUDA");
+  TORCH_CHECK(src_starts.size() == dst_starts.size(), "src_starts and dst_starts must have the same length");
+  TORCH_CHECK(src_starts.size() == lengths.size(), "src_starts and lengths must have the same length");
+
+  const auto num_ranges = lengths.size();
+  if (num_ranges == 0) {
+    return;
+  }
+
+  const auto copy_device = src.is_cuda() ? src.device() : dst.device();
+  const at::cuda::OptionalCUDAGuard device_guard(copy_device);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  const size_t row_bytes = static_cast<size_t>(src.size(1)) * src.element_size();
+  const char* src_base = static_cast<const char*>(src.data_ptr());
+  char* dst_base = static_cast<char*>(dst.data_ptr());
+
+  thread_local std::vector<void*> batch_srcs;
+  thread_local std::vector<void*> batch_dsts;
+  thread_local std::vector<size_t> batch_sizes;
+  batch_srcs.clear();
+  batch_dsts.clear();
+  batch_sizes.clear();
+  batch_srcs.reserve(num_ranges);
+  batch_dsts.reserve(num_ranges);
+  batch_sizes.reserve(num_ranges);
+
+  // Validate the complete plan before submitting any asynchronous copy so a
+  // bad later range cannot leave the destination partially updated.
+  for (size_t i = 0; i < num_ranges; ++i) {
+    const int64_t src_start = src_starts[i];
+    const int64_t dst_start = dst_starts[i];
+    const int64_t length = lengths[i];
+
+    TORCH_CHECK(length >= 0, "Range length must be non-negative");
+    if (length == 0) {
+      continue;
+    }
+    TORCH_CHECK(src_start >= 0, "Source range start must be non-negative");
+    TORCH_CHECK(dst_start >= 0, "Destination range start must be non-negative");
+    TORCH_CHECK(length <= src.size(0) - src_start, "Source range is out of bounds");
+    TORCH_CHECK(length <= dst.size(0) - dst_start, "Destination range is out of bounds");
+
+    batch_srcs.push_back(const_cast<char*>(src_base + static_cast<size_t>(src_start) * row_bytes));
+    batch_dsts.push_back(dst_base + static_cast<size_t>(dst_start) * row_bytes);
+    batch_sizes.push_back(static_cast<size_t>(length) * row_bytes);
+  }
+
+  const auto fallback_to_async_copies = [&]() {
+    for (size_t i = 0; i < batch_sizes.size(); ++i) {
+      C10_CUDA_CHECK(cudaMemcpyAsync(batch_dsts[i], batch_srcs[i], batch_sizes[i], cudaMemcpyDefault, stream));
+    }
+  };
+
+  if (batch_sizes.empty()) {
+    return;
+  }
+
+#if defined(USE_ROCM) || defined(USE_MUSA) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
+  fallback_to_async_copies();
+  return;
+#else
+  // cudaMemcpyBatchAsync rejects the legacy NULL stream.
+  if (stream == nullptr) {
+    fallback_to_async_copies();
+    return;
+  }
+
+  int driver_version = 0;
+  const cudaError_t driver_version_err = cudaDriverGetVersion(&driver_version);
+  if (driver_version_err != cudaSuccess || driver_version < 12080) {
+    fallback_to_async_copies();
+    return;
+  }
+
+  static void* cuda_memcpy_batch_async_sym = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
+  if (cuda_memcpy_batch_async_sym == nullptr) {
+    fallback_to_async_copies();
+    return;
+  }
+
+  static int runtime_version = 0;
+  static const cudaError_t runtime_version_err = cudaRuntimeGetVersion(&runtime_version);
+  if (runtime_version_err != cudaSuccess) {
+    fallback_to_async_copies();
+    return;
+  }
+  static const bool use_v13_signature = runtime_version >= 13000;
+
+  const int device_id = copy_device.index();
+  std::vector<size_t> attrs_idxs(1, 0);
+  cudaMemcpyAttributes attrs{};
+  attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+  attrs.srcLocHint.type = src.is_cuda() ? cudaMemLocationTypeDevice : cudaMemLocationTypeHost;
+  attrs.srcLocHint.id = src.is_cuda() ? device_id : 0;
+  attrs.dstLocHint.type = dst.is_cuda() ? cudaMemLocationTypeDevice : cudaMemLocationTypeHost;
+  attrs.dstLocHint.id = dst.is_cuda() ? device_id : 0;
+  attrs.flags = 0;
+
+  cudaError_t err;
+  size_t fail_idx = std::numeric_limits<size_t>::max();
+  if (use_v13_signature) {
+    using FnV13 = cudaError_t (*)(
+        void* const*, const void* const*, const size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, cudaStream_t);
+    auto fn = reinterpret_cast<FnV13>(cuda_memcpy_batch_async_sym);
+    err =
+        fn(batch_dsts.data(),
+           batch_srcs.data(),
+           batch_sizes.data(),
+           batch_sizes.size(),
+           &attrs,
+           attrs_idxs.data(),
+           1,
+           stream);
+  } else {
+    using FnV12 =
+        cudaError_t (*)(void**, void**, size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, size_t*, cudaStream_t);
+    auto fn = reinterpret_cast<FnV12>(cuda_memcpy_batch_async_sym);
+    err =
+        fn(batch_dsts.data(),
+           batch_srcs.data(),
+           batch_sizes.data(),
+           batch_sizes.size(),
+           &attrs,
+           attrs_idxs.data(),
+           1,
+           &fail_idx,
+           stream);
+  }
+
+  if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
+    (void)cudaGetLastError();
+    fallback_to_async_copies();
+    return;
+  }
+  TORCH_CHECK(
+      err == cudaSuccess, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
+#endif
 }
 
 template <bool IsLf2Pf>
