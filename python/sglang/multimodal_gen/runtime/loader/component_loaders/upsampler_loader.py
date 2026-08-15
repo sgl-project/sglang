@@ -98,7 +98,13 @@ def _normalize_config(raw: dict) -> dict:
 
     # diffusers uses rational_spatial_scale instead of rational_resampler + spatial_scale
     if "rational_spatial_scale" in raw and "rational_resampler" not in config:
-        config["rational_resampler"] = True
+        # LTX-2.5 states this explicitly and turns it off, so the scale alone
+        # no longer implies it. Assuming True builds the wrong module (3 missing
+        # / 2 unexpected tensors).
+        if "use_rational_resampler" in raw:
+            config["rational_resampler"] = bool(raw["use_rational_resampler"])
+        else:
+            config["rational_resampler"] = True
         config.setdefault("spatial_scale", raw["rational_spatial_scale"])
 
     return config

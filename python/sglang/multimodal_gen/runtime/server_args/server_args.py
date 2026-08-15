@@ -290,6 +290,8 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Component path overrides (key = model_index.json component name, value = path)
     component_paths: dict[str, str] = field(default_factory=dict)
+    # Optional LTX-2.5 decoder is large enough to load only when requested.
+    load_diffusion_decoder: bool = False
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
     transformer_weights_path: str | None = None
@@ -1563,6 +1565,16 @@ class ServerArgs(DisaggServerArgsMixin):
             help=(
                 "Advanced override for pipeline class selection from the model registry "
                 "or model_index.json. Must match a registered pipeline_name."
+            ),
+        )
+        parser.add_argument(
+            "--load-diffusion-decoder",
+            action=StoreBoolean,
+            default=ServerArgs.load_diffusion_decoder,
+            help=(
+                "Load the optional LTX-2.5 diffusion decoder so requests may set "
+                "use_diffusion_decoder. Offline generate enables this automatically "
+                "when --use-diffusion-decoder is passed."
             ),
         )
         # attention
