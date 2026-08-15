@@ -290,13 +290,12 @@ class MediaArtifactCacheMixin:
         if len(featureless_hit_mask) != media_count:
             raise ValueError("featureless_hit_mask must align with media_data")
 
-        # Keep all per-input state index-aligned until the final result is rebuilt.
-        # This is what makes duplicate media and partial hit/miss batches safe.
+        # keep per-input state aligned for duplicates and partial hits
         artifacts: list[Optional[MediaArtifact]] = [None] * media_count
         snapshots: list[Optional[MediaSnapshot]] = [None] * media_count
         keys: list[Optional[str]] = [None] * media_count
 
-        # Trusted callers may use a metadata hit without touching the source.
+        # 1. resolve trusted-hash hits without reading media
         load_indices = []
         for index, (source, caller_hash, allow_featureless) in enumerate(
             zip(media_data, content_hashes, featureless_hit_mask)
@@ -315,8 +314,7 @@ class MediaArtifactCacheMixin:
                     continue
             load_indices.append(index)
 
-        # Snapshot each remaining source once. The snapshot supplies both the
-        # verified content hash and the exact bytes/object decoded on a miss.
+        # 2. snapshot remaining media once and resolve verified hits
         snapshot_futures = {
             index: self.io_executor.submit(
                 self.snapshot_media_source, media_data[index], modality
@@ -343,9 +341,7 @@ class MediaArtifactCacheMixin:
                 allow_featureless=featureless_hit_mask[index],
             )
 
-        # Deduplicate misses before decode. A metadata-only entry may have been
-        # rejected above because this request still needs the feature; retain it
-        # only to verify that recomputation produces the same feature hash.
+        # 3. deduplicate misses before decode
         first_index_by_key: dict[str, int] = {}
         previous_metadata: dict[str, MediaArtifact] = {}
         for index in load_indices:
@@ -360,8 +356,7 @@ class MediaArtifactCacheMixin:
                     previous_metadata[key] = previous
 
         unique_keys = list(first_index_by_key)
-        # Atomically claim new misses. Concurrent requests for the same key get
-        # a CacheMiss with should_compute=False and wait for this shared work.
+        # 4. claim one computation for each unique miss
         cache_results = self.mm_preprocess_cache.lookup_or_claim_many(
             unique_keys,
             predicate=lambda key, artifact: self.artifact_usable(
@@ -388,18 +383,17 @@ class MediaArtifactCacheMixin:
                     modality,
                 )
             )
-            # Shared work outlives cancellation of the request doing the work.
+            # shared work outlives cancellation of this request
             await asyncio.shield(miss_task)
 
-        # Requests that lost the single-flight race reuse the first request's
-        # artifact instead of decoding and preprocessing the media again.
+        # 5. wait for misses already claimed by another request
         for key, result in zip(unique_keys, cache_results):
             if isinstance(result, CacheMiss) and not result.should_compute:
                 resolved_by_key[key] = await self.mm_preprocess_cache.wait_for_miss(
                     result
                 )
 
-        # Expand the per-key results back to the caller's original media order.
+        # 6. restore the original processor-input order
         for index, artifact in enumerate(artifacts):
             if artifact is None:
                 key = keys[index]
@@ -425,6 +419,7 @@ class MediaArtifactCacheMixin:
         CPU cache. The two values differ when a CUDA feature must not be cached.
         """
         try:
+            # 1. decode each unique miss
             miss_entries = []
             for miss in misses_to_compute:
                 index = first_index_by_key[miss.key]
@@ -444,6 +439,7 @@ class MediaArtifactCacheMixin:
                     )
                 )
 
+            # 2. preprocess all decoded misses as one model batch
             miss_artifacts = await self._run_artifact_batch(miss_entries)
             if len(miss_artifacts) != len(misses_to_compute):
                 raise ValueError(
@@ -464,8 +460,7 @@ class MediaArtifactCacheMixin:
                     )
                 cache_value = artifact.cache_value()
                 self.validate_artifact(cache_value, entry)
-                # Wake waiters with the full result, but retain only the
-                # cache-safe representation for future requests.
+                # 3. return full artifacts and retain cache-safe copies
                 self.mm_preprocess_cache.complete_miss(
                     miss,
                     artifact,

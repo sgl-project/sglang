@@ -528,7 +528,7 @@ class KimiK3ImageProcessor(
         """Preprocess cache-miss images into reusable per-image artifacts."""
         processor = processor or self._processor
         artifacts: list[Optional[KimiK3ImagePreprocessArtifact]] = [None] * len(entries)
-        # inputs preprocessed now instead of deferred to the GPU path
+        # 1. collect inputs preprocessed now instead of deferred to the GPU path
         eager_indices = []
         eager_images = []
 
@@ -568,6 +568,7 @@ class KimiK3ImageProcessor(
                 ),
             )
 
+        # 2. preprocess eager inputs as one batch
         if eager_images:
             features, sizes, configs, grids = processor.prepare_image_features(
                 eager_images
@@ -585,6 +586,7 @@ class KimiK3ImageProcessor(
                     feature=feature,
                 )
 
+        # 3. return artifacts in the original processor-input order
         if any(artifact is None for artifact in artifacts):
             raise RuntimeError("Kimi-K3 artifact batch did not produce every image")
         return [artifact for artifact in artifacts if artifact is not None]
@@ -603,8 +605,7 @@ class KimiK3ImageProcessor(
         ``MultimodalDataItem`` with offsets, grid metadata, feature, and feature
         hash. It does not read raw media or access the preprocess cache.
         """
-        # prompt tokens and offsets depend on the current turn, so rebuild them
-        # even when every per-image artifact came from the preprocess cache
+        # 1. rebuild prompt-specific tokens and offsets
         original_ids = (
             input_text
             if isinstance(input_text, (list, torch.Tensor))
@@ -621,8 +622,7 @@ class KimiK3ImageProcessor(
         if len(offsets) != len(artifacts):
             raise ValueError("Expected one Kimi-K3 image span for each image")
 
-        # turn each prompt-independent artifact into the request-owned item
-        # consumed by the downstream feature transport and vision encoder
+        # 2. build request-owned items from prompt-independent artifacts
         items = []
         for artifact, offset in zip(artifacts, offsets):
             model_specific_data = {
@@ -722,10 +722,12 @@ class KimiK3ImageProcessor(
             any(self._is_preprocessed_input(item) for item in image_data)
             or not self.mm_preprocess_cache.enabled
         ):
+            # 1. keep preprocessed inputs and cache-off requests on the legacy path
             return await self._process_mm_data_uncached(
                 image_data, input_text, request_obj, **kwargs
             )
 
+        # 2. resolve per-image artifacts before composing the current prompt
         artifacts = await self.prepare_media_artifacts(
             image_data,
             content_hashes=request_obj.mm_content_hashes,
