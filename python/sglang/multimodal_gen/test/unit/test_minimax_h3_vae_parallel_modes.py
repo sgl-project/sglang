@@ -12,6 +12,9 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import MiniMaxH3VideoV
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
     AutoencoderKLLegacy,
 )
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention import (
+    Attention,
+)
 
 
 def _init_kwargs(config: MiniMaxH3VideoVAEConfig):
@@ -49,3 +52,14 @@ def test_unvalidated_decode_modes_are_rejected(mode):
     config = MiniMaxH3VideoVAEConfig(parallel_decode_mode=mode)
     with pytest.raises(ValueError, match="use tiled"):
         config.resolved_parallel_decode_mode()
+
+
+def test_vit_attention_uses_local_usp_backend_dispatch():
+    attention_module = (
+        "sglang.multimodal_gen.runtime.models.vaes."
+        "minimax_h3_video_vae.attention.USPAttention"
+    )
+    with mock.patch(attention_module, autospec=True) as usp_attention:
+        Attention(heads=2, dim_head=64)
+
+    assert usp_attention.call_args.kwargs["skip_sequence_parallel"] is True
