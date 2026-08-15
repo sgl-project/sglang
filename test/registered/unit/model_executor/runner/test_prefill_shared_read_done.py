@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_utils import (
     maybe_publish_prefill_shared_read_done,
@@ -23,9 +23,7 @@ class _Event:
 
 
 def _model_runner(*, spec_algorithm=SpeculativeAlgorithm.NONE, compliant=True):
-    boundary = (
-        SharedReadBoundary.PRE_REPLAY if compliant else SharedReadBoundary.UNKNOWN
-    )
+    boundary = SharedReadEnds.PRE_REPLAY if compliant else SharedReadEnds.UNKNOWN
     return SimpleNamespace(
         spec_algorithm=spec_algorithm,
         attn_backend=SimpleNamespace(shared_read_boundary=lambda mode: boundary),

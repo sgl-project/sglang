@@ -44,7 +44,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -445,7 +445,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _resolve_shared_read_boundary(
         self, attn_backend, forward_mode
-    ) -> SharedReadBoundary:
+    ) -> SharedReadEnds:
         """Where this replay records its shared-read-done event: the backend's
         declaration, demoted when this runner cannot record at that point.
         UNKNOWN records nothing (scheduler keeps the coarse fence)."""
@@ -453,18 +453,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if not self.model_runner.spec_algorithm.is_last_shared_read_phase(
                 forward_mode
             ):
-                return SharedReadBoundary.UNKNOWN
+                return SharedReadEnds.UNKNOWN
         elif not forward_mode.is_decode():
-            return SharedReadBoundary.UNKNOWN
+            return SharedReadEnds.UNKNOWN
         boundary = attn_backend.shared_read_boundary(forward_mode)
 
         if (
-            boundary is SharedReadBoundary.IN_REPLAY
+            boundary is SharedReadEnds.IN_REPLAY
             and self.in_graph_metadata_prep_done is None
         ):
             # TODO: PRE_REPLAY is EARLIER than the declared boundary; POST_REPLAY
             # is the sound demotion for a backend that really reads in-graph.
-            return SharedReadBoundary.PRE_REPLAY
+            return SharedReadEnds.PRE_REPLAY
         return boundary
 
     def _publish_read_done(self, in_graph: bool):
@@ -1335,15 +1335,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         else ""
                     ),
                 )
-            if shared_read_boundary is SharedReadBoundary.PRE_REPLAY:
+            if shared_read_boundary is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
-            if shared_read_boundary is SharedReadBoundary.IN_REPLAY:
+            if shared_read_boundary is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)
 
-            if shared_read_boundary is SharedReadBoundary.POST_REPLAY:
+            if shared_read_boundary is SharedReadEnds.POST_REPLAY:
                 self._publish_read_done(in_graph=False)
 
         if isinstance(output, LogitsProcessorOutput):

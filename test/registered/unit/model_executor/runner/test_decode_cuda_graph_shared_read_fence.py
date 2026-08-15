@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -23,7 +23,7 @@ class _SpecAlgorithm:
         return self._target_verify_war and forward_mode.is_target_verify()
 
 
-def _attn_backend(boundary=SharedReadBoundary.IN_REPLAY):
+def _attn_backend(boundary=SharedReadEnds.IN_REPLAY):
     """Backend stub declaring one fixed read-end boundary for every mode."""
     return SimpleNamespace(shared_read_boundary=lambda _forward_mode: boundary)
 
@@ -47,7 +47,7 @@ def test_unrelated_modes_never_publish():
         _runner(has_marker=True)._resolve_shared_read_boundary(
             _attn_backend(), ForwardMode.EXTEND
         )
-        is SharedReadBoundary.UNKNOWN
+        is SharedReadEnds.UNKNOWN
     )
 
 
@@ -56,9 +56,9 @@ def test_post_replay_declaration_is_not_advanced():
     # POST_REPLAY. Having an in-graph marker must not pull the fence earlier.
     assert (
         _runner(target_verify_war=True, has_marker=True)._resolve_shared_read_boundary(
-            _attn_backend(SharedReadBoundary.POST_REPLAY), ForwardMode.TARGET_VERIFY
+            _attn_backend(SharedReadEnds.POST_REPLAY), ForwardMode.TARGET_VERIFY
         )
-        is SharedReadBoundary.POST_REPLAY
+        is SharedReadEnds.POST_REPLAY
     )
 
 

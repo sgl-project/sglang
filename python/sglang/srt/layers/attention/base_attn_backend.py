@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
-class SharedReadBoundary(Enum):
+class SharedReadEnds(Enum):
     """Where a backend's scheduler-shared reads end, relative to the replay;
     the shared-read-done record must land at or after this point. IN_REPLAY
     means at the captured (in-graph) metadata init."""
@@ -125,7 +125,7 @@ class AttentionBackend(ABC):
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
-    def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
+    def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.
 
         Decode/verify default to IN_REPLAY: the out-graph/in-graph init
@@ -133,8 +133,8 @@ class AttentionBackend(ABC):
         the contract. Override for audited deviations.
         """
         if forward_mode.is_decode() or forward_mode.is_target_verify():
-            return SharedReadBoundary.IN_REPLAY
-        return SharedReadBoundary.UNKNOWN
+            return SharedReadEnds.IN_REPLAY
+        return SharedReadEnds.UNKNOWN
 
     # Chunked-prefix FullCG capture has a second model topology and stable
     # prefix buffers. Backends must opt in explicitly so the runner does not
