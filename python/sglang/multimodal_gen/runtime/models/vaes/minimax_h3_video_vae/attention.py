@@ -44,7 +44,7 @@ def _apply_qk_norm(module, hidden_states):
         _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1")
         and isinstance(module, (nn.LayerNorm, nn.RMSNorm))
         and module.weight is None
-        and module.bias is None
+        and (not isinstance(module, nn.LayerNorm) or module.bias is None)
         and hidden_states.is_cuda
         and hidden_states.dtype in (torch.float16, torch.bfloat16)
         and not torch.is_grad_enabled()
