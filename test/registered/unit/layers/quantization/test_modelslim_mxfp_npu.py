@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUMXFP8LinearMethod,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUMXFP8MoEMethod,
     NPUW4A4MXFP4MoEMethod,
     NPUW4A8MXFPMoEMethod,
     _normalize_mxfp_input_scale,
@@ -45,6 +46,60 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestModelSlimMXFP4MoE(CustomTestCase):
+    @staticmethod
+    def _make_mxfp8_moe_layer():
+        layer = torch.nn.Module()
+        layer.register_parameter(
+            "w13_weight",
+            torch.nn.Parameter(
+                torch.zeros((2, 128, 64), dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            ),
+        )
+        layer.register_parameter(
+            "w13_weight_scale",
+            torch.nn.Parameter(
+                torch.zeros((2, 128, 2), dtype=torch.uint8),
+                requires_grad=False,
+            ),
+        )
+        layer.register_parameter(
+            "w2_weight",
+            torch.nn.Parameter(
+                torch.zeros((2, 64, 128), dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            ),
+        )
+        layer.register_parameter(
+            "w2_weight_scale",
+            torch.nn.Parameter(
+                torch.zeros((2, 64, 4), dtype=torch.uint8),
+                requires_grad=False,
+            ),
+        )
+        return layer
+
+    def test_mxfp8_moe_keeps_fused_w13_nd_but_formats_w2_nz(self):
+        layer = self._make_mxfp8_moe_layer()
+        formatted_w2 = torch.zeros(
+            (2, 64, 128), dtype=torch.float8_e4m3fn
+        )
+
+        with patch(
+            "sglang.srt.hardware_backend.npu.quantization.moe_methods."
+            "npu_format_cast",
+            return_value=formatted_w2,
+        ) as format_cast:
+            NPUMXFP8MoEMethod("w13").process_weights_after_loading(layer, "w13")
+            format_cast.assert_not_called()
+            NPUMXFP8MoEMethod("w2").process_weights_after_loading(layer, "w2")
+
+        format_cast.assert_called_once()
+        self.assertEqual(layer.w13_weight.shape, (2, 64, 128))
+        self.assertEqual(layer.w13_weight_scale.shape, (2, 1, 128, 2))
+        self.assertEqual(layer.w2_weight.shape, (2, 128, 64))
+        self.assertEqual(layer.w2_weight_scale.shape, (2, 2, 64, 2))
+
     def test_mlaprolog_source_is_preserved_only_for_required_linears(self):
         qkv_scheme = ModelSlimMXFP8Scheme(
             {}, "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa"

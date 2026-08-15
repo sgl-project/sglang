@@ -1197,20 +1197,19 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         else:
             weight, scale = self._quantize_weight_online(weight, weight_prefix)
 
-        # FRACTAL_NZ before the transpose, never after. gmm1 asserts that weight
-        # and weight_scale carry the SAME transpose flag (CheckMXTranspose: "the
-        # transposition of weightScale/weight should be equal"), and the cast
-        # yields a physically retiled — hence non-transposed — tensor. Casting
-        # the [E, K, N] view would therefore leave the weight at false against a
-        # true scale and fail outright, which is why this cannot copy the int8
-        # MoE methods above (they transpose first, but carry no MX scale to keep
-        # in sync). Same order as the dense W4A8 path in linear_method_npu.py.
+        # Keep W13 in ND. TorchNPU/op-plugin 26.0 infers the fused MXFP8
+        # GMM+SwiGLU output width incorrectly for FRACTAL_NZ weights: it reads
+        # K/64 from weight_scale axis 1 as N and allocates [M, K/128] instead
+        # of [M, N/2]. For GLM-5.2 this produces [M, 48] instead of [M, 2048].
+        # The bug is fixed upstream in op-plugin cc6df910, but 26.0 is still a
+        # supported SGLang environment and there is no reliable runtime
+        # capability probe for that adapter fix.
         #
-        # A5 measurement, Qwen3-30B-A3B shapes, 128 experts (see
-        # llm/probe_mxfp8_moe_nz.py): +1.4% decode, +3.8% prefill against a 0.2-
-        # 0.3% noise floor, bit-identical outputs. Set
-        # SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT to fall back to plain ND.
-        weight = npu_format_cast(weight)
+        # W2 uses the plain grouped matmul rather than the affected fused op, so
+        # retain its FRACTAL_NZ optimization. W4 methods have their own format
+        # path and are intentionally unaffected by this compatibility guard.
+        if weight_prefix == "w2":
+            weight = npu_format_cast(weight)
 
         # Both paths hand the grouped matmul weight [E, K, N] and scale
         # [E, K//64, N, 2] as strided transpose views — DO NOT call
