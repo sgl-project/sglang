@@ -99,7 +99,7 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import publish
+from sglang.srt.runtime_context import get_parallel, publish
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -336,7 +336,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 routed_dp_rank = data_parallel_rank
 
         if routed_dp_rank is not None:
-            dp_size = self.server_args.dp_size
+            dp_size = get_parallel().dp_size
             if dp_size <= 1 and routed_dp_rank == 0:
                 logger.debug(
                     f"routed_dp_rank={routed_dp_rank} is ignored because dp_size={dp_size}"
@@ -661,7 +661,7 @@ class Engine(EngineScoreMixin, EngineBase):
         (``python -m sglang.srt.weight_cache.daemon``) plus
         ``--weight-cache-mode client``, where the daemon outlives the engine.
         """
-        if server_args.dp_size > 1:
+        if get_parallel().dp_size > 1:
             raise ValueError(
                 "Weight cache daemon mode does not support dp_size > 1. "
                 "Please set --dp-size 1 when using --weight-cache-mode daemon."
@@ -751,7 +751,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     "--dp-size",
                     "1",
                     "--ep-size",
-                    str(server_args.ep_size),
+                    str(get_parallel().ep_size),
                     "--load-format",
                     server_args.load_format,
                     "--dtype",
@@ -863,7 +863,7 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         scheduler_procs = []
         use_dp_controller = (
-            server_args.dp_size > 1 or server_args.ep_join_mode == "scale"
+            get_parallel().dp_size > 1 or server_args.ep_join_mode == "scale"
         )
 
         if not use_dp_controller:
@@ -1835,7 +1835,7 @@ def _compute_parallelism_ranks(
     server_args: ServerArgs, tp_rank: int
 ) -> Tuple[int, int, int]:
     """Compute attention-CP, MoE-DP, and MoE-EP ranks for a TP rank."""
-    attn_dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
+    attn_dp_size = get_parallel().dp_size if get_parallel().enable_dp_attention else 1
 
     # Parallelism hierarchy (outermost to innermost):
     # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
@@ -1846,6 +1846,6 @@ def _compute_parallelism_ranks(
     moe_ep_rank = (
         tp_rank
         % (server_args.tp_size // server_args.moe_dp_size)
-        // (server_args.tp_size // server_args.moe_dp_size // server_args.ep_size)
+        // (server_args.tp_size // server_args.moe_dp_size // get_parallel().ep_size)
     )
     return attn_cp_rank, moe_dp_rank, moe_ep_rank
