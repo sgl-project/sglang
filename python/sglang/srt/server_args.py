@@ -44,6 +44,7 @@ from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     mamba_extra_buffer_lazy_of,
     mamba_extra_buffer_of,
+    remote_instance_transfer_engine_of,
     resolved_view,
 )
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
@@ -167,7 +168,7 @@ QUANTIZATION_CHOICES = [
     "mxfp_w4a8",  # for NPU W4A8 (MXFP4 weights + MXFP8 activations)
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
-    "quark_mxfp4",  # Online MOE + linear quantization.
+    "quark_mxfp4",  # Online MOE + linear quantization (incl. NVFP4 -> MXFP4 requantization).
     # Apple Silicon MLX backend — on-the-fly quantization of fp16 weights at load
     # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
     "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
@@ -377,6 +378,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "flashkda",
     "nvidia_kda",
     "ptx_kda",
+    "helion",
 ]
 
 
@@ -2025,7 +2027,7 @@ class ServerArgs:
     ] = False
 
     # -------------------------------------------------------------------------
-    # Torch compile and torchao
+    # Torch compile
     # -------------------------------------------------------------------------
     enable_torch_compile: A[
         bool,
@@ -2038,12 +2040,6 @@ class ServerArgs:
     torch_compile_max_bs: A[
         int, "Set the maximum batch size when using torch compile.", NS("exec.graph")
     ] = 32
-    torchao_config: A[
-        str,
-        "Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
-        NS("exec.graph"),
-    ] = ""
-
     # -------------------------------------------------------------------------
     # Speculative decoding
     # -------------------------------------------------------------------------
@@ -2577,7 +2573,7 @@ class ServerArgs:
     linear_attn_backend: A[
         str,
         Arg(
-            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend.",
+            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend. The Helion backend is KDA-only.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
         NS("exec.mamba"),
@@ -2612,11 +2608,10 @@ class ServerArgs:
         bool,
         "Enable the ReplaySSM buffered output-only linear-attn decode kernel. "
         "Primarily a GDN (scalar-gate) decode-bandwidth optimization (~1.2-1.5x "
-        "at batch >= 64). The unified kernel also supports KDA (per-K gate) and "
-        "is numerically correct, but KDA decode is SLOWER than the packed "
-        "baseline (the per-K g_cache is K x larger and the reconstruction "
-        "refolds the per-K decay every step), so it is not recommended for KDA "
-        "models. Requires the Triton linear-attn decode backend and "
+        "at batch >= 64). KDA uses its selected Triton or Helion implementation, "
+        "but its per-K gate ring is larger and ReplaySSM is typically slower "
+        "than packed KDA decode; benchmark before enabling it. Requires the "
+        "Triton linear-attn decode backend, or Helion for KDA, and "
         "--mamba-radix-cache-strategy no_buffer (the default).",
         NS("exec.mamba"),
     ] = False
@@ -2769,6 +2764,21 @@ class ServerArgs:
         "environment override when this argument is 0.",
         NS("mm"),
     ] = 0
+    mm_preprocess_cache_size_mb: A[
+        Optional[int],
+        "CPU memory budget for content-addressed multimodal preprocessing "
+        "artifacts. Unset selects a model-specific default (256 MiB for "
+        "Kimi-K3); 0 disables the cache. The budget is divided across "
+        "tokenizer workers and does not reserve GPU memory.",
+        NS("mm"),
+    ] = None
+    trust_mm_content_hashes: A[
+        bool,
+        "Trust caller-provided multimodal SHA-256 content hashes. This can "
+        "skip reading media on a hot metadata-cache hit; only enable it when "
+        "the caller guarantees that hashes identify immutable media bytes.",
+        NS("mm"),
+    ] = False
     limit_mm_data_per_request: A[
         Optional[Union[str, Dict[str, int]]],
         Arg(
@@ -2806,10 +2816,9 @@ class ServerArgs:
         Optional[Literal["cpu", "cuda_ipc", "cuda_vmm"]],
         "Transport multimodal features through CPU memory, a bounded CUDA IPC "
         "pool, or a bounded CUDA VMM pool. "
-        "Unset resolves automatically: multimodal models on single-node CUDA "
-        "deployments (without disaggregation) use cuda_ipc; validated multi-node "
-        "GB200/GB300 MNNVL models use cuda_vmm when an IMEX channel is available; "
-        "all other deployments use cpu. GPU transports reserve "
+        "Unset uses cpu except for validated multi-node GB200/GB300 MNNVL models, "
+        "which use cuda_vmm when an IMEX channel is available. Select cuda_ipc "
+        "explicitly for single-node GPU transport. GPU transports reserve "
         "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and fall "
         "back to CPU transport when the pool is full.",
         NS("mm"),
@@ -3158,6 +3167,16 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     # Model weight update and weight loading
     # -------------------------------------------------------------------------
+    startup_weight_load_mode: A[
+        Literal["serial", "overlap"],
+        (
+            "Control startup weight loading relative to CUDA graph capture. "
+            "'serial' preserves the existing startup order; 'overlap' stages "
+            "checkpoint files while CUDA graphs are captured and commits the "
+            "real weights afterward."
+        ),
+        NS("model"),
+    ] = "serial"
     custom_weight_loader: A[
         Optional[List[str]],
         Arg(
@@ -3508,6 +3527,9 @@ class ServerArgs:
     ] = None
 
     def __post_init__(self):
+        self._run_resolution_pipeline()
+
+    def _run_resolution_pipeline(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
 
@@ -4009,6 +4031,11 @@ class ServerArgs:
 
     def _handle_multimodal(self):
         """Validate mm_process_config structure before model loading."""
+        if (
+            self.mm_preprocess_cache_size_mb is not None
+            and self.mm_preprocess_cache_size_mb < 0
+        ):
+            raise ValueError("mm_preprocess_cache_size_mb must be non-negative")
         if self.mm_process_config is not None:
             if not isinstance(self.mm_process_config, dict):
                 raise TypeError(
@@ -4569,17 +4596,10 @@ class ServerArgs:
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
-        from sglang.srt.configs.model_config import is_deepseek_v4, is_nemotron_h
+        from sglang.srt.configs.model_config import is_deepseek_v4
         from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
         rules = [
-            # NemotronH's hybrid Mamba2 prefill is not BCG-safe: the mamba
-            # state-track write is not wired into the captured buffers, so a
-            # replay can commit a cache slot it never wrote.
-            (
-                "NemotronH (hybrid Mamba2 prefill)",
-                lambda: is_nemotron_h(self.get_model_config().hf_config),
-            ),
             # DSV4 is BCG-compatible but introduces heavy memory pressure: the
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
             (
@@ -5426,6 +5446,8 @@ class ServerArgs:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                if not envs.SGLANG_OPT_FUSE_MHC_POST_PRE.is_set():
+                    envs.SGLANG_OPT_FUSE_MHC_POST_PRE.set(True)
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
                 # Prefer TileLang over the Torch fallback.
@@ -6153,6 +6175,7 @@ class ServerArgs:
         # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
         if (
             self.linear_attn_decode_backend is None
+            and self.linear_attn_backend != "helion"
             and is_sm100_supported()
             and self.mamba_ssm_dtype == "bfloat16"
             # Stage 4: flashinfer's recurrent_kda compiles the state slot stride
@@ -6231,8 +6254,8 @@ class ServerArgs:
                 f"got CUDA {cuda_version or 'unknown'}"
             )
 
-        # GDN ReplaySSM buffered decode guards. Runs on the Triton GDN decode
-        # backend. cuda-graph is supported (slice 1b: CUDA-graph-safe static
+        # ReplaySSM buffered decode guards. Runs on Triton, or Helion for KDA.
+        # cuda-graph is supported (slice 1b: CUDA-graph-safe static
         # write-cursor buffers). The RADIX prefix cache is now supported (slice
         # 2b: the decode kernel force-flushes the ring into temporal[slot] on
         # the radix track boundary `seq_lens % mamba_track_interval == 0`, and
@@ -6246,10 +6269,10 @@ class ServerArgs:
         # cursor of the donated/kept slot would not be reset there. Handling
         # that donation path is a follow-up; for now require no_buffer.
         if self.enable_linear_replayssm:
-            if decode != "triton":
+            if decode not in {"triton", "helion"}:
                 raise ValueError(
-                    "--enable-linear-replayssm requires the Triton "
-                    "linear-attn decode backend, got "
+                    "--enable-linear-replayssm requires Triton, or Helion for "
+                    "KDA, as the linear-attn decode backend; got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
             from sglang.srt.arg_groups.overrides import (
@@ -6648,9 +6671,9 @@ class ServerArgs:
         if view.moe_runner_backend == "flashinfer_cutedsl":
             # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
             assert (
-                view.quantization in ["modelopt_fp4", "modelopt_mixed"]
+                view.quantization in ["modelopt_fp4", "modelopt_mixed", "nvfp4_online"]
                 or self.get_model_config().nvfp4_moe_meta is not None
-            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), or hybrid NVFP4 models."
+            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), 'nvfp4_online', or hybrid NVFP4 models."
             assert view.ep_size in [
                 1,
                 self.tp_size,
@@ -6663,6 +6686,14 @@ class ServerArgs:
                 f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
                 f"got '{view.moe_a2a_backend}'."
             )
+            if view.moe_a2a_backend == "deepep" and (
+                view.quantization == "nvfp4_online"
+                or envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+            ):
+                raise ValueError(
+                    "flashinfer_cutedsl per-token NVFP4 activation requires "
+                    "moe_a2a_backend='none' or 'flashinfer'."
+                )
 
         if view.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
             assert view.quantization in [
@@ -7749,10 +7780,10 @@ class ServerArgs:
     def _handle_multimodal_feature_transport(self):
         """Resolve multimodal feature transport before tokenizer workers start.
 
-        GPU transports use a fixed pool on ``base_gpu_id`` and therefore reduce
-        the memory left for model/KV-cache allocations. The legacy CUDA IPC flag
-        and environment variable remain supported so existing deployments map
-        to this single policy.
+        CUDA IPC is opt-in because its fixed pool on ``base_gpu_id`` reduces the
+        memory left for model/KV-cache allocations. Multi-node MNNVL deployments
+        may still auto-select CUDA VMM. The legacy CUDA IPC flag and environment
+        variable remain supported so existing deployments map to this policy.
         """
         requested_transport = self.mm_feature_transport
         legacy_ipc_is_set = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.is_set()
@@ -7792,16 +7823,12 @@ class ServerArgs:
                 and self.disaggregation_mode == "null"
             ):
                 # A full GPU pool always degrades to CPU transport per tensor.
-                # CUDA IPC is intra-node; multi-node auto-selection is limited
-                # to GB200/GB300 systems where the runtime already enables the
-                # MNNVL/IMEX communication stack.
+                # Keep CUDA IPC opt-in because even an idle pool consumes HBM
+                # that would otherwise back the KV cache. Multi-node
+                # auto-selection is limited to GB200/GB300 systems where the
+                # runtime already enables the MNNVL/IMEX communication stack.
                 if self.nnodes == 1:
-                    requested_transport = "cuda_ipc"
-                    logger.info(
-                        "Multimodal feature transport auto-resolved to cuda_ipc "
-                        "(single-node CUDA). Pass --mm-feature-transport=cpu to "
-                        "opt out."
-                    )
+                    requested_transport = "cpu"
                 elif is_mnnvl_fabric_device() and os.path.exists(
                     "/dev/nvidia-caps-imex-channels/channel0"
                 ):
@@ -7965,6 +7992,8 @@ class ServerArgs:
             "1" if self.enable_deterministic_inference else "0"
         )
         self._handle_custom_all_reduce_v2_multinode()
+        if self.enable_deterministic_inference:
+            envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
         if self.debug_cuda_graph:
             if not (is_cuda() or is_hip()):
                 logger.warning(
@@ -8261,21 +8290,20 @@ class ServerArgs:
         # The Mamba/KDA state is stored in envelope-strided views; only
         # stride-audited kernels may read it (Stage 4 audit, per slot):
         # - decode: triton; flashinfer (recurrent_kda compiles the state slot
-        #   stride as a free int64 — natively strided); cutedsl (KDA fused
-        #   sigmoid-gating update made stride-safe) on KDA-hybrid models only —
-        #   cutedsl_gdn still compiles h0 against a contiguous dummy.
-        # - prefill: triton; flashkda (wrapper gathers/scatters a contiguous
-        #   per-slot copy, external kernel never sees the pool); cutedsl
-        #   (kernel_h compiles h0/ht with dynamic int64 strides), same
-        #   KDA-only caveat.
+        #   stride as a free int64); helion (specializes KDA state strides 0-3
+        #   and rejects a non-unit innermost stride); cutedsl (KDA fused sigmoid-
+        #   gating update is stride-safe) on KDA-hybrid models only.
+        # - prefill: triton; flashkda (the wrapper gathers/scatters a contiguous
+        #   per-slot copy); helion; cutedsl (kernel_h compiles h0/ht with dynamic
+        #   int64 strides), with the same KDA-only caveat.
         # - mamba (mamba2/short-conv state): triton only.
         # use_mla_backend() distinguishes the KDA-hybrid family (K3/KimiLinear
-        # are MLA-hybrid) from GDN models (GQA-hybrid) for the cutedsl caveat.
+        # are MLA-hybrid) from GDN models (GQA-hybrid) for the KDA-only caveat.
         decode_allowed = {"triton", "flashinfer"}
         prefill_allowed = {"triton", "flashkda"}
         if self.use_mla_backend():
-            decode_allowed.add("cutedsl")
-            prefill_allowed.add("cutedsl")
+            decode_allowed.update({"cutedsl", "helion"})
+            prefill_allowed.update({"cutedsl", "helion"})
         resolved_linear_decode = (
             self.linear_attn_decode_backend or self.linear_attn_backend
         )
@@ -8802,6 +8830,10 @@ class ServerArgs:
     @property
     def is_ep_scale_joiner(self) -> bool:
         return self.ep_join_mode == "scale"
+
+    @property
+    def is_startup_weight_load_overlap(self) -> bool:
+        return self.startup_weight_load_mode == "overlap"
 
     def ssl_verify(self):
         """Return the value for the requests library's verify= parameter.
@@ -9442,20 +9474,7 @@ class ServerArgs:
     def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
         """``load_format`` overrides the seed's: a draft runner loading under
         ``--speculative-draft-load-format`` needs its own transfer engine."""
-        # Use TransferEngine as seed backend.
-        if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
-            return True
-        # Use TransferEngine as client backend.
-        if (load_format or self.load_format) == "remote_instance" and (
-            self.remote_instance_weight_loader_backend == "transfer_engine"
-            or (
-                self.remote_instance_weight_loader_backend == "modelexpress"
-                and self.modelexpress_transport == "transfer_engine"
-            )
-        ):
-            return True
-        else:
-            return False
+        return remote_instance_transfer_engine_of(self, load_format)
 
     def describe_kv_events_publisher(self) -> Optional[dict]:
         """Return a structured description of this server's KV-event
