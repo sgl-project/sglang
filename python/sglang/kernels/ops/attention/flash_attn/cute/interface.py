@@ -1,6 +1,4 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.2.0.
-
 import math
 import os
 from dataclasses import dataclass
@@ -60,8 +58,10 @@ from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100 import (
     DescaleTensors,
     FlashAttentionForwardSm100,
 )
-from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm120 import (
-    FlashAttentionForwardSm120,
+from sglang.kernels.ops.attention.fa4_sm120.dispatch import (
+    get_forward_host,
+    try_cached_paged_decode,
+    try_cached_varlen,
 )
 from sglang.kernels.ops.attention.flash_attn.cute.shearing_bias import ShearingBias
 
@@ -87,9 +87,8 @@ def _parse_arch_str(arch_str):
 def _get_device_arch():
     """Cached device arch check.
 
-    Override with FLASH_ATTENTION_ARCH (e.g. 'sm_80' or '80') to select which
-    kernel path to use (SM80/SM90/SM100/SM120) independently of the compilation
-    target (CUTE_DSL_ARCH).
+    Override with FLASH_ATTENTION_ARCH (e.g. 'sm_80' or '80') to select the
+    kernel path independently of the compilation target (CUTE_DSL_ARCH).
 
     For CPU-only compilation (no GPU), set both:
       FLASH_ATTENTION_ARCH=sm_80  (kernel selection)
@@ -100,6 +99,12 @@ def _get_device_arch():
         return _parse_arch_str(arch_override)
     major, minor = torch.cuda.get_device_capability()
     return major * 10 + int(minor)
+
+
+@lru_cache(maxsize=None)
+def _get_device_num_sms(device: torch.device) -> int:
+    """Return the stable SM count without querying CUDA on every launch."""
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 def _validate_head_dims(
@@ -344,6 +349,60 @@ def _flash_attn_fwd(
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
     """
+    fake_mode = is_fake_mode()
+    arch = _get_device_arch() if _arch is None else _arch
+    arch_forward_host = get_forward_host(arch)
+    requested_num_splits = num_splits
+    if (
+        not fake_mode
+        and arch_forward_host is not None
+        and not return_lse
+        and lse is None
+        and softcap in (None, 0.0)
+        and all(
+            value is None
+            for value in (
+                qv,
+                gather_kv_indices,
+                score_mod,
+                mask_mod,
+                block_sparse_tensors,
+                aux_tensors,
+                aux_scalars,
+                q_descale,
+                k_descale,
+                v_descale,
+                rel_bias,
+                sfq,
+                sfk,
+                sfv,
+            )
+        )
+    ):
+        fast_result = try_cached_paged_decode(
+            arch=arch,
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            page_table=page_table,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            learnable_sink=learnable_sink,
+            requested_num_splits=requested_num_splits,
+            pack_gqa=pack_gqa,
+            out=out,
+        )
+        if fast_result is not None:
+            return fast_result
+
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
@@ -480,7 +539,7 @@ def _flash_attn_fwd(
         assert learnable_sink.shape == (num_head,)
         assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
 
-    if not is_fake_mode():
+    if not fake_mode:
         assert all(
             t is None or t.is_cuda
             for t in (
@@ -499,17 +558,13 @@ def _flash_attn_fwd(
                 learnable_sink,
             )
         ), "inputs must be on CUDA device"
-    arch = _get_device_arch() if _arch is None else _arch
-    assert arch // 10 in [
-        8,
-        9,
-        10,
-        11,
-        12,
-    ], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
+    assert arch // 10 in [8, 9, 10, 11] or arch_forward_host is not None, (
+        "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, "
+        "and architectures registered through the forward-host bridge"
+    )
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // v.element_size()
-    if arch // 10 not in [8, 12]:
+    if arch // 10 != 8 and arch_forward_host is None:
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
     if softmax_scale is None:
         softmax_scale = (
@@ -567,6 +622,10 @@ def _flash_attn_fwd(
             device=device,
         )
     else:
+        if out.requires_grad:
+            raise ValueError("out must not require gradients")
+        if out.stride(-1) != 1:
+            raise ValueError("out must have stride 1 in the last dimension")
         _validate_tensor(
             out,
             "out",
@@ -621,21 +680,41 @@ def _flash_attn_fwd(
 
     current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    # SM80/SM120: uses SM80 MMA, 128 threads (4 warps)
-    if arch // 10 in [8, 12]:
+    if arch // 10 == 8:
         num_threads = 128
+    num_SMs = 132 if fake_mode else _get_device_num_sms(device)
 
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
-    if tile_mn is None:
-        if arch // 10 == 12:
-            # SM120 tile sizes tuned for 99 KB SMEM capacity:
-            # D<=64:  128x128 → 48 KB (good occupancy)
-            # D>64:   128x64  → 64 KB (128x128 would use 96 KB, hurting occupancy)
-            if head_dim <= 64:
-                fwd_cfg = FwdConfig(128, 128, True, True)
-            else:
-                fwd_cfg = FwdConfig(128, 64, True, True)
-        elif arch // 10 == 8:
+    arch_forward_config = None
+    if arch_forward_host is not None:
+        arch_forward_config = arch_forward_host.select_config(
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            tile_mn=tile_mn,
+            has_bias=rel_bias is not None,
+            total_q_rows=total_q * num_head,
+            num_sms=None if fake_mode else num_SMs,
+            num_batch=batch_size,
+            seqlen_q=(max_seqlen_q if max_seqlen_q is not None else seqlen_q),
+            seqlen_k=(max_seqlen_k if max_seqlen_k is not None else seqlen_k),
+            num_head_kv=num_head_kv,
+            qhead_per_kvhead=qhead_per_kvhead,
+            is_causal=causal,
+            is_local=local,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            pack_gqa=pack_gqa,
+            paged_kv=page_table is not None,
+        )
+        fwd_cfg = FwdConfig(
+            arch_forward_config.tile_m,
+            arch_forward_config.tile_n,
+            True,
+            True,
+        )
+        num_threads = arch_forward_config.num_threads
+    elif tile_mn is None:
+        if arch // 10 == 8:
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
             sparse_q = get_sparse_q_block_size(block_sparse_tensors, seqlen_q)
@@ -685,13 +764,58 @@ def _flash_attn_fwd(
     ) // m_block_size_effective
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
-    num_SMs = (
-        132
-        if is_fake_mode()
-        else torch.cuda.get_device_properties(device).multi_processor_count
-    )
-    if num_splits < 1:
-        num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
+    arch_forward_plan = None
+    if arch_forward_host is not None:
+        arch_forward_plan = arch_forward_host.resolve_plan(
+            requested_num_splits=num_splits,
+            generic_num_n_blocks=num_n_blocks,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            batch_size=batch_size,
+            num_head_kv=num_head_kv,
+            paged_kv=page_table is not None,
+            page_size=page_size,
+            k=k,
+            v=v,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            pack_gqa=pack_gqa,
+            element_size=q.element_size(),
+            packed_q_rows=seqlen_q_packgqa,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            num_m_blocks=num_m_blocks,
+            total_mblocks=total_mblocks,
+            num_sms=num_SMs,
+            total_q=total_q,
+            has_cu_seqlens_q=cu_seqlens_q is not None,
+            has_seqused_q=seqused_q is not None,
+            has_seqused_k=seqused_k is not None,
+            is_causal=causal,
+            is_local=local,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            has_score_or_mask_mod=(
+                softcap is not None
+                or score_mod is not None
+                or mask_mod is not None
+                or rel_bias is not None
+            ),
+            is_stream_capturing=(
+                not fake_mode and torch.cuda.is_current_stream_capturing()
+            ),
+            device=device,
+            fake_mode=fake_mode,
+            generic_heuristic=num_splits_heuristic,
+        )
+        num_splits = arch_forward_plan.num_splits
+    elif num_splits < 1:
+        num_splits = num_splits_heuristic(
+            total_mblocks,
+            num_SMs,
+            num_n_blocks,
+            128,
+        )
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
     # in shared memory, causing OOM for diff-headdim (192, 128)
@@ -707,6 +831,10 @@ def _flash_attn_fwd(
             num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
         else:
             num_splits = 1
+
+    if qv is not None:
+        # The qv kernel has no split-KV variant.
+        num_splits = 1
 
     is_split_kv = num_splits > 1
     if is_split_kv:
@@ -857,8 +985,8 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask = None
         p = row_max = None
 
-    # rel_bias -> sheared bias (Inkling relative attention). Produces `bias`, the column-aligned
-    # bias the SM100 kernel adds to pre-softmax scores via its dedicated TMA pipeline.
+    # Inkling relative attention. Shear the relative rows into the column-aligned
+    # tiles consumed by the architecture-specific attention mainloop.
     rel_extent = 0
     rel_extent_padded = 0
     bias = None
@@ -866,16 +994,17 @@ def _flash_attn_fwd(
     cu_total_m_blocks_bias = None
     blocks_to_batch_idx = None
     if rel_bias is not None:
-        assert arch // 10 in [
-            9,
-            10,
-            11,
-        ], "rel_bias (sheared bias) is only supported on SM9x/10x"
+        assert arch // 10 in [9, 10, 11] or arch_forward_host is not None, (
+            "rel_bias requires SM9x/10x/11x or an architecture-owned "
+            "forward implementation"
+        )
         qhead_per_kvhead_packgqa = qhead_per_kvhead if pack_gqa else 1
         rel_extent = rel_bias.shape[-1]
         rel_extent_padded = rel_extent + 256
         assert rel_extent % 128 == 0
-        assert tile_m == 128 and tile_n == 128
+        assert tile_n == 128
+        if arch_forward_host is None:
+            assert tile_m == 128
         assert (
             causal
             or window_size_left is None
@@ -973,7 +1102,7 @@ def _flash_attn_fwd(
                         current_stream,
                         options="--enable-tvm-ffi",
                     )
-                if not is_fake_mode():
+                if not fake_mode:
                     _flash_attn_fwd.compile_cache_prepare_shear_bias[
                         compile_key_prepare
                     ](
@@ -1001,6 +1130,7 @@ def _flash_attn_fwd(
             qhead_per_kvhead,
             rows_per_cta,
             group_tile_bias,
+            tile_m,
             max_m_blocks_leq_one,
             cu_total_m_blocks_bias is not None,
             blocks_to_batch_idx is not None,
@@ -1037,6 +1167,7 @@ def _flash_attn_fwd(
                     qhead_per_kvhead=qhead_per_kvhead,
                     rows_per_cta=rows_per_cta,
                     tile_m=group_tile_bias,
+                    attention_tile_m=tile_m,
                     max_m_blocks_leq_one=max_m_blocks_leq_one,
                     use_pdl=use_pdl,
                 ),
@@ -1055,7 +1186,7 @@ def _flash_attn_fwd(
                 current_stream,
                 options="--enable-tvm-ffi",
             )
-        if not is_fake_mode():
+        if not fake_mode:
             _flash_attn_fwd.compile_cache_shear_bias[shear_compile_key](
                 rel_bias,
                 bias,
@@ -1109,6 +1240,8 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         arch,
+        arch_forward_config.compile_key if arch_forward_config is not None else None,
+        arch_forward_plan.compile_key if arch_forward_plan is not None else None,
         page_size not in [None, tile_n],  # paged KV non-TMA
         use_2cta_instrs,
         q_subtile_factor,
@@ -1362,31 +1495,37 @@ def _flash_attn_fwd(
                         )
                     ),
                 )
-        elif arch // 10 == 12:
-            # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
-            assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
-            assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
-            fa_fwd = FlashAttentionForwardSm120(
-                dtype,
-                head_dim,
-                head_dim_v,
-                qhead_per_kvhead,
+        elif arch_forward_host is not None:
+            assert not use_block_sparsity, (
+                "Block sparsity is not supported by the architecture-owned "
+                "forward implementation"
+            )
+            assert arch_forward_config is not None
+            assert arch_forward_plan is not None
+            fa_fwd = arch_forward_host.make_kernel(
+                dtype=dtype,
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                qhead_per_kvhead=qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
                 pack_gqa=pack_gqa,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                num_stages=1,
-                num_threads=num_threads,
-                Q_in_regs=False,
+                config=arch_forward_config,
+                paged_kv=page_table is not None,
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
+                is_split_kv=is_split_kv,
+                has_bias=bias is not None,
+                bias_block_size=tile_bias,
+                rel_extent_padded=rel_extent_padded,
+                plan=arch_forward_plan,
             )
         else:
             raise ValueError(
-                f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
+                f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, "
+                "10.x, 11.x, and architectures registered through the "
+                "forward-host bridge"
             )
         # TODO: check @can_implement
         if qv is not None:
@@ -1438,7 +1577,7 @@ def _flash_attn_fwd(
                     AuxData(cute_aux_tensors, aux_scalars),
                 ]
             )
-            if arch // 10 in [9, 10, 11]:
+            if arch // 10 in [9, 10, 11] or arch_forward_host is not None:
                 compile_args.append(bias_tensor)  # mBias
             if arch // 10 in [10, 11]:
                 if not use_dedicated_hd256_kernel:
@@ -1451,12 +1590,17 @@ def _flash_attn_fwd(
                             v_sf_vec_size,
                         ]
                     )
+            if arch_forward_host is not None:
+                assert arch_forward_plan is not None
+                compile_args.extend(
+                    arch_forward_host.compile_arguments(arch_forward_plan)
+                )
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 *compile_args, options="--enable-tvm-ffi"
             )
 
-    if not is_fake_mode():
+    if not fake_mode:
         q_call, k_call, v_call, qv_call = [
             t.detach() if t is not None else None for t in (q, k, v, qv)
         ]
@@ -1541,7 +1685,7 @@ def _flash_attn_fwd(
                     AuxData(aux_tensors, aux_scalars),
                 ]
             )
-            if arch // 10 in [9, 10, 11]:
+            if arch // 10 in [9, 10, 11] or arch_forward_host is not None:
                 call_args.append(bias)  # mBias
             if arch // 10 in [10, 11]:
                 if not use_dedicated_hd256_kernel:
@@ -1554,7 +1698,52 @@ def _flash_attn_fwd(
                             sfv_call,  # mSFV (None unless v_blockscaled)
                         ]
                     )
-            _flash_attn_fwd.compile_cache[compile_key](*call_args)
+            if arch_forward_host is not None:
+                assert arch_forward_plan is not None
+                call_args.extend(arch_forward_host.runtime_arguments(arch_forward_plan))
+            compiled_fwd = _flash_attn_fwd.compile_cache[compile_key]
+            if (
+                arch_forward_host is not None
+                and cu_seqlens_q is not None
+                and cu_seqlens_k is not None
+                and seqused_q is None
+                and seqused_k is None
+                and not is_split_kv
+                and not requires_grad
+                and (learnable_sink is None or not learnable_sink.requires_grad)
+                and lse is None
+                and softcap is None
+                and score_mod is None
+                and mask_mod is None
+                and block_sparse_tensors is None
+                and aux_tensors is None
+                and aux_scalars is None
+                and q_descale is None
+                and k_descale is None
+                and v_descale is None
+                and rel_bias is None
+                and sfq is None
+                and sfk is None
+                and sfv is None
+            ):
+                arch_forward_host.register_varlen(
+                    arch=arch,
+                    compiled_fn=compiled_fwd,
+                    compile_key=compile_key,
+                    q=q,
+                    k=k,
+                    v=v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    causal=causal,
+                    window_size_left=window_size_left,
+                    window_size_right=window_size_right,
+                    learnable_sink=learnable_sink,
+                    pack_gqa=pack_gqa,
+                )
+            compiled_fwd(*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
@@ -1563,6 +1752,72 @@ def _flash_attn_fwd(
             lse.transpose(-1, -2) if lse is not None else None,
             cu_seqlens_q,
             seqused_q,
+        )
+    if (
+        not fake_mode
+        and not torch.cuda.is_current_stream_capturing()
+        and arch_forward_host is not None
+        and q is not None
+        and k is not None
+        and qv is None
+        and cu_seqlens_q is not None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is not None
+        and page_table is not None
+        and not requires_grad
+        and (learnable_sink is None or not learnable_sink.requires_grad)
+        and lse is None
+        and softcap is None
+        and score_mod is None
+        and mask_mod is None
+        and block_sparse_tensors is None
+        and aux_tensors is None
+        and aux_scalars is None
+        and q_descale is None
+        and k_descale is None
+        and v_descale is None
+        and rel_bias is None
+        and sfq is None
+        and sfk is None
+        and sfv is None
+    ):
+        compiled_combine = None
+        if is_split_kv:
+            lse_partial_transposed = lse_partial.transpose(-1, -2)
+            combine_key = _fwd_combine_compile_key(
+                out_partial,
+                out,
+                None,
+                cu_seqlens_q,
+                None,
+                None,
+            )
+            compiled_combine = _flash_attn_fwd_combine.compile_cache[combine_key]
+        arch_forward_host.register_paged_decode(
+            arch=arch,
+            compiled_fn=compiled_fwd,
+            compile_key=compile_key,
+            compiled_combine=compiled_combine,
+            actual_num_splits=num_splits,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            page_table=page_table,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            causal=causal,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            learnable_sink=learnable_sink,
+            pack_gqa=pack_gqa,
+            requested_num_splits=requested_num_splits,
+            out_partial=out_partial if is_split_kv else None,
+            lse_partial=lse_partial if is_split_kv else None,
         )
     return out, lse
 
@@ -1687,6 +1942,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         v_sf_vec_size: Optional[int] = None,
         rel_bias_prep_cache: Optional[dict] = None,
         return_lse: bool = False,
+        out: Optional[torch.Tensor] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -1734,32 +1990,34 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             qk_sf_vec_size=qk_sf_vec_size,
             v_sf_vec_size=v_sf_vec_size,
             rel_bias_prep_cache=rel_bias_prep_cache,
+            out=out,
         )
-        ctx.save_for_backward(
-            q,
-            k,
-            v,
-            out,
-            lse,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_q,
-            seqused_k,
-            *(aux_tensors or ()),
-        )
-        ctx.softmax_scale = softmax_scale
-        ctx.causal = causal
-        ctx.window_size = window_size
-        ctx.softcap = softcap
-        ctx.deterministic = deterministic
-        ctx.max_seqlen_q = max_seqlen_q
-        ctx.max_seqlen_k = max_seqlen_k
-        ctx.return_lse = return_lse
-        ctx.score_mod = score_mod
-        ctx.score_mod_bwd = score_mod_bwd
-        ctx.mask_mod = mask_mod
-        ctx.aux_scalars = aux_scalars
-        ctx.set_materialize_grads(False)
+        if ctx is not None:
+            ctx.save_for_backward(
+                q,
+                k,
+                v,
+                out,
+                lse,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
+                *(aux_tensors or ()),
+            )
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.softcap = softcap
+            ctx.deterministic = deterministic
+            ctx.max_seqlen_q = max_seqlen_q
+            ctx.max_seqlen_k = max_seqlen_k
+            ctx.return_lse = return_lse
+            ctx.score_mod = score_mod
+            ctx.score_mod_bwd = score_mod_bwd
+            ctx.mask_mod = mask_mod
+            ctx.aux_scalars = aux_scalars
+            ctx.set_materialize_grads(False)
         return out, lse
 
 
@@ -1850,6 +2108,7 @@ def flash_attn_varlen_func(
     v_sf_vec_size: Optional[int] = None,
     rel_bias_prep_cache: Optional[dict] = None,
     return_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
 ):
     """
     Tensor arguments:
@@ -1889,7 +2148,63 @@ def flash_attn_varlen_func(
         qk_sf_vec_size = 32
     if v_sf_vec_size is None and sfv is not None and sfv.dtype == torch.float8_e8m0fnu:
         v_sf_vec_size = 32
-    return FlashAttnVarlenFunc.apply(
+    if out is not None and out.requires_grad:
+        raise ValueError("out must not require gradients")
+    if out is not None and out.stride(-1) != 1:
+        raise ValueError("out must have stride 1 in the last dimension")
+    runtime_arch = _get_device_arch()
+    forward_host = None if is_fake_mode() else get_forward_host(runtime_arch)
+    if (
+        forward_host is not None
+        and q is not None
+        and k is not None
+        and cu_seqlens_q is not None
+        and cu_seqlens_k is not None
+        and num_splits == 1
+        and softcap in (None, 0.0)
+        and not return_lse
+        and all(
+            value is None
+            for value in (
+                qv,
+                seqused_q,
+                seqused_k,
+                gather_kv_indices,
+                page_table,
+                score_mod,
+                mask_mod,
+                block_sparse_tensors,
+                aux_tensors,
+                aux_scalars,
+                q_descale,
+                k_descale,
+                v_descale,
+                rel_bias,
+                sfq,
+                sfk,
+                sfv,
+            )
+        )
+    ):
+        fast_result = try_cached_varlen(
+            arch=runtime_arch,
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            learnable_sink=learnable_sink,
+            pack_gqa=pack_gqa,
+            out=out,
+        )
+        if fast_result is not None:
+            return fast_result
+    autograd_args = (
         q,
         k,
         v,
@@ -1928,7 +2243,34 @@ def flash_attn_varlen_func(
         v_sf_vec_size,
         rel_bias_prep_cache,
         return_lse,
+        out,
     )
+    needs_autograd = False
+    if forward_host is not None or out is not None:
+        differentiable_tensors = (
+            q,
+            k,
+            v,
+            qv,
+            learnable_sink,
+            q_descale,
+            k_descale,
+            v_descale,
+            rel_bias,
+            sfq,
+            sfk,
+            sfv,
+            *(aux_tensors or ()),
+        )
+        needs_autograd = torch.is_grad_enabled() and any(
+            tensor is not None and tensor.requires_grad
+            for tensor in differentiable_tensors
+        )
+    if needs_autograd and out is not None:
+        raise ValueError("out is only supported for forward-only inference")
+    if not needs_autograd and forward_host is not None:
+        return FlashAttnVarlenFunc.forward(None, *autograd_args)
+    return FlashAttnVarlenFunc.apply(*autograd_args)
 
 
 def _compile_fwd_combine(
@@ -2037,6 +2379,35 @@ def _compile_fwd_combine(
     )
 
 
+def _fwd_combine_compile_key(
+    out_partial: torch.Tensor,
+    out: torch.Tensor,
+    lse: Optional[torch.Tensor],
+    cu_seqlens: Optional[torch.Tensor],
+    seqused: Optional[torch.Tensor],
+    varlen_batch_idx: Optional[torch.Tensor],
+) -> tuple:
+    head_dim = out_partial.shape[-1]
+    num_splits = out_partial.shape[0]
+    k_block_size = 64 if head_dim <= 64 else 128
+    tile_m = 8 if k_block_size % 128 == 0 else (16 if k_block_size % 64 == 0 else 32)
+    log_max_splits = max(math.ceil(math.log2(num_splits)), 4)
+    if tile_m == 8:
+        log_max_splits = max(log_max_splits, 5)
+    return (
+        torch2cute_dtype_map[out.dtype],
+        torch2cute_dtype_map[out_partial.dtype],
+        head_dim,
+        tile_m,
+        k_block_size,
+        log_max_splits,
+        cu_seqlens is not None,
+        seqused is not None,
+        lse is not None,
+        varlen_batch_idx is not None,
+    )
+
+
 def _flash_attn_fwd_combine(
     out_partial: torch.Tensor,
     lse_partial: torch.Tensor,
@@ -2090,38 +2461,18 @@ def _flash_attn_fwd_combine(
             if not is_fake_mode():
                 assert t.is_cuda, f"{name} must be on CUDA device"
             assert t.is_contiguous(), f"{name} must be contiguous"
-    head_dim = out_partial.shape[-1]
     num_splits = out_partial.shape[0]
     assert num_splits <= 256
-    # If hdim is 96 or 192, it's faster to round them to 128 or 256 respectively
-    # so that kBlockM is smaller and we have more parallelism.
-    k_block_size = 64 if head_dim <= 64 else 128
-    # We want kBlockM to be as small as possible to maximize parallelism.
-    # E.g., if hdim is 64, we want kBlockM to be 16 so that we can use 256 threads, each reading 4 elements (floats).
-    tile_m = 8 if k_block_size % 128 == 0 else (16 if k_block_size % 64 == 0 else 32)
-    log_max_splits = max(math.ceil(math.log2(num_splits)), 4)
-    if tile_m == 8:
-        # If kBlockM == 8 then the minimum number of splits is 32.
-        # TODO: we can deal w this by using 128 threads instead
-        log_max_splits = max(log_max_splits, 5)
-
-    # Create combine kernel configuration
-    dtype = torch2cute_dtype_map[out.dtype]
-    dtype_partial = torch2cute_dtype_map[out_partial.dtype]
     # Device architecture is invariant for the lifetime of this server/JIT
     # cache, so PDL does not belong in the compile key.
     use_pdl = is_arch_support_pdl()
-    compile_key = (
-        dtype,
-        dtype_partial,
-        head_dim,
-        tile_m,
-        k_block_size,
-        log_max_splits,
-        cu_seqlens is not None,
-        seqused is not None,
-        lse is not None,
-        varlen_batch_idx is not None,
+    compile_key = _fwd_combine_compile_key(
+        out_partial,
+        out,
+        lse,
+        cu_seqlens,
+        seqused,
+        varlen_batch_idx,
     )
     if compile_key not in _flash_attn_fwd_combine.compile_cache:
         _flash_attn_fwd_combine.compile_cache[compile_key] = _compile_fwd_combine(

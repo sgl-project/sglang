@@ -506,7 +506,11 @@ class DeepseekV4AttnBackend(
 
     def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
         # Breakable-graph verify rereads shared state across segments.
+        # DSPARK verify replays one full (non-breakable) graph that honors the
+        # out-graph/in-graph init contract, so the base IN_REPLAY bound holds.
         if forward_mode.is_target_verify():
+            if self.model_runner.spec_algorithm.is_dspark():
+                return SharedReadBoundary.IN_REPLAY
             return SharedReadBoundary.POST_REPLAY
         return super().shared_read_boundary(forward_mode)
 
@@ -1824,6 +1828,14 @@ class DeepseekV4AttnBackend(
         if cache is None:
             seq_lens_cpu = forward_batch.seq_lens_cpu
             assert seq_lens_cpu is not None
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            assert extend_seq_lens_cpu is not None
+            total_swa = sum(
+                min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
+                for seq_len, extend_len in zip(
+                    seq_lens_cpu.tolist(), extend_seq_lens_cpu, strict=True
+                )
+            )
             # ``swa_window_size`` on the pool is its storage page size, not
             # the model's SWA window — pass both explicitly.
             cache = SparsePrefillChunkCache.build(
@@ -1836,6 +1848,7 @@ class DeepseekV4AttnBackend(
                 swa_page_size=token_to_kv_pool.swa_window_size,
                 num_qo_tokens=q_flat.shape[0],
                 max_seq_len=int(seq_lens_cpu.max().item()),
+                total_swa=total_swa,
             )
             self.forward_metadata.sparse_prefill_cache = cache
 

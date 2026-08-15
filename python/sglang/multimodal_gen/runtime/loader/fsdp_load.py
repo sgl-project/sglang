@@ -9,6 +9,7 @@
 from collections import Counter, defaultdict
 from collections.abc import Callable, Generator
 from itertools import chain
+from types import MethodType
 from typing import Any
 
 import torch
@@ -26,7 +27,12 @@ from torch.distributed.fsdp import (
 from torch.nn.modules.module import _IncompatibleKeys
 
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
-from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+    UnquantizedLinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
     attach_bitsandbytes_4bit_quant_states,
     build_bitsandbytes_4bit_quant_states,
@@ -91,6 +97,45 @@ def _make_param_like(
     new_param.__dict__.update(actual_param.__dict__)
     new_param.requires_grad = False
     return new_param
+
+
+def _can_assign_cpu_tensor_without_copy(
+    actual_param: torch.nn.Parameter,
+    full_tensor: torch.Tensor,
+    target_param: torch.Tensor,
+) -> bool:
+    """Return whether a TP=1 linear loader would only copy this CPU tensor."""
+    if full_tensor.device.type != "cpu":
+        return False
+    weight_loader = actual_param.__dict__.get("weight_loader")
+    if not isinstance(weight_loader, MethodType):
+        return False
+
+    owner = weight_loader.__self__
+    if not isinstance(
+        owner,
+        (ReplicatedLinear, ColumnParallelLinear, RowParallelLinear),
+    ):
+        return False
+    if not isinstance(owner.quant_method, UnquantizedLinearMethod):
+        return False
+    if not isinstance(owner, ReplicatedLinear) and owner.tp_size != 1:
+        return False
+    if type(actual_param) is not nn.Parameter:
+        return False
+    if any(
+        actual_param.__dict__.get(attribute, False)
+        for attribute in (
+            "is_metadata",
+            "is_sharded_weight",
+            "needs_scalar_to_array",
+        )
+    ):
+        return False
+    return (
+        full_tensor.shape == target_param.shape
+        and full_tensor.dtype == target_param.dtype
+    )
 
 
 def _make_class_name_shard_condition(class_names: set[str]):
@@ -162,6 +207,20 @@ def _maybe_dequantize_fp8(
     return full_tensor
 
 
+def register_fsdp_entrypoints(model: torch.nn.Module) -> None:
+    """Let FSDP2 unshard around forward passes that bypass ``__call__``.
+
+    FSDP2 only unshards around the wrapped module's own ``forward``. Parameters
+    the shard conditions did not match stay in the catch-all root group, whose
+    hook therefore never fires for a model driven through a custom method, and
+    the first op mixing them with a plain tensor fails. Models declare those
+    entry points in ``_fsdp_forward_methods``, which every model loaded through
+    FSDP must define; ``BaseDiT`` and ``TextEncoder`` default it to ``()``.
+    """
+    for name in model._fsdp_forward_methods:
+        register_fsdp_forward_method(model, name)
+
+
 # TODO(PY): add compile option
 def maybe_load_fsdp_model(
     model_cls: type[nn.Module],
@@ -178,8 +237,12 @@ def maybe_load_fsdp_model(
     pin_cpu_memory: bool = True,
     strict: bool = True,
     weight_load_plan: WeightLoadPlan | None = None,
+    checkpoint_key_filter: Callable[[str], bool] | None = None,
 ) -> torch.nn.Module:
     """Load a model with optional FSDP (Fully Sharded Data Parallel) support.
+
+    ``model_cls`` must declare ``_fsdp_forward_methods``, the entry points FSDP2
+    has to unshard around (empty when the model is driven through ``__call__``).
 
     Args:
         param_dtype: Data type for model parameters, also used for:
@@ -271,8 +334,7 @@ def maybe_load_fsdp_model(
             fsdp_shard_conditions=getattr(model, "_fsdp_shard_conditions", None),
             pin_cpu_memory=pin_cpu_memory,
         )
-        if callable(getattr(model, "refine_prompt_embeds", None)):
-            register_fsdp_forward_method(model, "refine_prompt_embeds")
+        register_fsdp_entrypoints(model)
 
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
 
@@ -282,9 +344,11 @@ def maybe_load_fsdp_model(
     preconverted_state_dict = None
     is_bnb_quantized = _is_bitsandbytes_quant_config(init_params.get("quant_config"))
     if (
-        use_fsdp
+        not weight_load_plan.load_full_state_dict_on_device
+        and use_fsdp
         and weight_dir_list
         and preprocess_loaded_state_dict is None
+        and checkpoint_key_filter is None
         and not is_bnb_quantized
     ):
         preconverted_state_dict = (
@@ -295,9 +359,11 @@ def maybe_load_fsdp_model(
             )
         )
     elif (
-        not use_fsdp
+        not weight_load_plan.load_full_state_dict_on_device
+        and not use_fsdp
         and weight_dir_list
         and preprocess_loaded_state_dict is None
+        and checkpoint_key_filter is None
         and not is_bnb_quantized
     ):
         preconverted_state_dict = (
@@ -309,7 +375,17 @@ def maybe_load_fsdp_model(
         )
 
     if preconverted_state_dict is None:
-        weight_iterator = safetensors_weights_iterator(weight_dir_list)
+        if weight_load_plan.load_full_state_dict_on_device:
+            weight_iterator = safetensors_weights_iterator(
+                weight_dir_list,
+                key_filter=checkpoint_key_filter,
+                weight_load_plan=weight_load_plan,
+            )
+        else:
+            weight_iterator = safetensors_weights_iterator(
+                weight_dir_list,
+                key_filter=checkpoint_key_filter,
+            )
         if preprocess_loaded_state_dict is not None:
             weight_iterator = preprocess_loaded_state_dict(weight_iterator)
         if is_bnb_quantized:
@@ -611,7 +687,8 @@ def load_model_from_full_model_state_dict(
                 sharded_tensor = sharded_tensor.cpu()
         elif not isinstance(meta_sharded_param, dist_tensor.DTensor):
             full_tensor = full_tensor.to(
-                device=checkpoint_load_device, dtype=target_dtype
+                device=checkpoint_load_device,
+                dtype=target_dtype,
             )
             actual_param = rank_local_checkpoint.get_param_for_weight_loading(
                 model, param_dict, target_param_name
@@ -623,30 +700,38 @@ def load_model_from_full_model_state_dict(
             )
             if weight_loader is not None:
                 assert actual_param is not None
-                sharded_tensor = torch.empty_like(
+                if _can_assign_cpu_tensor_without_copy(
+                    actual_param,
+                    full_tensor,
                     meta_sharded_param,
-                    device=checkpoint_load_device,
-                    dtype=target_dtype,
-                )
-                # Preserve requires_grad flag to avoid errors with non-floating dtypes
-                requires_grad = getattr(meta_sharded_param, "requires_grad", False)
-                temp_param = _make_param_like(actual_param, sharded_tensor)
-                if not (
-                    sharded_tensor.is_floating_point() or sharded_tensor.is_complex()
                 ):
-                    requires_grad = False
-                temp_param.requires_grad = requires_grad
-                try:
-                    weight_loader(temp_param, full_tensor)
-                except AssertionError as exc:
-                    raise AssertionError(
-                        "Failed to shard/load parameter "
-                        f"{target_param_name}: full_tensor.shape={tuple(full_tensor.shape)}, "
-                        f"meta_sharded_param.shape={tuple(meta_sharded_param.shape)}, "
-                        f"temp_param.shape={tuple(temp_param.shape)}, "
-                        f"param_cls={type(actual_param).__name__}"
-                    ) from exc
-                sharded_tensor = temp_param.data
+                    sharded_tensor = full_tensor
+                else:
+                    sharded_tensor = torch.empty_like(
+                        meta_sharded_param,
+                        device=checkpoint_load_device,
+                        dtype=target_dtype,
+                    )
+                    # Preserve requires_grad flag to avoid errors with non-floating dtypes
+                    requires_grad = meta_sharded_param.requires_grad
+                    temp_param = _make_param_like(actual_param, sharded_tensor)
+                    if not (
+                        sharded_tensor.is_floating_point()
+                        or sharded_tensor.is_complex()
+                    ):
+                        requires_grad = False
+                    temp_param.requires_grad = requires_grad
+                    try:
+                        weight_loader(temp_param, full_tensor)
+                    except AssertionError as exc:
+                        raise AssertionError(
+                            "Failed to shard/load parameter "
+                            f"{target_param_name}: full_tensor.shape={tuple(full_tensor.shape)}, "
+                            f"meta_sharded_param.shape={tuple(meta_sharded_param.shape)}, "
+                            f"temp_param.shape={tuple(temp_param.shape)}, "
+                            f"param_cls={type(actual_param).__name__}"
+                        ) from exc
+                    sharded_tensor = temp_param.data
             else:
                 # In cases where parts of the model aren't sharded, some parameters will be plain tensors
                 sharded_tensor = full_tensor

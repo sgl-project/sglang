@@ -48,8 +48,8 @@ def test_flux_fused_ln_modulate_is_bit_exact(shape, chunks):
     out = _flux_fused_ln_modulate(norm, x, scale, shift)
     assert out is not None
     assert torch.equal(out, _eager(norm, x, scale, shift))
-    assert not flux._FLUX_FUSED_LN_MOD_DISABLED
-    assert flux._FLUX_FUSED_LN_MOD_VERIFIED
+    assert not flux._FLUX_LN_MOD.disabled
+    assert flux._FLUX_LN_MOD.verified
 
 
 def test_flux_norm_modulate_bitexact_supersedes_high_fold():

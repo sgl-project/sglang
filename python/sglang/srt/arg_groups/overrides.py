@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import json
 import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -51,6 +52,7 @@ from sglang.srt.utils.common import (
     is_gfx95_supported,
     is_hip,
     is_mnnvl_fabric_device,
+    is_mps,
     is_musa,
     is_npu,
     is_sm90_supported,
@@ -60,6 +62,7 @@ from sglang.srt.utils.common import (
     is_xpu,
     xpu_has_xmx_support,
 )
+from sglang.srt.utils.tensor_bridge import use_mlx
 
 logger = logging.getLogger(__name__)
 
@@ -288,12 +291,60 @@ def attention_backends_of(cfg: Any) -> tuple:
     return prefill, decode
 
 
+def modelexpress_transport_of(cfg: Any) -> str:
+    """The modelexpress transport a config-shaped object asks for.
+
+    ``modelexpress_config`` is a JSON string (or an already-parsed dict) rather
+    than a leaf of its own; this is the shared parse for the transfer-engine
+    gate (`remote_instance_transfer_engine_of`) and any future bag reader.
+    ``ServerArgs.modelexpress_transport`` keeps its own instance-cached parse
+    (`_parsed_modelexpress_config`) -- same rule, cached seed-side."""
+    raw = cfg.modelexpress_config
+    if raw is None:
+        parsed = {}
+    elif isinstance(raw, str):
+        parsed = json.loads(raw)
+    else:
+        parsed = raw
+    return parsed.get("transport", "nixl")
+
+
+def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> bool:
+    """Whether remote-instance weight loading runs over the transfer engine.
+
+    ``load_format`` overrides the config's: a draft runner loading under
+    ``--speculative-draft-load-format`` needs its own transfer engine. Every
+    input is a ``model`` leaf, so this serves both the pre-publish member and
+    the post-publish accessor."""
+    if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
+        return True
+    if (load_format or cfg.load_format) != "remote_instance":
+        return False
+    backend = cfg.remote_instance_weight_loader_backend
+    return backend == "transfer_engine" or (
+        backend == "modelexpress"
+        and modelexpress_transport_of(cfg) == "transfer_engine"
+    )
+
+
 def mamba_extra_buffer_of(cfg: Any) -> bool:
     """Mid-resolution equivalent of runtime_context.mamba_extra_buffer_enabled:
-    reads the (possibly overlaid) strategy from a config-shaped object."""
+    reads the (possibly overlaid) strategy from a config-shaped object.
+
+    This is the one definition of the predicate: ``ServerArgs`` delegates its
+    member to it, and the runtime_context accessor is its post-publish sibling
+    (which cannot reuse it, because the two leaves land in different bags)."""
     return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
         "extra_buffer",
         "extra_buffer_lazy",
+    )
+
+
+def mamba_extra_buffer_lazy_of(cfg: Any) -> bool:
+    """The lazy variant of :func:`mamba_extra_buffer_of`."""
+    return (
+        cfg.disable_radix_cache is False
+        and cfg.mamba_radix_cache_strategy == "extra_buffer_lazy"
     )
 
 
@@ -357,13 +408,6 @@ def _dspark_verify_on_decode_backend(
     return False
 
 
-_KIMI_K3_DCP_PATCH_URL = (
-    "https://github.com/sgl-project/sglang/blob/"
-    "b701464720ca22aa1851d5dda7144e84a410f2c7/"
-    "docker/kimi_k3/kimi_k3_cu13.Dockerfile#L116-L123"
-)
-
-
 def _require_kimi_k3_cutedsl_dcp_support() -> None:
     try:
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
@@ -372,17 +416,16 @@ def _require_kimi_k3_cutedsl_dcp_support() -> None:
     except (ImportError, TypeError, ValueError) as exc:
         raise RuntimeError(
             "Kimi-K3 DCP with decode_attention_backend='cutedsl_mla' requires "
-            "a DCP-patched FlashInfer "
-            "trtllm_batch_decode_with_kv_cache_mla exposing enable_dcp in its "
-            f"signature. Apply the patch as shown in {_KIMI_K3_DCP_PATCH_URL}."
+            "FlashInfer 0.6.17 or newer with "
+            "trtllm_batch_decode_with_kv_cache_mla exposing enable_dcp."
         ) from exc
 
     if "enable_dcp" not in parameters:
         raise RuntimeError(
             "Kimi-K3 DCP with decode_attention_backend='cutedsl_mla' requires "
             "enable_dcp in the signature of "
-            "flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla. Apply "
-            f"the FlashInfer DCP patch as shown in {_KIMI_K3_DCP_PATCH_URL}."
+            "flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla; upgrade "
+            "to FlashInfer 0.6.17 or newer."
         )
 
 
@@ -532,43 +575,19 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # MoE runner default, independent of the attention-backend gate above.
     # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on both the decode
     # (M=bs) and the target-verify (M=bs*(gamma+1)) regimes on SM100/SM103;
-    # it hard-requires the SiTU cubin pool on the box (K3's SiTU activation has
-    # no public cubins). Do not silently trade W4A8 for Marlin W4A16 when the
-    # default cannot start; explicit non-FlashInfer runner choices still win.
-    if server_args.moe_runner_backend not in ("auto", "flashinfer_mxfp4"):
+    # FlashInfer 0.6.17+ ships the required SiTU kernels and is a pinned
+    # project dependency.
+    if server_args.moe_runner_backend != "auto":
         return {}
     if not (is_sm100_supported() and get_device_sm() in (100, 103)):
         return {}
     if not _is_mxfp4_pack_quantized(hf_config):
         return {}
-    from sglang.kernels.ops.moe.trtllm_gen_moe import available as _trtllm_gen_moe_ok
-
-    if not _trtllm_gen_moe_ok():
-        raise RuntimeError(
-            "Kimi-K3 on Blackwell with moe_runner_backend='auto' or "
-            "'flashinfer_mxfp4' requires a valid "
-            "SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL. Install it with:\n"
-            "wget https://github.com/sgl-project/whl/releases/download/"
-            "trtllm_gen_moe_cubin_20260617/"
-            "trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip\n"
-            "sudo mkdir -p /opt/trtllm_gen_moe_cubin_pool\n"
-            "sudo unzip -q "
-            "trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip -d "
-            "/opt/trtllm_gen_moe_cubin_pool\n"
-            "export "
-            "SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/opt/trtllm_gen_moe_cubin_pool/"
-            "trtllm_gen_moe_cubin_pool_20260617_v0613rc1\n"
-            "To use Marlin "
-            "instead, set --moe-runner-backend marlin explicitly."
-        )
-
-    if server_args.moe_runner_backend == "auto":
-        logger.info(
-            "Kimi-K3 on SM100/SM103: moe_runner_backend=flashinfer_mxfp4 "
-            "(trtllm-gen SiTU cubin pool found)."
-        )
-        return {"moe_runner_backend": "flashinfer_mxfp4"}
-    return {}
+    logger.info(
+        "Kimi-K3 on SM100/SM103: moe_runner_backend=flashinfer_mxfp4 "
+        "(FlashInfer SiTU kernels)."
+    )
+    return {"moe_runner_backend": "flashinfer_mxfp4"}
 
 
 @_register_for(
@@ -718,10 +737,21 @@ def _mimo_v2_overrides(server_args: Any, hf_config: Any) -> dict:
 
 @_register_for("MiniMaxM2ForCausalLM")
 def _minimax_m2_overrides(server_args: Any, hf_config: Any) -> dict:
+    overrides = {"enable_tf32_matmul": True}
     logger.info(
         "Enable TF32 matmul for MiniMaxM2ForCausalLM model to improve gate gemm performance."
     )
-    return {"enable_tf32_matmul": True}
+    if (
+        is_sm100_supported()
+        and server_args.moe_runner_backend == "auto"
+        and server_args.get_model_config().quantization == "modelopt_fp4"
+    ):
+        overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
+        logger.info(
+            "Use flashinfer_trtllm_routed as MoE runner backend on SM10X "
+            "for MiniMaxM2ForCausalLM with modelopt_fp4."
+        )
+    return overrides
 
 
 @_register_for("MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration")
@@ -909,7 +939,10 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["attention_backend"] = "intel_xpu"
         elif is_hip():
             overrides["attention_backend"] = "aiter"
-        else:
+        elif not (is_mps() and use_mlx()):
+            # Exempt MLX only -- it owns attention in its own runner.  macOS
+            # without MLX still falls through to triton and fails fast below,
+            # rather than landing on torch_native (no sliding window, no sinks).
             overrides["attention_backend"] = "triton"
     if is_xpu():
         # Check for bf16 dtype on Intel XPU. Reads the pristine dtype request,
@@ -1902,6 +1935,14 @@ def _deepseek_v4_sm120_moe(view: Any) -> dict:
     return {}
 
 
+@_register_for("MuseGlimmerForConditionalGeneration", "MuseGlimmerForCausalLM")
+def _muse_glimmer_fp4_gemm_runner_overrides(server_args: Any, hf_config: Any) -> dict:
+    if is_sm120_supported() and server_args.fp4_gemm_runner_backend == "auto":
+        logger.info("Use marlin as FP4 GEMM runner backend on SM120 for Muse Glimmer")
+        return {"fp4_gemm_runner_backend": "marlin"}
+    return {}
+
+
 @register_post_process
 def _sparse_head_overlap_disable(view: Any) -> dict:
 
@@ -1919,6 +1960,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
     {
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
+        "DeepseekV4ForCausalLM",
         "GptOssForCausalLM",
         "GlmMoeDsaForCausalLM",
         "Glm4MoeForCausalLM",
@@ -2013,6 +2055,7 @@ def _deterministic_is_deepseek_model(view: Any) -> bool:
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
+            "Glm4MoeLiteForCausalLM",
         ]
     except Exception:
         return False
@@ -2390,11 +2433,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         elif moe_runner_backend not in [
             "flashinfer_trtllm",
             "flashinfer_trtllm_routed",
+            "flashinfer_cutedsl",
         ]:
             raise ValueError(
                 "--quantization nvfp4_online supports only "
                 "--moe-runner-backend flashinfer_trtllm or "
-                "flashinfer_trtllm_routed."
+                "flashinfer_trtllm_routed, or flashinfer_cutedsl."
             )
     # Ascend runs MXFP8 MoE on the Ascend runner; every backend selected below is
     # CUDA/ROCm-only. Forcing one here would not merely pick the wrong runner:
