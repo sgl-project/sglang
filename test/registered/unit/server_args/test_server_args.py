@@ -567,6 +567,52 @@ class TestCakeLinearAttnBackend(unittest.TestCase):
         "sglang.srt.utils.is_sm100_supported",
         return_value=True,
     )
+    def test_kimi_linear_h32_d128_defaults_ssm_state_to_bfloat16(
+        self, _mock_sm100
+    ):
+        server_args = ServerArgs(model_path="dummy", tp_size=2)
+        hf_config = SimpleNamespace(
+            linear_attn_config={"num_heads": 64, "head_dim": 128}
+        )
+
+        apply_kimi_k3_linear_attn_defaults(
+            server_args,
+            model_arch="KimiLinearForCausalLM",
+            hf_config=hf_config,
+        )
+
+        self.assertEqual(server_args.mamba_ssm_dtype, "bfloat16")
+        self.assertEqual(server_args.linear_attn_decode_backend, "cake")
+        self.assertEqual(server_args.linear_attn_prefill_backend, "cake")
+
+    @patch(
+        "sglang.srt.utils.is_sm100_supported",
+        return_value=True,
+    )
+    def test_kimi_linear_h32_d128_respects_explicit_fp32_ssm_state(
+        self, _mock_sm100
+    ):
+        server_args = ServerArgs(
+            model_path="dummy", mamba_ssm_dtype="float32", tp_size=2
+        )
+        hf_config = SimpleNamespace(
+            linear_attn_config={"num_heads": 64, "head_dim": 128}
+        )
+
+        apply_kimi_k3_linear_attn_defaults(
+            server_args,
+            model_arch="KimiLinearForCausalLM",
+            hf_config=hf_config,
+        )
+
+        self.assertEqual(server_args.mamba_ssm_dtype, "float32")
+        self.assertIsNone(server_args.linear_attn_decode_backend)
+        self.assertIsNone(server_args.linear_attn_prefill_backend)
+
+    @patch(
+        "sglang.srt.utils.is_sm100_supported",
+        return_value=True,
+    )
     def test_kimi_linear_only_auto_routes_exact_per_rank_h32_contract(
         self, _mock_sm100
     ):

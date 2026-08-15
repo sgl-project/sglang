@@ -116,11 +116,15 @@ def apply_kimi_k3_linear_attn_defaults(
     native_kimi_linear = _uses_native_kimi_linear_unbounded_kda(
         server_args, model_arch=model_arch, hf_config=hf_config
     )
-    if (
-        native_kimi_linear
-        and server_args.mamba_ssm_dtype == "bfloat16"
-        and is_sm100_supported()
-    ):
+    if native_kimi_linear and is_sm100_supported():
+        if server_args.mamba_ssm_dtype is None:
+            server_args.mamba_ssm_dtype = "bfloat16"
+            logger.info(
+                "Kimi-Linear H32/D128: defaulting --mamba-ssm-dtype to "
+                "bfloat16 for Cake's native KDA route."
+            )
+        if server_args.mamba_ssm_dtype != "bfloat16":
+            return
         if server_args.linear_attn_decode_backend is None:
             server_args.linear_attn_decode_backend = "cake"
         if server_args.linear_attn_prefill_backend is None:
