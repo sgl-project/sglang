@@ -636,6 +636,34 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             )
             env[tgt_pages] = env[src_pages]
 
+    # The methods below assume per-layer contiguous 3-D buffers indexed by TOKEN
+    # id (or set `_kv_buffer_descs`, which `_create_buffers` here does not).
+    # The dense views are 3-D and contiguous but indexed by DENSE id, so they
+    # would silently accept a token id as a dense row. Fail loudly instead
+    # (mirrors PageMajorMHATokenToKVPool).
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "unified dense layout has no per-layer contiguous regions; "
+            "KV transfer / disaggregation is unsupported."
+        )
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        raise NotImplementedError(
+            "CPU offloading is unsupported under the unified dense layout."
+        )
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        raise NotImplementedError(
+            "CPU offloading is unsupported under the unified dense layout."
+        )
+
+    def set_kv_buffer_prefix_valid(self, *args, **kwargs):
+        raise NotImplementedError(
+            "prefix-valid commit is unsupported under the unified dense layout "
+            "(_set_kv_buffer_prefix_valid_impl assumes token-id indexing)."
+        )
+
 
 class UnifiedMLATokenToKVPool(MLATokenToKVPool):
     """MLA KV pool whose per-layer `kv_buffer` entries are DENSE views into a

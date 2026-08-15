@@ -380,6 +380,20 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
             "envelope move did not relocate exactly the named pages",
         )
 
+    def test_transfer_entry_points_fail_loud(self):
+        """PD / CPU-copy entry points assume per-layer buffers indexed by TOKEN
+        id; against the dense row space they would silently mis-index (or hit a
+        missing-attr AttributeError). Every one of them must raise."""
+        _, pool = _make_pool_and_kv(1)
+        with self.assertRaises(NotImplementedError):
+            pool.get_contiguous_buf_infos()
+        with self.assertRaises(NotImplementedError):
+            pool.get_cpu_copy(torch.tensor([1]))
+        with self.assertRaises(NotImplementedError):
+            pool.load_cpu_copy(None, torch.tensor([1]))
+        with self.assertRaises(NotImplementedError):
+            pool.set_kv_buffer_prefix_valid()
+
     def test_hnd_env_cannot_hijack_layout(self):
         """SGLANG_USE_HND_KVCACHE=1 used to flip the inherited env-driven
         layout selector, putting the pool in a mode whose code paths do not
