@@ -316,8 +316,7 @@ def forward_mla_core_npu(
         )
         torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
     else:
-        # torch.ops.npu.batch_matmul_transpose is not numerically equivalent for
-        # Kimi-K3, so use the numerically validated torch_npu implementation.
+        # Use the numerically validated torch_npu implementation when supported.
         attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
             attn_output,
             m.w_vc,
