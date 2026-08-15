@@ -13,8 +13,8 @@ from sglang.srt.utils import is_cuda
 logger = logging.getLogger(__name__)
 
 
-def make_war_read_done_event(device_module) -> Optional[torch.cuda.Event]:
-    """Create a persistent external event for CUDA graph capture."""
+def make_external_event(device_module) -> Optional[torch.cuda.Event]:
+    """Create a persistent external event, e.g., for CUDA graph capture."""
     if not is_cuda():
         return None
     try:

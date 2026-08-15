@@ -424,13 +424,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
-    def _record_in_graph_read_done(self):
-        # Plant the shared buffer read done in graph
+    def _record_in_graph_metadata_prep_done(self):
+        # This is only a hook right after the in-graph metadata prep.
+        # When the shared buffers are read done is decided by attn backend.
         if (
-            self.model_runner.in_graph_read_done_event is not None
+            self.model_runner.in_graph_metadata_prep_done is not None
             and torch.cuda.is_current_stream_capturing()
         ):
-            self.model_runner.in_graph_read_done_event.record()
+            self.model_runner.in_graph_metadata_prep_done.record()
             self._war_read_done_node_planted = True
 
     def _war_read_done_record(self, attn_backend, forward_mode) -> SharedReadBoundary:
@@ -450,13 +451,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return SharedReadBoundary.PRE_REPLAY
         return boundary
 
-    def _publish_war_read_done(self, in_graph: bool):
-        """Publish the read-done event the scheduler's WAR barrier waits on."""
+    def _publish_read_done(self, in_graph: bool):
         if in_graph:
+            # all reads end exactly after in-graph metadata prep done,
+            # then wire the internal event to read done event.
             self.model_runner.war_fastpath_read_done_event = (
-                self.model_runner.in_graph_read_done_event
+                self.model_runner.in_graph_metadata_prep_done
             )
         else:
+            # Happens out side of graph replay
             read_done = self.device_module.Event()
             read_done.record()
             self.model_runner.war_fastpath_read_done_event = read_done
@@ -1061,7 +1064,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 # run eagerly in `init_forward_metadata_out_graph` (replay-prep), so
                 # the captured graph reads already-physical locs. Base no-op for triton.
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
-                self._record_in_graph_read_done()
+                self._record_in_graph_metadata_prep_done()
 
                 # No invalidate_loc_cache() here: the unified pool translates its
                 # locs in `init_forward_metadata_out_graph`, so no cache to invalidate.
@@ -1319,15 +1322,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     ),
                 )
             if war_record is SharedReadBoundary.PRE_REPLAY:
-                self._publish_war_read_done(in_graph=False)
+                self._publish_read_done(in_graph=False)
 
-            # Replay happens here
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
+            if war_record is SharedReadBoundary.IN_REPLAY:
+                self._publish_read_done(in_graph=True)
+
             if war_record is SharedReadBoundary.POST_REPLAY:
-                self._publish_war_read_done(in_graph=False)
-            elif war_record is SharedReadBoundary.IN_REPLAY:
-                self._publish_war_read_done(in_graph=True)
+                self._publish_read_done(in_graph=False)
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:

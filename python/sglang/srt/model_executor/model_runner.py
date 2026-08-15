@@ -166,7 +166,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.model_executor.runner_utils import make_war_read_done_event
+from sglang.srt.model_executor.runner_utils import make_external_event
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
@@ -406,8 +406,8 @@ class ModelRunner:
         # instead of the whole-forward wait_stream. None -> whole-forward fallback.
         self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
 
-        # Graph runners record this persistent event after shared-state reads.
-        self.in_graph_read_done_event = make_war_read_done_event(
+        # In-graph metadata prep: shared buffers -> in-graph private data
+        self.in_graph_metadata_prep_done = make_external_event(
             torch.get_device_module(self.device)
         )
 
