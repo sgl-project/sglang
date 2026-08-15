@@ -2,6 +2,8 @@
 import os
 from dataclasses import dataclass, field
 
+import torch
+
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTConfig
 from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLConfig,
@@ -19,7 +21,14 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionRequirements,
+)
+from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 
 
 @dataclass
@@ -169,12 +178,23 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     def validate_server_args(self, server_args) -> None:
         # Reject known-inexact VAE modes before any large component download.
         self.vae_config.resolved_parallel_decode_mode()
-        attention_backend = self._server_arg_value(server_args.attention_backend)
-        if str(attention_backend).strip().lower() == "sage_attn":
-            raise ValueError(
-                "MiniMax-H3 does not support SageAttention: the current packed "
-                "varlen path does not preserve model output"
-            )
+        component_backends = server_args.component_attention_backends or {}
+        attention_backend = component_backends.get(
+            "transformer", self._server_arg_value(server_args.attention_backend)
+        )
+        if attention_backend is None:
+            return
+        selected_backend = (
+            attention_backend
+            if isinstance(attention_backend, AttentionBackendEnum)
+            else AttentionBackendEnum[str(attention_backend).strip().upper()]
+        )
+        get_attn_backend(
+            self.dit_config.arch_config.attention_head_dim,
+            torch.bfloat16,
+            selected_attention_backend=selected_backend,
+            attention_requirements=AttentionRequirements(packed_varlen=True),
+        )
 
     def select_vae_weight_files(
         self,

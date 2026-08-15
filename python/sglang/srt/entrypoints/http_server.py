@@ -895,7 +895,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     "error": {
                         "message": str(e),
                         "type": "invalid_request_error",
-                        "code": 400,
+                        "code": getattr(e, "status_code", 400),
                         "retryable": False,
                     }
                 }
@@ -2041,14 +2041,17 @@ async def vertex_generate(
         **(vertex_req.parameters or {}),
     )
     ret = await generate_request(req, raw_request)
-    if isinstance(ret, Response):
-        return ret
+    if isinstance(ret, Response) and ret.status_code == 200 and hasattr(ret, "body"):
+        return ORJSONResponse({"predictions": orjson.loads(ret.body)})
+    return ret
+
     return ORJSONResponse({"predictions": ret})
 
 
 def _create_error_response(e):
     return ORJSONResponse(
-        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        {"error": {"message": str(e)}},
+        status_code=getattr(e, "status_code", HTTPStatus.BAD_REQUEST),
     )
 
 
@@ -2193,6 +2196,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     is_vlm = (
         bool(model_info.get("has_image_understanding", False))
         and not server_args.language_only
+        and not server_args.language_model_only
         and not is_mps()
     )
     if model_info["is_generation"]:
