@@ -518,11 +518,17 @@ def generate_metrics_json(metrics_data_file, test_case, status):
     tc_name = test_case.rsplit("/", 1)[-1].rsplit(".", 1)[0]
 
     test_type = "unknown"
-    # Directory structure: .../tests/output/{branch_label}-{create_date}-{run_id}-{run_attempt}/{workflow_name}/{test_type}/{tc_name}
+    # nightly: .../output/{branch}-{date}-{run_id}-{run_attempt}/{workflow}/{test_type}/...
+    # PR:      .../output/{test_type}/{date}/{tc_name}
+    # After `output`, rest >= 4 segments -> test_type at parts[i+3]; otherwise at parts[i+1].
     parts = metrics_data_file.split("/")
     for i, part in enumerate(parts):
-        if part == "output" and i + 3 < len(parts):
-            test_type = parts[i + 3]
+        if part == "output":
+            rest = len(parts) - (i + 1)
+            if rest >= 4:
+                test_type = parts[i + 3]
+            elif rest >= 1:
+                test_type = parts[i + 1]
             break
 
     output = {
@@ -577,16 +583,20 @@ def run_npu_e2e_test_case(
 
     kube_config_map = f"sglang-configmap-{random_str}"
     final_kube_job_name = f"{kube_job_name_prefix}-{random_str}"
-    # run_label is derived from the persistence directory (first two segments:
-    # {branch_label}-{create_date}-{run_id}-{run_attempt}/{workflow_name}) and is injected into the
-    # pod as RUN_LABEL env var to build the pod log directory prefix
+    # run_label is injected into the pod as RUN_LABEL to build the pod log directory prefix.
+    # nightly (>=4 segments after `output`): first two segments {branch}-{date}-{run_id}-{run_attempt}/{workflow}
+    # PR legacy layout: fall back to the date segment to keep the original {date}/{tc_name}/{host} path.
     parts = (
         metrics_data_file.split("/output/")[-1]
         if "/output/" in metrics_data_file
         else ""
     )
     if parts:
-        run_label = "/".join(parts.split("/")[:2])
+        segments = parts.split("/")
+        if len(segments) >= 4:
+            run_label = "/".join(segments[:2])
+        else:
+            run_label = segments[1] if len(segments) > 1 else "unknown"
     else:
         run_label = "unknown"
 

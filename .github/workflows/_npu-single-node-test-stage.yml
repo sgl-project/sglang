@@ -374,7 +374,10 @@ jobs:
 
           # Nightly additionally persists the full suite log to ${log_path}/${tc_name}.log
           # under the structured path; PR runs only tee to /tmp/test_output.log.
-          LOG_TEE_TARGET="$([ "${{ inputs.is_nightly_pipeline_job }}" = "true" ] && echo "${log_path}/${tc_name}.log")"
+          LOG_TEE_TARGET=""
+          if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
+            LOG_TEE_TARGET="${log_path}/${tc_name}.log"
+          fi
 
           # Run NPU test suite with run_suite.py.
           ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log ${LOG_TEE_TARGET} || test_exit_code=$?
