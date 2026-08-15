@@ -405,8 +405,9 @@ class ModelRunner:
         # load_batch; the scheduler's WAR barrier waits on it (then clears it)
         # instead of the whole-forward wait_stream. None -> whole-forward fallback.
         self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
+
         # Graph runners record this persistent event after shared-state reads.
-        self.war_read_done_event = make_war_read_done_event(
+        self.in_graph_read_done_event = make_war_read_done_event(
             torch.get_device_module(self.device)
         )
 

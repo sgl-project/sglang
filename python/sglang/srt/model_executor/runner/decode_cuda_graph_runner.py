@@ -427,10 +427,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _plant_war_read_done_node(self):
         # Plant the shared buffer read done in graph
         if (
-            self.model_runner.war_read_done_event is not None
+            self.model_runner.in_graph_read_done_event is not None
             and torch.cuda.is_current_stream_capturing()
         ):
-            self.model_runner.war_read_done_event.record()
+            self.model_runner.in_graph_read_done_event.record()
             self._war_read_done_node_planted = True
 
     def _war_read_done_record(self, attn_backend, forward_mode) -> SharedReadBoundary:
@@ -454,7 +454,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """Publish the read-done event the scheduler's WAR barrier waits on."""
         if in_graph:
             self.model_runner.war_fastpath_read_done_event = (
-                self.model_runner.war_read_done_event
+                self.model_runner.in_graph_read_done_event
             )
         else:
             read_done = self.device_module.Event()
