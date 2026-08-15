@@ -1,6 +1,7 @@
 """CPU coverage for Kimi-K2.5/K2.7 encoder-DP wiring."""
 
 import asyncio
+import functools
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -610,6 +611,8 @@ def test_kimi_processor_workers_share_the_placeholder_contract(
         mm_processor_worker_num=0,
         tokenizer_worker_num=1,
         base_gpu_id=0,
+        allowed_media_domains=[],
+        media_url_max_file_size_mb=64,
     )
     processor = processor_cls(
         hf_config=SimpleNamespace(media_placeholder_token_id=42),
@@ -705,6 +708,7 @@ def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
 def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
     from sglang.srt.multimodal.kimi_k3_image_processing import (
         DEFERRED_PREPROCESSING_KEY,
+        KimiK3DeferredPreprocessing,
     )
 
     processor = object.__new__(KimiK3ImageProcessor)
@@ -732,11 +736,13 @@ def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
                         "pad_height": 2,
                     },
                 ],
-                {
-                    "image_mean": [0.5, 0.5, 0.5],
-                    "image_std": [0.5, 0.5, 0.5],
-                    "transparent_bg_config": None,
-                },
+                functools.partial(
+                    KimiK3DeferredPreprocessing,
+                    backend="gpu",
+                    image_mean=[0.5, 0.5, 0.5],
+                    image_std=[0.5, 0.5, 0.5],
+                    transparent_bg_config=None,
+                ),
             )
         ),
     )
@@ -766,10 +772,13 @@ def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
     ]
     assert all(item.hash is not None for item in output.mm_items)
     assert all(item.pad_value is not None for item in output.mm_items)
-    assert all(
-        DEFERRED_PREPROCESSING_KEY in item.model_specific_data
-        for item in output.mm_items
-    )
+    deferred = [
+        item.model_specific_data[DEFERRED_PREPROCESSING_KEY] for item in output.mm_items
+    ]
+    # The staged features are CHW uint8, so the config has to route them to the
+    # GPU arm of `materialize_item_features`.
+    assert [config.backend for config in deferred] == ["gpu", "gpu"]
+    assert [config.resize_config["new_width"] for config in deferred] == [4, 2]
 
 
 @pytest.mark.parametrize(

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import json
 import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -288,6 +289,42 @@ def attention_backends_of(cfg: Any) -> tuple:
         else cfg.attention_backend
     )
     return prefill, decode
+
+
+def modelexpress_transport_of(cfg: Any) -> str:
+    """The modelexpress transport a config-shaped object asks for.
+
+    ``modelexpress_config`` is a JSON string (or an already-parsed dict) rather
+    than a leaf of its own; this is the shared parse for the transfer-engine
+    gate (`remote_instance_transfer_engine_of`) and any future bag reader.
+    ``ServerArgs.modelexpress_transport`` keeps its own instance-cached parse
+    (`_parsed_modelexpress_config`) -- same rule, cached seed-side."""
+    raw = cfg.modelexpress_config
+    if raw is None:
+        parsed = {}
+    elif isinstance(raw, str):
+        parsed = json.loads(raw)
+    else:
+        parsed = raw
+    return parsed.get("transport", "nixl")
+
+
+def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> bool:
+    """Whether remote-instance weight loading runs over the transfer engine.
+
+    ``load_format`` overrides the config's: a draft runner loading under
+    ``--speculative-draft-load-format`` needs its own transfer engine. Every
+    input is a ``model`` leaf, so this serves both the pre-publish member and
+    the post-publish accessor."""
+    if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
+        return True
+    if (load_format or cfg.load_format) != "remote_instance":
+        return False
+    backend = cfg.remote_instance_weight_loader_backend
+    return backend == "transfer_engine" or (
+        backend == "modelexpress"
+        and modelexpress_transport_of(cfg) == "transfer_engine"
+    )
 
 
 def mamba_extra_buffer_of(cfg: Any) -> bool:
@@ -2396,11 +2433,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         elif moe_runner_backend not in [
             "flashinfer_trtllm",
             "flashinfer_trtllm_routed",
+            "flashinfer_cutedsl",
         ]:
             raise ValueError(
                 "--quantization nvfp4_online supports only "
                 "--moe-runner-backend flashinfer_trtllm or "
-                "flashinfer_trtllm_routed."
+                "flashinfer_trtllm_routed, or flashinfer_cutedsl."
             )
     # Ascend runs MXFP8 MoE on the Ascend runner; every backend selected below is
     # CUDA/ROCm-only. Forcing one here would not merely pick the wrong runner:

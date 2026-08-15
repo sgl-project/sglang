@@ -261,8 +261,20 @@ def _write_backup(cache, node, write_back: bool = False) -> int:
     )
 
 
-def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
-    """Create (tree, allocator, req_to_token_pool) from a CacheConfig."""
+def build_fixture(
+    cfg: CacheConfig,
+    *,
+    enable_kv_cache_events: bool = False,
+    tree_page_size: Optional[int] = None,
+    mamba_cache_chunk_size: Optional[int] = None,
+):
+    """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
+
+    ``tree_page_size`` stands in for DCP, which widens the tree page past the
+    ``page_size`` the rest of the config still sees. It only reaches values
+    derived from the tree page: the allocator keeps ``cfg.page_size``, whereas
+    DCP sets the two equal, so do not read insert or match behaviour off it.
+    """
     server_args = ServerArgs(
         model_path="dummy",
         page_size=cfg.page_size,
@@ -271,7 +283,11 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
     # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
     # loads the HF config for self.model_path — impossible for the dummy model.
     # Mirror the property's default for a dummy HF config: FLA_CHUNK_SIZE.
-    server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, cfg.page_size)
+    server_args._mamba_cache_chunk_size = (
+        max(FLA_CHUNK_SIZE, cfg.page_size)
+        if mamba_cache_chunk_size is None
+        else mamba_cache_chunk_size
+    )
     set_global_server_args_for_scheduler(server_args)
     device = get_device()
 
@@ -372,7 +388,7 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
     cache_init_params = CacheInitParams(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=allocator,
-        page_size=cfg.page_size,
+        page_size=cfg.page_size if tree_page_size is None else tree_page_size,
         disable=False,
         sliding_window_size=cfg.sliding_window_size,
         tree_components=cfg.components,
@@ -559,9 +575,9 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         seq = [1, 2, 3, 4]
         self._insert(cache, allocator, seq)
         stored = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(stored), 2)
-        self.assertEqual([list(e.token_ids) for e in stored], [[1, 2], [3, 4]])
-        stored_hashes = [e.block_hashes[0] for e in stored]
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(list(stored[0].token_ids), [1, 2, 3, 4])
+        stored_hashes = self._event_hashes(stored)
 
         result = cache.evict(EvictParams(num_tokens=len(seq)))
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
@@ -575,7 +591,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
         self._insert(cache, allocator, [1, 2, 3, 4])
         first_insert = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(first_insert), 2)
+        self.assertEqual(len(first_insert), 1)
         split_parent_hash = first_insert[0].block_hashes[0]
 
         self._insert(cache, allocator, [1, 2, 5, 6])
@@ -599,13 +615,13 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         seq = [1, 2, 3, 4]
         self._insert(cache, allocator, seq)
         stored_gpu = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(stored_gpu), 2)
-        stored_hashes = [e.block_hashes[0] for e in stored_gpu]
+        self.assertEqual(len(stored_gpu), 1)
+        stored_hashes = self._event_hashes(stored_gpu)
 
         node = self._leaf_for(cache, seq)
         self._backup_node(cache, node)
         stored_cpu = self._stored_events(cache, StorageMedium.CPU)
-        self.assertCountEqual([e.block_hashes[0] for e in stored_cpu], stored_hashes)
+        self.assertCountEqual(self._event_hashes(stored_cpu), stored_hashes)
 
         cache.evict(EvictParams(num_tokens=len(seq)))
         removed_gpu = self._removed_events(cache, StorageMedium.GPU)
@@ -613,7 +629,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
         self._load_back_node(cache, node)
         restored_gpu = self._stored_events(cache, StorageMedium.GPU)
-        self.assertCountEqual([e.block_hashes[0] for e in restored_gpu], stored_hashes)
+        self.assertCountEqual(self._event_hashes(restored_gpu), stored_hashes)
 
         cache.evict(EvictParams(num_tokens=len(seq)))
         self._removed_events(cache, StorageMedium.GPU)
@@ -648,14 +664,12 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             [[1, 2], [3, 4]],
         )
 
-        # Both split fragments must be published, with intact parentage.
+        # Both split fragments must be published as one parent-linked batch.
         stored_cpu = self._stored_events(cache, StorageMedium.CPU)
-        self.assertEqual(
-            [list(e.token_ids) for e in stored_cpu],
-            [[1, 2], [3, 4]],
-        )
+        self.assertEqual(len(stored_cpu), 1)
+        self.assertEqual(list(stored_cpu[0].token_ids), [1, 2, 3, 4])
         self.assertIsNone(stored_cpu[0].parent_block_hash)
-        self.assertEqual(stored_cpu[1].parent_block_hash, stored_cpu[0].block_hashes[0])
+        self.assertEqual(len(stored_cpu[0].block_hashes), 2)
 
     def test_hicache_reinsert_evicted_node_emits_gpu_store(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
@@ -665,8 +679,8 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         seq = [1, 2, 3, 4]
         self._insert(cache, allocator, seq)
         stored_gpu = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(stored_gpu), 2)
-        stored_hashes = [e.block_hashes[0] for e in stored_gpu]
+        self.assertEqual(len(stored_gpu), 1)
+        stored_hashes = self._event_hashes(stored_gpu)
 
         node = self._leaf_for(cache, seq)
         self._backup_node(cache, node)
@@ -680,7 +694,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self._insert(cache, allocator, seq)
         restored_gpu = self._stored_events(cache, StorageMedium.GPU)
         self.assertFalse(node.evicted)
-        self.assertCountEqual([e.block_hashes[0] for e in restored_gpu], stored_hashes)
+        self.assertCountEqual(self._event_hashes(restored_gpu), stored_hashes)
 
 
 class UnifiedRadixCacheSuite:
@@ -5161,6 +5175,41 @@ class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
         order = self._mamba_lru_mru_to_lru(cache)
         self.assertIs(order[0], b1)
         self.assertGreater(order.index(a1), order.index(a2))
+
+
+class TestMambaCheckpointGrid(CustomTestCase):
+    """A donated mamba checkpoint is only reusable at a depth the tree can name.
+
+    ``tree_page_size`` simulates DCP: it widens the page the tree allocates on
+    while ``page_size`` and the mamba chunk grid stay where they are, which is
+    exactly the split that lets a checkpoint land between two node boundaries.
+    """
+
+    cfg = CacheConfig(
+        page_size=64,
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        kv_size=1024,
+        max_context_len=1024,
+    )
+
+    def _grid(self, cache):
+        component = next(
+            c
+            for c in cache._components_tuple
+            if c.component_type is ComponentType.MAMBA
+        )
+        return component.mamba_checkpoint_grid
+
+    def test_grid_follows_the_widened_tree_page(self):
+        cache, _, _ = build_fixture(
+            self.cfg, tree_page_size=256, mamba_cache_chunk_size=64
+        )
+        self.assertEqual(self._grid(cache), 256)
+
+    def test_grid_is_the_chunk_size_without_widening(self):
+        cache, _, _ = build_fixture(self.cfg, mamba_cache_chunk_size=64)
+        self.assertEqual(self._grid(cache), 64)
 
 
 class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):

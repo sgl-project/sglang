@@ -19,6 +19,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal.cache import (
+    MultimodalPreprocessCache,
+    build_processor_fingerprint,
+)
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
@@ -28,6 +32,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 )
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
+    configure_media_url_security,
     envs,
     is_cpu,
     is_npu,
@@ -185,6 +190,7 @@ class BaseMultimodalProcessor(ABC):
     preserve_processor_input_ids = False
     auto_mm_processor_worker_num = 1
     auto_mm_io_worker_num = 4
+    auto_mm_preprocess_cache_size_mb = 0
     supports_mm_processor_concurrency = False
 
     def __init__(
@@ -194,6 +200,10 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
+        configure_media_url_security(
+            server_args.allowed_media_domains,
+            server_args.media_url_max_file_size_mb,
+        )
         configured_mm_feature_transport = getattr(
             server_args, "mm_feature_transport", "cpu"
         )
@@ -218,6 +228,41 @@ class BaseMultimodalProcessor(ABC):
         self.image_config = mm_process_config.get("image", {})
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
+
+        requested_cache_mb = getattr(
+            self.server_args, "mm_preprocess_cache_size_mb", None
+        )
+        total_cache_mb = (
+            self.auto_mm_preprocess_cache_size_mb
+            if requested_cache_mb is None
+            else requested_cache_mb
+        )
+        tokenizer_worker_num = max(
+            int(getattr(self.server_args, "tokenizer_worker_num", 1)), 1
+        )
+        worker_cache_bytes = total_cache_mb * 1024 * 1024 // tokenizer_worker_num
+        self.mm_preprocess_cache = MultimodalPreprocessCache(
+            max_size_bytes=worker_cache_bytes,
+            max_entries=8192,
+        )
+        self.trust_mm_content_hashes = bool(
+            getattr(self.server_args, "trust_mm_content_hashes", False)
+        )
+        self.processor_fingerprint = (
+            build_processor_fingerprint(self, hf_config, server_args)
+            if self.mm_preprocess_cache.enabled
+            else None
+        )
+        if self.mm_preprocess_cache.enabled:
+            logger.info(
+                "Multimodal preprocess cache enabled for %s: %d MiB total "
+                "(%d MiB per tokenizer worker), at most 8192 entries; "
+                "caller content hashes are %s.",
+                type(self).__name__,
+                total_cache_mb,
+                worker_cache_bytes // (1024 * 1024),
+                "trusted" if self.trust_mm_content_hashes else "verified",
+            )
 
         # Resolve tokenizer: some processors (e.g. InternVL) pass a tokenizer
         # directly as _processor rather than a processor that wraps a tokenizer.
@@ -374,6 +419,30 @@ class BaseMultimodalProcessor(ABC):
     @property
     def keep_mm_features_on_device(self) -> bool:
         return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm")
+
+    def preprocess_fingerprint_payload(self) -> dict[str, Any]:
+        """Stable processor choices that may change per-media artifacts."""
+        return {
+            "wrapper_class": (
+                f"{type(self._processor).__module__}."
+                f"{type(self._processor).__qualname__}"
+            ),
+            "gpu_image_decode": self.gpu_image_decode,
+            "image_config": self.image_config,
+            "video_config": self.video_config,
+            "audio_config": self.audio_config,
+        }
+
+    def clear_preprocess_cache(self) -> None:
+        self.mm_preprocess_cache.clear()
+
+    def shutdown(self) -> None:
+        """Release executor resources and cached CPU artifacts."""
+        self.clear_preprocess_cache()
+        self.io_executor.shutdown(wait=False, cancel_futures=True)
+        self.cpu_executor.shutdown(wait=False, cancel_futures=True)
+        if self.mm_processor_executor is not None:
+            self.mm_processor_executor.shutdown()
 
     def compute_mrope_positions(self, input_ids, mm_items):
         """Compute M-RoPE positions from expanded input_ids and multimodal items.
@@ -938,7 +1007,6 @@ class BaseMultimodalProcessor(ABC):
         discard_alpha_channel: bool = True,
         audio_sample_rate: Optional[int] = None,
     ) -> BaseMultiModalProcessorOutput:
-
         BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
 
         input_ids = prompt if isinstance(prompt, list) else None
