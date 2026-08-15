@@ -40,7 +40,6 @@ def _runner(*, target_verify_war: bool = False, planted: bool = False):
         spec_algorithm=_SpecAlgorithm(target_verify_war),
         device_timer=None,
         is_draft_worker=False,
-        war_read_done_event=None,
         war_fastpath_read_done_event=None,
         in_graph_metadata_prep_done=object() if planted else None,
     )
