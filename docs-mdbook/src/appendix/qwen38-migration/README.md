@@ -68,13 +68,13 @@ curl -sL https://huggingface.co/Qwen/Qwen3.8-27B/resolve/main/config.json | pyth
 
 | 项 | 风险 | 应对 |
 |----|------|------|
-| SGLang 版本 | ~~main 分支每日变化~~ → **已消除**：Qwen3.5 架构 v0.5.10 起支持（PR #18489），0.5.17 含 qwen3_5 / qwen3_5_text / qwen3_5_mtp | 无需为模型层升级；如需 `--language-model-only` 强制文本加载多模态权重，需等含 #22867 的版本 |
+| SGLang 版本 | ~~main 分支每日变化~~ → **已消除**：Qwen3.5 架构 v0.5.10 起支持（PR #18489），0.5.17 含 qwen3_5 / qwen3_5_text / qwen3_5_mtp | 无需为模型层升级；强制文本加载用 #22867 的 config 字段路径（2026-08-15 修正，见 8.3） |
 | sgl-kernel | 新版本预编译为 CUDA 12.8，缺 libcudart.so.13 | 源码编译 sm_89 only（附录 C 2.4 流程重走） |
 | load_utils 路由 | main 分支可能重构目录/命名 | 重查 `compute_capability` 路由逻辑（附录 C 2.1/2.2） |
 | stubs | 新内核符号集变化 | 重查 undefined symbol 清单（附录 C 2.3） |
 | flashinfer | 版本可能升级 | 重查 python/cubin 版本对齐（附录 C 2.5） |
 | 安装方式 | pip 安装 build_wheel 嵌套 bug | 沿用 rsync + 删 editable（附录 C 2.6） |
-| 多模态权重 | config `language_model_only=false`，含 vision tower；**0.5.17 的 qwen3_5 不识别 `--language-model-only`**（#22867 在 main，2026-08-10） | 预研环境实测 vision 显存增量；或等 #22867 版本后强制文本加载；或确认官方是否另发 text-only checkpoint |
+| 多模态权重 | config `language_model_only=false`，含 vision tower；0.5.17 无 #22867，无法跳过视觉塔 | 预研环境实测 vision 显存增量；或在 ≥08-10 的源码（含 08-13 Muse-Glimmer 镜像）上用 `--json-model-override-args '{"language_model_only": true}'` 强制文本加载（见 8.3）；或确认官方是否另发 text-only checkpoint |
 | MTP / FP8 | 量化转档可能丢弃 `mtp.safetensors`（Qwen3.6 已有先例） | 权重目录内确认 MTP 权重存在；缺失则需带 MTP 的 FP8 转档流程 |
 
 **决策规则**：
@@ -163,13 +163,13 @@ CUDA_VISIBLE_DEVICES=6 python3.12 -m sglang.launch_server \
 |---|---|
 | Qwen3.5 架构支持 | v0.5.10 起（PR #18489 `model: support Qwen3.5`）→ **0.5.17 自带 qwen3_5.py / qwen3_5_text.py / qwen3_5_mtp.py** |
 | 文本单模态 checkpoint | v0.5.17 已支持（PR #32401） |
-| `--language-model-only` 对 Qwen3.5 生效 | 2026-08-10 合入 main（PR #22867），**不在 0.5.17** |
+| 强制文本加载（跳过视觉塔） | **#22867（2026-08-10 合入 main，不在 0.5.17）**：读 HF config 的 `language_model_only` 字段，用法 `--json-model-override-args '{"language_model_only": true}'`。⚠️ 区别于 CLI 旗标 `--language-model-only`——后者由 Muse Glimmer 支持（#34262，08-11）引入，白名单仅 `MuseGlimmerForConditionalGeneration`，对 Qwen3_5 直接 ValueError（2026-08-15 核实，当前 main 仍如此） |
 | 原预研假设"0.5.17 不支持 Qwen3.5、必须 main + 重打补丁" | **不成立**（模型层 0.5.17 已支持） |
 
 ### 8.4 迁移影响
 
 - **模型层：0.5.17 可直接加载**，无需升级 SGLang，也无需为 Qwen3.5 重打 L40S 补丁栈（Qwen3.6 与 Qwen3.5 同为混合线性注意力，kernel 路径一致）；
-- **多模态权重**：`language_model_only=false` 意味着完整 checkpoint 带 vision tower；0.5.17 的 qwen3_5 不会跳过视觉塔，显存会增大（vision 27 层 / hidden 1152 / patch 16 / temporal 2，估算 1~3GB 级）。若只想跑文本：等含 #22867 的版本用 `--language-model-only`，或确认官方是否另发 text-only checkpoint；
+- **多模态权重**：`language_model_only=false` 意味着完整 checkpoint 带 vision tower；0.5.17 的 qwen3_5 不会跳过视觉塔，显存会增大（vision 27 层 / hidden 1152 / patch 16 / temporal 2，估算 1~3GB 级）。若只想跑文本：用 ≥08-10 的源码 + `--json-model-override-args '{"language_model_only": true}'`（#22867，详见 8.3；CLI 旗标 `--language-model-only` 对 Qwen3_5 无效），或确认官方是否另发 text-only checkpoint；
 - **MTP**：config 声明 1 层 MTP，SGLang draft 路径匹配（`Qwen3_5ForConditionalGeneration` → `Qwen3_5ForCausalLMMTP`，`num_nextn_predict_layers=1`）。**生产路径用 FP8 变体（含 `mtp.safetensors`），MTP 直接可用**；BF16 变体无独立 MTP 文件，若需用 BF16 再查 index 是否内嵌 `mtp.*` 键：
   ```bash
   # 仅 BF16 变体需要：有输出 = MTP 权重内嵌在主分片，0.5.17 可直接验证
@@ -308,3 +308,14 @@ hybrid GDN 架构中，48 层 GDN 的状态定长（~146MB/req，不占 KV 池�
 3. **按第 4 节清单单卡冒烟**：启动日志检查 → 一条真实请求 → `qwen3` / `qwen3_coder` parser 验证 → MTP 生效确认（看 accept length）。预计当天出结果。
 
 冒烟全绿后，生产切换只是改 `--model-path` 和 `--served-model-name`，TP=2 DP=3 及其余参数全部沿用（复用审计明细见 10.2）。
+
+### 11.3 备选部署载体：08-13 Muse-Glimmer 镜像
+
+08-13 基于新源码构建的 Muse-Glimmer 镜像**同样可以直接部署 Qwen3.8-27B**，且比 08-04 生产镜像多一个"纯文本模式"选项：
+
+- 该镜像源码晚于 08-10 → 含 #22867，可用 `--json-model-override-args '{"language_model_only": true}'` 跳过视觉塔、回收 1~3GB 显存（8.3 已修正：CLI 旗标 `--language-model-only` 白名单仅限 MuseGlimmer，对 Qwen3_5 无效，勿用）；
+- 该镜像同样含 qwen3_5 全套模型实现，3.8-27B 加载无障碍；
+- **前提**：确认该镜像的 sglang-kernel / flashinfer 是按 L40S（sm_89、CUDA 12.1）环境编译的——若 Muse-Glimmer 镜像面向其他硬件构建，则不可用，仍走 08-04 生产镜像；
+- 注意新源码基线风险（10.1）：kernel 0.4.6.post1 / flashinfer ≥0.6.17 断言，MTP + flashinfer 需 > 0.6.15.post1，否则 spec 路径走 `--attention-backend triton`。
+
+选择建议：**生产迁移仍以 08-04 镜像（0.5.17）为首选**——补丁栈已验证、风险最小；08-13 镜像作为"需要纯文本模式回收显存"时的备选，启用前先按 10.1 核对基线。
