@@ -9,7 +9,6 @@ ARG SGL_VERSION
 ARG SGL_DEEP_GEMM_VERSION=0.1.5.post2
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
-ARG NCCL_VERSION=2.30.7
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
@@ -174,7 +173,6 @@ ARG CUDA_VERSION
 ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
 ARG GITHUB_ARTIFACTORY
-ARG NCCL_VERSION
 
 WORKDIR /sgl-workspace
 
@@ -250,10 +248,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
        fi \
     && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
-    && if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-           python3 -m pip install --force-reinstall --no-deps \
-               "nvidia-nccl-cu13==${NCCL_VERSION}"; \
-       fi \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
