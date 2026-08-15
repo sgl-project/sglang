@@ -83,16 +83,22 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         get_model_architecture.assert_not_called()
 
     def test_vmm_transport_initializes_pool(self):
+        from sglang.srt.runtime_context import get_context
         from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 
         server_args = SimpleNamespace(
             mm_feature_transport="cuda_vmm",
             tokenizer_worker_num=2,
             base_gpu_id=3,
-            enable_dp_attention=False,
             tp_size=4,
             nnodes=1,
         )
+        # The consumer count comes from the published topology.
+        override = get_context().override_server_args(
+            enable_dp_attention=False, tp_size=4
+        )
+        override.install()
+        self.addCleanup(override.restore)
         pool = object()
         with (
             patch.object(vmm, "get_mm_feature_pool_size_per_worker", return_value=123),
