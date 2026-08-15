@@ -4,9 +4,12 @@ from unittest import mock
 
 import transformers
 
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
     TextEncoderLoader,
+    _configure_text_encoder_quantization,
 )
+from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
 )
@@ -100,6 +103,43 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
             {name: should_load(name) for name in expected},
             expected,
         )
+
+
+class TestTextEncoderQuantization(unittest.TestCase):
+    def setUp(self):
+        serialized = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+        )
+        self.quant_config_patcher = mock.patch(
+            "sglang.multimodal_gen.runtime.loader.component_loaders."
+            "text_encoder_loader.get_quant_config",
+            return_value=serialized,
+        )
+        self.get_quant_config = self.quant_config_patcher.start()
+        self.addCleanup(self.quant_config_patcher.stop)
+        self.serialized = serialized
+
+    def test_serialized_fp8_checkpoint_configures_h3_encoder(self):
+        model_config = SimpleNamespace(quant_config=None)
+        _configure_text_encoder_quantization(
+            model_config,
+            MiniMaxH3Qwen3VLEncoder,
+            {},
+            "/model/text_encoder",
+        )
+        self.assertIs(model_config.quant_config, self.serialized)
+
+    def test_encoder_class_must_opt_in(self):
+        model_config = SimpleNamespace(quant_config=None)
+        with self.assertRaisesRegex(ValueError, "does not support"):
+            _configure_text_encoder_quantization(
+                model_config,
+                TextEncoder,
+                {},
+                "/model/text_encoder",
+            )
 
 
 if __name__ == "__main__":

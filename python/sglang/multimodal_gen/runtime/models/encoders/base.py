@@ -174,6 +174,9 @@ class TextEncoder(
     # Qwen2_5_VLCausalLMOutputWithPast). Off by default so a new encoder is
     # replicated rather than silently broken; flip it once dp is verified there.
     supports_dp_encode = False
+    # Quantized checkpoints are opt-in because an encoder must construct
+    # quantized linears and load the checkpoint's auxiliary scale parameters.
+    supported_checkpoint_quantization_methods: frozenset[str] = frozenset()
     layerwise_offload_dit_group_enabled = False
     layer_names = [
         "layers",
