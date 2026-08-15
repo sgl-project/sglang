@@ -149,11 +149,20 @@ class MLPSyncBatchInfo:
             rank = torch.distributed.get_rank(group)
             if 0 <= rank < flat_info.shape[0]:
                 flat_info[rank] = local_info_tensor
-            torch.distributed.all_reduce(
+            # Retried: Mooncake can transiently reject this on the first
+            # post-shrink tick while its bitmap catches up to active_ranks.
+            from sglang.srt.elastic_ep.elastic_ep import (
+                mooncake_all_reduce_transient_retry,
+            )
+            mooncake_all_reduce_transient_retry(
                 global_info_tensor,
                 op=torch.distributed.ReduceOp.SUM,
                 group=group,
             )
+            # Cheap scalar sync so tick N+1's collective can't fire before
+            # Mooncake settles tick N; b3c02cbce7 dropped the .item() that
+            # used to provide this incidentally.
+            global_info_tensor.sum().item()
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
         else:
@@ -179,6 +188,10 @@ class MLPSyncBatchInfo:
             )
         tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
 
+        # One D2H for every field: each `.item()` / `.tolist()` on a device
+        # tensor is its own stream sync. Copy the whole tensor, not the
+        # `[:, 0, :]` slice -- that slice is non-contiguous once
+        # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
         tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()

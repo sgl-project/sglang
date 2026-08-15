@@ -95,6 +95,7 @@ def capture_cuda_graphs(
     because they capture their own decode-style graphs separately.
 
     """
+
     model_runner.graph_shared_output = GraphSharedOutput.create_for_model_runner(
         model_runner
     )

@@ -358,12 +358,10 @@ class GroupCoordinator:
                         f"max_world_size ({max_world_size}) must be >= "
                         f"group size ({len(ranks)})"
                     )
-                    # Only reserve headroom when max_world_size > len(ranks).
-                    if max_world_size > len(ranks):
-                        pg_active_size = max_world_size
-                elif recovered_rank and max_world_size is not None and max_world_size >= len(ranks):
-                    # Recover path: attach to existing pool with full max_ws mask.
                     pg_active_size = max_world_size
+                elif recovered_rank and max_world_size is not None:
+                    # Recover: attach to the existing pool with the full mask.
+                    pg_active_size = max(max_world_size, len(ranks))
                 pass_max_ws = pg_active_size == max_world_size
 
                 pg_active_ranks = torch.zeros(

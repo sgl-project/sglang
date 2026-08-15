@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from enum import Enum, auto
 
 import torch
@@ -84,14 +83,11 @@ class NixlEPBuffer:
         state = cls._state()
         if state.buffer is None:
             return
-        t0 = time.monotonic()
         cls._disconnect_ranks(state, list(retiree_ranks), tag="retire")
         new_size = min(retiree_ranks)
         state.connected_ep_size = new_size
         state.scale_to = new_size
         state.dispatch_ep_size = new_size
-        logger.info("[Elastic EP][nixl] on_retire retiree=%s new=%d took=%.3fs",
-                    list(retiree_ranks), new_size, time.monotonic() - t0)
 
     @classmethod
     def _connect_ranks(cls, state, ranks: list, *, tag: str) -> None:

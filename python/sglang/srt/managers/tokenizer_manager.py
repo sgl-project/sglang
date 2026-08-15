@@ -3259,52 +3259,57 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: ScaleElasticEPReqInput
     ) -> ScaleElasticEPReqOutput:
         """Send a scale request to every DP scheduler."""
-        # Lock: serialize concurrent HTTP-driven scale requests.
+        # Serialize concurrent HTTP-driven scale requests.
         async with self._elastic_scale_lock:
-            if self.elastic_pending_ep_size is not None:
-                return ScaleElasticEPReqOutput(
-                    success=False,
-                    message=(
-                        "A previous scale operation has not completed yet. Wait until "
-                        "all pending ranks have joined before issuing another scale."
-                    ),
-                    old_ep_size=self.elastic_worker_count,
-                    new_ep_size=obj.new_ep_size,
-                    pending_ep_size=self.elastic_pending_ep_size,
-                    scale_phase=self.elastic_scale_phase,
-                )
-            self.auto_create_handle_loop()
+            return await self._scale_elastic_ep_locked(obj)
 
-            # Eagerly close shrink gate + publish pending; reopened on completion/failure.
-            is_shrink = obj.new_ep_size < self.elastic_worker_count
-            self.elastic_pending_ep_size = obj.new_ep_size
-            self.elastic_scale_phase = "waiting_for_cohort"
+    async def _scale_elastic_ep_locked(
+        self, obj: ScaleElasticEPReqInput
+    ) -> ScaleElasticEPReqOutput:
+        if self.elastic_pending_ep_size is not None:
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    "A previous scale operation has not completed yet. Wait until "
+                    "all pending ranks have joined before issuing another scale."
+                ),
+                old_ep_size=self.elastic_worker_count,
+                new_ep_size=obj.new_ep_size,
+                pending_ep_size=self.elastic_pending_ep_size,
+                scale_phase=self.elastic_scale_phase,
+            )
+        self.auto_create_handle_loop()
+
+        # Close the shrink gate and publish pending; reopened on completion/failure.
+        is_shrink = obj.new_ep_size < self.elastic_worker_count
+        self.elastic_pending_ep_size = obj.new_ep_size
+        self.elastic_scale_phase = "waiting_for_cohort"
+        if is_shrink:
+            self._elastic_shrink_pause_event.clear()
+
+        try:
+            responses: List[ScaleElasticEPReqOutput] = (
+                await self.scale_elastic_ep_communicator(obj)
+            )
+        except Exception:
+            self.elastic_pending_ep_size = None
+            self.elastic_scale_phase = None
             if is_shrink:
-                self._elastic_shrink_pause_event.clear()
+                self._elastic_shrink_pause_event.set()
+            raise
 
-            try:
-                responses: List[ScaleElasticEPReqOutput] = (
-                    await self.scale_elastic_ep_communicator(obj)
-                )
-            except Exception:
-                self.elastic_pending_ep_size = None
-                self.elastic_scale_phase = None
+        for res in responses:
+            if not res.success:
+                self.elastic_scale_phase = res.scale_phase
+                self.elastic_pending_ep_size = res.pending_ep_size
+                self.elastic_last_error = res.message
                 if is_shrink:
                     self._elastic_shrink_pause_event.set()
-                raise
-
-            for res in responses:
-                if not res.success:
-                    self.elastic_scale_phase = res.scale_phase
-                    self.elastic_pending_ep_size = res.pending_ep_size
-                    self.elastic_last_error = res.message
-                    if is_shrink:
-                        self._elastic_shrink_pause_event.set()
-                    return res
-            self.elastic_pending_ep_size = responses[0].pending_ep_size
-            self.elastic_scale_phase = responses[0].scale_phase
-            self.elastic_last_error = None
-            return responses[0]
+                return res
+        self.elastic_pending_ep_size = responses[0].pending_ep_size
+        self.elastic_scale_phase = responses[0].scale_phase
+        self.elastic_last_error = None
+        return responses[0]
 
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)
