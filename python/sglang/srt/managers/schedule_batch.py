@@ -5,6 +5,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_exec,
     get_schedule,
+    get_server_args,
     get_serving,
     get_spec,
     mamba_cache_chunk_size,
@@ -2183,6 +2184,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
 
+    # Mixed-chunk x EAGLE "Tier B" (SGLANG_EAGLE_MIXED_VERIFY=1): the decode
+    # tail's EagleDraftInput, stashed aside by mix_with_running so the generic
+    # merge/resolve machinery keeps ignoring it. The eagle worker picks it up
+    # to run draft->verify for the tail in a separate forward. None under the
+    # default Tier A behavior.
+    mixed_decode_draft_input: Optional[SpecInput] = None
+
     @classmethod
     def init_new(
         cls,
@@ -2739,6 +2747,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
         self.forward_mode = ForwardMode.SPLIT_PREFILL
 
+    def _eagle_mixed_verify_active(self, running_batch: ScheduleBatch) -> bool:
+        """Whether Tier B (SGLANG_EAGLE_MIXED_VERIFY) drives this mixed step.
+
+        Only the single-layer EAGLEWorkerV2 implements the verify-in-mixed
+        path, and only without grammar / return_hidden_states (MVP fallback
+        to Tier A). The whole layout decision must key off this one predicate:
+        a Tier B layout (prefill-only input_ids / out_cache_loc) fed to the
+        Tier A fused forward would silently drop the decode tail.
+        """
+        if not envs.SGLANG_EAGLE_MIXED_VERIFY.get():
+            return False
+        if getattr(get_server_args(), "enable_multi_layer_eagle", False):
+            return False
+        # Worker-side MVP fallbacks; keep the fused Tier A layout for them.
+        if self.has_grammar or running_batch.has_grammar:
+            return False
+        if self.return_hidden_states or running_batch.return_hidden_states:
+            return False
+        return True
+
     def mix_with_running(self, running_batch: ScheduleBatch):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
@@ -2752,10 +2780,61 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = None
         self.mix_running_indices = running_batch.req_pool_indices
         self.num_mixed_decode_tokens = running_bs
-        out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+        if not self.spec_algorithm.is_none():
+            if self._eagle_mixed_verify_active(running_batch):
+                # Tier B: the decode tail verifies in its own forward, which
+                # recomputes its cache locs (eagle_prepare_for_verify), so the
+                # merged batch only carries the prefill chunk's forward inputs.
+                out_cache_loc = self.out_cache_loc
+            else:
+                # Spec decode keeps no per-step out_cache_loc on the running batch
+                # (eagle_prepare_for_decode only reserves slots inside
+                # req_to_token). The mixed forward recomputes each running
+                # request's pending bonus token at position seq_lens, so gather
+                # that reserved slot from req_to_token.
+                running_out_cache_loc = running_batch.req_to_token_pool.req_to_token[
+                    running_batch.req_pool_indices.long(),
+                    running_batch.seq_lens.long(),
+                ].to(self.out_cache_loc.dtype)
+                out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
+        else:
+            out_cache_loc = torch.cat(
+                [self.out_cache_loc, running_batch.out_cache_loc]
+            )
+
+        # Rebuild seq_lens_cpu for the merged batch: merge_batch nulls it
+        # when either side is None (the running side in overlap+spec mode has
+        # none), but the DSV4 backend's prefill metadata requires it.
+        # NOTE: do NOT use running_batch.seq_lens.cpu() — the GPU->CPU copy
+        # stalls the overlap pipeline (~200ms per mixed step). The tail
+        # entries are only consumed by assertions; the backend's mixed-split
+        # path uses GPU seq_lens for the tail and seq_lens_cpu for the head.
+        prefill_seq_lens_cpu = self.seq_lens_cpu
+        running_seq_lens_cpu = torch.tensor(
+            [int(r.seqlen) for r in running_batch.reqs], dtype=torch.int64
+        )
+        if prefill_seq_lens_cpu is None:
+            merged_seq_lens_cpu = running_seq_lens_cpu
+        else:
+            merged_seq_lens_cpu = torch.cat(
+                [prefill_seq_lens_cpu, running_seq_lens_cpu]
+            )
 
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
+        self.seq_lens_cpu = merged_seq_lens_cpu
+
+        if (
+            self._eagle_mixed_verify_active(running_batch)
+            and running_batch.spec_info is not None
+        ):
+            # Tier B: keep the decode tail's draft state for the worker. The
+            # tail was already filter_batch()'d by the scheduler, so spec_info
+            # (future_indices under overlap) is aligned with the tail reqs.
+            # merge_batch deliberately does NOT merge it into self.spec_info:
+            # the future-map resolve for the tail runs through
+            # resolve_mixed_spec_tail at forward entry.
+            self.mixed_decode_draft_input = running_batch.spec_info
 
         # For overlap scheduler, the output_ids has one step delay
         delta = 0 if self.enable_overlap else -1
@@ -3283,6 +3362,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
+            mixed_decode_draft_input=self.mixed_decode_draft_input,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,

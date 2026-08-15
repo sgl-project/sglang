@@ -1540,6 +1540,18 @@ class DeepseekV4AttnBackend(
         )
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
+        # refresh_ resets mixed_decode_tail_len to None; re-arm it from the
+        # live batch so graph-replayed mixed batches keep the split
+        # decode-attention path (mirrors eager init_forward_metadata).
+        if (
+            envs.SGLANG_OPT_MIXED_SPLIT_DECODE_ATTN.get()
+            and forward_batch.forward_mode.is_mixed()
+            and not _is_sm120
+            and not _is_xpu
+        ):
+            capture_metadata.mixed_decode_tail_len = (
+                forward_batch.num_mixed_decode_tokens
+            )
         self.forward_metadata = capture_metadata
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
@@ -1862,7 +1874,17 @@ class DeepseekV4AttnBackend(
         if metadata.sparse_prefill_cache is None:
             seq_lens_cpu = forward_batch.seq_lens_cpu
             assert seq_lens_cpu is not None
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            assert extend_seq_lens_cpu is not None
             num_head_reqs = int(forward_batch.seq_lens.shape[0]) - num_tail
+            total_swa = sum(
+                min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
+                for seq_len, extend_len in zip(
+                    seq_lens_cpu[:num_head_reqs].tolist(),
+                    extend_seq_lens_cpu[:num_head_reqs],
+                    strict=True,
+                )
+            )
             metadata.sparse_prefill_cache = SparsePrefillChunkCache.build(
                 seq_lens=forward_batch.seq_lens[:num_head_reqs].to(torch.int32),
                 extend_seq_lens=forward_batch.extend_seq_lens[:num_head_reqs].to(
@@ -1877,6 +1899,7 @@ class DeepseekV4AttnBackend(
                 swa_page_size=token_to_kv_pool.swa_window_size,
                 num_qo_tokens=num_head,
                 max_seq_len=int(seq_lens_cpu[:num_head_reqs].max().item()),
+                total_swa=total_swa,
             )
         o_head = self._forward_prefill_sparse(
             q=q[:num_head],

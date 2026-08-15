@@ -3236,6 +3236,18 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
+        # Decode-aware budget: cap per-step prefill tokens during mixed-chunk
+        # steps so a full prefill chunk does not dominate decode ITL.
+        if (
+            self.is_mixed_chunk
+            and running_batch is not None
+            and len(running_batch.reqs) > 0
+        ):
+            import os
+
+            _mixed_cap = int(os.environ.get("SGLANG_MIXED_CHUNK_PREFILL_CAP", "0"))
+            if _mixed_cap > 0:
+                chunked_prefill_size = min(chunked_prefill_size, _mixed_cap)
         if self.chunked_req is not None and self.enable_dynamic_chunking:
             history_len = len(self.chunked_req.prefix_indices)
             dynamic_size = self.predict_next_chunk_size(history_len)
@@ -3250,6 +3262,23 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        # Per-running-request token cost of a mixed step. Tier A degrades each
+        # running request to a 1-token decode; Tier B
+        # (SGLANG_EAGLE_MIXED_VERIFY=1) runs the full verify for the tail, so
+        # each running request occupies draft_token_num tokens of the budget.
+        # Mirrors ScheduleBatch._eagle_mixed_verify_active (single-layer
+        # EAGLEWorkerV2 only).
+        mixed_tokens_per_req = 1
+        if (
+            self.is_mixed_chunk
+            and envs.SGLANG_EAGLE_MIXED_VERIFY.get()
+            and not self.spec_algorithm.is_none()
+            and not getattr(self.server_args, "enable_multi_layer_eagle", False)
+        ):
+            mixed_tokens_per_req = max(
+                1, self.server_args.speculative_num_draft_tokens or 1
+            )
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -3258,7 +3287,7 @@ class Scheduler(
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            running_bs * mixed_tokens_per_req if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,

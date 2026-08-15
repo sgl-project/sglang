@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 from dataclasses import dataclass
 from typing import (
@@ -29,6 +30,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardMode,
     get_required_capture_hidden_mode,
     get_server_return_hidden_states_mode,
 )
@@ -220,6 +222,33 @@ class SchedulerBatchResultProcessor:
                 result.extend_logprob_start_len_per_req,
             )
 
+            # Mixed-chunk x spec (Tier B, SGLANG_EAGLE_MIXED_VERIFY=1): the
+            # worker verified the decode tail in a separate forward, so the
+            # tail's accepted runs ride on this result -- next_token_ids lays
+            # out as [n_prefill sampled tokens | n_tail * draft_token_num
+            # verified tokens] with accept_lens per tail request. Split them
+            # off: head requests take the prefill path below; the tail takes
+            # spec-decode accounting (_process_mixed_spec_decode_tail). Tier A
+            # results carry accept_lens=None and skip this split.
+            mixed_spec_tail = (
+                batch.decoding_reqs
+                if (
+                    batch.decoding_reqs
+                    and result.accept_lens is not None
+                    and batch.spec_algorithm is not None
+                    and not batch.spec_algorithm.is_none()
+                )
+                else None
+            )
+            tail_next_token_ids = None
+            if mixed_spec_tail is not None:
+                n_prefill_reqs = len(batch.reqs) - len(mixed_spec_tail)
+                tail_next_token_ids = next_token_ids[n_prefill_reqs:]
+                next_token_ids = next_token_ids[:n_prefill_reqs]
+                prefill_reqs = batch.reqs[:n_prefill_reqs]
+            else:
+                prefill_reqs = batch.reqs
+
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
             self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
@@ -235,7 +264,7 @@ class SchedulerBatchResultProcessor:
             # Check finish conditions
             logprob_pt = 0
 
-            for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            for i, (req, next_token_id) in enumerate(zip(prefill_reqs, next_token_ids)):
                 if (
                     batch.return_hidden_states
                     and logits_output.hidden_states is not None
@@ -271,6 +300,23 @@ class SchedulerBatchResultProcessor:
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
                     req.update_finish_state()
+                    # Mixed-chunk x spec (Tier A): a spec decoding request in
+                    # the mixed tail committed its pending bonus token this
+                    # step (the mixed forward wrote its KV). Mirror the
+                    # spec-decode resolve (_resolve_spec_v2_tokens) so the
+                    # next eagle_prepare_for_decode reserves from the right
+                    # base. Tier B results (accept_lens set) settle the tail
+                    # through _resolve_spec_v2_tokens instead -- never stack
+                    # the two.
+                    if (
+                        not req.finished()
+                        and result.accept_lens is None
+                        and batch.decoding_reqs
+                        and req in batch.decoding_reqs
+                        and batch.spec_algorithm is not None
+                        and not batch.spec_algorithm.is_none()
+                    ):
+                        req.kv_committed_len += 1
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
@@ -325,6 +371,13 @@ class SchedulerBatchResultProcessor:
 
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
+            # Tier B: settle the decode tail's spec-decode accounting in the
+            # same free group, before streaming the merged reqs' outputs.
+            if mixed_spec_tail is not None:
+                self._process_mixed_spec_decode_tail(
+                    batch, result, tail_next_token_ids, logits_output
+                )
+
         else:  # embedding or reward model
             if result.copy_done is not None:
                 result.copy_done.synchronize()
@@ -374,6 +427,71 @@ class SchedulerBatchResultProcessor:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _process_mixed_spec_decode_tail(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        tail_next_token_ids: torch.Tensor,
+        logits_output: LogitsProcessorOutput,
+    ):
+        """Settle spec-decode accounting for a Tier B mixed step's decode tail.
+
+        The tail requests ran draft->verify in the worker's separate forward,
+        so mirror process_batch_result_decode for them (accepted-run commit
+        via _resolve_spec_v2_tokens, output/finish handling) while the
+        prefill head went through the prefill path. The Tier A per-step +1 on
+        kv_committed_len is gated on accept_lens being None, so the two never
+        stack.
+        """
+        tail_reqs = batch.decoding_reqs
+        n_prefill_reqs = len(batch.reqs) - len(tail_reqs)
+
+        # _resolve_spec_v2_tokens indexes next_token_ids per request with a
+        # draft-token stride and advances the grammar FSM by forward mode, so
+        # hand it a tail-only result view and a decode-mode batch view.
+        tail_result = dataclasses.replace(
+            result, next_token_ids=tail_next_token_ids
+        )
+        tail_batch = batch.copy()
+        tail_batch.reqs = tail_reqs
+        tail_batch.forward_mode = ForwardMode.DECODE
+        predict_tokens = self._resolve_spec_v2_tokens(tail_result, tail_batch)
+
+        # Surface the tail's acceptance stats on the merged result.
+        result.num_correct_drafts = tail_result.num_correct_drafts
+        result.num_correct_drafts_per_req_cpu = (
+            tail_result.num_correct_drafts_per_req_cpu
+        )
+        result.num_block_accept_tokens = tail_result.num_block_accept_tokens
+        result.num_cap_tokens = tail_result.num_cap_tokens
+        self.metrics_reporter.num_generated_tokens += len(tail_reqs)
+        self.metrics_reporter.update_spec_metrics(
+            len(tail_reqs),
+            tail_result.num_correct_drafts,
+            num_block_accept_tokens=tail_result.num_block_accept_tokens,
+            num_cap_tokens=tail_result.num_cap_tokens,
+        )
+
+        for j, (req, tokens) in enumerate(zip(tail_reqs, predict_tokens)):
+            if (self.enable_overlap or self.enable_overlap_mlx) and (
+                req.finished() or req.is_retracted
+            ):
+                # Mirrored from process_batch_result_decode: under overlap the
+                # req may already be finished by a newer batch's processing;
+                # over-allocated tokens are freed in release_kv_cache.
+                continue
+
+            req.output_ids.extend(tokens)
+            self._maybe_update_reasoning_tokens(req, tokens)
+            req.time_stats.set_last_decode_finish_time()
+            req.update_finish_state(len(tokens))
+            self._handle_finish_state_updated_req(
+                req, batch, result, n_prefill_reqs + j, logits_output
+            )
+            if req.grammar is not None:
+                # Spec already advanced the FSM in _resolve_spec_v2_tokens.
+                req.grammar.finished = req.finished()
 
     def _convert_embeddings(self, *, result: EmbeddingBatchResult) -> list:
         is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()

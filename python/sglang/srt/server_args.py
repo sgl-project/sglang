@@ -4606,7 +4606,8 @@ class ServerArgs:
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
             (
                 "DeepSeek-V4 (heavy capture-pool memory pressure)",
-                lambda: is_deepseek_v4(self.get_model_config().hf_config),
+                lambda: is_deepseek_v4(self.get_model_config().hf_config)
+                and not envs.SGLANG_DSV4_ALLOW_BREAKABLE_CG.get(),
             ),
             # CP all_gather replay size mismatch under BCG.
             (
@@ -9059,9 +9060,16 @@ class ServerArgs:
 
         # Check speculative decoding
         if self.speculative_algorithm is not None:
+            # Mixed chunk is supported for EAGLE-family speculation only
+            # (Tier A: running requests degrade to plain 1-token decode inside
+            # a mixed step and skip verify for that step).
             assert (
                 not self.enable_mixed_chunk
-            ), "enable_mixed_chunk is required for speculative decoding"
+                or self.speculative_algorithm.upper() in ("EAGLE", "EAGLE3")
+            ), (
+                "enable_mixed_chunk is not supported with "
+                f"speculative_algorithm={self.speculative_algorithm}"
+            )
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).

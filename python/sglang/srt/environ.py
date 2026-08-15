@@ -1095,6 +1095,16 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # Mixed-chunk x EAGLE "Tier B": running requests inside a mixed-chunk step
+    # run the full draft->verify flow (two separate forwards: prefill chunk,
+    # then decode-tail verify) instead of Tier A's 1-token degrade. Default
+    # off: mixed steps keep the Tier A behavior (verify skipped).
+    SGLANG_EAGLE_MIXED_VERIFY = EnvBool(False)
+    # Opt-in: allow breakable prefill CUDA graph for DeepSeek-V4 despite the
+    # capture-pool memory pressure (see _disable_breakable_cudagraph_if_incompatible).
+    # Use with a curated --cuda-graph-bs-prefill bucket list to bound pinned
+    # per-bucket metadata (~0.5GiB/GPU for {256..8192}).
+    SGLANG_DSV4_ALLOW_BREAKABLE_CG = EnvBool(False)
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch

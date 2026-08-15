@@ -556,11 +556,13 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "speculative decoding."
         )
 
-    if server_args.enable_mixed_chunk:
+    # Tier A: mixed chunk is allowed with EAGLE-family speculation
+    # (running requests degrade to plain 1-token decode inside a mixed step).
+    if server_args.enable_mixed_chunk and server_args.speculative_algorithm and server_args.speculative_algorithm.upper() not in ("EAGLE", "EAGLE3"):
         server_args.enable_mixed_chunk = False
         logger.warning(
             "Mixed chunked prefill is disabled because of using "
-            "eagle speculative decoding."
+            "non-EAGLE speculative decoding."
         )
 
     model_arch = server_args.get_model_config().hf_config.architectures[0]

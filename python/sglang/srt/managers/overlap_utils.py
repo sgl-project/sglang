@@ -90,14 +90,22 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     if batch.prefill_input_ids_cpu is not None:
         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
         if batch.mix_running_indices is not None:
-            decode_gpu = future_map.output_tokens_buf[batch.mix_running_indices]
-            if _DEBUG_ASSERT:
-                _assert_nonneg_and_invalidate(
-                    decode_gpu,
-                    future_map.output_tokens_buf,
-                    batch.mix_running_indices,
-                )
-            batch.input_ids = torch.cat([prefill_gpu, decode_gpu])
+            if batch.mixed_decode_draft_input is not None:
+                # Tier B (SGLANG_EAGLE_MIXED_VERIFY): the decode tail runs its
+                # own verify forward (tree root = stashed bonus tokens), so the
+                # merged batch only needs the prefill chunk's input ids. This
+                # also avoids a double consume of output_tokens_buf rows, which
+                # resolve_mixed_spec_tail gathers into the tail draft input.
+                batch.input_ids = prefill_gpu
+            else:
+                decode_gpu = future_map.output_tokens_buf[batch.mix_running_indices]
+                if _DEBUG_ASSERT:
+                    _assert_nonneg_and_invalidate(
+                        decode_gpu,
+                        future_map.output_tokens_buf,
+                        batch.mix_running_indices,
+                    )
+                batch.input_ids = torch.cat([prefill_gpu, decode_gpu])
         else:
             batch.input_ids = prefill_gpu
         batch.prefill_input_ids_cpu = None
@@ -113,6 +121,102 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     # synchronous (non-overlap) V2 path installs next_draft_input directly.
     if batch.enable_overlap and not batch.spec_algorithm.is_none():
         future_map._resolve_spec_extras(batch)
+
+    if batch.mixed_decode_draft_input is not None:
+        resolve_mixed_spec_tail(batch, future_map)
+
+
+def resolve_mixed_spec_tail(batch: ScheduleBatch, future_map: FutureMap) -> None:
+    """Tier B (SGLANG_EAGLE_MIXED_VERIFY): resolve a mixed batch's decode tail.
+
+    Mirrors for the tail requests what resolve_seq_lens_cpu +
+    _resolve_spec_extras do for a pure decode batch at forward entry, but
+    WITHOUT touching the merged batch's seq_lens family: the schedule-time
+    CPU mirror built by mix_with_running is the prefill view's only source of
+    head lengths (the DSV4 prefill metadata asserts on it), and the merged
+    tail entries stay Tier-A-style stale on purpose. The resolved tail values
+    instead ride on the stashed EagleDraftInput as ad-hoc attributes:
+
+    - ``mixed_tail_seq_lens``: post-verify tail lengths, gathered GPU-side
+      from new_seq_lens_buf behind the same publish fence resolve_seq_lens_cpu
+      uses (the merged seq_lens carried over from mix_with_running is one
+      verify stale in overlap mode);
+    - ``mixed_tail_seq_lens_cpu``: the pinned CPU mirror of the same values,
+      only when the backend chain maintains one (needs_cpu_seq_lens); None
+      otherwise, matching the stock GPU-only verify path;
+    - the draft state (bonus_tokens / topk_p / topk_index / hidden_states),
+      gathered by _resolve_spec_extras.
+
+    The eagle worker's decode view then runs draft->verify for the tail in a
+    separate forward. Non-overlap mode needs nothing: the previous iter
+    already installed fresh seq_lens / draft tensors on the running batch
+    synchronously.
+    """
+    draft_input = batch.mixed_decode_draft_input
+    if not batch.enable_overlap or batch.spec_algorithm.is_none():
+        return
+    n_dec = batch.num_mixed_decode_tokens
+    if draft_input is None or not n_dec:
+        return
+    fi = draft_input.future_indices
+    if fi is None or fi.shape[0] == 0:
+        return
+
+    # Same publish fence as resolve_seq_lens_cpu: the tail lengths are only
+    # valid once the previous forward's verify published them.
+    if future_map.publish_ready is not None:
+        if _DEBUG_ASSERT:
+            # Consume-once: every event wait must be re-armed by a fresh
+            # forward publish; a stale consume means a publish went missing.
+            assert future_map._publish_fresh, "resolve without a fresh forward publish"
+            future_map._publish_fresh = False
+        if _is_hip:
+            # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
+            future_map.publish_ready.synchronize()
+        else:
+            future_map.publish_ready.wait()
+
+    tail_seq_lens = future_map.new_seq_lens_buf[fi]
+
+    if future_map.needs_cpu_seq_lens:
+        # Pinned-mirror pull identical to resolve_seq_lens_cpu: the private
+        # D2H stream is gated on the publish event, off the schedule stream.
+        # NB: gather with the TAIL's cpu indices -- resolve_seq_lens_cpu would
+        # use the merged batch.req_pool_indices_cpu here, which is longer than
+        # fi and holds garbage in the prefill rows.
+        if (
+            future_map.fwd_prepare_d2h_stream is None
+            or future_map.publish_ready is None
+        ):
+            tail_seq_lens_cpu = tail_seq_lens.cpu()  # bootstrap / non-CUDA
+        else:
+            future_map.fwd_prepare_d2h_stream.wait_event(future_map.publish_ready)
+            with torch.get_device_module(future_map.device).stream(
+                future_map.fwd_prepare_d2h_stream
+            ):
+                future_map.new_seq_lens_cpu_pinned.copy_(
+                    future_map.new_seq_lens_buf, non_blocking=True
+                )
+            future_map.fwd_prepare_d2h_stream.synchronize()
+            tail_seq_lens_cpu = future_map.new_seq_lens_cpu_pinned[
+                batch.req_pool_indices_cpu[-n_dec:]
+            ]
+    else:
+        # Stock no-verify-sync layout: decode/verify reads GPU seq_lens only.
+        tail_seq_lens_cpu = None
+
+    draft_input.mixed_tail_seq_lens = tail_seq_lens
+    draft_input.mixed_tail_seq_lens_cpu = tail_seq_lens_cpu
+
+    # Draft state (bonus_tokens / topk_p / topk_index / hidden_states):
+    # _resolve_spec_extras keys off batch.spec_info; temporarily swap in the
+    # tail draft input (its future_indices are the tail req_pool_indices).
+    saved_spec_info = batch.spec_info
+    try:
+        batch.spec_info = draft_input
+        future_map._resolve_spec_extras(batch)
+    finally:
+        batch.spec_info = saved_spec_info
 
 
 CONFIDENCE_RELAY_RING_LAG: int = 2

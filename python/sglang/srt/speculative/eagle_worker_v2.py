@@ -39,7 +39,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -123,6 +127,160 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
+
+
+def _subset_sampling_info_for_mixed(sampling_info, start: int, end: int):
+    """Non-mutating per-view subset of SamplingBatchInfo for Tier B mixed steps.
+
+    Mirrors SamplingBatchInfo.filter_batch field-for-field over the contiguous
+    req range [start, end), but on a shallow dataclasses.replace copy so the
+    merged batch's sampling_info stays intact for result processing. The
+    forward-only copy installed by Scheduler.run_batch has
+    penalizer_orchestrator=None already, so there is no shared penalizer state
+    to corrupt.
+    """
+    if sampling_info is None:
+        return None
+    keep_indices_device = torch.arange(
+        start, end, device=sampling_info.temperatures.device
+    )
+    keep_indices = list(range(start, end))
+    out = replace(sampling_info)
+    for item in (
+        "temperatures",
+        "top_ps",
+        "top_ks",
+        "min_ps",
+        "sampling_seed",
+        "logit_bias",
+        # Overlap-mode accumulated penalties are per-req rows.
+        "acc_additive_penalties",
+        "acc_scaling_penalties",
+    ):
+        value = getattr(out, item, None)
+        if value is not None:
+            setattr(out, item, value[keep_indices_device])
+    if out.custom_logit_processor is not None:
+        out.custom_logit_processor = {
+            k: (p, mask[keep_indices_device])
+            for k, (p, mask) in out.custom_logit_processor.items()
+            if torch.any(mask[keep_indices_device])
+        }
+        if len(out.custom_logit_processor) == 0:
+            out.custom_logit_processor = None
+            out.custom_params = None
+            out.has_custom_logit_processor = False
+    if out.custom_params is not None:
+        out.custom_params = [out.custom_params[i] for i in keep_indices]
+    if out.return_sampling_masks is not None:
+        out.return_sampling_masks = [
+            out.return_sampling_masks[i] for i in keep_indices
+        ]
+    # Repopulated from the view's reqs by ForwardBatch.init_new; the verify
+    # tree mask is rebuilt per view.
+    out.grammars = None
+    out.grammar_mask = None
+    return out
+
+
+def _build_mixed_prefill_view(
+    batch: ScheduleBatch, n_pre: int, n_dec: int
+) -> ScheduleBatch:
+    """Tier B: the prefill-chunk head of a mixed batch as a pure EXTEND batch.
+
+    The view is a dataclasses.replace copy: unlisted fields (pools, config,
+    flags) are shared with the merged batch, while every batch-makeup field
+    is sliced down to the head requests. Under Tier B the merged batch's
+    input_ids / out_cache_loc carry only the prefill chunk's tokens (the
+    decode tail verifies in its own forward), so they are taken whole.
+    """
+    n_pre_tokens = batch.input_ids.shape[0]
+    sampling_info = _subset_sampling_info_for_mixed(batch.sampling_info, 0, n_pre)
+    return replace(
+        batch,
+        reqs=batch.reqs[:n_pre],
+        forward_mode=ForwardMode.EXTEND,
+        num_mixed_decode_tokens=None,
+        mix_running_indices=None,
+        mixed_decode_draft_input=None,
+        spec_info=None,
+        decoding_reqs=None,
+        req_pool_indices=batch.req_pool_indices[:n_pre],
+        req_pool_indices_cpu=batch.req_pool_indices_cpu[:n_pre],
+        seq_lens=batch.seq_lens[:n_pre],
+        seq_lens_cpu=(
+            batch.seq_lens_cpu[:n_pre] if batch.seq_lens_cpu is not None else None
+        ),
+        seq_lens_sum=None,
+        orig_seq_lens=batch.orig_seq_lens[:n_pre],
+        input_ids=batch.input_ids,
+        out_cache_loc=batch.out_cache_loc,
+        out_cache_loc_dsv4=None,
+        extend_lens=batch.extend_lens[:n_pre],
+        prefix_lens=batch.prefix_lens[:n_pre],
+        extend_logprob_start_lens=batch.extend_logprob_start_lens[:n_pre],
+        extend_num_tokens=n_pre_tokens,
+        sampling_info=sampling_info,
+        has_grammar=any(r.grammar is not None for r in batch.reqs[:n_pre]),
+        is_extend_in_batch=False,
+    )
+
+
+def _build_mixed_decode_view(
+    batch: ScheduleBatch, n_pre: int, n_dec: int
+) -> ScheduleBatch:
+    """Tier B: the running-request tail of a mixed batch as a DECODE batch.
+
+    The tail's post-verify lengths come from the stashed draft input's
+    mixed_tail_seq_lens override, resolved by resolve_mixed_spec_tail from
+    the future map at forward entry (overlap mode) -- the merged batch's own
+    seq_lens tail stays one verify stale, exactly like Tier A. Non-overlap
+    has no override and falls back to the merged slices, which are fresh
+    there. spec_info carries the stashed EagleDraftInput (draft state
+    resolved into it at forward entry); input_ids / out_cache_loc are
+    (re)built by draft/verify prepare.
+    """
+    n_all = n_pre + n_dec
+    sampling_info = _subset_sampling_info_for_mixed(
+        batch.sampling_info, n_pre, n_all
+    )
+    draft_input = batch.mixed_decode_draft_input
+    tail_seq_lens = getattr(draft_input, "mixed_tail_seq_lens", None)
+    if tail_seq_lens is not None:
+        seq_lens = tail_seq_lens
+        # None when the backend chain runs the GPU-only verify path.
+        seq_lens_cpu = getattr(draft_input, "mixed_tail_seq_lens_cpu", None)
+    else:
+        seq_lens = batch.seq_lens[n_pre:]
+        seq_lens_cpu = (
+            batch.seq_lens_cpu[n_pre:] if batch.seq_lens_cpu is not None else None
+        )
+    return replace(
+        batch,
+        reqs=batch.reqs[n_pre:],
+        forward_mode=ForwardMode.DECODE,
+        num_mixed_decode_tokens=None,
+        mix_running_indices=None,
+        mixed_decode_draft_input=None,
+        spec_info=draft_input,
+        decoding_reqs=None,
+        req_pool_indices=batch.req_pool_indices[n_pre:],
+        req_pool_indices_cpu=batch.req_pool_indices_cpu[n_pre:],
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens_cpu,
+        seq_lens_sum=int(seq_lens_cpu.sum()) if seq_lens_cpu is not None else None,
+        orig_seq_lens=batch.orig_seq_lens[n_pre:],
+        input_ids=None,
+        out_cache_loc=None,
+        out_cache_loc_dsv4=None,
+        extend_lens=[1] * n_dec,
+        prefix_lens=batch.prefix_lens[n_pre:],
+        extend_logprob_start_lens=[0] * n_dec,
+        extend_num_tokens=n_dec,
+        sampling_info=sampling_info,
+        has_grammar=any(r.grammar is not None for r in batch.reqs[n_pre:]),
+        is_extend_in_batch=False,
+    )
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -1105,6 +1263,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
     ):
+        if (
+            batch.forward_mode.is_mixed()
+            and batch.num_mixed_decode_tokens
+            and envs.SGLANG_EAGLE_MIXED_VERIFY.get()
+            and batch.mixed_decode_draft_input is not None
+            and not batch.has_grammar
+            and not batch.return_hidden_states
+        ):
+            # Tier B (SGLANG_EAGLE_MIXED_VERIFY=1): the decode tail verifies
+            # normally inside a mixed step. Grammar / return_hidden_states are
+            # out of MVP scope and fall back to the Tier A path below.
+            return self._forward_mixed_with_verify(
+                batch, on_publish=on_publish, grammar_barrier=grammar_barrier
+            )
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -1118,7 +1290,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
-            batch_output.new_seq_lens = batch.seq_lens
+            if batch.forward_mode.is_mixed() and batch.num_mixed_decode_tokens:
+                # Mixed chunk (Tier A): prefill requests already hold the
+                # next-iter length (prefix + chunk) in batch.seq_lens; each
+                # decode-tail request committed its pending bonus token this
+                # step, so its next-iter length advances by one.
+                new_seq_lens = batch.seq_lens.clone()
+                new_seq_lens[-batch.num_mixed_decode_tokens :] += 1
+                batch_output.new_seq_lens = new_seq_lens
+            else:
+                batch_output.new_seq_lens = batch.seq_lens
             # Publish before draft_extend so the fence is at target-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1198,6 +1379,119 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
             return batch_output
+
+    def _forward_mixed_with_verify(
+        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+    ) -> GenerationBatchResult:
+        """Tier B mixed step: prefill-chunk forward + decode-tail draft->verify.
+
+        Two separate forwards replace Tier A's single fused mixed forward: the
+        prefill chunk runs as a pure EXTEND batch, then the decode tail runs
+        the stock decode flow (draft -> target verify -> draft extend) on its
+        own view. Results are stitched back into the merged-batch layout so
+        scheduler bookkeeping (relay payload, next-iter draft input, seq_lens
+        publish) looks exactly like one spec step over the merged batch.
+        """
+        n_dec = batch.num_mixed_decode_tokens
+        n_pre = len(batch.reqs) - n_dec
+
+        prefill_view = _build_mixed_prefill_view(batch, n_pre, n_dec)
+        decode_view = _build_mixed_decode_view(batch, n_pre, n_dec)
+
+        # 1. Target forward for the prefill chunk (captures hidden states for
+        # the draft extend, same as the Tier A path).
+        target_capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+        prefill_output = self.target_worker.forward_batch_generation(
+            prefill_view, capture_hidden_mode=target_capture_mode
+        )
+
+        # 2. Draft the decode tail and build its verify input.
+        self.activate_step_by_batch(n_dec)
+        if self.speculative_num_steps == 0:
+            # Drafting disabled (adaptive high-bs): trivial 1-node verify.
+            verify_input = self._build_trivial_verify_input(decode_view)
+        else:
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft"),
+            ):
+                verify_input: EagleVerifyInput = self.draft_worker.draft(decode_view)
+        assert verify_input.is_verify_input()
+        decode_view.spec_info = verify_input
+
+        # 3. Target verify for the decode tail.
+        verify_output = self.verify(decode_view, grammar_barrier=grammar_barrier)
+
+        # 4. Publish the merged next-iter seq_lens before the draft extends so
+        # the fence sits at verify-end (same as the decode path). Prefill reqs
+        # already hold their next-iter length (prefix + chunk) in seq_lens.
+        new_seq_lens = torch.cat([prefill_view.seq_lens, verify_output.new_seq_lens])
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+
+        # 5. Draft extends: the prefill chunk seeds fresh draft state; the
+        # decode tail folds its accepted run into the draft KV (updates
+        # verify_output.next_draft_input in place).
+        with (
+            self.draft_worker.draft_tp_context(
+                self.draft_worker.draft_runner.tp_group
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft_extend"),
+        ):
+            prefill_draft_input = self.draft_worker._draft_extend_for_prefill(
+                prefill_view,
+                prefill_output.logits_output.hidden_states,
+                prefill_output.next_token_ids,
+                prefill_output.logits_output.mm_input_embeds,
+            )
+            self.draft_worker._draft_extend_for_decode(decode_view, verify_output)
+
+        # 6. Next-iter draft state in merged-req order (prefill head, then
+        # decode tail), matching batch.reqs and the relay future_indices.
+        prefill_draft_input.merge_batch(verify_output.next_draft_input)
+
+        extra_keep_alive_refs = list(verify_output.extra_keep_alive_refs or [])
+        if prefill_output.extra_keep_alive_refs:
+            extra_keep_alive_refs.extend(prefill_output.extra_keep_alive_refs)
+
+        return GenerationBatchResult(
+            logits_output=prefill_output.logits_output,
+            next_token_ids=torch.cat(
+                [
+                    prefill_output.next_token_ids.to(verify_output.next_token_ids.dtype),
+                    verify_output.next_token_ids,
+                ]
+            ),
+            # The mixed step as a whole stays eager; the verify may still have
+            # replayed a cuda graph internally, but the batch-level flag
+            # describes the (eager) mixed forward.
+            can_run_cuda_graph=False,
+            speculative_num_draft_tokens=verify_output.speculative_num_draft_tokens,
+            next_draft_input=prefill_draft_input,
+            accept_lens=verify_output.accept_lens,
+            new_seq_lens=new_seq_lens,
+            routed_experts_output=(
+                prefill_output.routed_experts_output
+                if prefill_output.routed_experts_output is not None
+                else verify_output.routed_experts_output
+            ),
+            indexer_topk_output=(
+                prefill_output.indexer_topk_output
+                if prefill_output.indexer_topk_output is not None
+                else verify_output.indexer_topk_output
+            ),
+            extra_keep_alive_refs=extra_keep_alive_refs or None,
+        )
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.
