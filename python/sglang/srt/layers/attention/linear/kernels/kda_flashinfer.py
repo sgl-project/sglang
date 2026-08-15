@@ -2019,14 +2019,6 @@ class CakeKDAKernel(FlashInferKDAKernel):
                 detail=stable_kda_exception_detail(exc),
             )
             raise
-        copy_evidence = (
-            {}
-            if unbounded_softplus_candidate
-            else {
-                "copy_count": 0,
-                "copy_count_source": "static_zero_copy_row_view",
-            }
-        )
         record_kda_terminal_route(
             mode="decode",
             layer_id=layer_id,
@@ -2037,6 +2029,7 @@ class CakeKDAKernel(FlashInferKDAKernel):
             fatal=False,
             reason=admission.reason,
             detail=admission.detail,
-            **copy_evidence,
+            copy_count=0,
+            copy_count_source="static_zero_copy_row_view",
         )
         return result

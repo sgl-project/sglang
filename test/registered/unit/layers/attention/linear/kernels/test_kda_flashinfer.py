@@ -871,6 +871,8 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
             fatal=False,
             reason=CakePackedDecodeReason.ELIGIBLE,
             detail="",
+            copy_count=0,
+            copy_count_source="static_zero_copy_row_view",
         )
 
     def test_h32_unbounded_contract_rejection_is_fatal_not_triton_fallback(self):
