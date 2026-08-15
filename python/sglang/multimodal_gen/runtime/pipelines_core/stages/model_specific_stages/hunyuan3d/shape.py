@@ -214,7 +214,12 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
         # 3. Conditioning with CFG
         do_cfg = batch.guidance_scale >= 0 and not self.guidance_embed
 
-        cond = self.conditioner(image=image, **cond_inputs)
+        with set_forward_context(
+            current_timestep=0,
+            attn_metadata=None,
+            forward_batch=batch,
+        ):
+            cond = self.conditioner(image=image, **cond_inputs)
         if do_cfg:
             un_cond = self.conditioner.unconditional_embedding(
                 image.shape[0], **cond_inputs
