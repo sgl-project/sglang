@@ -593,7 +593,17 @@ class KimiK3ImageProcessor(
         input_text,
         artifacts: list[KimiK3ImagePreprocessArtifact],
     ) -> MultimodalProcessorOutput:
-        """Combine reusable artifacts with this prompt's tokens and offsets."""
+        """Compose the current request from its prompt and ordered artifacts.
+
+        ``prepare_media_artifacts`` has already returned one artifact for each
+        processor input, either from the preprocess cache or from fresh
+        preprocessing. This method expands the current prompt's image tokens
+        and converts each artifact into its request-specific
+        ``MultimodalDataItem`` with offsets, grid metadata, feature, and feature
+        hash. It does not read raw media or access the preprocess cache.
+        """
+        # prompt tokens and offsets depend on the current turn, so rebuild them
+        # even when every per-image artifact came from the preprocess cache
         original_ids = (
             input_text
             if isinstance(input_text, (list, torch.Tensor))
@@ -610,6 +620,8 @@ class KimiK3ImageProcessor(
         if len(offsets) != len(artifacts):
             raise ValueError("Expected one Kimi-K3 image span for each image")
 
+        # turn each prompt-independent artifact into the request-owned item
+        # consumed by the downstream feature transport and vision encoder
         items = []
         for artifact, offset in zip(artifacts, offsets):
             model_specific_data = {

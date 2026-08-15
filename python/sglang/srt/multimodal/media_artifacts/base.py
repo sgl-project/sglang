@@ -261,11 +261,18 @@ class MediaArtifactCacheMixin:
         featureless_hit_mask: Optional[Sequence[bool]] = None,
         modality: Optional[Modality] = None,
     ) -> list[MediaArtifact]:
-        """Return one reusable artifact per media item, in the same order.
+        """Resolve one preprocess-cache artifact for each processor input.
 
-        Cache hits return their stored artifact. Misses are snapshotted,
-        decoded, and passed to ``prepare_artifact_batch``. This method does not
-        create prompt tokens, offsets, or ``MultimodalDataItem`` objects.
+        Each media input is looked up independently, and results preserve the
+        input order. A cache hit returns the stored artifact (the cache item).
+        A miss snapshots and decodes the raw input, runs
+        ``prepare_artifact_batch``, stores its cache-safe artifact, and returns
+        the prepared artifact to the current request. Duplicate and concurrent
+        misses share the same preprocessing work.
+
+        This stage is prompt-independent. It does not create prompt tokens,
+        offsets, or ``MultimodalDataItem`` objects; the model processor uses the
+        returned artifacts to compose those request-specific values afterward.
         """
         modality = self._resolve_artifact_modality(modality)
         media_count = len(media_data)
