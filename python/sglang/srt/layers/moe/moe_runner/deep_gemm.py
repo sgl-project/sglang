@@ -4,7 +4,6 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
-import einops
 import torch
 import triton
 import triton.language as tl
@@ -255,7 +254,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         self.swiglu_limit = self.config.swiglu_limit
         self.use_swizzle = False
         if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-            assert envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
             self.use_swizzle = True
 
     def run(
@@ -636,20 +634,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         swiglu_limit_arg: Optional[float] = None
         if self.swiglu_limit is not None:
-            if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
-                swiglu_limit_arg = self.swiglu_limit
-            else:
-                gateup_output = einops.rearrange(
-                    gateup_output, "grp tok hidden -> (grp tok) hidden"
-                )
-                gateup_output = _apply_swiglu_limit(
-                    gateup_output, swiglu_limit=self.swiglu_limit
-                )
-                gateup_output = einops.rearrange(
-                    gateup_output,
-                    "(grp tok) hidden -> grp tok hidden",
-                    grp=num_groups,
-                )
+            swiglu_limit_arg = self.swiglu_limit
 
         # Act.
         if self.config.activation == "situ":
