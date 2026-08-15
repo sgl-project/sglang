@@ -53,15 +53,7 @@ message KvHints {
   optional DerefHint deref = 1;
 }
 
-enum DerefApplyOn {
-  DEREF_APPLY_ON_UNSPECIFIED = 0;
-  DEREF_APPLY_ON_CURRENT_SUCCESS = 1;
-  DEREF_APPLY_ON_NEXT_SUCCESS = 2;
-}
-
-message DerefHint {
-  DerefApplyOn apply_on = 1;
-}
+message DerefHint {}
 
 // Sampling parameters shared across text and tokenized RPCs.
 message SamplingParams {

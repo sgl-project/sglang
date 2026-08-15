@@ -6,7 +6,6 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.kv_hints import (  # noqa: E402
-    DerefApplyOn,
     DerefHint,
     KvHintManager,
     KvHints,
@@ -20,10 +19,10 @@ class TestKvHints(unittest.TestCase):
     def test_request_dict_converts_to_typed_envelope(self):
         request = GenerateReqInput(
             text="hello",
-            kv_hints={"deref": {"apply_on": "next_success"}},
+            kv_hints={"deref": {}},
         )
 
-        self.assertEqual(request.kv_hints.deref.apply_on, DerefApplyOn.NEXT_SUCCESS)
+        self.assertIsNotNone(request.kv_hints.deref)
 
     def test_capability_requires_an_installed_handler(self):
         self.assertEqual(KvHintManager().capabilities(), [])
@@ -42,7 +41,7 @@ class TestKvHints(unittest.TestCase):
 
         manager.on_request(
             request,
-            KvHints(deref=DerefHint(apply_on=DerefApplyOn.CURRENT_SUCCESS)),
+            KvHints(deref=DerefHint()),
         )
 
         self.assertIsNone(request.kv_hints)

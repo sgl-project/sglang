@@ -53,7 +53,6 @@ class UnifiedSessionRefTracker:
         self._closed_session_ids: OrderedDict[str, None] = OrderedDict()
         self._session_incarnation_counter: int = 0
         self._session_generations: dict[str, int] = {}
-        self._pending_session_evictions: dict[str, int] = {}
         for component in self.components:
             component.reset_session_state()
 
@@ -98,7 +97,6 @@ class UnifiedSessionRefTracker:
 
     def open_radix_session(self, session_id: str) -> Optional[int]:
         self._closed_session_ids.pop(session_id, None)
-        self._pending_session_evictions.pop(session_id, None)
         self._session_incarnation_counter += 1
         self._session_generations[session_id] = self._session_incarnation_counter
         return self._session_incarnation_counter
@@ -114,55 +112,6 @@ class UnifiedSessionRefTracker:
         for component in self.components:
             indexed += component.release_session(session_id)
         return indexed
-
-    def defer_radix_session_eviction(self, req: Req) -> bool:
-        """Keep this generation referenced until its next successful request."""
-        if not self.enable_session_radix_cache:
-            return False
-        if req.session is not None and req.session.streaming:
-            return False
-
-        session_id = self.session_id_for_req(req)
-        if session_id is None or session_id in self._closed_session_ids:
-            return False
-
-        current_generation = self._session_generations.get(session_id)
-        if current_generation is None or req.session_generation != current_generation:
-            logger.warning(
-                "Cannot defer session eviction for stale request "
-                "session_id=%s request_generation=%s current_generation=%s",
-                session_id,
-                req.session_generation,
-                current_generation,
-            )
-            return False
-
-        self._pending_session_evictions[session_id] = current_generation
-        return True
-
-    def apply_pending_radix_session_eviction(
-        self, req: Req
-    ) -> Optional[SessionCacheEvictResult]:
-        """Release old references before registering this request's new leaf."""
-        session_id = self.session_id_for_req(req)
-        if session_id is None:
-            return None
-
-        pending_generation = self._pending_session_evictions.get(session_id)
-        if pending_generation is None:
-            return None
-
-        current_generation = self._session_generations.get(session_id)
-        if current_generation != pending_generation:
-            self._pending_session_evictions.pop(session_id, None)
-            return None
-        if req.session_generation != pending_generation:
-            return None
-
-        result = self.evict_radix_session(session_id, pending_generation)
-        if result.status == "evicted":
-            req.session_generation = result.generation
-        return result
 
     def evict_radix_session(
         self, session_id: str, generation: Optional[int] = None
@@ -180,7 +129,6 @@ class UnifiedSessionRefTracker:
             )
 
         indexed = self._release_session_refs(session_id)
-        self._pending_session_evictions.pop(session_id, None)
         self._session_incarnation_counter += 1
         new_generation = self._session_incarnation_counter
         self._session_generations[session_id] = new_generation
@@ -199,7 +147,6 @@ class UnifiedSessionRefTracker:
 
         self._remember_closed_session(session_id)
         self._session_generations.pop(session_id, None)
-        self._pending_session_evictions.pop(session_id, None)
 
         indexed = self._release_session_refs(session_id)
 

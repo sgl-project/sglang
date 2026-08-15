@@ -182,19 +182,11 @@ fn insert_kv_hints(
     request: &mut HashMap<String, serde_json::Value>,
     hints: &Option<proto::KvHints>,
 ) {
-    let Some(deref) = hints.as_ref().and_then(|hints| hints.deref.as_ref()) else {
+    let Some(_deref) = hints.as_ref().and_then(|hints| hints.deref.as_ref()) else {
         return;
     };
 
-    let apply_on = match proto::DerefApplyOn::try_from(deref.apply_on) {
-        Ok(proto::DerefApplyOn::CurrentSuccess) => "current_success",
-        Ok(proto::DerefApplyOn::NextSuccess) => "next_success",
-        _ => return,
-    };
-    request.insert(
-        "kv_hints".into(),
-        serde_json::json!({"deref": {"apply_on": apply_on}}),
-    );
+    request.insert("kv_hints".into(), serde_json::json!({"deref": {}}));
 }
 
 fn now_timestamp() -> f64 {
@@ -425,9 +417,7 @@ mod tests {
     #[test]
     fn generate_dicts_include_typed_deref_hint() {
         let kv_hints = Some(proto::KvHints {
-            deref: Some(proto::DerefHint {
-                apply_on: proto::DerefApplyOn::NextSuccess as i32,
-            }),
+            deref: Some(proto::DerefHint {}),
         });
         let text_req = proto::TextGenerateRequest {
             kv_hints: kv_hints.clone(),
@@ -442,29 +432,8 @@ mod tests {
             build_text_generate_dict("text-request", &text_req).unwrap(),
             build_generate_dict("token-request", &token_req).unwrap(),
         ] {
-            assert_eq!(
-                mapped["kv_hints"],
-                serde_json::json!({"deref": {"apply_on": "next_success"}})
-            );
+            assert_eq!(mapped["kv_hints"], serde_json::json!({"deref": {}}));
         }
-    }
-
-    #[test]
-    fn generate_dicts_drop_unspecified_deref_hint() {
-        let request = proto::GenerateRequest {
-            kv_hints: Some(proto::KvHints {
-                deref: Some(proto::DerefHint {
-                    apply_on: proto::DerefApplyOn::Unspecified as i32,
-                }),
-            }),
-            ..Default::default()
-        };
-
-        assert!(
-            !build_generate_dict("request", &request)
-                .unwrap()
-                .contains_key("kv_hints")
-        );
     }
 
     #[test]

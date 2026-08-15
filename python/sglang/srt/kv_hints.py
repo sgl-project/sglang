@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import logging
-from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -23,11 +22,6 @@ logger = logging.getLogger(__name__)
 KV_HINT_DEREF_V1 = "kv_hint.deref.v1"
 
 
-class DerefApplyOn(str, Enum):
-    CURRENT_SUCCESS = "current_success"
-    NEXT_SUCCESS = "next_success"
-
-
 class KvHintStruct(msgspec.Struct, kw_only=True):
     @classmethod
     def __get_pydantic_core_schema__(cls, source, handler):
@@ -35,7 +29,7 @@ class KvHintStruct(msgspec.Struct, kw_only=True):
 
 
 class DerefHint(KvHintStruct):
-    apply_on: DerefApplyOn
+    pass
 
 
 class KvHints(KvHintStruct):
@@ -66,38 +60,28 @@ class KvHintManager:
 
         req.kv_hints = hints
         logger.info(
-            "Accepted KV DEREF session_id=%s generation=%s apply_on=%s",
+            "Accepted KV DEREF session_id=%s generation=%s",
             req.session_id,
             req.session_generation,
-            hints.deref.apply_on.value,
         )
 
     def on_request_success(self, req: Req, *, has_reusable_leaf: bool) -> None:
-        """Apply DEREF at the requested success boundary and track the new leaf."""
+        """Apply DEREF on request success and track ordinary request leaves."""
         if self._session_refs is None:
             return
 
         deref = req.kv_hints.deref if req.kv_hints is not None else None
-        if deref is not None and deref.apply_on == DerefApplyOn.CURRENT_SUCCESS:
+        if deref is not None:
             result = self._session_refs.evict_radix_session(
                 req.session_id, req.session_generation
             )
             self._log_deref_result(req, result)
             return
 
-        if deref is not None and deref.apply_on == DerefApplyOn.NEXT_SUCCESS:
-            if has_reusable_leaf:
-                self._session_refs.register_session_ref(req)
-            self._session_refs.defer_radix_session_eviction(req)
-            return
-
         if not has_reusable_leaf:
             return
 
-        result = self._session_refs.apply_pending_radix_session_eviction(req)
         self._session_refs.register_session_ref(req)
-        if result is not None:
-            self._log_deref_result(req, result)
 
     @staticmethod
     def _log_deref_result(req: Req, result: SessionCacheEvictResult) -> None:
