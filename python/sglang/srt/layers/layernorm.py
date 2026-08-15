@@ -174,6 +174,8 @@ if _is_npu:
     import torch_npu
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
 
+_NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE = 5120
+
 
 @lru_cache(maxsize=1)
 def _get_aiter_per_group_quant():
@@ -1143,9 +1145,15 @@ class GemmaRMSNorm(BaseFusedOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            norm_out, residual = add_gemma_rms_norm(
-                x, self.weight, residual, self.variance_epsilon
-            )
+            if x.shape[-1] > _NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE:
+                gamma = self.gemma_weight.to(x.dtype)
+                norm_out, _, residual = torch_npu.npu_add_rms_norm(
+                    residual, x, gamma, self.variance_epsilon
+                )
+            else:
+                norm_out, residual = add_gemma_rms_norm(
+                    x, self.weight, residual, self.variance_epsilon
+                )
             return norm_out, residual
 
         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
