@@ -28,8 +28,7 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
 )
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
-    is_dsa_enable_prefill_cp,
-    is_dsa_prefill_cp_in_seq_split,
+    is_dsa_cp_enabled,
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
@@ -43,7 +42,6 @@ from sglang.srt.runtime_context import (
     configured_pp_size,
     get_device,
     get_exec,
-    get_parallel,
     get_schedule,
 )
 from sglang.srt.state_capturer.indexer_topk import (
@@ -113,12 +111,11 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.base import get_cp_strategy, is_zigzag
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -241,11 +238,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not is_neox_style
         )
         self.alt_stream = alt_stream
-        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        if self.dsa_enable_prefill_cp:
-            self.cp_size = get_parallel().attn_cp_size
-        else:
-            self.cp_size = None
+        self.dsa_cp_enabled = is_dsa_cp_enabled()
         if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
@@ -463,11 +456,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             with torch.cuda.stream(self.alt_stream):
                 key = self._maybe_rotate(key)
             current_stream.wait_stream(self.alt_stream)
-        elif (
-            self.alt_stream is not None
-            and forward_batch.attn_cp_metadata is not None
-            and self.dsa_enable_prefill_cp
-        ):
+        elif self.alt_stream is not None and is_cp_active(forward_batch):
             key = self._maybe_rotate(key)
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -476,17 +465,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # Gather the full key on alt_stream so the CP all-gather overlaps
             # with the query rotate above on the current stream.
             with torch.cuda.stream(self.alt_stream):
-                if is_cp_active(forward_batch):
-                    key = get_cp_strategy().materialize_full_indexer_k_cache(
-                        key, forward_batch
-                    )
-                else:
-                    key = cp_all_gather_rerange_output(
-                        key.contiguous(),
-                        self.cp_size,
-                        forward_batch,
-                        torch.cuda.current_stream(),
-                    )
+                strategy = get_cp_strategy()
+                assert strategy is not None
+                key = strategy.materialize_full_indexer_k_cache(key, forward_batch)
             current_stream.wait_stream(self.alt_stream)
             return query, key, weights_raw
         else:
@@ -495,14 +476,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         # allgather+rerrange
         if is_cp_active(forward_batch):
-            key = get_cp_strategy().materialize_full_indexer_k_cache(key, forward_batch)
-        elif forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
-            key = cp_all_gather_rerange_output(
-                key.contiguous(),
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
+            strategy = get_cp_strategy()
+            assert strategy is not None
+            key = strategy.materialize_full_indexer_k_cache(key, forward_batch)
         return query, key, weights_raw
 
     def _get_k_bf16(
@@ -1544,7 +1520,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
 
         # Optimization: fast path when skipping topk computation
-        if skip_logits_computation and (not self.dsa_enable_prefill_cp):
+        if skip_logits_computation and (not self.dsa_cp_enabled):
             topk_result = self._forward_cuda_k_only(
                 x,
                 positions,
@@ -1568,15 +1544,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if (
             self.use_dsa_indexer_fusion
             and not in_piecewise_or_breakable_cuda_graph
-            and forward_batch.attn_cp_metadata is None
+            and not is_cp_active(forward_batch)
         ):
             q_fp8, weights = self._fused_q_prepare_and_store(
                 x, q_lora, positions, forward_batch, layer_id, act_quant
             )
-        elif (
-            is_graph_dsa_split_op_surface(forward_batch)
-            and not self.dsa_enable_prefill_cp
-        ):
+        elif is_graph_dsa_split_op_surface(forward_batch) and not self.dsa_cp_enabled:
             # Default path for non-CP prefill under PCG/BCG: run the whole indexer
             # (q/k proj, head gate, k-cache store, topk) as a single eager split op
             # instead of capturing it piecemeal in the graph. The split op is
@@ -1768,10 +1741,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )
             else:
-                if (
-                    forward_batch.attn_cp_metadata is not None
-                    and is_dsa_prefill_cp_in_seq_split()
-                ):
+                if is_cp_active(forward_batch) and is_zigzag():
                     kv_len_prev = forward_batch.attn_cp_metadata.kv_len_prev_list[0]
                     kv_len_next = forward_batch.attn_cp_metadata.kv_len_next_list[0]
                     actual_seq_q_prev = (

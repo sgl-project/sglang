@@ -350,7 +350,7 @@ class EagerRunner(BaseRunner):
     def _execute_extend_cp(
         self, forward_batch: ForwardBatch, kwargs: dict
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        """CP-v2 extend: shard inputs at the model boundary, run the body on the
+        """CP extend: shard inputs at the model boundary, run the body on the
         rank-local slice, then gather hidden states before the logits step.
         """
         model = self.model_runner.model

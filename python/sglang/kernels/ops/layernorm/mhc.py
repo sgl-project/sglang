@@ -13,7 +13,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
+from sglang.srt.layers.cp.base import is_interleave
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 
@@ -1042,7 +1042,7 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    if is_dsa_prefill_cp_round_robin_split():
+    if is_interleave():
         x = strict_contiguous(x)
         residual = strict_contiguous(residual)
         post_layer_mix = strict_contiguous(post_layer_mix)

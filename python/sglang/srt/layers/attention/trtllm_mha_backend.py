@@ -79,7 +79,7 @@ class TRTLLMMHAMetadata:
     page_table: torch.Tensor = None
     # Page table for SWA layers (translated from full pool indices to SWA pool indices)
     swa_page_table: torch.Tensor = None
-    # CP-v2 zigzag treats prev/next halves as a synthetic 2 * batch_size batch.
+    # Zigzag CP treats prev/next halves as a synthetic 2 * batch_size batch.
     zigzag_page_table: torch.Tensor = None
     zigzag_swa_page_table: torch.Tensor = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
@@ -1200,7 +1200,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         cache_loc = forward_batch.out_cache_loc
         cp_active = is_cp_active(forward_batch)
 
-        # The fused path writes rank-local K/V directly to cache. CP-v2 needs
+        # The fused path writes rank-local K/V directly to cache. CP needs
         # the strategy to gather K/V into full logical token order first.
         use_fused_fp8_path = self._should_use_fused_fp8_path(
             save_kv_cache, k, forward_batch

@@ -48,13 +48,9 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     TopkTransformMethod,
 )
 from sglang.srt.layers.attention.dsa.utils import (
-    can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
-    dsa_cp_round_robin_split_data,
-    dsa_cp_round_robin_split_q_seqs,
-    dsa_use_prefill_cp,
-    is_dsa_enable_prefill_cp,
-    is_dsa_prefill_cp_in_seq_split,
+    is_dsa_cp_active,
+    is_dsa_cp_enabled,
     pad_dsa_cache_seqlens,
     should_use_dsa_fused_topk,
 )
@@ -62,12 +58,8 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
 )
-from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.base import get_cp_strategy, is_interleave, is_zigzag
 from sglang.srt.layers.cp.utils import is_cp_active
-from sglang.srt.layers.utils.cp_utils import (
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_position,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils import (
@@ -95,24 +87,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
-def _all_gather_dsa_trtllm_fp8_kv(
-    forward_batch: ForwardBatch,
-    k: torch.Tensor,
-    k_rope: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    kv_lora_rank = k.shape[-1]
-    qk_rope_head_dim = k_rope.shape[-1]
-    kv_dtype = k.dtype
-    kv = torch.cat((k, k_rope), dim=-1).view(torch.uint8)
-    kv = cp_all_gather_rerange_output(
-        kv,
-        get_parallel().attn_cp_size,
-        forward_batch,
-        torch.cuda.current_stream(),
-    ).view(kv_dtype)
-    return kv.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
-
-
 def prepare_kv_for_attention(
     attn_mla,
     forward_batch: ForwardBatch,
@@ -124,7 +98,7 @@ def prepare_kv_for_attention(
     """Materialize KV needed before attention for the active layout."""
     if (
         defer_materialization
-        or not dsa_use_prefill_cp(forward_batch)
+        or not is_dsa_cp_active(forward_batch)
         or not is_cp_active(forward_batch)
     ):
         return k_nope, k_pe
@@ -935,20 +909,13 @@ class DeepseekSparseAttnBackend(
                 ]
             )
 
-            if can_dsa_prefill_cp_round_robin_split(forward_batch):
-                if is_cp_active(forward_batch):
-                    strategy = get_cp_strategy()
-                    seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
-                    extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
-                        strategy.shard_per_request(extend_seq_lens_cpu, extend_seq_lens)
-                    )
-                else:
-                    seqlens_expanded = dsa_cp_round_robin_split_data(seqlens_expanded)
-                    extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
-                        dsa_cp_round_robin_split_q_seqs(
-                            extend_seq_lens_cpu, extend_seq_lens
-                        )
-                    )
+            if is_cp_active(forward_batch) and is_interleave():
+                strategy = get_cp_strategy()
+                assert strategy is not None
+                seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
+                extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
+                    strategy.shard_per_request(extend_seq_lens_cpu, extend_seq_lens)
+                )
                 indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx_cpu]
                 indexer_seq_lens = indexer_seq_lens[bs_idx]
                 cache_seqlens_int32 = cache_seqlens_int32[bs_idx]
@@ -1153,12 +1120,10 @@ class DeepseekSparseAttnBackend(
         ke = torch.cat(ke_list, dim=0)
         token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
         if bs_idx is not None:
-            assert can_dsa_prefill_cp_round_robin_split(forward_batch)
-            split_per_token = (
-                get_cp_strategy().shard_local_tokens
-                if is_cp_active(forward_batch)
-                else dsa_cp_round_robin_split_data
-            )
+            assert is_cp_active(forward_batch) and is_interleave()
+            strategy = get_cp_strategy()
+            assert strategy is not None
+            split_per_token = strategy.shard_local_tokens
             ks = split_per_token(ks)
             ke = split_per_token(ke)
             token_to_batch_idx = split_per_token(token_to_batch_idx)
@@ -2487,7 +2452,7 @@ class DeepseekSparseAttnBackend(
         # single-slot stash handshake is not safe there.
         if self._q8kv8_born_q_tbo:
             return False
-        if is_dsa_enable_prefill_cp():
+        if is_dsa_cp_enabled():
             return False
         if (
             self.get_topk_transform_method(forward_batch.forward_mode)
@@ -3147,15 +3112,12 @@ class DeepseekSparseAttnBackend(
             ), "For FP8 path cos_sin_cache should not be None."
 
             rope_positions = forward_batch.positions
-            if dsa_use_prefill_cp(forward_batch):
-                if is_cp_active(forward_batch):
-                    rope_positions = get_cp_strategy().shard_position_ids(
-                        rope_positions, forward_batch
-                    )
-                else:
-                    rope_positions = cp_split_and_rebuild_position(
-                        forward_batch, rope_positions
-                    )
+            if is_dsa_cp_active(forward_batch):
+                strategy = get_cp_strategy()
+                assert strategy is not None
+                rope_positions = strategy.shard_position_ids(
+                    rope_positions, forward_batch
+                )
 
             q, k, k_rope = mla_quantize_and_rope_for_fp8(
                 q,
@@ -3168,13 +3130,12 @@ class DeepseekSparseAttnBackend(
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
             )
-            if save_kv_cache and dsa_use_prefill_cp(forward_batch):
-                if is_cp_active(forward_batch):
-                    k, k_rope = get_cp_strategy().all_gather_dsa_trtllm_fp8_kv(
-                        forward_batch, k, k_rope
-                    )
-                else:
-                    k, k_rope = _all_gather_dsa_trtllm_fp8_kv(forward_batch, k, k_rope)
+            if save_kv_cache and is_dsa_cp_active(forward_batch):
+                strategy = get_cp_strategy()
+                assert strategy is not None
+                k, k_rope = strategy.all_gather_dsa_trtllm_fp8_kv(
+                    forward_batch, k, k_rope
+                )
             merge_query = False
 
             # Save KV cache if requested
@@ -3253,8 +3214,8 @@ class DeepseekSparseAttnBackend(
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 
         if (
-            dsa_use_prefill_cp(forward_batch)
-            and is_dsa_prefill_cp_in_seq_split()
+            is_dsa_cp_active(forward_batch)
+            and is_zigzag()
             and forward_batch.attn_cp_metadata is not None
         ):
             cp_meta = forward_batch.attn_cp_metadata
@@ -3341,7 +3302,7 @@ class DeepseekSparseAttnBackend(
                 and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
-                and (not is_dsa_enable_prefill_cp())  # CP not enabled
+                and (not is_dsa_cp_enabled())
                 and (self.hisparse_coordinator is None)
             )
         else:

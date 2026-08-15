@@ -32,8 +32,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
-    dsa_use_prefill_cp,
-    is_dsa_enable_prefill_cp,
+    is_dsa_cp_active,
+    is_dsa_cp_enabled,
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
 from sglang.srt.layers.dp_attention import (
@@ -212,7 +212,7 @@ class ScatterMode(Enum):
     @staticmethod
     def model_input_output():
         """The scatter mode for model forward pass input and output data"""
-        if is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled():
+        if is_dsa_cp_enabled() or is_mla_prefill_cp_enabled():
             return ScatterMode.SCATTERED
 
         return ScatterMode.TP_ATTN_FULL
@@ -394,7 +394,7 @@ class LayerScatterModes:
                 return ScatterMode.SCATTERED
             # DSA CP and MLA CP both don't support MOE_FULL yet; fall back to FULL.
             if is_enable_moe_cp_allgather() and not (
-                is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
+                is_dsa_cp_enabled() or is_mla_prefill_cp_enabled()
             ):
                 return ScatterMode.MOE_FULL
             return ScatterMode.FULL
@@ -799,7 +799,7 @@ class LayerCommunicator:
                 return True
             if forward_batch.dp_padding_mode.is_max_len():
                 return True
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+        if is_dsa_cp_active(forward_batch) or mla_use_prefill_cp(forward_batch):
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
             return True

@@ -18,7 +18,7 @@ from sglang.kernels.ops.attention.dsv4.compress_old import (
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import is_dsa_cp_active
 from sglang.srt.layers.cp.utils import cp_materialize_global_token_order
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -407,7 +407,7 @@ class Compressor(BaseFusedOp):
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
 
         # CUDA path: delegate to backend
-        if dsa_use_prefill_cp(forward_batch):
+        if is_dsa_cp_active(forward_batch):
             kv_score = cp_materialize_global_token_order(
                 kv_score,
                 forward_batch,
@@ -453,7 +453,7 @@ class Compressor(BaseFusedOp):
             assert x.shape[0] == 0
             return x.new_empty(0, self.head_dim)
 
-        if dsa_use_prefill_cp(forward_batch):
+        if is_dsa_cp_active(forward_batch):
             x = cp_materialize_global_token_order(
                 x,
                 forward_batch,

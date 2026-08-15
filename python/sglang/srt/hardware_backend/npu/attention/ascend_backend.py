@@ -20,9 +20,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -30,7 +28,6 @@ from sglang.srt.runtime_context import get_flags, get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import (
     get_bool_env_var,
-    get_current_device_stream_fast,
     next_power_of_2,
 )
 
@@ -247,54 +244,6 @@ class AscendAttnMaskBuilder:
         return mask.unsqueeze(1).to(self.device, non_blocking=True)
 
 
-def _cp_allgather_and_save_kv_npu(
-    forward_batch, layer, k, v, cp_size, token_to_kv_pool, swa_loc=None
-):
-    """NPU-compatible CP KV all-gather with merged K/V communication.
-
-    Merges K and V along the feature dimension so only one all-gather is
-    needed instead of two, halving communication latency.
-
-    k shape: [S_local, tp_k_head_num, qk_head_dim]
-    v shape: [S_local, tp_v_head_num, v_head_dim]
-
-    Equivalent to cp_allgather_and_save_kv_cache() in cp_utils.py, but uses
-    a single all-gather for both K and V.
-
-    swa_loc is the pre-translated full->SWA write target for hybrid SWA pools
-    (None for non-SWA pools); set_kv_buffer never translates internally.
-    """
-    cache_loc = (
-        forward_batch.out_cache_loc
-        if not layer.is_cross_attention
-        else forward_batch.encoder_out_cache_loc
-    )
-    # Save original trailing shapes for reshape after gather.
-    k_tail = k.shape[1:]  # (tp_k_head_num, qk_head_dim)
-    v_tail = v.shape[1:]  # (tp_v_head_num, v_head_dim)
-
-    # Flatten trailing dims then concat → one all-gather instead of two.
-    # Works for GQA where tp_k_head_num != tp_v_head_num.
-    k_flat = k.contiguous().reshape(k.shape[0], -1)  # [S_local, k_feat]
-    v_flat = v.contiguous().reshape(v.shape[0], -1)  # [S_local, v_feat]
-    k_feat_size = k_flat.shape[-1]
-    kv_flat = torch.cat([k_flat, v_flat], dim=-1)  # [S_local, k_feat + v_feat]
-
-    kv_full = cp_all_gather_rerange_kv_cache(
-        kv_flat, cp_size, forward_batch, get_current_device_stream_fast()
-    )  # [S_full, k_feat + v_feat]
-
-    key_cache_full = kv_full[..., :k_feat_size].reshape(-1, *k_tail)
-    value_cache_full = kv_full[..., k_feat_size:].reshape(-1, *v_tail)
-
-    token_to_kv_pool.set_kv_buffer(
-        layer,
-        KVWriteLoc(cache_loc, swa_loc),
-        key_cache_full,
-        value_cache_full,
-    )
-
-
 class AscendAttnBackend(AttentionBackend):
 
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
@@ -391,8 +340,6 @@ class AscendAttnBackend(AttentionBackend):
         if self.dllm_config is not None:
             self.is_dllm_model = True
             self.dllm_block_size = self.dllm_config.block_size
-
-        self.attn_cp_size = model_runner.ps.attn_cp_size
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
@@ -897,159 +844,6 @@ class AscendAttnBackend(AttentionBackend):
         attn_output = attn_output.view(-1, num_heads * head_size)
         return attn_output
 
-    def do_cp_balance_attn(
-        self,
-        q_nope,
-        k_nope,
-        q_pe,
-        k_pe,
-        topk_indices,
-        layer,
-        actual_seq_qlen,
-        actual_seq_lengths_kv,
-    ):
-        seq_len = q_nope.shape[0]
-        split_len = (seq_len + 1) // 2
-        q_nope_prev, q_nope_next = torch.split(q_nope, split_len, dim=0)
-        q_rope_prev, q_rope_next = torch.split(q_pe, split_len, dim=0)
-        q_nope_prev = q_nope_prev.contiguous()
-        q_nope_next = q_nope_next.contiguous()
-        q_rope_prev = q_rope_prev.contiguous()
-        q_rope_next = q_rope_next.contiguous()
-        topk_indices = _expand_dsa_sparse_indices(topk_indices)
-        topk_indices_prev, topk_indices_next = torch.split(
-            topk_indices, split_len, dim=0
-        )
-
-        actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
-        actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
-
-        attn_out_prev, _, _ = torch_npu.npu_sparse_flash_attention(
-            query=q_nope_prev,
-            key=k_nope,
-            value=k_nope,
-            query_rope=q_rope_prev,
-            key_rope=k_pe,
-            sparse_indices=topk_indices_prev,
-            scale_value=layer.scaling,
-            actual_seq_lengths_query=actual_seq_qlen_prev.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_kv=actual_seq_lengths_kv_prev.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            block_table=self.forward_metadata.block_tables,
-            sparse_block_size=1,
-            layout_query="TND",
-            layout_kv="PA_BSND",
-            sparse_mode=3,
-            attention_mode=2,
-            return_softmax_lse=False,
-        )
-        attn_out_next, _, _ = torch_npu.npu_sparse_flash_attention(
-            query=q_nope_next,
-            key=k_nope,
-            value=k_nope,
-            query_rope=q_rope_next,
-            key_rope=k_pe,
-            sparse_indices=topk_indices_next,
-            scale_value=layer.scaling,
-            actual_seq_lengths_query=actual_seq_qlen_next.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_kv=actual_seq_lengths_kv_next.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            block_table=self.forward_metadata.block_tables,
-            sparse_block_size=1,
-            layout_query="TND",
-            layout_kv="PA_BSND",
-            sparse_mode=3,
-            attention_mode=2,
-            return_softmax_lse=False,
-        )
-        return torch.cat([attn_out_prev, attn_out_next], dim=0)
-
-    def do_cp_attn_fia(
-        self,
-        q: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        """CP-aware attention for standard (non-MLA) models using FIA on Ascend NPU.
-
-        Uses npu_fused_infer_attention_score with paged KV cache (block_table).
-        The KV cache must already contain the full gathered sequence
-        (written by _cp_allgather_and_save_kv_npu before this call).
-
-        Args:
-            q:            Query tensor, shape [total_q_tokens, tp_q_head_num * qk_head_dim]
-            k_cache:      Full key cache from token_to_kv_pool
-            v_cache:      Full value cache from token_to_kv_pool
-            layer:        RadixAttention layer
-            forward_batch: ForwardBatch with attn_cp_metadata populated
-
-        Returns:
-            attn_output [total_q_tokens, tp_q_head_num * v_head_dim]
-        """
-        cp_meta = forward_batch.attn_cp_metadata
-
-        # Local tokens are laid out [all_seqs_prev, all_seqs_next]; split at
-        # total_q_prev_tokens rather than the midpoint to support bs > 1.
-        split = cp_meta.total_q_prev_tokens
-        q_prev = (
-            q[:split].contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        )
-        q_next = (
-            q[split:].contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        )
-
-        k_cache_paged = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
-        )
-        v_cache_paged = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
-        )
-
-        attn_out_prev, _ = torch.ops.npu.npu_fused_infer_attention_score(
-            q_prev,
-            k_cache_paged,
-            v_cache_paged,
-            block_table=self.forward_metadata.block_tables,
-            block_size=self.page_size,
-            num_heads=layer.tp_q_head_num,
-            num_key_value_heads=layer.tp_k_head_num,
-            input_layout="TND",
-            atten_mask=self.fia_mask,
-            sparse_mode=3,
-            next_tokens=0,
-            scale=layer.scaling,
-            actual_seq_lengths=np.cumsum(cp_meta.actual_seq_q_prev_list).tolist(),
-            actual_seq_lengths_kv=cp_meta.kv_len_prev_list,
-        )
-
-        attn_out_next, _ = torch.ops.npu.npu_fused_infer_attention_score(
-            q_next,
-            k_cache_paged,
-            v_cache_paged,
-            block_table=self.forward_metadata.block_tables,
-            block_size=self.page_size,
-            num_heads=layer.tp_q_head_num,
-            num_key_value_heads=layer.tp_k_head_num,
-            input_layout="TND",
-            atten_mask=self.fia_mask,
-            sparse_mode=3,
-            next_tokens=0,
-            scale=layer.scaling,
-            actual_seq_lengths=np.cumsum(cp_meta.actual_seq_q_next_list).tolist(),
-            actual_seq_lengths_kv=cp_meta.kv_len_next_list,
-        )
-
-        attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
-        return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -1114,47 +908,31 @@ class AscendAttnBackend(AttentionBackend):
         else:
             actual_seq_lengths_kv = self.forward_metadata.seq_lens
 
-        if (
-            is_prefill
-            and is_dsa_enable_prefill_cp()
-            and forward_batch.attn_cp_metadata is not None
-        ):
-            attn_out = self.do_cp_balance_attn(
-                q_nope,
-                k_nope,
-                q_pe,
-                k_pe,
-                topk_indices,
-                layer,
-                actual_seq_qlen,
-                actual_seq_lengths_kv,
-            )
-        else:
-            if topk_indices is not None:
-                topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
-            topk_indices = _expand_dsa_sparse_indices(topk_indices)
-            attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
-                query=q_nope,
-                key=k_nope,
-                value=k_nope,
-                query_rope=q_pe,
-                key_rope=k_pe,
-                sparse_indices=topk_indices,
-                scale_value=layer.scaling,
-                actual_seq_lengths_query=actual_seq_qlen.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                block_table=self.forward_metadata.block_tables,
-                sparse_block_size=1,
-                layout_query="TND",
-                layout_kv="PA_BSND",
-                sparse_mode=3,
-                attention_mode=2,
-                return_softmax_lse=False,
-            )
+        if topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+        topk_indices = _expand_dsa_sparse_indices(topk_indices)
+        attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+            query=q_nope,
+            key=k_nope,
+            value=k_nope,
+            query_rope=q_pe,
+            key_rope=k_pe,
+            sparse_indices=topk_indices,
+            scale_value=layer.scaling,
+            actual_seq_lengths_query=actual_seq_qlen.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            actual_seq_lengths_kv=actual_seq_lengths_kv.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            block_table=self.forward_metadata.block_tables,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            attention_mode=2,
+            return_softmax_lse=False,
+        )
 
         return attn_out
 
@@ -1216,41 +994,22 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if not self.use_mla:
-            # Detect CP mode for prefill (context parallel)
-            is_cp_mode = (
-                forward_batch.forward_mode.is_context_parallel_extend()
-                and forward_batch.attn_cp_metadata is not None
-                and self.attn_cp_size > 1
-            )
-
             # In cross attention layer, when there is no vision input,the values of k and v is None
             if save_kv_cache and k is not None and v is not None:
-                if is_cp_mode:
-                    # All-gather K/V from all CP ranks and write full sequence to KV pool
-                    _cp_allgather_and_save_kv_npu(
-                        forward_batch,
-                        layer,
-                        k,
-                        v,
-                        self.attn_cp_size,
-                        self.token_to_kv_pool,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
-                    )
-                else:
-                    # support cross attention
-                    cache_loc = (
-                        forward_batch.out_cache_loc
-                        if not layer.is_cross_attention
-                        else forward_batch.encoder_out_cache_loc
-                    )
-                    swa_loc = (
-                        self.forward_metadata.swa_out_cache_loc
-                        if not layer.is_cross_attention
-                        else None
-                    )
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer, KVWriteLoc(cache_loc, swa_loc), k, v
-                    )
+                # support cross attention
+                cache_loc = (
+                    forward_batch.out_cache_loc
+                    if not layer.is_cross_attention
+                    else forward_batch.encoder_out_cache_loc
+                )
+                swa_loc = (
+                    self.forward_metadata.swa_out_cache_loc
+                    if not layer.is_cross_attention
+                    else None
+                )
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer, KVWriteLoc(cache_loc, swa_loc), k, v
+                )
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -1383,18 +1142,6 @@ class AscendAttnBackend(AttentionBackend):
                         layer.tp_k_head_num,
                     )
                 return attn_out
-
-            if is_cp_mode:
-                if self.use_fia:
-                    attn_output = self.do_cp_attn_fia(
-                        q, k_cache, v_cache, layer, forward_batch
-                    )
-                else:
-                    raise NotImplementedError(
-                        "CP attention for non-FIA path on Ascend is not yet implemented. "
-                        "Set ASCEND_USE_FIA=1 to use FIA-based CP attention."
-                    )
-                return attn_output
 
             if self.use_fia:
                 if self._can_use_tnd(layer):

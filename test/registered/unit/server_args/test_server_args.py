@@ -1429,7 +1429,6 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
 
     def _validate_prefill_only_args(self, **overrides):
         sa = ServerArgs(**self._base_kwargs(**overrides))
-        sa._handle_legacy_cp_arguments()
         sa._validate_prefill_only_disable_kv_cache_args()
         return sa
 
@@ -1453,9 +1452,9 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--attn-cp-size"):
             self._validate_prefill_only_args(attn_cp_size=2, tp_size=2)
 
-    def test_rejects_prefill_context_parallel(self):
+    def test_rejects_prefill_cp(self):
         with self.assertRaisesRegex(ValueError, "--enable-prefill-cp"):
-            self._validate_prefill_only_args(enable_prefill_context_parallel=True)
+            self._validate_prefill_only_args(enable_prefill_cp=True)
 
     def test_rejects_hisparse(self):
         with self.assertRaisesRegex(ValueError, "--enable-hisparse"):

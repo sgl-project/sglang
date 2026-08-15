@@ -73,7 +73,7 @@ from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper, model_parallel
-from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import is_dsa_cp_enabled
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
     is_cp_active,
@@ -247,7 +247,7 @@ logger = logging.getLogger(__name__)
 def _prefill_cuda_graph_allows_context_parallel(
     prefill_runner, forward_batch: ForwardBatch
 ) -> bool:
-    """Allow CP only through a runner that captured the validated CP-v2 body."""
+    """Allow CP only through a runner that captured the validated CP body."""
     return get_cp_strategy() is None or (
         bool(getattr(prefill_runner, "enable_cp_bcg_capture", False))
         and is_cp_active(forward_batch)
@@ -1437,7 +1437,7 @@ class ModelRunner:
             forward_batch.num_token_non_padded is not None
             and forward_batch.global_num_tokens_gpu is not None
             and require_gathered_buffer(self.server_args)
-            and not is_dsa_enable_prefill_cp()
+            and not is_dsa_cp_enabled()
             and not is_mla_prefill_cp_enabled()
         ):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(

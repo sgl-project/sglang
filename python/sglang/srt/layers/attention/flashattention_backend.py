@@ -23,10 +23,6 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_utils import (
-    cp_allgather_and_save_kv_cache,
-    cp_attn_forward_extend,
-)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -969,25 +965,6 @@ class FlashAttentionBackend(AttentionBackend):
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
 
-            # MLA/MHA CP: prepare_mlp_sync_batch pads extend tokens up to
-            # lcm(attn_tp_size, attn_cp_size), so cache_seqlens_cp can exceed
-            # seq_lens_cpu.max(). Widen page_table by the pad delta to keep
-            # FA3's causal reads in-bounds; widened columns index KV slot 0
-            # (req_to_token is zero-init) and outputs for padding queries are
-            # discarded downstream.
-            if (
-                not is_cp_active(forward_batch)
-                and self.attn_cp_size > 1
-                and forward_batch.global_num_tokens_cpu is not None
-                and forward_batch.extend_num_tokens is not None
-                and forward_batch.extend_seq_lens_cpu is not None
-            ):
-                padded_extend = int(forward_batch.extend_num_tokens)
-                real_extend = int(sum(forward_batch.extend_seq_lens_cpu))
-                pad_delta = padded_extend - real_extend
-                if pad_delta > 0:
-                    metadata.max_seq_len_k += pad_delta
-
             metadata.page_table = self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
@@ -1179,11 +1156,7 @@ class FlashAttentionBackend(AttentionBackend):
     ):
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
-        is_cp_mode = (
-            forward_batch.forward_mode.is_context_parallel_extend()
-            and forward_batch.attn_cp_metadata is not None
-            and self.attn_cp_size > 1
-        )
+        cp_active = is_cp_active(forward_batch)
 
         if k is not None:
             assert v is not None
@@ -1195,25 +1168,20 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if self.use_mla:
-                    if is_cp_active(forward_batch):
-                        # CP-v2: k/k_rope are rank-local; the strategy gathers
-                        # the latent to full sequence and writes it.
+                    if cp_active:
                         cp_strategy = get_cp_strategy()
                         assert cp_strategy is not None
                         cp_strategy.materialize_full_mla_kv(
                             forward_batch, layer, k, k_rope
                         )
                     else:
-                        # CP-v1: k/k_rope arrive full-sequence (rebuild_cp_kv_cache
-                        # ran upstream); rank-local when CP is off. out_cache_loc is
-                        # never zigzag-split, so the write lands in the right slots.
                         self.token_to_kv_pool.set_mla_kv_buffer(
                             layer,
                             cache_loc,
                             k,
                             k_rope,
                         )
-                elif is_cp_mode:
+                elif cp_active:
                     # Dense-MHA CP: k, v are still rank-local; backend
                     # all-gathers and writes to the per-rank pool.
                     swa_loc = (
@@ -1221,21 +1189,11 @@ class FlashAttentionBackend(AttentionBackend):
                         if self.use_sliding_window_kv_pool
                         else None
                     )
-                    if is_cp_active(forward_batch):
-                        cp_strategy = get_cp_strategy()
-                        assert cp_strategy is not None
-                        cp_strategy.materialize_full_kv(
-                            forward_batch, layer, k, v, swa_loc=swa_loc
-                        )
-                    else:
-                        cp_allgather_and_save_kv_cache(
-                            forward_batch,
-                            layer,
-                            k,
-                            v,
-                            self.attn_cp_size,
-                            swa_loc=swa_loc,
-                        )
+                    cp_strategy = get_cp_strategy()
+                    assert cp_strategy is not None
+                    cp_strategy.materialize_full_kv(
+                        forward_batch, layer, k, v, swa_loc=swa_loc
+                    )
                 else:
                     k_scale = k_descale if self.kv_cache_is_mxfp8 else layer.k_scale
                     v_scale = v_descale if self.kv_cache_is_mxfp8 else layer.v_scale
@@ -1386,11 +1344,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
-            if (
-                forward_batch.forward_mode.is_context_parallel_extend()
-                and forward_batch.attn_cp_metadata is not None
-                and self.attn_cp_size > 1
-            ):
+            if cp_active:
 
                 def _fa_cp_attn(
                     q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp
@@ -1415,23 +1369,15 @@ class FlashAttentionBackend(AttentionBackend):
                     )
 
                 q_cp = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-                if is_cp_active(forward_batch):
-                    cp_strategy = get_cp_strategy()
-                    assert cp_strategy is not None
-                    result = cp_strategy.run_attention(
-                        q_cp,
-                        forward_batch,
-                        self.device,
-                        _fa_cp_attn,
-                        attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
-                    )
-                else:
-                    result = cp_attn_forward_extend(
-                        forward_batch,
-                        q_cp,
-                        self.device,
-                        _fa_cp_attn,
-                    )
+                cp_strategy = get_cp_strategy()
+                assert cp_strategy is not None
+                result = cp_strategy.run_attention(
+                    q_cp,
+                    forward_batch,
+                    self.device,
+                    _fa_cp_attn,
+                    attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
+                )
             elif self.fa_skip_kv_cache:
                 # Embedding mode: skip KV cache read and use raw K/V tensors
                 # directly via flash_attn_varlen_func. The KV cache write is
@@ -1636,17 +1582,16 @@ class FlashAttentionBackend(AttentionBackend):
                     q_nope = q_all[:, :, : layer.v_head_dim]
                     q_rope = q_all[:, :, layer.v_head_dim :]
 
-                if is_cp_mode:
+                if cp_active:
                     # MLA CP: q is rank-local zigzag-split; run the
                     # absorbed-MLA kernel twice (prev/next halves) against
-                    # the full latent KV pool (which rebuild_cp_kv_cache
-                    # populated upstream) via cp_attn_forward_extend.
+                    # the full latent KV pool through the selected strategy.
                     # Concat q_nope + q_rope along dim=-1 so the wrapper's
                     # chunk(2, dim=0) keeps their alignment; split back
                     # inside the closure.
                     assert (
                         not use_cascade_attn
-                    ), "Cascade attention under MLA CP is not supported in v1."
+                    ), "Cascade attention under MLA CP is not supported."
                     q_fused = torch.cat([q_nope, q_rope], dim=-1)
 
                     def _mla_cp_attn(
@@ -1678,20 +1623,15 @@ class FlashAttentionBackend(AttentionBackend):
                             ver=self.fa_impl_ver,
                         )
 
-                    if is_cp_active(forward_batch):
-                        cp_strategy = get_cp_strategy()
-                        assert cp_strategy is not None
-                        o = cp_strategy.run_attention(
-                            q_fused,
-                            forward_batch,
-                            self.device,
-                            _mla_cp_attn,
-                            attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
-                        )
-                    else:
-                        o = cp_attn_forward_extend(
-                            forward_batch, q_fused, self.device, _mla_cp_attn
-                        )
+                    cp_strategy = get_cp_strategy()
+                    assert cp_strategy is not None
+                    o = cp_strategy.run_attention(
+                        q_fused,
+                        forward_batch,
+                        self.device,
+                        _mla_cp_attn,
+                        attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
+                    )
                 else:
                     result = flash_attn_with_kvcache(
                         q=q_rope,
