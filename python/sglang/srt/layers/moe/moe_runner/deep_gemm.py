@@ -60,7 +60,7 @@ _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
-# Imported only for the SGLANG_OPT_FIX_MEGA_MOE_MEMORY=False fallback path.
+
 if not (_is_npu or _is_hip) and _is_cuda:
     from sglang.kernels.ops.activation.activation import (
         silu_and_mul as _legacy_silu_and_mul,
@@ -252,9 +252,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         assert self.config.activation in ("silu", "situ")
         assert self.config.is_gated
         self.swiglu_limit = self.config.swiglu_limit
-        self.use_swizzle = False
-        if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-            self.use_swizzle = True
+        self.use_swizzle = True
 
     def run(
         self,
@@ -392,7 +390,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     scale_ue8m0=False,
                 )
                 del down_input
-        elif envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        else:
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
 
             down_input_fp8 = torch.empty(
@@ -419,38 +417,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 swizzle=self.use_swizzle,
             )
             del gateup_output
-        else:
-            # Hacky byte-equal fallback that reproduces the optimize-branch
-            # code path exactly: bf16 silu_and_mul then a separate per-token
-            # group fp8 quant. Kept behind the mega-moe-memory flag.
-            from sglang.kernels.ops.quantization.fp8_kernel import (
-                sglang_per_token_group_quant_fp8,
-            )
-
-            if self.swiglu_limit is not None:
-                gateup_output = _apply_swiglu_limit(
-                    gateup_output, swiglu_limit=self.swiglu_limit
-                )
-
-            if not _is_musa:
-                down_input = torch.empty(
-                    (all_tokens, N // 2),
-                    device=gateup_output.device,
-                    dtype=torch.bfloat16,
-                )
-                _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
-            else:
-                down_input = _silu_and_mul_musa(gateup_output.view(-1, N))
-            del gateup_output
-
-            down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
-                down_input,
-                scale_block_size,
-                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            )
-            del down_input
 
         # Allocate the MoE output in the NCCL symmetric memory pool when symmetric
         # allocation is required, so the downstream all-reduce takes the low-latency

@@ -6828,10 +6828,6 @@ class ServerArgs:
             self.enforce_shared_experts_fusion = True
             logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
 
-        if a2a_backend == "megamoe":
-            if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
-                envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
-
         if a2a_backend == "deepep":
             if self.moe_runner_backend == "flashinfer_cutedsl":
                 if self.deepep_mode == "auto":
