@@ -477,36 +477,35 @@ class TestDSAIndexer(CustomTestCase):
             )
 
             actual_page_indices = out_page_indices[row]
-            valid = actual_page_indices >= 0
-            self.assertEqual(int(valid.sum().item()), expected_count)
-            expected_valid = torch.arange(topk, device=scores.device) < expected_count
-            self.assertTrue(torch.equal(valid, expected_valid))
-            self.assertTrue(torch.all(actual_page_indices[~valid] == -1))
+            actual_page_prefix = actual_page_indices[:expected_count]
             self.assertTrue(
                 torch.equal(
-                    torch.sort(actual_page_indices[valid]).values,
+                    torch.sort(actual_page_prefix).values,
                     torch.sort(expected_page_indices).values,
                 )
             )
 
+            # FlashMLA consumes only the selected prefix, except that it clamps a
+            # zero C4 length to one. In that case slot zero must remain an invalid
+            # index. The rest of the unused suffix is not model-visible and may be
+            # left unspecified by the top-k implementation.
+            if expected_count == 0:
+                self.assertLess(int(actual_page_indices[0].item()), 0)
+
             if out_raw_indices is not None:
                 actual_raw = out_raw_indices[row]
-                raw_valid = actual_raw >= 0
-                self.assertTrue(torch.equal(raw_valid, valid))
+                actual_raw_prefix = actual_raw[:expected_count]
                 self.assertTrue(
                     torch.equal(
-                        torch.sort(actual_raw[raw_valid]).values,
+                        torch.sort(actual_raw_prefix).values,
                         torch.sort(expected_raw).values,
                     )
                 )
                 translated_raw = (
-                    page_table[row, actual_raw[raw_valid].long() // page_size]
-                    * page_size
-                    + actual_raw[raw_valid] % page_size
+                    page_table[row, actual_raw_prefix.long() // page_size] * page_size
+                    + actual_raw_prefix % page_size
                 )
-                self.assertTrue(
-                    torch.equal(actual_page_indices[raw_valid], translated_raw)
-                )
+                self.assertTrue(torch.equal(actual_page_prefix, translated_raw))
 
     def test_dsv4_flashinfer_compact_topk_cuda_graph(self):
         num_rows, max_len, page_size = 4, 2048, 64
@@ -540,6 +539,8 @@ class TestDSAIndexer(CustomTestCase):
                         torch.empty_like(out_page_indices) if with_raw_output else None
                     )
 
+                    # Capture with every output slot valid so shrinking lengths on
+                    # replay leaves meaningful stale values in any unwritten suffix.
                     with (
                         envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.override(True),
                         envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("small"),
