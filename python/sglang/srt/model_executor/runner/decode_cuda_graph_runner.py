@@ -208,7 +208,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         speculative_num_draft_tokens: Optional[int] = None,
     ):
         super().__init__(model_runner)
-        self._war_read_done_node_planted = False
+        self.in_graph_metadata_prep_done = False
+
         # --- core state ------------------------------------------------
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
@@ -432,7 +433,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and torch.cuda.is_current_stream_capturing()
         ):
             self.model_runner.in_graph_metadata_prep_done.record()
-            self._war_read_done_node_planted = True
+            self.in_graph_metadata_prep_done = True
 
     def _war_read_done_record(self, attn_backend, forward_mode) -> SharedReadBoundary:
         """Where this replay records its WAR read-done event; UNKNOWN records
@@ -445,7 +446,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         boundary = attn_backend.shared_read_boundary(forward_mode)
         if (
             boundary is SharedReadBoundary.IN_REPLAY
-            and not self._war_read_done_node_planted
+            and not self.in_graph_metadata_prep_done
         ):
             # Non-capturing runs / no external-event support.
             return SharedReadBoundary.PRE_REPLAY

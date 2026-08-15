@@ -43,7 +43,7 @@ def _runner(*, target_verify_war: bool = False, planted: bool = False):
         war_read_done_event=None,
         war_fastpath_read_done_event=None,
     )
-    runner._war_read_done_node_planted = planted
+    runner.in_graph_metadata_prep_done = planted
     return runner
 
 
