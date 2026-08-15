@@ -303,13 +303,14 @@ multi-turn agents; set `--mm-preprocess-cache-size-mb 0` to disable it. The cach
 does not reserve HBM. Its separate embedding cache has a lazy 4 GiB per-GPU cap;
 set `SGLANG_VLM_CACHE_SIZE_MB=1024` for a lower-HBM profile or `0` to disable it.
 
-No client change is required. Clients that already hash immutable image bytes
-may attach `"content_hash": "sha256:<64-hex>"` inside each OpenAI `image_url`, or
-pass ordered `mm_content_hashes` through the Native Engine API. SGLang reads the
-image and verifies the hash by default. `--trust-mm-content-hashes` lets a hot
-hit skip that read, but a stale trusted hash can reuse the wrong image artifact
-and change the answer; enable it only when the caller owns immutable
-content-addressed media. Legacy `mm_hashes` is not a substitute.
+No client change is required, and most clients should omit the hash. Clients
+that already hash immutable image bytes may attach
+`"content_hash": "sha256:<64-hex>"` inside each OpenAI `image_url`, or pass
+ordered `mm_content_hashes` through the Native Engine API. SGLang reads the
+image and verifies the hash by default. `--trust-mm-content-hashes` only saves
+that read on a hot hit; a stale trusted hash can reuse the wrong image artifact
+and change the answer. Enable it only for immutable content-addressed media.
+Legacy `mm_hashes` is not a substitute.
 
 In EPD, add `--enable-prefix-mm-cache` to the encoder role for complete local
 reuse; `--enable-mm-global-cache` optionally shares embeddings through Mooncake.
