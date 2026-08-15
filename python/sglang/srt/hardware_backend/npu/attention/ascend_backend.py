@@ -1558,7 +1558,9 @@ class AscendAttnBackend(AttentionBackend):
                             (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
                         )
                     else:
-                        attn_output = torch.empty_like(q)
+                        attn_output = torch.empty_like(
+                            q, memory_format=torch.contiguous_format
+                        )
 
                     use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -2717,7 +2719,9 @@ class AscendAttnBackend(AttentionBackend):
                         (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
                     )
                 else:
-                    attn_output = torch.empty_like(q)
+                    attn_output = torch.empty_like(
+                        q, memory_format=torch.contiguous_format
+                    )
 
                 use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
