@@ -861,6 +861,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 len(gen_layers),
                 compile_kwargs,
             )
+            transformer._gen_layers_torch_compiled = True
             for i, layer in enumerate(gen_layers):
                 gen_layers[i] = torch.compile(layer, **compile_kwargs)
         else:
