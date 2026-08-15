@@ -44,6 +44,88 @@ except (AttributeError, ValueError):
 _is_triton_ge_37 = _triton_version_parts >= (3, 7)
 
 
+def _custom_mask_dense_attention_fwd(
+    q_extend: torch.Tensor,
+    k_extend: torch.Tensor,
+    v_extend: torch.Tensor,
+    o_extend: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    custom_mask: torch.Tensor,
+    mask_indptr: torch.Tensor,
+    k_scale: float,
+    v_scale: float,
+    sm_scale: float,
+) -> None:
+    """Exact short custom-mask path with an optional small cached prefix."""
+
+    batch_size = qo_indptr.shape[0] - 1
+    kv_group_num = q_extend.shape[1] // k_extend.shape[1]
+    for request_index in range(batch_size):
+        query_start = int(qo_indptr[request_index].item())
+        query_end = int(qo_indptr[request_index + 1].item())
+        query_len = query_end - query_start
+        if query_len == 0:
+            continue
+
+        prefix_start = int(kv_indptr[request_index].item())
+        prefix_end = int(kv_indptr[request_index + 1].item())
+        prefix_locations = kv_indices[prefix_start:prefix_end]
+        prefix_len = prefix_end - prefix_start
+
+        mask_start = int(mask_indptr[request_index].item())
+        mask_end = int(mask_indptr[request_index + 1].item())
+        expected_mask_len = query_len * (prefix_len + query_len)
+        if mask_end - mask_start != expected_mask_len:
+            raise RuntimeError(
+                "Dense custom-mask attention received an incompatible mask: "
+                f"mask_len={mask_end - mask_start}, query_len={query_len}, "
+                f"prefix_len={prefix_len}"
+            )
+
+        query = q_extend[query_start:query_end]
+        current_key = k_extend[query_start:query_end]
+        current_value = v_extend[query_start:query_end]
+        if prefix_len:
+            prefix_key = k_buffer[prefix_locations]
+            prefix_value = v_buffer[prefix_locations]
+            key = torch.cat([prefix_key, current_key], dim=0)
+            value = torch.cat([prefix_value, current_value], dim=0)
+        else:
+            key = current_key
+            value = current_value
+        if kv_group_num != 1:
+            key = key.repeat_interleave(kv_group_num, dim=1)
+            value = value.repeat_interleave(kv_group_num, dim=1)
+
+        allowed = custom_mask[mask_start:mask_end].reshape(
+            query_len,
+            prefix_len + query_len,
+        )
+        scores = torch.einsum(
+            "qhd,khd->hqk",
+            query.float(),
+            key.float(),
+        )
+        scores.mul_(float(sm_scale) * float(k_scale))
+        scores.masked_fill_(
+            ~allowed.bool().unsqueeze(0),
+            torch.finfo(scores.dtype).min,
+        )
+        probabilities = torch.softmax(scores, dim=-1).to(value.dtype)
+        output = torch.einsum(
+            "hqk,khd->qhd",
+            probabilities,
+            value,
+        )
+        if float(v_scale) != 1.0:
+            output = output * float(v_scale)
+        o_extend[query_start:query_end].copy_(output.to(o_extend.dtype))
+
+
 def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
     """
     Get block sizes and configuration for extend attention kernels.
@@ -600,9 +682,11 @@ def _fwd_kernel(
 
     # stage 2: compute the triangle part
 
+    # A custom mask is the complete row policy and may permit later current-chunk
+    # keys (for example, bidirectional image spans).
     cur_block_m_end = (
         cur_seq_len_extend
-        if not IS_CAUSAL
+        if USE_CUSTOM_MASK or not IS_CAUSAL
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
     extend_end = 0 if SKIP_EXTEND else cur_block_m_end
@@ -793,19 +877,61 @@ def extend_attention_fwd(
     ``score_mod`` / ``aux_tensors`` add a custom term to the attention logits;
     see triton_ops/score_mod.py for the contract.
     """
-    Lq, Lk, Lv = (
+    Lq, _, Lv = (
         q_extend.shape[-1],
         k_extend.shape[-1],
         v_extend.shape[-1],
     )
+    sm_scale = sm_scale or 1.0 / (Lq**0.5)
+    batch_size = qo_indptr.shape[0] - 1
+
+    if (
+        custom_mask is not None
+        and mask_indptr is not None
+        and max_len_extend <= 512
+        and kv_indices.numel() <= batch_size * 512
+        and custom_mask.numel() <= batch_size * 512 * 512
+        and q_extend.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and k_extend.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and v_extend.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and k_buffer.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and v_buffer.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and not skip_prefix
+        and not skip_extend
+        and lse_extend is None
+        and sinks is None
+        and score_mod is None
+        and aux_tensors is None
+        and sliding_window_size == -1
+        and logit_cap == 0.0
+        and xai_temperature_len <= 0
+        and page_size == 1
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        _custom_mask_dense_attention_fwd(
+            q_extend=q_extend,
+            k_extend=k_extend,
+            v_extend=v_extend,
+            o_extend=o_extend,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            custom_mask=custom_mask,
+            mask_indptr=mask_indptr,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            sm_scale=sm_scale,
+        )
+        return
 
     # Get block sizes and configuration
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
 
-    sm_scale = sm_scale or 1.0 / (Lq**0.5)
-    batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
+    head_num = q_extend.shape[1]
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
     USE_CUSTOM_MASK = custom_mask is not None

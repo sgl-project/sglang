@@ -1,17 +1,75 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import os
+import sys
 from pathlib import Path
 
+import pytest
 from sglang.srt.configs.neo_chat import NEOChatConfig
 from sglang.srt.models.neo_chat import _stacked_weight_target
 from transformers import AutoConfig
 
-MODEL_PATH = Path("/mnt/afs/fanyijiat/models/SenseNova-U1-8B-MoT-Interleaved-bd39")
+_MODEL_PATH_VALUE = os.environ.get("SENSENOVA_U1_MODEL_PATH")
+MODEL_PATH = Path(_MODEL_PATH_VALUE) if _MODEL_PATH_VALUE else None
 
 
-def test_neo_chat_config_loads_without_remote_code() -> None:
-    config = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=False)
+def test_neo_chat_import_does_not_load_official_modeling() -> None:
+    blocked = sorted(
+        name
+        for name in sys.modules
+        if name.startswith("sensenova_u1.") and ".modeling" in name
+    )
+
+    assert blocked == []
+
+
+def test_neo_chat_config_loads_without_remote_code(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "architectures": ["NEOChatModel"],
+                "auto_map": {
+                    "AutoConfig": "configuration_neo_chat.NEOChatConfig",
+                },
+                "model_type": "neo_chat",
+                "llm_config": {
+                    "attention_bias": False,
+                    "head_dim": 128,
+                    "hidden_size": 4096,
+                    "intermediate_size": 12288,
+                    "max_position_embeddings": 262144,
+                    "max_position_embeddings_hw": 10000,
+                    "num_attention_heads": 32,
+                    "num_hidden_layers": 42,
+                    "num_key_value_heads": 8,
+                    "rms_norm_eps": 1e-6,
+                    "rope_theta": 5000000,
+                    "rope_theta_hw": 10000,
+                    "vocab_size": 151936,
+                },
+                "vision_config": {
+                    "auto_map": {
+                        "AutoConfig": "configuration_neo_vit.NEOVisionConfig",
+                    },
+                    "downsample_ratio": 0.5,
+                    "hidden_size": 1024,
+                    "llm_hidden_size": 4096,
+                    "max_position_embeddings_vision": 10000,
+                    "num_channels": 3,
+                    "patch_size": 16,
+                    "rope_theta_vision": 10000,
+                },
+                "patch_size": 16,
+                "downsample_ratio": 0.5,
+                "template": "neo1_0",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = AutoConfig.from_pretrained(tmp_path, trust_remote_code=False)
 
     assert isinstance(config, NEOChatConfig)
     assert config.architectures == ["NEOChatModel"]
@@ -45,7 +103,12 @@ def test_neo_chat_qkv_weight_targets_cover_both_towers() -> None:
         assert _stacked_weight_target(source) == expected
 
 
+@pytest.mark.skipif(
+    MODEL_PATH is None or not (MODEL_PATH / "model.safetensors.index.json").exists(),
+    reason="SENSENOVA_U1_MODEL_PATH must point to a local checkpoint",
+)
 def test_neo_chat_checkpoint_language_weight_inventory() -> None:
+    assert MODEL_PATH is not None
     index = json.loads(
         (MODEL_PATH / "model.safetensors.index.json").read_text(encoding="utf-8")
     )
