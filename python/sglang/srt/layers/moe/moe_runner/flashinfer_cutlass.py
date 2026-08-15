@@ -65,8 +65,9 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
 class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     """Quantization payload for CUTLASS MXFP4 MoE.
 
-    SM90 consumes W4A16-interleaved weights and scales. SM120 consumes packed
-    MXFP4 weights and block-interleaved scales with MXFP8 activations.
+    SM90 consumes either W4A16-interleaved weights/scales or the Humming-style
+    W4A8 layouts. SM120 consumes packed MXFP4 weights and block-interleaved
+    scales with MXFP8 activations.
     """
 
     # SM90 weights are interleaved; SM120 weights remain checkpoint-packed.
@@ -79,6 +80,13 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
 
     # A non-None global scale selects the SM120 MXFP8 activation path.
     mxfp4_weight_global_scale: Optional[torch.Tensor] = None
+
+    # A complete non-None triplet selects the SM90 Humming W4A8 path. The
+    # residuals are FP32 [num_local_experts] and already include the fixed 2^6
+    # compensation required by FlashInfer's epilogue.
+    w13_humming_residual_scale: Optional[torch.Tensor] = None
+    w2_humming_residual_scale: Optional[torch.Tensor] = None
+    humming_fc2_act_scale: Optional[torch.Tensor] = None
 
     # Per-expert bias. GPT-OSS has both; DSv4 leaves both None.
     w13_bias: Optional[torch.Tensor] = None  # bf16 [E, 2*N]
@@ -340,6 +348,22 @@ def fused_experts_none_to_flashinfer_mxfp4(
 
     weight_global_scale = quant_info.mxfp4_weight_global_scale
     use_mxfp8_act_scaling = weight_global_scale is not None
+    w13_humming_residual_scale = quant_info.w13_humming_residual_scale
+    w2_humming_residual_scale = quant_info.w2_humming_residual_scale
+    humming_fc2_act_scale = quant_info.humming_fc2_act_scale
+    humming_scales = (
+        w13_humming_residual_scale,
+        w2_humming_residual_scale,
+        humming_fc2_act_scale,
+    )
+    use_wfp4afp8_humming = any(scale is not None for scale in humming_scales)
+    if use_wfp4afp8_humming and not all(scale is not None for scale in humming_scales):
+        raise ValueError(
+            "SM90 Humming MXFP4 MoE requires both expert residual scales "
+            "and the FC2 activation scale."
+        )
+    if use_wfp4afp8_humming and use_mxfp8_act_scaling:
+        raise ValueError("SM90 Humming and SM120 MXFP8 scaling are mutually exclusive.")
     input_sf = None
     fc1_expert_weights = quant_info.w13_weight
     fc2_expert_weights = quant_info.w2_weight
@@ -359,6 +383,17 @@ def fused_experts_none_to_flashinfer_mxfp4(
             quant_info.w2_weight_scale.view(torch.int32),
             weight_global_scale,
         ]
+    elif use_wfp4afp8_humming:
+        assert w13_humming_residual_scale is not None
+        assert w2_humming_residual_scale is not None
+        assert humming_fc2_act_scale is not None
+        quant_scales = [
+            quant_info.w13_weight_scale.view(torch.int32),
+            w13_humming_residual_scale,
+            humming_fc2_act_scale,
+            quant_info.w2_weight_scale.view(torch.int32),
+            w2_humming_residual_scale,
+        ]
     else:
         quant_scales = [
             quant_info.w13_weight_scale.view(torch.int32),
@@ -367,6 +402,10 @@ def fused_experts_none_to_flashinfer_mxfp4(
 
     out_hidden = padded_hidden if do_pad else origin_hidden
     output_dtype = torch.bfloat16
+    # FlashInfer 0.6.17 intentionally reverted the Humming API. Do not pass the
+    # new keyword at all on the existing W4A16/MXFP8 paths, so those paths keep
+    # working with SGLang's currently pinned release.
+    humming_kwargs = {"use_wfp4afp8_humming": True} if use_wfp4afp8_humming else {}
     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
         out = torch.empty(x.shape[0], out_hidden, dtype=output_dtype, device=x.device)
 
@@ -398,6 +437,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
         tune_max_num_tokens=next_power_of_2(x.shape[0]),
         output=out,
         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+        **humming_kwargs,
     )
 
     if do_pad:
