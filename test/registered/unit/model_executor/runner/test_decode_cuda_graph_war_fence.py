@@ -41,8 +41,8 @@ def _runner(*, target_verify_war: bool = False, planted: bool = False):
         device_timer=None,
         is_draft_worker=False,
         war_fastpath_read_done_event=None,
-        in_graph_metadata_prep_done=object() if planted else None,
     )
+    runner.in_graph_metadata_prep_done = object() if planted else None
     return runner
 
 
@@ -81,7 +81,7 @@ def test_war_read_done_record():
 def test_publish_war_read_done():
     runner = _runner()
     graph_event = object()
-    runner.model_runner.in_graph_metadata_prep_done = graph_event
+    runner.in_graph_metadata_prep_done = graph_event
     runner._publish_read_done(in_graph=True)
     assert runner.model_runner.war_fastpath_read_done_event is graph_event
 
@@ -120,7 +120,7 @@ def _execute_harness(runner, calls, mode=ForwardMode.DECODE):
 def test_execute_publishes_the_planted_graph_event():
     runner = _runner(planted=True)
     graph_event = object()
-    runner.model_runner.in_graph_metadata_prep_done = graph_event
+    runner.in_graph_metadata_prep_done = graph_event
     runner.attn_backend = _attn_backend()
     runner.device_module = SimpleNamespace(
         Event=lambda: (_ for _ in ()).throw(
@@ -159,7 +159,7 @@ def test_execute_records_pre_replay_for_snapshot_backends():
 def test_target_verify_requires_war_capability(supported):
     runner = _runner(target_verify_war=supported, planted=True)
     graph_event = object()
-    runner.model_runner.in_graph_metadata_prep_done = graph_event
+    runner.in_graph_metadata_prep_done = graph_event
     runner.attn_backend = _attn_backend()
     runner.device_module = SimpleNamespace(Event=lambda: None)
 

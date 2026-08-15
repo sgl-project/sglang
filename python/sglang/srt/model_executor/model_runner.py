@@ -405,9 +405,6 @@ class ModelRunner:
         # instead of the whole-forward wait_stream. None -> whole-forward fallback.
         self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
 
-        # In-graph metadata prep: shared buffers -> in-graph private data
-        self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
-
         # CPU offload
         set_offloader(
             create_offloader_from_server_args(server_args, dp_rank=self.ps.dp_rank)

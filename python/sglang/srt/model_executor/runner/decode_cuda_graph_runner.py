@@ -210,6 +210,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     ):
         super().__init__(model_runner)
 
+        # In-graph metadata prep: shared buffers -> in-graph private data
+        self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
+
         # --- core state ------------------------------------------------
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
@@ -431,11 +434,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if not torch.cuda.is_current_stream_capturing():
             # Warmup runs share this body; only a capturing run plants a node.
             return
-        if self.model_runner.in_graph_metadata_prep_done is None:
-            self.model_runner.in_graph_metadata_prep_done = make_external_event(
-                self.device_module
-            )
-        event = self.model_runner.in_graph_metadata_prep_done
+        if self.in_graph_metadata_prep_done is None:
+            self.in_graph_metadata_prep_done = make_external_event(self.device_module)
+        event = self.in_graph_metadata_prep_done
         if event is not None:
             # None here means no external-event support; stays None so the
             # boundary resolution below never hands out an unrecorded event.
@@ -453,7 +454,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if (
             boundary is SharedReadBoundary.IN_REPLAY
-            and self.model_runner.in_graph_metadata_prep_done is None
+            and self.in_graph_metadata_prep_done is None
         ):
             # Non-capturing runs / no external-event support.
             return SharedReadBoundary.PRE_REPLAY
@@ -464,7 +465,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # all reads end exactly after in-graph metadata prep done,
             # then wire the internal event to read done event.
             self.model_runner.war_fastpath_read_done_event = (
-                self.model_runner.in_graph_metadata_prep_done
+                self.in_graph_metadata_prep_done
             )
         else:
             # Happens out side of graph replay
