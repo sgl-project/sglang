@@ -401,6 +401,7 @@ class _FakeResolvedArgs:
     max_running_requests: A[int | None, Arg(help="mrr"), NS("schedule")] = None
     chunked_prefill_size: A[int, Arg(help="cps"), NS("schedule")] = -1
     max_prefill_tokens: A[int, Arg(help="mpt"), NS("schedule")] = 16384
+    enable_dynamic_chunking: A[bool, Arg(help="edc"), NS("schedule")] = False
     cuda_graph_config: A[object | None, Arg(help="cgc"), NS("exec.graph")] = None
     tp_size: A[int, Arg(help="tp"), NS("parallel")] = 1
     pp_size: A[int, Arg(help="pp"), NS("parallel")] = 1
@@ -1025,6 +1026,31 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
                         ServerArgs.enable_mamba_extra_buffer_lazy(args),
                         mamba_extra_buffer_lazy_enabled(),
                     )
+
+    def test_prefill_buffer_ceiling_matches_the_member(self):
+        from sglang.srt.runtime_context import max_prefill_buffer_tokens
+
+        for chunked in (-1, 0, 1024, 8192):
+            for dynamic in (False, True):
+                for pp in (1, 4):
+                    for max_prefill in (0, 2048, 16384):
+                        with self.subTest(
+                            chunked=chunked,
+                            dynamic=dynamic,
+                            pp=pp,
+                            max_prefill=max_prefill,
+                        ):
+                            args = _FakeResolvedArgs(
+                                chunked_prefill_size=chunked,
+                                enable_dynamic_chunking=dynamic,
+                                pp_size=pp,
+                                max_prefill_tokens=max_prefill,
+                            )
+                            get_context().set_server_args(args)
+                            self.assertEqual(
+                                ServerArgs.max_prefill_buffer_tokens(args),
+                                max_prefill_buffer_tokens(),
+                            )
 
     def test_activation_reserve_matches_the_member(self):
         from types import SimpleNamespace
