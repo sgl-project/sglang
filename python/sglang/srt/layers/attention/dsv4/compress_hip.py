@@ -12,9 +12,6 @@ from sglang.kernels.ops.attention.deepseek_v4_rope import (
     fused_norm_rope_inplace_triton,
     fused_softmax_pool_triton,
 )
-from sglang.kernels.ops.attention.dsv4.fused_compress_triton import (
-    fused_ape_pool_norm_rope,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
 from sglang.srt.layers.attention.dsv4.compressor import Compressor as _CompressorBase
@@ -66,14 +63,6 @@ class CompressorHip(_CompressorBase):
     @cached_property
     def use_hip_fused_compress(self) -> bool:
         return envs.SGLANG_OPT_USE_FUSED_COMPRESS.get()
-
-    @cached_property
-    def use_fused_compress_triton(self) -> bool:
-        # The fused Triton kernel only benefits non-overlap (HCA, ratio=128)
-        # but HCA's K=128 loop is too sequential to outperform batched ops.
-        # CSA (overlap=True) has a reshape/overlap-transform semantic mismatch.
-        # Disabled until a tiled kernel for CSA overlap is implemented.
-        return False
 
     def _get_states(
         self,
@@ -342,34 +331,6 @@ class CompressorHip(_CompressorBase):
             compress_indices_state.view(-1)
         ).view(-1, self.ratio, self.coff * self.head_dim)
         bs = seq_lens.size(0)
-
-        if self.use_fused_compress_triton and not self.overlap:
-            # Fused path for non-overlap (HCA, ratio=128, coff=1):
-            # APE + softmax-pool + norm + RoPE in one kernel.
-            # Overlap (CSA) is excluded because the overlap_transform_decode
-            # rearranges A/B halves across the coff dimension in a way
-            # that simple reshape cannot replicate correctly.
-            raw = kv_and_score_to_compress.kv_score
-            gathered = raw.reshape(bs, self.ratio, raw.shape[-1]).contiguous()
-
-            comp_positions = (seq_lens - 1) // self.ratio * self.ratio
-            freqs_real_table = self._get_freqs_cis_real()
-            freqs_batch = freqs_real_table[comp_positions]
-
-            kv_compressed = fused_ape_pool_norm_rope(
-                kv_score_gathered=gathered,
-                ape=self.ape,
-                rms_weight=self.norm.weight,
-                rms_eps=self.norm.eps,
-                freqs_cis_real=freqs_batch,
-                head_dim=self.head_dim,
-                rope_head_dim=self.rope_head_dim,
-                ratio=self.ratio,
-                overlap=self.overlap,
-            )
-            if self.rotate:
-                kv_compressed = rotate_activation(kv_compressed)
-            return kv_compressed
 
         # Unfused reference path
         kv_and_score_to_compress.score.add_(self.ape.unsqueeze(0))
