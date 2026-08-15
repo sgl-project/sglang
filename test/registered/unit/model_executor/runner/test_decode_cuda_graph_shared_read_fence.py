@@ -25,7 +25,7 @@ class _SpecAlgorithm:
 
 def _attn_backend(boundary=SharedReadEnds.IN_REPLAY):
     """Backend stub declaring one fixed read-end boundary for every mode."""
-    return SimpleNamespace(shared_read_boundary=lambda _forward_mode: boundary)
+    return SimpleNamespace(shared_read_ends=lambda _forward_mode: boundary)
 
 
 def _runner(*, target_verify_war: bool = False, has_marker: bool = False):

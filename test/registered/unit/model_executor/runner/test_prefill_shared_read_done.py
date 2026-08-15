@@ -26,7 +26,7 @@ def _model_runner(*, spec_algorithm=SpeculativeAlgorithm.NONE, compliant=True):
     boundary = SharedReadEnds.PRE_REPLAY if compliant else SharedReadEnds.UNKNOWN
     return SimpleNamespace(
         spec_algorithm=spec_algorithm,
-        attn_backend=SimpleNamespace(shared_read_boundary=lambda mode: boundary),
+        attn_backend=SimpleNamespace(shared_read_ends=lambda mode: boundary),
         shared_read_done_event=None,
     )
 

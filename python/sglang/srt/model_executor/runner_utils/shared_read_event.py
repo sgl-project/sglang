@@ -36,9 +36,7 @@ def maybe_publish_prefill_shared_read_done(
     if not model_runner.spec_algorithm.is_none():
         return
     # The record lands right after replay prep, so PRE_REPLAY only.
-    boundary = model_runner.attn_backend.shared_read_boundary(
-        forward_batch.forward_mode
-    )
+    boundary = model_runner.attn_backend.shared_read_ends(forward_batch.forward_mode)
     if boundary is not SharedReadEnds.PRE_REPLAY:
         return
     logger.info_once(

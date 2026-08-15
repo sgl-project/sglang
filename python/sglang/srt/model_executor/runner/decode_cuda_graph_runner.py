@@ -456,7 +456,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 return SharedReadEnds.UNKNOWN
         elif not forward_mode.is_decode():
             return SharedReadEnds.UNKNOWN
-        boundary = attn_backend.shared_read_boundary(forward_mode)
+        boundary = attn_backend.shared_read_ends(forward_mode)
 
         if (
             boundary is SharedReadEnds.IN_REPLAY
