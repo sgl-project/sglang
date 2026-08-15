@@ -96,6 +96,36 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ):
         raise NotImplementedError
 
+    def padded_intermediate_size(self, intermediate_size_per_partition: int) -> int:
+        """Per-partition intermediate size this method allocates for, after any
+        backend-specific alignment padding.
+
+        Must be a pure function of the argument, so a caller can ask what the
+        method *would* allocate for a different partitioning than the one it was
+        created with. ``load_tp_by_experts`` relies on that: it builds weights
+        under an EP-shaped partitioning and then has to know the TP-shaped
+        target width, which is not recoverable by dividing (``round_up`` does
+        not commute with division).
+
+        Default is no padding; override alongside any padding done in
+        ``create_weights``, and have ``create_weights`` call this so the two
+        cannot drift.
+        """
+        return intermediate_size_per_partition
+
+    def rebind_partition_dims(
+        self, *, num_experts: int, intermediate_size_per_partition: int
+    ) -> None:
+        """Re-point dimensions captured during ``create_weights`` at a new
+        partitioning of the same layer.
+
+        Needed when weights are materialized under one partitioning and then
+        redistributed to another (``load_tp_by_experts``). Default is a no-op —
+        only override if ``create_weights`` stored dimensions on ``self``;
+        methods that read them off the layer need nothing here.
+        """
+        return None
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):

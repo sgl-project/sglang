@@ -25,6 +25,9 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.moe.ep_to_tp_transform import (
+    maybe_ep_to_tp_transform_all_layers,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -436,6 +439,8 @@ class DeepseekV2WeightLoaderMixin:
                 future.result()
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+
+        maybe_ep_to_tp_transform_all_layers(self.model)
 
     def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:
         """

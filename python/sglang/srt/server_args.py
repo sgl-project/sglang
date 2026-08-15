@@ -5191,6 +5191,22 @@ class ServerArgs:
                 "(DeepSeek Sparse Attention) models."
             )
 
+        # load_tp_by_experts requires load_weights() to call
+        # maybe_ep_to_tp_transform_all_layers() after loading. Fail early if the
+        # architecture doesn't use one of those code paths.
+        extra_config = json.loads(self.model_loader_extra_config)
+        if extra_config.get("load_tp_by_experts", False):
+            from sglang.srt.layers.moe.ep_to_tp_transform import (
+                EP_TO_TP_SUPPORTED_ARCHS,
+            )
+
+            assert model_arch in EP_TO_TP_SUPPORTED_ARCHS, (
+                f"load_tp_by_experts is only supported for models whose "
+                f"load_weights() drives the EP-to-TP transform "
+                f"({sorted(EP_TO_TP_SUPPORTED_ARCHS)}), "
+                f"but got architecture {model_arch!r}"
+            )
+
         if self.enable_cp_decode_attn_tp:
             from sglang.srt.layers.cp.cp_decode_attn_tp import (
                 CP_DECODE_ATTN_TP_SUPPORTED_ARCHS,
