@@ -455,7 +455,7 @@ bash sglang_start.sh \
 
 ### 8.6 待实施优化：Python 代理网关（预期收益）
 
-> 现状：生产**未开代理**（`sglang_start.sh` 默认 `PROXY_PORT=0`）。脚本已内置 `--proxy-port 8080` 拉起 [sglang_proxy.py](appendix/sglang_proxy.py)（限并发 + 注入 priority + 429 兜底），无需改客户端。
+> 现状：生产**未开代理**（`sglang_start.sh` 默认 `PROXY_PORT=0`）。脚本已内置 `--proxy-port 8080` 拉起 [sglang_proxy.py](appendix/sglang_proxy.py)（限并发 + 注入 priority + 429 兜底），客户端只需把端口从 8000 改到 8080。启用操作手册见 8.7。
 
 **收益不在总量，在混合流量下的分配**。当前稳态已不错（TTFT 5.69s / abort 1.56%），代理预期带来三块收益：
 
@@ -485,3 +485,53 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 - 对比两个数：tool call 排队（`num_queue_reqs{priority="10"}`）是否下降、高峰 abort；
 - 若 tool call 占比确实大，1~2 天内可见排队与 TTFT 改善；无改善再调 thinking 上限；
 - 附录 D 11.9 有完整机制说明（限并发语义、热调、K8s 外部访问），附录 G 有监控方法。
+
+### 8.7 代理启用操作手册（灰度切换清单）
+
+#### 前置条件（已具备，无需改动）
+
+- 服务端 priority 调度脚本默认开：`--enable-priority-scheduling --default-priority-value 0` + `--schedule-policy priority`（`sglang_start.sh:163-164`）；
+- 代理随 `--proxy-port 8080` 拉起，会等 server 健康后启动并自检告警；kill 残留进程的正则已覆盖 `sglang_proxy.py`。
+
+#### 切换步骤
+
+```bash
+# 1. 服务端：仅加 --proxy-port，其余参数不变
+bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
+    --port 8000 --proxy-port 8080
+#    限流默认 tool_call=16 / thinking=12，
+#    可用 --proxy-tool-call-limit / --proxy-thinking-limit 覆盖
+
+# 2. 验证代理就绪与限流值
+curl -sf localhost:8080/health
+curl -s localhost:8080/admin/limits        # 期望 {"limits": {"tool_call": 16, "thinking": 12}}
+
+# 3. 灰度：先切一个低流量调用方到 8080，观察 1~2 天，再全量
+```
+
+#### 必须提前知道的四个行为
+
+| 事项 | 说明 | 对策 |
+|------|------|------|
+| **429 是预期行为** | 限流命中时请求排队等槽位，10s 拿不到直接 429（body 含 `concurrency_limit` 标识） | 提前告知调用方：429 ≠ 故障，客户端需重试退避；无重试能力的调用方最后切 |
+| **灰度期直连 8000 的请求会被插队** | 服务端 `--default-priority-value 0`，绕过代理的直连请求 priority=0，低于代理注入的 tool_call(priority=10) | 新旧端口混跑期间，长请求延迟分布会变化属预期；尽快收敛到全量 8080 |
+| **`/v1/messages`（Anthropic 协议）无 priority 注入** | 该协议无 priority 字段，此入口只享分类限流、不享插队 | 走 Anthropic 入口的调用方如对 TTFT 敏感，需知悉该限制 |
+| **第 7 卡长上下文实例禁止挂代理** | 代理 10s 超时与分钟级 prefill 天然冲突 | 长上下文实例客户端直连，见 qwen38-migration 附录第 6 节约束② |
+
+#### 运行期操作
+
+```bash
+# 热调限流（无需重启；在途请求不受影响）
+curl -X POST localhost:8080/admin/limits -H 'Content-Type: application/json' \
+    -d '{"tool_call": 12, "thinking": 16}'
+```
+
+#### 验证指标（对照 8.6 预期收益）
+
+- tool call 排队：`num_queue_reqs{priority="10"}` 应较切换前下降；
+- 高峰 abort 率方差应收窄（均值未必大降）；
+- 代理侧 429 次数：偶发为正常削峰，持续高 = 限流值过紧或容量不足，先调 `/admin/limits` 再考虑扩容。
+
+#### 变更顺序约束
+
+按"一次只动一个变量"原则，三个变更**不要合并**：先上代理跑稳（本节约 1~2 天灰度）→ 再开 `--adaptive-limit` 自适应调流 → 最后切 Qwen3.8-27B。合并变更出问题无法归因。
