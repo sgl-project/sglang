@@ -2396,8 +2396,10 @@ class ServerArgs:
         NS("exec.moe"),
     ] = "auto"
     flashinfer_mxfp4_moe_precision: A[
-        Literal["default", "bf16"],
-        "Choose the computation precision of flashinfer mxfp4 moe",
+        Literal["default", "bf16", "fp8"],
+        "Choose the computation precision of flashinfer mxfp4 moe. "
+        "On SM90, `fp8` selects the Humming-style MXFP4-weight x FP8-activation "
+        "path introduced by FlashInfer #3738 and requires FlashInfer >= 0.6.18.",
         NS("exec.moe"),
     ] = "default"
     deepep_mode: A[

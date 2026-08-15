@@ -83,6 +83,7 @@ def test_cutlass_adapter_import_does_not_require_flashinfer(monkeypatch):
 
 def test_dsv4_sm120_load_contract(monkeypatch):
     import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as adapter_module
+    from sglang.srt.runtime_context import get_context
 
     monkeypatch.setattr(adapter_module, "is_sm120_supported", lambda: True)
 
@@ -92,7 +93,8 @@ def test_dsv4_sm120_load_contract(monkeypatch):
         def create_weights(self, *args, **kwargs):
             captured.update(kwargs)
 
-    method = adapter_module.Mxfp4FlashinferCutlassMoEMethod(_Fp8Method(), "test")
+    with get_context().override_server_args(flashinfer_mxfp4_moe_precision="default"):
+        method = adapter_module.Mxfp4FlashinferCutlassMoEMethod(_Fp8Method(), "test")
     method.create_weights(
         SimpleNamespace(),
         num_experts=4,
@@ -123,6 +125,7 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
         Mxfp4FlashinferCutlassMoEMethod,
     )
+    from sglang.srt.runtime_context import get_context
 
     monkeypatch.setattr(
         runner_module, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
@@ -152,9 +155,10 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
         moe_ep_rank=0,
     )
 
-    method = Mxfp4FlashinferCutlassMoEMethod(
-        SimpleNamespace(process_weights_after_loading=lambda layer: None), "test"
-    )
+    with get_context().override_server_args(flashinfer_mxfp4_moe_precision="default"):
+        method = Mxfp4FlashinferCutlassMoEMethod(
+            SimpleNamespace(process_weights_after_loading=lambda layer: None), "test"
+        )
     config = MoeRunnerConfig(
         num_experts=num_experts,
         num_local_experts=num_experts,

@@ -53,6 +53,11 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
+        if self.flashinfer_mxfp4_moe_precision == "fp8":
+            raise ValueError(
+                "flashinfer_mxfp4_moe_precision=fp8 selects the SM90 Humming "
+                "path; use `default` for the SM100 MXFP8 path."
+            )
 
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config

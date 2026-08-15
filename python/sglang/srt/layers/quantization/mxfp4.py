@@ -22,6 +22,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+from packaging.version import InvalidVersion, Version
 from torch.nn.parameter import Parameter
 
 # Silence the TRT-LLM cutlass autotune trace embedded inside FlashInfer's
@@ -98,8 +99,27 @@ if is_flashinfer_available():
         interleave_moe_scales_for_sm90_mixed_gemm = None
         interleave_moe_weights_for_sm90_mixed_gemm = None
         _FI_HAS_SM90_CUTLASS_MXFP4 = False
+
+    # FlashInfer #3738 originally exposed routed-row residual scales. #4431
+    # changed the contract to per-local-expert scales so downstream runtimes do
+    # not duplicate FlashInfer's expert permutation on every forward. The old
+    # implementation shipped briefly in 0.6.16 and was reverted from 0.6.17;
+    # only enable the corrected ABI starting with the 0.6.18 release line.
+    try:
+        from flashinfer import __version__ as _flashinfer_version
+        from flashinfer import fused_moe as _flashinfer_fused_moe
+
+        _fi_release = Version(_flashinfer_version).release
+        _fi_release = _fi_release + (0,) * (3 - len(_fi_release))
+        _FI_HAS_SM90_CUTLASS_MXFP4_FP8 = _fi_release[:3] >= (0, 6, 18) and hasattr(
+            _flashinfer_fused_moe,
+            "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
+        )
+    except (ImportError, InvalidVersion):
+        _FI_HAS_SM90_CUTLASS_MXFP4_FP8 = False
 else:
     _FI_HAS_SM90_CUTLASS_MXFP4 = False
+    _FI_HAS_SM90_CUTLASS_MXFP4_FP8 = False
 
 _flashinfer_mxfp4_permute_indices_cache: dict[torch.Size, torch.Tensor] = {}
 _flashinfer_mxfp4_permute_indices_device_cache: dict[
@@ -349,17 +369,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
+        self._use_sm90_humming = False
         # When `flashinfer_mxfp4` is enabled, dispatch to one of three FlashInfer
         # entry points depending on the GPU:
         #   - SM100 (Blackwell)  -> trtllm_fp4_block_scale_moe (existing)
         #   - SM120 (Blackwell)  -> cutlass_fused_moe(MXFP8 x MXFP4)
-        #   - SM90  (Hopper)     -> cutlass_fused_moe(use_w4_group_scaling=True)
-        #                           (FlashInfer PR #3084, post-0.6.10)
+        #   - SM90  (Hopper)     -> cutlass_fused_moe(use_w4_group_scaling=True),
+        #                           W4A16 by default (PR #3084) or opt-in
+        #                           Humming W4A8 (PR #3738/#4431)
         self._fi_kernel: Optional[str] = None
         if self.use_flashinfer:
             if is_sm100_supported():
+                if self.flashinfer_mxfp4_moe_precision == "fp8":
+                    raise ValueError(
+                        "flashinfer_mxfp4_moe_precision=fp8 selects the SM90 "
+                        "Humming path; use `default` for the SM100 MXFP8 path."
+                    )
                 self._fi_kernel = "trtllm_sm100"
             elif is_sm120_supported():
+                if self.flashinfer_mxfp4_moe_precision == "fp8":
+                    raise ValueError(
+                        "flashinfer_mxfp4_moe_precision=fp8 selects the SM90 "
+                        "Humming path; use `default` for the SM120 MXFP8 path."
+                    )
                 self._fi_kernel = "cutlass_sm120"
             elif is_sm90_supported():
                 if not _FI_HAS_SM90_CUTLASS_MXFP4:
@@ -368,6 +400,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         "interleave_moe_{weights,scales}_for_sm90_mixed_gemm helpers "
                         "from FlashInfer PR #3084 (>= 0.6.11). Upgrade flashinfer-python "
                         "or pick a different backend (e.g. marlin / triton_kernel)."
+                    )
+                self._use_sm90_humming = self.flashinfer_mxfp4_moe_precision == "fp8"
+                if self._use_sm90_humming and not _FI_HAS_SM90_CUTLASS_MXFP4_FP8:
+                    raise RuntimeError(
+                        "flashinfer_mxfp4_moe_precision=fp8 on SM90 requires "
+                        "the corrected per-expert Humming API from FlashInfer "
+                        ">= 0.6.18. FlashInfer 0.6.17 intentionally reverted "
+                        "PR #3738; upgrade FlashInfer or use `default`/`bf16` "
+                        "for the existing W4A16 path."
                     )
                 self._fi_kernel = "cutlass_sm90"
             else:
@@ -1053,7 +1094,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         _interleaved = getattr(layer.moe_runner_config, "gate_up_interleaved", True)
 
-        def _stack_up_gate_w13(unpadded_w13, last_pad, last_un):
+        def _stack_up_gate_w13(
+            unpadded_w13, last_pad, last_un, preserve_expert_range=False
+        ):
             # unpadded_w13: [E, 2*N_un, last_un]
             # Returns: [E, 2*N_pad, last_pad] in [up_padded; gate_padded] order.
             if _interleaved:
@@ -1066,6 +1109,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             out = torch.zeros(
                 E, 2 * N_pad, last_pad, dtype=unpadded_w13.dtype, device=device
             )
+            if preserve_expert_range:
+                # Humming derives one residual from each expert's min/max E8M0
+                # exponents. Fill padding with an existing expert value so
+                # padding cannot change that range.
+                out.copy_(unpadded_w13[:, :1, :1])
             # First half: up (with row + col padding zeros).
             out[:, :N_un, :last_un] = up_rows
             # Second half: gate.
@@ -1079,6 +1127,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_weight_scale.data,
             K_pad // sf_block_size,
             K_un // sf_block_size,
+            preserve_expert_range=self._use_sm90_humming,
         )
         # Bias: same de-interleave on dim=-1.
         if _interleaved:
@@ -1091,8 +1140,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w13_bias_padded[:, :N_un] = w13_bias_up
         w13_bias_padded[:, N_pad : N_pad + N_un] = w13_bias_gate
 
-        def _pad_w2_3d(unpadded, last_pad, last_un):
+        def _pad_w2_3d(unpadded, last_pad, last_un, preserve_expert_range=False):
             out = torch.zeros(E, K_pad, last_pad, dtype=unpadded.dtype, device=device)
+            if preserve_expert_range:
+                out.copy_(unpadded[:, :1, :1])
             out[:, :K_un, :last_un] = unpadded[:, :K_un, :]
             return out
 
@@ -1104,6 +1155,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale.data,
             N_pad // sf_block_size,
             N_un // sf_block_size,
+            preserve_expert_range=self._use_sm90_humming,
         )
         w2_bias_padded = torch.zeros(E, K_pad, dtype=bias_dtype, device=device)
         w2_bias_padded[:, :K_un] = layer.w2_weight_bias.data
@@ -1127,26 +1179,47 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # ---- FlashInfer SM90 byte / scale interleave -----------------------
         # The padded buffers above are contiguous by construction (allocated
         # via torch.zeros + slice assignment), so we feed them straight in.
-        layer.w13_weight = Parameter(
-            interleave_moe_weights_for_sm90_mixed_gemm(w13_padded, "fp4"),
-            requires_grad=False,
-        )
-        layer.w2_weight = Parameter(
-            interleave_moe_weights_for_sm90_mixed_gemm(w2_padded, "fp4"),
-            requires_grad=False,
-        )
-        layer.w13_weight_scale = Parameter(
-            interleave_moe_scales_for_sm90_mixed_gemm(
+        if self._use_sm90_humming:
+            from flashinfer.fused_moe import (
+                preprocess_moe_weights_for_sm90_mixed_gemm_humming,
+            )
+
+            w13_il, w13_scale_il, w13_residual = (
+                preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+                    w13_padded, w13_scale_padded
+                )
+            )
+            w2_il, w2_scale_il, w2_residual = (
+                preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+                    w2_padded, w2_scale_padded
+                )
+            )
+            # Humming keeps the FP4->FP8 exponent-bias compensation in the
+            # epilogue. FlashInfer #4431 consumes these in local expert order.
+            layer.w13_humming_residual_scale = Parameter(
+                (w13_residual * 64.0).contiguous(), requires_grad=False
+            )
+            layer.w2_humming_residual_scale = Parameter(
+                (w2_residual * 64.0).contiguous(), requires_grad=False
+            )
+            layer.humming_fc2_act_scale = Parameter(
+                torch.ones((), dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
+        else:
+            w13_il = interleave_moe_weights_for_sm90_mixed_gemm(w13_padded, "fp4")
+            w2_il = interleave_moe_weights_for_sm90_mixed_gemm(w2_padded, "fp4")
+            w13_scale_il = interleave_moe_scales_for_sm90_mixed_gemm(
                 w13_scale_padded, group_size=sf_block_size
-            ),
-            requires_grad=False,
-        )
-        layer.w2_weight_scale = Parameter(
-            interleave_moe_scales_for_sm90_mixed_gemm(
+            )
+            w2_scale_il = interleave_moe_scales_for_sm90_mixed_gemm(
                 w2_scale_padded, group_size=sf_block_size
-            ),
-            requires_grad=False,
-        )
+            )
+
+        layer.w13_weight = Parameter(w13_il, requires_grad=False)
+        layer.w2_weight = Parameter(w2_il, requires_grad=False)
+        layer.w13_weight_scale = Parameter(w13_scale_il, requires_grad=False)
+        layer.w2_weight_scale = Parameter(w2_scale_il, requires_grad=False)
         layer.w13_weight_bias = Parameter(w13_bias_padded, requires_grad=False)
         layer.w2_weight_bias = Parameter(w2_bias_padded, requires_grad=False)
 
@@ -1289,10 +1362,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             pass
 
     def _apply_sm90_cutlass(self, layer, dispatch_output):
-        """SM90 (Hopper) MXFP4 x BF16 MoE via FlashInfer's cutlass mixed-input
-        path (PR #3084). Routed through the unified ``MoeRunner`` -- this
-        helper only builds the quant_info; the actual kernel call lives in
-        :mod:`sglang.srt.layers.moe.moe_runner.flashinfer_cutlass`."""
+        """SM90 MXFP4 x BF16/FP8 MoE via FlashInfer's mixed-input kernels.
+
+        Routed through the unified ``MoeRunner``; this helper only builds the
+        quant_info. The actual kernel call lives in
+        :mod:`sglang.srt.layers.moe.moe_runner.flashinfer_cutlass`.
+        """
         from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
             FlashInferCutlassMxfp4MoeQuantInfo,
         )
@@ -1302,6 +1377,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale,
             w2_weight_scale=layer.w2_weight_scale,
+            w13_humming_residual_scale=getattr(
+                layer, "w13_humming_residual_scale", None
+            ),
+            w2_humming_residual_scale=getattr(layer, "w2_humming_residual_scale", None),
+            humming_fc2_act_scale=getattr(layer, "humming_fc2_act_scale", None),
             w13_bias=layer.w13_weight_bias,
             w2_bias=layer.w2_weight_bias,
             swiglu_alpha=layer.swiglu_alpha,
