@@ -425,12 +425,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
     def _plant_war_read_done_node(self):
-        """Record the read-done event as a graph node right after the in-graph
-        metadata hook. Safe for both full and breakable capture: capture is
-        active here (breakable opens segment 1 on context entry) and every
-        segment replays, re-arming the node. Non-capturing runs (warmup,
-        debug-eager, no external-event support) leave the flag unset and stay
-        on the fallback paths."""
+        # Plant the shared buffer read done in graph
         if (
             self.model_runner.war_read_done_event is not None
             and torch.cuda.is_current_stream_capturing()
@@ -1325,7 +1320,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             if war_record is SharedReadBoundary.PRE_REPLAY:
                 self._publish_war_read_done(in_graph=False)
+
+            # Replay happens here
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+
             if war_record is SharedReadBoundary.POST_REPLAY:
                 self._publish_war_read_done(in_graph=False)
             elif war_record is SharedReadBoundary.IN_REPLAY:
