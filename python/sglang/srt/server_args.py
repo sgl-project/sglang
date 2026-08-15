@@ -1801,11 +1801,14 @@ class ServerArgs:
         str,
         Arg(
             help="DeepSeek V4 attention backend. 'auto' (default) resolves to "
-            "'flashmla'. 'trtllm' (SM100/SM103 Blackwell only) switches the "
-            "SWA/compressed KV pools to a uniform 512-dim FP8 layout and runs "
-            "decode and sparse prefill through the flashinfer trtllm-gen "
-            "sparse MLA kernel. The backend choice is shared by prefill and decode.",
+            "'trtllm' on SM100/SM103 (Blackwell) when the KV cache is FP8 and "
+            "no context-parallel mode or hisparse is active, and to 'flashmla' "
+            "otherwise. 'trtllm' switches the SWA/compressed KV pools to a "
+            "uniform 512-dim FP8 layout and runs decode and sparse prefill "
+            "through the flashinfer trtllm-gen sparse MLA kernel. The backend "
+            "choice is shared by prefill and decode.",
             choices=DSV4_ATTN_BACKEND_CHOICES,
+            resolvable=True,
         ),
         NS("exec.kernel"),
     ] = "auto"

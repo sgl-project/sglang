@@ -132,11 +132,14 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # (arg_groups/overrides.py: _deepseek_v4_kv_cache_dtype), invoked here at
     # its legacy slot.
     from sglang.srt.arg_groups.overrides import (
+        _deepseek_v4_attn_backend_auto,
         _deepseek_v4_kv_cache_dtype,
         run_post_process_pass,
     )
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
+
+    run_post_process_pass(server_args, _deepseek_v4_attn_backend_auto)
 
     if server_args.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.common import is_sm100_supported

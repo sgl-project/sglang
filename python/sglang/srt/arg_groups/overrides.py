@@ -1885,6 +1885,44 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
 
 
 @register_post_process
+def _deepseek_v4_attn_backend_auto(view: Any) -> dict:
+    """Slot pass in the DeepSeek V4 hook (after _deepseek_v4_kv_cache_dtype):
+    resolve dsv4_attn_backend 'auto' to 'trtllm' on SM100/SM103 when the KV
+    cache is uniform FP8 and no context-parallel mode is active (the
+    trtllm-gen sparse MLA kernel supports neither CP layouts nor hisparse).
+    An explicit --dsv4-attn-backend flashmla/trtllm is always respected."""
+    hf_config = view.get_model_config().hf_config
+    model_arch = hf_config.architectures[0]
+    if model_arch != "DeepseekV4ForCausalLM":
+        return {}
+    if view.dsv4_attn_backend != "auto":
+        return {}
+
+    from sglang.srt.utils.common import is_sm100_supported
+
+    uses_cp = (
+        view.attn_cp_size > 1
+        or view.dcp_size > 1
+        or view.enable_prefill_cp
+        or view.enable_prefill_context_parallel
+        or view.enable_dsa_prefill_context_parallel
+    )
+    if (
+        view.device == "cuda"
+        and is_sm100_supported()
+        and view.kv_cache_dtype == "fp8_e4m3"
+        and not uses_cp
+        and not view.enable_hisparse
+    ):
+        logger.info(
+            "DeepSeek V4 attention backend auto-resolved to trtllm "
+            "(SM100, FP8 KV cache, no CP)."
+        )
+        return {"dsv4_attn_backend": "trtllm"}
+    return {}
+
+
+@register_post_process
 def _deepseek_v4_sm120_moe(view: Any) -> dict:
     """Default DeepSeek V4 MXFP4 experts to FlashInfer CUTLASS on SM120."""
     hf_config = view.get_model_config().hf_config
