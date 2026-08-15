@@ -429,19 +429,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
     def _record_in_graph_metadata_prep_done(self):
-        # This is only a hook right after the in-graph metadata prep.
-        # When the shared buffers are read done is decided by attn backend.
+        # Purely a marker at this point in the graph; where the shared reads
+        # actually end is the attn backend's call.
         if not torch.cuda.is_current_stream_capturing():
-            # Warmup runs share this body; only a capturing run plants a node.
-            # Breakable capture is fine: it opens segment 1 on context entry and
-            # every segment replays, re-arming the node.
+            # Warmup shares this body. Breakable capture still plants: it opens
+            # segment 1 on context entry and every segment re-arms the node.
             return
         if self.in_graph_metadata_prep_done is None:
             self.in_graph_metadata_prep_done = make_external_event(self.device_module)
         event = self.in_graph_metadata_prep_done
         if event is not None:
-            # None here means no external-event support; stays None so the
-            # boundary resolution below never hands out an unrecorded event.
+            # Stays None without external-event support, so the boundary
+            # resolution below never hands out an unrecorded event.
             event.record()
 
     def _resolve_shared_read_boundary(
@@ -463,8 +462,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             boundary is SharedReadBoundary.IN_REPLAY
             and self.in_graph_metadata_prep_done is None
         ):
-            # In-graph marker not found, fall back to the pre-replay record.
-            # TODO: PRE_REPLAY is earlier than the declared boundary; POST_REPLAY
+            # TODO: PRE_REPLAY is EARLIER than the declared boundary; POST_REPLAY
             # is the sound demotion for a backend that really reads in-graph.
             return SharedReadBoundary.PRE_REPLAY
         return boundary
@@ -473,11 +471,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """Hand the scheduler's WAR barrier the event marking this phase's
         shared-buffer reads as done."""
         if in_graph:
-            # All reads end exactly at the in-graph metadata prep, so wire that
-            # marker through instead of recording a second event.
+            # Reads end at the in-graph marker: wire it through, don't re-record.
             self.model_runner.shared_read_done_event = self.in_graph_metadata_prep_done
         else:
-            # Recorded eagerly on the stream, outside the captured graph.
             read_done = self.device_module.Event()
             read_done.record()
             self.model_runner.shared_read_done_event = read_done

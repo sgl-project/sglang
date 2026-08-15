@@ -1,8 +1,4 @@
-"""Shared-read-done event utilities for CUDA graph runners.
-
-The event marks that a phase has finished reading the scheduler-shared
-buffers; the scheduler's WAR barrier waits on it before overwriting them.
-"""
+"""Shared-read-done event utilities for CUDA graph runners."""
 
 import logging
 from typing import Optional

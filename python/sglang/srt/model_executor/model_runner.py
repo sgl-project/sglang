@@ -403,10 +403,9 @@ class ModelRunner:
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
-        # The step's last shared-buffer-reading phase publishes a fresh event here
-        # once its reads are done (decode graph, eagle draft extend, or prefill);
-        # the scheduler's WAR barrier waits on it (then clears it) instead of the
-        # whole-forward wait_stream. None -> whole-forward fallback.
+        # Published by the step's last shared-buffer-reading phase (decode graph,
+        # eagle draft extend, or prefill); the scheduler's WAR barrier waits on it
+        # then clears it. None -> coarse whole-forward wait_stream.
         self.shared_read_done_event: Optional[torch.cuda.Event] = None
 
         # CPU offload

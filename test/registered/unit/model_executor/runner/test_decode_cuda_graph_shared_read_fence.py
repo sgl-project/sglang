@@ -41,9 +41,8 @@ def _runner(*, target_verify_war: bool = False, has_marker: bool = False):
 
 
 def test_unrelated_modes_never_publish():
-    # The decode runner owns the fence for decode / target verify only. Any
-    # other mode must leave the scheduler on the coarse whole-forward wait,
-    # even when a marker is available.
+    # This runner owns the fence for decode / target verify only; every other
+    # mode stays on the coarse wait, even with a marker available.
     assert (
         _runner(has_marker=True)._resolve_shared_read_boundary(
             _attn_backend(), ForwardMode.EXTEND
