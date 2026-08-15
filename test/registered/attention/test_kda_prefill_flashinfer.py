@@ -249,7 +249,10 @@ def test_kda_prefill_cake_native_unbounded_kimi_linear_h32_with_checkpoints():
         state_ref,
         seq_lens,
         lower_bound=None,
-        clone_inputs=False,
+        # Triton's chunk prefill intentionally reuses ``v`` as its output
+        # buffer.  Keep the Cake inputs pristine while still exercising the
+        # zero-copy Cake adapter below.
+        clone_inputs=True,
         return_intermediate_states=True,
     )
     state_cake = data["state"].clone()
