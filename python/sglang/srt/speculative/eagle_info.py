@@ -392,33 +392,35 @@ class EagleDraftExtendInput(SpecInput):
 
 @dataclass
 class EaglePPVerifyInputRaw(SpecInput):
-    """CPU-side draft tree produced by the PP last rank and relayed across PP
+    """Draft tree produced by the PP last rank and relayed across PP
     stages so non-last ranks can rebuild an EagleVerifyInput on the next iter.
 
     Carries the raw (pre-tree-mask) fields rather than a built EagleVerifyInput
     because the tree mask / positions must be rebuilt against each rank's own
     attention backend buffers.
+
+    All fields are GPU tensors so the PP ring relays them over the GPU
+    channel instead of pickling Python lists through CPU.
     """
 
-    draft_tokens: List[List[int]]
-    bonus_tokens: List[int]
-    top_scores_index: List[List[int]]
-    parent_list: List[List[int]]
-    accept_lens: List[int]
-    accept_index: Optional[List] = None
+    draft_tokens: torch.Tensor  # [bs, num_draft], col 0 is the bonus token
+    bonus_tokens: torch.Tensor  # [bs]
+    top_scores_index: torch.Tensor  # [bs, num_draft - 1]
+    parent_list: torch.Tensor  # [bs, num_draft - 1]
+    accept_lens: Optional[torch.Tensor] = None  # [bs]
+    # Accepted tree path, [bs, max_tree_depth]; None when topk == 1.
+    accept_index: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_PP_VERIFY_INPUT_RAW)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        num_draft = (
-            len(self.draft_tokens[0])
-            if self.draft_tokens and isinstance(self.draft_tokens[0], list)
-            else 1
-        )
+        num_draft = self.draft_tokens.shape[1] if self.draft_tokens.dim() == 2 else 1
         return num_draft, num_draft
 
     def to_tensor_dict(self) -> dict:
+        # Nested tensors are flattened by _split_tensor_dict, so the whole
+        # dataclass dict still travels over the GPU channel.
         return {"pp_spec_output": asdict(self)}
 
     @classmethod
@@ -437,39 +439,38 @@ class EaglePPVerifyInputRaw(SpecInput):
         """
         bs = len(batch.reqs)
         parent_width = max(num_draft - 1, 0)
+        device = batch.input_ids.device
 
-        bonus_tokens = batch.input_ids.tolist()
-        draft_tokens = [bonus_tokens[i : i + 1] * num_draft for i in range(bs)]
-        parent_row = list(range(-1, parent_width - 1))
-        parent_list = [parent_row[:] for _ in range(bs)]
-        score_row = list(range(parent_width))
-        top_scores_index = [score_row[:] for _ in range(bs)]
+        # repeat (not expand): the relayed tensors must stay contiguous.
+        bonus_tokens = batch.input_ids.to(torch.int64)
+        draft_tokens = bonus_tokens.unsqueeze(1).repeat(1, num_draft)
+        parent_list = torch.arange(-1, parent_width - 1, device=device).repeat(bs, 1)
+        top_scores_index = torch.arange(parent_width, device=device).repeat(bs, 1)
 
         return cls(
             draft_tokens=draft_tokens,
             bonus_tokens=bonus_tokens,
             top_scores_index=top_scores_index,
             parent_list=parent_list,
-            accept_lens=[1] * bs,
+            accept_lens=torch.ones(bs, dtype=torch.int64, device=device),
             accept_index=None,
         )
 
     def filter_batch(
         self, new_indices: torch.Tensor, new_indices_cpu: Optional[List[int]] = None
     ):
-        idx = new_indices.tolist()
-
-        def pick(lst):
-            return [lst[i] for i in idx]
-
         try:
-            self.bonus_tokens = pick(self.bonus_tokens)
-            self.draft_tokens = pick(self.draft_tokens)
-            self.top_scores_index = pick(self.top_scores_index)
-            self.parent_list = pick(self.parent_list)
-            self.accept_lens = pick(self.accept_lens)
+            self.bonus_tokens = self.bonus_tokens[new_indices]
+            if self.draft_tokens is not None:
+                self.draft_tokens = self.draft_tokens[new_indices]
+            if self.top_scores_index is not None:
+                self.top_scores_index = self.top_scores_index[new_indices]
+            if self.parent_list is not None:
+                self.parent_list = self.parent_list[new_indices]
+            if self.accept_lens is not None:
+                self.accept_lens = self.accept_lens[new_indices]
             if self.accept_index is not None:
-                self.accept_index = [self.accept_index[i] for i in idx]
+                self.accept_index = self.accept_index[new_indices]
         except TypeError as e:
             raise RuntimeError(
                 "EaglePPVerifyInputRaw.filter_batch: a required field was None. "
@@ -479,13 +480,29 @@ class EaglePPVerifyInputRaw(SpecInput):
 
     def merge_batch(self, other: "EaglePPVerifyInputRaw"):
         try:
+            if other.bonus_tokens.numel() == 0:
+                return
+            if self.bonus_tokens.numel() == 0:
+                self.draft_tokens = other.draft_tokens
+                self.bonus_tokens = other.bonus_tokens
+                self.top_scores_index = other.top_scores_index
+                self.parent_list = other.parent_list
+                self.accept_lens = other.accept_lens
+                self.accept_index = other.accept_index
+                return
+            if other.draft_tokens is not None:
+                self.draft_tokens = torch.cat([self.draft_tokens, other.draft_tokens])
+            self.bonus_tokens = torch.cat([self.bonus_tokens, other.bonus_tokens])
+            if other.top_scores_index is not None:
+                self.top_scores_index = torch.cat(
+                    [self.top_scores_index, other.top_scores_index]
+                )
+            if self.parent_list is not None and other.parent_list is not None:
+                self.parent_list = torch.cat([self.parent_list, other.parent_list])
+            if self.accept_lens is not None and other.accept_lens is not None:
+                self.accept_lens = torch.cat([self.accept_lens, other.accept_lens])
             if self.accept_index is not None and other.accept_index is not None:
-                self.accept_index = self.accept_index + other.accept_index
-            self.draft_tokens = self.draft_tokens + other.draft_tokens
-            self.bonus_tokens = self.bonus_tokens + other.bonus_tokens
-            self.top_scores_index = self.top_scores_index + other.top_scores_index
-            self.parent_list = self.parent_list + other.parent_list
-            self.accept_lens = self.accept_lens + other.accept_lens
+                self.accept_index = torch.cat([self.accept_index, other.accept_index])
         except TypeError as e:
             raise RuntimeError(
                 "EaglePPVerifyInputRaw.merge_batch: a required field was None. "

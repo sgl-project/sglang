@@ -578,7 +578,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
             # CUDA Graph buffers are reused; clone before flattening so the
             # relayed raw tokens survive the next replay.
-            if can_cuda_graph:
+            if can_run_decode_cuda_graph:
                 parent_list = parent_list.clone()
                 top_scores_index = top_scores_index.clone()
                 draft_tokens = draft_tokens.clone()
@@ -1330,20 +1330,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         self.draft_worker.draft(batch)
                     )
 
-        # PP last rank: serialize the draft tree for PP relay.
+        # PP last rank: serialize the draft tree for PP relay. Tensors stay on
+        # GPU so the PP ring relays them over the GPU channel.
         if self._pp_enabled and self._pp_is_last_rank:
             batch_output.pp_verify_input_raw = EaglePPVerifyInputRaw(
                 draft_tokens=pp_draft_tokens.reshape(
                     batch.batch_size(), self.speculative_num_draft_tokens
-                ).tolist(),
+                ).to(self.device, torch.int64),
                 bonus_tokens=batch_output.next_draft_input.bonus_tokens.to(
-                    torch.int64
-                ).tolist(),
-                top_scores_index=pp_top_scores_index.tolist(),
-                parent_list=pp_parent_list.tolist(),
-                accept_lens=batch_output.accept_lens.tolist(),
+                    self.device, torch.int64
+                ),
+                top_scores_index=pp_top_scores_index.to(self.device, torch.int64),
+                parent_list=pp_parent_list.to(self.device, torch.int64),
+                accept_lens=batch_output.accept_lens.to(self.device, torch.int64),
                 accept_index=(
-                    batch_output.accept_index.tolist() if self.topk > 1 else None
+                    batch_output.accept_index.to(self.device, torch.int64)
+                    if self.topk > 1
+                    else None
                 ),
             )
 
@@ -1357,27 +1360,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
         attention backend buffers here.
         """
         raw: EaglePPVerifyInputRaw = batch.spec_info
-        device = batch.seq_lens.device
 
         topk = self.topk
         spec_steps = self.speculative_num_steps
         num_draft = self.speculative_num_draft_tokens
 
-        bonus_tokens = torch.tensor(raw.bonus_tokens, dtype=torch.long, device=device)
-        draft_tokens = torch.tensor(raw.draft_tokens, dtype=torch.long, device=device)
-        parent_list = torch.tensor(raw.parent_list, dtype=torch.long, device=device)
-        top_scores_index = torch.tensor(
-            raw.top_scores_index, dtype=torch.long, device=device
-        )
+        bonus_tokens = raw.bonus_tokens.to(torch.long)
+        draft_tokens = raw.draft_tokens.to(torch.long)
+        parent_list = raw.parent_list.to(torch.long)
+        top_scores_index = raw.top_scores_index.to(torch.long)
 
         # draft_tokens is [bs, num_draft_tokens] with bonus as col 0.
         # build_tree_kernel_efficient expects draft_tokens without bonus.
         draft_tokens_no_bonus = draft_tokens[:, 1:]
-
-        # Directly write to cuda graph buffers for verify attn.
-        tree_mask_buf, position_buf = (
-            self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
-        )
 
         seq_lens_sum = batch.seq_lens_sum
         if seq_lens_sum is None:
@@ -1391,6 +1386,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
             bs,
             num_draft - 1,
         ), f"topology shape mismatch: {parent_list.shape} vs ({bs}, {num_draft - 1})"
+
+        # Write straight into the backend's verify-mask buffer when it owns one
+        # and this batch fits; an eager batch past the captured max_bs falls
+        # back to allocating. Mode and fill stay paired with the buffer, same
+        # contract as the shared draft tail in eagle_worker_common.
+        target_attn_backend = self.target_worker.model_runner.attn_backend
+        verify_mask = target_attn_backend.verify_mask
+        if verify_mask is None:
+            tree_mask_buf, mask_mode, fill_mask = None, self.tree_mask_mode, True
+        else:
+            mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
+            tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
 
         (
             tree_mask,
@@ -1409,9 +1416,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             topk,
             spec_steps,
             num_draft,
-            self.tree_mask_mode,
+            mask_mode,
             tree_mask_buf,
-            position_buf,
+            fill_prefix_mask=fill_mask,
         )
 
         draft_tokens_arranged = draft_tokens_arranged.to(torch.int64)

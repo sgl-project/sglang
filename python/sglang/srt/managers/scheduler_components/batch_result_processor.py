@@ -848,14 +848,10 @@ class SchedulerBatchResultProcessor:
         accept_lens_cpu = None
         if isinstance(batch.spec_info, EaglePPVerifyInputRaw):
             pp_raw = batch.spec_info
-            accept_lens_cpu = torch.tensor(pp_raw.accept_lens, dtype=torch.int64)
-            accept_lens = accept_lens_cpu.to(batch.seq_lens.device)
+            accept_lens = pp_raw.accept_lens.to(torch.int64)
+            accept_lens_cpu = accept_lens.cpu()
             if pp_raw.accept_index is not None:
-                accept_index = torch.tensor(
-                    pp_raw.accept_index,
-                    dtype=torch.long,
-                    device=batch.seq_lens.device,
-                )
+                accept_index = pp_raw.accept_index.to(torch.long)
                 move_accept_tokens_to_target_kvcache(
                     batch,
                     accept_index,
