@@ -13,24 +13,25 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
-class LayerwiseOffloadableQwen2_5VLForConditionalGeneration(
-    LayerwiseOffloadableModuleMixin,
-    Qwen2_5_VLForConditionalGeneration,
-):
-    """Transformers Qwen2.5-VL with SGLang layerwise residency support."""
+class Qwen2_5VLGenerationEncoder(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+    """Qwen2.5-VL encoder for stages that also use autoregressive generation."""
 
     layerwise_offload_dit_group_enabled = False
-    # Configure the larger language stack first to keep setup peak memory low.
-    layer_names = ["model.language_model.layers", "model.visual.blocks"]
+    # release the larger language stack before allocating vision offload buffers
+    layer_names = [
+        "transformers_model.model.language_model.layers",
+        "transformers_model.model.visual.blocks",
+    ]
 
-    @classmethod
-    def from_pretrained(cls, *args, **kwargs):
-        # Transformers selects legacy Qwen weight conversions by the concrete
-        # class name. Load through the upstream class before adding this
-        # stateless mixin so checkpoints keep their original conversion path.
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(*args, **kwargs)
-        model.__class__ = cls
-        return model
+    def __init__(self, model: Qwen2_5_VLForConditionalGeneration) -> None:
+        super().__init__()
+        self.transformers_model = model
+
+    def forward(self, *args, **kwargs):
+        return self.transformers_model(*args, **kwargs)
+
+    def generate(self, *args, **kwargs):
+        return self.transformers_model.generate(*args, **kwargs)
 
 
 def load_qwen2_5vl_generation_model(
@@ -38,18 +39,18 @@ def load_qwen2_5vl_generation_model(
     *,
     server_args: ServerArgs,
     dtype: torch.dtype,
-) -> LayerwiseOffloadableQwen2_5VLForConditionalGeneration:
+) -> Qwen2_5VLGenerationEncoder:
     """Load the Transformers implementation needed for autoregressive generation."""
     device = (
         torch.device("cpu")
         if server_args.should_start_component_on_cpu("text_encoder")
         else get_local_torch_device()
     )
-    model = LayerwiseOffloadableQwen2_5VLForConditionalGeneration.from_pretrained(
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_path,
         subfolder="text_encoder",
         trust_remote_code=server_args.trust_remote_code,
         revision=server_args.revision,
         torch_dtype=dtype,
     )
-    return model.to(device=device)
+    return Qwen2_5VLGenerationEncoder(model).to(device=device)

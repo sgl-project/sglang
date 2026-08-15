@@ -12,6 +12,9 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_transformers import (
+    load_qwen2_5vl_generation_model,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -173,10 +176,6 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
         self.vae_dtype = vae_dtype
         self.text_encoder_dtype = text_encoder_dtype
         if text_encoder is None:
-            from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_transformers import (
-                load_qwen2_5vl_generation_model,
-            )
-
             text_encoder = load_qwen2_5vl_generation_model(
                 model_path,
                 server_args=self.server_args,

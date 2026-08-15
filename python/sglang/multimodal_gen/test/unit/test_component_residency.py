@@ -17,7 +17,8 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_transformers import (
-    LayerwiseOffloadableQwen2_5VLForConditionalGeneration,
+    Qwen2_5VLGenerationEncoder,
+    load_qwen2_5vl_generation_model,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding import (
     RealtimeTextEncodingStage,
@@ -226,19 +227,17 @@ def test_realtime_text_encoder_use_starts_at_call_site():
 
 def test_transformers_qwen_generation_model_supports_layerwise_offload():
     assert issubclass(
-        LayerwiseOffloadableQwen2_5VLForConditionalGeneration,
+        Qwen2_5VLGenerationEncoder,
         LayerwiseOffloadableModuleMixin,
     )
-    assert LayerwiseOffloadableQwen2_5VLForConditionalGeneration.layer_names == [
-        "model.language_model.layers",
-        "model.visual.blocks",
+    assert Qwen2_5VLGenerationEncoder.layer_names == [
+        "transformers_model.model.language_model.layers",
+        "transformers_model.model.visual.blocks",
     ]
 
 
 def test_layerwise_qwen_loads_through_upstream_class(monkeypatch):
-    model = Qwen2_5_VLForConditionalGeneration.__new__(
-        Qwen2_5_VLForConditionalGeneration
-    )
+    model = torch.nn.Linear(2, 2)
     upstream_load = Mock(return_value=model)
     monkeypatch.setattr(
         Qwen2_5_VLForConditionalGeneration,
@@ -246,13 +245,28 @@ def test_layerwise_qwen_loads_through_upstream_class(monkeypatch):
         upstream_load,
     )
 
-    loaded = LayerwiseOffloadableQwen2_5VLForConditionalGeneration.from_pretrained(
-        "model", subfolder="text_encoder"
+    server_args = SimpleNamespace(
+        trust_remote_code=True,
+        revision="revision",
+        should_start_component_on_cpu=lambda _component_name: True,
     )
 
-    upstream_load.assert_called_once_with("model", subfolder="text_encoder")
-    assert loaded is model
-    assert type(loaded) is LayerwiseOffloadableQwen2_5VLForConditionalGeneration
+    loaded = load_qwen2_5vl_generation_model(
+        "model",
+        server_args=server_args,
+        dtype=torch.bfloat16,
+    )
+
+    upstream_load.assert_called_once_with(
+        "model",
+        subfolder="text_encoder",
+        trust_remote_code=True,
+        revision="revision",
+        torch_dtype=torch.bfloat16,
+    )
+    assert isinstance(loaded, Qwen2_5VLGenerationEncoder)
+    assert loaded.transformers_model is model
+    assert type(loaded.transformers_model) is torch.nn.Linear
 
 
 def test_qwen_layered_registers_stage_loaded_text_encoder(monkeypatch):
