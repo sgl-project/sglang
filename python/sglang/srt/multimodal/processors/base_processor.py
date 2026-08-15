@@ -32,6 +32,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 )
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
+    configure_media_url_security,
     envs,
     is_cpu,
     is_npu,
@@ -199,6 +200,10 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
+        configure_media_url_security(
+            getattr(server_args, "allowed_media_domains", None),
+            getattr(server_args, "media_url_max_file_size_mb", 64),
+        )
         configured_mm_feature_transport = getattr(
             server_args, "mm_feature_transport", "cpu"
         )
