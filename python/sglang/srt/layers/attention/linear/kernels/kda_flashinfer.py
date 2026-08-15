@@ -441,20 +441,23 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         num_heads, head_k_dim = q.shape[2:]
         num_v_heads, head_v_dim = v.shape[2:]
 
-        query_fi = (
-            q.reshape(batch_size, 1, num_heads, head_k_dim)
-            .to(torch.bfloat16)
-            .contiguous()
+        query_fi = torch.as_strided(
+            q,
+            (batch_size, 1, num_heads, head_k_dim),
+            (q.stride(1), num_heads * head_k_dim, head_k_dim, 1),
+            storage_offset=q.storage_offset(),
         )
-        key_fi = (
-            k.reshape(batch_size, 1, num_heads, head_k_dim)
-            .to(torch.bfloat16)
-            .contiguous()
+        key_fi = torch.as_strided(
+            k,
+            (batch_size, 1, num_heads, head_k_dim),
+            (k.stride(1), num_heads * head_k_dim, head_k_dim, 1),
+            storage_offset=k.storage_offset(),
         )
-        value_fi = (
-            v.reshape(batch_size, 1, num_v_heads, head_v_dim)
-            .to(torch.bfloat16)
-            .contiguous()
+        value_fi = torch.as_strided(
+            v,
+            (batch_size, 1, num_v_heads, head_v_dim),
+            (v.stride(1), num_v_heads * head_v_dim, head_v_dim, 1),
+            storage_offset=v.storage_offset(),
         )
         native_unbounded_softplus = (
             lower_bound is None
@@ -464,12 +467,22 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             and head_v_dim == _CAKE_UNBOUNDED_HEAD_DIM
         )
         if native_unbounded_softplus:
-            gate_fi = a.reshape(
-                batch_size,
-                1,
-                _CAKE_UNBOUNDED_NUM_HEADS,
-                _CAKE_UNBOUNDED_HEAD_DIM,
-            ).to(torch.bfloat16)
+            gate_fi = torch.as_strided(
+                a,
+                (
+                    batch_size,
+                    1,
+                    _CAKE_UNBOUNDED_NUM_HEADS,
+                    _CAKE_UNBOUNDED_HEAD_DIM,
+                ),
+                (
+                    a.stride(0),
+                    _CAKE_UNBOUNDED_GATE_WIDTH,
+                    _CAKE_UNBOUNDED_HEAD_DIM,
+                    1,
+                ),
+                storage_offset=a.storage_offset(),
+            )
             A_log_fi, dt_bias_fi = self._prep_gate_params(A_log, dt_bias)
         else:
             gate_fi = self._cake_precompute_gate(
@@ -484,11 +497,19 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             )
             A_log_fi = None
             dt_bias_fi = None
-        beta_fi = (
-            torch.sigmoid(b.float())
-            .to(torch.bfloat16)
-            .reshape(batch_size, 1, num_v_heads)
-        )
+        if native_unbounded_softplus:
+            beta_fi = torch.as_strided(
+                b,
+                (batch_size, 1, num_v_heads),
+                (b.stride(0), num_v_heads, 1),
+                storage_offset=b.storage_offset(),
+            )
+        else:
+            beta_fi = (
+                torch.sigmoid(b.float())
+                .to(torch.bfloat16)
+                .reshape(batch_size, 1, num_v_heads)
+            )
 
         direct_indexed_state = self._cake_direct_indexed_state_is_supported(
             ssm_states,
@@ -527,6 +548,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             use_gate_in_kernel=native_unbounded_softplus,
             lower_bound=lower_bound if native_unbounded_softplus else None,
             ssm_state_indices=cache_indices if direct_indexed_state else None,
+            beta_is_logit=native_unbounded_softplus,
             backend="cake",
         )
         if not direct_indexed_state:
@@ -1939,14 +1961,37 @@ class CakeKDAKernel(FlashInferKDAKernel):
                     row_width=_CAKE_UNBOUNDED_QKV_WIDTH,
                 )
                 head_width = _CAKE_UNBOUNDED_GATE_WIDTH
-                q = qkv_rows[:, :head_width].reshape(
+                qkv_stride = qkv_rows.stride(0)
+                qkv_shape = (
                     1,
                     batch_size,
                     _CAKE_UNBOUNDED_NUM_HEADS,
                     _CAKE_UNBOUNDED_HEAD_DIM,
                 )
-                k = qkv_rows[:, head_width : 2 * head_width].reshape_as(q)
-                v = qkv_rows[:, 2 * head_width :].reshape_as(q)
+                qkv_strides = (
+                    batch_size * qkv_stride,
+                    qkv_stride,
+                    _CAKE_UNBOUNDED_HEAD_DIM,
+                    1,
+                )
+                q = torch.as_strided(
+                    qkv_rows,
+                    qkv_shape,
+                    qkv_strides,
+                    storage_offset=qkv_rows.storage_offset(),
+                )
+                k = torch.as_strided(
+                    qkv_rows,
+                    qkv_shape,
+                    qkv_strides,
+                    storage_offset=qkv_rows.storage_offset() + head_width,
+                )
+                v = torch.as_strided(
+                    qkv_rows,
+                    qkv_shape,
+                    qkv_strides,
+                    storage_offset=qkv_rows.storage_offset() + 2 * head_width,
+                )
                 raw_gate = self._cake_packed_row_view(
                     a,
                     batch_size=batch_size,

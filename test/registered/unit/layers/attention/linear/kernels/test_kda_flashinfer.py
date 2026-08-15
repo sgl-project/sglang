@@ -661,9 +661,12 @@ class TestCakeKDAIndexedStateAdapter(CustomTestCase):
         self.assertEqual(len(calls), 1)
         call = calls[0]
         self.assertTrue(call["use_gate_in_kernel"])
+        self.assertTrue(call["beta_is_logit"])
         self.assertIsNone(call["lower_bound"])
         self.assertEqual(call["g"].data_ptr(), inputs["a"].data_ptr())
         self.assertEqual(call["g"].stride(0), inputs["a"].stride(0))
+        self.assertEqual(call["beta"].data_ptr(), inputs["b"].data_ptr())
+        self.assertEqual(call["beta"].stride(0), inputs["b"].stride(0))
         self.assertEqual(call["A_log"].data_ptr(), A_log.data_ptr())
         self.assertEqual(call["dt_bias"].data_ptr(), dt_bias.data_ptr())
         self.assertIs(call["initial_state"], state_pool)

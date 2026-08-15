@@ -461,9 +461,20 @@ def test_kda_decode_cake_native_unbounded_kimi_linear_h32_matches_triton(
     call = recurrent_calls[0]
     assert call["backend"] == "cake"
     assert call["use_gate_in_kernel"]
+    assert call["use_qk_l2norm_in_kernel"]
+    assert call["beta_is_logit"]
     assert call["lower_bound"] is None
+    packed_row_stride = d["mixed_qkv"].stride(0)
+    assert call["q"].data_ptr() == d["mixed_qkv"].data_ptr()
+    assert call["k"].data_ptr() == d["mixed_qkv"].data_ptr() + gate_width * 2
+    assert call["v"].data_ptr() == d["mixed_qkv"].data_ptr() + 2 * gate_width * 2
+    assert call["q"].stride(0) == packed_row_stride
+    assert call["k"].stride(0) == packed_row_stride
+    assert call["v"].stride(0) == packed_row_stride
     assert call["g"].data_ptr() == d["a"].data_ptr()
     assert call["g"].stride(0) == d["a"].stride(0)
+    assert call["beta"].data_ptr() == d["b"].data_ptr()
+    assert call["beta"].stride(0) == d["b"].stride(0)
     assert call["initial_state"].data_ptr() == state_cake.data_ptr()
     assert call["ssm_state_indices"].data_ptr() == d["cache_indices"].data_ptr()
     torch.testing.assert_close(output_cake, output_ref, atol=1e-2, rtol=1e-2)
