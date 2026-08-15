@@ -282,6 +282,7 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
                     nominal_capability.assert_called_once_with(None)
                 else:
                     nominal_capability.assert_not_called()
+
     def test_helion_backend_reports_kda_only(self):
         cases = (
             (LinearAttnKernelBackend.HELION, LinearAttnKernelBackend.TRITON),
