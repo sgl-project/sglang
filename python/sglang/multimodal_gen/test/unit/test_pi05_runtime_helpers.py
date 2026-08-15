@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from functools import partial
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,11 +9,8 @@ from torch import nn
 
 import sglang.multimodal_gen.runtime.models.vlas.pi05_policy as pi05_policy_module
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
-from sglang.multimodal_gen.runtime.models.vlas.pi05_core import (
-    Pi05CoreModel,
-    Pi05SiglipAttention,
-    patch_siglip_vision_attention_to_native,
-)
+from sglang.multimodal_gen.runtime.models.encoders.siglip import SiglipVisionModel
+from sglang.multimodal_gen.runtime.models.vlas.pi05_core import Pi05CoreModel
 from sglang.multimodal_gen.runtime.models.vlas.pi05_policy import (
     Pi05CheckpointManifest,
     Pi05PolicyModel,
@@ -183,30 +181,30 @@ def test_action_parallel_info_reports_single_rank_without_process_group():
     }
 
 
-class _FakeSiglipAttention(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.embed_dim = 8
-        self.num_heads = 2
-        self.head_dim = 4
-        self.scale = self.head_dim**-0.5
-        self.dropout = 0.0
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
+def test_siglip_non_tp_model_keeps_transformers_checkpoint_names():
+    config = SimpleNamespace(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        layer_norm_eps=1e-6,
+        image_size=4,
+        patch_size=2,
+        num_channels=3,
+    )
+    model = SiglipVisionModel(
+        config,
+        activation_factory=partial(nn.GELU, approximate="tanh"),
+        tensor_parallel=False,
+    )
 
-
-def test_siglip_attention_patch_uses_native_wrapper_once():
-    layer = SimpleNamespace(self_attn=_FakeSiglipAttention())
-    vision_model = SimpleNamespace(encoder=SimpleNamespace(layers=[layer]))
-
-    patch_siglip_vision_attention_to_native(vision_model)
-    first = layer.self_attn
-    patch_siglip_vision_attention_to_native(vision_model)
-
-    assert isinstance(first, Pi05SiglipAttention)
-    assert layer.self_attn is first
+    state_keys = set(model.state_dict())
+    prefix = "vision_model.encoder.layers.0.self_attn"
+    assert f"{prefix}.q_proj.weight" in state_keys
+    assert f"{prefix}.k_proj.weight" in state_keys
+    assert f"{prefix}.v_proj.weight" in state_keys
+    assert not any("qkv_proj" in key for key in state_keys)
+    assert model.layer_names == ["vision_model.encoder.layers"]
 
 
 def test_prefix_language_embedding_matches_openpi_scale():
