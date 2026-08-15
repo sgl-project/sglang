@@ -100,26 +100,6 @@ Use the model's Diffusers pipeline, official implementation, or
 If the new model is close to Flux, Qwen-Image, GLM-Image, Wan, HunyuanVideo, or
 LTX, extend that implementation before starting from an empty file.
 
-## Native support completion criteria
-
-Single-GPU numerical parity is the first milestone, not the definition of
-complete native support. A new native model must integrate with the shared
-parallelism and memory-management paths below. The Diffusers backend remains a
-compatibility-first option and is not expected to satisfy this contract.
-
-| Module | Required integration |
-| --- | --- |
-| Text, image, and conditioning encoders | TP through SGLang distributed layers; SP through `USPAttention`; layerwise offload for every repeated block stack. |
-| DiT, transformer, or diffusion policy expert | TP through SGLang distributed layers; SP through `USPAttention`; layerwise offload for every repeated block stack. |
-| VAE decoder | `ParallelTiledVAE` (or an existing native base that already provides the same contract), tiled decode, decode-group spatial sharding, and layerwise offload. |
-| Other loaded neural modules | Reuse the applicable TP/SP primitives when transformer-based and expose every repeated block stack to layerwise offload. This includes adapters, bridges, vocoders, and upsamplers. |
-
-Do not silently replicate a full encoder or DiT when the user requests TP or SP.
-Do not count coarse component CPU offload as layerwise-offload support. If a
-checkpoint component cannot meet one of these requirements, document the gap in
-the model PR and compatibility matrix instead of presenting the port as complete
-native support.
-
 ## Choose a Pipeline Shape
 
 SGLang-Diffusion uses `ComposedPipelineBase` to wire stages together. Most
@@ -376,85 +356,31 @@ Required fields for `DenoisingStage`:
 | `batch.num_inference_steps` | Number of denoising iterations. |
 | `batch.raw_latent_shape` | Original latent shape before packing, if decode needs it. |
 
-### 5. Encoder and denoising modules
+### 5. Distributed and memory integration
 
-Add a file under `runtime/models/dits/` only when the architecture is new. Reuse
-existing encoders, VAEs, schedulers, normalization layers, and fused kernels
-whenever possible.
+Single-GPU parity is only the first milestone. Complete native support also
+requires:
 
-After the single-GPU path is correct, implement TP and SP for every
-transformer-based encoder and denoising module. TP and SP are independent
-requirements and must also compose when both are enabled.
+- **Encoder and DiT TP/SP:** use native parallel projections and sharded weight
+  loading for TP, and `USPAttention` for SP. Handle masks, RoPE, padding, and
+  output gathering without falling back to a replicated full model. TP and SP
+  must work together.
+- **VAE parallel decode:** subclass `ParallelTiledVAE`, or reuse an existing
+  native base with the same contract. Support tiled and `spatial_shard` decode
+  through `DecodingStage` and the shared decode group. Reuse
+  `runtime/layers/parallel_conv.py` and
+  `runtime/models/vaes/parallel/diffusers_spatial.py` where applicable.
+- **Layerwise offload:** every loaded neural module must inherit
+  `LayerwiseOffloadableModuleMixin` and list all repeated block paths in
+  `layer_names`. Set `layerwise_offload_dit_group_enabled = False` for non-DiT
+  modules. Component CPU offload is not a substitute.
 
-- **Tensor parallelism:** replace full-rank attention and MLP projections with
-  the native distributed layers such as `QKVParallelLinear`,
-  `MergedColumnParallelLinear`, `ColumnParallelLinear`, and
-  `RowParallelLinear`. Implement sharded checkpoint loading for the same layout;
-  do not load full weights on every TP rank and gather them around each block.
-- **Sequence parallelism:** route the module's main attention paths through
-  `USPAttention`. Keep hidden states sequence-sharded outside attention and pass
-  the local `[B, S_local, H_local, D]` Q/K/V layout into USP. The model remains
-  responsible for padding and unpadding, RoPE indices, masks, packed sequences,
-  and replicated prefix or suffix metadata.
-- **Composition:** validate head divisibility after TP, sequence divisibility,
-  output gathering, and the combined TP x SP process groups. A TP-only module
-  or an SP path that falls back to replicated full-rank execution is incomplete.
-- **Encoders:** apply the same contract to text, image, and conditioning
-  encoders. Reusing a third-party encoder whose projections or attention bypass
-  the native distributed layers does not provide complete native support.
+See `wanvideo.py` and `qwen_image.py` for DiT TP/SP, `gemma_3.py` for encoder TP
+and offload, and `autoencoder_kl_qwenimage.py` or `ltx_2_vae.py` for VAE decode.
+The Diffusers backend is compatibility-first and does not need to meet this
+native integration contract.
 
-Useful references:
-
-- `runtime/models/dits/wanvideo.py` for TP plus SP.
-- `runtime/models/dits/qwen_image.py` for USP attention.
-- `runtime/models/encoders/gemma_3.py` for encoder TP and layerwise offload.
-- `runtime/layers/attention/layer.py` for the `USPAttention` contract and
-  supported Ulysses, Ring, and K/V-gather paths.
-
-### 6. VAE decoder
-
-A new native VAE decoder must subclass `ParallelTiledVAE`. The only exception is
-extending an existing native VAE base that already implements the same
-`VAEConfig`, tiling, decode-group, spatial-shard, and layerwise-offload contract.
-Do not add a standalone model-specific decode path.
-
-- Preserve ordinary decode and tiled decode before enabling distributed decode.
-- Integrate `spatial_shard` through the decode parallel group. Split the latent
-  height, use spatial-parallel convolution and the required halo exchange or
-  global-operation gather, then gather and trim the final output.
-- Use the helpers in `runtime/layers/parallel_conv.py` and, for Diffusers-style
-  2D decoders, `runtime/models/vaes/parallel/diffusers_spatial.py`. Add a narrow
-  model-specific equivalent only when the shared installer cannot express the
-  decoder topology.
-- Make `auto`, `tiled`, and `spatial_shard` dispatch through the VAE config. Do
-  not hard-code a parallel mode in pipeline wiring.
-- Keep the decoder compatible with `DecodingStage` and its decode parallel
-  group; do not create a second model-specific process-group lifecycle.
-
-Useful references include `autoencoder_kl_qwenimage.py`, `ltx_2_vae.py`,
-`hunyuanvae.py`, and `wanvae.py`.
-
-### 7. Layerwise offload for every module
-
-Every loaded neural module must expose its repeated layer or block stacks to the
-shared layerwise-offload manager. This applies to encoders, every DiT, the VAE
-encoder and decoder, and auxiliary neural modules owned by the pipeline.
-
-- Inherit `LayerwiseOffloadableModuleMixin`, directly or through a shared base
-  such as `TextEncoder`, `ImageEncoder`, or `ParallelTiledVAE`.
-- Set `layer_names` to every real `ModuleList` or `Sequential` block path. A
-  mixin with empty or incorrect paths only logs that no offloadable layers were
-  found and does not satisfy this requirement.
-- Set `layerwise_offload_dit_group_enabled = False` on non-DiT modules so legacy
-  DiT residency and prefetch tuning does not leak into auxiliary components.
-- Preserve layerwise hooks across TP/FSDP weight loading, quantization, compile
-  warmup, and repeated requests. Component-level CPU offload is a separate
-  fallback, not a substitute.
-- Verify explicit component selectors and `--layerwise-offload-components all`;
-  each expected block stack should install an offload manager and retain output
-  parity with resident execution.
-
-### 8. Registry
+### 6. Registry
 
 Register the family once the sampling params and pipeline config exist.
 
@@ -479,17 +405,13 @@ implementation.
    content.
 2. Compare latent scale and shift, timestep order, sigma values, and conditioning
    kwargs against Diffusers or the official implementation.
-3. Verify VAE decode and post-processing separately from denoising.
-4. Run encoder and DiT TP, SP, and combined TP x SP cases. Exercise the USP
-   attention path rather than accepting replicated fallback behavior.
-5. Run VAE tiled decode and multi-GPU `spatial_shard` decode, and compare each
-   output with single-GPU decode before measuring performance.
-6. Run layerwise offload for every loaded neural component and confirm that each
-   declared `layer_names` path installs a manager and survives repeated
-   requests.
-7. If the model supports LoRA, CFG parallelism, or disaggregation, test each
+3. Compare VAE decode separately, including tiled and multi-GPU `spatial_shard`.
+4. Run encoder and DiT TP, SP, combined TP x SP, and
+   `--layerwise-offload-components all`; compare with the single-GPU resident
+   baseline.
+5. If the model supports LoRA, CFG parallelism, or disaggregation, test each
    feature explicitly.
-8. Add or update docs, examples, or the compatibility matrix when users need a
+6. Add or update docs, examples, or the compatibility matrix when users need a
    new launch command.
 
 Common failure points:
@@ -512,11 +434,5 @@ Common failure points:
       `_class_name` when applicable.
 - [ ] Confirmed `_required_config_modules` matches the model repo.
 - [ ] Verified image or video quality against a reference output.
-- [ ] Implemented and tested TP and USP-based SP for every transformer-based
-      encoder and DiT, including a combined TP x SP case.
-- [ ] Integrated the VAE decoder with `ParallelTiledVAE` behavior and tested
-      tiled plus multi-GPU `spatial_shard` decode.
-- [ ] Exposed every loaded neural module's repeated block stacks through
-      `LayerwiseOffloadableModuleMixin.layer_names` and tested explicit and
-      `all` component selection.
+- [ ] Completed the distributed and memory integration checks above.
 - [ ] Tested CFG parallelism and distributed serving paths when they apply.
