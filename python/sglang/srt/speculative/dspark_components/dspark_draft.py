@@ -173,6 +173,11 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        self._num_token_non_padded = (
+            torch.empty((1,), dtype=torch.int32, device=self.draft_model_runner.device)
+            if enable_num_token_non_padded()
+            else None
+        )
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -377,6 +382,13 @@ class DraftBlockProposer:
     def _fill_dp_moe_sync_metadata(
         self, forward_batch: ForwardBatch, batch: ScheduleBatch
     ) -> None:
+        forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
+        device = self.draft_model_runner.device
+        num_tokens = forward_batch.input_ids.numel()
+        if self._num_token_non_padded is not None:
+            self._num_token_non_padded.fill_(num_tokens)
+            forward_batch.num_token_non_padded = self._num_token_non_padded
+        forward_batch.num_token_non_padded_cpu = num_tokens
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
         gnt, gnt_logprob = spec_scale_global_num_tokens(
@@ -384,14 +396,7 @@ class DraftBlockProposer:
             batch.global_num_tokens,
             batch.global_num_tokens_for_logprob,
         )
-        device = self.draft_model_runner.device
         forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
-        num_tokens = forward_batch.input_ids.numel()
-        if enable_num_token_non_padded():
-            forward_batch.num_token_non_padded = torch.tensor(
-                num_tokens, dtype=torch.int32, device=device
-            )
-        forward_batch.num_token_non_padded_cpu = num_tokens
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
         forward_batch.global_num_tokens_gpu = torch.tensor(gnt, dtype=torch.int64).to(
@@ -400,4 +405,3 @@ class DraftBlockProposer:
         forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
             gnt_logprob, dtype=torch.int64
         ).to(device, non_blocking=True)
-        forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
