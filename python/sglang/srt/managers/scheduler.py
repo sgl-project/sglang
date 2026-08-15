@@ -1893,20 +1893,25 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                if self.rust_server is not None:
-                    # Embedded Rust server: every control-request response goes
-                    # back through the egress ring (the zmq tokenizer socket is
-                    # not consumed); the Rust api_server shapes it per-endpoint.
-                    self.rust_server.push_control_output(recv_req, output)
-                elif isinstance(output, RpcReqOutput):
-                    if self.ipc_channels.recv_from_rpc is not None:
-                        sock_send(self.ipc_channels.recv_from_rpc, output)
-                else:
-                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+                self.send_control_output(recv_req, output)
 
         self.flush_wrapper.check_pending()
+        self.profiler_manager.check_pending_flush()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+
+    def send_control_output(self, recv_req, output) -> None:
+        """Answer a control request, now or once a deferred handler completes."""
+        if self.rust_server is not None:
+            # Embedded Rust server: every control-request response goes
+            # back through the egress ring (the zmq tokenizer socket is
+            # not consumed); the Rust api_server shapes it per-endpoint.
+            self.rust_server.push_control_output(recv_req, output)
+        elif isinstance(output, RpcReqOutput):
+            if self.ipc_channels.recv_from_rpc is not None:
+                sock_send(self.ipc_channels.recv_from_rpc, output)
+        else:
+            self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
     def _materialize_cuda_vmm_inputs(self, recv_req):
         """Release VMM slices before request handling can reject the request."""
@@ -1935,6 +1940,7 @@ class Scheduler(
             ps=self.ps,
             dp_tp_cpu_group=self.dp_tp_cpu_group,
             get_forward_ct=lambda: self.forward_ct,
+            send_response=self.send_control_output,
         )
 
     def init_weight_updater(self) -> None:
@@ -5082,4 +5088,7 @@ def run_scheduler_process(
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
+                # The loop above has stopped polling, so a trace still being
+                # written has to be waited for here to answer its /stop_profile.
+                scheduler.profiler_manager.drain_pending_flushes()
                 scheduler.release_host_resources()
