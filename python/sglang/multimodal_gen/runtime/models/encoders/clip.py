@@ -162,6 +162,7 @@ class CLIPAttention(nn.Module):
             )
         self.scale = self.head_dim**-0.5
         self.dropout = config.attention_dropout
+        self.causal = isinstance(config, CLIPTextConfig)
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size=self.embed_dim,
@@ -186,7 +187,7 @@ class CLIPAttention(nn.Module):
             self.head_dim,
             self.num_heads_per_partition,
             softmax_scale=self.scale,
-            causal=True,
+            causal=self.causal,
             supported_attention_backends=config._supported_attention_backends,
         )
 
@@ -246,7 +247,7 @@ class CLIPAttention(nn.Module):
                     key_states,
                     value_states,
                     attn_mask=None,
-                    is_causal=True,
+                    is_causal=self.causal,
                     scale=self.scale,
                 )
             else:
@@ -269,7 +270,7 @@ class CLIPAttention(nn.Module):
                     key_states,
                     value_states,
                     attn_mask=attn_mask,
-                    is_causal=attention_mask is None,
+                    is_causal=self.causal and attention_mask is None,
                     scale=self.scale,
                 )
             attn_output = attn_output.transpose(1, 2)

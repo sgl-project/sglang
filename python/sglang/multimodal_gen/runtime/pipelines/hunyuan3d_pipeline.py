@@ -283,6 +283,28 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         return component.eval()
 
     @classmethod
+    def _load_conditioner(
+        cls,
+        cfg: dict[str, Any],
+        weights: dict[str, torch.Tensor] | None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> nn.Module:
+        if "target" not in cfg:
+            raise KeyError("Expected key 'target' in conditioner config.")
+        target_cls = cls._resolve_class(cfg["target"])
+        params = cfg.get("params", {})
+
+        with set_default_torch_dtype(dtype):
+            conditioner = target_cls(**params)
+
+        if weights is not None:
+            conditioner.load_weights(weights.items())
+
+        conditioner.to(device=device, dtype=dtype)
+        return conditioner.eval()
+
+    @classmethod
     def _instantiate_component(cls, cfg: dict[str, Any]) -> Any:
         """Instantiate a lightweight component (scheduler / image_processor) without weights."""
         if "target" not in cfg:
@@ -337,7 +359,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
             model_config["vae"], ckpt.get("vae"), device, dtype
         )
 
-        components["hy3dshape_conditioner"] = self._load_simple_component(
+        components["hy3dshape_conditioner"] = self._load_conditioner(
             model_config["conditioner"], ckpt.get("conditioner"), device, dtype
         )
 
