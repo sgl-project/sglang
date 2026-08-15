@@ -2323,9 +2323,7 @@ class DeepseekV4AttnBackend(
                 buf[:sum_q].copy_(src)
             return buf[:sum_q]
 
-        swa_indices = _tile_padded_pf(
-            -1, swa_page_indices[:sum_q], width=SWA_WINDOW
-        )
+        swa_indices = _tile_padded_pf(-1, swa_page_indices[:sum_q], width=SWA_WINDOW)
         assert swa_indices.shape == (sum_q, SWA_WINDOW), f"{swa_indices.shape=}"
         if extra_indices is None:
             # SWA-only (compress_ratio == 0) layer. SWA_WINDOW satisfies the

@@ -177,6 +177,28 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
                 server_args.speculative_eagle_topk == 1
             ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
 
+    # TEMPORARY containment: trtllm + speculative + DP attention under the
+    # overlap scheduler intermittently corrupts an int32 table consumed by
+    # the trtllm-gen sparse kernel (illegal memory access in
+    # fmhaSm100fKernel...VarSeq during concurrent GSM8K-style bursts,
+    # ~1 in 2-20 bursts). The corruption reproduces ONLY with overlap AND
+    # speculation both enabled (10/10 crashing runs vs 20/20 clean with
+    # either disabled); root cause is still under investigation. Disable
+    # overlap scheduling for exactly this configuration until it is fixed.
+    if (
+        server_args.dsv4_attn_backend == "trtllm"
+        and server_args.speculative_algorithm is not None
+        and server_args.enable_dp_attention
+        and not server_args.disable_overlap_schedule
+    ):
+        logger.warning(
+            "Disabling the overlap scheduler for the trtllm DeepSeek-V4 "
+            "backend with speculative decoding + DP attention (temporary "
+            "containment for an intermittent trtllm-gen kernel memory fault; "
+            "see the dsv4 trtllm PR discussion)."
+        )
+        server_args.disable_overlap_schedule = True
+
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
