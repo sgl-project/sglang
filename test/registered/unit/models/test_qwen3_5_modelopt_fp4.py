@@ -11,13 +11,17 @@ Covers three things:
 """
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER
+from sglang.srt.models.qwen3_5 import (
+    QWEN3_5_KV_SCALE_MAPPER,
+    _load_unregistered_lm_head_weight_scale,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -151,6 +155,60 @@ class TestQwen3_5KvScaleMapper(CustomTestCase):
         weight_loader(scale_param, loaded_weight)
 
         self.assertAlmostEqual(scale_param.item(), 0.0347, places=6)
+
+
+class TestQwen3_5UnregisteredLmHeadScale(CustomTestCase):
+    def test_dequantizes_the_local_vocab_shard_in_place(self):
+        weight = torch.nn.Parameter(
+            torch.tensor(
+                [[10.0, -20.0], [30.0, -40.0], [50.0, -60.0]],
+                dtype=torch.bfloat16,
+            ),
+            requires_grad=False,
+        )
+        model = SimpleNamespace(
+            lm_head=SimpleNamespace(
+                shard_indices=SimpleNamespace(
+                    org_vocab_start_index=2,
+                    org_vocab_end_index=5,
+                )
+            )
+        )
+        params = {"lm_head.weight": weight}
+        scale = torch.tensor([[0.1], [0.2], [0.3], [0.4], [0.5]])
+
+        consumed = _load_unregistered_lm_head_weight_scale(
+            model, params, "lm_head.weight_scale", scale
+        )
+
+        self.assertTrue(consumed)
+        torch.testing.assert_close(
+            weight.float(),
+            torch.tensor([[3.0, -6.0], [12.0, -16.0], [25.0, -30.0]]),
+            rtol=0.01,
+            atol=0.01,
+        )
+
+    def test_registered_quantization_scale_uses_the_normal_loader(self):
+        params = {
+            "lm_head.weight": torch.nn.Parameter(torch.ones(2, 2)),
+            "lm_head.weight_scale": torch.nn.Parameter(torch.ones(2, 1)),
+        }
+        model = SimpleNamespace(
+            lm_head=SimpleNamespace(
+                shard_indices=SimpleNamespace(
+                    org_vocab_start_index=0,
+                    org_vocab_end_index=2,
+                )
+            )
+        )
+
+        consumed = _load_unregistered_lm_head_weight_scale(
+            model, params, "lm_head.weight_scale", torch.full((2, 1), 0.5)
+        )
+
+        self.assertFalse(consumed)
+        torch.testing.assert_close(params["lm_head.weight"], torch.ones(2, 2))
 
 
 if __name__ == "__main__":

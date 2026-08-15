@@ -2505,7 +2505,9 @@ class Scheduler(
         if self.spec_algorithm.is_dflash_family():
             error_msg = (
                 "DSpark speculative decoding does not support return_logprob yet."
-                if self.spec_algorithm.is_dspark() and req.return_logprob
+                if self.spec_algorithm.is_dspark()
+                and req.return_logprob
+                and not req.is_prefill_only
                 else validate_dflash_request(req, self.enable_overlap)
             )
             if error_msg is not None:
@@ -3743,7 +3745,10 @@ class Scheduler(
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None
 
-                if not batch.spec_algorithm.is_none():
+                if (
+                    not batch.spec_algorithm.is_none()
+                    and batch_result.next_draft_input is not None
+                ):
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_dsa_topk_indices_available = (
                         batch.spec_info.dsa_topk_indices is not None

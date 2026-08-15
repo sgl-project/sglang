@@ -1262,6 +1262,50 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
 )
 
 
+def _load_unregistered_lm_head_weight_scale(
+    model: nn.Module,
+    params_dict: dict[str, torch.nn.Parameter],
+    name: str,
+    loaded_scale: torch.Tensor,
+) -> bool:
+    """Dequantize an FP8 LM head when its quant scheme falls back to BF16.
+
+    Some compressed-tensors checkpoints store the LM head as an FP8 tensor
+    plus a per-output-channel ``lm_head.weight_scale``.  If the selected
+    compressed-tensors method is unsupported for ``ParallelLMHead``, it falls
+    back to an unquantized parameter and therefore does not register the scale.
+    The ordinary weight loader has already copied the FP8 values into that
+    BF16/FP16 parameter by the time the scale is yielded.  Apply the missing
+    scale in place instead of silently dropping it and producing logits that
+    are thousands of times too large.
+
+    Return ``True`` only when the scale was consumed here.  A quantized LM head
+    that registered its own scale continues through the normal weight loader.
+    """
+    if name != "lm_head.weight_scale" or name in params_dict:
+        return False
+
+    weight = params_dict.get("lm_head.weight")
+    lm_head = getattr(model, "lm_head", None)
+    shard_indices = getattr(lm_head, "shard_indices", None)
+    if weight is None or shard_indices is None:
+        return False
+
+    scale = loaded_scale.reshape(-1)
+    start = shard_indices.org_vocab_start_index
+    end = shard_indices.org_vocab_end_index
+    if scale.numel() < end:
+        raise ValueError(
+            "lm_head.weight_scale is too short for this vocabulary shard: "
+            f"scale rows={scale.numel()}, requested=[{start}:{end}]"
+        )
+
+    local_scale = scale[start:end].to(device=weight.device, dtype=weight.dtype)
+    with torch.no_grad():
+        weight[: end - start].mul_(local_scale[:, None])
+    return True
+
+
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
@@ -1908,6 +1952,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 # print(name, loaded_weight.shape)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if _load_unregistered_lm_head_weight_scale(
+                    self, params_dict, name, loaded_weight
+                ):
+                    loaded_params.add(name)
                     continue
                 if name not in params_dict:
                     logger.warning(f"Parameter {name} not found in params_dict")

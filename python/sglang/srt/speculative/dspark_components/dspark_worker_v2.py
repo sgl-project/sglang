@@ -412,9 +412,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
     ) -> GenerationBatchResult:
         if getattr(batch, "return_logprob", False):
-            raise ValueError(
-                "DSpark speculative decoding does not support return_logprob yet."
+            if not batch.is_prefill_only:
+                raise ValueError(
+                    "DSpark speculative decoding does not support return_logprob yet."
+                )
+
+            # A prefill-only request scores fixed input tokens with the target
+            # policy. It does not generate tokens, so the draft model must not
+            # participate or mutate its state.
+            batch_output = self.target_worker.forward_batch_generation(
+                batch, capture_hidden_mode=CaptureHiddenMode.NULL
             )
+            batch_output.new_seq_lens = batch.seq_lens
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
+            return batch_output
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()

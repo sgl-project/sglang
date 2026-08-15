@@ -1211,10 +1211,13 @@ class Req(ReqDllmMixin):
     @property
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
-        # NOTE: when spec is enabled, prefill_only optimizations are disabled
-
         spec_alg = get_spec().speculative_algorithm
-        return self.sampling_params.max_new_tokens == 0 and spec_alg is None
+        supports_target_only_scoring = (
+            spec_alg == "DSPARK" and self.return_logprob
+        )
+        return self.sampling_params.max_new_tokens == 0 and (
+            spec_alg is None or supports_target_only_scoring
+        )
 
     @property
     def output_ids_through_stop(self) -> array[int]:
