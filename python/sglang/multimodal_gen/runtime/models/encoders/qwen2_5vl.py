@@ -309,8 +309,14 @@ class Qwen2_5_VLAttention(nn.Module):
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
+        # Diffusion text encoding is cache-free and historically uses the native
+        # causal kernel; its trailing padding is removed during postprocessing.
+        # Cached generation still needs the explicit mask for padded batches.
         attn_output = self.attn(
-            query_states, key_states, value_states, attn_mask=attention_mask
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attention_mask if use_cache else None,
         )
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
+import sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl as qwen2_5vl
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
 from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
     LongCatImagePipelineConfig,
@@ -11,6 +12,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageLayeredPipelineConfig,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl import (
+    Qwen2_5_VLAttention,
     Qwen2_5_VLForConditionalGeneration,
     _apply_repetition_penalty,
     _select_next_token,
@@ -50,6 +52,49 @@ class _StubQwen2_5VL(Qwen2_5_VLForConditionalGeneration):
             logits=logits,
             past_key_values=f"cache-{call_index}",
         )
+
+
+class _AttentionRecorder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.masks = []
+
+    def forward(self, query, key, value, attn_mask=None):
+        self.masks.append(attn_mask)
+        return query
+
+
+def test_explicit_attention_mask_is_limited_to_cached_generation(monkeypatch):
+    attention = Qwen2_5_VLAttention.__new__(Qwen2_5_VLAttention)
+    nn.Module.__init__(attention)
+    attention.q_proj = nn.Identity()
+    attention.k_proj = nn.Identity()
+    attention.v_proj = nn.Identity()
+    attention.o_proj = nn.Identity()
+    attention.num_heads = 1
+    attention.num_key_value_heads = 1
+    attention.head_dim = 4
+    attention.rope_scaling = {"mrope_section": [1, 1, 0]}
+    attention.attn = _AttentionRecorder()
+    monkeypatch.setattr(
+        qwen2_5vl,
+        "apply_multimodal_rotary_pos_emb",
+        lambda query, key, *_args: (query, key),
+    )
+
+    hidden_states = torch.randn(1, 2, 4)
+    explicit_mask = torch.zeros(1, 1, 2, 2)
+    kwargs = {
+        "hidden_states": hidden_states,
+        "attention_mask": explicit_mask,
+        "position_embeddings": (torch.empty(0), torch.empty(0)),
+    }
+
+    attention(**kwargs, use_cache=False)
+    attention(**kwargs, use_cache=True)
+
+    assert attention.attn.masks[0] is None
+    assert attention.attn.masks[1] is explicit_mask
 
 
 def test_repetition_penalty_matches_sign_dependent_scaling():
