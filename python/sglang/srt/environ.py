@@ -534,6 +534,7 @@ class Envs:
     # "legacy" (rectangular grid, max_extend_len-shaped).
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
+    SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
