@@ -128,12 +128,7 @@ class AttentionBackend(ABC):
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
     def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadEnds:
-        """Declare where this backend's scheduler-shared reads end per mode.
-
-        Decode/verify default to IN_REPLAY: the out-graph/in-graph init
-        contract above makes it a safe upper bound for any backend honoring
-        the contract. Override for audited deviations.
-        """
+        """Declare where this backend's scheduler-shared reads end per mode."""
         if forward_mode.is_decode() or forward_mode.is_target_verify():
             return SharedReadEnds.IN_REPLAY
         return SharedReadEnds.UNKNOWN
