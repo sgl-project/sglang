@@ -160,9 +160,11 @@ class TestMxfp4ShardedState(CustomTestCase):
                 self.assertIs(parameter, original_parameters[name])
                 self.assertTrue(parameter._sglang_keep_on_device)
                 self.assertFalse(parameter.is_contiguous())
-                self.assertIs(runtime_tensor.storage.data, parameter)
                 self.assertEqual(
                     runtime_tensor.storage.data.data_ptr(), parameter.data_ptr()
+                )
+                self.assertEqual(
+                    runtime_tensor.storage.data.stride(), parameter.stride()
                 )
 
         for name in _RUNTIME_STATE_NAMES:
@@ -192,8 +194,13 @@ class TestMxfp4ShardedState(CustomTestCase):
             destination_parameter = getattr(destination, name)
             destination_runtime_tensor = destination_runtime_tensors[name]
             self.assertFalse(destination_parameter.is_contiguous())
-            self.assertIs(
-                destination_runtime_tensor.storage.data, destination_parameter
+            self.assertEqual(
+                destination_runtime_tensor.storage.data.data_ptr(),
+                destination_parameter.data_ptr(),
+            )
+            self.assertEqual(
+                destination_runtime_tensor.storage.data.stride(),
+                destination_parameter.stride(),
             )
             self.assertTrue(
                 torch.equal(

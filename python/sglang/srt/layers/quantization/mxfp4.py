@@ -961,8 +961,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             # Rebind the existing Parameters so state exports contain the
             # tensors consumed by Triton while preserving weight-loader attrs.
-            # Point each wrapper back to the stable Parameter object so later
-            # module-level storage changes remain visible to the kernel.
+            # Keep the wrappers' original Tensor objects while sharing their
+            # backing storage with the registered Parameters.
             for name, tensor in (
                 ("w13_weight", w13_weight),
                 ("w13_weight_scale", w13_scale),
@@ -971,7 +971,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ):
                 param = getattr(layer, name)
                 param.data = tensor.storage.data
-                tensor.storage.data = param
 
             self.w13_precision_config = PrecisionConfig(
                 b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
