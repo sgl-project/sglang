@@ -277,7 +277,7 @@ jobs:
             prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
-      runner: linux-amd64-cpu-8
+      runner: linux-amd64-cpu-4
       test_type: ${{ matrix.test_config.test_type || 'perf' }}
       test_config_name: ${{ matrix.test_config.name }}
       prefill_size: ${{ matrix.test_config.prefill_size }}
@@ -310,7 +310,7 @@ jobs:
             test_type: 'accuracy'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
-      runner: linux-amd64-cpu-8
+      runner: linux-amd64-cpu-4
       test_type: ${{ matrix.test_config.test_type || 'perf' }}
       test_config_name: ${{ matrix.test_config.name }}
       node_size: ${{ matrix.test_config.node_size }}
