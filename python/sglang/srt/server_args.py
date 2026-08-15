@@ -337,11 +337,6 @@ def resolve_encoder_transfer_backend(
     return "zmq_to_scheduler"
 
 
-DSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
-NSA_PREFILL_CP_SPLIT_CHOICES = DSA_PREFILL_CP_SPLIT_CHOICES  # deprecated alias
-
-PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
-
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
 DSA_CHOICES = [
@@ -1125,12 +1120,6 @@ class ServerArgs:
         "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory. Currently only supported with the mooncake transfer backend (mooncake / mooncake_tcp); mori/nixl support will be added later by the community.",
         NS("parallel"),
     ] = False
-    enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True), NS("parallel")] = (
-        False
-    )
-    dsa_prefill_cp_mode: A[str, Arg(no_cli=True), NS("parallel")] = "round-robin-split"
-    enable_prefill_context_parallel: A[bool, Arg(no_cli=True), NS("parallel")] = False
-    prefill_cp_mode: A[str, Arg(no_cli=True), NS("parallel")] = "in-seq-split"
     enable_cp_decode_attn_tp: A[
         bool,
         "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
@@ -3581,9 +3570,6 @@ class ServerArgs:
         # Validate PD disaggregation flags before CUDA graph config.
         self._handle_pd_disaggregation()
 
-        # Normalize deprecated CP aliases before validations or model-specific
-        # defaults inspect enable_prefill_cp/cp_strategy.
-        self._handle_legacy_cp_arguments()
         self._validate_prefill_only_disable_kv_cache_args()
         self._handle_dcp_validation()
 
@@ -3655,10 +3641,6 @@ class ServerArgs:
 
         # Normalize load balancing defaults.
         self._handle_load_balance_method()
-
-        # Re-apply after model-specific defaults resolve attention_backend so
-        # canonical CP mirrors to the right legacy runtime aliases.
-        self._handle_legacy_cp_arguments()
 
         # Handle context parallelism.
         self._handle_context_parallelism()
@@ -4575,7 +4557,7 @@ class ServerArgs:
             ("CUDA graph debug mode", lambda: self.debug_cuda_graph),
             (
                 "DSA prefill context parallelism",
-                lambda: self.enable_dsa_prefill_context_parallel,
+                lambda: self.enable_prefill_cp,
             ),
             # Capture builds a dummy extend forward with attn_dcp_metadata=None.
             (
@@ -6379,100 +6361,30 @@ class ServerArgs:
                     self.mamba_ssm_dtype,
                 )
 
-    def _handle_legacy_cp_arguments(self):
-        legacy_mode_to_strategy = {
-            "in-seq-split": "zigzag",
-            "round-robin-split": "interleave",
-        }
-        strategy_to_legacy_mode = {
-            "zigzag": "in-seq-split",
-            "interleave": "round-robin-split",
-        }
-
-        if (
-            self.enable_prefill_context_parallel
-            or self.enable_dsa_prefill_context_parallel
-        ):
-            self.enable_prefill_cp = True
-
-        if self.enable_prefill_context_parallel and self.cp_strategy is None:
-            self.cp_strategy = legacy_mode_to_strategy[self.prefill_cp_mode]
-        if self.enable_dsa_prefill_context_parallel and self.cp_strategy is None:
-            self.cp_strategy = legacy_mode_to_strategy[self.dsa_prefill_cp_mode]
-
-        if (
-            self.enable_prefill_context_parallel
-            and self.enable_dsa_prefill_context_parallel
-        ):
-            return
-
-        if not self.enable_prefill_cp or self.cp_strategy is None:
-            return
-
-        mode = strategy_to_legacy_mode[self.cp_strategy]
-        use_dsa_legacy_aliases = self.enable_dsa_prefill_context_parallel or getattr(
-            self._resolved(), "attention_backend", None
-        ) in ("dsa", "dsv4")
-        if use_dsa_legacy_aliases:
-            self.enable_dsa_prefill_context_parallel = True
-            self.enable_prefill_context_parallel = False
-        else:
-            self.enable_prefill_context_parallel = True
-        self.dsa_prefill_cp_mode = mode
-        self.prefill_cp_mode = mode
-
     def _handle_context_parallelism(self):
-        if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
-            from sglang.srt.configs.model_config import is_deepseek_dsa
-            from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
-
+        if (
+            self.enable_prefill_cp
+            and parse_connector_type(self.model_path) != ConnectorType.INSTANCE
+        ):
             model_config = self.get_model_config()
             hf_config = model_config.hf_config
             model_arch = hf_config.architectures[0]
-            if model_arch in CP_V2_DEFAULT_MODEL_CLASSES:
-                is_dsa_default_model = is_deepseek_dsa(hf_config)
-                # DSA CP-v2 currently supports only the interleave strategy.
-                enable_default_cp_v2 = not is_dsa_default_model or (
-                    self.enable_prefill_cp and self.cp_strategy == "interleave"
-                )
-                if enable_default_cp_v2 and not envs.SGLANG_ENABLE_CP_V2.is_set():
-                    envs.SGLANG_ENABLE_CP_V2.set(True)
-
-            if (
-                self.enable_prefill_cp
-                and model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
-                and envs.SGLANG_ENABLE_CP_V2.get()
-            ):
+            if model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
                 if self.cp_strategy != "zigzag":
-                    raise ValueError(
-                        "MiMo V2 CP-v2 only supports --cp-strategy zigzag."
-                    )
+                    raise ValueError("MiMo V2 CP only supports --cp-strategy zigzag.")
                 if (
                     model_config.is_multimodal
                     and not self.language_only
                     and not self.language_model_only
                 ):
                     raise ValueError(
-                        "MiMo V2 CP-v2 only supports text inference; add "
+                        "MiMo V2 CP only supports text inference; add "
                         "--language-only."
                     )
 
         if self.enable_prefill_cp and self.cp_strategy is None:
             raise ValueError(
                 "--cp-strategy must be set when --enable-prefill-cp is enabled."
-            )
-
-        if (
-            self.enable_prefill_context_parallel
-            and self.enable_dsa_prefill_context_parallel
-        ):
-            raise ValueError(
-                "--enable-prefill-context-parallel and "
-                "--enable-nsa-prefill-context-parallel are mutually "
-                "exclusive. Use --enable-nsa-prefill-context-parallel for "
-                "DeepSeek V3.2 (NSA) models and "
-                "--enable-prefill-context-parallel for MLA-based models "
-                "(DeepSeek V3/R1, Kimi K2.5) or MHA/GQA-based models."
             )
 
         view = self._resolved()
@@ -8711,69 +8623,11 @@ class ServerArgs:
             help="Deprecated alias for --cuda-graph-max-bs-prefill.",
         )
         parser.add_argument(
-            "--enable-dsa-prefill-context-parallel",
-            dest="enable_dsa_prefill_context_parallel",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--enable-prefill-cp",
-            help="[Deprecated] Use --enable-prefill-cp instead.",
-        )
-        parser.add_argument(
-            "--enable-nsa-prefill-context-parallel",
-            dest="enable_dsa_prefill_context_parallel",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--enable-prefill-cp",
-            help="[Deprecated] Use --enable-prefill-cp instead.",
-        )
-        parser.add_argument(
             "--enable-gdn-replayssm-spec",
             dest="enable_linear_replayssm_spec",
             action=DeprecatedStoreTrueAction,
             new_flag="--enable-linear-replayssm-spec",
             help="[Deprecated] Use --enable-linear-replayssm-spec instead.",
-        )
-        parser.add_argument(
-            "--enable-prefill-context-parallel",
-            dest="enable_prefill_context_parallel",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--enable-prefill-cp",
-            help="[Deprecated] Use --enable-prefill-cp instead.",
-        )
-        parser.add_argument(
-            "--dsa-prefill-cp-mode",
-            dest="dsa_prefill_cp_mode",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cp-strategy",
-            type=str,
-            default=ServerArgs.dsa_prefill_cp_mode,
-            choices=DSA_PREFILL_CP_SPLIT_CHOICES,
-            help=(
-                "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
-                "'in-seq-split' maps to 'zigzag'; 'round-robin-split' maps to "
-                "'interleave'."
-            ),
-        )
-        parser.add_argument(
-            "--nsa-prefill-cp-mode",
-            dest="dsa_prefill_cp_mode",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cp-strategy",
-            type=str,
-            default=argparse.SUPPRESS,
-            choices=DSA_PREFILL_CP_SPLIT_CHOICES,
-            help="[Deprecated] Use --cp-strategy instead.",
-        )
-        parser.add_argument(
-            "--prefill-cp-mode",
-            dest="prefill_cp_mode",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cp-strategy",
-            type=str,
-            default=ServerArgs.prefill_cp_mode,
-            choices=PREFILL_CP_SPLIT_CHOICES,
-            help=(
-                "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
-                "'in-seq-split' maps to 'zigzag'."
-            ),
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",

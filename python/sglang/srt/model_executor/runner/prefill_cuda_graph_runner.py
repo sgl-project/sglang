@@ -56,13 +56,13 @@ from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
 )
 from sglang.srt.layers.cp.bcg import (
-    enable_cp_v2_bcg_capture as should_enable_cp_v2_bcg_capture,
+    enable_cp_bcg_capture as should_enable_cp_bcg_capture,
 )
 from sglang.srt.layers.cp.bcg import (
     execute_prefill_cp_bcg,
     filter_prefill_cp_bcg_capture_num_tokens,
 )
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -353,7 +353,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._is_full_backend = False
         # Same ordering requirement: capture_prepare reads this.
         self._capture_lora = False
-        self.enable_cp_v2_bcg_capture = False
+        self.enable_cp_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
@@ -451,10 +451,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 }
 
         server_args = model_runner.server_args
-        self.enable_cp_v2_bcg_capture = isinstance(
+        self.enable_cp_bcg_capture = isinstance(
             self.backend, BreakableCudaGraphBackend
-        ) and should_enable_cp_v2_bcg_capture(server_args)
-        if self.enable_cp_v2_bcg_capture:
+        ) and should_enable_cp_bcg_capture(server_args)
+        if self.enable_cp_bcg_capture:
             self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
                 self.capture_num_tokens, server_args
             )
@@ -1116,7 +1116,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
         ):
             return False
-        if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
+        if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(
             forward_batch
         ):
             assert self.prefill_cp_bcg_input is not None
@@ -1333,7 +1333,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
-        if self.enable_cp_v2_bcg_capture:
+        if self.enable_cp_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
                 self,
@@ -1411,7 +1411,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = len(forward_batch.input_ids)
         static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
-        if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
+        if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(
             forward_batch
         ):
             assert self.prefill_cp_bcg_input is not None
@@ -1606,7 +1606,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         metadata_forward_batch = forward_batch
-        if self.enable_cp_v2_bcg_capture:
+        if self.enable_cp_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
                 self,
@@ -1762,7 +1762,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner, forward_batch, self.device_module
             )
 
-            if self.enable_cp_v2_bcg_capture:
+            if self.enable_cp_bcg_capture:
                 output = execute_prefill_cp_bcg(
                     self,
                     forward_batch,

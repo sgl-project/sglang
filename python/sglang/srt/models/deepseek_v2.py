@@ -83,7 +83,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
     maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -2804,7 +2804,7 @@ class DeepseekV2Model(nn.Module):
         use_cp_v1 = (
             dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
             or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
-        ) and not is_cp_v2_active(forward_batch)
+        ) and not is_cp_active(forward_batch)
 
         if use_cp_v1:
             if self.pp_group.is_first_rank:
@@ -3089,7 +3089,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             len_input_ids = input_embeds.shape[0]
         else:
             len_input_ids = pp_proxy_tensors["hidden_states"].shape[0]
-        if not is_cp_v2_active(forward_batch):
+        if not is_cp_active(forward_batch):
             if self.dsa_enable_prefill_cp:
                 if can_dsa_cp_split(
                     len_input_ids, self.cp_size, self.use_dsa, forward_batch

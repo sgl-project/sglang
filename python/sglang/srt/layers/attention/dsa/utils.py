@@ -17,7 +17,7 @@ from sglang.srt.runtime_context import (
     process_model_config,
 )
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
-from sglang.srt.utils.common import ceil_align, ceil_div
+from sglang.srt.utils.common import ceil_div
 
 
 @lru_cache(maxsize=1)
@@ -106,12 +106,8 @@ def should_use_dsa_fused_topk(
 
 
 def is_dsa_enable_prefill_cp():
-    if not envs.SGLANG_ENABLE_CP_V2.get():
-        return get_parallel().enable_dsa_prefill_context_parallel
-
-    # Derive from the runtime CP topology + model arch rather than the legacy
-    # flag under CP-v2: DSA prefill CP is active when the CP group is on for a
-    # DeepSeek Sparse Attention model.
+    # DSA prefill CP is active when the CP group is on for a DeepSeek Sparse
+    # Attention model.
     if get_parallel().attn_cp_size <= 1:
         return False
     from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
@@ -121,17 +117,15 @@ def is_dsa_enable_prefill_cp():
 
 
 def is_dsa_prefill_cp_in_seq_split():
-    return (
-        is_dsa_enable_prefill_cp()
-        and get_parallel().dsa_prefill_cp_mode == "in-seq-split"
-    )
+    from sglang.srt.layers.cp.base import is_zigzag
+
+    return is_dsa_enable_prefill_cp() and is_zigzag()
 
 
 def is_dsa_prefill_cp_round_robin_split():
-    return (
-        is_dsa_enable_prefill_cp()
-        and get_parallel().dsa_prefill_cp_mode == "round-robin-split"
-    )
+    from sglang.srt.layers.cp.base import is_interleave
+
+    return is_dsa_enable_prefill_cp() and is_interleave()
 
 
 # Structural surface where the graph DSA split-op dispatch (DSA indexer) and the
@@ -194,28 +188,16 @@ def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
 def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
-    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
-    from sglang.srt.layers.cp.utils import enable_cp_v2, is_cp_v2_active
+    from sglang.srt.layers.cp.utils import is_cp_active
 
-    # CP-v2 already pads each rank-local shard to its physical size
-    if is_cp_v2_active(forward_batch):
+    # CP already pads each rank-local shard to its physical size.
+    if is_cp_active(forward_batch):
         return forward_batch.attn_cp_metadata.per_rank_actual_token[
             get_parallel().attn_cp_rank
         ]
 
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
-    sync_group_size = len(global_num_tokens)
     attn_cp_size = get_parallel().attn_cp_size
-    # Must mirror ForwardBatch.prepare_mlp_sync_batch, which applies cp_align_size only when
-    # CP-v2 is disabled. Under enable_cp_v2() the speculative forwards (TARGET_VERIFY /
-    # DRAFT_EXTEND_V2) reach here with is_cp_v2_active False, and q is padded to attn_tp_size only
-    # (not cp-aligned). Applying cp_align here over-pads the flashmla metadata past q, so
-    # num_splits ends up longer than q -> fwd_kvcache_mla fails "num_splits must have shape (b+1)".
-    # (attn_cp analog of the attn_tp fix in PR #30642 / issue #30296.)
-    if not enable_cp_v2():
-        cp_align_size = get_cp_padding_align_size()
-        for i in range(sync_group_size):
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
     # Reuse the mode selected when the DP buffer was prepared.
     dp_padding_mode = forward_batch.dp_padding_mode
     if dp_padding_mode is None:
@@ -267,7 +249,7 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
         cur_cp_seq_len = seq_len // cp_size
         assert (
             seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
+        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} under interleave CP"
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,

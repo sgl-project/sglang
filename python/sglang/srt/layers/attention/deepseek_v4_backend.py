@@ -58,7 +58,7 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillWorkspace,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel, get_spec
@@ -713,8 +713,8 @@ class DeepseekV4AttnBackend(
         forward_batch: Optional[ForwardBatch] = None,
     ) -> DSV4Metadata:
         padded_num_tokens = out_cache_loc.shape[0]
-        cp_v2_active = forward_batch is not None and is_cp_v2_active(forward_batch)
-        if cp_v2_active:
+        cp_active = forward_batch is not None and is_cp_active(forward_batch)
+        if cp_active:
             cp_metadata = forward_batch.attn_cp_metadata
             assert cp_metadata is not None
             padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
@@ -738,9 +738,9 @@ class DeepseekV4AttnBackend(
             need_compress=need_compress,
             is_prefill=True,
             dspark_block_size=dspark_block_size,
-            num_tokens=num_tokens if cp_v2_active else None,
+            num_tokens=num_tokens if cp_active else None,
         )
-        if cp_v2_active:
+        if cp_active:
             core_attn_metadata.apply_cp_reindex(num_tokens=num_tokens)
             core_attn_metadata.init_flashmla_related(is_prefill=True)
         indexer_metadata = (

@@ -182,9 +182,9 @@ class ContextParallelStrategy(ABC):
         positions: Any,
         input_embeds: Optional[Any] = None,
     ) -> Optional[Any]:
-        """Shard model inputs before model.forward in CP-v2 paths."""
+        """Shard model inputs before model.forward in CP paths."""
         if input_ids is not None:
-            forward_batch.cp_v2_input_ids = self.shard_hidden_states(
+            forward_batch.cp_input_ids = self.shard_hidden_states(
                 input_ids, forward_batch
             )
         forward_batch.positions = self.shard_position_ids(positions, forward_batch)

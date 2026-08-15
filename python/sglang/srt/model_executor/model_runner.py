@@ -76,7 +76,7 @@ from sglang.srt.layers import deep_gemm_wrapper, model_parallel
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
-    is_cp_v2_active,
+    is_cp_active,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
@@ -249,8 +249,8 @@ def _prefill_cuda_graph_allows_context_parallel(
 ) -> bool:
     """Allow CP only through a runner that captured the validated CP-v2 body."""
     return get_cp_strategy() is None or (
-        bool(getattr(prefill_runner, "enable_cp_v2_bcg_capture", False))
-        and is_cp_v2_active(forward_batch)
+        bool(getattr(prefill_runner, "enable_cp_bcg_capture", False))
+        and is_cp_active(forward_batch)
     )
 
 

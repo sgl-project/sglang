@@ -814,13 +814,9 @@ class TestContextParallelServerArgs(CustomTestCase):
     def _new_cp_args(self, **overrides):
         server_args = object.__new__(ServerArgs)
         defaults = dict(
-            enable_prefill_context_parallel=False,
-            enable_dsa_prefill_context_parallel=False,
             enable_prefill_cp=False,
             cp_strategy=None,
             model_path="instance://127.0.0.1:8000/dummy",
-            dsa_prefill_cp_mode="round-robin-split",
-            prefill_cp_mode="in-seq-split",
             attn_cp_size=1,
             tp_size=1,
             dp_size=1,
@@ -847,43 +843,31 @@ class TestContextParallelServerArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "--cp-strategy"):
             server_args._handle_context_parallelism()
 
-    def test_deprecated_dsa_cp_mode_maps_to_unified_strategy(self):
+    def test_canonical_prefill_cp_surface_has_no_legacy_fields(self):
         args = self.parser.parse_args(
             [
                 "--model",
                 "dummy",
-                "--enable-dsa-prefill-context-parallel",
-                "--dsa-prefill-cp-mode",
-                "round-robin-split",
+                "--enable-prefill-cp",
+                "--cp-strategy",
+                "interleave",
             ]
         )
         server_args = self._new_cp_args(
-            enable_dsa_prefill_context_parallel=(
-                args.enable_dsa_prefill_context_parallel
-            ),
-            dsa_prefill_cp_mode=args.dsa_prefill_cp_mode,
+            enable_prefill_cp=args.enable_prefill_cp,
+            cp_strategy=args.cp_strategy,
+            attn_cp_size=2,
+            tp_size=2,
         )
 
-        server_args._handle_legacy_cp_arguments()
+        server_args._handle_context_parallelism()
 
         self.assertTrue(server_args.enable_prefill_cp)
         self.assertEqual(server_args.cp_strategy, "interleave")
-        self.assertEqual(server_args.dsa_prefill_cp_mode, "round-robin-split")
-
-    def test_canonical_interleave_cp_mirrors_to_dsa_runtime_aliases(self):
-        server_args = self._new_cp_args(
-            enable_prefill_cp=True,
-            cp_strategy="interleave",
-            attention_backend="dsa",
-        )
-
-        server_args._handle_legacy_cp_arguments()
-        server_args._handle_context_parallelism()
-
-        self.assertTrue(server_args.enable_dsa_prefill_context_parallel)
-        self.assertFalse(server_args.enable_prefill_context_parallel)
-        self.assertEqual(server_args.dsa_prefill_cp_mode, "round-robin-split")
-        self.assertEqual(server_args.prefill_cp_mode, "round-robin-split")
+        self.assertFalse(hasattr(ServerArgs, "enable_prefill_context_parallel"))
+        self.assertFalse(hasattr(ServerArgs, "enable_dsa_prefill_context_parallel"))
+        self.assertFalse(hasattr(ServerArgs, "prefill_cp_mode"))
+        self.assertFalse(hasattr(ServerArgs, "dsa_prefill_cp_mode"))
 
     def test_context_parallel_handler_initializes_cp_strategy(self):
         server_args = self._new_cp_args(
@@ -897,87 +881,6 @@ class TestContextParallelServerArgs(CustomTestCase):
 
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
-
-    def test_registered_cp_legacy_args_map_to_unified_strategy(self):
-        cases = [
-            (
-                "deepseek_v3_mla_cp",
-                dict(enable_prefill_context_parallel=True),
-                "zigzag",
-                "in-seq-split",
-                False,
-                True,
-            ),
-            (
-                "qwen3_gqa_cp",
-                dict(
-                    enable_prefill_context_parallel=True,
-                    tp_size=4,
-                    attn_cp_size=2,
-                ),
-                "zigzag",
-                "in-seq-split",
-                False,
-                True,
-            ),
-            (
-                "deepseek_v32_dsa_in_seq_split",
-                dict(
-                    enable_dsa_prefill_context_parallel=True,
-                    dsa_prefill_cp_mode="in-seq-split",
-                    tp_size=8,
-                    dp_size=2,
-                    attn_cp_size=4,
-                ),
-                "zigzag",
-                "in-seq-split",
-                True,
-                False,
-            ),
-            (
-                "deepseek_v32_dsa_round_robin_split",
-                dict(
-                    enable_dsa_prefill_context_parallel=True,
-                    tp_size=8,
-                    attn_cp_size=8,
-                ),
-                "interleave",
-                "round-robin-split",
-                True,
-                False,
-            ),
-            (
-                "deepseek_v4_flash_fp4_b200_dsa_round_robin_split",
-                dict(
-                    enable_dsa_prefill_context_parallel=True,
-                    dsa_prefill_cp_mode="round-robin-split",
-                    tp_size=4,
-                    attn_cp_size=4,
-                ),
-                "interleave",
-                "round-robin-split",
-                True,
-                False,
-            ),
-        ]
-
-        for name, overrides, strategy, mode, expect_dsa, expect_generic in cases:
-            with self.subTest(name=name):
-                server_args = self._new_cp_args(**overrides)
-
-                server_args._handle_legacy_cp_arguments()
-                server_args._handle_context_parallelism()
-
-                self.assertTrue(server_args.enable_prefill_cp)
-                self.assertEqual(server_args.cp_strategy, strategy)
-                self.assertEqual(server_args.dsa_prefill_cp_mode, mode)
-                self.assertEqual(server_args.prefill_cp_mode, mode)
-                self.assertEqual(
-                    server_args.enable_dsa_prefill_context_parallel, expect_dsa
-                )
-                self.assertEqual(
-                    server_args.enable_prefill_context_parallel, expect_generic
-                )
 
 
 class TestPortArgs(unittest.TestCase):

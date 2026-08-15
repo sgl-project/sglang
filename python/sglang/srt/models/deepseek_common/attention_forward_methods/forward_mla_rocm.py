@@ -22,7 +22,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -542,7 +542,7 @@ class DeepseekMLARocmForwardMixin:
                 k_nope,
                 k_pe,
             )
-        elif mla_prefill_cp and not is_cp_v2_active(forward_batch):
+        elif mla_prefill_cp and not is_cp_active(forward_batch):
             # CP-v1 gathers the latent here; CP-v2 gathers it in the attention
             # backend via the strategy (materialize_full_mla_kv).
             k_nope, k_pe = self.rebuild_cp_kv_cache(

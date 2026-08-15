@@ -63,7 +63,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_position,
@@ -120,7 +120,7 @@ def materialize_full_kv_cp(
     k_nope: torch.Tensor,
     k_pe: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if is_cp_v2_active(forward_batch):
+    if is_cp_active(forward_batch):
         return get_cp_strategy().materialize_full_mla_kv(
             forward_batch,
             attn_mla.attn_mqa,
@@ -928,7 +928,7 @@ class DeepseekSparseAttnBackend(
             )
 
             if can_dsa_prefill_cp_round_robin_split(forward_batch):
-                if is_cp_v2_active(forward_batch):
+                if is_cp_active(forward_batch):
                     strategy = get_cp_strategy()
                     seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
                     extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
@@ -1148,7 +1148,7 @@ class DeepseekSparseAttnBackend(
             assert can_dsa_prefill_cp_round_robin_split(forward_batch)
             split_per_token = (
                 get_cp_strategy().shard_local_tokens
-                if is_cp_v2_active(forward_batch)
+                if is_cp_active(forward_batch)
                 else dsa_cp_round_robin_split_data
             )
             ks = split_per_token(ks)
@@ -3140,7 +3140,7 @@ class DeepseekSparseAttnBackend(
 
             rope_positions = forward_batch.positions
             if dsa_use_prefill_cp(forward_batch):
-                if is_cp_v2_active(forward_batch):
+                if is_cp_active(forward_batch):
                     rope_positions = get_cp_strategy().shard_position_ids(
                         rope_positions, forward_batch
                     )
@@ -3161,7 +3161,7 @@ class DeepseekSparseAttnBackend(
                 self.qk_rope_head_dim,
             )
             if save_kv_cache and dsa_use_prefill_cp(forward_batch):
-                if is_cp_v2_active(forward_batch):
+                if is_cp_active(forward_batch):
                     k, k_rope = get_cp_strategy().all_gather_dsa_trtllm_fp8_kv(
                         forward_batch, k, k_rope
                     )

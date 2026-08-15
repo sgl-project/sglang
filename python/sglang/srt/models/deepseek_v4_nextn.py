@@ -14,8 +14,8 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.cp.utils import (
-    cp_round_robin_input_ids_v2,
-    is_cp_v2_active,
+    cp_round_robin_input_ids,
+    is_cp_active,
 )
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
@@ -144,7 +144,7 @@ class DeepseekV4ModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        cp_v2_active = is_cp_v2_active(forward_batch)
+        cp_active = is_cp_active(forward_batch)
         use_prefill_cp = dsa_use_prefill_cp(forward_batch)
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -182,8 +182,8 @@ class DeepseekV4ModelNextN(nn.Module):
             input_ids_global = input_ids
 
         if use_prefill_cp:
-            if cp_v2_active:
-                input_ids = cp_round_robin_input_ids_v2(input_ids, forward_batch)
+            if cp_active:
+                input_ids = cp_round_robin_input_ids(input_ids, forward_batch)
             else:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -202,7 +202,7 @@ class DeepseekV4ModelNextN(nn.Module):
             # deferred fused hc_post state.
             hidden_states = self.decoder.hc_post(hidden_states, residual, post, comb)
 
-        if use_prefill_cp and not cp_v2_active:
+        if use_prefill_cp and not cp_active:
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
@@ -261,7 +261,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if self.dsa_enable_prefill_cp and not is_cp_v2_active(forward_batch):
+        if self.dsa_enable_prefill_cp and not is_cp_active(forward_batch):
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),

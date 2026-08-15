@@ -114,7 +114,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.cp.base import get_cp_strategy
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -476,7 +476,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # Gather the full key on alt_stream so the CP all-gather overlaps
             # with the query rotate above on the current stream.
             with torch.cuda.stream(self.alt_stream):
-                if is_cp_v2_active(forward_batch):
+                if is_cp_active(forward_batch):
                     key = get_cp_strategy().materialize_full_indexer_k_cache(
                         key, forward_batch
                     )
@@ -494,7 +494,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             key = self._maybe_rotate(key)
 
         # allgather+rerrange
-        if is_cp_v2_active(forward_batch):
+        if is_cp_active(forward_batch):
             key = get_cp_strategy().materialize_full_indexer_k_cache(key, forward_batch)
         elif forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
             key = cp_all_gather_rerange_output(
