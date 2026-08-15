@@ -532,3 +532,95 @@ SGLang 原生暴露 Prometheus 格式的 `/metrics`（需 `--enable-metrics`）�
 | PD 分离 / 扩容 | 解耦 prefill 与 decode | 结构性，适合更大规模 |
 
 > 一个容易忽视的点：MTP 是"系统侧最大优化"，但 E2E<10s 的物理前提依然是限制输出长度，两者必须一起做。
+
+## 附录 C:Qwen3.8-27B 前瞻评估与单卡长上下文验证方案(2026-08-15)
+
+> 本节为**发布前/发布当天的评估记录**,非生产实测。Qwen3.8-27B 于 2026-08-14 发布,以下结论基于官方 config、cookbook 与显存核算,落地前以实测为准。
+
+### C.1 架构兼容性:无需 Day-0 补丁
+
+Qwen3.8-27B 是 Qwen3.6-27B 的继任者(稠密、原生多模态、可控思考),其 `config.json` 声明:
+
+- `architectures: ["Qwen3_5ForConditionalGeneration"]` —— 与 Qwen3.6-27B **完全相同**;
+- 文本侧参数一致:64 层(48 GDN + 16 full attention,3:1 混合)、hidden 5120、head_dim 256、原生上下文 262,144(官方称可扩展至 1,000,000);
+- vision config 亦与 3.6 一致(27 层 ViT,1152 维)。
+
+SGLang 侧 `Qwen3_5ForConditionalGeneration` 类早已存在(`models/qwen3_5.py`),多模态处理器(`multimodal/processors/qwen_vl.py`)、MTP 映射(`model_config.py`)均在位。**结论:直接复用本文 3.6-27B 的全套启动参数即可,不需要等待任何 Day-0 支持。** 同期的旗舰 Qwen3.8-2.4T-A95B(MoE)同理,声明 `Qwen3_5MoeForCausalLM`。
+
+注意一个命名陷阱:SGLang 里的 `Qwen3_5*` 类名是**架构家族代号而非版本号**,dense 与 MoE 两支都在其中——"3.6/3.8 的模型用 3.5 的类"是预期行为,不是配置错误。
+
+上游在 3.8-27B 发布前后的相关提交只有文档(cookbook #34860、GB300 benchmark #34863)和一条值得带走的修复:**#34560 修复 Qwen3.5 架构家族 MTP + HiCache 同开时启动失败**,开分层缓存前请确认代码已包含此提交。
+
+### C.2 YaRN 长上下文扩展:官方 1M 配方解读
+
+官方把上下文从 262K 扩到 1M 的启动参数由三部分组成:
+
+```bash
+SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \   # ① 允许 --context-length 超过 max_position_embeddings
+                                                #    (否则 model_config.py 直接 ValueError)
+python -m sglang.launch_server ... \
+  --context-length 1000000 \                     # ② 目标上下文
+  --json-model-override-args '{"text_config": {"rope_parameters": {
+      "rope_type": "yarn", "factor": 4.0,        # ③ RoPE 换 YaRN 外推,factor ≈ 1M/262K
+      "original_max_position_embeddings": 262144,
+      "mrope_interleaved": true, "mrope_section": [11, 11, 10],   # 多模态 mrope,必须从原 config 保留
+      "rope_theta": 10000000, "partial_rotary_factor": 0.25       # 同上,漏带会被默认值覆盖
+  }}}'
+```
+
+要点:YaRN 通过对旋转频率分段插值/外推,避免位置编码落到训练未见区域;`--json-model-override-args` 是**整体替换** `rope_parameters`,所以 `mrope_*`、`partial_rotary_factor`(本家族仅 25% head_dim 加旋转)必须原样带上。262K 以内是原生训练范围,之外的质量依赖 YaRN,需用自有长文负载抽测。
+
+### C.3 单卡 L40S 的显存天花板:1M 放不下,320K 可行
+
+**权重**:单卡只有 FP8(blockwise,~28GB)可选。BF16 ~54GB 超容量;NVFP4 是 Blackwell 专属,SM89 无硬件 FP4。
+
+**KV cache**:hybrid GDN 架构中只有 16 层 full attention 产生随长度增长的 KV(48 层 GDN 状态定长,~146MB/req):
+
+```
+每 token KV = 16 层 × 2(K+V) × 4 KV头 × 256 head_dim = 32,768 元素
+  fp8 KV → 32 KB/token;bf16 KV → 64 KB/token
+```
+
+**总账**(`--mem-fraction-static 0.85`,静态池 ~39GB):
+
+| 目标上下文 | FP8 KV 占用 | + 权重 28GB | 单卡 L40S(46GB) |
+|---|---|---|---|
+| 1,000,000 | 32 GB | 60 GB | **不可行** |
+| 524,288 | 16 GB | 44 GB | 极限,mamba buffer 无空间 |
+| 327,680 | 10 GB | 38 GB | **可行(推荐验证目标)** |
+| 262,144(原生) | 8 GB | 36 GB | 轻松,但走不到扩展路径 |
+
+### C.4 单卡验证方案(推荐)
+
+用 `--context-length 327680`(超过原生 262K, YaRN 路径真实生效),并发压到 1~2:
+
+```bash
+CUDA_VISIBLE_DEVICES=<卡号> SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
+python -m sglang.launch_server \
+    --model-path /path/to/Qwen3.8-27B-FP8 \
+    --tp 1 --context-length 327680 \
+    --mem-fraction-static 0.85 --kv-cache-dtype fp8_e5m2 \
+    --mamba-backend triton --mamba-radix-cache-strategy extra_buffer \
+    --max-running-requests 2 \
+    --speculative-algorithm NEXTN --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
+    --json-model-override-args '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}'
+```
+
+**验证方法(大海捞针对照实验)**:构造 ~30 万 token 输入,把"针"埋在 **262K 之后**(埋在原生范围内则实验无区分度):
+
+1. 带 YaRN override 启动 → 答对,扩展路径工作正常;
+2. (对照)只加环境变量、不加 override → RoPE 直接外推,答错或乱码,反向验证。
+
+**预期管理**:GDN 层 prefill 是串行 scan,30 万 token 输入单卡 TTFT 为分钟级,是架构特性而非故障。
+
+### C.5 如果一定要单卡挑战 1M
+
+纯显存路线物理不可行(60GB > 46GB),唯一路径是 **HiCache 分层缓存把 KV 卸载到主机内存**(`--enable-hierarchical-cache --hicache-ratio 2`),GPU 只保留热窗口。风险与代价:
+
+- hybrid GDN(mamba state)+ HiCache 的组合**无官方验证记录**,能否协同需实测(#34560 修复后是最好的尝试时机);
+- 1M token prefill 在单卡 L40S 上,16 层 full attention 的 O(n²) 开销主导,TTFT 预计 **10 分钟以上**;
+- 需主机内存 ≥32GB 余量承接卸载的 KV;decode 命中冷 KV 时 ITL 会抖。
+
+务实路线:先跑通 C.4 的 320K 验证,再视需求决定是否投入 1M 探索。真需要 1M 生产可用,TP=2 起步是更稳妥的结构。
