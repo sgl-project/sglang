@@ -98,6 +98,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # after it, not content. True to start with, because the preamble is
         # content from the first character.
         self._gap_started = True
+        # Whether any normal text has left the detector this turn. A gap has
+        # something to separate itself from only if it has.
+        self._emitted_anything = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -203,7 +206,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
             # No section opener, but the turn may have been cut off inside one.
             return StreamingParseResult(normal_text=self._cut_at_markup(text), calls=[])
 
-        normal_text = text[:idx].removesuffix("\n\n")
+        # The whitespace in front of the opener indents it; the line break the
+        # call stood on comes back from `_join_gap` on the other side.
+        normal_text = text[:idx].rstrip()
 
         calls = []
         try:
@@ -250,43 +255,82 @@ class DeepSeekV32Detector(BaseFormatDetector):
         markup = re.search(r"\s*</?｜", text)
         return text if markup is None else text[: markup.start()]
 
-    def _gap_text(self, text: str) -> str:
-        """Drop the layout whitespace at the head of a gap, once per gap.
+    @staticmethod
+    def _join_gap(layout: str, *, after_text: bool) -> str:
+        """What a gap's leading whitespace collapses to once its call is gone.
 
-        The blank line between a section closer and the prose after it indents
-        the markup; it is not the model's paragraph break. Tracked on the
-        instance rather than trimmed in place because a gap arrives over several
-        deltas: only the whitespace before the gap's first real character is
-        layout, and a newline in the middle of the prose has to survive.
+        The call sat on its own line, so removing it has to leave the line break
+        it was standing on -- and nothing more. Deleting the whitespace outright
+        runs `'Let me look it up.'` into `'It is sunny in SF.'`, and takes the
+        indent off the line that follows, which is content: a list item stops
+        starting its line, a code line loses the four spaces the newline was
+        carrying. Collapsing to two would open a paragraph break the model never
+        wrote.
+
+        Nothing at all when no text has been emitted yet: the turn opened with
+        the call, so there is nothing on the other side to separate from. And a
+        run with no newline in it never had a line to keep -- the call was inline
+        -- so it stands as the model wrote it.
+        """
+        if not after_text:
+            return ""
+        line_start = layout.rfind("\n")
+        return layout if line_start == -1 else "\n" + layout[line_start + 1 :]
+
+    def _gap_text(self, text: str) -> str:
+        """Resolve the layout whitespace at the head of a gap, once per gap.
+
+        Tracked on the instance rather than trimmed in place because a gap
+        arrives over several deltas: only the whitespace before the gap's first
+        real character is layout, and a newline in the middle of the prose has
+        to survive. Whitespace with nothing behind it yet is left for a later
+        delta to resolve, since what it collapses to depends on the text that
+        follows it.
 
         Call this on text that is being emitted, never on text `_split_flushable`
         may still hold back: a fragment that grows into a tag would otherwise
         count as the gap's first real character and strand the layout behind it.
         """
-        if not self._gap_started:
-            text = text.lstrip()
-            self._gap_started = bool(text)
-        return text
+        if self._gap_started:
+            self._emitted_anything = self._emitted_anything or bool(text)
+            return text
+
+        prose = text.lstrip()
+        if not prose:
+            return ""
+
+        layout = text[: len(text) - len(prose)]
+        self._gap_started = True
+        joined = self._join_gap(layout, after_text=self._emitted_anything) + prose
+        self._emitted_anything = True
+        return joined
 
     def _section_gaps(self, text: str, sections: list["re.Match[str]"]) -> str:
         """The normal text between and after the tool call sections of `text`.
 
         The one-shot counterpart of what the streaming path emits from
-        `_gap_text` and `_lead_text`, and trimmed to match: leading layout goes
-        everywhere, trailing layout only where another section follows it and
-        can claim the whitespace as its indent. The last gap ends the turn, so
-        its trailing newlines are the model's own.
+        `_gap_text` and `_lead_text`, trimmed to match: leading layout goes
+        through `_join_gap`, trailing layout goes wherever another section
+        follows it and can claim the whitespace as its indent. The last gap ends
+        the turn, so its trailing newlines are the model's own.
         """
+        emitted = bool(text[: sections[0].start()].strip())
         gaps = []
         for i, section in enumerate(sections):
             is_last = i + 1 == len(sections)
             end = len(text) if is_last else sections[i + 1].start()
-            gap = self._cut_at_markup(text[section.end() : end]).lstrip()
-            if gap in ("<", "</"):
+            gap = self._cut_at_markup(text[section.end() : end])
+            prose = gap.lstrip()
+            if prose in ("<", "</"):
                 # Nothing in this gap but the first characters of the next tag,
                 # which the turn stopped inside of. Layout, not the model's `<`.
-                gap = ""
-            gaps.append(gap if is_last else gap.rstrip())
+                prose = ""
+            if not prose:
+                continue
+            layout = gap[: len(gap) - len(gap.lstrip())]
+            joined = self._join_gap(layout, after_text=emitted) + prose
+            gaps.append(joined if is_last else joined.rstrip())
+            emitted = True
         return "".join(gaps)
 
     def _markers(self) -> tuple[str, ...]:
@@ -369,7 +413,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             # The turn stopped inside the opening section, before any invoke was
             # matched, so what is held is the preamble and nothing else. Trim it
             # exactly as `detect_and_parse` trims it.
-            return StreamingParseResult(normal_text=held[:bot_pos].removesuffix("\n\n"))
+            return StreamingParseResult(normal_text=held[:bot_pos].rstrip())
 
         # Closers first: the buffer can still carry those of a call that did
         # finish, and the prose after them is owed to the client.
@@ -381,24 +425,25 @@ class DeepSeekV32Detector(BaseFormatDetector):
             held = held.partition("<")[0]
         return StreamingParseResult(normal_text=self._gap_text(held))
 
-    def _lead_text(
-        self, current_text: str, *, invoke_start: int, is_first_call: bool
-    ) -> tuple[str, int]:
+    def _lead_text(self, current_text: str, *, invoke_start: int) -> tuple[str, int]:
         """The normal text in front of the call, and where that call begins.
 
-        The two trims differ on purpose. The first call keeps `detect_and_parse`'s
-        exact `removesuffix("\\n\\n")` so the streaming and one-shot paths agree on
-        the preamble. Every later call drops all trailing whitespace, because
-        whitespace in front of a call is layout -- the separator between parallel
-        invokes is nothing else -- and because the alternative is not stable: that
-        whitespace lands in this lead or in the preceding flush depending only on
-        where the deltas happened to split.
+        Trailing whitespace always goes: it indents the call, which is all the
+        separator between two parallel invokes ever is, and keeping it would not
+        be stable anyway -- it lands in this lead or in the preceding flush
+        depending only on where the deltas happened to split. What the call was
+        standing on comes back on the other side, from `_join_gap`.
         """
         call_start = current_text.rfind(self.bot_token, 0, invoke_start)
         if call_start == -1:
             call_start = invoke_start
+        had_text = self._emitted_anything
         lead = self._gap_text(self._strip_section_markers(current_text[:call_start]))
-        trimmed = lead.removesuffix("\n\n") if is_first_call else lead.rstrip()
+        trimmed = lead.rstrip()
+        # This is the one caller that trims what `_gap_text` handed back, so it
+        # is the one that has to say what actually reached the client: a lead of
+        # nothing but the call's own indent leaves the turn still empty.
+        self._emitted_anything = had_text or bool(trimmed)
         return trimmed, call_start
 
     def parse_streaming_increment(
@@ -469,9 +514,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 # invoke that spans chunks can't re-emit the same lead.
                 if not self.current_tool_name_sent:
                     lead, call_start = self._lead_text(
-                        current_text,
-                        invoke_start=invoke_match.start(),
-                        is_first_call=is_first_call,
+                        current_text, invoke_start=invoke_match.start()
                     )
                     if lead:
                         normal_text_parts.append(lead)

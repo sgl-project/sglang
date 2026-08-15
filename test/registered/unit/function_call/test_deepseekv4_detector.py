@@ -56,6 +56,29 @@ TURN_SHAPES = {
     "several paragraphs after the call": (
         _weather_call() + "\n\nFirst line.\nSecond line.\n\nThird."
     ),
+    "indented line after the call": "Result:\n" + _weather_call() + "\n    x = True\n",
+    "markdown list after the call": (
+        "Here you go:\n\n" + _weather_call() + "\n- SF: sunny\n- LA: hot\n"
+    ),
+}
+
+# What the turn should read as once the calls are taken out of it, for the shapes
+# where getting that wrong is invisible to the one-shot comparison.
+JOINED_TURNS = {
+    "Let me look it up.\n\n"
+    + _weather_call()
+    + "\nIt is sunny in SF.": "Let me look it up.\nIt is sunny in SF.",
+    "我查一下。\n\n"
+    + _weather_call()
+    + "\n旧金山是晴天。": "我查一下。\n旧金山是晴天。",
+    _weather_call()
+    + "\nAnd now the other one:\n"
+    + _weather_call("NY")
+    + "\nDone.": "And now the other one:\nDone.",
+    "Here you go:\n\n"
+    + _weather_call()
+    + "\n- SF: sunny\n- LA: hot\n": "Here you go:\n- SF: sunny\n- LA: hot\n",
+    "Result:\n" + _weather_call() + "\n    x = True\n": "Result:\n    x = True\n",
 }
 
 
@@ -134,6 +157,23 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             for size in (None, 1, 2, 3, 5, 13):
                 with self.subTest(shape=label, chunk_size=size):
                     self.assertEqual(self._stream(text, size), expected)
+
+    def test_removing_a_call_leaves_the_line_it_stood_on(self):
+        """Taking the call out has to leave the line break it was standing on --
+        and only that.
+
+        Dropping the whitespace outright runs the sentence before the call into
+        the one after it, with no word boundary to recover in CJK, and takes the
+        indent off the line that follows: a list item stops starting its line, a
+        code line loses the spaces the newline was carrying. None of that is
+        visible to the one-shot comparison, which agreed with the streaming path
+        on all five of these while both were wrong, so the text is pinned here.
+        """
+        for text, expected in JOINED_TURNS.items():
+            for size in (None, 16, 8, 4, 1):
+                with self.subTest(turn=text[:24], chunk_size=size):
+                    normal, _ = self._stream(text, size)
+                    self.assertEqual(normal, expected)
 
     def test_turn_cut_off_mid_generation_repeats_nothing_and_leaks_no_markup(self):
         """A turn that stops inside a tool call is what a length cap looks like.
