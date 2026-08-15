@@ -314,6 +314,21 @@ class TestCPZigzagStrategy(CustomTestCase):
 
         self.assertTrue(torch.equal(state.topk_indices, global_topk))
 
+    def test_index_topk_share_skips_publish_without_spec_info(self):
+        local_topk = torch.tensor([[1, 2], [3, 4]])
+        forward_batch = SimpleNamespace(
+            input_ids=torch.arange(8),
+            forward_mode=_ExtendMode(),
+            extend_seq_lens_cpu=[8],
+            reuse_dsa_topk_indices=False,
+            spec_info=None,
+        )
+        state = IndexTopKShareState(forward_batch, None)
+
+        state.update(local_topk)
+
+        self.assertTrue(torch.equal(state.topk_indices, local_topk))
+
     def test_eager_runner_passes_rank_local_input_ids_to_model_body(self):
         metadata = self._metadata_for_rank(
             0,
