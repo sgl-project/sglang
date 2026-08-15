@@ -1210,9 +1210,8 @@ class Qwen3LLMModel(Qwen3Model):
 
 
 class Qwen3VLForConditionalGeneration(nn.Module):
-    # Opt in to the optional BCG DeepStack replay slot (see
-    # PrefillCudaGraphRunner). Runtime activation additionally
-    # requires ``num_deepstack_embeddings > 0`` on the instance.
+    # Opt-in consumed by PrefillCudaGraphRunner; the slot activates only
+    # when num_deepstack_embeddings > 0 on the instance.
     supports_bcg_deepstack_replay = True
     supports_cuda_vmm_feature_transport = True
 

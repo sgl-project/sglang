@@ -194,17 +194,11 @@ def _slice_output_rows(output: Any, num_tokens: int) -> Any:
 def _refresh_deepstack_replay_slot(
     slot: torch.Tensor, deepstack_embeds: Optional[torch.Tensor]
 ) -> None:
-    """Point the captured DeepStack slot at this request's contribution.
+    """Sync the captured DeepStack slot for this replay.
 
-    ``slot`` is the token-row slice the captured graph reads. Absence —
-    ``None`` or an empty tensor — zeroes it, so a previous replay's rows
-    cannot bleed into a text-only or shorter request through the LM's
-    ``add_``.
-
-    A non-empty tensor that does not fit the slot is a contract violation,
-    not an absence: zeroing and replaying anyway would serve a silently
-    zero-DeepStack answer, the failure this slot exists to prevent. Raise
-    instead, before touching the slot.
+    Absence zeroes the slot so previous rows cannot bleed through the LM's
+    ``add_``; a non-empty tensor that does not fit raises instead — replaying
+    with zeros would silently serve the request without its visual part.
     """
     if deepstack_embeds is None or deepstack_embeds.numel() == 0:
         slot.zero_()
@@ -1709,7 +1703,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.buffer_registry.get_slot("input_embeds").slice_for(
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
-            # DeepStack replay slot: same lifecycle as ``input_embeds`` above.
             if self.buffer_registry.has_slot("input_deepstack_embeds"):
                 _refresh_deepstack_replay_slot(
                     slot=self.buffer_registry.get_slot(
