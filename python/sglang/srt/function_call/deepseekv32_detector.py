@@ -93,6 +93,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.prefix_parameter_end_call = ["</", "｜DSML｜", "parameter"]
         self.prefix_invoke_end_call = ["</", "｜DSML｜", "inv", "oke"]
         self.current_tool_id = -1
+        # False while nothing but whitespace has been emitted since the last DSML
+        # tag: that whitespace is the layout separating the tag from the prose
+        # after it, not content. True to start with, because the preamble is
+        # content from the first character.
+        self._gap_started = True
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -194,18 +199,23 @@ class DeepSeekV32Detector(BaseFormatDetector):
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
         idx = text.find(self.bot_token)
-        normal_text = text[:idx].removesuffix("\n\n") if idx != -1 else text
-        if self.bot_token not in text:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
+        if idx == -1:
+            # No section opener, but the turn may have been cut off inside one.
+            return StreamingParseResult(normal_text=self._cut_at_markup(text), calls=[])
+
+        normal_text = text[:idx].removesuffix("\n\n")
 
         calls = []
         try:
-            sections = re.findall(self.function_calls_regex, text, re.DOTALL)
+            sections = list(re.finditer(self.function_calls_regex, text, re.DOTALL))
             if not sections:
                 return StreamingParseResult(normal_text=normal_text, calls=[])
 
+            normal_text += self._section_gaps(text, sections)
+
             # Find all invoke blocks
-            for function_calls_content in sections:
+            for section in sections:
+                function_calls_content = section.group(1)
                 for invoke_match in re.finditer(
                     self.invoke_regex, function_calls_content, re.DOTALL
                 ):
@@ -225,6 +235,59 @@ class DeepSeekV32Detector(BaseFormatDetector):
             logger.error(f"Error in detect_and_parse: {e}")
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
+
+    @staticmethod
+    def _cut_at_markup(text: str) -> str:
+        """Everything up to the first DSML tag, opening or closing, and its indent.
+
+        A turn can stop anywhere -- a length cap, an abort -- including in the
+        middle of a tag the model was still writing. What follows the `<｜` (or
+        `</｜`) was markup by then, not content, and must not reach the client;
+        what precedes it is prose no completed call ever consumed. The whitespace
+        in front of the tag goes with it, exactly as `_strip_section_markers`
+        drops the indent of a tag that did finish arriving.
+        """
+        markup = re.search(r"\s*</?｜", text)
+        return text if markup is None else text[: markup.start()]
+
+    def _gap_text(self, text: str) -> str:
+        """Drop the layout whitespace at the head of a gap, once per gap.
+
+        The blank line between a section closer and the prose after it indents
+        the markup; it is not the model's paragraph break. Tracked on the
+        instance rather than trimmed in place because a gap arrives over several
+        deltas: only the whitespace before the gap's first real character is
+        layout, and a newline in the middle of the prose has to survive.
+
+        Call this on text that is being emitted, never on text `_split_flushable`
+        may still hold back: a fragment that grows into a tag would otherwise
+        count as the gap's first real character and strand the layout behind it.
+        """
+        if not self._gap_started:
+            text = text.lstrip()
+            self._gap_started = bool(text)
+        return text
+
+    def _section_gaps(self, text: str, sections: list["re.Match[str]"]) -> str:
+        """The normal text between and after the tool call sections of `text`.
+
+        The one-shot counterpart of what the streaming path emits from
+        `_gap_text` and `_lead_text`, and trimmed to match: leading layout goes
+        everywhere, trailing layout only where another section follows it and
+        can claim the whitespace as its indent. The last gap ends the turn, so
+        its trailing newlines are the model's own.
+        """
+        gaps = []
+        for i, section in enumerate(sections):
+            is_last = i + 1 == len(sections)
+            end = len(text) if is_last else sections[i + 1].start()
+            gap = self._cut_at_markup(text[section.end() : end]).lstrip()
+            if gap in ("<", "</"):
+                # Nothing in this gap but the first characters of the next tag,
+                # which the turn stopped inside of. Layout, not the model's `<`.
+                gap = ""
+            gaps.append(gap if is_last else gap.rstrip())
+        return "".join(gaps)
 
     def _markers(self) -> tuple[str, ...]:
         """Every DSML tag this detector can meet, longest-lived first.
@@ -251,6 +314,18 @@ class DeepSeekV32Detector(BaseFormatDetector):
         for token in (self.eot_token, self.invoke_end_token, self.bot_token):
             text = re.sub(rf"\s*{re.escape(token)}", "", text)
         return text
+
+    def _strip_leading_closers(self, text: str) -> str:
+        """Drop the closers of a call that already streamed, and their indent.
+
+        Only the leading run: a tag further in is one the turn was cut off
+        inside, and `_cut_at_markup` has to see it where it stands rather than
+        have it spliced out from under the prose in front of it.
+        """
+        closers = "|".join(
+            re.escape(t) for t in (self.invoke_end_token, self.eot_token)
+        )
+        return re.sub(rf"^(?:\s*(?:{closers}))+", "", text)
 
     def _split_flushable(self, text: str) -> tuple[str, str]:
         """Split `text` into (safe to emit now, hold back for the next chunk).
@@ -284,15 +359,32 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         `_split_flushable` withholds anything that could still turn out to be a
         DSML tag. Once the stream is over nothing more is coming, so a held
-        fragment was ordinary text all along and is owed to the client.
+        fragment was ordinary text all along and is owed to the client -- unless
+        the tag did arrive and the turn ended inside it, which is what
+        `_cut_at_markup` separates.
         """
         held, self._buffer = self._buffer, ""
-        return StreamingParseResult(normal_text=self._strip_section_markers(held))
+        bot_pos = held.find(self.bot_token)
+        if bot_pos != -1 and self.current_tool_id == -1:
+            # The turn stopped inside the opening section, before any invoke was
+            # matched, so what is held is the preamble and nothing else. Trim it
+            # exactly as `detect_and_parse` trims it.
+            return StreamingParseResult(normal_text=held[:bot_pos].removesuffix("\n\n"))
+
+        # Closers first: the buffer can still carry those of a call that did
+        # finish, and the prose after them is owed to the client.
+        held = self._cut_at_markup(self._strip_leading_closers(held))
+        if not self._gap_started:
+            # Nothing but layout has been emitted since the last tag, so a lone
+            # `<` sitting in it is the next tag cut short rather than the model's
+            # own `5 < 6` -- which is why that reading is confined to here.
+            held = held.partition("<")[0]
+        return StreamingParseResult(normal_text=self._gap_text(held))
 
     def _lead_text(
-        self, current_text: str, *, call_start: int, is_first_call: bool
-    ) -> str:
-        """The normal text sitting in front of the call that starts at `call_start`.
+        self, current_text: str, *, invoke_start: int, is_first_call: bool
+    ) -> tuple[str, int]:
+        """The normal text in front of the call, and where that call begins.
 
         The two trims differ on purpose. The first call keeps `detect_and_parse`'s
         exact `removesuffix("\\n\\n")` so the streaming and one-shot paths agree on
@@ -302,11 +394,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
         whitespace lands in this lead or in the preceding flush depending only on
         where the deltas happened to split.
         """
-        bot_pos = current_text.rfind(self.bot_token, 0, call_start)
-        if bot_pos != -1:
-            call_start = bot_pos
-        lead = self._strip_section_markers(current_text[:call_start])
-        return lead.removesuffix("\n\n") if is_first_call else lead.rstrip()
+        call_start = current_text.rfind(self.bot_token, 0, invoke_start)
+        if call_start == -1:
+            call_start = invoke_start
+        lead = self._gap_text(self._strip_section_markers(current_text[:call_start]))
+        trimmed = lead.removesuffix("\n\n") if is_first_call else lead.rstrip()
+        return trimmed, call_start
 
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]
@@ -338,7 +431,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 if e_token in current_text:
                     current_text = current_text.replace(e_token, "")
             flushable, self._buffer = self._split_flushable(current_text)
-            return StreamingParseResult(normal_text=flushable)
+            return StreamingParseResult(normal_text=self._gap_text(flushable))
 
         all_calls: list[ToolCallItem] = []
         normal_text_parts: list[str] = []
@@ -375,14 +468,19 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 # call: it is only False the first time a call is seen, so an
                 # invoke that spans chunks can't re-emit the same lead.
                 if not self.current_tool_name_sent:
-                    lead = self._lead_text(
+                    lead, call_start = self._lead_text(
                         current_text,
-                        call_start=invoke_match.start(),
+                        invoke_start=invoke_match.start(),
                         is_first_call=is_first_call,
                     )
                     if lead:
                         normal_text_parts.append(lead)
                         lead_is_still_in_current_text = True
+                    # The lead has left the detector, so drop it from the buffer.
+                    # A completed call advances past it below; an incomplete one
+                    # never would, and `finish()` would emit it a second time at
+                    # the end of a turn cut short inside this invoke.
+                    self._buffer = current_text[call_start:]
 
                 # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -446,6 +544,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self._buffer = current_text[invoke_match.end() :]
                     current_text = self._buffer  # Update for next iteration
                     lead_is_still_in_current_text = False
+                    # Whatever whitespace follows the call indents its closers.
+                    self._gap_started = False
 
                     # Move to next tool call
                     self.current_tool_id += 1
@@ -467,7 +567,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 flushable, self._buffer = self._split_flushable(
                     self._strip_section_markers(current_text)
                 )
-                normal_text_parts.append(flushable)
+                normal_text_parts.append(self._gap_text(flushable))
 
             return StreamingParseResult(
                 normal_text="".join(normal_text_parts), calls=all_calls

@@ -30,6 +30,35 @@ def _weather_call(city: str = "SF") -> str:
     return _wrapped(_invoke("get_weather", _param("city", "true", city)))
 
 
+# Turn shapes the streaming and one-shot paths must agree on, whatever the chunk
+# size. Anything the one-shot path cannot parse at all -- a bare invoke with no
+# section around it -- is tested on its own instead.
+TURN_SHAPES = {
+    "no tool call at all": "Just talking.\n\n",
+    "preamble": "Hi\n\n" + _weather_call(),
+    "preamble, single newline": "Hi\n" + _weather_call(),
+    "call alone": _weather_call(),
+    "prose after the call": _weather_call() + "\n\nSunny in SF.",
+    "newlines after the call": _weather_call() + "\n\n",
+    "prose between two calls": (
+        _weather_call("SF") + "\n\nNow the other city.\n\n" + _weather_call("NY")
+    ),
+    "sections back to back": _weather_call("SF") + "\n" + _weather_call("NY"),
+    "parallel invokes in one section": _wrapped(
+        _invoke("get_weather", _param("city", "true", "SF"))
+        + "\n"
+        + _invoke("get_weather", _param("city", "true", "NY"))
+    ),
+    "json body": "Lead.\n\n" + _wrapped(_invoke("get_weather", '{"city": "SF"}')),
+    "self-closing invoke": _wrapped(f'<{DSML}invoke name="get_weather"/>')
+    + "\n\nDone.",
+    "angle bracket in the prose": _weather_call() + "\n\n5 < 6 and a < b.",
+    "several paragraphs after the call": (
+        _weather_call() + "\n\nFirst line.\nSecond line.\n\nThird."
+    ),
+}
+
+
 class TestDeepSeekV4Streaming(CustomTestCase):
     def setUp(self):
         self.tools = [
@@ -57,16 +86,77 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             calls.extend(result.calls)
         return normal, calls
 
-    def test_preamble_in_same_delta_as_tool_call(self):
-        """Prose sharing a delta with the tool call must not be dropped, and the
-        streaming and one-shot paths must agree on it."""
-        text = "Let me check.\n" + _weather_call()
-        normal, calls = self._feed([text])
+    def _stream(self, text, chunk_size):
+        """Returns (normal_text, [(name, arguments)]) for `text` fed in deltas of
+        `chunk_size` characters (the whole text at once when it is None), end of
+        turn included.
 
-        self.assertEqual([c.name for c in calls if c.name], ["get_weather"])
-        self.assertEqual(
-            normal, DeepSeekV4Detector().detect_and_parse(text, self.tools).normal_text
+        Calls are compared as an ordered list rather than by `tool_index`: the
+        one-shot path numbers them by position in the tools list, the streaming
+        path by call ordinal, so the indices themselves do not line up.
+        """
+        detector = DeepSeekV4Detector()
+        chunks = (
+            [text]
+            if chunk_size is None
+            else [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
         )
+        normal, merged = "", {}
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            normal += result.normal_text
+            for call in result.calls:
+                item = merged.setdefault(call.tool_index, {"name": None, "args": ""})
+                if call.name:
+                    item["name"] = call.name
+                item["args"] += call.parameters
+        normal += detector.finish(self.tools).normal_text
+        self.assertEqual(detector._buffer, "", "end of turn left the buffer behind")
+        return normal, [(v["name"], v["args"]) for _, v in sorted(merged.items())]
+
+    def _one_shot(self, text):
+        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+        return result.normal_text, [(c.name, c.parameters) for c in result.calls]
+
+    def test_streaming_matches_one_shot_at_every_chunk_size(self):
+        """A turn must read the same however it was cut into deltas, and the same
+        as if it had never been streamed at all.
+
+        Both halves matter. Where the deltas fall is not the model's choice, so
+        anything that depends on it is a bug by construction; and a client that
+        switches `stream=` must not get different content out of the same
+        generation. Down to one character per delta, because that is where a
+        marker or its indent gets split across two chunks -- how the duplicated
+        preamble and the stray newlines this file guards were all found.
+        """
+        for label, text in TURN_SHAPES.items():
+            expected = self._one_shot(text)
+            for size in (None, 1, 2, 3, 5, 13):
+                with self.subTest(shape=label, chunk_size=size):
+                    self.assertEqual(self._stream(text, size), expected)
+
+    def test_turn_cut_off_mid_generation_repeats_nothing_and_leaks_no_markup(self):
+        """A turn that stops inside a tool call is what a length cap looks like.
+
+        The lead used to come out twice -- once from the delta that matched the
+        invoke, once more from the end-of-turn flush, because an invoke that
+        never completes never advances the buffer past it -- and the half-written
+        tag and its partial JSON went to the client as assistant content.
+
+        Only the text is compared with the one-shot path here. The calls cannot
+        be: streaming a cut-off call is exactly what the incremental protocol is
+        for, while `detect_and_parse` has no complete section to report.
+        """
+        full = "Checking.\n" + _weather_call() + "\nSunny."
+
+        for length in range(1, len(full) + 1):
+            text = full[:length]
+            expected, _ = self._one_shot(text)
+            for size in (None, 1, 3, 7):
+                with self.subTest(cut_at=length, chunk_size=size):
+                    normal, _ = self._stream(text, size)
+                    self.assertNotIn(DSML, normal)
+                    self.assertEqual(normal, expected)
 
     def test_preamble_before_bare_invoke_without_wrapper(self):
         """The bare `<｜DSML｜invoke …>` form has no tool_calls wrapper to walk
@@ -76,12 +166,6 @@ class TestDeepSeekV4Streaming(CustomTestCase):
 
         self.assertIn("Checking.", normal)
         self.assertEqual([c.name for c in calls if c.name], ["get_weather"])
-
-    def test_no_dsml_markers_leak_into_normal_text(self):
-        text = "Prose.\n" + _weather_call()
-        normal, _ = self._feed([text[i : i + 4] for i in range(0, len(text), 4)])
-
-        self.assertNotIn(DSML, normal)
 
     def test_malformed_partial_json_falls_back_to_raw_value(self):
         """A partial non-string parameter must not escape as MalformedJSON."""
@@ -102,44 +186,29 @@ class TestDeepSeekV4Streaming(CustomTestCase):
 
         self.assertEqual(len(result.calls), 2)
 
-    def test_prose_between_two_tool_calls_is_streamed(self):
-        """Prose sitting between two calls used to be dropped outright: the lead
-        was only recovered for the first call, and consuming the second call
-        advanced the buffer straight past the text in front of it."""
+    def test_prose_around_tool_calls_reaches_the_client(self):
+        """Prose between two calls used to be dropped outright -- the lead was
+        only recovered for the first call, and consuming the second advanced the
+        buffer straight past the text in front of it -- and prose after the last
+        call was stranded, because the section closer keeps the DSML guard true
+        for the rest of the turn.
+
+        Both are asserted here rather than left to the one-shot comparison: that
+        comparison would still hold if a change dropped this text on both paths.
+        """
         normal, calls = self._feed(
-            [_weather_call("SF"), "\n\nNow the other city.\n\n", _weather_call("NY")]
+            [
+                _weather_call("SF"),
+                "\n\nNow the other city.\n\n",
+                _weather_call("NY"),
+                "\n\nThat's the forecast.",
+            ]
         )
 
         self.assertIn("Now the other city.", normal)
-        self.assertNotIn(DSML, normal)
-        self.assertEqual([c.name for c in calls if c.name], ["get_weather"] * 2)
-
-    def test_prose_after_the_last_tool_call_is_streamed(self):
-        """Trailing prose used to be stranded: the section closer keeps the DSML
-        guard true for the rest of the turn, so the buffer holding the text was
-        never released and nothing flushes it at end of turn."""
-        detector = DeepSeekV4Detector()
-        normal = ""
-        for chunk in [_weather_call("SF"), "\n\nThat's the forecast."]:
-            normal += detector.parse_streaming_increment(chunk, self.tools).normal_text
-
         self.assertIn("That's the forecast.", normal)
         self.assertNotIn(DSML, normal)
-        self.assertEqual(detector._buffer, "")
-
-    def test_trailing_prose_is_chunk_invariant(self):
-        """Where the deltas happen to split must not change what the client sees.
-        The lead of a call spanning several chunks is emitted once, and text after
-        a call reads the same whether or not it shares a delta with the closer."""
-        text = _weather_call("SF") + "\n\nAnd that is that."
-        one_shot, _ = self._feed([text])
-
-        for size in (1, 2, 3, 7, 13):
-            with self.subTest(chunk_size=size):
-                split, _ = self._feed(
-                    [text[i : i + size] for i in range(0, len(text), size)]
-                )
-                self.assertEqual(split, one_shot)
+        self.assertEqual([c.name for c in calls if c.name], ["get_weather"] * 2)
 
     def test_prose_with_angle_bracket_is_not_held_back(self):
         """Only a suffix that could still grow into a DSML marker may be withheld.
