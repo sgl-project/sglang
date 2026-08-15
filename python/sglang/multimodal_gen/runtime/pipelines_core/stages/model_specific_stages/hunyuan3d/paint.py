@@ -197,7 +197,7 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
     def _prepare_delight_target(
         image: Image.Image, device: torch.device
     ) -> tuple[Image.Image, torch.Tensor, torch.Tensor]:
-        image = image.resize((512, 512), Image.Resampling.LANCZOS)
+        image = image.resize((512, 512), Image.Resampling.BICUBIC)
         if image.mode == "RGBA":
             pixels = np.asarray(image).copy()
             kernel = np.ones((3, 3), np.uint8)
@@ -279,7 +279,7 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
 
         scheduler = self.delight_scheduler
         scheduler.set_timesteps(self.config.delight_num_inference_steps, device=device)
-        generator = torch.Generator(device=device).manual_seed(42)
+        generator = torch.Generator(device="cpu").manual_seed(42)
         latent_channels = self.delight_transformer.config.out_channels
         latents = randn_tensor(
             (1, latent_channels, image_latents.shape[-2], image_latents.shape[-1]),
@@ -493,7 +493,7 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
     ) -> torch.Tensor:
         tensors = []
         for image in images:
-            image = image.resize((size, size), Image.Resampling.LANCZOS)
+            image = image.resize((size, size), Image.Resampling.BICUBIC)
             if image.mode == "L":
                 image = image.point(lambda value: 255 if value > 1 else 0).convert(
                     "RGB"
@@ -570,7 +570,7 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
         references = reference if isinstance(reference, list) else [reference]
         reference_images = [
             _to_rgb_image(image).resize(
-                (render_size, render_size), Image.Resampling.LANCZOS
+                (render_size, render_size), Image.Resampling.BICUBIC
             )
             for image in references
         ]
@@ -799,7 +799,7 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
         textures = [
             image.resize(
                 (self.config.paint_render_size, self.config.paint_render_size),
-                Image.Resampling.LANCZOS,
+                Image.Resampling.BICUBIC,
             )
             for image in batch.extra["multiview_textures"]
         ]
