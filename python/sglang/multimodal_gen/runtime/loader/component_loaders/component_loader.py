@@ -418,7 +418,12 @@ class ComponentLoader(ABC):
         # NOTE(FlamingoPg): special for LTX-2 models
         # `model_index.json` records these under an `ltx2` library that is not a
         # real importable package; SGLang implements them natively.
-        if component_name in ("vocoder", "connectors", "duration_head"):
+        if component_name in (
+            "vocoder",
+            "connectors",
+            "duration_head",
+            "diffusion_decoder",
+        ):
             transformers_or_diffusers = "diffusers"
 
         # NOTE(CloudRipple): special for MOVA models

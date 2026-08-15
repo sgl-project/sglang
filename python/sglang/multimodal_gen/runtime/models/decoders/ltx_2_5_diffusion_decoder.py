@@ -17,11 +17,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.multimodal_gen.configs.models.vaes.ltx_2_5_diffusion_decoder import (
+from sglang.multimodal_gen.configs.models.decoders.ltx_2_5_diffusion_decoder import (
     LTX25DiffusionDecoderConfig,
 )
-from sglang.multimodal_gen.runtime.models.dits.ltx_2 import (
-    LTX2PixArtAlphaCombinedTimestepSizeEmbeddings,
+from sglang.multimodal_gen.runtime.layers.visual_embedding import (
+    timestep_embedding,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -52,6 +52,42 @@ def _na3d():
 
 
 _compiled_flex_attention = None
+
+
+class LTX2VideoDecoderTimestepEmbedder(nn.Module):
+    """Replicated native timestep MLP used by the standalone decoder.
+
+    The decoder is replicated across TP ranks, so these projections must remain
+    ordinary linear layers. Reusing the DiT's tensor-parallel embedder shards
+    their parameters and makes the unsharded decoder checkpoint unloadable.
+    """
+
+    def __init__(self, embedding_dim: int, in_channels: int = 256) -> None:
+        super().__init__()
+        self.linear_1 = nn.Linear(in_channels, embedding_dim, bias=True)
+        self.linear_2 = nn.Linear(embedding_dim, embedding_dim, bias=True)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.linear_1(hidden_states)
+        hidden_states = F.silu(hidden_states)
+        return self.linear_2(hidden_states)
+
+
+class LTX2VideoDecoderCombinedTimestepEmbeddings(nn.Module):
+    def __init__(self, embedding_dim: int) -> None:
+        super().__init__()
+        self.timestep_embedder = LTX2VideoDecoderTimestepEmbedder(embedding_dim)
+
+    def forward(
+        self, timestep: torch.Tensor, hidden_dtype: torch.dtype | None = None
+    ) -> torch.Tensor:
+        timestep = timestep.reshape(-1).to(dtype=torch.float32)
+        hidden_states = timestep_embedding(
+            timestep, dim=256, max_period=10000, dtype=torch.float32
+        )
+        if hidden_dtype is not None:
+            hidden_states = hidden_states.to(dtype=hidden_dtype)
+        return self.timestep_embedder(hidden_states)
 
 
 def _flex_attention_fn():
@@ -580,7 +616,7 @@ class LTX2VideoDiffusionDecoder3d(nn.Module):
                 )
             )
 
-        self.t_embedder = LTX2PixArtAlphaCombinedTimestepSizeEmbeddings(
+        self.t_embedder = LTX2VideoDecoderCombinedTimestepEmbeddings(
             embedding_dim=arch.decoder_t_emb_dim
         )
 

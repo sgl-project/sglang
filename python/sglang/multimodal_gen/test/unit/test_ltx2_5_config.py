@@ -6,7 +6,11 @@ silent regression would produce wrong output rather than an error. Everything
 here is CPU/meta-device only -- no weights, no GPU.
 """
 
+import json
+import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
     LTX2ConnectorArchConfig,
@@ -366,7 +370,7 @@ class TestLTX25DiffusionDecoder(unittest.TestCase):
     """The 2.5 diffusion decoder: config shape and the geometry it implies."""
 
     def _config(self):
-        from sglang.multimodal_gen.configs.models.vaes.ltx_2_5_diffusion_decoder import (
+        from sglang.multimodal_gen.configs.models.decoders.ltx_2_5_diffusion_decoder import (
             LTX25DiffusionDecoderConfig,
         )
 
@@ -401,7 +405,7 @@ class TestLTX25DiffusionDecoder(unittest.TestCase):
     def test_builds_and_reports_expected_context_width(self):
         import torch
 
-        from sglang.multimodal_gen.runtime.models.vaes.ltx_2_5_diffusion_decoder import (
+        from sglang.multimodal_gen.runtime.models.decoders.ltx_2_5_diffusion_decoder import (
             LTX2VideoDiffusionDecoderModel,
         )
 
@@ -416,11 +420,88 @@ class TestLTX25DiffusionDecoder(unittest.TestCase):
         # trailing frames that stage 4 crops.
         self.assertEqual(model.decoder.trailing_pad_latent_frames, 2)
 
+    def test_timestep_embedder_is_replicated_and_checkpoint_compatible(self):
+        import torch
+        from torch import nn
+
+        from sglang.multimodal_gen.runtime.models.decoders.ltx_2_5_diffusion_decoder import (
+            LTX2VideoDiffusionDecoderModel,
+        )
+
+        with torch.device("meta"):
+            model = LTX2VideoDiffusionDecoderModel(self._config())
+        timestep_embedder = model.decoder.t_embedder.timestep_embedder
+        self.assertIsInstance(timestep_embedder.linear_1, nn.Linear)
+        self.assertIsInstance(timestep_embedder.linear_2, nn.Linear)
+        self.assertEqual(
+            tuple(timestep_embedder.linear_1.weight.shape),
+            (self._config().arch_config.decoder_t_emb_dim, 256),
+        )
+        self.assertIn(
+            "decoder.t_embedder.timestep_embedder.linear_1.weight",
+            model.state_dict(),
+        )
+
     def test_class_name_resolves(self):
         from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 
         cls, _ = ModelRegistry.resolve_model_cls("LTX2VideoDiffusionDecoderModel")
         self.assertEqual(cls.__name__, "LTX2VideoDiffusionDecoderModel")
+
+
+class TestLTX25OptionalDecoderLoading(unittest.TestCase):
+    @staticmethod
+    def _server_args(load_diffusion_decoder: bool):
+        return SimpleNamespace(
+            load_diffusion_decoder=load_diffusion_decoder,
+            model_variant=None,
+            component_paths={},
+        )
+
+    @staticmethod
+    def _write_model_index(model_path: str, *, include_decoder: bool = True):
+        model_index = {
+            "_class_name": "LTX2Pipeline",
+            "duration_head": ["ltx2", "LTX2DurationHeadModel"],
+        }
+        if include_decoder:
+            model_index["diffusion_decoder"] = [
+                "ltx2",
+                "LTX2VideoDiffusionDecoderModel",
+            ]
+        with open(f"{model_path}/model_index.json", "w") as f:
+            json.dump(model_index, f)
+
+    def test_decoder_is_not_loaded_by_default(self):
+        from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import LTX2Pipeline
+        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+            LoRAPipeline,
+        )
+
+        with tempfile.TemporaryDirectory() as model_path:
+            self._write_model_index(model_path)
+            with mock.patch.object(LoRAPipeline, "__init__", return_value=None) as init:
+                LTX2Pipeline(model_path, self._server_args(False))
+        modules = init.call_args.kwargs["required_config_modules"]
+        self.assertIn("duration_head", modules)
+        self.assertNotIn("diffusion_decoder", modules)
+
+    def test_decoder_load_is_explicit_and_validated(self):
+        from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import LTX2Pipeline
+        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+            LoRAPipeline,
+        )
+
+        with tempfile.TemporaryDirectory() as model_path:
+            self._write_model_index(model_path)
+            with mock.patch.object(LoRAPipeline, "__init__", return_value=None) as init:
+                LTX2Pipeline(model_path, self._server_args(True))
+            modules = init.call_args.kwargs["required_config_modules"]
+            self.assertIn("diffusion_decoder", modules)
+
+            self._write_model_index(model_path, include_decoder=False)
+            with self.assertRaisesRegex(ValueError, "does not declare"):
+                LTX2Pipeline(model_path, self._server_args(True))
 
 
 class TestLTX25LatentUpsampler(unittest.TestCase):

@@ -7,10 +7,14 @@ Runs between the text connectors and latent preparation, so it can rewrite
 
 import torch
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 logger = init_logger(__name__)
 
@@ -27,8 +31,24 @@ class LTX2DurationStage(PipelineStage):
         super().__init__()
         self.duration_head = duration_head
 
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        if self.duration_head is None:
+            return []
+        dtype = resolve_precision(
+            server_args, "duration_head", precision_attr="dit_precision"
+        )
+        return [
+            ComponentUse(
+                self._component_stage_name(stage_name),
+                "duration_head",
+                target_dtype=dtype,
+            )
+        ]
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        if not getattr(batch, "auto_duration", False):
+        if not batch.auto_duration:
             return batch
 
         if self.duration_head is None:
@@ -46,8 +66,14 @@ class LTX2DurationStage(PipelineStage):
 
         # A CFG batch carries [negative, positive] with duplicated rows, so
         # predict from the first positive row only.
-        with torch.no_grad():
-            num_frames = self.duration_head.predict_num_frames(
+        with (
+            self.use_declared_component(
+                component_name="duration_head", module=self.duration_head
+            ) as duration_head,
+            torch.no_grad(),
+        ):
+            assert duration_head is not None
+            num_frames = duration_head.predict_num_frames(
                 video_tokens[:1],
                 audio_tokens[:1],
                 frame_rate=float(batch.fps),

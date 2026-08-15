@@ -1,8 +1,4 @@
-import json
-import os
 import re
-
-from safetensors.torch import load_file as safetensors_load_file
 
 from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
     LTX2ConnectorConfig,
@@ -10,14 +6,11 @@ from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
 from sglang.multimodal_gen.configs.models.adapter.ltx_2_duration_head import (
     LTX2DurationHeadConfig,
 )
-from sglang.multimodal_gen.configs.models.vaes.ltx_2_5_diffusion_decoder import (
-    LTX25DiffusionDecoderConfig,
-)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
-    _list_safetensors_files,
+    load_safetensors_state_dict,
     set_default_torch_dtype,
     skip_init_modules,
 )
@@ -37,14 +30,13 @@ class AdapterLoader(ComponentLoader):
     2) Loads the safetensors state_dict (single-file or sharded).
     """
 
-    component_names = ["connectors", "duration_head", "diffusion_decoder"]
+    component_names = ["connectors", "duration_head"]
     expected_library = "diffusers"
 
     # `update_model_arch` fills each from the component's `config.json`.
     _CONFIG_CLASSES = {
         "connectors": LTX2ConnectorConfig,
         "duration_head": LTX2DurationHeadConfig,
-        "diffusion_decoder": LTX25DiffusionDecoderConfig,
     }
 
     def load_customized(
@@ -70,9 +62,8 @@ class AdapterLoader(ComponentLoader):
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
-        # Not a fixed name: the policy answers differently for `connectors`
-        # (follows `dit_cpu_offload`) than for the other two, which stay
-        # resident by default.
+        # Not a fixed name: connectors follow DiT offload, while the duration
+        # head stays resident unless selected explicitly.
         target_device = self.target_device(
             server_args.should_cpu_offload_component(component_name)
         )
@@ -86,7 +77,7 @@ class AdapterLoader(ComponentLoader):
             adapter_cfg.update_model_arch(config)
             model = model_cls(adapter_cfg).to(device=target_device, dtype=default_dtype)
 
-        loaded = self._load_connector_state_dict(component_model_path)
+        loaded = load_safetensors_state_dict(component_model_path)
         mapping = adapter_cfg.arch_config.param_names_mapping
         loaded = {_remap_connector_key(k, mapping): v for k, v in loaded.items()}
 
@@ -103,37 +94,6 @@ class AdapterLoader(ComponentLoader):
             )
 
         return model
-
-    @staticmethod
-    def _load_connector_state_dict(component_model_path: str) -> dict:
-        """Read the connector weights, single-file or sharded.
-
-        LTX-2.0 ships one file; LTX-2.5 ships a 2-shard set *alongside* a
-        single-file copy of the same weights, so prefer the index when it is
-        present and fall back to the lone file otherwise.
-        """
-        index_path = os.path.join(
-            component_model_path, "diffusion_pytorch_model.safetensors.index.json"
-        )
-        if os.path.exists(index_path):
-            with open(index_path) as f:
-                shards = sorted(set(json.load(f)["weight_map"].values()))
-            state_dict: dict = {}
-            for shard in shards:
-                state_dict.update(
-                    safetensors_load_file(os.path.join(component_model_path, shard))
-                )
-            return state_dict
-
-        safetensors_list = _list_safetensors_files(component_model_path)
-        if not safetensors_list:
-            raise ValueError(f"No safetensors files found in {component_model_path}")
-        if len(safetensors_list) != 1:
-            raise ValueError(
-                f"Found {len(safetensors_list)} safetensors files in "
-                f"{component_model_path} and no index to disambiguate them."
-            )
-        return safetensors_load_file(safetensors_list[0])
 
 
 def _remap_connector_key(key: str, param_names_mapping: dict[str, str]) -> str:

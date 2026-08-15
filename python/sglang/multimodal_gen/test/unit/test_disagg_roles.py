@@ -139,11 +139,15 @@ class TestGetModuleRole(unittest.TestCase):
         self.assertEqual(get_module_role("audio_vae"), RoleType.DECODER)
         self.assertEqual(get_module_role("video_vae"), RoleType.DECODER)
         self.assertEqual(get_module_role("vocoder"), RoleType.DECODER)
+        self.assertEqual(get_module_role("diffusion_decoder"), RoleType.DECODER)
         self.assertEqual(get_module_role("hy3dshape_vae"), RoleType.DECODER)
 
     def test_shared_modules(self):
         self.assertIsNone(get_module_role("scheduler"))
         self.assertIsNone(get_module_role("hy3dshape_scheduler"))
+
+    def test_ltx25_optional_modules(self):
+        self.assertEqual(get_module_role("duration_head"), RoleType.ENCODER)
 
 
 class TestFilterModulesForRole(unittest.TestCase):

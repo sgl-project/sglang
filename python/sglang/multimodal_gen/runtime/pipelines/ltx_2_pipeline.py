@@ -344,13 +344,21 @@ class _BaseLTX2Pipeline(LoRAPipeline):
 
     def __init__(self, model_path, server_args, required_config_modules=None, **kwargs):
         self._maybe_route_dev_transformer(model_path, server_args)
-        # LTX-2 / 2.3 ship neither, so require them only when declared.
+        # LTX-2 / 2.3 ship neither. The small duration head is always available
+        # when declared; the much larger decoder is loaded only on request.
         modules = list(required_config_modules or self._required_config_modules)
-        for optional in ("duration_head", "diffusion_decoder"):
-            if optional not in modules and self._declares_component(
-                model_path, optional
-            ):
-                modules.append(optional)
+        if "duration_head" not in modules and self._declares_component(
+            model_path, "duration_head"
+        ):
+            modules.append("duration_head")
+        if server_args.load_diffusion_decoder:
+            if not self._declares_component(model_path, "diffusion_decoder"):
+                raise ValueError(
+                    "--load-diffusion-decoder was requested, but this checkpoint "
+                    "does not declare a diffusion_decoder component."
+                )
+            if "diffusion_decoder" not in modules:
+                modules.append("diffusion_decoder")
         super().__init__(
             model_path, server_args, required_config_modules=modules, **kwargs
         )

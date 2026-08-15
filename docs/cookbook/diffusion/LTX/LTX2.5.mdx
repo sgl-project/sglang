@@ -277,7 +277,23 @@ sglang generate \
 
 It is a diffusion model in its own right and decodes more slowly than the VAE
 decoder, so it is off by default — matching upstream, where `LTX2Pipeline` also
-decodes with the VAE.
+decodes with the VAE. The offline `generate` command loads the optional decoder
+automatically when `--use-diffusion-decoder` is present.
+
+For an online server, opt into loading the decoder at startup, then select it per
+request with `use_diffusion_decoder: true`:
+
+```bash
+sglang serve \
+  --model-path Lightricks/LTX-2.5-Diffusers \
+  --pipeline-class-name LTX2Pipeline \
+  --load-diffusion-decoder
+```
+
+This keeps the default server footprint unchanged while still allowing VAE and
+diffusion-decoder requests to share one server. When GPU memory is constrained,
+`--cpu-offload-components diffusion_decoder` keeps the optional decoder on CPU
+between uses.
 
 <Tip>
 **Install NATTEN for this decoder.** Its stages run 3D neighborhood attention,
