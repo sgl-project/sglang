@@ -1,4 +1,8 @@
-"""WAR read-done event utilities for CUDA graph runners."""
+"""Shared-read-done event utilities for CUDA graph runners.
+
+The event marks that a phase has finished reading the scheduler-shared
+buffers; the scheduler's WAR barrier waits on it before overwriting them.
+"""
 
 import logging
 from typing import Optional
@@ -23,7 +27,7 @@ def make_external_event(device_module) -> Optional[torch.cuda.Event]:
         return None
 
 
-def maybe_publish_prefill_war_read_done(
+def maybe_publish_prefill_shared_read_done(
     model_runner, forward_batch, device_module
 ) -> None:
     """Publish prefill read-done after compliant metadata initialization."""
@@ -42,9 +46,9 @@ def maybe_publish_prefill_war_read_done(
     if boundary is not SharedReadBoundary.PRE_REPLAY:
         return
     logger.info_once(
-        "Prefill WAR read-done fastpath active (%s)",
+        "Prefill shared-read-done fastpath active (%s)",
         type(model_runner.attn_backend).__name__,
     )
     read_done = device_module.Event()
     read_done.record()
-    model_runner.war_fastpath_read_done_event = read_done
+    model_runner.shared_read_done_event = read_done

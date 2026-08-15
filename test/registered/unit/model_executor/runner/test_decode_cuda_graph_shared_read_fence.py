@@ -19,7 +19,7 @@ class _SpecAlgorithm:
     def __init__(self, target_verify_war: bool = False):
         self._target_verify_war = target_verify_war
 
-    def is_war_publish_phase(self, forward_mode) -> bool:
+    def is_last_shared_read_phase(self, forward_mode) -> bool:
         return self._target_verify_war and forward_mode.is_target_verify()
 
 
@@ -34,7 +34,7 @@ def _runner(*, target_verify_war: bool = False, has_marker: bool = False):
         spec_algorithm=_SpecAlgorithm(target_verify_war),
         device_timer=None,
         is_draft_worker=False,
-        war_fastpath_read_done_event=None,
+        shared_read_done_event=None,
     )
     runner.in_graph_metadata_prep_done = object() if has_marker else None
     return runner
@@ -45,7 +45,7 @@ def test_unrelated_modes_never_publish():
     # other mode must leave the scheduler on the coarse whole-forward wait,
     # even when a marker is available.
     assert (
-        _runner(has_marker=True)._war_read_done_record(
+        _runner(has_marker=True)._resolve_shared_read_boundary(
             _attn_backend(), ForwardMode.EXTEND
         )
         is SharedReadBoundary.UNKNOWN
@@ -56,7 +56,7 @@ def test_post_replay_declaration_is_not_advanced():
     # A backend that keeps reading shared state across the whole graph declares
     # POST_REPLAY. Having an in-graph marker must not pull the fence earlier.
     assert (
-        _runner(target_verify_war=True, has_marker=True)._war_read_done_record(
+        _runner(target_verify_war=True, has_marker=True)._resolve_shared_read_boundary(
             _attn_backend(SharedReadBoundary.POST_REPLAY), ForwardMode.TARGET_VERIFY
         )
         is SharedReadBoundary.POST_REPLAY
@@ -98,7 +98,7 @@ def test_execute_publishes_the_in_graph_marker():
     result = runner.execute(forward_batch)
 
     assert result.tensors["hidden_states"].shape == (1, 1)
-    assert runner.model_runner.war_fastpath_read_done_event is marker
+    assert runner.model_runner.shared_read_done_event is marker
 
 
 def test_execute_falls_back_to_pre_replay_without_marker():
@@ -117,7 +117,7 @@ def test_execute_falls_back_to_pre_replay_without_marker():
 
     # The eager record lands before the replay so the fence stays truthful.
     assert calls == ["record", "replay"]
-    assert isinstance(runner.model_runner.war_fastpath_read_done_event, Event)
+    assert isinstance(runner.model_runner.shared_read_done_event, Event)
 
 
 @pytest.mark.parametrize("supported", [False, True])
@@ -130,7 +130,7 @@ def test_target_verify_requires_war_capability(supported):
     runner.execute(_execute_harness(runner, [], ForwardMode.TARGET_VERIFY))
 
     expected = marker if supported else None
-    assert runner.model_runner.war_fastpath_read_done_event is expected
+    assert runner.model_runner.shared_read_done_event is expected
 
 
 if __name__ == "__main__":

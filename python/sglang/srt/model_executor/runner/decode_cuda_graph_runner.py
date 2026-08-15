@@ -93,7 +93,7 @@ from sglang.srt.model_executor.runner_utils.capture_mode import (
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
-from sglang.srt.model_executor.runner_utils.war_event import make_external_event
+from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
@@ -433,6 +433,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # When the shared buffers are read done is decided by attn backend.
         if not torch.cuda.is_current_stream_capturing():
             # Warmup runs share this body; only a capturing run plants a node.
+            # Breakable capture is fine: it opens segment 1 on context entry and
+            # every segment replays, re-arming the node.
             return
         if self.in_graph_metadata_prep_done is None:
             self.in_graph_metadata_prep_done = make_external_event(self.device_module)
@@ -442,11 +444,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # boundary resolution below never hands out an unrecorded event.
             event.record()
 
-    def _war_read_done_record(self, attn_backend, forward_mode) -> SharedReadBoundary:
-        """Where this replay records its WAR read-done event; UNKNOWN records
-        nothing."""
+    def _resolve_shared_read_boundary(
+        self, attn_backend, forward_mode
+    ) -> SharedReadBoundary:
+        """Where this replay records its shared-read-done event: the backend's
+        declaration, demoted when this runner cannot record at that point.
+        UNKNOWN records nothing (scheduler keeps the coarse fence)."""
         if forward_mode.is_target_verify():
-            if not self.model_runner.spec_algorithm.is_war_publish_phase(forward_mode):
+            if not self.model_runner.spec_algorithm.is_last_shared_read_phase(
+                forward_mode
+            ):
                 return SharedReadBoundary.UNKNOWN
         elif not forward_mode.is_decode():
             return SharedReadBoundary.UNKNOWN
@@ -456,22 +463,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             boundary is SharedReadBoundary.IN_REPLAY
             and self.in_graph_metadata_prep_done is None
         ):
-            # In-graph record not found, fall back to the pre-replay
+            # In-graph marker not found, fall back to the pre-replay record.
+            # TODO: PRE_REPLAY is earlier than the declared boundary; POST_REPLAY
+            # is the sound demotion for a backend that really reads in-graph.
             return SharedReadBoundary.PRE_REPLAY
         return boundary
 
     def _publish_read_done(self, in_graph: bool):
+        """Hand the scheduler's WAR barrier the event marking this phase's
+        shared-buffer reads as done."""
         if in_graph:
-            # all reads end exactly after in-graph metadata prep done,
-            # then wire the internal event to read done event.
-            self.model_runner.war_fastpath_read_done_event = (
-                self.in_graph_metadata_prep_done
-            )
+            # All reads end exactly at the in-graph metadata prep, so wire that
+            # marker through instead of recording a second event.
+            self.model_runner.shared_read_done_event = self.in_graph_metadata_prep_done
         else:
-            # Happens out side of graph replay
+            # Recorded eagerly on the stream, outside the captured graph.
             read_done = self.device_module.Event()
             read_done.record()
-            self.model_runner.war_fastpath_read_done_event = read_done
+            self.model_runner.shared_read_done_event = read_done
 
     def _build_ragged_verify_token_buckets(self) -> list[int]:
         buckets = sorted({bs * self.captured_req_width for bs in self.capture_bs})
@@ -1311,7 +1320,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         timer_ctx = device_timer_ctx(
             self.model_runner.device_timer, forward_batch.forward_mode.name.lower()
         )
-        war_record = self._war_read_done_record(
+        shared_read_boundary = self._resolve_shared_read_boundary(
             self.attn_backend, forward_batch.forward_mode
         )
         with timer_ctx, self.backend.replay_session():
@@ -1330,15 +1339,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         else ""
                     ),
                 )
-            if war_record is SharedReadBoundary.PRE_REPLAY:
+            if shared_read_boundary is SharedReadBoundary.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
-            if war_record is SharedReadBoundary.IN_REPLAY:
+            if shared_read_boundary is SharedReadBoundary.IN_REPLAY:
                 self._publish_read_done(in_graph=True)
 
-            if war_record is SharedReadBoundary.POST_REPLAY:
+            if shared_read_boundary is SharedReadBoundary.POST_REPLAY:
                 self._publish_read_done(in_graph=False)
 
         if isinstance(output, LogitsProcessorOutput):
