@@ -439,13 +439,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.in_graph_metadata_prep_done = make_external_event(self.device_module)
         event = self.in_graph_metadata_prep_done
         if event is not None:
-            # Stays None without external-event support, so the boundary
+            # Stays None without external-event support, so the read-end
             # resolution below never hands out an unrecorded event.
             event.record()
 
-    def _resolve_shared_read_boundary(
-        self, attn_backend, forward_mode
-    ) -> SharedReadEnds:
+    def _resolve_shared_read_ends(self, attn_backend, forward_mode) -> SharedReadEnds:
         """Where this replay records its shared-read-done event: the backend's
         declaration, demoted when this runner cannot record at that point.
         UNKNOWN records nothing (scheduler keeps the coarse fence)."""
@@ -456,16 +454,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 return SharedReadEnds.UNKNOWN
         elif not forward_mode.is_decode():
             return SharedReadEnds.UNKNOWN
-        boundary = attn_backend.shared_read_ends(forward_mode)
+        declared = attn_backend.shared_read_ends(forward_mode)
 
         if (
-            boundary is SharedReadEnds.IN_REPLAY
+            declared is SharedReadEnds.IN_REPLAY
             and self.in_graph_metadata_prep_done is None
         ):
-            # TODO: PRE_REPLAY is EARLIER than the declared boundary; POST_REPLAY
+            # TODO: PRE_REPLAY is EARLIER than the declared read end; POST_REPLAY
             # is the sound demotion for a backend that really reads in-graph.
             return SharedReadEnds.PRE_REPLAY
-        return boundary
+        return declared
 
     def _publish_read_done(self, in_graph: bool):
         """Hand the scheduler's WAR barrier the event marking this phase's
@@ -1316,7 +1314,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         timer_ctx = device_timer_ctx(
             self.model_runner.device_timer, forward_batch.forward_mode.name.lower()
         )
-        shared_read_boundary = self._resolve_shared_read_boundary(
+        shared_read_ends = self._resolve_shared_read_ends(
             self.attn_backend, forward_batch.forward_mode
         )
         with timer_ctx, self.backend.replay_session():
@@ -1335,15 +1333,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         else ""
                     ),
                 )
-            if shared_read_boundary is SharedReadEnds.PRE_REPLAY:
+            if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
-            if shared_read_boundary is SharedReadEnds.IN_REPLAY:
+            if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)
 
-            if shared_read_boundary is SharedReadEnds.POST_REPLAY:
+            if shared_read_ends is SharedReadEnds.POST_REPLAY:
                 self._publish_read_done(in_graph=False)
 
         if isinstance(output, LogitsProcessorOutput):
