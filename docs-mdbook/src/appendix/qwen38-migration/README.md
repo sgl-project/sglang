@@ -1,6 +1,6 @@
 # 附录 H：Qwen3.8-27B 迁移预研
 
-> 状态：**config 架构判定完成 + 权重核对完成**（2026-08-14）。Qwen3.8-27B 判定为 **Qwen3.5 dense 家族架构**（详见第 8 节）。核心结论：SGLang **v0.5.10 起已支持该架构，生产 0.5.17 无需为模型层升级**；**生产路径首选 `Qwen/Qwen3.8-27B-FP8`**——该变体含 `mtp.safetensors`（MTP 可用），显存账与 Qwen3.6-27B-FP8 相当；BF16 全量变体（≈55.6GB）无独立 MTP 文件，仅作对照。
+> 状态：**最终判定已出（2026-08-15）：0.5.17 免重编、免升级，直接部署**（见第 11 节）。Qwen3.8-27B 与 Qwen3.6-27B 的 `architectures` 声明完全相同（`Qwen3_5ForConditionalGeneration`），执行路径逐字节一致；生产路径首选 `Qwen/Qwen3.8-27B-FP8`——该变体含 `mtp.safetensors`（MTP 可用），显存账与 Qwen3.6-27B-FP8 相当；BF16 全量变体（≈55.6GB）无独立 MTP 文件，仅作对照。
 
 ## 1. 目标与核心风险
 
@@ -234,12 +234,77 @@ hybrid GDN 架构中，48 层 GDN 的状态定长（~146MB/req，不占 KV 池�
 
 预期管理：GDN 层 prefill 是串行 scan，30 万 token 输入单卡 TTFT 为分钟级，属架构特性而非故障；decode 有 MTP，体验与生产一致。
 
-### 9.4 单卡挑战 1M 的唯一路径：HiCache 卸载（探索性）
+### 9.4 单卡挑战 1M 的路径（2026-08-15 源码核实后重写）
 
-纯显存路线物理不可行（60GB > 46GB），唯一路径是 **HiCache 分层缓存把 KV 卸载到主机内存**（`--enable-hierarchical-cache --hicache-ratio 2`），GPU 只保留热窗口：
+**先纠正本节此前的错误结论**：原稿认为 HiCache 分层缓存是单卡 1M 的路径，源码核实后**不成立**。HiCache 是**前缀缓存而非虚拟内存**：命中主机内存的前缀会在请求准入前整体载回 GPU（`schedule_policy.py` 的 `needs_host_load_back`），且存在硬上限 `max_req_len = min(context_len-1, 池子总 token 数-1)`（`tp_worker.py:411-416`，池子不够直接 assert 拒绝）——**decode 要求完整 KV 驻留 GPU，源码中不存在部分驻留的 decode 路径**。运行中请求持有 tree lock，KV 也不会被中途降级。HiCache 只对"后续请求共享长前缀"的多轮场景有用，对单条 1M 请求无能为力。
 
-- **前提**：代码须含 #34560（MTP + HiCache 启动修复）；hybrid GDN（mamba state）+ HiCache 的组合**无官方验证记录**，mamba 定长状态与 KV 分层能否协同要实测；
-- **资源**：主机内存 ≥32GB 余量承接卸载的 KV；`--max-running-requests` 压到 1；
-- **代价**：1M token prefill 的 full-attn O(n²) 开销主导，单卡 TTFT 预计 10 分钟级；decode 命中冷 KV 需从内存搬回，ITL 抖动。
+源码核实后单卡 1M 的**唯一路径是权重卸载** `--cpu-offload-gb`：
 
-务实路线：先按 9.3 跑通 320K 验证（显存内可完成、有区分度），再视实际需求决定是否投入 1M 探索；**生产级 1M 建议 TP=2 起步**，不在单卡上硬扛。
+- 原理：把 ~20GB FP8 权重卸载到主机内存，腾出显存给 32GB 的 1M KV 池；无模型家族限制（`utils/offloader.py` OffloaderV1）；
+- 代价：**每个 decode step 和每个 prefill chunk 都要把卸载的权重经 PCIe 重新上传**——decode 约 0.7~1s/token（PCIe gen4），1M prefill 累计 ~2.5TB 主机流量；只适合离线批量分析，不可交互；
+- 风险：OffloaderV1 × FP8 量化权重 × GDN triton 内核的组合**无任何测试覆盖**，CUDA graph 捕获大概率失败，需 `--disable-cuda-graph`；
+- 配套：`--kv-cache-dtype fp8_e4m3 --mamba-ssm-dtype bfloat16 --mem-fraction-static 0.90 --chunked-prefill-size 8192 --max-running-requests 1 --max-mamba-cache-size 4`。
+
+务实路线不变：先按 9.3 跑通 320K 验证；**生产级 1M 用 TP=2 起步**（权重分摊后 KV 池自然够），不在单卡上硬扛。
+
+## 10. 同步后源码适配与参数复用结论（2026-08-15 源码核实）
+
+### 10.1 同步 main 后的 L40S（SM89）重编译评估
+
+| 0.5.17 时代的 workaround | 当前 main 上的状态 |
+|---|---|
+| `load_utils.py` sm89 路由修复 | bug 仍在（cc=89 仍路由到 sm100 目录），但两个架构目录现在用同一源码+同一 gencode 列表构建，**源码编译含 sm_89 cubin，补丁可不再打**；装预编译 wheel 才需要 |
+| `sm90` 目录软链接 | **已废弃**——上游 CMake 现在统一 `OUTPUT_NAME "common_ops"`，命名错配不存在了 |
+| 4 个 es_* 符号的 `LD_PRELOAD` stubs | **已废弃**——4 个符号全部改为无条件定义 + `TORCH_CHECK` 兜底体，sm89 构建可直接 `import sgl_kernel`；且旧 stubs.cc 签名已过期（`fp8_blockwise_scaled_grouped_mm` 加了 layout 参数），直接丢弃 |
+| 源码编译 sglang-kernel | **必须重编**：版本钉到 `0.4.6.post1`，源码已移到 `python/sglang/kernels/aot`；CMake 仍接受 CUDA 12.1，`ENABLE_BELOW_SM90` 默认 ON（自动带 sm_89 gencode） |
+| flashinfer 0.6.13 | 运行期断言要求 **≥0.6.17**（仅 flashinfer backend 路径）；可用 skip 环境变量绕过，但 0.6.13 与新 srt 的 API 漂移是真实风险；0.6.17 以 `[cu13]` 分发，cu121 兼容性未知 |
+| `SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1` | 仍需保留（除非同时升级 kernel 0.4.6.post1 + flashinfer 0.6.17） |
+| `--disable-cuda-graph` | 不再被架构强制；上游已为 Qwen3.5/Qwen3Next GDN 默认开启 piecewise CUDA graph——首发保留旧参数，A/B 验证后再考虑打开 |
+
+**最大风险是基线整体上移**：当前 main 的开发基线为 `torch==2.13.0` / `flashinfer 0.6.17[cu13]` / `cuda-python>=13.0` / `transformers==5.12.1` / Docker 基座 CUDA 13（上游构建目标已不含 12.1）。现有 torch 2.7.0+cu121 没有硬性 import 阻断，但完全在上游 CI 覆盖之外。若冒烟出现 torch API 相关报错，现实选项是升级到 torch ≥2.8 + CUDA 12.8/12.9（还能直接用官方 wheel，省掉大部分补丁），而不是在 cu121 上硬扛。
+
+### 10.2 Qwen3.6-27B 参数复用审计（对 Qwen3.8-27B）
+
+逐参数对当前源码核实，旧生产命令**无失效/改名参数**，但有几个必须知道的差异：
+
+| 参数 | 判定 | 说明 |
+|---|---|---|
+| `--mamba-backend triton` / `--mamba-radix-cache-strategy extra_buffer` | 直接复用 | extra_buffer 是投机解码下唯一兼容策略；Qwen3_5 在白名单内 |
+| `--speculative-algorithm NEXTN` + 3/1/4 | 直接复用 | NEXTN 仍是 EAGLE 的合法别名；MTP 映射 `Qwen3_5ForConditionalGeneration → Qwen3_5ForCausalLMMTP` 已确认。**注意**：MTP + flashinfer backend 需要 flashinfer > 0.6.15.post1（prefill plan 支持 `uniform_q_len`），否则 spec 路径改走 `--attention-backend triton` |
+| `--reasoning-parser qwen3` / `--tool-call-parser qwen3_coder` | 直接复用 | 两个 detector 均在，官方 cookbook 确认 qwen3_coder |
+| `--kv-cache-dtype fp8_e5m2` | 可用但偏离官方配方 | 官方 3.8-27B 配方全部用 auto（bf16 KV），FP8 KV 只文档化 e4m3；e5m2 仍合法，建议按 e4m3 重新标定 |
+| `--mem-fraction-static 0.85` | **需要调整** | 3.8-27B 是多模态权重，vision tower 默认常驻加载，且 VLM 会触发 mem-fraction **自动下调**（`server_args.py` `adjust_mem_fraction_for_vlm`），显式 0.85 会被静默改低 |
+| `--language-model-only` | **不可用** | 旗标存在，但 `_handle_language_model_only` 白名单不含 Qwen3_5 架构，会直接 ValueError；跳过视觉塔的通用化还在上游未合并分支上。当前唯一跳过的办法是改 checkpoint config 声明 `language_model_only: true`（代价：多模态请求被拒） |
+| `--context-length 98304` | 直接复用 | 3.8 原生 262,144 相同 |
+| `--disable-cuda-graph` | 复用（首发） | 官方配方已 graphs-on（该架构支持 breakable prefill graph），可作为后续 A/B 项 |
+| TP=2 DP=3 布局 | 直接复用 | 官方只出单卡配方，多卡布局是自己的加法 |
+| `--mamba-full-memory-ratio` | **新增必算** | 默认 0.9 会过度预留 KV、悄悄钳住并发；按官方公式 `ratio = (S+D)×state_bytes / (L×kv_per_token)` 用自有负载重算（S=5 extra_buffer 槽位、D=draft token 数、state ≈154MB fp32 / 78MB bf16） |
+| `--chunked-prefill-size 2048` | 新增建议 | 混合负载下 8192 chunk 会让 decode 卡顿 ~600ms |
+
+另外明确一点：3.8-27B 是 dense，**没有 MoE 路径**，3.6 时代关于 triton MoE / expert-specialization 符号的顾虑对这个 checkpoint 不适用。FP8 blockwise 的最低算力要求是 sm80，L40S 无问题。
+
+### 10.3 单卡 1M 结论（修正 9.4 后的最终版）
+
+- HiCache **不能**让单条 1M 请求跑起来（前缀缓存 ≠ 虚拟内存，decode 要求完整 KV 驻留 GPU，见 9.4）；
+- 单卡唯一路径是 `--cpu-offload-gb ~20` 权重卸载换 KV 空间，代价是 decode ~1s/token 级，仅限离线批量；
+- 无卸载的单卡上限约 320K~350K token；
+- 生产级 1M：TP=2 起步（两张卡分摊权重后 KV 池自然够 1M），这是结构性正解。
+
+## 11. 最终判定：0.5.17 免重编直接部署（2026-08-15）
+
+**结论：不重新编译、不升级 SGLang，现有 0.5.17 生产环境可直接部署 Qwen3.8-27B。CUDA 12.1 不可变不构成障碍。**
+
+### 11.1 判定依据
+
+1. **执行路径逐字节一致**：Qwen3.8-27B 与 Qwen3.6-27B 的 `config.json` 声明完全相同的 `architectures: ["Qwen3_5ForConditionalGeneration"]`，且文本/视觉结构参数一致——跑 3.8 就是跑 3.6 的同一份代码：同一个模型类、同一套 triton GDN 内核（现有 sm_89 编译的 sglang-kernel 0.4.5 已覆盖）、同一条 FP8 blockwise 量化路径（最低算力 sm80）、同一个 MTP 映射（`Qwen3_5ForCausalLMMTP`）。
+2. **0.5.17 tag 核实**：`v0.5.17` 源码树中 `qwen3_5.py` / `qwen3_5_text.py` / `qwen3_5_mtp.py` 均在位（架构支持自 v0.5.10 起）。
+3. **dense 无 MoE**：expert-specialization 符号 / stubs 的顾虑对该 checkpoint 不会触发（且现有环境 stubs 已就位）。
+4. **上游同步盘点**：3.8-27B 发布前后上游仅有文档提交，无模型代码——新 main 没有部署 3.8-27B 必需的任何东西（第 10.1 节的重编译与基线上移风险，只在"要升级 main"时才需要面对）。
+
+### 11.2 部署行动项（仅三项）
+
+1. **权重用 `Qwen/Qwen3.8-27B-FP8`**：已确认含 `mtp.safetensors`，MTP 直接可用；
+2. **vision tower 常驻无需额外处理**：3.6 生产 config 同样 `language_model_only: false`，现有环境已在承受该开销，显存账沿用（0.5.17 无跳过视觉塔的旗标）；
+3. **按第 4 节清单单卡冒烟**：启动日志检查 → 一条真实请求 → `qwen3` / `qwen3_coder` parser 验证 → MTP 生效确认（看 accept length）。预计当天出结果。
+
+冒烟全绿后，生产切换只是改 `--model-path` 和 `--served-model-name`，TP=2 DP=3 及其余参数全部沿用（复用审计明细见 10.2）。
