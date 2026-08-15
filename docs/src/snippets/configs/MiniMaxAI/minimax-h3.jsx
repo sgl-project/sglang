@@ -484,6 +484,8 @@ export const config = {
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
+      warn:
+        "Resident loading stages a full DiT copy per rank through host RAM — about 58 GiB per rank, peaking near 380 GiB container-wide for this 4-GPU recipe. Use a 512 GiB-class host, or the FSDP profile, which skips the staging.",
     },
     {
       match: { hw: "b300", profile: "fsdp" },
@@ -499,7 +501,7 @@ export const config = {
         "--port {{PORT}}",
       ],
       warn:
-        "FSDP reduces resident DiT memory but adds per-block parameter collectives. Prefer Resident when the full pipeline fits.",
+        "FSDP reduces resident DiT memory but adds per-block parameter collectives, and its sharded load skips the resident path's per-rank host-RAM staging. Prefer Resident when the full pipeline fits and host memory allows.",
     },
     {
       match: { hw: "h200", profile: "fsdp" },
@@ -515,7 +517,7 @@ export const config = {
         "--port {{PORT}}",
       ],
       warn:
-        "FSDP reduces resident DiT memory but adds per-block parameter collectives. Prefer Resident when the full pipeline fits.",
+        "FSDP reduces resident DiT memory but adds per-block parameter collectives, and its sharded load skips the resident path's per-rank host-RAM staging. Prefer Resident when the full pipeline fits and host memory allows.",
     },
     {
       match: { hw: "h200", profile: "cross_node" },
