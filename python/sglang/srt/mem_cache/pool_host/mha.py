@@ -244,7 +244,6 @@ class MHATokenToKVPoolHost(HostKVCache):
         io_backend,
         *,
         is_draft: bool = False,
-        dcp_localized: bool = False,
     ):
         if self.device_pool is not None:
             if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
@@ -807,7 +806,6 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         io_backend,
         *,
         is_draft: bool = False,
-        dcp_localized: bool = False,
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -1155,7 +1153,6 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         io_backend,
         *,
         is_draft: bool = False,
-        dcp_localized: bool = False,
     ):
         if self.device_pool is not None:
             if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):

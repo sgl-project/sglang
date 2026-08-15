@@ -224,19 +224,14 @@ class TestTransferEntryPointsTranslate(CustomTestCase):
             )
             return kernel.call_args.kwargs
 
-    def test_load_receives_physical_rows(self):
-        pool = _make_host_pool(dcp_rank=5)
-        logical = torch.arange(2 * WIDENED_PAGE)
-        kwargs = self._run_load(pool, logical, logical.clone())
-        expected = torch.arange(2 * PHYSICAL_PAGE)
-        torch.testing.assert_close(kwargs["src_indices"], expected)
-        torch.testing.assert_close(kwargs["dst_indices"], expected)
-
-    def test_load_trusts_already_localized_indices(self):
+    def test_load_forwards_localized_rows_unchanged(self):
+        # Re-translating inside the per-layer path would filter the rows a
+        # second time (64 -> 8 at dcp_size=8) and pass dcp_kernel_indices'
+        # numel assert, so the load would silently read the wrong slots.
         pool = _make_host_pool(dcp_rank=5)
         logical = torch.arange(2 * WIDENED_PAGE)
         localized = pool.dcp_localize_indices(logical, logical.clone())
-        kwargs = self._run_load(pool, *localized, dcp_localized=True)
+        kwargs = self._run_load(pool, *localized)
         expected = torch.arange(2 * PHYSICAL_PAGE)
         torch.testing.assert_close(kwargs["src_indices"], expected)
         torch.testing.assert_close(kwargs["dst_indices"], expected)
@@ -270,12 +265,13 @@ class _CountingHostPool:
     layer_num = 24
 
     def __init__(self):
+        self.rows = (torch.arange(100, 104), torch.arange(200, 204))
         self.localize_calls = 0
         self.load_calls = []
 
     def dcp_localize_indices(self, host_indices, device_indices):
         self.localize_calls += 1
-        return host_indices, device_indices
+        return self.rows
 
     def load_to_device_per_layer(
         self,
@@ -286,9 +282,8 @@ class _CountingHostPool:
         io_backend,
         *,
         is_draft: bool = False,
-        dcp_localized: bool = False,
     ):
-        self.load_calls.append(dcp_localized)
+        self.load_calls.append((host_indices, device_indices))
 
 
 class TestLoadLoopLocalizesOnce(CustomTestCase):
@@ -338,7 +333,9 @@ class TestLoadLoopLocalizesOnce(CustomTestCase):
 
         self.assertEqual(host_pool.localize_calls, 1)
         self.assertEqual(len(host_pool.load_calls), host_pool.layer_num)
-        self.assertTrue(all(host_pool.load_calls))
+        for host_rows, device_rows in host_pool.load_calls:
+            self.assertIs(host_rows, host_pool.rows[0])
+            self.assertIs(device_rows, host_pool.rows[1])
 
 
 if __name__ == "__main__":

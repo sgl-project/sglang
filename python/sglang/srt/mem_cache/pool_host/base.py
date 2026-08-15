@@ -250,10 +250,12 @@ class HostKVCache(abc.ABC):
         io_backend,
         *,
         is_draft: bool = False,
-        dcp_localized: bool = False,
     ) -> None:
         """
         Load KV data from the host memory pool to the device memory pool for a specific layer.
+
+        ``host_indices`` / ``device_indices`` are this rank's physical rows;
+        callers translate widened DCP slots with ``dcp_localize_indices``.
         """
         raise NotImplementedError()
 

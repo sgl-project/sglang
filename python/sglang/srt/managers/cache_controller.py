@@ -844,7 +844,6 @@ class HiCacheController:
                     kv_device_indices,
                     i,
                     self.io_backend,
-                    dcp_localized=True,
                 )
                 if self.has_draft and i < self.mem_pool_host_draft.layer_num:
                     self.mem_pool_host_draft.load_to_device_per_layer(
@@ -853,7 +852,6 @@ class HiCacheController:
                         draft_device_indices,
                         i,
                         self.io_backend,
-                        dcp_localized=True,
                     )
                 producer_event.complete(i)
             ack_finish_event.record()
