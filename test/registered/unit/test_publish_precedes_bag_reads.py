@@ -111,10 +111,6 @@ _UNREAD_ENTRIES: dict = {
     ("srt/managers/detokenizer_manager.py", "run_detokenizer_process"): (
         "DetokenizerManager reads the handed instance at this revision"
     ),
-    ("srt/managers/tokenizer_manager.py", "__init__"): (
-        "the constructor and the init_* helpers it calls read the handed "
-        "instance at this revision"
-    ),
 }
 
 # `publish` itself and its named wrappers live here; a call inside them is the
