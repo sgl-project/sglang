@@ -260,15 +260,17 @@ _OTHER_GROUP_KEY = ("other_device_group", "other_cpu_group")
 
 
 class TestFlashInferAllReduceOnly(CustomTestCase):
-    def _make_manager(self, world_size, group_key=_GROUP_KEY):
+    def _make_manager(self, world_size, group_key=_GROUP_KEY, backend="trtllm"):
         manager = fusion.FlashInferWorkspaceManager()
-        manager.workspace = _FakeWorkspace(None, world_size)
+        manager.workspace = _FakeWorkspace(backend, world_size)
         manager.initialized = True
         manager.world_size = world_size
         manager.group = group_key
         manager.max_token_num = 2048
         manager.hidden_dim = 4096
         manager.dtype = torch.float32
+        manager.backend = backend
+        manager.use_fp32_lamport = True
         return manager
 
     @contextlib.contextmanager
@@ -308,6 +310,7 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
         world_size = 4
         manager = self._make_manager(world_size)
         manager.dtype = torch.bfloat16
+        manager.use_fp32_lamport = False
         with self._patched_attn_workspace(manager):
             input_ = torch.randn(8, 16, dtype=torch.bfloat16, device="cuda")
             expected = input_ * world_size
@@ -364,17 +367,52 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
     def test_rejects_when_token_num_exceeds_workspace_capacity(self):
         """Oversized all-reduces fall back without triggering a warning.
 
-        FlashInfer warns whenever its size validator rejects an operation. The
-        local allocation metadata already proves that this operation cannot use
-        the workspace, so the validator must not be invoked.
+        TRT-LLM warns whenever its size validator rejects an operation. The
+        total element count already proves that this operation cannot use the
+        workspace, so the validator must not be invoked.
         """
         manager = self._make_manager(4)
         manager.max_token_num = 8
         manager.workspace.is_buffer_size_sufficient = MagicMock(return_value=True)
         with self._patched_attn_workspace(manager):
-            self.assertFalse(self._can_use(torch.randn(9, 16)))
+            self.assertFalse(self._can_use(torch.randn(9, 4096)))
 
         manager.workspace.is_buffer_size_sufficient.assert_not_called()
+
+    def test_reshaped_input_within_total_capacity_reaches_validator(self):
+        manager = self._make_manager(4)
+        manager.max_token_num = 8
+        manager.workspace.is_buffer_size_sufficient = MagicMock(return_value=True)
+        input_ = torch.randn(9, 16)
+        with self._patched_attn_workspace(manager):
+            self.assertTrue(self._can_use(input_))
+
+        manager.workspace.is_buffer_size_sufficient.assert_called_once_with(
+            tp_size=4,
+            num_tokens=9,
+            hidden_dim=16,
+            dtype=input_.dtype,
+        )
+
+    def test_non_fp32_dtype_change_reaches_validator(self):
+        manager = self._make_manager(4)
+        manager.dtype = torch.bfloat16
+        manager.use_fp32_lamport = False
+        manager.workspace.is_buffer_size_sufficient = MagicMock(return_value=True)
+        input_ = torch.randn(8, 16, dtype=torch.float16)
+        with self._patched_attn_workspace(manager):
+            self.assertTrue(self._can_use(input_))
+
+        manager.workspace.is_buffer_size_sufficient.assert_called_once()
+
+    def test_mnnvl_capacity_decision_reaches_validator(self):
+        manager = self._make_manager(4, backend="mnnvl")
+        manager.max_token_num = 8
+        manager.workspace.is_buffer_size_sufficient = MagicMock(return_value=False)
+        with self._patched_attn_workspace(manager):
+            self.assertFalse(self._can_use(torch.randn(9, 4096)))
+
+        manager.workspace.is_buffer_size_sufficient.assert_called_once()
 
     def test_compiling_rejects_when_token_num_exceeds_workspace_capacity(self):
         manager = self._make_manager(4)
