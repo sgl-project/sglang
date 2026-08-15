@@ -877,6 +877,7 @@ class DefaultModelLoader(BaseModelLoader):
                 model,
                 weights_iterator(),
                 target_device,
+                model_config=model_config,
             )
         self.counter_after_loading_weights = time.perf_counter()
 
@@ -989,14 +990,28 @@ class DefaultModelLoader(BaseModelLoader):
                 )
 
             self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+                model,
+                self._get_all_weights(model_config, model),
+                target_device,
+                model_config=model_config,
             )
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
+    # Runs after checkpoint bytes are loaded and before quantization/repacking.
+    pre_weight_processing_hook = None
+
     @staticmethod
-    def load_weights_and_postprocess(model, weights, target_device):
+    def load_weights_and_postprocess(model, weights, target_device, model_config=None):
+        DefaultModelLoader.load_weights_only(model, weights, target_device)
+        hook = DefaultModelLoader.pre_weight_processing_hook
+        if hook is not None and model_config is not None:
+            hook(model, model_config)
+        DefaultModelLoader.postprocess_weights(model, target_device)
+
+    @staticmethod
+    def load_weights_only(model, weights, target_device):
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -1052,6 +1067,8 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
+    @staticmethod
+    def postprocess_weights(model, target_device):
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
@@ -1205,7 +1222,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             return func
         return types.MethodType(func, obj)
 
-    def load_weights_and_postprocess(self, model, weights, target_device):
+    def load_weights_and_postprocess(
+        self, model, weights, target_device, model_config=None
+    ):
         """
         Initial load: Load BF16 → Record state → Apply FP8 quantization.
         Called ONCE during model initialization.
@@ -2249,6 +2268,7 @@ class PreshardedModelLoader(DefaultModelLoader):
                 model,
                 self._get_all_weights(model_config, model),
                 target_device,
+                model_config=model_config,
             )
 
             state_dict = dict(model.state_dict())
@@ -3702,7 +3722,10 @@ class IncModelLoader(DefaultModelLoader):
                 )
 
             self.load_weights_and_postprocess(
-                model, iter(quant_model.state_dict().items()), target_device
+                model,
+                iter(quant_model.state_dict().items()),
+                target_device,
+                model_config=model_config,
             )
         return model.eval()
 
@@ -4264,7 +4287,10 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 )
 
             DefaultModelLoader.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+                model,
+                self._get_all_weights(model_config, model),
+                target_device,
+                model_config=model_config,
             )
 
         return model.eval()
