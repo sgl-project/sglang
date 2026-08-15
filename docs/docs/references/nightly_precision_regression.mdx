@@ -140,7 +140,7 @@ Key CI configuration:
 
 `SGLANG_PRECISION_HF_TOKEN` rather than `HF_TOKEN`: the latter already carries the runner's gated-model read token, and overwriting it would turn every gated model on the job into a 401.
 
-Standalone `/rerun-test` runs set `SGLANG_PRECISION_HF_READ_ONLY=1` and receive no baseline-store write token. They fetch the same repository baseline as nightly without changing shared state.
+Standalone `/rerun-test` runs fetch the nightly baseline without changing it. Maintainers can refresh it from an in-repo PR with `/rerun-test --refresh-precision-baseline test/registered/debug_utils/test_nightly_precision_regression.py`.
 
 ### Required GitHub secrets/variables
 

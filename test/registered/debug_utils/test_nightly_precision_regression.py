@@ -68,7 +68,6 @@ EXP_NAME = "nightly_precision"
 PROMPT = "The capital of France is"
 NIGHTLY_PRECISION_SERVER_TIMEOUT = 3600
 PRECISION_FUSION_BACKEND = "trtllm"
-TP_LAYOUT_POLICY = "per-tensor-v1"
 
 
 def _sanitize_model_name(model: str) -> str:
@@ -157,7 +156,6 @@ def _capture_signature(dump_cfg: dict[str, Any], tp_size: int) -> str:
             dump_cfg["dumper_filter"],
             dump_cfg["comparator_filter"],
             dump_cfg["fusion_backend"],
-            TP_LAYOUT_POLICY,
         )
     )
     return hashlib.sha1(raw.encode()).hexdigest()[:12]
@@ -416,7 +414,7 @@ def _test_one_model(
         )
         today_exp_dir = today_dump_dir / EXP_NAME
         _assert_decode_captured(today_exp_dir, tp_size=model_setup.tp_size)
-        _assert_fused_tp_layout(today_exp_dir)
+        _assert_fused_tp_layout(today_exp_dir, tp_size=model_setup.tp_size)
 
         has_baseline = baseline_exp_dir.exists() and any(baseline_exp_dir.glob("*.pt"))
 
@@ -425,7 +423,6 @@ def _test_one_model(
                 baseline=baseline_exp_dir,
                 target=today_exp_dir,
                 threshold=diff_threshold,
-                filter_pattern=dump_cfg["comparator_filter"],
             )
             debug_file = _save_comparator_output(
                 stdout=result.stdout, stderr=result.stderr, prefix=model_dir_name
@@ -549,7 +546,6 @@ def _maybe_hf_push(
             "capture_layers": dump_cfg.get("capture_layers"),
             "capture_signature": dump_cfg.get("capture_signature"),
             "fusion_backend": dump_cfg.get("fusion_backend"),
-            "tp_layout_policy": TP_LAYOUT_POLICY,
             "num_tensor_files": len(pt_files),
             "pass_label": pass_label,
             "source": "test_nightly_precision_regression.py",
@@ -647,18 +643,8 @@ def _run_server_and_dump(
 
 
 def _run_comparator(
-    *, baseline: Path, target: Path, threshold: float, filter_pattern: str
+    *, baseline: Path, target: Path, threshold: float
 ) -> subprocess.CompletedProcess[str]:
-    baseline_layouts = _detect_tp_layouts(baseline)
-    target_layouts = _detect_tp_layouts(target)
-    print(
-        f"Comparator TP layouts: baseline={baseline_layouts}, target={target_layouts}",
-        flush=True,
-    )
-    layout_dims = {
-        "partial": "bs h[tp:partial]",
-        "replicated": "bs h # tp:replicated",
-    }
     cmd: list[str] = [
         sys.executable,
         "-m",
@@ -670,22 +656,21 @@ def _run_comparator(
         "--diff-threshold",
         str(threshold),
         "--filter",
-        filter_pattern,
+        COMPARATOR_FILTER,
         "--output-format",
         "json",
         "--allow-skipped-pattern",
         "input_ids|positions|seq_lens|req_pool_indices|rids",
+        "--override-dims",
+        (
+            r"^non_intrusive__model\.layers\.\d+\.self_attn\.inputs\."
+            r"hidden_states$:bs h # tp:replicated"
+        ),
     ]
-    for option, layouts in (
-        ("--override-baseline-dims", baseline_layouts),
-        ("--override-target-dims", target_layouts),
-    ):
-        for name, layout in sorted(layouts.items()):
-            cmd.extend([option, f"^{re.escape(name)}$:{layout_dims[layout]}"])
     return subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
 
-_RANK_TAG_RE = re.compile(r"___rank=\d+___")
+_RANK_TAG_RE = re.compile(r"___rank=(\d+)___")
 _NAME_TAG_RE = re.compile(r"(?:^|___)name=(.*?)(?:___|$)")
 _LAYER_INPUT_RE = re.compile(r"^non_intrusive__model\.layers\.(\d+)\.inputs\.1$")
 _ATTN_INPUT_RE = re.compile(
@@ -693,52 +678,54 @@ _ATTN_INPUT_RE = re.compile(
 )
 
 
-def _detect_tp_layouts(dump_dir: Path) -> dict[str, str]:
+def _assert_fused_tp_layout(dump_dir: Path, *, tp_size: int) -> None:
     reference_by_bundle: dict[str, Any] = {}
-    layouts: dict[str, str] = {}
-    compared_names: set[str] = set()
+    ranks_by_bundle: dict[str, set[int]] = {}
+    names_by_bundle: dict[str, str] = {}
+    partial_bundles: set[str] = set()
     for path in sorted(dump_dir.glob("*.pt")):
-        match = _NAME_TAG_RE.search(path.stem)
-        if match is None:
+        name_match = _NAME_TAG_RE.search(path.stem)
+        rank_match = _RANK_TAG_RE.search(path.name)
+        if name_match is None or rank_match is None:
             continue
-        name = match.group(1)
+        name = name_match.group(1)
+        if not (_LAYER_INPUT_RE.match(name) or _ATTN_INPUT_RE.match(name)):
+            continue
         bundle = _RANK_TAG_RE.sub("___rank=*___", path.name)
+        names_by_bundle[bundle] = name
+        ranks_by_bundle.setdefault(bundle, set()).add(int(rank_match.group(1)))
         raw = torch.load(path, weights_only=False, map_location="cpu")
         value = raw.get("value") if isinstance(raw, dict) else raw
         reference = reference_by_bundle.get(bundle)
         if reference is None:
             reference_by_bundle[bundle] = value
-            layouts.setdefault(name, "replicated")
             continue
-        compared_names.add(name)
         if not torch.equal(reference, value):
-            layouts[name] = "partial"
-    missing = layouts.keys() - compared_names
-    if missing:
+            partial_bundles.add(bundle)
+    expected_ranks = set(range(tp_size))
+    incomplete = [
+        bundle for bundle, ranks in ranks_by_bundle.items() if ranks != expected_ranks
+    ]
+    if incomplete:
         raise RuntimeError(
-            f"could not compare TP ranks for {sorted(missing)} in {dump_dir}"
+            f"incomplete TP dumps in {dump_dir}: {sorted(incomplete)[:10]}"
         )
-    if not layouts:
+    if not names_by_bundle:
         raise RuntimeError(f"no named tensor dumps found in {dump_dir}")
-    return layouts
-
-
-def _assert_fused_tp_layout(dump_dir: Path) -> None:
-    layouts = _detect_tp_layouts(dump_dir)
-    non_initial_layer_inputs = {
-        name: layout
-        for name, layout in layouts.items()
+    non_initial_layer_inputs = [
+        bundle
+        for bundle, name in names_by_bundle.items()
         if (match := _LAYER_INPUT_RE.match(name)) and int(match.group(1)) > 0
-    }
-    attn_inputs = {
-        name: layout for name, layout in layouts.items() if _ATTN_INPUT_RE.match(name)
-    }
+    ]
+    attn_inputs = [
+        bundle for bundle, name in names_by_bundle.items() if _ATTN_INPUT_RE.match(name)
+    ]
     if not non_initial_layer_inputs:
         raise AssertionError("no non-initial transformer layer input dumps found")
     if not attn_inputs:
         raise AssertionError("no post-fusion attention input dumps found")
     replicated_layer_inputs = [
-        name for name, layout in non_initial_layer_inputs.items() if layout != "partial"
+        bundle for bundle in non_initial_layer_inputs if bundle not in partial_bundles
     ]
     if replicated_layer_inputs:
         raise AssertionError(
@@ -746,78 +733,13 @@ def _assert_fused_tp_layout(dump_dir: Path) -> None:
             f"replicated tensors={replicated_layer_inputs}"
         )
     partial_attn_inputs = [
-        name for name, layout in attn_inputs.items() if layout != "replicated"
+        bundle for bundle in attn_inputs if bundle in partial_bundles
     ]
     if partial_attn_inputs:
         raise AssertionError(
             "post-fusion attention inputs were not replicated; "
             f"TP-partial tensors={partial_attn_inputs}"
         )
-
-
-class TestTpLayoutDetection(unittest.TestCase):
-    def test_mixed_layouts(self):
-        with tempfile.TemporaryDirectory() as td:
-            dump_dir = Path(td)
-            for rank in (0, 1):
-                torch.save(
-                    {"value": torch.tensor([[1.0, 2.0]])},
-                    dump_dir / f"step=0___rank={rank}___name=replicated.pt",
-                )
-                torch.save(
-                    {"value": torch.tensor([[float(rank), 2.0]])},
-                    dump_dir / f"step=0___rank={rank}___name=partial.pt",
-                )
-            self.assertEqual(
-                _detect_tp_layouts(dump_dir),
-                {"partial": "partial", "replicated": "replicated"},
-            )
-
-    def test_accepts_partial_layer_and_replicated_attention_input(self):
-        with tempfile.TemporaryDirectory() as td:
-            dump_dir = Path(td)
-            for rank in (0, 1):
-                torch.save(
-                    {"value": torch.tensor([[float(rank), 2.0]])},
-                    dump_dir
-                    / f"step=0___rank={rank}___name=non_intrusive__model.layers.8.inputs.1.pt",
-                )
-                torch.save(
-                    {"value": torch.tensor([[1.0, 2.0]])},
-                    dump_dir
-                    / f"step=0___rank={rank}___name=non_intrusive__model.layers.8.self_attn.inputs.hidden_states.pt",
-                )
-            _assert_fused_tp_layout(dump_dir)
-
-    def test_rejects_partial_attention_input(self):
-        with tempfile.TemporaryDirectory() as td:
-            dump_dir = Path(td)
-            for rank in (0, 1):
-                for name in (
-                    "non_intrusive__model.layers.8.inputs.1",
-                    "non_intrusive__model.layers.8.self_attn.inputs.hidden_states",
-                ):
-                    torch.save(
-                        {"value": torch.tensor([[float(rank), 2.0]])},
-                        dump_dir / f"step=0___rank={rank}___name={name}.pt",
-                    )
-            with self.assertRaisesRegex(AssertionError, "were not replicated"):
-                _assert_fused_tp_layout(dump_dir)
-
-    def test_rejects_fusion_fallback(self):
-        with tempfile.TemporaryDirectory() as td:
-            dump_dir = Path(td)
-            for rank in (0, 1):
-                for name in (
-                    "non_intrusive__model.layers.8.inputs.1",
-                    "non_intrusive__model.layers.8.self_attn.inputs.hidden_states",
-                ):
-                    torch.save(
-                        {"value": torch.tensor([[1.0, 2.0]])},
-                        dump_dir / f"step=0___rank={rank}___name={name}.pt",
-                    )
-            with self.assertRaisesRegex(AssertionError, "did not produce"):
-                _assert_fused_tp_layout(dump_dir)
 
 
 def _update_baseline(model_baseline_dir: Path, today_exp_dir: Path):
