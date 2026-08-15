@@ -2980,9 +2980,7 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
                 shm.buf[: len(magic_message)] = magic_message
                 recv[0] = shm.name
 
-        torch.distributed.broadcast_object_list(
-            recv, src=ranks[source_rank], group=pg
-        )
+        torch.distributed.broadcast_object_list(recv, src=ranks[source_rank], group=pg)
         name = recv[0]
 
         if rank == source_rank:
