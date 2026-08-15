@@ -57,17 +57,17 @@ DEFAULT_MODELS_FOR_NIGHTLY_PRECISION = "zai-org/GLM-5.2-FP8"
 DEFAULT_DIFF_THRESHOLD = 1e-3
 # Fallback when the layer count can't be resolved: never silently shrink coverage.
 DUMPER_FILTER_ALL_LAYERS = (
-    r"match(r'^non_intrusive__model\.layers\.\d+\.inputs\.1$', name)"
+    r"match(r'^non_intrusive__model\.layers\.\d+\."
+    r"(inputs\.1|self_attn\.inputs\.hidden_states)$', name)"
 )
+COMPARATOR_FILTER = r"self_attn\.inputs\.hidden_states"
 LAYER_CAPTURE_STRIDE = 8
 MAX_TOKENS = 2
 SCHEMA_VERSION = 3
 EXP_NAME = "nightly_precision"
 PROMPT = "The capital of France is"
 NIGHTLY_PRECISION_SERVER_TIMEOUT = 3600
-# Ordinary all-reduce gives the precision harness a stable capture boundary across
-# runners without inheriting fusion-kernel numerical variance.
-PRECISION_FUSION_BACKEND = None
+PRECISION_FUSION_BACKEND = "trtllm"
 TP_LAYOUT_POLICY = "per-tensor-v1"
 
 
@@ -94,7 +94,10 @@ def _build_dumper_filter(capture_layers: Optional[list[int]]) -> str:
     alt = "|".join(
         str(i) for i in sorted(capture_layers, key=lambda x: (-len(str(x)), x))
     )
-    return rf"match(r'^non_intrusive__model\.layers\.({alt})\.inputs\.1$', name)"
+    return (
+        rf"match(r'^non_intrusive__model\.layers\.({alt})\."
+        rf"(inputs\.1|self_attn\.inputs\.hidden_states)$', name)"
+    )
 
 
 def _resolve_num_layers(model_path: str) -> Optional[int]:
@@ -119,8 +122,6 @@ def _resolve_num_layers(model_path: str) -> Optional[int]:
 
 
 def _assert_decode_captured(exp_dir: Path, *, tp_size: int) -> None:
-    # One dump per (layer, rank) == prefill only: decode never ran, which would
-    # pass the comparison while silently halving coverage. Fail loudly instead.
     pts = list(exp_dir.glob("*.pt"))
     if not pts:
         raise AssertionError(f"no .pt dumps produced in {exp_dir}")
@@ -132,11 +133,10 @@ def _assert_decode_captured(exp_dir: Path, *, tp_size: int) -> None:
                 layers.add(kv[len("layer_id=") :])
             elif kv.startswith("step="):
                 steps.add(kv[len("step=") :])
-    prefill_only = len(layers) * tp_size
-    if len(pts) <= prefill_only:
+    if not steps or steps == {"0"}:
         raise AssertionError(
             f"decode path not captured: {len(pts)} .pt files for {len(layers)} "
-            f"layers x {tp_size} tp (== {prefill_only}, prefill-only); "
+            f"layers x {tp_size} tp; "
             f"steps={sorted(steps)}. The model generated no decode tokens "
             f"(check --max-total-tokens vs the decode reservation, max_tokens, "
             f"and ignore_eos)."
@@ -155,6 +155,7 @@ def _capture_signature(dump_cfg: dict[str, Any], tp_size: int) -> str:
             dump_cfg["ignore_eos"],
             tp_size,
             dump_cfg["dumper_filter"],
+            dump_cfg["comparator_filter"],
             dump_cfg["fusion_backend"],
             TP_LAYOUT_POLICY,
         )
@@ -389,6 +390,7 @@ def _test_one_model(
         "max_tokens": MAX_TOKENS,
         "ignore_eos": True,
         "dumper_filter": _build_dumper_filter(capture_layers),
+        "comparator_filter": COMPARATOR_FILTER,
         "num_hidden_layers": num_layers,
         "capture_layers": capture_layers,
         "fusion_backend": PRECISION_FUSION_BACKEND,
@@ -414,7 +416,7 @@ def _test_one_model(
         )
         today_exp_dir = today_dump_dir / EXP_NAME
         _assert_decode_captured(today_exp_dir, tp_size=model_setup.tp_size)
-        _assert_unfused_tp_layout(today_exp_dir)
+        _assert_fused_tp_layout(today_exp_dir)
 
         has_baseline = baseline_exp_dir.exists() and any(baseline_exp_dir.glob("*.pt"))
 
@@ -423,6 +425,7 @@ def _test_one_model(
                 baseline=baseline_exp_dir,
                 target=today_exp_dir,
                 threshold=diff_threshold,
+                filter_pattern=dump_cfg["comparator_filter"],
             )
             debug_file = _save_comparator_output(
                 stdout=result.stdout, stderr=result.stderr, prefix=model_dir_name
@@ -541,6 +544,7 @@ def _maybe_hf_push(
             "temperature": 0,
             "diff_threshold": diff_threshold,
             "dumper_filter": dump_cfg["dumper_filter"],
+            "comparator_filter": dump_cfg["comparator_filter"],
             "num_hidden_layers": dump_cfg.get("num_hidden_layers"),
             "capture_layers": dump_cfg.get("capture_layers"),
             "capture_signature": dump_cfg.get("capture_signature"),
@@ -601,7 +605,8 @@ def _run_server_and_dump(
         "--disable-cuda-graph",
         "--disable-piecewise-cuda-graph",
         "--disable-radix-cache",
-        "--enforce-disable-flashinfer-allreduce-fusion",
+        "--flashinfer-allreduce-fusion-backend",
+        PRECISION_FUSION_BACKEND,
     ]
 
     proc = popen_launch_server(
@@ -642,7 +647,7 @@ def _run_server_and_dump(
 
 
 def _run_comparator(
-    *, baseline: Path, target: Path, threshold: float
+    *, baseline: Path, target: Path, threshold: float, filter_pattern: str
 ) -> subprocess.CompletedProcess[str]:
     baseline_layouts = _detect_tp_layouts(baseline)
     target_layouts = _detect_tp_layouts(target)
@@ -664,6 +669,8 @@ def _run_comparator(
         str(target),
         "--diff-threshold",
         str(threshold),
+        "--filter",
+        filter_pattern,
         "--output-format",
         "json",
         "--allow-skipped-pattern",
@@ -681,6 +688,9 @@ def _run_comparator(
 _RANK_TAG_RE = re.compile(r"___rank=\d+___")
 _NAME_TAG_RE = re.compile(r"(?:^|___)name=(.*?)(?:___|$)")
 _LAYER_INPUT_RE = re.compile(r"^non_intrusive__model\.layers\.(\d+)\.inputs\.1$")
+_ATTN_INPUT_RE = re.compile(
+    r"^non_intrusive__model\.layers\.(\d+)\.self_attn\.inputs\.hidden_states$"
+)
 
 
 def _detect_tp_layouts(dump_dir: Path) -> dict[str, str]:
@@ -713,18 +723,35 @@ def _detect_tp_layouts(dump_dir: Path) -> dict[str, str]:
     return layouts
 
 
-def _assert_unfused_tp_layout(dump_dir: Path) -> None:
+def _assert_fused_tp_layout(dump_dir: Path) -> None:
     layouts = _detect_tp_layouts(dump_dir)
-    layer_inputs = {
-        name: layout for name, layout in layouts.items() if _LAYER_INPUT_RE.match(name)
+    non_initial_layer_inputs = {
+        name: layout
+        for name, layout in layouts.items()
+        if (match := _LAYER_INPUT_RE.match(name)) and int(match.group(1)) > 0
     }
-    if not layer_inputs:
-        raise AssertionError("no transformer layer input dumps found")
-    partial = [name for name, layout in layer_inputs.items() if layout != "replicated"]
-    if partial:
+    attn_inputs = {
+        name: layout for name, layout in layouts.items() if _ATTN_INPUT_RE.match(name)
+    }
+    if not non_initial_layer_inputs:
+        raise AssertionError("no non-initial transformer layer input dumps found")
+    if not attn_inputs:
+        raise AssertionError("no post-fusion attention input dumps found")
+    replicated_layer_inputs = [
+        name for name, layout in non_initial_layer_inputs.items() if layout != "partial"
+    ]
+    if replicated_layer_inputs:
         raise AssertionError(
-            "flashinfer allreduce fusion was not fully disabled; "
-            f"TP-partial layers={partial}. Refusing to compare or update baseline."
+            "flashinfer allreduce fusion did not produce TP-partial layer inputs; "
+            f"replicated tensors={replicated_layer_inputs}"
+        )
+    partial_attn_inputs = [
+        name for name, layout in attn_inputs.items() if layout != "replicated"
+    ]
+    if partial_attn_inputs:
+        raise AssertionError(
+            "post-fusion attention inputs were not replicated; "
+            f"TP-partial tensors={partial_attn_inputs}"
         )
 
 
@@ -746,17 +773,51 @@ class TestTpLayoutDetection(unittest.TestCase):
                 {"partial": "partial", "replicated": "replicated"},
             )
 
-    def test_rejects_partial_layer_when_fusion_disabled(self):
+    def test_accepts_partial_layer_and_replicated_attention_input(self):
         with tempfile.TemporaryDirectory() as td:
             dump_dir = Path(td)
-            name = "non_intrusive__model.layers.8.inputs.1"
             for rank in (0, 1):
                 torch.save(
                     {"value": torch.tensor([[float(rank), 2.0]])},
-                    dump_dir / f"step=0___rank={rank}___name={name}.pt",
+                    dump_dir
+                    / f"step=0___rank={rank}___name=non_intrusive__model.layers.8.inputs.1.pt",
                 )
-            with self.assertRaisesRegex(AssertionError, "Refusing to compare"):
-                _assert_unfused_tp_layout(dump_dir)
+                torch.save(
+                    {"value": torch.tensor([[1.0, 2.0]])},
+                    dump_dir
+                    / f"step=0___rank={rank}___name=non_intrusive__model.layers.8.self_attn.inputs.hidden_states.pt",
+                )
+            _assert_fused_tp_layout(dump_dir)
+
+    def test_rejects_partial_attention_input(self):
+        with tempfile.TemporaryDirectory() as td:
+            dump_dir = Path(td)
+            for rank in (0, 1):
+                for name in (
+                    "non_intrusive__model.layers.8.inputs.1",
+                    "non_intrusive__model.layers.8.self_attn.inputs.hidden_states",
+                ):
+                    torch.save(
+                        {"value": torch.tensor([[float(rank), 2.0]])},
+                        dump_dir / f"step=0___rank={rank}___name={name}.pt",
+                    )
+            with self.assertRaisesRegex(AssertionError, "were not replicated"):
+                _assert_fused_tp_layout(dump_dir)
+
+    def test_rejects_fusion_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            dump_dir = Path(td)
+            for rank in (0, 1):
+                for name in (
+                    "non_intrusive__model.layers.8.inputs.1",
+                    "non_intrusive__model.layers.8.self_attn.inputs.hidden_states",
+                ):
+                    torch.save(
+                        {"value": torch.tensor([[1.0, 2.0]])},
+                        dump_dir / f"step=0___rank={rank}___name={name}.pt",
+                    )
+            with self.assertRaisesRegex(AssertionError, "did not produce"):
+                _assert_fused_tp_layout(dump_dir)
 
 
 def _update_baseline(model_baseline_dir: Path, today_exp_dir: Path):
