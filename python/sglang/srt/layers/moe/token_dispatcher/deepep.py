@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -67,6 +68,18 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
+
+_NVSHMEM_QP_DEPTH_DEFAULT = 1024
+
+
+def _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank: int) -> None:
+    min_qp_depth = 2 * (num_max_dispatch_tokens_per_rank + 1)
+    current_qp_depth = int(
+        os.environ.get("NVSHMEM_QP_DEPTH", _NVSHMEM_QP_DEPTH_DEFAULT)
+    )
+    os.environ["NVSHMEM_QP_DEPTH"] = str(
+        max(current_qp_depth, _NVSHMEM_QP_DEPTH_DEFAULT, min_qp_depth)
+    )
 
 
 def _is_mnnvl_fabric_supported() -> bool:
@@ -220,6 +233,8 @@ class DeepEPBuffer:
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
+            if not _is_npu:
+                _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank)
             num_rdma_bytes = max(
                 Buffer.get_low_latency_rdma_size_hint(
                     num_max_dispatch_tokens_per_rank,
