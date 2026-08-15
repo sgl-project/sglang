@@ -12,6 +12,10 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler
     _minimax_h3_euler_eta0_step,
     _minimax_h3_rf_v_to_x0,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.condition_noise import (
+    minimax_h3_imgvid_cond_noise_aug_rows,
+    minimax_h3_prepare_request_noise,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     MiniMaxH3DenoiseBranch,
     _build_local_embedding_layout,
@@ -20,6 +24,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_tokens import (
+    minimax_h3_patchify_video_latent,
 )
 
 
@@ -53,6 +60,64 @@ def _branch(
         token_tags=packed["token_tags"] if token_tags is None else token_tags,
         device=torch.device("cpu"),
     )
+
+
+def test_request_noise_matches_single_generator_reference_order():
+    seed = 7
+    condition_shapes = [(1, 4, 6), (2, 6, 4)]
+    actual = minimax_h3_prepare_request_noise(
+        seed=seed,
+        condition_shapes=condition_shapes,
+        condition_audio_t=[3],
+        latent_t=3,
+        latent_h=4,
+        latent_w=6,
+        audio_t=5,
+        imgvid_noise_aug=0.999,
+        audio_noise_aug=1.0,
+    )
+
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    expected_condition = torch.cat(
+        [
+            minimax_h3_patchify_video_latent(
+                torch.randn(
+                    1,
+                    24,
+                    latent_t,
+                    latent_h,
+                    latent_w,
+                    generator=generator,
+                ),
+                patch_size=[1, 2, 2],
+            )
+            for latent_t, latent_h, latent_w in condition_shapes
+        ]
+    )
+    expected_video = minimax_h3_patchify_video_latent(
+        torch.randn(1, 24, 3, 4, 6, generator=generator),
+        patch_size=[1, 2, 2],
+    )
+    expected_audio = torch.randn(10, 32, generator=generator)
+
+    assert actual["condition_audio_noise_rows"] is None
+    torch.testing.assert_close(
+        actual["condition_video_noise_rows"], expected_condition, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        actual["initial_video_rows"], expected_video, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        actual["initial_audio_rows"], expected_audio, rtol=0, atol=0
+    )
+
+    noised = minimax_h3_imgvid_cond_noise_aug_rows(
+        torch.zeros_like(expected_condition),
+        noise_rows=actual["condition_video_noise_rows"],
+        noise_aug=0.999,
+    )
+    expected_noised = (1.0 - torch.tensor(0.999)) * expected_condition
+    torch.testing.assert_close(noised, expected_noised, rtol=0, atol=0)
 
 
 def test_precomputed_timestep_plan_matches_full_unique_reference():

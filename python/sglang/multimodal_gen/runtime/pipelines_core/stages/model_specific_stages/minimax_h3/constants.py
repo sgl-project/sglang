@@ -11,7 +11,8 @@ MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY = "minimax_h3_text_embeddings"
 MINIMAX_H3_KEYFRAME_COND_ROWS_EXTRA_KEY = "minimax_h3_keyframe_cond_rows"
 # Direct sigma schedules: {"video": [float], "audio": [float]}
 MINIMAX_H3_SIGMAS_EXTRA_KEY = "minimax_h3_sigmas"
-# Direct denoise state: {"initial_video_rows", "initial_audio_rows",
+# Direct denoise state: {"condition_video_noise_rows",
+#   "condition_audio_noise_rows", "initial_video_rows", "initial_audio_rows",
 #   "latent_t", "latent_h", "latent_w", "audio_t"}
 MINIMAX_H3_DENOISE_STATE_EXTRA_KEY = "minimax_h3_denoise_state"
 # ref2va direct reference encodes.

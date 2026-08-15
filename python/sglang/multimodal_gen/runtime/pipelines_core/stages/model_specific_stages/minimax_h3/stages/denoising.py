@@ -51,28 +51,11 @@ _REF2VA_VIDEO_CHAINS = {
 def minimax_h3_condition_noise_aug(sampling: Any) -> tuple[float, float]:
     """Resolve condition timesteps using the model defaults."""
 
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
-        MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
-        MINIMAX_H3_IMGVID_COND_TIMESTEP,
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.condition_noise import (
+        minimax_h3_resolve_condition_noise_aug,
     )
 
-    imgvid_noise_aug = getattr(
-        sampling,
-        "imgvid_cond_noise_aug_for_inference",
-        None,
-    )
-    if imgvid_noise_aug is None:
-        # The model default uses imgvid noise aug 0.999. A request selecting
-        # imgvid noise aug 1.0 still overrides this.
-        imgvid_noise_aug = MINIMAX_H3_IMGVID_COND_TIMESTEP
-    audio_noise_aug = getattr(
-        sampling,
-        "audio_cond_noise_aug_for_inference",
-        None,
-    )
-    if audio_noise_aug is None:
-        audio_noise_aug = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP
-    return float(imgvid_noise_aug), float(audio_noise_aug)
+    return minimax_h3_resolve_condition_noise_aug(sampling)
 
 
 def _validate_fl2va_keyframe_payload(plan: Any, keyframe: Any) -> None:
@@ -146,86 +129,6 @@ def _validate_fl2va_keyframe_payload(plan: Any, keyframe: Any) -> None:
         )
 
 
-def _imgvid_condition_shapes(
-    *,
-    ref2va_blocks: list[dict[str, int | str]] | None,
-    keyframe: Any,
-    is_ref2va: bool,
-) -> list[tuple[int, int, int]]:
-    """Return visual-condition ``(T,H,W)`` in packed anchor-row order."""
-
-    if ref2va_blocks is not None:
-        shapes = []
-        for block in ref2va_blocks:
-            kind = str(block["kind"])
-            if kind == "image":
-                shapes.append((1, int(block["latent_h"]), int(block["latent_w"])))
-            elif kind in {"video", "video_audio"}:
-                shapes.append(
-                    (
-                        int(block["latent_t"]),
-                        int(block["latent_h"]),
-                        int(block["latent_w"]),
-                    )
-                )
-        return shapes
-
-    if is_ref2va:
-        # ref2va always carries a resolved plan, so ordered blocks are
-        # supplied above; reaching here indicates an upstream bug.
-        raise ValueError("ref2va visual-condition shapes require ordered blocks")
-
-    if not isinstance(keyframe, Mapping):
-        return []
-    entries = keyframe.get("keyframes")
-    if isinstance(entries, list) and entries:
-        return [
-            (1, int(entry["latent_h"]), int(entry["latent_w"])) for entry in entries
-        ]
-
-    latent_h = int(keyframe["latent_h"])
-    latent_w = int(keyframe["latent_w"])
-    frame_rows = (latent_h // 2) * (latent_w // 2)
-    rows = keyframe["rows"]
-    if frame_rows <= 0 or int(rows.shape[0]) % frame_rows:
-        raise ValueError(
-            "legacy keyframe rows cannot be split into visual-condition frames"
-        )
-    return [(1, latent_h, latent_w)] * (int(rows.shape[0]) // frame_rows)
-
-
-def _ref2va_payload_entry(
-    payload: Any,
-    *,
-    list_key: str,
-    condition_index: int,
-    path: str,
-) -> Mapping[str, Any]:
-    if not isinstance(payload, Mapping):
-        raise ValueError(f"{path} is required for ref2va condition rows")
-    entries = payload.get(list_key)
-    if isinstance(entries, list):
-        for entry in entries:
-            if (
-                isinstance(entry, Mapping)
-                and entry.get("condition_index") is not None
-                and int(entry["condition_index"]) == int(condition_index)
-            ):
-                return entry
-        if len(entries) == 1 and isinstance(entries[0], Mapping):
-            return entries[0]
-        raise ValueError(
-            f"{path}.{list_key} missing entry for condition_index={condition_index}"
-        )
-    if payload.get("condition_index") is None or int(payload["condition_index"]) == int(
-        condition_index
-    ):
-        return payload
-    raise ValueError(
-        f"{path}.{list_key} missing entry for condition_index={condition_index}"
-    )
-
-
 def _cat_optional(rows: list[torch.Tensor]) -> torch.Tensor | None:
     if not rows:
         return None
@@ -239,6 +142,10 @@ def _ref2va_ordered_blocks_and_rows(
     ref_audio: Any,
     ref_video: Any,
 ) -> tuple[list[dict[str, int | str]], torch.Tensor | None, torch.Tensor | None]:
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.condition_noise import (
+        minimax_h3_ref_payload_entry,
+    )
+
     blocks: list[dict[str, int | str]] = []
     visual_rows: list[torch.Tensor] = []
     audio_rows: list[torch.Tensor] = []
@@ -246,7 +153,7 @@ def _ref2va_ordered_blocks_and_rows(
         chain = str(material.material_chain)
         condition_index = int(material.condition_index)
         if chain == "image.reference_preserve":
-            entry = _ref2va_payload_entry(
+            entry = minimax_h3_ref_payload_entry(
                 ref_image,
                 list_key="images",
                 condition_index=condition_index,
@@ -261,7 +168,7 @@ def _ref2va_ordered_blocks_and_rows(
             )
             visual_rows.append(entry["rows"])
         elif chain == "audio":
-            entry = _ref2va_payload_entry(
+            entry = minimax_h3_ref_payload_entry(
                 ref_audio,
                 list_key="audios",
                 condition_index=condition_index,
@@ -272,13 +179,13 @@ def _ref2va_ordered_blocks_and_rows(
             if ref_audio_t > 0:
                 audio_rows.append(entry["rows"])
         elif chain in _REF2VA_VIDEO_CHAINS:
-            video_entry = _ref2va_payload_entry(
+            video_entry = minimax_h3_ref_payload_entry(
                 ref_video,
                 list_key="videos",
                 condition_index=condition_index,
                 path="batch.extra.minimax_h3_reference_video_rows",
             )
-            audio_entry = _ref2va_payload_entry(
+            audio_entry = minimax_h3_ref_payload_entry(
                 ref_audio,
                 list_key="audios",
                 condition_index=condition_index,
@@ -620,7 +527,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         imgvid_noise_aug, audio_noise_aug = minimax_h3_condition_noise_aug(sampling)
         _apply_condition_noise_aug(
             ctx,
-            sampling=sampling,
             imgvid_noise_aug=imgvid_noise_aug,
             audio_noise_aug=audio_noise_aug,
         )
@@ -894,39 +800,13 @@ def _build_packed_layout(
     return packed
 
 
-def _condition_audio_lengths(ctx: _FullLoopContext) -> list[int]:
-    """Per-task condition audio T list for the noise-aug recipe."""
-
-    condition_audio_t: list[int] = []
-    if ctx.ref2va_positive_blocks is not None:
-        for block in ctx.ref2va_positive_blocks:
-            if str(block["kind"]) in {"audio", "video", "video_audio"}:
-                ref_audio_t = int(block["ref_audio_t"])
-                if ref_audio_t > 0:
-                    condition_audio_t.append(ref_audio_t)
-    elif isinstance(ctx.ref_audio, Mapping):
-        entries = ctx.ref_audio.get("audios")
-        if isinstance(entries, list):
-            condition_audio_t.extend(
-                int(entry["ref_audio_t"])
-                for entry in entries
-                if int(entry["ref_audio_t"]) > 0
-            )
-        elif ctx.ref_audio.get("ref_audio_t") is not None:
-            ref_audio_t = int(ctx.ref_audio["ref_audio_t"])
-            if ref_audio_t > 0:
-                condition_audio_t.append(ref_audio_t)
-    return condition_audio_t
-
-
 def _apply_condition_noise_aug(
     ctx: _FullLoopContext,
     *,
-    sampling: Any,
     imgvid_noise_aug: float,
     audio_noise_aug: float,
 ) -> None:
-    """Apply condition noise augmentation to cond rows."""
+    """Mix request-static condition noise prepared before the denoise loop."""
 
     noise_visual_conditions = (
         ctx.cond_rows is not None and float(imgvid_noise_aug) < 1.0
@@ -942,40 +822,23 @@ def _apply_condition_noise_aug(
         minimax_h3_imgvid_cond_noise_aug_rows,
     )
 
-    noise_seed = getattr(ctx.plan, "seed", None) if ctx.plan is not None else None
-    if noise_seed is None:
-        noise_seed = getattr(sampling, "seed", None)
-    if noise_seed is None:
-        noise_seed = 42
-
     if noise_visual_conditions:
-        condition_shapes = _imgvid_condition_shapes(
-            ref2va_blocks=ctx.ref2va_positive_blocks,
-            keyframe=ctx.keyframe,
-            is_ref2va=ctx.is_ref2va,
-        )
-        imgvid_cond_num_frames = len(condition_shapes)
-        if not condition_shapes:
-            raise ValueError("imgvid condition rows are missing shape metadata")
-        # Imgvid conditions (ref2va blocks / keyframes) contribute one frame
-        # count per condition entry.
+        noise_rows = ctx.state.get("condition_video_noise_rows")
+        if not isinstance(noise_rows, torch.Tensor):
+            raise ValueError("imgvid condition rows are missing prepared noise")
         ctx.cond_rows = minimax_h3_imgvid_cond_noise_aug_rows(
             ctx.cond_rows,
-            condition_shapes=condition_shapes,
-            target_latent_t=ctx.latent_t,
-            imgvid_cond_num_frames=imgvid_cond_num_frames,
-            seed=int(noise_seed),
+            noise_rows=noise_rows,
             noise_aug=float(imgvid_noise_aug),
         )
 
     if noise_audio_conditions:
-        condition_audio_t = _condition_audio_lengths(ctx)
-        if not condition_audio_t:
-            raise ValueError("audio condition rows are missing length metadata")
+        noise_rows = ctx.state.get("condition_audio_noise_rows")
+        if not isinstance(noise_rows, torch.Tensor):
+            raise ValueError("audio condition rows are missing prepared noise")
         ctx.audio_ref_rows = minimax_h3_audio_cond_noise_aug_rows(
             ctx.audio_ref_rows,
-            condition_audio_t=condition_audio_t,
-            seed=int(noise_seed),
+            noise_rows=noise_rows,
             noise_aug=float(audio_noise_aug),
         )
 

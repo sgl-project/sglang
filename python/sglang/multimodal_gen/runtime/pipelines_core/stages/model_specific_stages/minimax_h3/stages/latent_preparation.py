@@ -35,7 +35,7 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
         batches: list[Req],
         server_args: ServerArgs,
     ) -> list[Req]:
-        """Preserve H3's independent per-modality RNG streams per request."""
+        """Preserve H3's request-local RNG stream for every output."""
         return [self(batch, server_args) for batch in batches]
 
     @staticmethod
@@ -64,10 +64,7 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
         batch.raw_audio_latent_shape = (2, 32, audio_t)
 
     def _prepare_denoise_state_from_plan(self, batch: Req, plan) -> None:
-        """Direct initial-noise materialization (t2va recipe):
-        torch.Generator().manual_seed(seed); video rows drawn first,
-        then audio rows, CPU fp32. Every task consumes the final latent grid
-        frozen by the pre-queue shape resolver."""
+        """Materialize condition, video, and audio noise in reference order."""
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
             MINIMAX_H3_DENOISE_STATE_EXTRA_KEY,
         )
@@ -91,47 +88,49 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
         latent_t = int(shape["video_latent_t"])
         audio_t = int(shape["audio_latent_t"])
 
-        seed = plan.seed
-        if seed is None:
-            seed = 42  # pinned default seed
         video_rows_n = latent_t * (latent_h // 2) * (latent_w // 2)
         audio_rows_n = audio_t * 2
-        # Noise semantics:
-        # - video noise is drawn on the RAW latent tensor
-        #   [1, 24, T, H_lat, W_lat] in tensor layout, then patchified
-        #   into packed row order;
-        # - audio uses an INDEPENDENT generator re-seeded with the same
-        #   seed (each modality re-seeds its own generator);
-        # - no extra cond-frame noise is drawn for image-conditioned
-        #   requests.
-        # The same seed always reproduces the same noise.
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_tokens import (
-            minimax_h3_patchify_video_latent,
+
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.condition_noise import (
+            minimax_h3_condition_noise_shapes,
+            minimax_h3_prepare_request_noise,
+            minimax_h3_resolve_condition_noise_aug,
         )
 
-        gen_v = torch.Generator().manual_seed(int(seed))
-        video_tensor = torch.randn(
-            1,
-            24,
-            latent_t,
-            latent_h,
-            latent_w,
-            generator=gen_v,
-            dtype=torch.float32,
+        condition_shapes, condition_audio_t = minimax_h3_condition_noise_shapes(
+            batch, plan
         )
-        video_noise = minimax_h3_patchify_video_latent(
-            video_tensor, patch_size=[1, 2, 2]
-        ).to(torch.float32)
-        gen_a = torch.Generator().manual_seed(int(seed))
-        audio_noise = torch.randn(
-            audio_rows_n, 32, generator=gen_a, dtype=torch.float32
+        imgvid_noise_aug, audio_noise_aug = minimax_h3_resolve_condition_noise_aug(
+            batch.sampling_params
         )
+        noise = minimax_h3_prepare_request_noise(
+            seed=42 if plan.seed is None else int(plan.seed),
+            condition_shapes=condition_shapes,
+            condition_audio_t=condition_audio_t,
+            latent_t=latent_t,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            audio_t=audio_t,
+            imgvid_noise_aug=imgvid_noise_aug,
+            audio_noise_aug=audio_noise_aug,
+        )
+        video_noise = noise["initial_video_rows"]
+        audio_noise = noise["initial_audio_rows"]
+        assert isinstance(video_noise, torch.Tensor)
+        assert isinstance(audio_noise, torch.Tensor)
         if list(video_noise.shape) != [video_rows_n, 96]:
             raise ValueError(
                 f"aligned video noise shape {list(video_noise.shape)} != "
                 f"[{video_rows_n}, 96]"
             )
+        if list(audio_noise.shape) != [audio_rows_n, 32]:
+            raise ValueError(
+                f"aligned audio noise shape {list(audio_noise.shape)} != "
+                f"[{audio_rows_n}, 32]"
+            )
         batch.extra[MINIMAX_H3_DENOISE_STATE_EXTRA_KEY] = {
+            "condition_video_noise_rows": noise["condition_video_noise_rows"],
+            "condition_audio_noise_rows": noise["condition_audio_noise_rows"],
             "initial_video_rows": video_noise,
             "initial_audio_rows": audio_noise,
             "latent_t": latent_t,
