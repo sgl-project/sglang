@@ -1911,8 +1911,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> DENSE (kernel-facing) ids. Falls back
-        to the physical translate when `kernel_page_multiplier == 1` (MHA)."""
+        """Full-pool virtual TOKEN ids -> DENSE (kernel-facing) ids."""
         return self.full_attn_allocator.translate_kv_loc_dense(loc, out=out)
 
     def translate_kv_indices_for_transfer(

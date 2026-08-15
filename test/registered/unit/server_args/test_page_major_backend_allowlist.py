@@ -47,6 +47,7 @@ def _accepts(
     unified: bool = True,
     linear_decode: str | None = None,
     linear_prefill: str | None = None,
+    has_asymmetric_kv: bool = False,
 ) -> bool:
     """Run just `_handle_page_major_kv_layout` against a minimal stand-in.
 
@@ -72,7 +73,12 @@ def _accepts(
         sa,
         "_model_config",
         SimpleNamespace(
-            attention_arch=AttentionArch.MLA if use_mla else AttentionArch.MHA
+            attention_arch=AttentionArch.MLA if use_mla else AttentionArch.MHA,
+            has_asymmetric_kv=has_asymmetric_kv,
+            head_dim=192 if has_asymmetric_kv else 128,
+            v_head_dim=128,
+            swa_head_dim=128,
+            swa_v_head_dim=128,
         ),
     )
     try:
@@ -120,6 +126,29 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
             self.assertFalse(
                 _accepts(backend, use_mla=True, unified=False),
                 f"{backend} must stay rejected without --enable-unified-memory",
+            )
+
+    def test_asymmetric_kv_mha_model_cannot_use_unified_memory(self):
+        """head_dim != v_head_dim (MiMoV2): no uniform rows, so no dense views
+        and no unified pool. The rejection is the POOL's, not a backend's, so
+        it must fire on every backend -- Triton included."""
+        for backend in ("triton",) + self.DENSE_MLA_BACKENDS:
+            self.assertFalse(
+                _accepts(backend, use_mla=False, has_asymmetric_kv=True),
+                f"--enable-unified-memory + {backend} must be rejected for an "
+                "asymmetric-K/V model",
+            )
+
+    def test_asymmetric_dims_do_not_screen_out_mla(self):
+        """MLA stores one latent row per layer, so its K/V head dims never have
+        to agree -- and real MLA configs report them as unequal (Kimi-Linear:
+        head_dim 72, v_head_dim 128). Screening on `has_asymmetric_kv` alone
+        would lock every one of them out of the unified pool."""
+        for backend in ("triton",) + self.DENSE_MLA_BACKENDS:
+            self.assertTrue(
+                _accepts(backend, use_mla=True, has_asymmetric_kv=True),
+                f"{backend} must stay allowed for an MLA model with asymmetric "
+                "K/V head dims",
             )
 
     def test_unwired_backends_always_rejected(self):

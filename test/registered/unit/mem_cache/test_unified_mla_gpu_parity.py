@@ -85,7 +85,6 @@ def _make_pools(ps: int, n_tokens: int = 4096):
         device=_DEV,
         enable_memory_saver=False,
         page_size=ps,
-        view_tail_pad_bytes=ps * full.entry_bytes(),
     )
     unified = UnifiedMLATokenToKVPool(
         unified_buffer=pool,

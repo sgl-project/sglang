@@ -9,6 +9,7 @@ from typing import Any
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     declare_resolution,
+    model_config_of,
     resolved_view,
     resolving_view,
     use_mla_backend,
@@ -283,6 +284,24 @@ def handle_page_major_kv_layout(server_args: Any):
         )
     if not cfg.enable_page_major_kv_layout:
         return
+    if cfg.enable_unified_memory:
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            unified_memory_supported_for_model,
+        )
+
+        model_config = model_config_of(server_args)
+        assert unified_memory_supported_for_model(
+            model_config, use_mla_backend=use_mla_backend(server_args)
+        ), (
+            "--enable-unified-memory requires uniform K/V rows "
+            "(head_dim == v_head_dim); this model has "
+            f"head_dim={model_config.head_dim}, "
+            f"v_head_dim={model_config.v_head_dim}, "
+            f"swa_head_dim={model_config.swa_head_dim}, "
+            f"swa_v_head_dim={model_config.swa_v_head_dim}. The unified "
+            "pool's dense per-layer views require a uniform row width; run "
+            "this model without --enable-unified-memory."
+        )
     # Only the Triton attention kernels read the strided 4-D envelope K/V
     # views; FA3 / FlashInfer do not. EXCEPTION: the unified-memory MLA pool
     # exposes each layer as a DENSE contiguous per-layer view

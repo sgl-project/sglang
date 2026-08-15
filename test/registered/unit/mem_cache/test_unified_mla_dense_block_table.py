@@ -409,7 +409,6 @@ class TestInPlaceKvIndicesTranslate(unittest.TestCase):
             device=_DEV,
             enable_memory_saver=False,
             page_size=page_size,
-            view_tail_pad_bytes=page_size * full.entry_bytes(),
         )
 
         class _Stub:
