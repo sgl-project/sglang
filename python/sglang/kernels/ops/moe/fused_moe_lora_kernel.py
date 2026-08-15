@@ -10,13 +10,13 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.utils.common import is_blackwell_supported, is_hip, is_sm90_supported
 
-_IS_HIP = is_hip()
+_is_hip = is_hip()
 
 
 # Triton's AMD backend cannot legalize pipelined FP32 async copies here. The
 # kernel loads b as c's element type, so both operands gate this.
 def _safe_num_stages(num_stages: int, *dtypes: torch.dtype) -> int:
-    if _IS_HIP and any(dtype == torch.float32 for dtype in dtypes):
+    if _is_hip and any(dtype == torch.float32 for dtype in dtypes):
         return 1
     return num_stages
 
