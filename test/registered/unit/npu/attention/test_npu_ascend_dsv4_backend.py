@@ -59,7 +59,6 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     DeepseekV4AscendMultiStepDraftBackend,
     _apply_hadamard,
     _get_kv_indices,
-    _overlap_transform,
     _walsh_hadamard_matrix,
 )
 

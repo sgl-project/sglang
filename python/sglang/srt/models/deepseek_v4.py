@@ -1378,7 +1378,7 @@ class MQALayer(MqaAttentionBase):
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.alt_streams is not None
             and x.shape[0] <= self._multi_stream_bs_limit
-            and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
+            and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
