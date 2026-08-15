@@ -65,8 +65,9 @@ behavior such as Cache-DiT is documented separately below.
 
 **Deployment Profile** exposes resident and FSDP placement on B200, B300,
 H200, and H100. Resident is the latency-oriented default; FSDP reduces DiT
-weight residency at the cost of per-block parameter collectives. On H200 it
-also selects the verified 2-node cross-node topology. **Online
+weight residency at the cost of per-block parameter collectives, and its
+sharded load also skips the resident path's per-rank host-memory staging. On
+H200 it also selects the verified 2-node cross-node topology. **Online
 Quantization** appears only on B200 and B300. AMD keeps its resident AITER
 recipe, while RTX 5090 uses its dedicated layerwise-offload profile.
 
@@ -107,6 +108,16 @@ tensor-parallel all-reduces and measured slower end-to-end, at about 30 GB
 lower peak memory per GPU. See the **H200 topology comparison** in the
 Benchmarks section for the measured numbers; treat TP2 + Ulysses2 on H200 as
 a deliberate memory trade, not a latency default.
+
+Budget host memory for any resident multi-GPU launch: each rank stages a full
+DiT copy through host RAM before placement, about 58 GiB per rank for the DiT
+alone (measured 114.3 GiB with two ranks and 233.5 GiB with four on H200), and
+container-wide usage peaks near 380 GiB for this four-card recipe. Use a
+512 GiB-class machine, or the FSDP profile, which loads sharded and does not
+stage the DiT through host memory (measured 12.8 GiB for the same two-rank
+load). On a smaller host the load is OOM-killed by the operating system partway
+through, with no server-side error — the last log line is the Run:ai streamer
+reporting a stream to `cpu`.
 
 For 4×H100 80 GB, balance the large packed activation with resident weight
 sharding. TP2 + Ulysses2 was the fastest measured lossless topology while the
@@ -757,7 +768,7 @@ real H3 validation runs.
 - Keep the default `--encoder-parallel auto`. With the server’s default `batching_max_size` of 1, single-node H100/H200/B200/B300 recipes with peer-to-peer access fold the Qwen text encoder over otherwise idle Ulysses ranks. This is separate from DiT tensor parallelism. A pure-TP recipe already shards the encoder over its TP group and does not add a world fold.
 - For throughput-oriented serving, select **DP (batched throughput)**. The picker pairs `--encoder-parallel dp` with an editable `--batching-max-size` greater than 1; compatible requests are distributed across ranks, while every rank keeps a full encoder replica. Encoder DP requires TP1 and DiT DP1, so it is disabled for the H100 TP2 + Ulysses2 and RTX 5090 TP2 recipes. It provides no benefit for a batch of one and is not bitwise-identical to the folded deployment.
 - Use explicit **Fold** to prioritize single-request latency and encoder memory on a measured high-bandwidth single-node topology. Use **Replicate** as the compatibility path when folding or encoder DP is unsuitable.
-- `--use-fsdp-inference true` shards only the DiT. MiniMax-H3 preserves the original FP32 dtype of its patch, time, and output projections during FSDP all-gather, so this path does not trade numerical correctness for memory. On 4×H100, prefer TP2 + Ulysses2 for speed; use FSDP as an explicit capacity policy rather than assuming it is faster.
+- `--use-fsdp-inference true` shards only the DiT. MiniMax-H3 preserves the original FP32 dtype of its patch, time, and output projections during FSDP all-gather, so this path does not trade numerical correctness for memory. On 4×H100, prefer TP2 + Ulysses2 for speed; use FSDP as an explicit capacity policy rather than assuming it is faster. FSDP also loads sharded, so it avoids the resident path's per-rank host-RAM staging of the full DiT (measured 12.8 GiB versus 114.3 GiB of host memory for a two-rank DiT load).
 - `speed` keeps model components resident, `auto` applies the model-aware 120 GiB residency threshold, and `memory` enables the memory-saving placement policy. Explicit `--layerwise-offload-components` overrides that placement list. DiT residency/prefetch knobs are scoped to the DiT; the text encoder and video VAE decoder use one-layer prefetch and zero residency, while the H3 video VAE encoder stays resident. When `memory` is combined with explicit FSDP, H3 instead keeps the sharded DiT on GPU and layerwise-offloads the text encoder and executable VAE decoder blocks. Use `speed` only after confirming that the complete target workload fits.
 - Breakable CUDA graph execution is an explicit opt-in, not part of the recommended `speed` preset. It requires `--enable-breakable-cuda-graph`, every served size in `--warmup-resolutions`, and `--bcg-text-buckets` that cover the live H3 condition sequence. The validated 1344×768 Ref2VA recipe uses 5504; other task profiles and reference sets may need a different value. It preserves eager output for matching captured signatures, but graph capture consumes additional GPU memory and may provide little latency benefit when Ulysses attention and collectives dominate, so benchmark it on the target topology before enabling it.
 
