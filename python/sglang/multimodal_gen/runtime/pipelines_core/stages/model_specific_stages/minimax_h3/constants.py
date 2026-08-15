@@ -27,12 +27,28 @@ MINIMAX_H3_MAX_DURATION_SECONDS = 15.0
 # The distilled checkpoint has exactly one positive denoise branch.
 MINIMAX_H3_DEFAULT_BRANCHES: tuple = ({"name": "cond_1"},)
 
-# Audited 4xH200 and 8xB300 T2VA Cache-DiT parameters for quality="high":
-# (warmup steps, residual-difference threshold, max consecutive cached steps).
-# On the validated workload, 4xH200 measured SSIM 0.931 / PSNR 28.16 dB and
-# 8xB300 measured LPIPS AlexNet mean 0.100 / max 0.214 plus a passing temporal
-# artifact review against quality="lossless". quality="lossless" (the default)
-# uses no Cache-DiT configuration at all. Process-wide SGLANG_CACHE_DIT_*
-# environment controls remain available for manual experiments and are
-# independent of this field.
-MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG: tuple[int, float, int] = (4, 0.04, 1)
+# Audited T2VA Cache-DiT parameters for quality="high", keyed by validated
+# deployment profile: (warmup steps, residual-difference threshold, max
+# consecutive cached steps).
+#
+# 4xH200 keeps the original conservative schedule; it measured SSIM 0.931 /
+# PSNR 28.16 dB against quality="lossless" on the validated workload.
+#
+# 8xB300 uses a re-audited schedule validated on the sglang-native prompt
+# set (the cookbook MiniMax-H3 example plus two benchmark preset prompts,
+# seeds 0/1/2). The 0.08 threshold acts as an adaptive brake: 21 of 49
+# video-tower steps run full on typical prompts, more on drifting content.
+# Same-session measurements: 11.16 s vs 23.03 s lossless and 41.19 s
+# Diffusers BF16 dense Ulysses8 (2.06x / 3.69x), LPIPS AlexNet mean 0.293 /
+# max 0.399 against lossless -- below the 0.347 / 0.465 distance that
+# separates the two reference implementations themselves -- plus a passing
+# consecutive-frame temporal-artifact review. Outputs are byte-identical
+# across server launches.
+#
+# quality="lossless" (the default) uses no Cache-DiT configuration at all.
+# Process-wide SGLANG_CACHE_DIT_* environment controls remain available for
+# manual experiments and are independent of these fields.
+MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIGS: dict[str, tuple[int, float, int]] = {
+    "4xH200": (4, 0.04, 1),
+    "8xB300": (4, 0.08, 3),
+}

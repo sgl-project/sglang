@@ -24,7 +24,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
-    MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG,
+    MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIGS,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES,
@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
@@ -380,6 +381,21 @@ def _precompute_rope_cache(
     return True
 
 
+def _resolve_high_quality_cache_profile() -> str:
+    """Map the local device to an audited quality="high" Cache-DiT profile.
+
+    quality="high" admission has already fail-closed to the exact validated
+    deployments before Cache-DiT mounts, so this only distinguishes between
+    the audited profiles; the H200 schedule is the conservative default.
+    """
+    device_name = (current_platform.get_device_name() or "").upper()
+    capability = current_platform.get_device_capability()
+    capability_int = capability.to_int() if capability is not None else 0
+    if "B300" in device_name and capability_int == 103:
+        return "8xB300"
+    return "4xH200"
+
+
 class MiniMaxH3DenoisingStage(DenoisingStage):
     def __init__(self, transformer, pipeline=None) -> None:
         super().__init__(
@@ -537,7 +553,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 scm_policy,
                 secondary=secondary,
             )
-        warmup, threshold, max_cached = MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG
+        warmup, threshold, max_cached = MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIGS[
+            _resolve_high_quality_cache_profile()
+        ]
         return CacheDitConfig(
             enabled=True,
             Fn_compute_blocks=1,

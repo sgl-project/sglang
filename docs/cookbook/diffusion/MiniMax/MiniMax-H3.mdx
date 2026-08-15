@@ -534,10 +534,12 @@ done
 
 - `"lossless"` (default): the exact reference path. Output is bit-exact
   against the reference implementation and the CI ground truth.
-- `"high"`: the audited accelerated path. Quality is guaranteed (the audited
-  Cache-DiT configuration measures SSIM 0.931 / PSNR 28.16 dB against
-  `lossless` on 4×H200, and passes the temporal-artifact review described below
-  on 8×B300), but output is no longer bit-identical to the reference.
+- `"high"`: the audited accelerated path. Each validated deployment mounts
+  its own audited Cache-DiT schedule: 4×H200 keeps the conservative
+  `(4, 0.04, 1)` policy (SSIM 0.931 / PSNR 28.16 dB against `lossless`),
+  while 8×B300 uses a re-audited `(4, 0.08, 3)` policy that passes the LPIPS
+  and temporal-artifact gates described below at 2.06× the lossless speed.
+  Output is no longer bit-identical to the reference.
 
 One resident server serves both levels; a `quality: "high"` request mounts
 its audited Cache-DiT policy at the batch boundary, and a later
@@ -616,37 +618,53 @@ absolute perceptual quality: the `high` path can produce a different but
 still plausible realization. It also changes the joint audio-video denoise
 trajectory, while these two metrics cover video only.
 
-The same audited Cache-DiT policy was re-evaluated on 8×B300 against both a
-lossless Diffusers baseline and SGLang lossless. Latency is the median of three
-requests after one warmup request. The three fixed prompt/seed pairs were
-scored against SGLang lossless with frame-aligned LPIPS AlexNet at 1 fps.
-Consecutive 4 fps frame sheets were also reviewed with the
-[Sol-Engine H3 temporal-artifact taxonomy](https://nvlabs.github.io/Sana/Sol-Engine/H3/)
-for flicker, coherence, boundaries, mosaic/static regions, ghosting, broken
-motion, and major blur.
+On 8×B300 the schedule was re-audited with a parameter sweep on the
+sglang-native prompt set: the cookbook MiniMax-H3 example (three cats with
+brass instruments) plus two benchmark preset prompts (cat and dog baking,
+cyberpunk city), seeds 0/1/2. Every candidate was gated on LPIPS and a
+temporal review. The 0.08 residual threshold acts as an adaptive brake: it
+forces full computation whenever the trajectory drifts, leaving 21 of 49
+full video-tower steps on typical prompts and more on harder content. At
+this threshold the consecutive-cache cap barely binds, and the same
+threshold with cap 1 is strictly slower at equal quality (11.60 s,
+LPIPS 0.289 / 0.401), so cap 3 is used.
+
+All rows below were measured back-to-back in a single session on one 8×B300
+node (this air-cooled box sits on its 1100 W power cap under sustained load
+and its sustained-clock regime drifts intraday, so only same-session ratios
+are comparable). Latency is the median of three requests after one warmup
+request. The three fixed prompt/seed pairs were scored against SGLang
+lossless with frame-aligned LPIPS AlexNet at 1 fps, and consecutive 4 fps
+frame sheets were reviewed for flicker, coherence, boundaries, mosaic/static
+regions, ghosting, broken motion, and major blur. The audited schedule is
+deterministic: its three clips are byte-identical across independent server
+launches, so the gate transfers exactly.
 
 ![MiniMax-H3 B300 quality and latency comparison](./assets/minimax-h3-b300-quality-high.png)
 
 | B300 arm | Median latency | Speedup vs Diffusers | LPIPS mean / max | Temporal review | Decision |
 | --- | ---: | ---: | ---: | --- | --- |
-| Diffusers BF16 dense, Ulysses8 | 30.29 s | 1.00× | n/a | Baseline implementation | Baseline |
-| SGLang lossless | 18.61 s | 1.63× | 0.000 / 0.000 | Reference | Default exact path |
-| SGLang generic Sol-Attn | 17.97 s | 1.69× | 0.229 / 0.301 | Pass | Evaluated, not admitted |
-| SGLang `quality="high"` Cache-DiT | 10.70 s | 2.83× | 0.100 / 0.214 | Pass | **Validated high path** |
-| SGLang Cache-DiT + generic Sol-Attn | 10.35 s | 2.93× | 0.215 / 0.283 | Pass | Evaluated, not admitted |
+| Diffusers BF16 dense, Ulysses8 | 41.19 s | 1.00× | 0.347 / 0.465 | Baseline implementation | Baseline |
+| SGLang lossless | 23.03 s | 1.79× | 0.000 / 0.000 | Reference | Default exact path |
+| SGLang `quality="high"` Cache-DiT (4, 0.04, 1) | 16.45 s | 2.50× | 0.101 / 0.129 | Pass | Superseded on B300 |
+| SGLang `quality="high"` Cache-DiT (4, 0.08, 3) | 11.16 s | 3.69× | 0.293 / 0.399 | Pass | **Validated high path** |
 
-The B300 high path is 1.74× faster than SGLang lossless. Adding generic
-Sol-Attn saves only another 3.4% while more than doubling mean LPIPS, so sparse
-attention is not enabled by `quality="high"`. The temporal rubric was applied
-by aligned human review rather than the Gemini judge used by the published
-Sol-Engine evaluation. LPIPS remains a same-seed trajectory-distance signal,
-not an absolute image-quality score.
+The audited B300 high path is 2.06× faster than SGLang lossless and 3.69×
+faster than the Diffusers baseline, and its LPIPS distance (0.293 / 0.399)
+is below the distance that already separates the two reference
+implementations from each other (0.347 / 0.465, the Diffusers row). LPIPS
+remains a same-seed trajectory-distance signal, not an absolute
+image-quality score.
 
-The generic Sol-Attn experiment used `tau=1`, diagonal thresholding, ten dense
-prefix steps, dense DiT blocks 0 and 1, and no KV sink. It is not NVIDIA's
-H3-specific Sol-Engine policy. The dedicated H3 SubBlock sparse backend is
-currently built for SM100 and rejects B300's SM103, so it is not included in
-the B300 comparison.
+Two additions were measured on top of audited schedules but are not part of
+`quality="high"` yet. SubBlock sparse attention (merged in #34148, 0.75
+sparsity, dense first 10 steps) composes with Cache-DiT and keeps passing
+the gate, but its blk64 kernel needs a FlashInfer-side SM103 scheduling fix
+that is not upstreamed yet; stock FlashInfer falls back to a slower path on
+B300. NVFP4 weight quantization was evaluated and rejected: after fixing a
+QKV scale-unification bug in the checkpoint conversion, full-model FP4
+reaches LPIPS 0.604 / 0.697 and an MLP-only variant still 0.530 / 0.674 for
+at most a 6% latency gain, so it does not pass the same-seed gate.
 
 `quality: "high"` currently accepts only the exact workload and either the
 4×H200 deployment above or its audited 8×B300 TP1/Ulysses8 counterpart;

@@ -311,6 +311,40 @@ def test_quality_admission_accepts_validated_b300_profile():
             config.validate_quality_deployment(server_args)
 
 
+def test_high_quality_cache_profile_selects_audited_schedule():
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+        MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIGS,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+        _resolve_high_quality_cache_profile,
+    )
+
+    assert MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIGS["4xH200"] == (4, 0.04, 1)
+    assert MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIGS["8xB300"] == (4, 0.08, 3)
+
+    with (
+        patch.object(
+            current_platform, "get_device_name", return_value="NVIDIA B300 SXM6"
+        ),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_BlackwellCapability(),
+        ),
+    ):
+        assert _resolve_high_quality_cache_profile() == "8xB300"
+
+    with (
+        patch.object(current_platform, "get_device_name", return_value="NVIDIA H200"),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_HopperCapability(),
+        ),
+    ):
+        assert _resolve_high_quality_cache_profile() == "4xH200"
+
+
 def test_quality_admission_fails_closed_outside_validated_request():
     metadata = MiniMaxH3ReleaseMetadata.from_model_index(
         {
