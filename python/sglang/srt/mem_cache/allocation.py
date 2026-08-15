@@ -35,7 +35,7 @@ from sglang.srt.utils import (
     next_power_of_2,
     support_triton,
 )
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import get_num_new_pages, is_pin_memory_available
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -208,9 +208,13 @@ def alloc_paged_token_slots_extend(
     dsv4_state_lens: Optional[DSV4StateLens] = None,
     batch=None,
 ):
-    # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
-    num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+    num_new_pages = get_num_new_pages(
+        seq_lens=seq_lens_cpu,
+        page_size=allocator.page_size,
+        prefix_lens=prefix_lens_cpu,
+    )
+    num_tokens = num_new_pages * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
