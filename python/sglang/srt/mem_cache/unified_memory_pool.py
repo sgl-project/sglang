@@ -576,6 +576,28 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             )
             env[tgt_pages] = env[src_pages]
 
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "unified dense layout has no per-layer contiguous regions; "
+            "KV transfer / disaggregation is unsupported."
+        )
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        raise NotImplementedError(
+            "CPU offloading is unsupported under the unified dense layout."
+        )
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        raise NotImplementedError(
+            "CPU offloading is unsupported under the unified dense layout."
+        )
+
+    def set_kv_buffer_prefix_valid(self, *args, **kwargs):
+        raise NotImplementedError(
+            "prefix-valid commit is unsupported under the unified dense layout "
+            "(_set_kv_buffer_prefix_valid_impl assumes token-id indexing)."
+        )
+
 
 class UnifiedMLATokenToKVPool(MLATokenToKVPool):
     """MLA KV pool whose per-layer `kv_buffer` entries are DENSE views into a
