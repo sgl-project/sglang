@@ -2285,7 +2285,6 @@ class ServingChatTestCase(unittest.TestCase):
         self.fastapi_request.headers = {
             "x-sglext-return-input-ids": "1",
             "x-sglext-return-output-ids": "1",
-            "x-sglext-ids-framed": "1",
         }
         req = ChatCompletionRequest(
             model="x",
@@ -2310,7 +2309,6 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertTrue(processed_request.return_input_ids)
         self.assertTrue(processed_request.return_output_ids)
-        self.assertTrue(processed_request.sglext_ids_framed)
 
     def _run_output_ids_stream(
         self,
@@ -2325,6 +2323,8 @@ class ServingChatTestCase(unittest.TestCase):
         sglext chunks (or the raw chunk strings if return_raw, for asserting
         on SSE framing)."""
         self.tm.server_args.incremental_streaming_output = incremental
+        if framed:
+            self.fastapi_request.headers["x-sglext-ids-framed"] = "1"
 
         async def _mock_generate():
             for i, ids in enumerate(chunk_output_ids):
@@ -2357,7 +2357,6 @@ class ServingChatTestCase(unittest.TestCase):
             stream=True,
             return_input_ids=True,
             return_output_ids=True,
-            sglext_ids_framed=framed,
             return_cached_tokens_details=cached_tokens_details is not None,
         )
 

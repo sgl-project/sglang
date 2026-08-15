@@ -905,19 +905,12 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
         # Header-based opt-in (same rationale as request_headers.py).
         if raw_request is not None and not request.return_input_ids:
-            header_value = raw_request.headers.get("x-sglext-return-input-ids")
-            if header_value is not None and header_value.lower() in ("1", "true"):
+            if raw_request.headers.get("x-sglext-return-input-ids") == "1":
                 request.return_input_ids = True
 
         if raw_request is not None and not request.return_output_ids:
-            header_value = raw_request.headers.get("x-sglext-return-output-ids")
-            if header_value is not None and header_value.lower() in ("1", "true"):
+            if raw_request.headers.get("x-sglext-return-output-ids") == "1":
                 request.return_output_ids = True
-
-        if raw_request is not None and not request.sglext_ids_framed:
-            header_value = raw_request.headers.get("x-sglext-ids-framed")
-            if header_value is not None and header_value.lower() in ("1", "true"):
-                request.sglext_ids_framed = True
 
         reasoning_effort = (
             request.chat_template_kwargs.pop("reasoning_effort", None)
@@ -1526,6 +1519,11 @@ class OpenAIServingChat(OpenAIServingBase):
             return_input_ids = self._should_return_input_ids(request)
             return_output_ids = self._should_return_output_ids(request)
 
+            ids_framed = (
+                raw_request is not None
+                and raw_request.headers.get("x-sglext-ids-framed") == "1"
+            )
+
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ):
@@ -1725,7 +1723,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             sglext_non_ids, sglext_ids = sglext_full.split_ids()
 
-            if request.sglext_ids_framed:
+            if ids_framed:
                 # Emit token ids as their own named SSE event, separate from
                 # the other sglext fields, so they can be identified at the
                 # SSE framing level (by event name, no JSON parsing) and

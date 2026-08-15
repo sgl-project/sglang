@@ -800,8 +800,6 @@ class ChatCompletionRequest(BaseModel):
     return_meta_info: bool = False
     return_input_ids: bool = False
     return_output_ids: bool = False
-    # Streaming only: emit the sglext token ids as a separate named SSE event.
-    sglext_ids_framed: bool = False
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
