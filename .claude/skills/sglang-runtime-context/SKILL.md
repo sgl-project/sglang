@@ -136,7 +136,7 @@ requires today). A process-global seed field-read of one of these
 sizes (`get_server_args().tp_size`, or an alias of it) is a read-ratchet failure; the
 sites that legitimately go around the live property are the `configured_*_size()`
 readers, and those are what the ratchet registers, each with its reason
-(`_CONFIGURED_SIZE_CALL_SITES` in `scripts/lint/check_global_config_read_ratchet.py`). A
+(`_CONFIGURED_SIZE_CALL_SITES` in `test_global_config_read_ratchet.py`). A
 `server_args` the object was *handed* is a different thing and not a ratchet
 matter — see "Reads that legitimately stay on a ServerArgs instance".
 Fail-loud is narrower: before dist init, a live size/group read raises — except
@@ -189,11 +189,11 @@ this).
   topology (`1` / `False` when no group is installed). A site
   that must know the *requested* DCP size before dist init needs its own
   `configured_dcp_size()` (and an entry in `_CONFIGURED_SIZE_CALL_SITES`, which lives
-  in the ratchet checker, not in this skill); note the live pair does not *need*
+  in the ratchet test, not in this skill); note the live pair does not *need*
   dist init — with no group it answers `1` / `False` — it just cannot answer
   with the requested size. Every (file, accessor) pair is registered
-  with its reason in `scripts/lint/check_global_config_read_ratchet.py`
-  (`_CONFIGURED_SIZE_CALL_SITES`), and that checker fails if the code and the list
+  with its reason in `test_global_config_read_ratchet.py`
+  (`_CONFIGURED_SIZE_CALL_SITES`), and that test fails if the code and the list
   disagree — a new file, or a new accessor in a listed file, has to be added — so a new site needs both an answer the live property cannot give and
   an entry saying what it is.
 - **this runner's resolved value** → the runner
@@ -378,31 +378,31 @@ ONE thread — do not design for TBO threads that don't exist.
    resolved config with `get_context().override`; hand a per-runner value to its
    runner as a constructor argument. Projected bags are sealed the same way (leaf
    assignment raises).
-2. **Mutation guard** (`scripts/lint/check_server_args_mutation_ratchet.py`, pinned at 0 over the whole
+2. **Mutation ratchet** (`test_server_args_mutation_ratchet.py`, exact pin 0 over the whole
    package minus the pipeline / multimodal_gen): textual scan for assignment forms. Never
    raise the baseline.
 3. **No-copy contract** (`test_server_args_no_instance_mutation_entry.py`): neither
    `ServerArgs.override` nor `ServerArgs.derive` exists, and nothing in the package
    calls either form. Rerouting a writer to the bags means flipping **all its readers
    in the same commit** (no transitional dual-write).
-4. **Legacy-accessor ratchet** (`scripts/lint/check_legacy_global_ratchet.py`): `get_global_server_args`
+4. **Legacy-accessor ratchet** (`test_legacy_global_ratchet.py`): `get_global_server_args`
    call sites must not grow. The replacement for a *decision* is a bag leaf, a named
    accessor, or the owning runner's stamp — not `get_server_args().field`, which the
    read ratchet below pins at zero. `runtime_context.get_server_args()` is only for the
    whole-object shapes (dumps, provenance, a hand-off to a callee that takes a config).
-5. **Global config read ratchet** (`scripts/lint/check_global_config_read_ratchet.py`): baselines are
+5. **Global config read ratchet** (`test_global_config_read_ratchet.py`): baselines are
    **0** for both the direct `get_server_args().field` and the alias form (function-local
    — including local copies of an alias, `cfg = sa` — module-level, or parked on an
    instance attribute, plus the `getattr(..., "field")` spelling of each; a name
    computed at runtime or indirection deeper than a local name copy is census-tool
-   territory, per the checker's module docstring). The scanners match `get_server_args` and
+   territory, per the test's docstring). The scanners match `get_server_args` and
    `configured_*_size` by their literal names, and the same file *bans*
    `import ... as` renames of them so that matching stays sound. Exempt by owner
    module only (`runtime_context.py`, `server_args.py`, `arg_groups/`). The same file
    carries `_CONFIGURED_SIZE_CALL_SITES`, the (file, accessor) map of every
    `configured_*_size()` reader with the reason the live property cannot serve it — a new
    file or a new accessor in a listed file must be added there.
-6. **Module-state ratchet** (`scripts/lint/check_module_state_ratchet.py`): `global` statements in the
+6. **Module-state ratchet** (`test_module_state_ratchet.py`): `global` statements in the
    flag-owning layers are pinned by name. A new module-level runtime global belongs on a
    flags group / resources slot instead; migrating a pinned survivor must shrink the pin.
 7. **Namespace coverage** (`test_server_args_namespaces.py`,
@@ -456,9 +456,9 @@ Key source files: `python/sglang/srt/runtime_context.py` (the container, every t
 `publish`, `_ConfigBag`, `preserve_config`, `override_server_args`),
 `python/sglang/srt/arg_groups/overrides.py` (override registry, passes,
 `declare_late_resolution`), `python/sglang/srt/server_args.py` (`NS` metadata,
-`Arg(..., resolvable=True)`, `__setattr__` strict guard), the static guardrails under
-`scripts/lint/` (`check_server_args_mutation_ratchet.py`,
-`check_global_config_read_ratchet.py`, `check_legacy_global_ratchet.py`,
-`check_module_state_ratchet.py`), and the runtime guardrail tests under
-`test/registered/unit/` (`test_server_args_namespaces.py`, `test_runtime_context.py` — the latter doubles
+`Arg(..., resolvable=True)`, `__setattr__` strict guard), and the guardrail tests under
+`test/registered/unit/` (`test_server_args_mutation_ratchet.py`,
+`test_global_config_read_ratchet.py`, `test_legacy_global_ratchet.py`,
+`test_module_state_ratchet.py`, `test_server_args_namespaces.py`,
+`test_runtime_context.py` — the last one doubles
 as executable documentation of every tier's semantics).
