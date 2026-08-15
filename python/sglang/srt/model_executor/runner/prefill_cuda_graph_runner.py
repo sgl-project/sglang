@@ -109,7 +109,9 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     TCPCG_FAILURE_HINT,
     set_tc_piecewise_forward_context,
 )
-from sglang.srt.model_executor.runner_utils import maybe_publish_prefill_war_read_done
+from sglang.srt.model_executor.runner_utils import (
+    maybe_publish_prefill_shared_read_done,
+)
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
@@ -1758,7 +1760,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
             # Replay prep, including the optional chunked-prefix gather above,
             # has finished every scheduler-shared read.
-            maybe_publish_prefill_war_read_done(
+            maybe_publish_prefill_shared_read_done(
                 self.model_runner, forward_batch, self.device_module
             )
 

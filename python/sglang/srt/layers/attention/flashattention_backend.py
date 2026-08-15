@@ -30,7 +30,14 @@ from sglang.srt.layers.utils.cp_utils import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_model,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -49,8 +56,8 @@ from sglang.kernels.ops.attention.flash_attention import (
 )
 
 
-def _should_disable_scheduler_metadata_precompute(server_args) -> bool:
-    return bool(server_args.enable_prefill_cp or server_args.enable_dp_attention)
+def _should_disable_scheduler_metadata_precompute() -> bool:
+    return bool(get_parallel().enable_prefill_cp or get_parallel().enable_dp_attention)
 
 
 @dataclass
@@ -202,7 +209,7 @@ class FlashAttentionBackend(AttentionBackend):
             and model_runner.token_to_kv_pool.swa_layer_nums > 0
         )
 
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
@@ -214,7 +221,7 @@ class FlashAttentionBackend(AttentionBackend):
                 phase="target_verify",
                 server_args=model_runner.server_args,
                 spec_algorithm=SpeculativeAlgorithm.from_string(
-                    model_runner.server_args.speculative_algorithm
+                    get_spec().speculative_algorithm
                 ),
                 is_draft_worker=True,
                 num_draft_tokens=int(self.speculative_num_draft_tokens),
@@ -253,6 +260,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Select version
         self.fa_impl_ver = fa_impl_ver
+        device_capability = get_device_capability()
         if self.fa_impl_ver == 3:
             from sgl_kernel.flash_attn import (
                 flash_attn_varlen_func,
@@ -261,14 +269,28 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
             self._get_scheduler_metadata = get_scheduler_metadata
+            self._get_fa_runtime_policy = None
         elif self.fa_impl_ver == 4:
-            from sglang.kernels.ops.attention.flash_attention_v4 import (
-                flash_attn_varlen_func,
-                flash_attn_with_kvcache,
-            )
+            if device_capability[0] == 12:
+                from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
+                    flash_attn_varlen_func,
+                    flash_attn_with_kvcache,
+                    get_flash_attention_v4_sm120_runtime_policy,
+                )
+
+                self._get_fa_runtime_policy = (
+                    get_flash_attention_v4_sm120_runtime_policy
+                )
+            else:
+                from sglang.kernels.ops.attention.flash_attention_v4 import (
+                    flash_attn_varlen_func,
+                    flash_attn_with_kvcache,
+                )
+
+                self._get_fa_runtime_policy = None
 
             self._get_scheduler_metadata = None
-            if model_runner.server_args.enable_deterministic_inference:
+            if get_exec().deterministic.enable_deterministic_inference:
                 # Must precede the first kernel compile.
                 from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
                     set_batch_invariant,
@@ -295,15 +317,22 @@ class FlashAttentionBackend(AttentionBackend):
         )
         self.has_softcap = _softcapping is not None and _softcapping > 0.0
 
-        # If num_splits == 0, we use a heuristic to automatically determine the number of splits.
-        # We set nums splits to 1 if deterministic inference is enabled.
-        # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
-        fa4_no_splitkv = self.fa_impl_ver == 4 and get_device_capability() < (9, 0)
-        self.num_splits = (
-            1
-            if model_runner.server_args.enable_deterministic_inference or fa4_no_splitkv
-            else 0
-        )
+        # num_splits == 0 delegates SplitKV sizing to the selected FA runtime.
+        deterministic = get_exec().deterministic.enable_deterministic_inference
+        if self._get_fa_runtime_policy is None:
+            self.num_splits = 1 if deterministic else 0
+            self.decode_num_splits = self.num_splits
+            self._decode_uses_static_max_seqlen_k = False
+        else:
+            runtime_policy = self._get_fa_runtime_policy(
+                device_capability=device_capability,
+                deterministic=deterministic,
+            )
+            self.num_splits = runtime_policy.num_splits
+            self.decode_num_splits = runtime_policy.decode_num_splits
+            self._decode_uses_static_max_seqlen_k = (
+                runtime_policy.decode_uses_static_max_seqlen_k
+            )
         # Set (never getattr'd) so forward_extend can identity-check "is this the
         # full-CG prefill metadata?" to disable the pointer-keyed shear-bias
         # block-schedule cache (see forward_extend rel_bias handling).
@@ -317,11 +346,10 @@ class FlashAttentionBackend(AttentionBackend):
         # guard wraps both set_kv_buffer and set_mla_kv_buffer. Without this
         # gate, MLA + is_embedding would skip the write but still read stale
         # cache via get_key_buffer in the absorbed-MLA path.
-        server_args = model_runner.server_args
         self.fa_skip_kv_cache = (
-            server_args.is_embedding
-            and server_args.chunked_prefill_size == -1
-            and server_args.disable_radix_cache
+            get_model().is_embedding
+            and get_schedule().chunked_prefill_size == -1
+            and get_memory().disable_radix_cache
             and not self.use_mla
         )
 
@@ -331,7 +359,7 @@ class FlashAttentionBackend(AttentionBackend):
         # combine kernel (flash_fwd_combine_launch_template.h:52). Leaving
         # scheduler_metadata unset uses the existing per-layer metadata path.
         self._disable_scheduler_metadata_precompute = (
-            _should_disable_scheduler_metadata_precompute(server_args)
+            _should_disable_scheduler_metadata_precompute()
         )
 
     def _compute_scheduler_metadata(
@@ -506,6 +534,12 @@ class FlashAttentionBackend(AttentionBackend):
                 # Local attention and scheduler metadata require capture-time slice sizing.
                 # Both depend on data already filled by replay above.
                 metadata = self.decode_cuda_graph_metadata[bs]
+                if self._decode_uses_static_max_seqlen_k:
+                    # FA4 bakes its N-tile grid and SplitKV specialization into
+                    # the graph. Capture against the full replay bound, not the
+                    # padded seq-len fill value (1), or a later long-context
+                    # replay would leave K/V tiles uncovered.
+                    metadata.max_seq_len_k = self.max_context_len
                 self._maybe_update_local_attn_metadata_for_capture(metadata, bs)
                 if self._sched_meta_buf is not None:
                     sched = self._compute_scheduler_metadata(
@@ -1860,6 +1894,8 @@ class FlashAttentionBackend(AttentionBackend):
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
+                if self._decode_uses_static_max_seqlen_k:
+                    kwargs["max_seqlen_k"] = metadata.encoder_max_seq_len_k
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -1879,6 +1915,8 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             elif use_local_attn:
                 # Use chunked (local) attention batching for self-attention
+                if self._decode_uses_static_max_seqlen_k:
+                    kwargs["max_seqlen_k"] = local_attn_metadata.local_max_seq_len
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -1932,6 +1970,8 @@ class FlashAttentionBackend(AttentionBackend):
                     and not pa_swa_active
                 ):
                     sched_meta = metadata.scheduler_metadata
+                if self._decode_uses_static_max_seqlen_k:
+                    kwargs["max_seqlen_k"] = metadata.max_seq_len_k
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
@@ -1945,7 +1985,13 @@ class FlashAttentionBackend(AttentionBackend):
                     window_size=window_size,
                     softcap=layer.logit_cap,
                     return_softmax_lse=use_cascade_attn,
-                    num_splits=self.num_splits,
+                    num_splits=(
+                        self.decode_num_splits
+                        if not is_swa_layer
+                        and not use_cascade_attn
+                        and not pa_swa_active
+                        else self.num_splits
+                    ),
                     out=_fa_out,
                     ver=self.fa_impl_ver,
                     scheduler_metadata=sched_meta,
@@ -1953,6 +1999,10 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
+                    if self._decode_uses_static_max_seqlen_k:
+                        kwargs["max_seqlen_k"] = (
+                            self.forward_metadata_spec_decode_expand.max_seq_len_k
+                        )
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
                             q=q_reshaped,
