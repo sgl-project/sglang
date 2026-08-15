@@ -4,6 +4,8 @@
 from unittest import mock
 
 import pytest
+import torch
+import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEConfig,
@@ -14,6 +16,7 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention import (
     Attention,
+    _apply_qk_norm,
 )
 
 
@@ -65,3 +68,12 @@ def test_vit_attention_uses_local_usp_backend_dispatch():
         Attention(heads=2, dim_head=64)
 
     assert usp_attention.call_args.kwargs["skip_sequence_parallel"] is True
+
+
+def test_vit_qk_norm_supports_affine_free_rmsnorm():
+    norm = nn.RMSNorm(64, elementwise_affine=False)
+    hidden_states = torch.randn(1, 2, 2, 64)
+
+    output = _apply_qk_norm(norm, hidden_states)
+
+    assert output.shape == hidden_states.shape
