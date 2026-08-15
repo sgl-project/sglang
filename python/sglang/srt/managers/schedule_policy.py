@@ -37,7 +37,6 @@ import torch
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.cp.base import is_zigzag
-from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -607,7 +606,6 @@ class PrefillAdder:
         )
         self.cp_uses_zigzag = is_zigzag()
         self.max_running_requests = max_running_requests
-        self.prefill_context_parallel_enabled = is_prefill_context_parallel_enabled()
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
