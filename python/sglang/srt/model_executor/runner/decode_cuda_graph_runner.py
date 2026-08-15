@@ -424,7 +424,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
-    def _plant_war_read_done_node(self):
+    def _plan_in_graph_read_done(self):
         # Plant the shared buffer read done in graph
         if (
             self.model_runner.in_graph_read_done_event is not None
@@ -1061,7 +1061,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 # run eagerly in `init_forward_metadata_out_graph` (replay-prep), so
                 # the captured graph reads already-physical locs. Base no-op for triton.
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
-                self._plant_war_read_done_node()
+                self._plan_in_graph_read_done()
 
                 # No invalidate_loc_cache() here: the unified pool translates its
                 # locs in `init_forward_metadata_out_graph`, so no cache to invalidate.
