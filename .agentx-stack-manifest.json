@@ -1,0 +1,45 @@
+{
+  "schema_version": 2,
+  "status": "agentx_decode_gap_v2_split_metadata_hoist",
+  "frozen_at": "2026-08-15T12:37:43-07:00",
+  "model": {
+    "repo": "nvidia/Qwen3.5-397B-A17B-NVFP4",
+    "revision": "1dcf92e1a474ef147273a2a2d15ad5daec44edc5"
+  },
+  "container": {
+    "image": "lmsysorg/sglang:nightly-dev-cu13-20260809-cea16bf2",
+    "registry_digest": "sha256:4c44c95626c7601f19259266342341976e848f835fbe33ebb4b09a28dff3063c",
+    "aga_sqsh": "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/yangminl/agentx-max-tps-20260810/containers/lmsysorg+sglang+nightly-dev-cu13-20260809-cea16bf2-arm64-enroot.sqsh",
+    "aga_sqsh_sha256": "87c34529c0e854e85b6075619a0f62cece4843de8bb4698f7aeaf30e0ae04c5a"
+  },
+  "sglang": {
+    "runtime_base_identity": "5be8757c0d99f83bde9f5254b1fee30b97dcf66f",
+    "change_commit": "8aa2c4360c17cfba569e0fdc156d7527e4748fb6",
+    "upstream_change_commit": "78fa0f5e8031da1f778feeec26f3a06d400bc592",
+    "patch_sha256": "a2e00dee946f16cb40e69d78c562d7493ee16b0778e3b3c70fb96f3af84ef265",
+    "change": "Prepare TRTLLM-MHA request order, sorted sequence lengths, and sorted page tables once per forward and reuse them across attention layers.",
+    "targeted_validation": {
+      "clean_apply_to_runtime_copy": "pass",
+      "py_compile": "pass",
+      "callsite_audit": "pass: graph and eager metadata initialization are mutually exclusive and each invokes the preparation once per forward"
+    }
+  },
+  "srt_slurm": {
+    "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
+    "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
+  },
+  "aiperf": {
+    "repo": "https://github.com/SemiAnalysisAI/aiperf.git",
+    "commit": "bcfc235c552a17de6d1a7a5d2345cf012401588d",
+    "tag": "agentx-v1.0.3"
+  },
+  "dataset": {
+    "public_alias": "semianalysis_cc_traces_weka_062126_256k",
+    "num_dataset_entries": 393,
+    "live_assistant_responses": false,
+    "random_seed": 42,
+    "trajectory_start_min_ratio": 0.25,
+    "trajectory_start_max_ratio": 0.75,
+    "trace_delays": "recorded"
+  }
+}

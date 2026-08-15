@@ -1,0 +1,148 @@
+import subprocess
+import unittest
+from types import SimpleNamespace
+
+import requests
+
+from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.run_eval import run_eval
+from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
+from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    is_in_ci,
+    popen_launch_server,
+    try_cached_model,
+)
+
+register_cuda_ci(
+    est_time=189,
+    stage="base-c",
+    runner_config="4-gpu-h100",
+    disabled="Temporarily disabled until the next Mooncake release includes the PyTorch 2.13 collective forwarding fix.",
+)
+
+ib_devices = get_rdma_devices_args()
+
+
+class TestTP(CustomTestCase):
+    extra_args = []
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--elastic-ep-backend",
+                "mooncake",
+                "--mooncake-ib-device",
+                ib_devices,
+                "--moe-a2a-backend",
+                "mooncake",
+                "--deepep-mode",
+                "low_latency",
+                "--moe-dense-tp-size",
+                "1",
+                "--enable-dp-lm-head",
+                "--enable-two-batch-overlap",
+                "--disable-custom-all-reduce",
+                "--enable-eplb",
+                "--ep-num-redundant-experts",
+                "72",
+                "--chunked-prefill-size",
+                "512",
+                "--cuda-graph-max-bs-decode",
+                "128",
+                "--max-running-requests",
+                "512",
+                "--mem-fraction-static",
+                "0.5",
+                *cls.extra_args,
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(metrics)
+
+        self.assertGreater(metrics["score"], 0.60)
+
+
+class TestPureDP(TestTP):
+    extra_args = [
+        "--enable-dp-attention",
+        "--dp",
+        "4",
+    ]
+
+    pkill_process_1 = "sglang::scheduler_DP1_TP1_EP1"
+    pkill_process_2 = "sglang::scheduler_DP3_TP3_EP3"
+
+    def _kill_and_bootstrap(self, process_name: str) -> None:
+        subprocess.run(["pkill", "-f", process_name], check=True)
+        # Bootstrap one forward on a survivor so the controller learns the
+        # post-fault active-rank mask before dispatching concurrent requests.
+        response = requests.post(
+            f"{self.base_url}/generate",
+            json={
+                "text": "Hello",
+                "sampling_params": {"max_new_tokens": 1},
+                "routed_dp_rank": 0,
+            },
+            timeout=120,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_gsm8k_fault_1(self):
+        """
+        Kill one rank and the system should remain operational.
+        """
+        self._kill_and_bootstrap(self.pkill_process_1)
+        super().test_gsm8k()
+
+    @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
+    def test_gsm8k_fault_2(self):
+        """
+        Kill another rank and the system should remain operational.
+        """
+        self._kill_and_bootstrap(self.pkill_process_2)
+        super().test_gsm8k()
+
+
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
+class TestHybridDPTP(TestPureDP):
+    extra_args = [
+        "--enable-dp-attention",
+        "--dp",
+        "2",
+    ]
+
+    pkill_process_1 = "sglang::scheduler_DP1_TP2_EP2"
+    pkill_process_2 = "sglang::scheduler_DP1_TP3_EP3"
+
+
+if __name__ == "__main__":
+    unittest.main()

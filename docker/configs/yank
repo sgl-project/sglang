@@ -1,0 +1,12 @@
+#!/bin/bash
+put() {
+  esc=$1
+  test -n "$TMUX" -o -z "${TERM##screen*}" && esc="\033Ptmux;\033$esc\033\\"
+  printf "$esc"
+}
+put "\033]52;c;!\a"
+buf=$( cat "$@" )
+len=$( printf %s "$buf" | wc -c ) max=74994
+test $len -gt $max && echo "$0: input is $(( len - max )) bytes too long" >&2
+put "\033]52;c;$( printf %s "$buf" | head -c $max | base64 | tr -d '\r\n' )\a"
+test -n "$TMUX" && tmux set-buffer "$buf" ||:
