@@ -1123,7 +1123,7 @@ def fused_kda_decode_mtp_dspark(
         *(_tensor_layout_key(tensor) for tensor in args),
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    compiled = _DSPARK_COMPILED.get(key)
+    compiled = _DSPARK_COMPILED[key] if key in _DSPARK_COMPILED else None
     if compiled is None:
         cute_args = tuple(_cute_tensor(tensor, dynamic=False) for tensor in args)
         compiled = cute.compile(

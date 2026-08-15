@@ -1,11 +1,8 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 import math
 import os
-import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
-from getpass import getuser
-from pathlib import Path
 from typing import Callable, Optional, Tuple
 
 import cutlass
@@ -14,10 +11,12 @@ import torch
 from cutlass import Float32, Int32
 from quack.compile_utils import make_fake_tensor as fake_tensor
 
-from sglang.kernels.jit.cute_aot_cache import get_jit_cache
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
     is_batch_invariant,
+)
+from sglang.kernels.ops.attention.flash_attn.cute.cache_config import (
+    get_flash_attn_jit_cache,
 )
 from sglang.kernels.ops.attention.flash_attn.cute.testing import is_fake_mode
 
@@ -73,26 +72,6 @@ from sglang.kernels.ops.attention.flash_attn.cute.sm100_hd256_2cta_fmha_forward 
     BlackwellFusedMultiHeadAttentionForward,
 )
 from sglang.kernels.ops.attention.flash_attn.cute.utils import AuxData
-
-
-def _get_flash_attn_jit_cache(name: str):
-    cache_dir = os.getenv("SGLANG_CUTE_AOT_CACHE_DIR") or None
-    if cache_dir is None and os.getenv(
-        "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "0"
-    ) == "1":
-        cache_dir = os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_DIR") or None
-        if cache_dir is None:
-            cache_dir = (
-                Path(tempfile.gettempdir())
-                / getuser()
-                / "flash_attention_cute_dsl_cache"
-            )
-    return get_jit_cache(
-        name,
-        cache_dir=cache_dir,
-        source_paths=(Path(__file__).resolve().parent,),
-        enable_tvm_ffi=True,
-    )
 
 
 def _parse_arch_str(arch_str):
@@ -1845,11 +1824,9 @@ def _flash_attn_fwd(
     return out, lse
 
 
-_flash_attn_fwd.compile_cache = _get_flash_attn_jit_cache("fwd")
-_flash_attn_fwd.compile_cache_shear_bias = _get_flash_attn_jit_cache(
-    "fwd_shear_bias"
-)
-_flash_attn_fwd.compile_cache_prepare_shear_bias = _get_flash_attn_jit_cache(
+_flash_attn_fwd.compile_cache = get_flash_attn_jit_cache("fwd")
+_flash_attn_fwd.compile_cache_shear_bias = get_flash_attn_jit_cache("fwd_shear_bias")
+_flash_attn_fwd.compile_cache_prepare_shear_bias = get_flash_attn_jit_cache(
     "fwd_prepare_shear_bias"
 )
 
@@ -2517,7 +2494,7 @@ def _flash_attn_fwd_combine(
         )
 
 
-_flash_attn_fwd_combine.compile_cache = _get_flash_attn_jit_cache("fwd_combine")
+_flash_attn_fwd_combine.compile_cache = get_flash_attn_jit_cache("fwd_combine")
 
 
 def flash_attn_combine(

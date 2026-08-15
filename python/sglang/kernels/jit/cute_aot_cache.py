@@ -1,3 +1,4 @@
+# Manage Ahead-of-Time (AOT) compiled kernels
 """In-memory and persistent caches for CuTe DSL JIT functions.
 
 Set ``SGLANG_CUTE_AOT_CACHE_DIR`` to a trusted persistent directory to share
@@ -34,19 +35,12 @@ def _normalize_disk_key(value: Any) -> Any:
         return ("torch.device", value.type)
     if isinstance(value, tuple):
         return tuple(_normalize_disk_key(item) for item in value)
-    if isinstance(value, list):
-        return [_normalize_disk_key(item) for item in value]
-    if isinstance(value, dict):
-        return {
-            key: _normalize_disk_key(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-        }
     return value
 
 
 @lru_cache(maxsize=None)
 def _compute_source_fingerprint(
-    source_paths: tuple[str, ...], enable_tvm_ffi: bool
+    source_paths: tuple[str, ...], enable_tvm_ffi: bool, target_arch: str
 ) -> str:
     """
     Hash all CuTe Python sources plus runtime ABI stamps into a short fingerprint.
@@ -64,7 +58,7 @@ def _compute_source_fingerprint(
     h.update(f"cutlass={cutlass.__version__}".encode())
     h.update(f"cuda={getattr(cutlass, 'CUDA_VERSION', 'unknown')}".encode())
     h.update(f"tvm_ffi={enable_tvm_ffi}".encode())
-    h.update(f"arch={os.getenv('CUTE_DSL_ARCH')}".encode())
+    h.update(f"arch={target_arch}".encode())
     if enable_tvm_ffi:
         import tvm_ffi
 
@@ -91,9 +85,22 @@ def _compute_source_fingerprint(
     return h.hexdigest()
 
 
+def _resolve_target_arch() -> str:
+    if target_arch := os.getenv("CUTE_DSL_ARCH"):
+        return target_arch
+
+    import torch
+
+    major, minor = torch.cuda.get_device_capability()
+    return f"sm_{major}{minor}"
+
+
+# Pre-load cute DSL runtime libraries with RTLD_GLOBAL so that their symbols
+# (e.g. _cudaLibraryLoadData) are visible to .so modules loaded later via dlopen.
+# Upstream cute.runtime.load_module loads these without RTLD_GLOBAL, which causes
+# "undefined symbol" errors when loading cached kernels from disk.
 @lru_cache(maxsize=2)
 def _preload_runtime_libraries(enable_tvm_ffi: bool) -> None:
-    """Make CuTe runtime symbols visible to cached objects loaded by dlopen."""
     import cutlass.cute as cute
 
     for raw_path in cute.runtime.find_runtime_libraries(enable_tvm_ffi=enable_tvm_ffi):
@@ -105,7 +112,7 @@ def _preload_runtime_libraries(enable_tvm_ffi: bool) -> None:
 
 
 def _load_object(
-    object_path: Path, function_prefix: str, *, enable_tvm_ffi: bool
+    object_path: Path, function_prefix: str, enable_tvm_ffi: bool
 ) -> CallableFunction:
     import cutlass.cute as cute
 
@@ -206,11 +213,6 @@ class JITCache:
     def __contains__(self, key: CompileKeyType) -> bool:
         return key in self.cache
 
-    def get(
-        self, key: CompileKeyType, default: CallableFunction | None = None
-    ) -> CallableFunction | None:
-        return self[key] if key in self else default
-
     def clear(self) -> None:
         """
         Clear in-memory cache of compiled functions
@@ -220,9 +222,10 @@ class JITCache:
 
 class JITPersistentCache(JITCache):
     """
-    In-memory cache for compiled functions backed by persistent storage.
+    In-memory cache for compiled functions, which is also backed by persistent storage.
     """
 
+    EXPORT_FUNCTION_PREFIX = "func"
     LOCK_TIMEOUT_SECONDS = 15
 
     def __init__(self, cache_path: Path, *, enable_tvm_ffi: bool = True):
@@ -262,13 +265,20 @@ class JITPersistentCache(JITCache):
             label=sha256_hex,
         ):
             if obj_path.exists():
-                logger.info("Loading compiled function from disk: %s", obj_path)
-                prefix = self._function_prefix(sha256_hex)
-                fn = _load_object(obj_path, prefix, enable_tvm_ffi=self.enable_tvm_ffi)
-                JITCache.__setitem__(self, key, fn)
-                return True
+                logger.debug("Loading compiled function from disk: %s", obj_path)
+                try:
+                    fn = _load_object(
+                        obj_path, self.EXPORT_FUNCTION_PREFIX, self.enable_tvm_ffi
+                    )
+                except Exception as error:
+                    logger.warning("Invalid cache object %s: %s", obj_path, error)
+                    # The shared lock excludes writers, so this is the failed object.
+                    obj_path.unlink(missing_ok=True)
+                else:
+                    JITCache.__setitem__(self, key, fn)
+                    return True
             else:
-                logger.info("Cache miss on disk for key hash %s", sha256_hex)
+                logger.debug("Cache miss on disk for key hash %s", sha256_hex)
         return False
 
     def _try_export_to_storage(self, key: CompileKeyType, fn: CallableFunction) -> None:
@@ -283,22 +293,30 @@ class JITPersistentCache(JITCache):
             obj_path = self.cache_path / f"{sha256_hex}.o"
             if obj_path.exists():
                 # Another process already exported.
-                logger.info("Skipping export, already on disk: %s", obj_path)
+                logger.debug("Skipping export, already on disk: %s", obj_path)
                 return
-            logger.info("Exporting compiled function to disk: %s", obj_path)
-            prefix = self._function_prefix(sha256_hex)
-            if self.enable_tvm_ffi:
-                fn.export_to_c(
-                    object_file_path=str(obj_path),
-                    function_name=prefix,
-                )
-            else:
-                fn.export_to_c(
-                    str(self.cache_path),
-                    sha256_hex,
-                    function_prefix=prefix,
-                )
-            logger.info("Successfully exported compiled function to disk: %s", obj_path)
+            logger.debug("Exporting compiled function to disk: %s", obj_path)
+            temp_key = f".{sha256_hex}.tmp"
+            temp_obj_path = self.cache_path / f"{temp_key}.o"
+            temp_obj_path.unlink(missing_ok=True)
+            try:
+                if self.enable_tvm_ffi:
+                    fn.export_to_c(
+                        object_file_path=str(temp_obj_path),
+                        function_name=self.EXPORT_FUNCTION_PREFIX,
+                    )
+                else:
+                    fn.export_to_c(
+                        str(self.cache_path),
+                        temp_key,
+                        function_prefix=self.EXPORT_FUNCTION_PREFIX,
+                    )
+                os.replace(temp_obj_path, obj_path)
+            finally:
+                temp_obj_path.unlink(missing_ok=True)
+            logger.debug(
+                "Successfully exported compiled function to disk: %s", obj_path
+            )
 
     def _key_to_hash(self, key: CompileKeyType) -> str:
         disk_key = (self.enable_tvm_ffi, _normalize_disk_key(key))
@@ -307,15 +325,11 @@ class JITPersistentCache(JITCache):
     def _lock_path(self, sha256_hex: str) -> Path:
         return self.cache_path / f"{sha256_hex}.lock"
 
-    @staticmethod
-    def _function_prefix(sha256_hex: str) -> str:
-        return f"sglang_cute_{sha256_hex[:20]}"
-
     def clear(self) -> None:
         """
         Not only clear the in-memory cache. Also purge persistent compilation cache.
         """
-        logger.info("Clearing persistent cache at %s", self.cache_path)
+        logger.debug("Clearing persistent cache at %s", self.cache_path)
         super().clear()
         for child in self.cache_path.iterdir():
             child.unlink()
@@ -341,12 +355,12 @@ def get_jit_cache(
             str(Path(path).resolve()) for path in source_paths
         )
         path = Path(cache_dir).expanduser() / _compute_source_fingerprint(
-            paths, enable_tvm_ffi
+            paths, enable_tvm_ffi, _resolve_target_arch()
         )
         if name:
             path = path / name
-        logger.info("Creating persistent JIT cache at %s", path)
+        logger.debug("Creating persistent JIT cache at %s", path)
         return JITPersistentCache(path, enable_tvm_ffi=enable_tvm_ffi)
     else:
-        logger.info("Persistent cache disabled, using in-memory JIT cache")
+        logger.debug("Persistent cache disabled, using in-memory JIT cache")
         return JITCache()
