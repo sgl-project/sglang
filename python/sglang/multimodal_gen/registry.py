@@ -78,6 +78,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.magi2 import Magi2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
     MOVA720PConfig,
@@ -151,6 +152,7 @@ from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX23HQSamplingParams,
     LTX23SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.magi2 import Magi2SamplingParams
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
@@ -304,6 +306,8 @@ _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
     "minimax/minimax-h3": "MiniMaxH3Pipeline",
+    "sand-ai/magi-2-preview": "Magi2Pipeline",
+    "magi-2-preview": "Magi2Pipeline",
     "lerobot/pi05": "Pi05Pipeline",
     "pi05": "Pi05Pipeline",
     "pi0.5": "Pi05Pipeline",
@@ -863,6 +867,21 @@ def _register_configs():
         model_detectors=[
             lambda model_id: "minimaxh3"
             in model_id.lower().replace("-", "").replace("_", "")
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Magi2SamplingParams,
+        pipeline_config_cls=Magi2PipelineConfig,
+        hf_model_paths=[
+            "sand-ai/MAGI-2-preview",
+        ],
+        # Local snapshots are the normal case for a 280GB checkpoint, so the
+        # detector matches the directory name as well as the hub id. Kept
+        # specific: a bare "magi2" is matched as a substring of the whole path
+        # and would hijack any unrelated model served from a magi2-* directory.
+        model_detectors=[
+            lambda model_id: "magi-2-preview" in model_id.lower()
+            or "magi2-preview" in model_id.lower()
         ],
     )
     # FLUX

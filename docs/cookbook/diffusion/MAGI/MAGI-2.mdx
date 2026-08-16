@@ -1,0 +1,347 @@
+---
+title: MAGI-2-preview
+description: Run native MAGI-2-preview joint audio-video generation with SGLang Diffusion.
+metatags:
+    description: "Serve MAGI-2-preview with SGLang Diffusion for text-to-video-and-audio and image+text-to-video-and-audio, with expert parallelism over its multi-head MoE DiT and a two-stage 1080p refiner."
+---
+
+## 1. Model introduction
+
+[MAGI-2-preview](https://huggingface.co/sand-ai/MAGI-2-preview) is a 114B-parameter
+mixture-of-experts diffusion model from SandAI that generates a video and its
+synchronized stereo soundtrack in one denoising trajectory. Roughly 6B parameters
+are active per token, so serving cost tracks the active path far more closely than
+the 114B total.
+
+Generation is text-to-video-and-audio, or image-plus-text-to-video-and-audio
+(TI2V) when a conditioning image is supplied. Audio is not a second pass over a
+finished video: the video and audio latents share one packed sequence and one
+denoise loop.
+
+One root checkpoint holds two DiT partitions, which SGLang loads as separate
+components rather than as separate model IDs:
+
+| Partition | Layers | Hidden | Attention | MLP |
+| --- | ---: | ---: | --- | --- |
+| Preview DiT | 40 | 3072 | 24 heads with attention sinks, 4-stream hyper-connections | 12-head MoE over 256 experts, top-6 |
+| Refiner DiT | 30 | 4096 | 32 heads, GQA with 8 query groups, block-window local attention in every layer | Dense |
+
+Use the root model ID `sand-ai/MAGI-2-preview`. SGLang owns the mapping from that
+root to the preview weights, refiner weights, video VAE, distilled turbo decoder,
+and audio VAE. Do not point `--model-path` at a manually downloaded
+subdirectory.
+
+### Quality tiers
+
+| Tier | Delivered geometry | Delivered rate | Passes |
+| --- | --- | ---: | --- |
+| Preview only | 896x512 | 12.5 fps | Preview DiT |
+| Two-stage 1080p (default) | 1920x1088 | 25 fps | Preview DiT, then refiner |
+
+Both tiers produce a 10-second clip with joint stereo audio at 44100 Hz. The
+default two-stage tier delivers 249 frames: the preview pass generates at
+896x512, and the refiner upsamples to 1920x1088 while halving the temporal VAE
+stride, which doubles the delivered frame rate.
+
+The output canvas is 1088 tall rather than 1080 because the VAE stride forces
+every spatial dimension to a multiple of 16. Only the two resolutions above are
+accepted; any other `width`/`height` pair is rejected before denoising.
+
+<Warning>
+Review the license and usage terms on the MAGI-2-preview model card before
+production or commercial use. SGLang support does not grant additional model
+usage rights.
+</Warning>
+
+## 2. Installation
+
+Install SGLang with the diffusion dependencies:
+
+```bash Command
+uv pip install "sglang[diffusion]" --prerelease=allow
+```
+
+For platform-specific setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+
+## 3. Parallelism
+
+MAGI-2 layers two parallel decompositions over the same ranks. Ulysses sequence
+parallelism spans every rank and shards the packed sequence, and expert
+parallelism shares those same ranks to split the preview MoE by head. There is
+no separate expert-parallel process group to size independently.
+
+`--num-gpus` must divide every head axis in the model, because a rank owns whole
+heads on all of them. All four are checked at launch rather than deep inside a
+collective:
+
+| Axis | Count |
+| --- | ---: |
+| Preview attention heads | 24 |
+| Preview MoE heads (also the expert-parallel degree) | 12 |
+| Refiner attention heads | 32 |
+| Refiner key/value heads (GQA) | 8 |
+
+Divisibility alone does not make a count usable, because expert parallelism is also
+what makes the weights fit. The preview partition is 113.9B parameters — 228 GB in
+BF16 — and only its expert tensors shard; the 6.7B refiner is replicated on every
+rank. Measured on 143 GB H20Z cards, preview tier, 20 steps:
+
+| GPUs | Result |
+| ---: | --- |
+| 4 | **works**, 124s for 20 preview steps |
+| 2 | out of memory during denoise, 132 GiB resident |
+| 1 | out of memory during load |
+
+**Use 4 GPUs.** 2 divides every head axis and still fails: weights alone come to
+~132 GiB of a 139.8 GiB usable card, which leaves nothing for activations. Counts
+above 4 (6 and 12, preview-only) satisfy the head axes but were not measured here.
+
+<Warning>
+6 and 12 GPUs work for preview-only but fail the refiner's 8 key/value heads.
+
+8 GPUs divides every Ulysses axis but not the preview's 12 MoE heads. The
+reference implementation handles that by padding the head axis to 16 and giving
+the two spare ranks zero-weight experts whose output is discarded; SGLang does
+not implement that padding and rejects the configuration at startup instead. If
+you need 8-way parallelism, run the preview and refiner as separate deployments.
+</Warning>
+
+The denoise loop runs both CFG branches itself, so SGLang must not also split CFG
+across ranks. Passing `--enable-cfg-parallel` is rejected rather than silently
+double-applied.
+
+Tensor parallelism is rejected too. No layer in either DiT is column- or
+row-parallel, so `--tp-size` shards nothing and only takes ranks away from
+Ulysses. Measured at 896x512, 20 steps on 4x H20Z:
+
+| Configuration | Time | Per-rank memory |
+| --- | ---: | ---: |
+| `--ulysses-degree 4` | **124s** | 85 GB |
+| `--tp-size 2 --ulysses-degree 2` | 206s | 120-133 GB |
+| `--tp-size 4 --ulysses-degree 1` | 608s | 135 GB |
+
+Slower *and* larger, so put the whole degree in `--ulysses-degree`.
+
+## 4. Serve MAGI-2-preview
+
+The recommended four-card launch. Ulysses spans all four ranks, and expert
+parallelism defaults to that same world size:
+
+```bash 4 GPUs recommended
+sglang serve \
+  --model-path sand-ai/MAGI-2-preview \
+  --num-gpus 4 \
+  --ulysses-degree 4 \
+  --performance-mode speed \
+  --port 30010
+```
+
+`--performance-mode speed` keeps components GPU-resident for lowest latency.
+Use it only after confirming the workload fits; see the offload section below
+when it does not.
+
+Both DiTs use attention sinks and a packed variable-length attention path that
+are implemented only on the FlashAttention backend. Sink logits are silently
+dropped on any other backend, so MAGI-2 restricts itself to FlashAttention and
+does not accept `--attention-backend sage_attn`.
+
+The first launch downloads the checkpoint. If the repository requires
+authentication, export a Hugging Face token in the server environment.
+
+## 5. Generate video and audio
+
+<Tabs>
+
+<Tab title="T2VA">
+
+Text only. The defaults already describe the two-stage 1080p tier, so a minimal
+request changes nothing but the prompt and seed.
+
+Pass long prompts inline with `--prompt`. Do not use `--prompt-file-path` or
+`--prompt-path` for a single long caption: both read a file and split it into one
+request per non-empty line, which turns a wrapped paragraph into many unrelated
+short prompts.
+
+```bash Command
+sglang generate \
+  --model-path sand-ai/MAGI-2-preview \
+  --num-gpus 4 \
+  --ulysses-degree 4 \
+  --performance-mode speed \
+  --prompt "A cellist tunes up alone in a wood-panelled rehearsal room at dusk, then draws one long low note; dust turns in the last of the window light and the room's natural reverb settles around the sound." \
+  --seed 1101 \
+  --save-output
+```
+
+</Tab>
+
+<Tab title="TI2V">
+
+Supply a conditioning image with `--image-path`. Prefer it over the shorter
+spellings: `--image-path` and its `--image-paths` alias are the flags that
+actually feed image-to-video conditioning, and several other flags begin with
+`--image`.
+
+MAGI-2 VAE-encodes the original conditioning image rather than a resized and
+centre-cropped copy, so the generic TI2V preprocessing path is deliberately
+skipped.
+
+```bash Command
+sglang generate \
+  --model-path sand-ai/MAGI-2-preview \
+  --num-gpus 4 \
+  --ulysses-degree 4 \
+  --performance-mode speed \
+  --prompt "The camera pushes in slowly on the supplied frame as steam rises from the cup and quiet kitchen sounds settle in." \
+  --image-path "<YOUR-IMAGE-PATH>" \
+  --seed 2101 \
+  --save-output
+```
+
+</Tab>
+
+<Tab title="Preview-only tier">
+
+Request the preview geometry to skip the refiner entirely. A request delivered
+at the preview size leaves the refiner nothing to do, so the second pass is
+skipped even when its weights are loaded:
+
+```bash Command
+sglang generate \
+  --model-path sand-ai/MAGI-2-preview \
+  --num-gpus 4 \
+  --ulysses-degree 4 \
+  --performance-mode speed \
+  --width 896 \
+  --height 512 \
+  --prompt "Rain moves across a quiet street at night while a single neon sign buzzes overhead." \
+  --seed 3101 \
+  --save-output
+```
+
+<Note>
+`--fps` is validated as an integer, so the preview tier's 12.5 fps delivered
+rate cannot be named exactly on the command line. Leave `--num-frames` and
+`--fps` at their defaults and select the tier through `--width`/`--height`
+alone.
+</Note>
+
+</Tab>
+
+</Tabs>
+
+To skip loading the refiner weights altogether rather than skipping the pass,
+turn the refiner off in the pipeline configuration. There is no CLI flag for it;
+see the configuration notes below.
+
+## 6. Offload
+
+The preview DiT's expert weights are the memory driver. There are 256 experts
+per head across 12 heads in each of 36 MoE layers, and they dominate resident
+footprint even though only 6 experts per head are active for a given token. When
+a topology cannot hold them, offload the DiT rather than shrinking the topology.
+
+```bash 4 GPUs with DiT layerwise offload
+sglang serve \
+  --model-path sand-ai/MAGI-2-preview \
+  --num-gpus 4 \
+  --ulysses-degree 4 \
+  --performance-mode memory \
+  --dit-layerwise-offload \
+  --dit-offload-prefetch-size 1 \
+  --port 30010
+```
+
+`--dit-layerwise-offload` streams DiT blocks with asynchronous host-to-device
+prefetch overlap and selects only the DiT layerwise group. Raise
+`--dit-layerwise-resident-layers` to pin leading blocks on GPU across denoise
+steps when VRAM allows; resident layers are transferred once instead of being
+re-streamed every step, which trades memory for latency more efficiently than
+raising the prefetch size.
+
+For coarser placement, `--cpu-offload-components` selects whole components, for
+example `--cpu-offload-components dit text_encoder`. The video VAE, turbo
+decoder, and audio VAE are kept resident by MAGI-2's deployment configuration.
+
+The Qwen3.5 text encoder is 52 GiB and stays on the host regardless of these
+flags, and its forward runs there too. Staging it onto a card costs 42-84 s for a
+3 s GPU forward against 24 s on the CPU, and the transfer spikes 52 GiB on top of
+the resident DiTs, which is enough to fail the second request of a run. Only one
+rank encodes; the embedding is broadcast to the others.
+
+<Warning>
+Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` when running the
+two-stage 1080p tier. Both DiTs stay resident through decode, and the 1080p
+window decode requests a single ~9 GiB block; without expandable segments that
+allocation fails on fragmentation while tens of GiB sit reserved but unallocated.
+</Warning>
+
+<Warning>
+DiT layerwise offload and cache-dit are mutually exclusive. With
+`SGLANG_CACHE_DIT_ENABLED` set and DiT selected for layerwise offload, SGLang
+raises rather than running: cache-dit may reuse a skipped block whose weights
+layerwise offload has already released, which surfaces as a shape mismatch.
+Disable `--dit-layerwise-offload`, remove `dit` from
+`--layerwise-offload-components`, or unset `SGLANG_CACHE_DIT_ENABLED`. DiT
+layerwise offload also disables FSDP inference, with a warning rather than an
+error.
+</Warning>
+
+## 7. Configuration notes
+
+- Only 1920x1088 and 896x512 are accepted. The tier is selected by the
+  requested geometry, not by a separate flag.
+- The clip length is fixed at 10 seconds. `num_frames` and `fps` must agree with
+  that duration to within one frame, which is why the default is 249 frames at
+  25 fps rather than a round 250.
+- 249 is `(63 - 1) * 4 + 1`. The refiner latent has 63 frames and the turbo
+  decoder is causal, so the first latent yields one frame and each later one
+  yields four.
+- Video and audio carry separate guidance scales, and the refiner carries its own
+  pair. The request defaults are 5.0 and 7.0 for the preview pass, and 2.0 and
+  5.0 for the refiner. These are request fields, not CLI flags;
+  `--guidance-scale` sets the video scale only.
+- `--num-inference-steps` defaults to 100 for the preview pass. Neither DiT is
+  step-distilled, so this dominates wall-clock time. The refiner runs 5 steps.
+- The refiner, the expert-parallel degree, and the distilled turbo decoder are
+  pipeline-configuration fields (`enable_refiner`, `ep_size`, `use_turbo_vae`)
+  with no dedicated CLI flags. Turning off `use_turbo_vae` falls back to the
+  video VAE decode path and is a configuration-only change.
+- Audio is delivered as stereo at 44100 Hz. The audio VAE decodes at 51200 Hz
+  and is resampled for the container.
+- The text encoder is a Qwen3.5 hybrid backbone loaded through transformers.
+  Prompts are treated as long structured captions and are padded rather than
+  truncated, so a long caption is not silently cut.
+- Do not enable CFG parallelism. `--enable-cfg-parallel` is rejected because the
+  denoise loop already runs both branches itself.
+
+## 8. Performance
+
+MAGI-2's cost is dominated by expert-weight movement and by the packed joint
+audio-video sequence, both of which depend heavily on GPU model, interconnect,
+offload policy, and the selected quality tier. Benchmark your own topology before
+sizing a deployment; the figures below are one data point, not a target.
+
+Measured on four H20Z (139 GiB each), two-stage 1080p tier, 100 preview steps
+plus 5 refiner steps, one 10-second clip, `--ulysses-degree 4`:
+
+| Phase | Time |
+| --- | --- |
+| Text encoding | 17.6 s |
+| Preview denoise (100 steps) | 452.8 s |
+| Preview-to-refiner handoff | &lt;0.1 s |
+| Refiner denoise (5 steps) | 101.6 s |
+| Decode (video and audio) | 15.5 s |
+| **Total** | **592 s** |
+
+Weight loading is separate and paid once per process: roughly 5 minutes for both
+DiTs, the expert tensors dominating.
+
+Text encoding is the first clip of a batch, so it is cold. The encoder runs on the
+host and its weights are memory-mapped from storage, so later clips in the same
+process take 9 s rather than 17 s. Longer prompts cost more: a 1900-token caption
+takes about 24 s against 9 s for a one-line prompt.
+
+The preview pass at 4.5 s/step dominates everything else, so step count is the
+first knob to reach for when trading quality against latency. The refiner is
+5 steps against the preview's 100 and is not worth tuning first.
