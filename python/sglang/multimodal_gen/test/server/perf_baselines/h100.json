@@ -2118,7 +2118,7 @@
                 "Hunyuan3DShapeSaveStage": 684.0,
                 "Hunyuan3DPaintPreprocessStage": 256020.36,
                 "Hunyuan3DPaintTexGenStage": 23764.05,
-                "Hunyuan3DPaintPostprocessStage": 7095.01
+                "Hunyuan3DPaintPostprocessStage": 11500.0
             },
             "denoise_step_ms": {
                 "0": 131.29,
