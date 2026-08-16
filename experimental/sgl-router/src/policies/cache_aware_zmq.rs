@@ -138,7 +138,7 @@ pub struct CacheAwareZmqPolicy {
     tokenizers: Arc<TokenizerRegistry>,
     /// Worker-sourced block size, shared with the `KvEventIndex` that
     /// seeds it on worker registration. Read once per request; if
-    /// `None` (no worker has reported a `page_size` yet) the policy
+    /// `None` (no worker has reported a block size yet) the policy
     /// degrades to min-load — the router cannot hash a prompt without
     /// a block size that matches what the worker publishes.
     block_size_oracle: Arc<BlockSizeOracle>,

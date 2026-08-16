@@ -317,7 +317,8 @@ pub struct KvEventIndex {
     /// may legitimately have a fresh publisher whose sequence numbers
     /// restart from 1.
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
-    /// Worker-sourced `page_size` shared with the cache-aware-zmq policy.
+    /// Worker-sourced publish block size (`page_size * dcp_size`), shared
+    /// with the cache-aware-zmq policy.
     /// `add_worker` calls `try_set(cfg.block_size)` so the first worker
     /// establishes the value; subsequent workers that disagree are
     /// rejected (logged + not subscribed). The policy reads it at routing
@@ -1155,7 +1156,7 @@ impl KvEventIndex {
                 }
             },
         };
-        // Reconcile this worker's `page_size` with the oracle BEFORE
+        // Reconcile this worker's publish block size with the oracle BEFORE
         // any subscriber state is created. The first worker establishes
         // the value; later workers must agree. A mismatch means the
         // router and at least one engine would compute different block
@@ -1166,9 +1167,10 @@ impl KvEventIndex {
                 worker_url = %worker_url,
                 established_block_size = err.established,
                 worker_block_size = err.candidate,
-                "kv-events: worker page_size disagrees with established block_size; \
-                 skipping worker — cache-aware routing requires every worker to publish \
-                 at the same block size",
+                "kv-events: worker block size (page_size * dcp_size) disagrees with the \
+                 established block_size; skipping worker — cache-aware routing requires \
+                 every worker to publish at the same block size. Check --page-size and \
+                 --dcp-size on this worker; the discovery log line for it reports both",
             );
             return;
         }
@@ -1835,8 +1837,9 @@ fn spawn_mode_recheck(
                     worker_url = %url,
                     established_block_size = established,
                     worker_block_size = cfg.block_size,
-                    "kv-events: restarted worker's page_size disagrees with the fleet; its \
-                     entries will never match queries — re-register it at the fleet page size",
+                    "kv-events: restarted worker's block size (page_size * dcp_size) disagrees \
+                     with the fleet; its entries will never match queries — restart it with \
+                     --page-size / --dcp-size matching the fleet",
                 );
             }
         }
@@ -5164,6 +5167,54 @@ mod tests {
             index.block_size_oracle().hash_config(),
             None,
             "a rejected worker must not vote in the fleet hashing mode",
+        );
+        index.shutdown().await;
+    }
+
+    /// A rolling DCP rollout is the realistic way two *healthy* workers behind
+    /// one model come to report different block sizes — before the widening
+    /// they all reported `page_size` and agreed. Whichever registers first
+    /// latches the oracle; the other half of the fleet is then excluded from
+    /// the index entirely, with no subscriber and no hashing-mode vote. Both
+    /// sides are derived through `kv_event_block_size` so this breaks if the
+    /// derivation changes.
+    #[tokio::test]
+    async fn add_worker_rejects_dcp_worker_joining_a_non_dcp_fleet() {
+        let index = KvEventIndex::new();
+        // dp_size=0 short-circuits before the subscriber spawn while still
+        // running the block-size validation, as in the test below.
+        let cfg = |port_base: u16, dcp_size: Option<u32>| EventConfig {
+            host: "127.0.0.1".into(),
+            port_base,
+            topic: String::new(),
+            load_port_base: None,
+            block_size: crate::policies::kv_events::kv_event_block_size(
+                64,
+                dcp_size,
+                "http://127.0.0.1",
+            )
+            .unwrap(),
+            dp_size: 0,
+            is_bigram: false,
+        };
+
+        index
+            .add_worker("http://127.0.0.1:30300", Some(cfg(30300, Some(1))))
+            .await;
+        assert_eq!(index.block_size_oracle().get(), Some(64));
+
+        index
+            .add_worker("http://127.0.0.1:30301", Some(cfg(30301, Some(8))))
+            .await;
+        assert_eq!(
+            index.block_size_oracle().get(),
+            Some(64),
+            "a DCP worker must not overwrite the latched fleet block size",
+        );
+        assert_eq!(
+            index.block_size_oracle().vote_of("http://127.0.0.1:30301"),
+            None,
+            "a rejected worker casts no hashing-mode vote",
         );
         index.shutdown().await;
     }

@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 /// Per-worker KV-event publisher configuration, resolved to something the
@@ -44,10 +44,12 @@ pub struct EventConfig {
     /// worker predates load publishing — the load subscriber is then skipped
     /// and selection falls back to the router-side in-flight counter.
     pub load_port_base: Option<u16>,
-    /// Worker-reported `page_size`. Callers MUST compare against their
-    /// own configured `block_size`; a mismatch produces silent
-    /// miscompute since [`super::hash::compute_block_hashes`] is keyed
-    /// on the caller's value, not on this one.
+    /// The size, in tokens, at which this worker actually publishes KV
+    /// blocks: the advertised `page_size` widened by `dcp_size` (see
+    /// `kv_event_block_size`). Callers MUST hash at this size; a
+    /// mismatch produces silent miscompute since
+    /// [`super::hash::compute_block_hashes`] is keyed on the caller's
+    /// value, not on this one.
     pub block_size: u32,
     /// Number of attention-DP ranks publishing. The gateway opens this
     /// many SUB connections (one per rank), skipping any rank whose
@@ -116,6 +118,13 @@ pub async fn fetch_event_config(
         }
     };
 
+    // The worker advertises its unwidened `page_size`; under DCP it publishes
+    // at `page_size * dcp_size`. Resolve the size the router must hash at.
+    // `None` means no sound value exists, so fail rather than subscribe at a
+    // block size that would silently match nothing.
+    let block_size = kv_event_block_size(block.block_size, body.dcp_size, worker_url)
+        .ok_or_else(|| anyhow!("cannot resolve a KV-event block size for {worker_url}"))?;
+
     // Wildcard bind hosts mean "any interface" on the worker side — the
     // gateway has to connect to a routable address, which it learns from
     // the worker URL.
@@ -133,7 +142,7 @@ pub async fn fetch_event_config(
         port_base: block.endpoint_port_base,
         topic: block.topic,
         load_port_base: block.load_endpoint_port_base,
-        block_size: block.block_size,
+        block_size,
         dp_size: block.dp_size,
         is_bigram,
     }))
@@ -209,6 +218,100 @@ struct ServerInfoResponse {
     /// token bigrams — see [`EventConfig::is_bigram`].
     #[serde(default)]
     speculative_algorithm: Option<String>,
+    /// Top-level `/server_info` field mirroring `ServerArgs.dcp_size`: the
+    /// decode context-parallel size. Absent on engines that predate the
+    /// field — see [`kv_event_block_size`].
+    ///
+    /// `/server_info` is `dataclasses.asdict(server_args)`, so this tracks the
+    /// dataclass *field* name, not the `--decode-context-parallel-size` CLI
+    /// alias. A Python-side rename would land here as `None` with no signal —
+    /// one more reason the wire-level cross-check in [`kv_event_block_size`]
+    /// is the durable check.
+    #[serde(default)]
+    dcp_size: Option<u32>,
+}
+
+/// The size, in tokens, at which a worker actually publishes KV blocks, or
+/// `None` when no sound value exists and the subscription must be skipped.
+///
+/// Event granularity is set by the worker's **radix tree** page size. Under
+/// decode context parallelism (`--dcp-size N`) the tree adopts the KV
+/// allocator's page verbatim, and SGLang's generic paged allocator pages at
+/// `page_size * N`; the tree then emits one block hash per widened page (the
+/// publisher coalesces runs of them into a single `BlockStored`). Meanwhile
+/// `/server_info` keeps advertising the *unwidened* `page_size` in its
+/// `kv_events` block, with `dcp_size` alongside it at the top level.
+///
+/// Hashing queries at the advertised `page_size` therefore produces hashes a
+/// DCP worker never stores: every cache-aware lookup misses and routing
+/// degrades to min-load.
+///
+/// **Nothing downstream catches that.** [`super::block_size_oracle`] only
+/// reconciles workers against *each other*, so a uniformly-DCP fleet agrees
+/// perfectly while every lookup misses; correctness rests entirely on this
+/// function matching the engine. The untapped check is the wire itself — every
+/// [`super::wire::BlockStored`] carries the publisher's own `block_size`, which
+/// the pump decodes and discards. Comparing it against the latched oracle value
+/// (`>` is proof of a mismatch; a trailing partial page is legitimately `<`)
+/// would make this whole class of failure loud without trusting anyone's
+/// reading of the engine.
+///
+/// `worker_url` is for logging only, mirroring [`classify_bigram`].
+pub(crate) fn kv_event_block_size(
+    advertised_page_size: u32,
+    dcp_size: Option<u32>,
+    worker_url: &str,
+) -> Option<u32> {
+    let dcp_size = match dcp_size {
+        // Absent on engines predating the field, which by construction ran no
+        // DCP. Silent: this is the ordinary non-DCP reading.
+        None => 1,
+        // Defensive only: `ServerArgs` defaults `dcp_size` to 1 and rejects
+        // anything below it, so no healthy SGLang emits this. Reaching it means
+        // the payload is not the contract we think it is — say so rather than
+        // quietly repairing it and proceeding on a reading just disproven.
+        Some(0) => {
+            warn!(
+                worker_url = worker_url,
+                "kv-events discovery: worker reported dcp_size=0, which no healthy \
+                 SGLang emits; assuming no DCP. If this worker is running DCP, its \
+                 cache-aware routing will silently never match",
+            );
+            1
+        }
+        Some(n) => n,
+    };
+
+    let Some(block_size) = advertised_page_size.checked_mul(dcp_size) else {
+        // Saturating would hand back a value that passes every downstream guard
+        // and then destroys prefix matching: `u32::MAX` latches the oracle
+        // fleet-wide, and `div_ceil(u32::MAX)` collapses any prompt to a single
+        // hash. There is no "closest representable" block size, only a corrupt
+        // one, so refuse the worker instead of fabricating it.
+        warn!(
+            worker_url = worker_url,
+            page_size = advertised_page_size,
+            dcp_size,
+            "kv-events discovery: page_size * dcp_size overflows u32; skipping this \
+             worker's KV subscription rather than routing on a corrupt block size",
+        );
+        return None;
+    };
+
+    if dcp_size > 1 {
+        // Logged here rather than at the call sites so both `EventConfig`
+        // builders inherit it, and at info! because the router's default level
+        // is info and a wrong block size is invisible in every metric.
+        info!(
+            worker_url = worker_url,
+            page_size = advertised_page_size,
+            dcp_size,
+            block_size,
+            "kv-events discovery: DCP worker publishes at the widened page size; \
+             hashing at page_size * dcp_size",
+        );
+    }
+    Some(block_size)
 }
 
 /// Whether a worker's `/server_info` `speculative_algorithm` means it hashes KV
@@ -371,6 +474,73 @@ mod tests {
                 "speculative_algorithm={algo:?} should map to is_bigram={expected}"
             );
         }
+    }
+
+    /// Under DCP the worker publishes at `page_size * dcp_size`, so discovery
+    /// must report the widened size. Hashing at the advertised `page_size`
+    /// would miss every block the worker actually stores.
+    #[tokio::test]
+    async fn fetch_widens_block_size_by_dcp_size() {
+        let body = Arc::new(json!({
+            "dcp_size": 8,
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "kv",
+                "block_size": 64,
+                "dp_size": 1,
+            }
+        }));
+        let (url, _shutdown) = spawn_fake_worker(body).await;
+        let got = fetch_event_config(&url, &client()).await.unwrap().unwrap();
+        assert_eq!(got.block_size, 512);
+    }
+
+    /// A worker that reports DCP disabled keeps the advertised page size
+    /// verbatim. (`dcp_size` absent entirely is covered by
+    /// `fetch_returns_event_config_when_block_present`.)
+    #[tokio::test]
+    async fn fetch_keeps_page_size_when_dcp_disabled() {
+        let body = Arc::new(json!({
+            "dcp_size": 1,
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "kv",
+                "block_size": 64,
+                "dp_size": 1,
+            }
+        }));
+        let (url, _shutdown) = spawn_fake_worker(body).await;
+        let got = fetch_event_config(&url, &client()).await.unwrap().unwrap();
+        assert_eq!(got.block_size, 64);
+    }
+
+    #[test]
+    fn kv_event_block_size_widens_only_under_dcp() {
+        const URL: &str = "http://w1:30000";
+        assert_eq!(kv_event_block_size(64, Some(8), URL), Some(512));
+        assert_eq!(kv_event_block_size(64, Some(1), URL), Some(64));
+        assert_eq!(
+            kv_event_block_size(64, None, URL),
+            Some(64),
+            "an engine predating the dcp_size field is not running DCP"
+        );
+        assert_eq!(
+            kv_event_block_size(64, Some(0), URL),
+            Some(64),
+            "a reported 0 must not reach compute_block_hashes, which asserts \
+             block_size > 0 and would panic the selection hot path"
+        );
+        assert_eq!(
+            kv_event_block_size(u32::MAX, Some(2), URL),
+            None,
+            "overflow must refuse the worker, not saturate: u32::MAX passes the \
+             oracle and every downstream guard, then collapses any prompt to a \
+             single hash via div_ceil"
+        );
     }
 
     /// Worker reports a specific bind host (not wildcard): gateway must

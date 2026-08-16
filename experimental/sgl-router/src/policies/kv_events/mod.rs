@@ -32,6 +32,7 @@ pub use bootstrap::{
     WireWorker,
 };
 pub(crate) use discovery::classify_bigram;
+pub(crate) use discovery::kv_event_block_size;
 pub use discovery::{fetch_event_config, EventConfig};
 pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64};
 pub use index::KvEventIndex;

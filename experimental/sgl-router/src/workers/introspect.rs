@@ -25,7 +25,7 @@ use serde::Deserialize;
 use tracing::warn;
 use url::Url;
 
-use crate::policies::kv_events::EventConfig;
+use crate::policies::kv_events::{kv_event_block_size, EventConfig};
 
 /// Default timeout for `/server_info`. Conservative for a small JSON
 /// payload served by SGLang's HTTP server.
@@ -142,7 +142,7 @@ impl WorkerIntrospector {
         );
         let event_config = parsed
             .kv_events
-            .map(|block| resolve_event_config(block, worker_url, is_bigram));
+            .and_then(|block| resolve_event_config(block, worker_url, is_bigram, parsed.dcp_size));
 
         let disaggregation_role = resolve_disaggregation_role(
             parsed.disaggregation_mode.as_deref(),
@@ -296,17 +296,29 @@ impl Default for WorkerIntrospector {
     }
 }
 
+/// Resolve a worker's advertised `kv_events` block into a dialable
+/// [`EventConfig`]: substitute wildcard bind hosts, and widen the advertised
+/// `page_size` by `dcp_size` into the size the worker actually publishes at.
+/// `None` when no sound block size exists, in which case the worker registers
+/// without a KV subscription rather than with one that matches nothing.
+///
 /// Substitute a wildcard bind host (`*`, `0.0.0.0`, `::`, `[::]`) with
 /// the host parsed from the worker URL — the gateway has to connect to
 /// a routable address.  An unparsable worker URL leaves the host
 /// unchanged: the subsequent ZMQ connect will fail visibly with the
 /// wildcard literal, which is the same observable failure mode that
 /// would occur today if the bind/connect were skipped.
+///
+/// `dcp_size` is the worker's top-level `/server_info` field; see
+/// [`kv_event_block_size`], which also logs the widening for both this path
+/// and `kv_events::discovery`.
 pub(crate) fn resolve_event_config(
     block: KvEventsBlock,
     worker_url: &str,
     is_bigram: bool,
-) -> EventConfig {
+    dcp_size: Option<u32>,
+) -> Option<EventConfig> {
+    let block_size = kv_event_block_size(block.block_size, dcp_size, worker_url)?;
     let host = if matches!(
         block.endpoint_host.as_str(),
         "*" | "0.0.0.0" | "::" | "[::]"
@@ -327,15 +339,15 @@ pub(crate) fn resolve_event_config(
     } else {
         block.endpoint_host
     };
-    EventConfig {
+    Some(EventConfig {
         host,
         port_base: block.endpoint_port_base,
         topic: block.topic,
         load_port_base: block.load_endpoint_port_base,
-        block_size: block.block_size,
+        block_size,
         dp_size: block.dp_size,
         is_bigram,
-    }
+    })
 }
 
 /// Projection of `/server_info` used by the introspector. Every field is
@@ -367,6 +379,11 @@ struct ServerInfoBody {
     /// versions that predate the flag.
     #[serde(default)]
     enable_http2: Option<bool>,
+    /// `ServerArgs.dcp_size` — the decode context-parallel size. Widens the
+    /// KV-event block size (see [`kv_event_block_size`]). Absent on older
+    /// SGLang versions that predate the field.
+    #[serde(default)]
+    dcp_size: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -590,6 +607,68 @@ mod tests {
         assert_eq!(cfg.dp_size, 2);
     }
 
+    /// The introspector is the second path that builds an `EventConfig` (the
+    /// first is `kv_events::discovery::fetch_event_config`); both must widen
+    /// the advertised page size by `dcp_size`, or a DCP worker registered
+    /// through this path hashes at a size it never publishes at.
+    #[tokio::test]
+    async fn introspect_widens_block_size_by_dcp_size() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "dcp_size": 8,
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "kv",
+                "block_size": 64,
+                "dp_size": 1,
+            }
+        }))
+        .await;
+        let got = fast_introspector().fetch(&url).await;
+        let cfg = got.event_config.expect("kv_events present");
+        assert_eq!(cfg.block_size, 512);
+    }
+
+    /// The structural guard behind the test above: one body fed to *both*
+    /// `EventConfig` builders must yield identical structs. A test per path
+    /// only proves both were patched this time; comparing them catches drift
+    /// in every field, and is the test that fails if a future change touches
+    /// only one of the two.
+    #[tokio::test]
+    async fn both_construction_paths_resolve_identical_event_configs() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "dcp_size": 4,
+            "speculative_algorithm": "EAGLE3",
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "kv",
+                "load_endpoint_port_base": 5559,
+                "block_size": 32,
+                "dp_size": 2,
+            }
+        }))
+        .await;
+
+        let via_introspect = fast_introspector()
+            .fetch(&url)
+            .await
+            .event_config
+            .expect("kv_events present");
+        let via_discovery =
+            crate::policies::kv_events::fetch_event_config(&url, &reqwest::Client::new())
+                .await
+                .unwrap()
+                .expect("kv_events present");
+
+        assert_eq!(via_introspect, via_discovery);
+        assert_eq!(via_discovery.block_size, 128, "page_size 32 * dcp_size 4");
+    }
+
     #[tokio::test]
     async fn fetch_substitutes_wildcard_host() {
         let (url, _shutdown) = spawn_fake_worker(json!({
@@ -662,7 +741,7 @@ mod tests {
         let got = fast_introspector().fetch(&url).await;
         assert!(
             got.served_model_name.is_none(),
-            "an unparseable body must register empty model_ids",
+            "an unparsable body must register empty model_ids",
         );
         assert_eq!(
             hits.load(Ordering::SeqCst),

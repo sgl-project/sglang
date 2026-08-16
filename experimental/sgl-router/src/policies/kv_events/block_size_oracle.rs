@@ -8,18 +8,30 @@
 //!
 //! `compute_block_hashes` must hash with the **same** block size the
 //! worker uses to publish KV-cache events; otherwise every cache-aware
-//! lookup misses silently. The worker advertises its `page_size` via
-//! `/server_info` (parsed into [`crate::policies::kv_events::EventConfig::block_size`]).
-//! Earlier versions of sgl-router carried a static `block_size` field on
-//! `CacheAwareConfig`; nothing reconciled it with the worker-reported
-//! value, so a mismatch silently destroyed cache-hit routing.
+//! lookup misses silently. Event granularity is set by the worker's radix
+//! tree page size: the worker advertises its `page_size` via `/server_info`
+//! and discovery widens it by `dcp_size` (the tree adopts the DCP-widened
+//! allocator page) into
+//! [`crate::policies::kv_events::EventConfig::block_size`] — see
+//! `kv_event_block_size`. Earlier versions of sgl-router carried a static
+//! `block_size` field on `CacheAwareConfig`; nothing reconciled it with the
+//! worker-reported value, so a mismatch silently destroyed cache-hit routing.
+//!
+//! # What this oracle does NOT catch
+//!
+//! It reconciles workers against **each other**, never against what a worker
+//! actually publishes. A fleet that is uniformly wrong — every worker
+//! reporting the same block size that the router derives incorrectly — agrees
+//! perfectly here while every lookup misses. Only worker-vs-worker divergence
+//! is detectable. Closing that hole needs the publisher's own `block_size`
+//! off the wire; see `kv_event_block_size`.
 //!
 //! # Single oracle vs per-model
 //!
 //! For now the oracle is process-wide. Realistic deployments use one
-//! `page_size` across the cluster, so a single value suffices and
-//! mismatches across models indicate misconfiguration the operator
-//! should see. A per-model oracle would require threading `ModelId`
+//! `page_size` *and* one `dcp_size` across the cluster, so a single block
+//! size suffices and mismatches across models indicate misconfiguration the
+//! operator should see. A per-model oracle would require threading `ModelId`
 //! through `KvEventIndex::add_worker`; that refactor can land later
 //! without changing the oracle's public surface.
 
