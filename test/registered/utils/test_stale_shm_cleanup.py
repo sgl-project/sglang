@@ -6,6 +6,7 @@ from multiprocessing import shared_memory
 from unittest.mock import patch
 
 from sglang.srt.utils.stale_shm_cleanup import (
+    _MAX_SHM_NAME_LEN,
     _creator_pid,
     cleanup_stale_shm,
     make_shm_name,
@@ -27,6 +28,24 @@ class TestMakeShmName(unittest.TestCase):
         a, b = make_shm_name("mm"), make_shm_name("mm")
         self.assertNotEqual(a, b)
         self.assertEqual(_creator_pid(a), os.getpid())
+
+    def test_long_kind_stays_within_platform_limit(self):
+        # Regression for #34800: "nodecheck" overflowed the 30-char macOS
+        # budget, and the resulting OSError silently deadlocked the group.
+        for kind in ("nodecheck", "n" * 200):
+            name = make_shm_name(kind)
+            self.assertLessEqual(len(name), _MAX_SHM_NAME_LEN, f"kind={kind!r}")
+            # Truncation must not break the cleanup sweep's pid parsing.
+            self.assertEqual(_creator_pid(name), os.getpid(), f"kind={kind!r}")
+
+    def test_long_kind_is_still_openable(self):
+        name = make_shm_name("nodecheck")
+        shm = shared_memory.SharedMemory(create=True, size=128, name=name)
+        try:
+            self.assertEqual(shm.name.lstrip("/"), name.lstrip("/"))
+        finally:
+            shm.close()
+            shm.unlink()
 
     def test_creator_pid_parsing(self):
         self.assertEqual(_creator_pid("sgl_shm_mq_1234_abcd1234"), 1234)
