@@ -6,8 +6,6 @@ from transformers import (
 )
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
-from transformers.utils.generic import is_flash_attention_requested
-from transformers.vision_utils import get_vision_cu_seqlens, get_vision_position_ids
 
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLConfig
 from sglang.multimodal_gen.runtime.distributed import (
@@ -31,6 +29,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
+    Qwen3VLVisionTransformer,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
@@ -58,7 +59,6 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLModelOutputWithPast,
     Qwen3VLTextRMSNorm,
     Qwen3VLTextRotaryEmbedding,
-    Qwen3VLVisionModel,
     apply_rotary_pos_emb,
 )
 
@@ -664,7 +664,7 @@ class Qwen3VLModel(nn.Module):
 
     def __init__(self, config, *, use_tensor_parallel: bool = False):
         super().__init__()
-        self.visual = Qwen3VLVisionModel._from_config(config.vision_config)
+        self.visual = Qwen3VLVisionTransformer(config.vision_config)
         self.language_model = Qwen3VLTextModel(
             config.text_config,
             use_tensor_parallel=use_tensor_parallel,
@@ -874,18 +874,7 @@ class Qwen3VLModel(nn.Module):
         pixel_values: torch.FloatTensor,
         grid_thw: Optional[torch.LongTensor],
     ):
-        pixel_values = pixel_values.type(self.visual.dtype)
-        vision_kwargs = {}
-        if grid_thw is not None and grid_thw.device.type == "cpu":
-            if not is_flash_attention_requested(self.visual.config):
-                vision_kwargs = {
-                    "position_ids": get_vision_position_ids(
-                        grid_thw, self.visual.spatial_merge_size
-                    ).to(pixel_values.device),
-                    "cu_seqlens": get_vision_cu_seqlens(grid_thw),
-                }
-            grid_thw = grid_thw.to(pixel_values.device)
-        visual_out = self.visual(pixel_values, grid_thw=grid_thw, **vision_kwargs)
+        visual_out = self.visual(pixel_values, grid_thw=grid_thw)
         return visual_out.pooler_output, visual_out.deepstack_features
 
     def get_image_features(
@@ -1161,6 +1150,7 @@ class Qwen3VLModel(nn.Module):
 
 
 class Qwen3VLForConditionalGeneration(TextEncoder):
+    layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
     default_bitsandbytes_target_modules = [
         ".gate_up_proj.",
         ".down_proj.",
