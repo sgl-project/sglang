@@ -1121,7 +1121,22 @@ class SWAComponent(TreeComponent):
             # freeing only the incoming full, then store the swa on the node.
             swa_value = self._translate_full_to_swa(action.incoming_full)
             alloc.set_full_to_swa_mapping(action.kept_full, swa_value)
-            alloc.full_to_swa_index_mapping[action.incoming_full.to(torch.int64)] = 0
+            # Tombstone the incoming full through the SAME method the line above
+            # uses, never the `full_to_swa_index_mapping` tensor directly. The
+            # unified-memory SWA allocator has no such tensor: it skips
+            # `SWATokenToKVPoolAllocator.__init__` on purpose (that init would
+            # allocate the static-partition sub-pools unified memory replaces),
+            # and its swa sub-pool's virtual->physical table IS the full->swa
+            # mapping, so there is nothing separate to keep in sync. Reaching
+            # for the raw tensor therefore raised AttributeError and killed the
+            # scheduler on every hybrid-SWA model running --enable-unified-memory
+            # with the radix cache. The method is the abstraction both allocators
+            # implement: it writes the tensor on the static allocator (identical
+            # to the assignment it replaces) and is a documented no-op on the
+            # unified one.
+            alloc.set_full_to_swa_mapping(
+                action.incoming_full, torch.zeros_like(action.incoming_full)
+            )
             alloc.full_attn_allocator.free(action.incoming_full)
             self.tree_core.set_component_device_value(
                 action.node_id, self.component_type, swa_value

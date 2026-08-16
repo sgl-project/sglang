@@ -5566,11 +5566,17 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         )
         # keep the locked full, remap it onto the incoming full's SWA translation
         alloc.translate_loc_from_full_to_swa.assert_called_once_with(incoming_full)
-        alloc.set_full_to_swa_mapping.assert_called_once_with(kept_full, swa_value)
-        # the incoming full's stale mapping is cleared, then its slot freed (full-only)
-        key, val = alloc.full_to_swa_index_mapping.__setitem__.call_args.args
-        self.assertTrue(torch.equal(key, incoming_full))
-        self.assertEqual(val, 0)
+        # BOTH mapping writes go through the allocator API — the unified SWA
+        # allocator has no `full_to_swa_index_mapping` tensor to index into.
+        self.assertEqual(alloc.set_full_to_swa_mapping.call_count, 2)
+        remap_args = alloc.set_full_to_swa_mapping.call_args_list[0].args
+        self.assertTrue(torch.equal(remap_args[0], kept_full))
+        self.assertIs(remap_args[1], swa_value)
+        # the incoming full's stale mapping is tombstoned, then its slot freed
+        tomb_full, tomb_swa = alloc.set_full_to_swa_mapping.call_args_list[1].args
+        self.assertTrue(torch.equal(tomb_full, incoming_full))
+        self.assertTrue(torch.equal(tomb_swa, torch.zeros_like(incoming_full)))
+        alloc.full_to_swa_index_mapping.__setitem__.assert_not_called()
         alloc.full_attn_allocator.free.assert_called_once_with(incoming_full)
         alloc.free.assert_not_called()
         cache.tree_core.set_component_device_value.assert_called_once_with(
