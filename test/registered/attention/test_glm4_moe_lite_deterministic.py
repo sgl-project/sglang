@@ -14,14 +14,13 @@ import unittest
 import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.gb300_utils import GB300_NCCL_PORT
 from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
     TestDeterministicBase,
 )
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
-register_cuda_ci(est_time=900, stage="nightly", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=900, stage="nightly", runner_config="4-gpu-b200")
 
 GLM_MODEL = "zai-org/GLM-4.7-Flash"
 
@@ -35,8 +34,6 @@ SERVER_ARGS = COMMON_SERVER_ARGS + [
     "2048",
     "--mem-fraction-static",
     "0.8",
-    "--nccl-port",
-    GB300_NCCL_PORT,
 ]
 
 
