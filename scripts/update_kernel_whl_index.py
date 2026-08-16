@@ -11,10 +11,10 @@ DEFAULT_CUDA_VERSION = "130"
 
 
 def check_wheel_cuda_version(path_name, target_cuda_version):
-    # Skip non-CUDA backend wheels (rocm, musa, xpu, ...). Their +<backend><ver>
-    # local-version tags or package names don't match the CUDA wheel regex below,
-    # and they are published by the dedicated release-rocm*/release-musa*/release-xpu jobs.
-    if re.search(r"\+(rocm|musa)", path_name) or "xpu" in path_name:
+    # Skip non-CUDA backend wheels. ROCm/MUSA encode the backend in the
+    # local-version tag (for example +rocm720), while XPU uses a dedicated
+    # package name (sglang_kernel_xpu-*).
+    if re.search(r"\+(rocm|musa)", path_name) or path_name.startswith("sglang_kernel_xpu-"):
         return False
 
     # For other CUDA versions, the wheel path name will contain the cuda version suffix, e.g. sglang_kernel-0.4.0+cu130-cp310-abi3-manylinux2014_x86_64.whl
@@ -48,19 +48,26 @@ def update_wheel_index(cuda_version=DEFAULT_CUDA_VERSION, rocm_version=None):
             f.write(f'<a href="{full_url}">{path.name}</a><br>\n')
 
 
-def _update_non_cuda_wheel_index(backend, version):
-    index_dir = pathlib.Path(f"sgl-whl/{backend}{version}/sglang-kernel")
+def _update_non_cuda_wheel_index(
+    backend,
+    version=None,
+    package_name="sglang_kernel",
+    index_package_name="sglang-kernel",
+):
+    backend_dir = f"{backend}{version or ''}"
+    index_dir = pathlib.Path(f"sgl-whl/{backend_dir}/{index_package_name}")
     index_dir.mkdir(exist_ok=True, parents=True)
     base_url = "https://github.com/sgl-project/whl/releases/download"
 
     for path in sorted(pathlib.Path("python/sglang/kernels/aot/dist").glob("*.whl")):
-        # Skip the wheel if not for this backend
-        if re.search(f"{backend}", path.name) is None:
+        if not path.name.startswith(f"{package_name}-"):
+            continue
+        if version is not None and f"+{backend}{version}" not in path.name:
             continue
         with open(path, "rb") as f:
             sha256 = hashlib.sha256(f.read()).hexdigest()
         ver = re.findall(
-            rf"sglang_kernel-([0-9.]+(?:\.post[0-9]+)?)(?:\+{backend}[0-9]+)?-",
+            rf"{re.escape(package_name)}-([0-9.]+(?:\.post[0-9]+)?)(?:\+{backend}[0-9]+)?-",
             path.name,
         )[0]
         full_url = f"{base_url}/v{ver}/{path.name}#sha256={sha256}"
@@ -69,22 +76,11 @@ def _update_non_cuda_wheel_index(backend, version):
 
 
 def update_wheel_index_xpu():
-    index_dir = pathlib.Path("sgl-whl/xpu/sglang-kernel-xpu")
-    base_url = "https://github.com/sgl-project/whl/releases/download"
-
-    for path in sorted(pathlib.Path("python/sglang/kernels/aot/dist").glob("*.whl")):
-        if "xpu" not in path.name:
-            continue
-        index_dir.mkdir(exist_ok=True, parents=True)
-        with open(path, "rb") as f:
-            sha256 = hashlib.sha256(f.read()).hexdigest()
-        ver = re.findall(
-            r"sglang_kernel_xpu-([0-9.]+(?:\.post[0-9]+)?)-",
-            path.name,
-        )[0]
-        full_url = f"{base_url}/v{ver}/{path.name}#sha256={sha256}"
-        with (index_dir / "index.html").open("a") as f:
-            f.write(f'<a href="{full_url}">{path.name}</a><br>\n')
+    _update_non_cuda_wheel_index(
+        "xpu",
+        package_name="sglang_kernel_xpu",
+        index_package_name="sglang-kernel-xpu",
+    )
 
 
 def update_wheel_index_rocm(rocm_version):

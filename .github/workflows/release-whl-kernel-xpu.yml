@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   build-xpu:
-    if: github.repository == 'sgl-project/sgl-kernel-xpu'
+    if: github.repository == 'sgl-project/sglang'
     runs-on: x64-docker-build-node
     strategy:
       matrix:
@@ -31,7 +31,8 @@ jobs:
           docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
             sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
 
-      - uses: actions/checkout@v4
+      - name: Checkout SGLang
+        uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
 
@@ -47,12 +48,20 @@ jobs:
           echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
           echo "Building sgl-kernel-xpu ${TAG_NAME} from ${BRANCH}"
 
+      - name: Checkout SGLang XPU kernel
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/sgl-kernel-xpu
+          ref: ${{ steps.xpu_meta.outputs.branch }}
+          path: sgl-kernel-xpu
+
       - name: Build native XPU Docker image
+        timeout-minutes: 120
         run: |
           set -euo pipefail
           IMAGE="sglang-xpu-kernel-release:${{ steps.xpu_meta.outputs.version }}"
-          docker build . \
-            -f Dockerfile.xpu_kernel \
+          docker build sgl-kernel-xpu \
+            -f sgl-kernel-xpu/Dockerfile.xpu_kernel \
             --build-arg PYTHON_VERSION=${{ matrix.python-version }} \
             --build-arg SG_LANG_REPO=https://github.com/sgl-project/sglang.git \
             --build-arg SG_LANG_BRANCH=main \
@@ -63,14 +72,15 @@ jobs:
           echo "XPU_IMAGE=${IMAGE}" >> "$GITHUB_ENV"
 
       - name: Build and export XPU kernel wheels
+        timeout-minutes: 360
         run: |
           set -euo pipefail
           docker rm -f sgl_kernel_xpu_release_build || true
           docker run -dt \
             --device /dev/dri/ \
             --name sgl_kernel_xpu_release_build \
-            -e CMAKE_BUILD_PARALLEL_LEVEL=64 \
-            -e MAX_JOBS=64 \
+            -e CMAKE_BUILD_PARALLEL_LEVEL=128 \
+            -e MAX_JOBS=128 \
             "${XPU_IMAGE}" \
             /bin/bash -lc 'sleep infinity'
           docker exec \
@@ -85,7 +95,7 @@ jobs:
             '
           mkdir -p python/sglang/kernels/aot/dist
           docker cp sgl_kernel_xpu_release_build:/root/sglang/sgl-kernel-xpu/dist/. python/sglang/kernels/aot/dist/
-          ls -lh python/sglang/kernels/aot/dist/
+          ls -lh python/sglang/kernels/aot/dist/sglang_kernel_xpu-*.whl
 
       - name: Cleanup XPU kernel build container
         if: always()
@@ -95,7 +105,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-xpu
-          path: python/sglang/kernels/aot/dist/*
+          path: python/sglang/kernels/aot/dist/sglang_kernel_xpu-*.whl
 
   release-xpu:
     if: github.repository == 'sgl-project/sglang'
@@ -120,7 +130,7 @@ jobs:
           repository: sgl-project/whl
           token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           files: |
-            python/sglang/kernels/aot/dist/*
+            python/sglang/kernels/aot/dist/sglang_kernel_xpu-*.whl
 
       - name: Clone wheel index
         run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
