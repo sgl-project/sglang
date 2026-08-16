@@ -36,6 +36,20 @@
       "correctness_job": "3071785: pass, 6 tests"
     }
   },
+  "verify_unroll_overlay": {
+    "parent_runtime_job": "3074223",
+    "parent_local_commit": "19932c2e9a114166beca3cb7091cd09d4bced0e5",
+    "file": "python/sglang/kernels/ops/attention/cutedsl_gdn_mtp_ring.py",
+    "baseline_sha256": "f5e8eb4af1a67288103e4b9af3c9a34c0483838baa9b559a0c55de0f71ca5ebf",
+    "candidate_sha256": "62f57ab2039d3805ca92ce507b3b6cb34b1948ffbf0de22f458bb3a15141bf14",
+    "change": "Set the production constexpr GDN verify token loop unroll factor from 1 to 2; ABI, per-token operation order, raw ring layout and raw-fold tile are unchanged.",
+    "source_evidence": {
+      "task_status_commit": "a3acbeb89b1359d6da5ff4cd5f5634ad5a811c64",
+      "gb300_micro_job": "3074240: pass, 7.003 to 5.347 ms/step at B64/T6/45 layers",
+      "bitwise_gate": "pass at B44 and B64 for output plus rawv/rawk/g/beta"
+    },
+    "pending_validation": "Exact-final eager and CUDA-graph bitwise matrix over production batch shapes, exact-histogram GB300 micro, then a single-variable production A/B if the TRT final Stage-2 gap exceeds 5%."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
