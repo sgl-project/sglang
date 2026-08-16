@@ -130,7 +130,7 @@ class AttentionBackend(ABC):
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode."""
         if fm.is_decode() or fm.is_target_verify():
-            # Default to IN_REPLAY, we assume shared data still reads after the in-graph hook
+            # Default to IN_REPLAY, we assume shared data still reads during the in-graph hook
             return SharedReadEnds.IN_REPLAY
         return SharedReadEnds.UNKNOWN
 
