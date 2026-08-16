@@ -255,6 +255,7 @@ def test_u1_interleave_lifecycle_parks_flows_reencodes_and_resumes() -> None:
     assert flow["image_t_index"] == 4
     assert flow["seed"] == 7
     assert child.batch_isolation_key.startswith("sensenova_u1_interleave_flow:")
+    assert child.radix_cache_prefix_limit == 0
     assert child.sampling_params.stop_strs == []
     assert child.sampling_params.stop_regex_strs == []
     assert parent.batch_isolation_key is None

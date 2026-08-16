@@ -223,6 +223,21 @@ class BenchmarkConfig:
         }
 
 
+@dataclass(frozen=True)
+class RequestInvocation:
+    concurrency: int
+    batch_kind: str
+    repeat_index: int
+    request_ordinal: int
+
+    @property
+    def logical_request_id(self) -> str:
+        return (
+            f"{self.batch_kind}-repeat-{self.repeat_index}-"
+            f"ordinal-{self.request_ordinal}"
+        )
+
+
 def _raw_native_prompt(config: BenchmarkConfig) -> str:
     return (
         f"<|im_start|>system\n{config.system_message}<|im_end|>\n"
@@ -365,13 +380,22 @@ def _summarize_level(
 def _run_concurrent_batch(
     *,
     concurrency: int,
-    request_fn: Callable[[int], dict[str, Any]],
+    batch_kind: str,
+    repeat_index: int,
+    request_fn: Callable[[RequestInvocation], dict[str, Any]],
 ) -> dict[str, Any]:
     barrier = threading.Barrier(concurrency + 1)
 
     def task(index: int) -> dict[str, Any]:
         barrier.wait()
-        return request_fn(index)
+        return request_fn(
+            RequestInvocation(
+                concurrency=concurrency,
+                batch_kind=batch_kind,
+                repeat_index=repeat_index,
+                request_ordinal=index,
+            )
+        )
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = [pool.submit(task, index) for index in range(concurrency)]
@@ -388,7 +412,7 @@ def _run_concurrent_batch(
 def _run_levels(
     *,
     config: BenchmarkConfig,
-    request_fn: Callable[[int], dict[str, Any]],
+    request_fn: Callable[[RequestInvocation], dict[str, Any]],
     before_measurement: Callable[[], None] | None = None,
     after_measurement: Callable[[], dict[str, Any] | None] | None = None,
     progress_path: Path,
@@ -397,16 +421,26 @@ def _run_levels(
     reference: dict[str, Any] | None = None
     for concurrency in config.concurrency_levels:
         warmups = [
-            _run_concurrent_batch(concurrency=concurrency, request_fn=request_fn)
-            for _ in range(config.warmup_repeats)
+            _run_concurrent_batch(
+                concurrency=concurrency,
+                batch_kind="warmup",
+                repeat_index=repeat_index,
+                request_fn=request_fn,
+            )
+            for repeat_index in range(config.warmup_repeats)
         ]
         if before_measurement is not None:
             before_measurement()
         sampler = GPUMemorySampler(config.gpu_index)
         sampler.start()
         repeats = [
-            _run_concurrent_batch(concurrency=concurrency, request_fn=request_fn)
-            for _ in range(config.measurement_repeats)
+            _run_concurrent_batch(
+                concurrency=concurrency,
+                batch_kind="measurement",
+                repeat_index=repeat_index,
+                request_fn=request_fn,
+            )
+            for repeat_index in range(config.measurement_repeats)
         ]
         gpu_memory = sampler.stop()
         torch_memory = after_measurement() if after_measurement is not None else None
@@ -487,8 +521,7 @@ def _run_hf(
     model_lock = threading.Lock()
     generation_config = SimpleNamespace(max_new_tokens=config.text_token_budget)
 
-    def request_fn(index: int) -> dict[str, Any]:
-        del index
+    def request_fn(invocation: RequestInvocation) -> dict[str, Any]:
         request_started = time.perf_counter()
         with model_lock:
             model_acquired = time.perf_counter()
@@ -555,6 +588,9 @@ def _run_hf(
             stop_reason = str(getattr(model, "last_interleave_stop_reason", "unknown"))
 
         return {
+            "logical_request_id": invocation.logical_request_id,
+            "request_ordinal": invocation.request_ordinal,
+            "request_seed": config.seed,
             "request_latency_s": request_finished - request_started,
             "queue_wait_s": model_acquired - request_started,
             "model_execution_s": model_finished - model_started,
@@ -672,11 +708,17 @@ def _run_native(config: BenchmarkConfig, server_url: str) -> int:
     img_end_id = int(tokenizer.convert_tokens_to_ids(IMG_END_TOKEN))
     prompt = _raw_native_prompt(config)
     endpoint = server_url.rstrip("/") + "/generate"
+    benchmark_run_id = time.time_ns()
 
-    def request_fn(index: int) -> dict[str, Any]:
+    def request_fn(invocation: RequestInvocation) -> dict[str, Any]:
         request_started = time.perf_counter()
+        rid = (
+            f"interleave-perf-{benchmark_run_id}-"
+            f"{invocation.batch_kind}-c{invocation.concurrency}-"
+            f"r{invocation.repeat_index}-o{invocation.request_ordinal}"
+        )
         payload = {
-            "rid": f"interleave-perf-{time.time_ns()}-{index}",
+            "rid": rid,
             "text": prompt,
             "sampling_params": {
                 "temperature": 0,
@@ -747,6 +789,10 @@ def _run_native(config: BenchmarkConfig, server_url: str) -> int:
         ]
         serialized_bytes = len(http_response.content)
         return {
+            "rid": rid,
+            "logical_request_id": invocation.logical_request_id,
+            "request_ordinal": invocation.request_ordinal,
+            "request_seed": config.seed,
             "request_latency_s": request_finished - request_started,
             "queue_wait_s": queue_wait_s,
             "model_execution_s": active_execution_s,
@@ -774,6 +820,7 @@ def _run_native(config: BenchmarkConfig, server_url: str) -> int:
         "ok": True,
         "backend": "main_sglang_scheduler_owned_interleave",
         "server_url": server_url,
+        "benchmark_run_id": benchmark_run_id,
         "concurrency_methodology": (
             "All clients issue simultaneous HTTP requests. SGLang owns parent "
             "decode batching, parent parking, isolated internal flow children, "
@@ -841,6 +888,8 @@ def _determinism_summary(
     all_contract_digests: set[str] = set()
     all_text_digests: set[str] = set()
     all_image_digests: set[str] = set()
+    logical_ids_by_level: dict[str, set[str]] = {}
+    logical_digests: dict[str, dict[str, set[str]]] = {}
     repeat_deterministic = True
     for concurrency in concurrency_levels:
         key = str(concurrency)
@@ -864,16 +913,56 @@ def _determinism_summary(
         image_digests = {
             str(request["contract"]["image_sha256"]) for request in requests
         }
+        logical_ids = {
+            str(request["logical_request_id"])
+            for request in requests
+            if request.get("logical_request_id") is not None
+        }
+        logical_ids_by_level[key] = logical_ids
+        for request in requests:
+            logical_request_id = request.get("logical_request_id")
+            if logical_request_id is None:
+                continue
+            logical_digests.setdefault(str(logical_request_id), {}).setdefault(
+                key, set()
+            ).add(str(request["contract"]["contract_sha256"]))
         per_level_contract_digests[key] = sorted(contract_digests)
         repeat_deterministic = repeat_deterministic and len(contract_digests) == 1
         all_contract_digests.update(contract_digests)
         all_text_digests.update(text_digests)
         all_image_digests.update(image_digests)
+    common_logical_ids = (
+        set.intersection(*logical_ids_by_level.values())
+        if logical_ids_by_level
+        else set()
+    )
+    common_logical_request_digests = {
+        logical_request_id: {
+            key: sorted(logical_digests[logical_request_id][key])
+            for key in sorted(logical_digests[logical_request_id])
+        }
+        for logical_request_id in sorted(common_logical_ids)
+    }
+    logical_request_batch_size_invariant = bool(common_logical_ids) and all(
+        len(
+            {
+                digest
+                for per_level in common_logical_request_digests[
+                    logical_request_id
+                ].values()
+                for digest in per_level
+            }
+        )
+        == 1
+        for logical_request_id in common_logical_ids
+    )
     return {
         "repeat_deterministic_per_level": repeat_deterministic,
         "contract_batch_size_invariant": len(all_contract_digests) == 1,
         "text_batch_size_invariant": len(all_text_digests) == 1,
         "image_batch_size_invariant": len(all_image_digests) == 1,
+        "logical_request_batch_size_invariant": (logical_request_batch_size_invariant),
+        "common_logical_request_digests": common_logical_request_digests,
         "unique_contract_digests_across_levels": sorted(all_contract_digests),
         "unique_text_digests_across_levels": sorted(all_text_digests),
         "unique_image_digests_across_levels": sorted(all_image_digests),
@@ -980,6 +1069,10 @@ def _markdown(summary: dict[str, Any]) -> str:
                 f"**{correctness['native_batch_size_invariant']}** "
                 f"(text: **{correctness['native_text_batch_size_invariant']}**; "
                 f"image: **{correctness['native_image_batch_size_invariant']}**)."
+            ),
+            (
+                "- Native same-logical-request invariant across BS1/2/4/8: "
+                f"**{correctness['native_logical_request_batch_size_invariant']}**."
             ),
             (
                 "- HF concurrency methodology: simultaneous clients enter a "
@@ -1115,6 +1208,12 @@ def _summarize(config: BenchmarkConfig) -> int:
         "native_image_batch_size_invariant": native_determinism[
             "image_batch_size_invariant"
         ],
+        "hf_logical_request_batch_size_invariant": hf_determinism[
+            "logical_request_batch_size_invariant"
+        ],
+        "native_logical_request_batch_size_invariant": native_determinism[
+            "logical_request_batch_size_invariant"
+        ],
         "determinism_detail": {
             "hf": hf_determinism,
             "native": native_determinism,
@@ -1139,6 +1238,8 @@ def _summarize(config: BenchmarkConfig) -> int:
         and correctness["post_image_tokens"] > 0
         and correctness["hf_deterministic"]
         and correctness["native_deterministic"]
+        and correctness["native_batch_size_invariant"]
+        and correctness["native_logical_request_batch_size_invariant"]
         and correctness["all_hf_levels_real_turn"]
         and correctness["all_native_levels_real_turn"]
         and image_metrics["psnr_db"] >= 46.0
@@ -1159,6 +1260,11 @@ def _summarize(config: BenchmarkConfig) -> int:
             "hf_compatibility_root": hf["compatibility_root"],
             "hf_model_load_s": hf["model_load_s"],
             "native": native["concurrency_methodology"],
+            "logical_request_mapping": (
+                "For each measured repeat, request ordinal N has the same "
+                "logical_request_id and explicit seed at every concurrency level. "
+                "Transport RIDs remain unique only to prevent cross-run Radix reuse."
+            ),
             "timing": {
                 "hf_model_execution": (
                     "CUDA-synchronized official interleave_gen call, excluding "

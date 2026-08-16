@@ -305,7 +305,10 @@ class SenseNovaU1InterleaveController:
         custom_params[U1_FLOW_BATCH_ISOLATION_PARAM] = (
             f"sensenova_u1_interleave_flow:{parent.rid}:{state.image_count}"
         )
-        custom_params[U1_FLOW_RADIX_PREFIX_LIMIT_PARAM] = image_start
+        # Parent KV was produced in a text batch whose numerical shape can vary
+        # with concurrency. Recompute flow conditioning in this isolated child
+        # so the explicit image seed determines one batch-invariant image.
+        custom_params[U1_FLOW_RADIX_PREFIX_LIMIT_PARAM] = 0
         custom_params[U1_FLOW_PREFILL_GRAPH_VARIANT_PARAM] = "sensenova_u1_flow"
         sampling_params.custom_params = custom_params
         sampling_params.max_new_tokens = 1
