@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 class SharedReadBoundary(Enum):
     """Where a backend's scheduler-shared reads end, relative to the replay;
-    the WAR read-done record must land at or after this point. IN_REPLAY
+    the shared-read-done record must land at or after this point. IN_REPLAY
     means at the captured (in-graph) metadata init."""
 
     PRE_REPLAY = auto()
