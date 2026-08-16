@@ -54,6 +54,37 @@ class SchedulerProfilerManager:
     get_forward_ct: Callable[[], int]
 
     def __post_init__(self) -> None:
+        self._profile_dp_rank = envs.SGLANG_TORCH_PROFILER_DP_RANK.get()
+        if self._profile_dp_rank is not None:
+            if envs.SGLANG_PROFILE_V2.get():
+                raise ValueError(
+                    "SGLANG_TORCH_PROFILER_DP_RANK does not support "
+                    "SGLANG_PROFILE_V2"
+                )
+            if self.ps.dp_rank is None:
+                raise ValueError(
+                    "SGLANG_TORCH_PROFILER_DP_RANK requires a resolved DP rank"
+                )
+            if not 0 <= self._profile_dp_rank < self.ps.dp_size:
+                raise ValueError(
+                    "SGLANG_TORCH_PROFILER_DP_RANK must be in "
+                    f"[0, {self.ps.dp_size}), got {self._profile_dp_rank}"
+                )
+
+        self._profile_rank_enabled = (
+            self._profile_dp_rank is None or self.ps.dp_rank == self._profile_dp_rank
+        )
+        self._symm_dp_profile_requested = False
+        self._symm_dp_profile_output_dir: Optional[str] = None
+        self._symm_dp_profile_id: Optional[str] = None
+        if self._profile_dp_rank is not None:
+            logger.info(
+                "Torch profiler DP-rank filter: rank=%s target=%s selected=%s",
+                self.ps.dp_rank,
+                self._profile_dp_rank,
+                self._profile_rank_enabled,
+            )
+
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
                 ps=self.ps,
@@ -95,6 +126,37 @@ class SchedulerProfilerManager:
         profile_prefix: str = "",
         profile_stages: Optional[List[str]] = None,
     ) -> ProfileReqOutput:
+        self._symm_dp_profile_requested = bool(
+            activities is not None and "SYMM_DP" in activities
+        )
+        if self._symm_dp_profile_requested:
+            if envs.SGLANG_PROFILE_V2.get():
+                return ProfileReqOutput(
+                    success=False,
+                    message="SYMM_DP telemetry does not support SGLANG_PROFILE_V2",
+                )
+            if not envs.SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY.get():
+                return ProfileReqOutput(
+                    success=False,
+                    message=(
+                        "SYMM_DP activity requires "
+                        "SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY=true"
+                    ),
+                )
+            self._symm_dp_profile_output_dir = output_dir or os.getenv(
+                "SGLANG_TORCH_PROFILER_DIR", "/tmp"
+            )
+            self._symm_dp_profile_id = profile_id
+
+        if not self._profile_rank_enabled:
+            return ProfileReqOutput(
+                success=True,
+                message=(
+                    f"Skipped profiling on DP rank {self.ps.dp_rank}; "
+                    f"target rank is {self._profile_dp_rank}."
+                ),
+            )
+
         if envs.SGLANG_PROFILE_V2.get():
             return self._profile_manager.configure(
                 output_dir=output_dir,
@@ -155,6 +217,37 @@ class SchedulerProfilerManager:
     def _start_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
+        symm_dp_recorders = 0
+        if self._symm_dp_profile_requested:
+            from sglang.srt.distributed.device_communicators.symm_mem_gather_telemetry import (
+                start_symm_mem_gather_telemetry,
+            )
+
+            assert self._symm_dp_profile_output_dir is not None
+            assert self._symm_dp_profile_id is not None
+            symm_dp_recorders = start_symm_mem_gather_telemetry(
+                output_dir=self._symm_dp_profile_output_dir,
+                profile_id=self._symm_dp_profile_id,
+                dp_rank=self.ps.dp_rank,
+            )
+            self.profile_in_progress = True
+            logger.info(
+                "SYMM_DP telemetry starts: dp_rank=%s recorders=%d output=%s",
+                self.ps.dp_rank,
+                symm_dp_recorders,
+                self._symm_dp_profile_output_dir,
+            )
+
+        if not self._profile_rank_enabled:
+            return ProfileReqOutput(
+                success=True,
+                message=(
+                    f"Skipped profiling on DP rank {self.ps.dp_rank}; "
+                    f"target rank is {self._profile_dp_rank}; "
+                    f"SYMM_DP recorders={symm_dp_recorders}."
+                ),
+            )
+
         if envs.SGLANG_PROFILE_V2.get():
             return self._profile_manager.manual_start()
 
@@ -298,6 +391,30 @@ class SchedulerProfilerManager:
     def _stop_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
+        symm_dp_paths = []
+        if self._symm_dp_profile_requested:
+            from sglang.srt.distributed.device_communicators.symm_mem_gather_telemetry import (
+                stop_symm_mem_gather_telemetry,
+            )
+
+            symm_dp_paths = stop_symm_mem_gather_telemetry()
+            logger.info(
+                "SYMM_DP telemetry stops: dp_rank=%s files=%s",
+                self.ps.dp_rank,
+                [str(path) for path in symm_dp_paths],
+            )
+
+        if not self._profile_rank_enabled:
+            self.profile_in_progress = False
+            return ProfileReqOutput(
+                success=True,
+                message=(
+                    f"Skipped profiling on DP rank {self.ps.dp_rank}; "
+                    f"target rank is {self._profile_dp_rank}; "
+                    f"SYMM_DP files={len(symm_dp_paths)}."
+                ),
+            )
+
         if envs.SGLANG_PROFILE_V2.get():
             return self._profile_manager.manual_stop()
 
@@ -382,9 +499,15 @@ class SchedulerProfilerManager:
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 
-        return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
+        return ProfileReqOutput(
+            success=True,
+            message=(f"Succeeded.{merge_message} SYMM_DP files={len(symm_dp_paths)}."),
+        )
 
     def _profile_batch_predicate(self, batch: ScheduleBatch):
+        if not self._profile_rank_enabled:
+            return
+
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager.step(forward_mode=batch.forward_mode)
             return
@@ -441,7 +564,7 @@ class SchedulerProfilerManager:
                     recv_req.profile_stages,
                 )
             else:
-                self._init_profile(
+                init_result = self._init_profile(
                     recv_req.output_dir,
                     recv_req.start_step,
                     recv_req.num_steps,
@@ -453,6 +576,8 @@ class SchedulerProfilerManager:
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
                 )
+                if not init_result.success:
+                    return init_result
                 return self._start_profile()
         else:
             return self._stop_profile()
