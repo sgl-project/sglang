@@ -78,6 +78,13 @@ class KVIndexBatchView(msgspec.Struct, frozen=True):
     swa_table: Optional[torch.Tensor]  # unified SWA models: the swa canonical
     full_to_swa_map: Optional[torch.Tensor]  # static SWA pools: legacy mapping
 
+    def swa_read_table(self) -> torch.Tensor:
+        """The table a sliding-window gather reads: the swa canonical when the
+        view is kernel-facing (entries already swa-side ids), otherwise the same
+        table as a full read (full-token ids, which the caller then maps through
+        the pool's static full->swa)."""
+        return self.swa_table if self.kernel_facing else self.table
+
 
 class KVIndexSource:
     """Built once per ModelRunner; the ONLY code that probes the allocator's
