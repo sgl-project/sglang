@@ -26,6 +26,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import get_observability
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.cache_controller import HiCacheController
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -233,6 +234,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     metrics_collector: Optional[RadixCacheMetricsCollector] = (
         None  # metrics collector for the cache
     )
+    cache_controller: Optional[HiCacheController] = None
 
     def init_metrics_collector(self):
         from sglang.srt.runtime_context import get_server_args

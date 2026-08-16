@@ -151,8 +151,7 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
     def resolve(cls, platform) -> str | AttentionBackendEnum:
         try:
             from sageattention import sageattn  # noqa: F401
-        except ImportError as e:
-            logger.info(e)
+        except ImportError:
             logger.info(
                 "Sage Attention backend is not installed (To install it, run `pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`). Falling back to Flash Attention."
             )
@@ -176,8 +175,7 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
             )
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
-        except ImportError as e:
-            logger.info(e)
+        except ImportError:
             logger.info(
                 "Sage Attention backend failed to import. Falling back to Flash Attention."
             )
@@ -195,8 +193,7 @@ class _SageAttention3BackendResolver(_CudaAttentionBackendResolver):
             )
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
-        except ImportError as e:
-            logger.info(e)
+        except ImportError:
             logger.info(
                 "Sage Attention 3 backend is not installed (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation). Falling back to Torch SDPA."
             )
