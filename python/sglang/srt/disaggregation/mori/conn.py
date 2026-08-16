@@ -544,6 +544,37 @@ class MoriKVManager(CommonKVManager):
         except Exception:
             logger.exception("Failed to parse transfer info message")
 
+    def _handle_abort_notification(self, msg: List[bytes]) -> bool:
+        if not msg or msg[0] != b"ABORT":
+            return False
+
+        try:
+            room_to_be_aborted = int(msg[1].decode("ascii"))
+        except Exception as e:
+            logger.debug(f"Ignoring malformed abort notification: {e}")
+            return True
+
+        if (
+            room_to_be_aborted in self.request_status
+            and self.check_status(room_to_be_aborted) != KVPoll.Success
+        ):
+            self.record_failure(
+                room_to_be_aborted,
+                "Aborted by decode-side abort notification.",
+            )
+            self.update_status(room_to_be_aborted, KVPoll.Failed)
+            logger.debug(
+                f"Received abort notification for room {room_to_be_aborted}, "
+                "marked as Failed"
+            )
+        else:
+            logger.debug(
+                f"Received abort notification for room {room_to_be_aborted}, "
+                "ignoring (already completed or unknown)"
+            )
+
+        return True
+
     def _validate_message(self, msg: List[bytes]) -> Optional[List[bytes]]:
         if not msg or msg[0] != MORI_GUARD:
             logger.warning("Received malformed bootstrap message")
@@ -558,6 +589,8 @@ class MoriKVManager(CommonKVManager):
             while True:
                 try:
                     msg = self.server_socket.recv_multipart()
+                    if self._handle_abort_notification(msg):
+                        continue
                     payload = self._validate_message(msg)
                     if payload is None:
                         continue
