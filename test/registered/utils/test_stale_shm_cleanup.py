@@ -5,6 +5,7 @@ import unittest
 from multiprocessing import shared_memory
 from unittest.mock import patch
 
+from sglang.srt.utils import stale_shm_cleanup
 from sglang.srt.utils.stale_shm_cleanup import (
     _MAX_SHM_NAME_LEN,
     _creator_pid,
@@ -29,17 +30,32 @@ class TestMakeShmName(unittest.TestCase):
         self.assertNotEqual(a, b)
         self.assertEqual(_creator_pid(a), os.getpid())
 
+    def test_platform_limit_matches_the_posix_ceiling(self):
+        self.assertEqual(_MAX_SHM_NAME_LEN, 30 if sys.platform == "darwin" else 255)
+
     def test_long_kind_stays_within_platform_limit(self):
         # Regression for #34800: "nodecheck" overflowed the 30-char macOS
         # budget, and the resulting OSError silently deadlocked the group.
+        # CI runs on Linux, where the limit is 255 and neither tag comes near
+        # it, so pin the limit to the macOS one. The pid is pinned as well: it
+        # is part of the budget, and the 1-digit pid a container hands out
+        # leaves room that a real 5-digit pid does not.
         for kind in ("nodecheck", "n" * 200):
-            name = make_shm_name(kind)
-            self.assertLessEqual(len(name), _MAX_SHM_NAME_LEN, f"kind={kind!r}")
+            with patch.object(stale_shm_cleanup, "_MAX_SHM_NAME_LEN", 30):
+                with patch.object(stale_shm_cleanup.os, "getpid", return_value=54321):
+                    with patch.object(stale_shm_cleanup, "_truncated_kinds", set()):
+                        name = make_shm_name(kind)
+                        # Prove the tag really was cut; otherwise the length
+                        # assertion below passes without testing the fix.
+                        self.assertIn(kind, stale_shm_cleanup._truncated_kinds)
+            self.assertLessEqual(len(name), 30, f"kind={kind!r}")
             # Truncation must not break the cleanup sweep's pid parsing.
-            self.assertEqual(_creator_pid(name), os.getpid(), f"kind={kind!r}")
+            self.assertEqual(_creator_pid(name), 54321, f"kind={kind!r}")
 
     def test_long_kind_is_still_openable(self):
-        name = make_shm_name("nodecheck")
+        with patch.object(stale_shm_cleanup, "_MAX_SHM_NAME_LEN", 30):
+            name = make_shm_name("nodecheck")
+        self.assertLessEqual(len(name), 30)
         shm = shared_memory.SharedMemory(create=True, size=128, name=name)
         try:
             self.assertEqual(shm.name.lstrip("/"), name.lstrip("/"))
