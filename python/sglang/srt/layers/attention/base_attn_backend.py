@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Iterable, Optional
 
 import torch
 
@@ -28,7 +28,7 @@ class SharedReadEnds(Enum):
     UNKNOWN = 4  # not audited -> coarse whole-forward fence
 
     @staticmethod
-    def max_of(items: list[SharedReadEnds]) -> SharedReadEnds:
+    def max_of(items: Iterable[SharedReadEnds]) -> SharedReadEnds:
         return max(items, key=lambda x: x.value)
 
 
