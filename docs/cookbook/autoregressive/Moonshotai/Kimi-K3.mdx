@@ -318,6 +318,8 @@ that read on a hot hit; a stale trusted hash can reuse the wrong image artifact
 and change the answer. Enable it only for immutable content-addressed media.
 Legacy `mm_hashes` is not a substitute.
 
+In EPD, add `--enable-prefix-mm-cache` to the encoder role for complete local
+reuse; `--enable-mm-global-cache` optionally shares embeddings through Mooncake.
 The normal and low-HBM unified profiles need no extra cache flag. See
 [VLM preprocessing and caching](../../../docs/advanced_features/vlm_preprocessing_cache)
 for the data flow and APIs.

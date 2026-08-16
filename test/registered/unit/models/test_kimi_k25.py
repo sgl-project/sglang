@@ -27,6 +27,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.multimodal_cache import (
     MM_EMBEDDING_CACHE_HASH_KEY,
+    MM_EMBEDDING_CACHE_IDENTITY_KEY,
     MM_EMBEDDING_CACHE_LEASE_ID_KEY,
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
@@ -711,6 +712,59 @@ def test_kimi_k3_cpu_prompt_uses_the_same_media_contract():
         "<|media_pad|><|media_pad|><|media_pad|><|media_end|>between"
         "<|media_begin|>image 1024x1536<|media_content|>"
         "<|media_pad|><|media_pad|><|media_end|>after"
+    )
+
+
+def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.hf_config = SimpleNamespace(
+        vision_config=SimpleNamespace(merge_kernel_size=(2, 2))
+    )
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor._tokenizer = _Tokenizer()
+    embeddings = {Modality.IMAGE: torch.arange(20, dtype=torch.float32).reshape(5, 4)}
+
+    output = processor.get_mm_data(
+        [1, 99, 2, 99, 3],
+        embeddings,
+        img_grid_thw=torch.tensor([[1, 2, 6], [1, 2, 4]]),
+        original_image_sizes=[[1536, 1024], [1024, 1536]],
+        mm_feature_identities=[
+            "sha256:" + "11" * 32,
+            "sha256:" + "22" * 32,
+        ],
+    )
+
+    assert output.input_ids == [
+        1,
+        10,
+        11,
+        99,
+        99,
+        99,
+        14,
+        2,
+        12,
+        13,
+        99,
+        99,
+        14,
+        3,
+    ]
+    assert [item.offsets for item in output.mm_items] == [[(3, 5)], [(10, 11)]]
+    assert [
+        item.model_specific_data[MM_EMBEDDING_CACHE_IDENTITY_KEY]
+        for item in output.mm_items
+    ] == ["sha256:" + "11" * 32, "sha256:" + "22" * 32]
+    assert [
+        item.model_specific_data[MM_EMBEDDING_CACHE_HASH_KEY]
+        for item in output.mm_items
+    ] == [int("11" * 8, 16), int("22" * 8, 16)]
+    torch.testing.assert_close(
+        output.mm_items[0].precomputed_embeddings, embeddings[Modality.IMAGE][:3]
+    )
+    torch.testing.assert_close(
+        output.mm_items[1].precomputed_embeddings, embeddings[Modality.IMAGE][3:]
     )
 
 

@@ -1,6 +1,8 @@
 """Content-addressed caches used by multimodal preprocessing."""
 
 from sglang.srt.multimodal.cache.contracts import (
+    EncoderMediaLookup,
+    EncoderPreprocessArtifact,
     PreprocessCacheLookup,
 )
 from sglang.srt.multimodal.cache.identity import (
@@ -10,6 +12,7 @@ from sglang.srt.multimodal.cache.identity import (
     build_artifact_key,
     build_feature_hash,
     build_feature_identity,
+    build_mm_global_cache_key,
     build_mm_radix_cache_namespace,
     build_processor_fingerprint,
     compact_feature_hash,
@@ -31,6 +34,8 @@ __all__ = [
     "CacheSizeProvider",
     "CacheLookup",
     "CacheMiss",
+    "EncoderMediaLookup",
+    "EncoderPreprocessArtifact",
     "MediaSnapshot",
     "MultimodalPreprocessCache",
     "PreprocessCacheLookup",
@@ -38,6 +43,7 @@ __all__ = [
     "build_artifact_key",
     "build_feature_identity",
     "build_feature_hash",
+    "build_mm_global_cache_key",
     "build_mm_radix_cache_namespace",
     "build_processor_fingerprint",
     "compact_feature_hash",
