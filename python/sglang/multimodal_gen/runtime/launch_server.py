@@ -412,6 +412,7 @@ def launch_pool_disagg_server(
             base_dict = {
                 f.name: getattr(server_args, f.name)
                 for f in dataclasses.fields(server_args)
+                if f.init
             }
             base_dict.update(role_overrides)
             base_dict.pop("pipeline_config", None)
@@ -743,7 +744,9 @@ def launch_disagg_role(server_args: ServerArgs):
         )
 
     base_dict = {
-        f.name: getattr(server_args, f.name) for f in dataclasses.fields(server_args)
+        f.name: getattr(server_args, f.name)
+        for f in dataclasses.fields(server_args)
+        if f.init
     }
     base_dict.update(role_overrides)
     base_dict.pop("pipeline_config", None)
