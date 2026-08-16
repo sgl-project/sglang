@@ -282,7 +282,6 @@ ARG SETUPTOOLS_SCM_PRETEND_VERSION
 RUN pip install IPython \
     && pip install orjson \
     && pip install python-multipart \
-    && pip install torchao==0.9.0 \
     && pip install pybind11
 
 # Rust toolchain — needed by setuptools-rust to build the sglang-mm extension
