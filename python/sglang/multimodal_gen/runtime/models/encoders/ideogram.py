@@ -26,6 +26,7 @@ class IdeogramQwen3VLTextEncoder(TextEncoder):
     """Language-only Qwen3-VL text encoder stored inside Ideogram checkpoints."""
 
     _activation_layers = (0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 35)
+    layer_names = ["language_model.layers"]
 
     def __init__(self, config: Ideogram4TextEncoderConfig) -> None:
         super().__init__(config)
