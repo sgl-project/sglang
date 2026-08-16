@@ -32,6 +32,10 @@ from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     Qwen3VLVisionTransformer,
 )
+from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
+    apply_qwen_vl_text_rope,
+    build_qwen_vl_text_rope,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.srt.layers.layernorm import RMSNorm
 
@@ -58,8 +62,6 @@ from transformers.models.qwen3_vl.configuration_qwen3_vl import (
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLCausalLMOutputWithPast,
     Qwen3VLModelOutputWithPast,
-    Qwen3VLTextRotaryEmbedding,
-    apply_rotary_pos_emb,
 )
 
 
@@ -281,6 +283,7 @@ class Qwen3VLTextAttention(nn.Module):
         )
         self.q_norm = _make_text_rms_norm(self.head_dim, config.rms_norm_eps)
         self.k_norm = _make_text_rms_norm(self.head_dim, config.rms_norm_eps)
+        self.rotary_emb = build_qwen_vl_text_rope(config)
 
         self.attn = LocalAttention(
             num_heads=self.num_heads,
@@ -297,7 +300,7 @@ class Qwen3VLTextAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
@@ -314,14 +317,15 @@ class Qwen3VLTextAttention(nn.Module):
         ).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin
+        query_states, key_states = apply_qwen_vl_text_rope(
+            self.rotary_emb,
+            position_ids,
+            query_states,
+            key_states,
         )
 
         if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_values.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
@@ -447,7 +451,6 @@ class Qwen3VLTextDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -465,7 +468,6 @@ class Qwen3VLTextDecoderLayer(nn.Module):
             past_key_values=past_key_values,
             use_cache=use_cache,
             cache_position=cache_position,
-            position_embeddings=position_embeddings,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -511,7 +513,6 @@ class Qwen3VLTextModel(nn.Module):
             ]
         )
         self.norm = _make_text_rms_norm(config.hidden_size, config.rms_norm_eps)
-        self.rotary_emb = Qwen3VLTextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -587,15 +588,10 @@ class Qwen3VLTextModel(nn.Module):
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
-            text_position_ids = position_ids[0]
             position_ids = position_ids[1:]
-        else:
-            text_position_ids = position_ids[0]
 
         hidden_states = inputs_embeds
 
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         # decoder layers
@@ -603,11 +599,10 @@ class Qwen3VLTextModel(nn.Module):
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
-                position_ids=text_position_ids,
+                position_ids=position_ids,
                 past_key_values=past_key_values,
                 cache_position=cache_position,
                 output_attentions=output_attentions,
-                position_embeddings=position_embeddings,
                 **kwargs,
             )
             # hidden_states = layer_outputs

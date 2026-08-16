@@ -27,6 +27,10 @@ from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_vision import (
     Qwen2_5VLVisionTransformer,
 )
+from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
+    apply_qwen_vl_text_rope,
+    build_qwen_vl_text_rope,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -75,8 +79,6 @@ import torch.nn as nn
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLCausalLMOutputWithPast,
     Qwen2_5_VLModelOutputWithPast,
-    Qwen2_5_VLRotaryEmbedding,
-    apply_multimodal_rotary_pos_emb,
 )
 
 logger = logging.getLogger(__name__)
@@ -194,10 +196,9 @@ class Qwen2_5_VLAttention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         if layer_idx is None:
-            logger.warn(
-                f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
-                "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
+            logger.warning(
+                "Instantiating %s without layer_idx disables correct cache updates",
+                self.__class__.__name__,
             )
 
         self.hidden_size = config.hidden_size
@@ -232,7 +233,6 @@ class Qwen2_5_VLAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.is_causal = True
         self.attention_dropout = config.attention_dropout
-        self.rope_scaling = config.rope_scaling
         self.scaling = self.head_dim**-0.5
 
         self.q_proj = _make_column_linear(
@@ -265,7 +265,7 @@ class Qwen2_5_VLAttention(nn.Module):
             else None
         )
 
-        self.rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
+        self.rotary_emb = build_qwen_vl_text_rope(config)
         self.attn = LocalAttention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
@@ -287,9 +287,6 @@ class Qwen2_5_VLAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[
-            tuple[torch.Tensor, torch.Tensor]
-        ] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
@@ -302,17 +299,15 @@ class Qwen2_5_VLAttention(nn.Module):
         key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_multimodal_rotary_pos_emb(
-            query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+        query_states, key_states = apply_qwen_vl_text_rope(
+            self.rotary_emb,
+            position_ids,
+            query_states,
+            key_states,
         )
 
         if past_key_values is not None:
-            cache_kwargs = {
-                "sin": sin,
-                "cos": cos,
-                "cache_position": cache_position,
-            }  # Specific to RoPE models
+            cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_values.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
@@ -381,9 +376,6 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[
-            tuple[torch.Tensor, torch.Tensor]
-        ] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[
         torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -402,9 +394,6 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
             past_key_values (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
             cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
                 Indices depicting the position of the input sequence tokens in the sequence.
-            position_embeddings (`tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
-                Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
-                with `head_dim` being the embedding dimension of each attention head.
             kwargs (`dict`, *optional*):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
@@ -423,7 +412,6 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
-            position_embeddings=position_embeddings,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -463,7 +451,6 @@ class Qwen2_5_VLTextModel(nn.Module):
             cast_x_before_out_mul=True,
             deterministic=True,
         )
-        self.rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
         self.gradient_checkpointing = False
@@ -567,9 +554,6 @@ class Qwen2_5_VLTextModel(nn.Module):
 
         hidden_states = inputs_embeds
 
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -581,12 +565,11 @@ class Qwen2_5_VLTextModel(nn.Module):
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                position_ids=text_position_ids,
+                position_ids=position_ids,
                 past_key_values=past_key_values,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
                 cache_position=cache_position,
-                position_embeddings=position_embeddings,
                 **kwargs,
             )
 

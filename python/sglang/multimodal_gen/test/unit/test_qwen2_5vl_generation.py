@@ -152,12 +152,12 @@ def test_explicit_attention_mask_is_limited_to_cached_generation(monkeypatch):
     attention.num_heads = 1
     attention.num_key_value_heads = 1
     attention.head_dim = 4
-    attention.rope_scaling = {"mrope_section": [1, 1, 0]}
+    attention.rotary_emb = object()
     attention.attn = _AttentionRecorder()
     monkeypatch.setattr(
         qwen2_5vl,
-        "apply_multimodal_rotary_pos_emb",
-        lambda query, key, *_args: (query, key),
+        "apply_qwen_vl_text_rope",
+        lambda _rotary_emb, _position_ids, query, key: (query, key),
     )
 
     hidden_states = torch.randn(1, 2, 4)
@@ -165,7 +165,7 @@ def test_explicit_attention_mask_is_limited_to_cached_generation(monkeypatch):
     kwargs = {
         "hidden_states": hidden_states,
         "attention_mask": explicit_mask,
-        "position_embeddings": (torch.empty(0), torch.empty(0)),
+        "position_ids": torch.zeros(3, 1, 2, dtype=torch.long),
     }
 
     attention(**kwargs, use_cache=False)
