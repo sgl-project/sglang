@@ -47,7 +47,7 @@ class Magi2DecodingStage(PipelineStage):
             .permute(3, 0, 1, 2)
             .unsqueeze(0)
         )
-        # Un-normalize: skipping this decodes washed-out, colour-shifted video.
+        # Un-normalize: latents_std is < 1, so skipping this oversaturates.
         std = self.latents_std.to(device=grid.device, dtype=grid.dtype)
         mean = self.latents_mean.to(device=grid.device, dtype=grid.dtype)
         grid = grid * std + mean

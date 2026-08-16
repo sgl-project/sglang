@@ -82,9 +82,10 @@ collective:
 | Refiner key/value heads (GQA) | 8 |
 
 Divisibility alone does not make a count usable, because expert parallelism is also
-what makes the weights fit. The preview partition is 113.9B parameters — 228 GB in
-BF16 — and only its expert tensors shard; the 6.7B refiner is replicated on every
-rank. Measured on 143 GB H20Z cards, preview tier, 20 steps:
+what makes the weights fit. The 114B headline is the preview partition — 113.9B
+parameters, 228 GB in BF16 — and only its expert tensors shard; the 6.7B refiner is
+separate and is replicated on every rank. Measured on 143 GB H20Z cards, preview
+tier, 20 steps:
 
 | GPUs | Result |
 | ---: | --- |
@@ -93,11 +94,12 @@ rank. Measured on 143 GB H20Z cards, preview tier, 20 steps:
 | 1 | out of memory during load |
 
 **Use 4 GPUs.** 2 divides every head axis and still fails: weights alone come to
-~132 GiB of a 139.8 GiB usable card, which leaves nothing for activations. Counts
-above 4 (6 and 12, preview-only) satisfy the head axes but were not measured here.
+~132 GiB of the card, which leaves nothing for activations. Counts above 4 (6 and
+12, preview-only) satisfy the head axes but were not measured here.
 
 <Warning>
-6 and 12 GPUs work for preview-only but fail the refiner's 8 key/value heads.
+6 and 12 GPUs satisfy the preview head axes but fail the refiner's 8 key/value
+heads, so they are preview-only counts.
 
 8 GPUs divides every Ulysses axis but not the preview's 12 MoE heads. The
 reference implementation handles that by padding the head axis to 16 and giving
@@ -112,7 +114,9 @@ double-applied.
 
 Tensor parallelism is rejected too. No layer in either DiT is column- or
 row-parallel, so `--tp-size` shards nothing and only takes ranks away from
-Ulysses. Measured at 896x512, 20 steps on 4x H20Z:
+Ulysses. Measured at 896x512, 20 steps on 4x H20Z. These are whole-stage times
+including per-process warmup, so do not divide them into a per-step cost and
+compare against the 100-step figures in section 8:
 
 | Configuration | Time | Per-rank memory |
 | --- | ---: | ---: |
@@ -310,10 +314,7 @@ error.
 - Audio is delivered as stereo at 44100 Hz. The audio VAE decodes at 51200 Hz
   and is resampled for the container.
 - The text encoder is a Qwen3.5 hybrid backbone loaded through transformers.
-  Prompts are treated as long structured captions and are padded rather than
-  truncated, so a long caption is not silently cut.
-- Do not enable CFG parallelism. `--enable-cfg-parallel` is rejected because the
-  denoise loop already runs both branches itself.
+  Prompts are padded to the longest in the batch and truncated at 7000 tokens.
 
 ## 8. Performance
 
@@ -332,7 +333,7 @@ plus 5 refiner steps, one 10-second clip, `--ulysses-degree 4`:
 | Preview-to-refiner handoff | &lt;0.1 s |
 | Refiner denoise (5 steps) | 101.6 s |
 | Decode (video and audio) | 15.5 s |
-| **Total** | **592 s** |
+| **Total** | **592 s** (the ~4 s residual is per-step scheduling and latent transforms) |
 
 Weight loading is separate and paid once per process: roughly 5 minutes for both
 DiTs, the expert tensors dominating.

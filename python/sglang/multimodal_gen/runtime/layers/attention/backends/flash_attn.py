@@ -375,8 +375,7 @@ class FlashAttentionImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
         self.attention_metadata = FlashAttentionMetadata()
         # Per-head sink logits (an extra always-attended column in the softmax
-        # denominator) and a local attention window. Both are kernel features
-        # that stay off unless a model asks for them.
+        # denominator) and a local attention window, both off by default.
         self.sinks = extra_impl_args.get("sinks")
         self.window_size = extra_impl_args.get("window_size", (-1, -1))
 

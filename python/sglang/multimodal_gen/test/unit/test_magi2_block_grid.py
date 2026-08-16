@@ -11,12 +11,8 @@ from sglang.multimodal_gen.runtime.layers.attention.magi2_block_grid_attention i
 
 
 def _expected_allowed(grid: Magi2BlockGrid, order: torch.Tensor) -> torch.Tensor:
-    """Ground-truth neighborhood, derived from raster coordinates.
-
-    ``order`` maps a position in the permuted sequence back to its raster token,
-    so the block a token belongs to is computed from that raster index rather
-    than from its position, which is what the mask does.
-    """
+    """Ground-truth neighborhood: block membership from the raster token
+    ``order`` points at, whereas the mask derives it from the position."""
     t_dim, h_dim, w_dim = grid.latent_thw
     block_t, block_h, block_w = grid.block_thw
     seq = grid.seq_len
@@ -88,7 +84,6 @@ class TestBlockScanOrder(unittest.TestCase):
     def test_mask_is_wrong_without_the_permutation(self):
         # The mask assigns a token's block from its position, so feeding it a
         # raster-ordered sequence silently attends over the wrong neighborhood.
-        # This is the failure the permutation exists to prevent.
         identity = torch.arange(self.grid.seq_len)
         mask = _mask_matrix(self.grid)
         self.assert_restrictive(mask)

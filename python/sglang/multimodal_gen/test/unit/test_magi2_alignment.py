@@ -79,9 +79,9 @@ class TestResizePad(unittest.TestCase):
     def test_reference_asset_reaches_the_reference_latent_grid(self):
         from PIL import Image
 
-        # The reference run logs `images: (1, 1, 48, 1, 30, 56)` for this asset
-        # at the 512x896 preview tier, so the sizing chain has to land on 30x56
-        # latent patches. Flooring to the compression ratio gives 31x56.
+        # The reference run logs `images: (1, 1, 48, 1, 30, 56)` for this asset at
+        # the 512x896 preview stage, so the chain must land on 30x56 latent
+        # patches: aligning to 16 instead of 32 gives 31 rows and misses.
         source = Image.new("RGB", (2710, 1510))
         height, width = ref_images.target_size(
             source, generation_height=512, generation_width=896
@@ -103,7 +103,6 @@ class TestShippedDefaults(unittest.TestCase):
             self.assertIn(marker, params.negative_prompt)
 
     def test_skimmed_guidance_is_off_by_default(self):
-        # use_skimmed_cfg_linear is false in the shipped config.
         self.assertFalse(Magi2SamplingParams(prompt="x").use_skimmed_guidance)
 
     def test_text_conditioning_skips_two_layers(self):

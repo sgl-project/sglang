@@ -68,7 +68,7 @@ _CKPT_W_GATE = "W_gate"
 _CKPT_W_UP = "W_up"
 _CKPT_W_DOWN = "W_down"
 
-# Checkpoint spelling: these become w13_weight and w2 only in _relayout_experts.
+# Checkpoint spelling: the W_* entries become w13_weight/w2 in _relayout_experts.
 _EP_SHARDED_SUFFIXES = (
     "moe_mlp.router.gate",
     "moe_mlp.router.expert_bias",

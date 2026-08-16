@@ -78,8 +78,8 @@ class Magi2PipelineConfig(PipelineConfig):
     output_audio_sample_rate: int | None = 44100
     output_audio_channels: int | None = 2
 
-    # Defaults to world size. moe_num_heads must divide it: ep=8 pads the head axis
-    # and leaves two ranks holding zero-weight experts.
+    # Defaults to world size, and must divide moe_num_heads (12), so ep=8 is rejected;
+    # the reference instead pads 12 heads to 16 to run ep=8.
     ep_size: int | None = None
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
@@ -150,7 +150,7 @@ class Magi2PipelineConfig(PipelineConfig):
             )
 
         # The refiner's 8 KV heads are the tightest axis: with it enabled only 1, 2
-        # and 4 GPUs work, where preview-only also allows 3, 6 and 12.
+        # and 4 divide every axis, where preview-only also admits 3, 6 and 12.
         preview = self.dit_config.arch_config
         axes = {
             "preview attention heads": preview.num_attention_heads,

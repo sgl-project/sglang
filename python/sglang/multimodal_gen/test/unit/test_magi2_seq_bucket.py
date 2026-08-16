@@ -25,10 +25,9 @@ class TestSequenceBucket(unittest.TestCase):
         self.assertLess(len(lengths), 16)
 
     def test_bucket_absorbs_the_shard_padding(self):
-        # Only the refiner uses the block grid, and its 8 GQA key/value heads limit
-        # it to these degrees. 3, 6 and 12 are preview-only and never reach here;
-        # the bucket is not a multiple of those, which costs a little shard padding
-        # rather than being wrong.
+        # Only the refiner uses the block grid (grid-local window attention), and
+        # its 8 GQA kv heads cap sp there at these degrees. Preview-only 3/6/12
+        # do not divide the bucket, which only costs shard padding.
         for sp_size in (1, 2, 4):
             with self.subTest(sp_size=sp_size):
                 self.assertEqual(SEQ_BUCKET % sp_size, 0)

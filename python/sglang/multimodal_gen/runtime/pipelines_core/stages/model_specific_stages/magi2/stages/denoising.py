@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Joint audio-video denoising for MAGI-2's preview pass."""
+"""Joint audio-video denoising for MAGI-2's preview and refiner passes."""
 
 from __future__ import annotations
 

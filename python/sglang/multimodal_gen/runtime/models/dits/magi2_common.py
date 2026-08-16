@@ -73,7 +73,7 @@ class Magi2FourierRope(nn.Module):
 def apply_partial_rope(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
-    """Tile, not interleave; fp32 cos/sin in, ``x`` dtype out. Channels past the rotary span pass through."""
+    """fp32 cos/sin in, ``x`` dtype out. Channels past the rotary span pass through."""
     rotary_dim = cos.shape[-1] * 2
     if rotary_dim > x.shape[-1]:
         raise ValueError(f"rotary_dim {rotary_dim} exceeds head_dim {x.shape[-1]}")
@@ -102,7 +102,6 @@ def swiglu7_interleaved(x: torch.Tensor) -> torch.Tensor:
 def shard_packed_rows(
     *tensors: torch.Tensor,
 ) -> tuple[list[torch.Tensor], object]:
-    """Pads by repeating the last row, because a zeroed coordinate row is a valid grid position."""
     from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
         build_shard_plan,
         shard_like,
@@ -298,9 +297,9 @@ class Magi2PreAdapter(nn.Module):
                 0, layout.ref_patch_index, self.video_embedder(ref_patches.float())
             )
 
-        # Not a token: overwrites the leading channels of every row, which is what
-        # allows a per-token schedule. 0 on the refiner, where it would discard 64
-        # real embedded channels.
+        # The timestep embedding is not a token: it overwrites the leading channels of
+        # every row, which is what allows a per-token schedule. time_channel_dim is 0
+        # on the refiner, where it would discard 64 real embedded channels.
         if self.time_channel_dim:
             time_embed = sinusoidal_embedding_1d(self.time_channel_dim, timestep)
             rows[:, : self.time_channel_dim] = time_embed.to(rows.dtype)

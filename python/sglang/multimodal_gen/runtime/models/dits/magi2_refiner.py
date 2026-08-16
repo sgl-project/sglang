@@ -94,7 +94,7 @@ class Magi2RefinerDiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         # KNOWN DEVIATION: the reference keeps this residual fp32 for all 30 layers;
-        # bf16 here trades accumulation error for fitting 1080p in memory.
+        # bf16 here trades accumulation error for footprint.
         rows = rows.to(self.blocks[0].attention.linear_qkv.weight.dtype)
 
         num_tail = layout.total_tokens - layout.video_index.numel()
@@ -193,7 +193,7 @@ class Magi2RefinerAttention(nn.Module):
         v = v.view(tokens, self.num_kv_heads, self.head_dim)
 
         # KNOWN DEVIATION: the reference carries q and k in fp32 from the norm through
-        # the rotary; at 1080p that OOMs. The norms still reduce in fp32 internally.
+        # the rotary. The norms still reduce in fp32 internally.
         q = self.q_norm(q, modality_ids)
         k = self.k_norm(k, modality_ids)
 
