@@ -117,7 +117,6 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
                     server_args.pipeline_config.text_encoder_precisions[0]
                 ],
             )
-            self.add_module("text_encoder", stage.text_encoder)
             return stage
 
         self.add_stage_factory(
