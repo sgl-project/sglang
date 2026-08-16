@@ -1679,8 +1679,14 @@ def get_mm_http_session() -> requests.Session:
 
 # Raised by the loaders below when client-supplied media cannot be fetched or
 # decoded. ValueError is in the set because invalid base64 raises binascii.Error.
+# OSError and SyntaxError cover PIL's decode-time failures on media that passed
+# format sniffing but is truncated or corrupt: lazy decode raises
+# OSError("image file is truncated") / OSError("broken data stream"), and the
+# PNG decoder raises SyntaxError("broken PNG file") for corrupt chunk structure.
 CLIENT_MEDIA_EXCEPTIONS = (
     ValueError,
+    OSError,
+    SyntaxError,
     UnidentifiedImageError,
     requests.exceptions.RequestException,
 )
