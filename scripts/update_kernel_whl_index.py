@@ -62,6 +62,7 @@ def _update_non_cuda_wheel_index(
     base_url = "https://github.com/sgl-project/whl/releases/download"
 
     for path in sorted(pathlib.Path("python/sglang/kernels/aot/dist").glob("*.whl")):
+        # Skip the wheel if not for this backend
         if re.search(f"{backend}", path.name) is None:
             continue
         with open(path, "rb") as f:
