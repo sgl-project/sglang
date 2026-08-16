@@ -59,7 +59,7 @@ class VisionLanguageEncoderLoader(ComponentLoader):
                 revision=server_args.revision,
             )
             target_device = self.target_device(
-                server_args.should_cpu_offload_component("vision_language_encoder")
+                server_args.should_start_component_on_cpu("vision_language_encoder")
             )
             model = GlmImageForConditionalGeneration.from_pretrained(
                 component_model_path,
