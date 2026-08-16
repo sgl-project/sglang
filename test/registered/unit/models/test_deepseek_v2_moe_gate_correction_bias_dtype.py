@@ -21,7 +21,9 @@ class TestMoEGateCorrectionBiasDtype(CustomTestCase):
     """
 
     def _make_config(self):
-        return SimpleNamespace(n_routed_experts=8, hidden_size=16, topk_method="noaux_tc")
+        return SimpleNamespace(
+            n_routed_experts=8, hidden_size=16, topk_method="noaux_tc"
+        )
 
     def test_aiter_fp8_quant_config_stays_fp32(self):
         quant_config = SimpleNamespace(get_name=lambda: "fp8")
