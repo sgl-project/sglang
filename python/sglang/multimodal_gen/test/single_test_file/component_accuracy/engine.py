@@ -181,7 +181,7 @@ def _load_sglang_component(
     sgl_args: ServerArgs,
     component: ComponentType,
     library: str,
-    text_encoder_cpu_offload: bool | None = None,
+    component_starts_on_cpu: bool | None = None,
 ) -> nn.Module:
     loader = ComponentLoader.for_component_type(component.value, library)
     if component == ComponentType.TEXT_ENCODER:
@@ -189,7 +189,7 @@ def _load_sglang_component(
             comp_path,
             sgl_args,
             component.value,
-            cpu_offload_flag=text_encoder_cpu_offload,
+            component_starts_on_cpu=component_starts_on_cpu,
         )
     else:
         component_model = loader.load_customized(comp_path, sgl_args, component.value)
@@ -611,7 +611,7 @@ class AccuracyEngine:
             sgl_args,
             component,
             library,
-            text_encoder_cpu_offload=(
+            component_starts_on_cpu=(
                 False
                 if component != ComponentType.TEXT_ENCODER or materialize_sgl_on_device
                 else True

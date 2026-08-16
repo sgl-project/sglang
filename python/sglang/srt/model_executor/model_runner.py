@@ -166,7 +166,6 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.model_executor.runner_utils import make_war_read_done_event
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
@@ -404,14 +403,10 @@ class ModelRunner:
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
-        # WAR fast-path: a decode-graph forward publishes a fresh event here after
-        # load_batch; the scheduler's WAR barrier waits on it (then clears it)
-        # instead of the whole-forward wait_stream. None -> whole-forward fallback.
-        self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
-        # Graph runners record this persistent event after shared-state reads.
-        self.war_read_done_event = make_war_read_done_event(
-            torch.get_device_module(self.device)
-        )
+        # Published by the step's last shared-buffer-reading phase (decode graph,
+        # eagle draft extend, or prefill); the scheduler's WAR barrier waits on it
+        # then clears it. None -> coarse whole-forward wait_stream.
+        self.shared_read_done_event: Optional[torch.cuda.Event] = None
 
         # CPU offload
         set_offloader(

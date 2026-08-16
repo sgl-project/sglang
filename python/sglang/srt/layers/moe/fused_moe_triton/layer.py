@@ -228,10 +228,7 @@ class FusedMoE(torch.nn.Module):
     # backend resolution distinguish them from routed experts.
     is_shared_fused_moe = False
 
-    # Set by quant methods that attach a per-layer scheme to this MoE layer,
-    # eagerly (compressed-tensors, AWQ) or lazily in create_weights()
-    # (gptq_marlin). See `LinearBase.scheme` for why the default exists and why
-    # a scheme must not be an `nn.Module`.
+    # Attached by quant methods for a quantized MoE layer; see LinearBase.scheme.
     scheme = None
 
     _skip_aiter_moe_shuffle: bool = False

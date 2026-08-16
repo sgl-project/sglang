@@ -155,19 +155,13 @@ class LinearBase(torch.nn.Module):
         quant_config: Quantization configure.
     """
 
-    # Set by quant methods that attach a per-layer scheme (e.g. Quark) inside
-    # get_quant_method(), which runs before create_weights() picks the loader --
-    # or lazily inside create_weights() itself when the scheme depends on the
-    # per-module cloned config the method was built with (GPTQ). The default is
-    # what makes "is a scheme attached yet?" a `None` test; an
-    # attribute-existence probe silently answers "yes" once this default exists.
-    #
-    # A scheme must stay a plain object (BaseLinearScheme / BaseMoEScheme are
-    # ABCs, not Modules): `nn.Module.__setattr__` files a Module-valued
-    # attribute under `self._modules` instead of `self.__dict__`, and this
-    # class-level default then shadows it on read -- so a Module-valued scheme
-    # would read back as `None` forever. `VocabParallelEmbedding.scheme` and
-    # `FusedMoE.scheme` are the same default for the same reasons.
+    # Set by quant methods that attach a per-layer scheme, eagerly in
+    # get_quant_method(), which runs before create_weights() picks the loader,
+    # or lazily inside create_weights() itself (GPTQ). The default is what lets
+    # callers probe with `is None`; a hasattr() probe answers "yes" once it
+    # exists. Schemes must stay plain objects -- nn.Module.__setattr__ files a
+    # Module value under self._modules, which this default then shadows on read.
+    # VocabParallelEmbedding and FusedMoE carry the same default.
     scheme = None
 
     def __init__(

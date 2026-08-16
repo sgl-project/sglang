@@ -55,6 +55,14 @@ class TestAdapterLoaderOffloadTarget(unittest.TestCase):
         server_args = self._server_args(cpu_offload_components=["vae"])
         self.assertTrue(server_args.should_cpu_offload_component("diffusion_decoder"))
 
+    def test_layerwise_diffusion_decoder_starts_on_cpu(self):
+        server_args = self._server_args(
+            component_residency={"diffusion_decoder": "layerwise-offload"}
+        )
+
+        self.assertFalse(server_args.should_cpu_offload_component("diffusion_decoder"))
+        self.assertTrue(server_args.should_start_component_on_cpu("diffusion_decoder"))
+
 
 if __name__ == "__main__":
     unittest.main()
