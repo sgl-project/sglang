@@ -897,10 +897,6 @@ def _register_configs():
         hf_model_paths=[
             "sand-ai/MAGI-2-preview",
         ],
-        # Local snapshots are the normal case for a 280GB checkpoint, so the
-        # detector matches the directory name as well as the hub id. Kept
-        # specific: a bare "magi2" is matched as a substring of the whole path
-        # and would hijack any unrelated model served from a magi2-* directory.
         model_detectors=[
             lambda model_id: "magi-2-preview" in model_id.lower()
             or "magi2-preview" in model_id.lower()
