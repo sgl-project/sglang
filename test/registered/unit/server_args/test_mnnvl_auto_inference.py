@@ -73,16 +73,15 @@ class TestCaV2MultinodeAuto(CustomTestCase):
             self.assertFalse(envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get())
             self.assertFalse(envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get())
 
-    def test_tp16_not_auto_opted_in(self):
-        """CustomAllReduceV2 supports world sizes 2..8 only; a TP16 fabric
-        launch must not auto-set the multinode opt-in (it would log
-        'enabling' and then silently fall back downstream)."""
+    def test_tp16_keeps_standard_v2(self):
+        """TP16 uses the topology-probed path, not the TP2-8 explicit mode."""
         with _cleared(
             envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE,
             envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2,
         ), patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True):
             _HANDLE(SimpleNamespace(nnodes=2, tp_size=16))
             self.assertFalse(envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.is_set())
+            self.assertTrue(envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get())
 
 
 if __name__ == "__main__":
