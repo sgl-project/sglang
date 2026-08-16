@@ -7,7 +7,7 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 
-register_cuda_ci(est_time=5400, stage="nightly", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=7200, stage="nightly", runner_config="4-gpu-gb300")
 
 MODEL_PATH = "Qwen/Qwen3.5-397B-A17B-FP8"
 
@@ -25,18 +25,18 @@ COMMON_ARGS = [
     GB300_NCCL_PORT,
 ]
 
-TP_MTP_ARGS = [
+DP_MTP_ARGS = [
     "--speculative-algorithm=EAGLE",
-    "--speculative-num-steps=3",
+    "--speculative-num-steps=1",
     "--speculative-eagle-topk=1",
-    "--speculative-num-draft-tokens=4",
+    "--speculative-num-draft-tokens=2",
 ]
 
 
-class TestQwen35Fp8Tp(CustomTestCase):
-    """Qwen3.5-397B FP8 TP4+MTP on GB300 (4x GB300 NVL4)."""
+class TestQwen35Fp8Dp(CustomTestCase):
+    """Qwen3.5-397B FP8 DP4+DPA+MTP on GB300 (4x GB300 NVL4)."""
 
-    def test_qwen35_fp8_tp(self):
+    def test_qwen35_fp8_dp(self):
         # Pinned to what `ns eval --benchmarks=mmmu-pro:1` sent implicitly --
         # its `:1` suffix means temperature 0.7, not greedy -- so the baseline
         # carries over unchanged. Do not "simplify" these away.
@@ -45,11 +45,13 @@ class TestQwen35Fp8Tp(CustomTestCase):
                 ModelLaunchSettings(
                     MODEL_PATH,
                     tp_size=4,
-                    extra_args=COMMON_ARGS + TP_MTP_ARGS,
-                    variant="TP4+MTP",
+                    extra_args=COMMON_ARGS
+                    + ["--dp-size=4", "--enable-dp-attention"]
+                    + DP_MTP_ARGS,
+                    variant="TP4+DP4+DPA+MTP",
                 )
             ],
-            test_name="Qwen3.5-397B-FP8 (TP4+MTP)",
+            test_name="Qwen3.5-397B-FP8 (TP4+DP4+DPA+MTP)",
             accuracy_params=AccuracyTestParams(
                 dataset="mmmu_pro_vision",
                 baseline_accuracy=0.76,
@@ -60,7 +62,7 @@ class TestQwen35Fp8Tp(CustomTestCase):
                 sgl_eval_thinking=False,
             ),
             performance_params=PerformanceTestParams(
-                batch_sizes=[1, 8],
+                batch_sizes=[16],
                 result_dir="performance_results_gb300",
             ),
         )
