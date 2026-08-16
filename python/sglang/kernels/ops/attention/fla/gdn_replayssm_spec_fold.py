@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """GDN ReplaySSM fold-every-commit: replay the ring-written raw inputs of the
-accepted draft prefix into the fp32 checkpoint on commit (replaces the
+accepted draft prefix into the checkpoint on commit (replaces the
 per-draft ``intermediate_ssm`` snapshots).
 
-The fold is a BITWISE CLONE of ``fused_sigmoid_gating_delta_rule_update_kernel``'s
-GDN branch (same tile, division-form L2 norm, op order). Do NOT reorder into
-tl.dot / reciprocal-multiply; keep num_warps=1 so the reduction trees match.
+The recurrence is a clone of ``fused_sigmoid_gating_delta_rule_update_kernel``'s
+GDN branch (division-form L2 norm and operation order). Do NOT reorder into
+tl.dot / reciprocal-multiply; keep num_warps=1 so the K reduction trees match.
 """
 
 from __future__ import annotations
@@ -84,8 +84,9 @@ def gdn_replayssm_exact_fold_kernel(
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
 
-    # Checkpoint-bandwidth bound. Tuning tried and rejected: num_stages (no-op),
-    # num_warps > 1 (breaks the bitwise clone), evict_first (loses cold-L2).
+    # Checkpoint-bandwidth bound. num_warps > 1 changes the K reduction tree;
+    # evict_first loses the cold-L2 path. The value tile is independent across
+    # columns and is selected by the wrapper for register occupancy.
     p_h0 = (
         h0
         + state_idx * stride_state_slot
@@ -164,7 +165,7 @@ def commit_gdn_replayssm_fold_all_layers(
     V = rawv_cache.shape[-1]
     B = ssm_state_indices.shape[0]
     BK = triton.next_power_of_2(K)
-    BV = min(triton.next_power_of_2(V), 32)
+    BV = min(triton.next_power_of_2(V), 16)
     grid = (triton.cdiv(V, BV), B, HV * num_layers)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
     if has_track:
