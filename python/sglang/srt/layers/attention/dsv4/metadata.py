@@ -114,7 +114,7 @@ class PagedIndexerMetadata:
     c4_seq_lens: torch.Tensor
     force_deep_gemm_metadata: bool = False
     use_prefill_cuda_graph: bool = False
-    enable_topk_v2: bool = True
+    topk_v2_backend_eligible: bool = True
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
@@ -153,7 +153,7 @@ class PagedIndexerMetadata:
 
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)
 
-        if self.enable_topk_v2 and envs.SGLANG_OPT_USE_TOPK_V2.get():
+        if self.topk_v2_backend_eligible and envs.SGLANG_OPT_USE_TOPK_V2.get():
             from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
 
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
@@ -189,7 +189,7 @@ class PagedIndexerMetadata:
                 "page_size",
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
-                "enable_topk_v2",
+                "topk_v2_backend_eligible",
             ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,

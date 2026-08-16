@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
+    Dict,
     List,
     Optional,
     Tuple,
@@ -262,6 +264,9 @@ def _topk_transform_512_vectorized(
     out_page_indices: torch.Tensor,
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
+    topk_op: Callable[..., Tuple[torch.Tensor, torch.Tensor]] = torch.topk,
+    topk_op_kwargs: Optional[Dict[str, object]] = None,
+    contiguous_topk_input: bool = False,
 ) -> None:
     TOPK = out_page_indices.shape[1]
     batch_size = scores.shape[0]
@@ -289,9 +294,13 @@ def _topk_transform_512_vectorized(
     masked_scores.masked_fill_(~valid_mask, float("-inf"))
 
     actual_k = min(TOPK, max_seq_len)
-    _, raw_indices = torch.topk(
-        masked_scores, actual_k, dim=1, largest=True, sorted=False
+    topk_kwargs = (
+        {"dim": 1, "largest": True, "sorted": False}
+        if topk_op_kwargs is None
+        else topk_op_kwargs
     )
+    topk_input = masked_scores.contiguous() if contiguous_topk_input else masked_scores
+    _, raw_indices = topk_op(topk_input, actual_k, **topk_kwargs)
     raw_indices = raw_indices.to(torch.int32)
 
     if actual_k < TOPK:
@@ -355,10 +364,44 @@ def topk_transform_512_pytorch_vectorized(
         out_page_indices,
         page_size,
         out_raw_indices,
+        topk_op=torch.topk,
+        topk_op_kwargs={"dim": 1, "largest": True, "sorted": False},
     )
 
 
-def topk_transform_512_flashinfer(
+def topk_transform_512_flashinfer_unfused(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    import flashinfer
+
+    from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+        _flashinfer_tie_break_value,
+    )
+
+    _topk_transform_512_vectorized(
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        out_raw_indices,
+        topk_op=flashinfer.top_k,
+        topk_op_kwargs={
+            "sorted": False,
+            "deterministic": envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
+            "tie_break": _flashinfer_tie_break_value(),
+            "dsa_graph_safe": True,
+        },
+        contiguous_topk_input=True,
+    )
+
+
+def topk_transform_512_flashinfer_fused(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
     page_tables: torch.Tensor,
@@ -383,6 +426,29 @@ def topk_transform_512_flashinfer(
         page_size=page_size,
         out=out_page_indices,
         out_raw_indices=out_raw_indices,
+    )
+
+
+def topk_transform_512_flashinfer(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    topk_transform = (
+        topk_transform_512_flashinfer_fused
+        if envs.SGLANG_DSA_FUSE_TOPK.get()
+        else topk_transform_512_flashinfer_unfused
+    )
+    topk_transform(
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        out_raw_indices,
     )
 
 

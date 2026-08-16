@@ -1,5 +1,6 @@
 import sys
 import unittest
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -72,7 +73,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
 
         self.assertIsNone(metadata.deep_gemm_metadata)
 
-    def test_non_sgl_backend_skips_topk_v2_plan(self):
+    def test_topk_v2_ineligible_backend_skips_plan(self):
         with (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
             envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
@@ -83,7 +84,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
                 page_size=256,
                 page_table=torch.zeros((1, 1), dtype=torch.int32),
                 c4_seq_lens=torch.tensor([65], dtype=torch.int32),
-                enable_topk_v2=False,
+                topk_v2_backend_eligible=False,
             )
 
         plan_topk_v2.assert_not_called()
@@ -91,8 +92,8 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
 
 
 class TestDSV4FlashInferTopK(CustomTestCase):
-    def test_compact_page_transform_uses_fused_flashinfer_api(self):
-        score_storage = torch.empty((2, 80), dtype=torch.float32)
+    def test_compact_page_transform_respects_fuse_topk(self):
+        score_storage = torch.arange(160, dtype=torch.float32).reshape(2, 80)
         scores = score_storage[:, 1:65]
         self.assertFalse(scores.is_contiguous())
 
@@ -100,18 +101,31 @@ class TestDSV4FlashInferTopK(CustomTestCase):
         page_tables = torch.tensor([[7], [11]], dtype=torch.int32)
         out_page_indices = torch.empty((2, 8), dtype=torch.int32)
 
-        for with_raw_output in (False, True):
-            with self.subTest(with_raw_output=with_raw_output):
+        for fuse_topk, with_raw_output in product((False, True), repeat=2):
+            with self.subTest(fuse_topk=fuse_topk, with_raw_output=with_raw_output):
                 out_raw_indices = (
                     torch.empty_like(out_page_indices) if with_raw_output else None
                 )
+
+                def fake_top_k(input: torch.Tensor, k: int, **kwargs):
+                    return torch.topk(
+                        input,
+                        k,
+                        dim=-1,
+                        largest=True,
+                        sorted=kwargs["sorted"],
+                    )
+
+                top_k = MagicMock(side_effect=fake_top_k)
                 top_k_page_table_transform = MagicMock()
                 flashinfer = SimpleNamespace(
-                    top_k_page_table_transform=top_k_page_table_transform
+                    top_k=top_k,
+                    top_k_page_table_transform=top_k_page_table_transform,
                 )
 
                 with (
                     patch.dict(sys.modules, {"flashinfer": flashinfer}),
+                    envs.SGLANG_DSA_FUSE_TOPK.override(fuse_topk),
                     envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.override(True),
                     envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("small"),
                 ):
@@ -124,6 +138,25 @@ class TestDSV4FlashInferTopK(CustomTestCase):
                         out_raw_indices=out_raw_indices,
                     )
 
+                if not fuse_topk:
+                    top_k_page_table_transform.assert_not_called()
+                    top_k.assert_called_once()
+                    call = top_k.call_args
+                    self.assertTrue(call.args[0].is_contiguous())
+                    self.assertEqual(call.args[0].shape, scores.shape)
+                    self.assertEqual(call.args[1], out_page_indices.shape[1])
+                    self.assertEqual(
+                        call.kwargs,
+                        {
+                            "sorted": False,
+                            "deterministic": True,
+                            "tie_break": 1,
+                            "dsa_graph_safe": True,
+                        },
+                    )
+                    continue
+
+                top_k.assert_not_called()
                 top_k_page_table_transform.assert_called_once()
                 call = top_k_page_table_transform.call_args
                 self.assertIs(call.args[0], scores)
