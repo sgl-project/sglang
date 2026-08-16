@@ -18,4 +18,3 @@ class PreprocessCacheLookup:
     processor_state: Any
     feature_hashes: tuple[Optional[int], ...]
     feature_identities: tuple[Optional[str], ...]
-    identity_sources: tuple[str, ...]

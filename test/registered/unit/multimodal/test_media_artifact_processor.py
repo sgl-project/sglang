@@ -89,9 +89,6 @@ class _Processor(MediaArtifactCacheMixin):
             for entry in entries
         ]
 
-    def observe_preprocess_phase(self, phase, duration):
-        pass
-
     def close(self):
         self.io_executor.shutdown()
 

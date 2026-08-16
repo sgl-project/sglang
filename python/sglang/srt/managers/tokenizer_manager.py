@@ -769,11 +769,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
                 bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
             )
-            if self.mm_processor is not None:
-                self.mm_processor.set_preprocess_metrics_callback(
-                    self.metrics_collector.observe_mm_preprocess_phase
-                )
-
             start_cpu_monitor_thread("tokenizer")
 
         if self.server_args.gc_warning_threshold_secs > 0.0:
@@ -1133,48 +1128,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and obj.image_data
                 and not self.server_args.language_only
             ):
-                lookup_start = time.perf_counter()
-                try:
-                    preprocess_cache_lookup = (
-                        await self.mm_processor.lookup_preprocess_cache(
-                            obj.image_data, obj
-                        )
-                    )
-                except ValueError:
-                    if self.enable_metrics:
-                        self.metrics_collector.record_mm_preprocess_cache(
-                            "invalid", len(obj.image_data)
-                        )
-                    raise
-                finally:
-                    if self.enable_metrics:
-                        self.metrics_collector.observe_mm_preprocess_phase(
-                            "hash", time.perf_counter() - lookup_start
-                        )
-                if self.enable_metrics:
-                    if preprocess_cache_lookup is None:
-                        if self.mm_processor.supports_early_mm_cache:
-                            self.metrics_collector.record_mm_preprocess_cache(
-                                "bypass", len(obj.image_data)
-                            )
-                    else:
-                        hits = sum(
-                            value is not None
-                            for value in preprocess_cache_lookup.feature_hashes
-                        )
-                        self.metrics_collector.record_mm_preprocess_cache("hit", hits)
-                        self.metrics_collector.record_mm_preprocess_cache(
-                            "miss", len(obj.image_data) - hits
-                        )
-                        for source in preprocess_cache_lookup.identity_sources:
-                            self.metrics_collector.record_mm_content_identity(source)
-                        cache_stats = self.mm_processor.mm_preprocess_cache.stats()
-                        self.metrics_collector.set_mm_preprocess_cache_state(
-                            cache_stats["entries"],
-                            cache_stats["size_bytes"],
-                            cache_stats["evictions"],
-                            cache_stats["singleflight_joins"],
-                        )
+                preprocess_cache_lookup = (
+                    await self.mm_processor.lookup_preprocess_cache(obj.image_data, obj)
+                )
                 if preprocess_cache_lookup is not None and any(
                     value is not None
                     for value in preprocess_cache_lookup.feature_hashes
@@ -1198,19 +1154,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         featureless_hit_mask = acquire.hit_mask
                         embedding_lease_id = acquire.lease_id
                         lease_dp_rank = acquire.routed_dp_rank
-                    if self.enable_metrics:
-                        hit_count = sum(acquire.hit_mask) if acquire is not None else 0
-                        self.metrics_collector.record_mm_embedding_acquire(
-                            "hit", hit_count
-                        )
-                        self.metrics_collector.record_mm_embedding_acquire(
-                            "miss",
-                            len(preprocess_cache_lookup.feature_hashes) - hit_count,
-                        )
-                        for stage in ("processor", "transport", "vit"):
-                            self.metrics_collector.record_mm_skipped_stage(
-                                stage, hit_count
-                            )
 
             mm_inputs = None
             mm_processor_input = (
@@ -1369,7 +1312,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         embedding_lease_id,
         lease_dp_rank,
     ):
-        start = time.perf_counter()
         try:
             return await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
@@ -1389,11 +1331,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if embedding_lease_id is not None:
                 self._release_mm_embedding_cache(embedding_lease_id, lease_dp_rank)
             raise
-        finally:
-            if self.enable_metrics:
-                self.metrics_collector.observe_mm_preprocess_phase(
-                    "total", time.perf_counter() - start
-                )
 
     async def _acquire_mm_embedding_cache(
         self,
