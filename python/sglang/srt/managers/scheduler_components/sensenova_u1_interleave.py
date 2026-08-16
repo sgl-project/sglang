@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import logging
 from array import array
+from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum, auto
 from http import HTTPStatus
@@ -17,6 +19,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    FINISH_LENGTH,
     FINISH_MATCHED_TOKEN,
     Modality,
     MultimodalDataItem,
@@ -25,6 +28,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.models.neo_chat_limits import (
+    U1_EXACT_TEXT_CUSTOM_PARAM,
     U1_FLOW_BATCH_ISOLATION_PARAM,
     U1_FLOW_CUSTOM_PARAM,
     U1_FLOW_PREFILL_GRAPH_VARIANT_PARAM,
@@ -40,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 class U1InterleavePhase(Enum):
     DECODING = auto()
+    PREFIX = auto()
     FLOW = auto()
     RESUMING = auto()
 
@@ -53,6 +58,7 @@ class U1InterleaveState:
     image_count: int = 0
     inserted_span_tokens: int = 0
     child: Req | None = None
+    flow_prefix_extra_key: str | None = None
 
 
 def _next_u1_t_index(
@@ -92,10 +98,15 @@ def _clone_multimodal_inputs(
 
 
 class SenseNovaU1InterleaveController:
+    _MAX_PRIMED_FLOW_PREFIXES = 16
+    _MAX_STANDALONE_EXACT_TEXT_STEPS = 256
+    _MAX_STANDALONE_EXACT_TEXT_TOTAL_TOKENS = 1024
+
     def __init__(self, scheduler: Scheduler) -> None:
         self.scheduler = scheduler
         self._parents: dict[str, U1InterleaveState] = {}
         self._children: dict[str, U1InterleaveState] = {}
+        self._primed_flow_prefixes: OrderedDict[str, None] = OrderedDict()
 
     @staticmethod
     def request_spec(req: Req) -> dict | None:
@@ -107,7 +118,10 @@ class SenseNovaU1InterleaveController:
 
     @staticmethod
     def is_internal_child(req: Req) -> bool:
-        return bool(getattr(req, "_sensenova_u1_internal_flow_child", False))
+        return bool(
+            getattr(req, "_sensenova_u1_internal_flow_child", False)
+            or getattr(req, "_sensenova_u1_internal_prefix_child", False)
+        )
 
     @staticmethod
     def is_parked(req: Req) -> bool:
@@ -116,6 +130,23 @@ class SenseNovaU1InterleaveController:
     def register_parent(self, req: Req) -> str | None:
         spec = self.request_spec(req)
         if spec is None:
+            custom_params = req.sampling_params.custom_params
+            exact_spec = (
+                custom_params.get(U1_EXACT_TEXT_CUSTOM_PARAM)
+                if isinstance(custom_params, dict)
+                else None
+            )
+            if isinstance(exact_spec, dict):
+                unsupported = self._unsupported_standalone_exact_text_reason(
+                    req,
+                    exact_spec,
+                )
+                if unsupported is not None:
+                    return unsupported
+                req._sensenova_u1_exact_text = True
+                req.batch_isolation_key = f"sensenova_u1_exact_text:{req.rid}"
+                req.radix_cache_prefix_limit = 0
+                req.skip_radix_cache_insert = True
             return None
 
         unsupported = self._unsupported_reason(req)
@@ -124,11 +155,115 @@ class SenseNovaU1InterleaveController:
 
         namespace = f"sensenova_u1_interleave:{req.rid}"
         req.extra_key = f"{req.extra_key}|{namespace}" if req.extra_key else namespace
-        self._parents[req.rid] = U1InterleaveState(
+        state = U1InterleaveState(
             parent=req,
             spec=spec,
             original_max_new_tokens=int(req.sampling_params.max_new_tokens),
         )
+        self._parents[req.rid] = state
+        req._sensenova_u1_exact_text = True
+        req.batch_isolation_key = f"sensenova_u1_exact_text:{req.rid}"
+        req.radix_cache_prefix_limit = 0
+        req.skip_radix_cache_insert = True
+        self._prepare_exact_text_segment(state)
+        return None
+
+    def _unsupported_standalone_exact_text_reason(
+        self,
+        req: Req,
+        spec: dict,
+    ) -> str | None:
+        allowed_keys = {
+            "compiled_add_rms",
+            "decode_steps",
+            "eos_token_ids",
+            "img_start_token_id",
+            "lm_head_linear",
+        }
+        if unknown_keys := sorted(set(spec) - allowed_keys):
+            return (
+                "SenseNova U1 exact text received unsupported parameters: "
+                + ", ".join(unknown_keys)
+            )
+
+        decode_steps = spec.get("decode_steps")
+        if isinstance(decode_steps, bool) or not isinstance(decode_steps, int):
+            return "SenseNova U1 exact text decode_steps must be an integer"
+        if not 1 <= decode_steps <= self._MAX_STANDALONE_EXACT_TEXT_STEPS:
+            return (
+                "SenseNova U1 exact text decode_steps must be between 1 and "
+                f"{self._MAX_STANDALONE_EXACT_TEXT_STEPS}"
+            )
+        if decode_steps != int(req.sampling_params.max_new_tokens):
+            return "SenseNova U1 exact text decode_steps must equal max_new_tokens"
+        if (
+            len(req.origin_input_ids) + decode_steps
+            > self._MAX_STANDALONE_EXACT_TEXT_TOTAL_TOKENS
+        ):
+            return (
+                "SenseNova U1 exact text prompt plus decode_steps exceeds the "
+                f"{self._MAX_STANDALONE_EXACT_TEXT_TOTAL_TOKENS}-token bound"
+            )
+
+        img_start_token_id = spec.get("img_start_token_id")
+        if (
+            isinstance(img_start_token_id, bool)
+            or not isinstance(img_start_token_id, int)
+            or not 0 <= img_start_token_id < req.vocab_size
+        ):
+            return "SenseNova U1 exact text img_start_token_id is invalid"
+        eos_token_ids = spec.get("eos_token_ids", [])
+        if not isinstance(eos_token_ids, list) or any(
+            isinstance(token_id, bool)
+            or not isinstance(token_id, int)
+            or not 0 <= token_id < req.vocab_size
+            for token_id in eos_token_ids
+        ):
+            return "SenseNova U1 exact text eos_token_ids must be valid token IDs"
+
+        compiled_add_rms = spec.get("compiled_add_rms", False)
+        lm_head_linear = spec.get("lm_head_linear", False)
+        if not isinstance(compiled_add_rms, bool) or not isinstance(
+            lm_head_linear,
+            bool,
+        ):
+            return "SenseNova U1 exact text arithmetic flags must be booleans"
+        if compiled_add_rms != lm_head_linear:
+            return (
+                "SenseNova U1 exact text arithmetic flags must select one "
+                "validated variant together"
+            )
+
+        greedy_sampling = (
+            float(req.sampling_params.temperature) == 0
+            or int(req.sampling_params.top_k) == 1
+        )
+        if not greedy_sampling:
+            return "SenseNova U1 exact text requires greedy temperature=0"
+        if not req.sampling_params.ignore_eos:
+            return "SenseNova U1 exact text requires ignore_eos=true"
+        if req.stream:
+            return "SenseNova U1 exact text does not support streaming"
+        if req.multimodal_inputs is not None or req.input_embeds is not None:
+            return "SenseNova U1 standalone exact text requires text token input"
+        if req.session is not None or req.session_id is not None:
+            return "SenseNova U1 exact text does not support sessions"
+        if (
+            req.return_logprob
+            or req.return_sampling_mask
+            or req.return_hidden_states
+            or req.return_routed_experts
+            or req.return_indexer_topk
+        ):
+            return "SenseNova U1 exact text does not support auxiliary model outputs"
+        if self.scheduler.enable_overlap:
+            return "SenseNova U1 exact text requires --disable-overlap-schedule"
+        if not self.scheduler.spec_algorithm.is_none():
+            return "SenseNova U1 exact text does not support speculative decoding"
+        if self.scheduler.disaggregation_mode != DisaggregationMode.NULL:
+            return "SenseNova U1 exact text does not support disaggregated serving"
+        if self.scheduler.ps.pp_size != 1:
+            return "SenseNova U1 exact text requires pipeline parallel size 1"
         return None
 
     def discard_parent(self, req: Req) -> None:
@@ -206,7 +341,8 @@ class SenseNovaU1InterleaveController:
             )
             req.finished_len = len(req.output_ids)
             return False
-        if req.req_pool_idx is None or req.kv is None:
+        exact_text = bool(getattr(req, "_sensenova_u1_exact_text", False))
+        if not exact_text and (req.req_pool_idx is None or req.kv is None):
             req.finished_reason = FINISH_ABORT(
                 "SenseNova U1 interleave lost the parent KV allocation",
                 HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -215,8 +351,15 @@ class SenseNovaU1InterleaveController:
             return False
 
         try:
-            child = self._build_flow_child(state)
-            self._cache_parent_committed_prefix(req)
+            prefix_key = self._ensure_flow_prefix_key(state)
+            prefix_primed = self._is_flow_prefix_primed(prefix_key)
+            child = (
+                self._build_flow_child(state)
+                if prefix_primed
+                else self._build_prefix_child(state)
+            )
+            if not exact_text:
+                self._cache_parent_committed_prefix(req)
         except Exception as error:
             logger.exception(
                 "SenseNova U1 interleave failed to park parent %s",
@@ -240,7 +383,11 @@ class SenseNovaU1InterleaveController:
         req.finished_len = None
         req.to_finish = None
         req._sensenova_u1_interleave_parked = True
-        state.phase = U1InterleavePhase.FLOW
+        if exact_text and req.req_pool_idx is not None:
+            self._release_exact_parent_kv(req)
+        state.phase = (
+            U1InterleavePhase.FLOW if prefix_primed else U1InterleavePhase.PREFIX
+        )
         state.child = child
         self._children[child.rid] = state
         logger.info(
@@ -249,6 +396,21 @@ class SenseNovaU1InterleaveController:
             state.image_count,
         )
         return True
+
+    def _release_exact_parent_kv(self, req: Req) -> None:
+        release = getattr(
+            self.scheduler,
+            "_release_sensenova_u1_exact_parent_kv",
+            None,
+        )
+        if callable(release):
+            release(req)
+            return
+        release_kv_cache(
+            req,
+            self.scheduler.tree_cache,
+            is_insert=False,
+        )
 
     def _validate_boundary_capacity(self, state: U1InterleaveState) -> str | None:
         parent = state.parent
@@ -301,14 +463,12 @@ class SenseNovaU1InterleaveController:
         custom_params = dict(sampling_params.custom_params or {})
         custom_params.pop("__req__", None)
         custom_params.pop(U1_INTERLEAVE_CUSTOM_PARAM, None)
+        custom_params.pop(U1_EXACT_TEXT_CUSTOM_PARAM, None)
         custom_params[U1_FLOW_CUSTOM_PARAM] = flow_spec
         custom_params[U1_FLOW_BATCH_ISOLATION_PARAM] = (
             f"sensenova_u1_interleave_flow:{parent.rid}:{state.image_count}"
         )
-        # Parent KV was produced in a text batch whose numerical shape can vary
-        # with concurrency. Recompute flow conditioning in this isolated child
-        # so the explicit image seed determines one batch-invariant image.
-        custom_params[U1_FLOW_RADIX_PREFIX_LIMIT_PARAM] = 0
+        custom_params[U1_FLOW_RADIX_PREFIX_LIMIT_PARAM] = image_start
         custom_params[U1_FLOW_PREFILL_GRAPH_VARIANT_PARAM] = "sensenova_u1_flow"
         sampling_params.custom_params = custom_params
         sampling_params.max_new_tokens = 1
@@ -337,13 +497,106 @@ class SenseNovaU1InterleaveController:
             eos_token_ids=parent.eos_token_ids,
             vocab_size=parent.vocab_size,
             priority=parent.priority,
-            extra_key=parent.extra_key,
+            extra_key=state.flow_prefix_extra_key,
         )
         child.tokenizer = parent.tokenizer
         child.multimodal_inputs = _clone_multimodal_inputs(parent.multimodal_inputs)
         child._sensenova_u1_internal_flow_child = True
         child.skip_radix_cache_insert = True
         return child
+
+    def _build_prefix_child(self, state: U1InterleaveState) -> Req:
+        parent = state.parent
+        prefix_ids = [
+            *[int(token_id) for token_id in parent.origin_input_ids],
+            *[int(token_id) for token_id in parent.output_ids],
+        ]
+        self._ensure_flow_prefix_key(state, prefix_ids=prefix_ids)
+        sampling_params = copy.copy(parent.sampling_params)
+        custom_params = dict(sampling_params.custom_params or {})
+        custom_params.pop("__req__", None)
+        custom_params.pop(U1_INTERLEAVE_CUSTOM_PARAM, None)
+        custom_params.pop(U1_EXACT_TEXT_CUSTOM_PARAM, None)
+        custom_params[U1_FLOW_BATCH_ISOLATION_PARAM] = (
+            f"sensenova_u1_interleave_prefix:{parent.rid}:{state.image_count}"
+        )
+        sampling_params.custom_params = custom_params
+        sampling_params.max_new_tokens = 1
+        sampling_params.min_new_tokens = 0
+        sampling_params.stop_token_ids = None
+        sampling_params.stop_strs = []
+        sampling_params.stop_str_max_len = 0
+        sampling_params.stop_regex_strs = []
+        sampling_params.stop_regex_max_len = 0
+        sampling_params.ignore_eos = True
+        sampling_params.logit_bias = None
+
+        child = Req(
+            rid=f"{parent.rid}::sensenova_u1_prefix:{state.image_count}",
+            origin_input_text=None,
+            origin_input_ids=array("q", prefix_ids),
+            sampling_params=sampling_params,
+            stream=False,
+            eos_token_ids=parent.eos_token_ids,
+            vocab_size=parent.vocab_size,
+            priority=parent.priority,
+            extra_key=state.flow_prefix_extra_key,
+        )
+        child.tokenizer = parent.tokenizer
+        child.multimodal_inputs = _clone_multimodal_inputs(parent.multimodal_inputs)
+        child._sensenova_u1_internal_prefix_child = True
+        return child
+
+    def _is_flow_prefix_primed(self, key: str) -> bool:
+        if key not in self._primed_flow_prefixes:
+            return False
+        self._primed_flow_prefixes.move_to_end(key)
+        return True
+
+    def _mark_flow_prefix_primed(self, key: str) -> None:
+        self._primed_flow_prefixes.pop(key, None)
+        self._primed_flow_prefixes[key] = None
+        while len(self._primed_flow_prefixes) > self._MAX_PRIMED_FLOW_PREFIXES:
+            self._primed_flow_prefixes.popitem(last=False)
+
+    def _ensure_flow_prefix_key(
+        self,
+        state: U1InterleaveState,
+        *,
+        prefix_ids: list[int] | None = None,
+    ) -> str:
+        if state.flow_prefix_extra_key is None:
+            parent = state.parent
+            if prefix_ids is None:
+                prefix_ids = [
+                    *[int(token_id) for token_id in parent.origin_input_ids],
+                    *[int(token_id) for token_id in parent.output_ids],
+                ]
+            state.flow_prefix_extra_key = self._flow_prefix_extra_key(
+                parent,
+                prefix_ids,
+            )
+        return state.flow_prefix_extra_key
+
+    @staticmethod
+    def _flow_prefix_extra_key(
+        parent: Req,
+        prefix_ids: list[int],
+    ) -> str:
+        hasher = hashlib.sha256()
+        hasher.update(b"sensenova-u1-interleave-flow-prefix-v1")
+        for token_id in prefix_ids:
+            hasher.update(int(token_id).to_bytes(8, "little", signed=True))
+        multimodal_inputs = parent.multimodal_inputs
+        if multimodal_inputs is not None:
+            for item in multimodal_inputs.mm_items:
+                feature = item.feature.detach().cpu().contiguous()
+                hasher.update(str(tuple(feature.shape)).encode("ascii"))
+                hasher.update(str(feature.dtype).encode("ascii"))
+                if feature.dtype == torch.bfloat16:
+                    feature = feature.view(torch.int16)
+                hasher.update(feature.numpy().tobytes())
+        return "sensenova_u1_interleave_prefix:" + hasher.hexdigest()
 
     def complete_child(self, child: Req) -> None:
         state = self._children.pop(child.rid, None)
@@ -357,6 +610,27 @@ class SenseNovaU1InterleaveController:
                 state,
                 f"SenseNova U1 internal flow failed: {child.finished_reason.message}",
             )
+            return
+
+        if bool(getattr(child, "_sensenova_u1_internal_prefix_child", False)):
+            self._mark_flow_prefix_primed(self._ensure_flow_prefix_key(state))
+            try:
+                flow_child = self._build_flow_child(state)
+            except Exception as error:
+                self._fail_parked_parent(
+                    state,
+                    f"SenseNova U1 could not build the internal flow request: {error}",
+                )
+                return
+            if not self.scheduler._add_internal_request_to_queue(flow_child):
+                self._fail_parked_parent(
+                    state,
+                    "SenseNova U1 could not admit the internal flow request",
+                )
+                return
+            state.phase = U1InterleavePhase.FLOW
+            state.child = flow_child
+            self._children[flow_child.rid] = state
             return
 
         try:
@@ -374,12 +648,19 @@ class SenseNovaU1InterleaveController:
             return
 
         parent._sensenova_u1_interleave_parked = False
-        parent._sensenova_u1_live_prefix_len = parent.kv_committed_len
-        parent._sensenova_u1_reuse_prefix_lock_once = True
-        parent.already_computed = max(
-            int(parent.already_computed),
-            int(parent.kv_committed_len),
-        )
+        state.flow_prefix_extra_key = None
+        if bool(getattr(parent, "_sensenova_u1_exact_text", False)):
+            parent.already_computed = 0
+            parent.kv_committed_len = 0
+            parent.radix_cache_prefix_limit = 0
+            self._prepare_exact_text_segment(state)
+        else:
+            parent._sensenova_u1_live_prefix_len = parent.kv_committed_len
+            parent._sensenova_u1_reuse_prefix_lock_once = True
+            parent.already_computed = max(
+                int(parent.already_computed),
+                int(parent.kv_committed_len),
+            )
         state.phase = U1InterleavePhase.RESUMING
         self.scheduler._resume_interleave_parent(parent)
         logger.info(
@@ -387,6 +668,73 @@ class SenseNovaU1InterleaveController:
             parent.rid,
             state.image_count - 1,
         )
+
+    def _prepare_exact_text_segment(self, state: U1InterleaveState) -> None:
+        parent = state.parent
+        remaining = int(parent.sampling_params.max_new_tokens) - len(parent.output_ids)
+        if state.image_count < int(state.spec["max_images"]):
+            remaining -= 1
+        decode_steps = max(remaining, 1)
+        custom_params = dict(parent.sampling_params.custom_params or {})
+        custom_params[U1_EXACT_TEXT_CUSTOM_PARAM] = {
+            "decode_steps": decode_steps,
+            "img_start_token_id": int(state.spec["img_start_token_id"]),
+            "eos_token_ids": sorted(int(token_id) for token_id in parent.eos_token_ids),
+        }
+        parent.sampling_params.custom_params = custom_params
+
+    def consume_exact_text_result(
+        self,
+        req: Req,
+        batch_index: int,
+        logits_output,
+    ) -> int:
+        state = self._parents.get(req.rid)
+        custom_params = req.sampling_params.custom_params
+        exact_spec = (
+            custom_params.get(U1_EXACT_TEXT_CUSTOM_PARAM)
+            if isinstance(custom_params, dict)
+            else None
+        )
+        if (
+            not isinstance(exact_spec, dict)
+            or logits_output is None
+            or logits_output.customized_info is None
+        ):
+            return 1
+        tails = logits_output.customized_info.pop(
+            "sensenova_u1_exact_text_tail",
+            None,
+        )
+        if tails is None:
+            return 1
+        tail = [int(token_id) for token_id in tails[batch_index]]
+        req.output_ids.extend(tail)
+        accepted_len = 1 + len(tail)
+
+        stats_values = logits_output.customized_info.pop(
+            "sensenova_u1_exact_text_stats",
+            None,
+        )
+        if stats_values is not None:
+            self._record_parent_custom_info(
+                req,
+                "sensenova_u1_exact_text_stats",
+                stats_values[batch_index],
+                len(req.output_ids) - accepted_len,
+            )
+
+        if state is not None:
+            terminal_ids = {
+                int(state.spec["img_start_token_id"]),
+                *[int(token_id) for token_id in req.eos_token_ids],
+            }
+            if not any(
+                token_id in terminal_ids for token_id in req.output_ids[-accepted_len:]
+            ):
+                if state.image_count < int(state.spec["max_images"]):
+                    req.to_finish = FINISH_LENGTH(length=len(req.output_ids))
+        return accepted_len
 
     @staticmethod
     def _extract_child_image(child: Req) -> torch.Tensor:
@@ -594,7 +942,10 @@ class SenseNovaU1InterleaveController:
             if state.child is not None:
                 self._children.pop(state.child.rid, None)
 
-            if state.phase == U1InterleavePhase.FLOW:
+            if state.phase in {
+                U1InterleavePhase.PREFIX,
+                U1InterleavePhase.FLOW,
+            }:
                 if parent.req_pool_idx is not None:
                     release_kv_cache(
                         parent,

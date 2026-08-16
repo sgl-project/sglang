@@ -96,9 +96,7 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
-    sensenova_u1_interleave_controller: Optional[
-        SenseNovaU1InterleaveController
-    ] = None
+    sensenova_u1_interleave_controller: Optional[SenseNovaU1InterleaveController] = None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -275,9 +273,20 @@ class SchedulerBatchResultProcessor:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
 
-                    self._maybe_update_reasoning_tokens(req, next_token_id)
+                    accepted_len = 1
+                    if self.sensenova_u1_interleave_controller is not None:
+                        accepted_len = self.sensenova_u1_interleave_controller.consume_exact_text_result(
+                            req,
+                            i,
+                            logits_output,
+                        )
 
-                    req.update_finish_state()
+                    self._maybe_update_reasoning_tokens(
+                        req,
+                        list(req.output_ids[-accepted_len:]),
+                    )
+
+                    req.update_finish_state(accepted_len)
                     interleave_parked = (
                         self.sensenova_u1_interleave_controller is not None
                         and self.sensenova_u1_interleave_controller.maybe_park_parent(

@@ -191,6 +191,68 @@ def build_replay_fb_view(
     )
 
 
+def _copy_preplanned_decode_inputs(
+    buffers: DecodeInputBuffers,
+    forward_batch: ForwardBatch,
+    raw_num_token: int,
+    *,
+    temporal_only_text_mrope: bool = False,
+) -> None:
+    buffers.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+    buffers.positions[:raw_num_token].copy_(forward_batch.positions)
+    _refresh_decode_mrope_positions(
+        buffers,
+        forward_batch,
+        raw_num_token,
+        temporal_only_text_mrope=temporal_only_text_mrope,
+    )
+
+
+def _refresh_decode_mrope_positions(
+    buffers: DecodeInputBuffers,
+    forward_batch: ForwardBatch,
+    raw_num_token: int,
+    *,
+    temporal_only_text_mrope: bool = False,
+) -> None:
+    if buffers.mrope_positions is None:
+        return
+    mm_inputs = forward_batch.mm_inputs
+    all_text = mm_inputs is None or all(item is None for item in mm_inputs)
+    if temporal_only_text_mrope and all_text:
+        temporal_positions = (
+            forward_batch.positions
+            if forward_batch.mrope_positions is None
+            else forward_batch.mrope_positions[0]
+        )
+        buffers.mrope_positions[0, :raw_num_token].copy_(
+            temporal_positions[:raw_num_token]
+        )
+        buffers.mrope_positions[1:, :raw_num_token].zero_()
+        return
+
+    if forward_batch.mrope_positions is not None:
+        buffers.mrope_positions[:, :raw_num_token].copy_(
+            forward_batch.mrope_positions[:, :raw_num_token]
+        )
+    elif temporal_only_text_mrope:
+        buffers.mrope_positions[0, :raw_num_token].copy_(
+            forward_batch.positions[:raw_num_token]
+        )
+
+    if not temporal_only_text_mrope:
+        return
+
+    if raw_num_token != forward_batch.batch_size:
+        raise RuntimeError(
+            "Temporal-only text MRoPE decode graph replay requires one token "
+            "per request"
+        )
+    for request_index in range(forward_batch.batch_size):
+        if mm_inputs[request_index] is None:
+            buffers.mrope_positions[1:, request_index].zero_()
+
+
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
@@ -1179,8 +1241,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"{ragged_layout.graph_num_tokens}"
                 )
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            _copy_preplanned_decode_inputs(
+                self.buffers,
+                forward_batch,
+                self.raw_num_token,
+                temporal_only_text_mrope=bool(
+                    getattr(
+                        self.model_runner.model,
+                        "decode_text_mrope_temporal_only",
+                        False,
+                    )
+                ),
+            )
             if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()
@@ -1235,6 +1307,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raw_num_tokens=raw_num_token,
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
+        )
+        _refresh_decode_mrope_positions(
+            buffers,
+            forward_batch,
+            raw_num_token,
+            temporal_only_text_mrope=bool(
+                getattr(
+                    self.model_runner.model,
+                    "decode_text_mrope_temporal_only",
+                    False,
+                )
+            ),
         )
 
         if (

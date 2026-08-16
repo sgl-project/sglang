@@ -4,12 +4,20 @@ import json
 import os
 import sys
 from array import array
+from collections import OrderedDict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import torch
+from torch import nn
 from sglang.srt.configs.neo_chat import NEOChatConfig
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.models.neo_chat import _flow_weight_target, _stacked_weight_target
+from sglang.srt.models.neo_chat import (
+    NEOChatModel,
+    _flow_weight_target,
+    _stacked_weight_target,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from transformers import AutoConfig
 
@@ -137,6 +145,48 @@ def test_neo_chat_flow_request_captures_batch_isolation_key() -> None:
 
     assert req.batch_isolation_key == "u1-flow:test"
     assert req._compute_max_prefix_len(20) == 7
+
+
+def test_neo_chat_reuses_bounded_flow_timestep_embeddings() -> None:
+    class CountingEmbedder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = nn.Parameter(torch.ones(1))
+            self.calls = 0
+
+        def forward(self, values: torch.Tensor) -> torch.Tensor:
+            self.calls += 1
+            return values[:, None].repeat(1, 4)
+
+    class FakeFlowModules(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.timestep_embedder = CountingEmbedder()
+            self.add_noise_scale_embedding = False
+
+    model = object.__new__(NEOChatModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(noise_scale_max_value=1.0)
+    model.fm_modules = FakeFlowModules()
+    model._flow_timestep_embed_cache = OrderedDict()
+    timesteps = torch.tensor([0.0, 0.5, 1.0])
+
+    first, first_hit = model._flow_timestep_embeds(
+        timesteps=timesteps,
+        image_token_count=3,
+        noise_scale=1.0,
+    )
+    second, second_hit = model._flow_timestep_embeds(
+        timesteps=timesteps,
+        image_token_count=3,
+        noise_scale=1.0,
+    )
+
+    assert not first_hit
+    assert second_hit
+    assert model.fm_modules.timestep_embedder.calls == 2
+    assert first[0] is second[0]
+    assert len(model._flow_timestep_embed_cache) == 1
 
 
 @pytest.mark.skipif(
