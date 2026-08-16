@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     Qwen3VLVisionTransformer,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.srt.layers.layernorm import RMSNorm
 
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
@@ -57,10 +58,18 @@ from transformers.models.qwen3_vl.configuration_qwen3_vl import (
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLCausalLMOutputWithPast,
     Qwen3VLModelOutputWithPast,
-    Qwen3VLTextRMSNorm,
     Qwen3VLTextRotaryEmbedding,
     apply_rotary_pos_emb,
 )
+
+
+def _make_text_rms_norm(hidden_size: int, eps: float) -> RMSNorm:
+    return RMSNorm(
+        hidden_size,
+        eps=eps,
+        cast_x_before_out_mul=True,
+        deterministic=True,
+    )
 
 
 class Qwen3VLQuantizedLinear(ReplicatedLinear):
@@ -270,12 +279,8 @@ class Qwen3VLTextAttention(nn.Module):
             use_tensor_parallel=use_tensor_parallel,
             prefix=f"{prefix}.o_proj",
         )
-        self.q_norm = Qwen3VLTextRMSNorm(
-            self.head_dim, eps=config.rms_norm_eps
-        )  # unlike olmo, only on the head dim!
-        self.k_norm = Qwen3VLTextRMSNorm(
-            self.head_dim, eps=config.rms_norm_eps
-        )  # thus post q_norm does not need reshape
+        self.q_norm = _make_text_rms_norm(self.head_dim, config.rms_norm_eps)
+        self.k_norm = _make_text_rms_norm(self.head_dim, config.rms_norm_eps)
 
         self.attn = LocalAttention(
             num_heads=self.num_heads,
@@ -432,11 +437,11 @@ class Qwen3VLTextDecoderLayer(nn.Module):
             use_tensor_parallel=use_tensor_parallel,
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = Qwen3VLTextRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.input_layernorm = _make_text_rms_norm(
+            config.hidden_size, config.rms_norm_eps
         )
-        self.post_attention_layernorm = Qwen3VLTextRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.post_attention_layernorm = _make_text_rms_norm(
+            config.hidden_size, config.rms_norm_eps
         )
 
     def forward(
@@ -505,7 +510,7 @@ class Qwen3VLTextModel(nn.Module):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = _make_text_rms_norm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 

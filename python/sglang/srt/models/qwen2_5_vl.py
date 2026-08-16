@@ -140,10 +140,21 @@ class Qwen2_5_VLMLP(nn.Module):
         use_data_parallel: bool = False,
         deterministic_activation: Optional[bool] = None,
         fuse_gate_up: bool = True,
+        tp_size: Optional[int] = None,
+        tp_rank: Optional[int] = None,
     ):
         super().__init__()
-        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
-        self.tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
+        if use_data_parallel:
+            if tp_size is not None or tp_rank is not None:
+                raise ValueError(
+                    "Explicit MLP TP cannot be combined with data parallel"
+                )
+            self.tp_size, self.tp_rank = 1, 0
+        else:
+            if (tp_size is None) != (tp_rank is None):
+                raise ValueError("MLP tp_size and tp_rank must be set together")
+            self.tp_size = get_parallel().tp_size if tp_size is None else tp_size
+            self.tp_rank = get_parallel().tp_rank if tp_rank is None else tp_rank
         self.fuse_gate_up = fuse_gate_up
         if fuse_gate_up:
             self.gate_up_proj = MergedColumnParallelLinear(
@@ -182,8 +193,10 @@ class Qwen2_5_VLMLP(nn.Module):
             tp_rank=self.tp_rank,
         )
         self.hidden_act = hidden_act
-        if self.hidden_act == "silu":
+        if self.fuse_gate_up and self.hidden_act == "silu":
             self.act = SiluAndMul(deterministic=deterministic_activation)
+        elif not self.fuse_gate_up:
+            self.act = ACT2FN[self.hidden_act]
         else:
             base_act = ACT2FN[self.hidden_act]
 
@@ -196,11 +209,11 @@ class Qwen2_5_VLMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.fuse_gate_up:
             gate_up, _ = self.gate_up_proj(x)
+            x = self.act(gate_up)
         else:
             gate, _ = self.gate_proj(x)
             up, _ = self.up_proj(x)
-            gate_up = torch.cat((gate, up), dim=-1)
-        x = self.act(gate_up)
+            x = self.act(gate) * up
         x_down, _ = self.down_proj(x)
         return x_down
 

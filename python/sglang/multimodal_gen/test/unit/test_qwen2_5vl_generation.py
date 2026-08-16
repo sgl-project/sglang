@@ -15,6 +15,8 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl import (
     Qwen2_5_VLAttention,
     Qwen2_5_VLForConditionalGeneration,
     _apply_repetition_penalty,
+    _make_column_linear,
+    _make_row_linear,
     _select_next_token,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_vision import (
@@ -24,6 +26,7 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_vision import (
     _vision_window_index,
 )
 from sglang.multimodal_gen.runtime.pipelines.longcat_image import LongCatImagePipeline
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.models.qwen2_5_vl import (
     Qwen2_5_VisionPatchEmbed,
     Qwen2_5_VisionPatchMerger,
@@ -102,6 +105,14 @@ def test_native_vision_reuses_srt_modules():
     assert hasattr(mlp, "gate_proj")
     assert hasattr(mlp, "up_proj")
     assert mlp.act is not None
+    assert isinstance(
+        _make_column_linear(16, 24, bias=False, use_tensor_parallel=False),
+        ReplicatedLinear,
+    )
+    assert isinstance(
+        _make_row_linear(24, 16, bias=False, use_tensor_parallel=False),
+        ReplicatedLinear,
+    )
 
 
 def test_explicit_attention_mask_is_limited_to_cached_generation(monkeypatch):

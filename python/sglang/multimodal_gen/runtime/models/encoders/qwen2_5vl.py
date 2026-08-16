@@ -5,7 +5,6 @@ from transformers import (
     DynamicCache,
     PretrainedConfig,
     Qwen2_5_VLTextConfig,
-    Qwen2RMSNorm,
 )
 from transformers.masking_utils import (
     create_causal_mask,
@@ -17,15 +16,11 @@ from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
 
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
 from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_rank,
     get_tp_world_size,
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
-from sglang.multimodal_gen.runtime.layers.linear import (
-    ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    RowParallelLinear,
-)
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
@@ -33,7 +28,14 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_vision import (
     Qwen2_5VLVisionTransformer,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.utils.common import add_prefix
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLMLP
 
 # coding=utf-8
 # Adapted from
@@ -70,7 +72,6 @@ except ImportError:
 
 import torch
 import torch.nn as nn
-from transformers.activations import ACT2FN
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLCausalLMOutputWithPast,
     Qwen2_5_VLModelOutputWithPast,
@@ -134,6 +135,12 @@ def _tp_world_size() -> int:
     return get_tp_world_size()
 
 
+def _tp_rank() -> int:
+    if not model_parallel_is_initialized():
+        return 0
+    return get_tp_rank()
+
+
 def _linear_output(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
     output = linear(x)
     return output[0] if isinstance(output, tuple) else output
@@ -152,8 +159,10 @@ def _make_column_linear(
             out_features,
             bias=bias,
             gather_output=False,
+            tp_size=_tp_world_size(),
+            tp_rank=_tp_rank(),
         )
-    return nn.Linear(in_features, out_features, bias=bias)
+    return ReplicatedLinear(in_features, out_features, bias=bias)
 
 
 def _make_row_linear(
@@ -168,8 +177,10 @@ def _make_row_linear(
             in_features,
             out_features,
             bias=bias,
+            tp_size=_tp_world_size(),
+            tp_rank=_tp_rank(),
         )
-    return nn.Linear(in_features, out_features, bias=bias)
+    return ReplicatedLinear(in_features, out_features, bias=bias)
 
 
 class Qwen2_5_VLAttention(nn.Module):
@@ -324,38 +335,6 @@ class Qwen2_5_VLAttention(nn.Module):
         return attn_output
 
 
-class Qwen2_5_VLTextMLP(nn.Module):
-    def __init__(self, config: Qwen2_5_VLTextConfig):
-        super().__init__()
-        tp_size = _tp_world_size()
-        use_tensor_parallel = tp_size > 1 and config.intermediate_size % tp_size == 0
-        self.gate_proj = _make_column_linear(
-            config.hidden_size,
-            config.intermediate_size,
-            bias=False,
-            use_tensor_parallel=use_tensor_parallel,
-        )
-        self.up_proj = _make_column_linear(
-            config.hidden_size,
-            config.intermediate_size,
-            bias=False,
-            use_tensor_parallel=use_tensor_parallel,
-        )
-        self.down_proj = _make_row_linear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-            use_tensor_parallel=use_tensor_parallel,
-        )
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.act_fn(_linear_output(self.gate_proj, x)) * _linear_output(
-            self.up_proj, x
-        )
-        return _linear_output(self.down_proj, x)
-
-
 class Qwen2_5_VLDecoderLayer(nn.Module):
     def __init__(self, config: Qwen2_5_VLTextConfig, layer_idx: int):
         super().__init__()
@@ -371,11 +350,23 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
             )
         self.self_attn = Qwen2_5_VLAttention(config, layer_idx)
 
-        self.mlp = Qwen2_5_VLTextMLP(config)
-        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen2RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.mlp = Qwen2_5_VLMLP(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=False,
+            hidden_act=config.hidden_act,
+            prefix=f"model.language_model.layers.{layer_idx}.mlp",
+            fuse_gate_up=False,
+            tp_size=_tp_world_size(),
+            tp_rank=_tp_rank(),
         )
+        norm_kwargs = dict(
+            eps=config.rms_norm_eps,
+            cast_x_before_out_mul=True,
+            deterministic=True,
+        )
+        self.input_layernorm = RMSNorm(config.hidden_size, **norm_kwargs)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, **norm_kwargs)
         self.attention_type = config.layer_types[layer_idx]
 
     def forward(
@@ -443,41 +434,6 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
         return hidden_states
 
 
-class Qwen2_5_VLMLP(nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        hidden_features: int = None,
-        bias: bool = True,
-        hidden_act="silu",
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            input_size=in_features,
-            output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
-            bias=bias,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-        )
-        self.down_proj = RowParallelLinear(
-            hidden_features,
-            in_features,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
-        )
-        self.act = ACT2FN[hidden_act]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        x = self.act(gate) * up
-        x_down, _ = self.down_proj(x)
-        return x_down
-
-
 class Qwen2_5_VLTextModel(nn.Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
@@ -485,8 +441,11 @@ class Qwen2_5_VLTextModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, self.padding_idx
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            prefix="model.language_model.embed_tokens",
         )
         self.layers = nn.ModuleList(
             [
@@ -495,7 +454,12 @@ class Qwen2_5_VLTextModel(nn.Module):
             ]
         )
         self._attn_implementation = config._attn_implementation
-        self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            cast_x_before_out_mul=True,
+            deterministic=True,
+        )
         self.rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
