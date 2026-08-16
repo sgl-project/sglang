@@ -15,12 +15,16 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
-import tomllib
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Iterator, Literal
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib  # type: ignore[no-redef]
 
 from sglang.srt.environ import envs
 
