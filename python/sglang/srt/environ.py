@@ -320,6 +320,13 @@ class Envs:
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
+    # Optional global DP rank filter for torch profiling. Unset preserves the
+    # historical behavior where every rank participates in profiling.
+    SGLANG_TORCH_PROFILER_DP_RANK = EnvInt(None)
+    # Opt-in host-only telemetry for the symmetric-memory DP metadata gather.
+    # Disabled by default so normal gathers do not take the instrumented path.
+    SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY = EnvBool(False)
+    SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY_MAX_RECORDS = EnvInt(256)
     SGLANG_ENABLE_NVTX_SCHEDULER = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_NVTX"
     )
