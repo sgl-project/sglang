@@ -405,6 +405,7 @@ class MHATokenToKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        kv_cache_recipe: Optional[str] = None,
     ):
         super().__init__(
             size,
@@ -418,6 +419,11 @@ class MHATokenToKVPool(KVCache):
         )
         self.head_num = head_num
         self.head_dim = head_dim
+        # MXFP4 (block32 E8M0): packed fp4 data + per-block scale buffers.
+        self.is_mxfp4 = kv_cache_recipe == "fp4_mx_block32"
+        assert not self.is_mxfp4 or head_dim == 128, (
+            "MXFP4 KV cache only supports head_dim=128 (Qwen3)"
+        )
 
         # for disagg with nvlink
         self.enable_custom_mem_pool = get_bool_env_var(
@@ -447,18 +453,59 @@ class MHATokenToKVPool(KVCache):
             ):
                 # [size, head_num, head_dim] for each layer
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
+                if self.is_mxfp4:
+                    # No bf16 buffers in MXFP4 mode; packed fp4 + scale buffers below.
+                    self.k_buffer = []
+                    self.v_buffer = []
+                else:
+                    self.k_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+
+        if self.is_mxfp4:
+            # MXFP4 layout: packed E2M1 data [S, H, D/2] u8 + E8M0 scale [S, H, D/32] u8
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                self.k_data_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
+                        (self.size + self.page_size, self.head_num, self.head_dim // 2),
+                        dtype=torch.uint8,
                         device=self.device,
                     )
                     for _ in range(self.layer_num)
                 ]
-                self.v_buffer = [
+                self.v_data_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
+                        (self.size + self.page_size, self.head_num, self.head_dim // 2),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.k_scale_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, self.head_num, self.head_dim // 32),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_scale_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, self.head_num, self.head_dim // 32),
+                        dtype=torch.uint8,
                         device=self.device,
                     )
                     for _ in range(self.layer_num)
@@ -474,6 +521,17 @@ class MHATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
+        if self.is_mxfp4:
+            self.k_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.k_data_buffer + self.k_scale_buffer],
+                dtype=torch.uint64,
+                device=self.device,
+            )
+            self.v_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.v_data_buffer + self.v_scale_buffer],
+                dtype=torch.uint64,
+                device=self.device,
+            )
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
         self.data_strides = torch.tensor(
             [
@@ -482,6 +540,15 @@ class MHATokenToKVPool(KVCache):
             ],
             device=self.device,
         )
+        if self.is_mxfp4:
+            self.data_strides = torch.tensor(
+                [
+                    np.prod(x.shape[1:]) * x.dtype.itemsize
+                    for x in self.k_data_buffer + self.k_scale_buffer
+                    + self.v_data_buffer + self.v_scale_buffer
+                ],
+                device=self.device,
+            )
 
     def _clear_buffers(self):
         del self.k_buffer
@@ -496,6 +563,14 @@ class MHATokenToKVPool(KVCache):
         v_size_bytes = 0
         for v_cache in self.v_buffer:
             v_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
+        if self.is_mxfp4:
+            # Add the packed fp4 data + E8M0 scale buffers (K and V).
+            k_size_bytes = 0
+            v_size_bytes = 0
+            for x in self.k_data_buffer + self.k_scale_buffer:
+                k_size_bytes += np.prod(x.shape) * x.dtype.itemsize
+            for x in self.v_data_buffer + self.v_scale_buffer:
+                v_size_bytes += np.prod(x.shape) * x.dtype.itemsize
         return k_size_bytes, v_size_bytes
 
     # for disagg
@@ -589,7 +664,21 @@ class MHATokenToKVPool(KVCache):
         return self._get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int):
+        assert not self.is_mxfp4, (
+            "get_kv_buffer is not supported in MXFP4 mode; use get_kv_fp4_buffers + dequantize"
+        )
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def get_kv_fp4_buffers(self, layer_id: int):
+        """Return (k_data, k_scale, v_data, v_scale) packed buffers for a layer."""
+        assert self.is_mxfp4, "get_kv_fp4_buffers requires MXFP4 mode"
+        local_id = layer_id - self.start_layer
+        return (
+            self.k_data_buffer[local_id],
+            self.k_scale_buffer[local_id],
+            self.v_data_buffer[local_id],
+            self.v_scale_buffer[local_id],
+        )
 
     def set_kv_buffer(
         self,
@@ -607,6 +696,21 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+
+        if self.is_mxfp4:
+            # Quantize bf16 K/V and store packed fp4 + E8M0 scales.
+            from sglang.srt.layers.jit_kernels.mxfp4_kv import quantize_and_store
+
+            local_id = layer_id - self.start_layer
+            quantize_and_store(
+                cache_k, loc, self.k_data_buffer[local_id], self.k_scale_buffer[local_id]
+            )
+            quantize_and_store(
+                cache_v, loc, self.v_data_buffer[local_id], self.v_scale_buffer[local_id]
+            )
+            torch.cuda.synchronize()  # DEBUG
+            return
+
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)

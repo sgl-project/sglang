@@ -1240,6 +1240,9 @@ class ModelRunner:
                 self.kv_cache_dtype = torch.float8_e4m3fnuz
             else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
+        elif self.server_args.kv_cache_dtype == "fp4_mx_block32":
+            # Stored as packed uint8; pool allocates data + scale buffers.
+            self.kv_cache_dtype = torch.uint8
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
@@ -1474,6 +1477,7 @@ class ModelRunner:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                    kv_cache_recipe=self.server_args.kv_cache_dtype,
                 )
 
         # Initialize token_to_kv_pool_allocator

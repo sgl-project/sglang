@@ -70,7 +70,7 @@ __device__ __forceinline__ int exp_from_max(float block_max) {
 
 __global__ void mxfp4_quantize_store_kernel(
     const __nv_bfloat16* __restrict__ cache_kv,  // [T, H, 128] bf16
-    const int* __restrict__ loc,          // [T] slot per token
+    int64_t* __restrict__ loc,            // [T] slot per token (int64, no conversion)
     uint8_t* __restrict__ data,           // [S, H, 64]
     uint8_t* __restrict__ scale,          // [S, H, 4]
     int T, int H) {
@@ -85,7 +85,9 @@ __global__ void mxfp4_quantize_store_kernel(
   if (row >= T * H) return;
   const int token = row / H;
   const int head = row % H;
-  const int slot = loc[token];
+  const int slot = (int)loc[token];
+
+  // Load 8 bf16 (128-bit) starting at element sub_lane*8.
 
   // Load 8 bf16 (128-bit) starting at element sub_lane*8.
   const int elem0 = sub_lane * 8;

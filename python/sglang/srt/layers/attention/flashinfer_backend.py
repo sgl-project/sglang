@@ -122,6 +122,18 @@ class FlashInferAttnBackend(AttentionBackend):
         ):
             global_config.flashinfer_workspace_size = 512 * 1024 * 1024
 
+        # MXFP4 (block32) support: decode/prefill read packed fp4 KV via a
+        # dequant workspace; pool stores data + scale buffers.
+        self.is_mxfp4 = model_runner.server_args.kv_cache_dtype == "fp4_mx_block32"
+        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
+            get_attention_tp_size()
+        )
+        self.head_dim = model_runner.model_config.head_dim
+        self._ws_kv = None  # lazy (n_tokens, kv_heads, head_dim) bf16 workspaces
+        self._compact_indices = None  # lazy arange buffer for flashinfer (fp4 mode)
+        self.cur_kv_indices = None  # set per step in call_begin_forward
+        self.cur_kv_len = 0
+
         # Allocate buffers
         global global_workspace_buffer
         if global_workspace_buffer is None:
@@ -533,9 +545,29 @@ class FlashInferAttnBackend(AttentionBackend):
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
+                if self.is_mxfp4:
+                    from sglang.srt.layers.jit_kernels.mxfp4_kv import (
+                        dequantize_indices,
+                    )
+
+                    kv_pool = forward_batch.token_to_kv_pool
+                    k_data, k_scale, v_data, v_scale = kv_pool.get_kv_fp4_buffers(
+                        layer.layer_id
+                    )
+                    indices = self.cur_kv_indices
+                    n = self.cur_kv_len
+                    ws_k, ws_v = self._get_dequant_workspace(n)
+                    dequantize_indices(k_data, k_scale, indices, ws_k)
+                    dequantize_indices(v_data, v_scale, indices, ws_v)
+                    kv = (ws_k[:n], ws_v[:n])
+                else:
+                    kv = forward_batch.token_to_kv_pool.get_kv_buffer(
+                        layer.layer_id
+                    )
+
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    kv,
                     causal=False,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
@@ -576,17 +608,50 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
         # Call the wrapped function
+        if self.is_mxfp4:
+            from sglang.srt.layers.jit_kernels.mxfp4_kv import dequantize_indices
+
+            kv_pool = forward_batch.token_to_kv_pool
+            k_data, k_scale, v_data, v_scale = kv_pool.get_kv_fp4_buffers(
+                layer.layer_id
+            )
+            indices = self.cur_kv_indices
+            n = self.cur_kv_len
+            ws_k, ws_v = self._get_dequant_workspace(n)
+            dequantize_indices(k_data, k_scale, indices, ws_k)
+            dequantize_indices(v_data, v_scale, indices, ws_v)
+            kv = (ws_k[:n], ws_v[:n])
+        else:
+            kv = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            kv,
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
             # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
             k_scale=layer.k_scale_float,
             v_scale=layer.v_scale_float,
         )
-
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _get_compact_indices(self, n_tokens: int) -> torch.Tensor:
+        """0..n-1 row indices for flashinfer in fp4 mode (workspace is compact)."""
+        if self._compact_indices is None or self._compact_indices.numel() < n_tokens:
+            self._compact_indices = torch.arange(
+                n_tokens, dtype=torch.int32, device="cuda"
+            )
+        return self._compact_indices[:n_tokens]
+
+    def _get_dequant_workspace(self, n_tokens: int):
+        """Lazily-sized bf16 (K, V) workspace for dequantizing packed fp4 KV."""
+        if self._ws_kv is None or self._ws_kv[0].shape[0] < n_tokens:
+            shape = (n_tokens, self.num_kv_heads, self.head_dim)
+            self._ws_kv = (
+                torch.empty(shape, dtype=torch.bfloat16, device="cuda"),
+                torch.empty(shape, dtype=torch.bfloat16, device="cuda"),
+            )
+        return self._ws_kv
 
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
@@ -610,7 +675,11 @@ class FlashInferIndicesUpdaterDecode:
             get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
-        self.data_type = model_runner.kv_cache_dtype
+        if model_runner.server_args.kv_cache_dtype == "fp4_mx_block32":
+            # Packed fp4 is dequantized to bf16 workspace before flashinfer reads it.
+            self.data_type = model_runner.dtype
+        else:
+            self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
@@ -799,9 +868,18 @@ class FlashInferIndicesUpdaterDecode:
             global_override_indptr_cpu[0] = 0
             global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(seq_lens_cpu, dim=0)
 
+        if self.attn_backend.is_mxfp4:
+            # Workspace rows are compacted 0..n-1; flashinfer must index them
+            # by compact ids, not global slot ids.
+            plan_kv_indices = self.attn_backend._get_compact_indices(
+                paged_kernel_lens_sum
+            )
+        else:
+            plan_kv_indices = kv_indices
+
         wrapper.begin_forward(
             kv_indptr,
-            kv_indices,
+            plan_kv_indices,
             self.kv_last_page_len[:bs],
             self.num_qo_heads,
             self.num_kv_heads,
@@ -811,6 +889,10 @@ class FlashInferIndicesUpdaterDecode:
             q_data_type=self.q_data_type,
             non_blocking=True,
         )
+
+        # Stash for fp4 dequant in forward_decode (indices order == workspace order).
+        self.attn_backend.cur_kv_indices = kv_indices
+        self.attn_backend.cur_kv_len = paged_kernel_lens_sum
 
         if locally_override:
             global_override_indptr_cpu = None
@@ -826,7 +908,11 @@ class FlashInferIndicesUpdaterPrefill:
             get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
-        self.data_type = model_runner.kv_cache_dtype
+        if model_runner.server_args.kv_cache_dtype == "fp4_mx_block32":
+            # Packed fp4 is dequantized to bf16 workspace before flashinfer reads it.
+            self.data_type = model_runner.dtype
+        else:
+            self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
@@ -1056,10 +1142,19 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
         # cached part
+        if self.attn_backend.is_mxfp4:
+            # Workspace rows are compacted 0..n-1; flashinfer must index them
+            # by compact ids, not global slot ids.
+            plan_kv_indices = self.attn_backend._get_compact_indices(
+                paged_kernel_lens_sum
+            )
+        else:
+            plan_kv_indices = kv_indices
+
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
-            kv_indices,
+            plan_kv_indices,
             self.kv_last_page_len[:bs],
             self.num_qo_heads,
             self.num_kv_heads,
@@ -1070,6 +1165,10 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask=custom_mask,
             non_blocking=True,
         )
+
+        # Stash for fp4 dequant in forward (paged prefix KV read).
+        self.attn_backend.cur_kv_indices = kv_indices
+        self.attn_backend.cur_kv_len = paged_kernel_lens_sum
 
 
 class FlashInferMultiStepDraftBackend:

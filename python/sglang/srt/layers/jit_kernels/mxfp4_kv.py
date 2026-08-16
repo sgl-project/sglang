@@ -44,7 +44,7 @@ void mxfp4_quantize_store(torch::Tensor cache_kv, torch::Tensor loc,
   const int grid = (rows + 15) / 16;
   mxfp4_quantize_store_kernel<<<grid, 256>>>(
       (const __nv_bfloat16*)cache_kv.data_ptr(),
-      (const int*)loc.data_ptr(), (uint8_t*)data.data_ptr(),
+      (int64_t*)loc.data_ptr(), (uint8_t*)data.data_ptr(),
       (uint8_t*)scale.data_ptr(), (int)t, (int)h);
 }
 
@@ -95,9 +95,40 @@ def _load_ext():
     return _ext
 
 
+# The kernel reads input tensors from GPU memory that must be plain cudaMalloc
+# allocations. torch's small-object pool (cudaMemMap-backed, used for small
+# tensors) faults on device reads under this driver (CUDA 12.6 / 570), so
+# stage inputs through preallocated large buffers. The staged copies also stay
+# alive across the async kernel launch.
+_KV_BUF_CAP = 32 << 20  # 32M bf16 elements = 64MB, plain cudaMalloc
+_LOC_BUF_CAP = 1 << 20  # 1M slots = 8MB, plain cudaMalloc
+_IDX_BUF_CAP = 1 << 20  # 1M indices = 4MB, plain cudaMalloc
+_buffers = {}  # name -> base tensor; slices keep the base alive here
+# copy_ is async; the source (possibly a temporary from .contiguous()/.to())
+# must stay referenced until the copy kernel has run. Keep one source per
+# staged buffer name; same-stream ordering guarantees the previous copy with
+# the same name finished before the next call.
+_keepalive = {}
+
+
+def _stage(name: str, tensor: torch.Tensor, cap: int, dtype=None) -> torch.Tensor:
+    """Copy into a large plain-cudaMalloc buffer; return the slice view."""
+    n = tensor.numel()
+    assert n <= cap, f"{name} too large: {n} > {cap}"
+    if dtype is not None and tensor.dtype != dtype:
+        tensor = tensor.to(dtype)
+    buf = _buffers.get(name)
+    if buf is None:
+        buf = torch.empty(cap, dtype=tensor.dtype, device="cuda")
+        _buffers[name] = buf
+    _keepalive[name] = tensor
+    buf[:n].view(tensor.shape).copy_(tensor)
+    return buf[:n]
+
+
 def quantize_and_store(
     cache_kv: torch.Tensor,  # [T, H, 128] bf16
-    loc: torch.Tensor,       # [T] int32 slot per token
+    loc: torch.Tensor,       # [T] int64 slot per token
     data: torch.Tensor,      # [S, H, 64] uint8 out
     scale: torch.Tensor,     # [S, H, 4] uint8 out
 ) -> None:
@@ -105,9 +136,11 @@ def quantize_and_store(
     ext = _load_ext()
     t, h, d = cache_kv.shape
     assert d == 128, "MXFP4 KV kernel only supports head_dim=128"
-    assert cache_kv.is_contiguous() and loc.is_contiguous()
-    assert loc.dtype == torch.int32
-    ext.mxfp4_quantize_store(cache_kv.contiguous(), loc, data, scale, t, h)
+    cache_kv = _stage("kv", cache_kv.contiguous(), _KV_BUF_CAP)
+    loc = _stage("loc", loc, _LOC_BUF_CAP, dtype=torch.int64)
+    ext.mxfp4_quantize_store(cache_kv, loc, data, scale, t, h)
+    # TODO(M1): kernel is async; sync until CUDA-graph path is supported.
+    torch.cuda.synchronize()
 
 
 def dequantize(
@@ -131,6 +164,7 @@ def dequantize_indices(
     ext = _load_ext()
     i = indices.numel()
     h = data.shape[1]
+    indices = _stage("idx", indices, _IDX_BUF_CAP, dtype=torch.int32)
     ext.mxfp4_dequantize_indices(data, scale, indices, out, i, h)
 
 
