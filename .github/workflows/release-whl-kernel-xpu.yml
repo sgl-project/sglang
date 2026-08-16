@@ -56,7 +56,6 @@ jobs:
           path: sgl-kernel-xpu
 
       - name: Build native XPU Docker image
-        timeout-minutes: 120
         run: |
           set -euo pipefail
           IMAGE="sglang-xpu-kernel-release:${{ steps.xpu_meta.outputs.version }}"
@@ -72,15 +71,14 @@ jobs:
           echo "XPU_IMAGE=${IMAGE}" >> "$GITHUB_ENV"
 
       - name: Build and export XPU kernel wheels
-        timeout-minutes: 360
         run: |
           set -euo pipefail
           docker rm -f sgl_kernel_xpu_release_build || true
           docker run -dt \
             --device /dev/dri/ \
             --name sgl_kernel_xpu_release_build \
-            -e CMAKE_BUILD_PARALLEL_LEVEL=128 \
-            -e MAX_JOBS=128 \
+            -e CMAKE_BUILD_PARALLEL_LEVEL=64 \
+            -e MAX_JOBS=64 \
             "${XPU_IMAGE}" \
             /bin/bash -lc 'sleep infinity'
           docker exec \
