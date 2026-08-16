@@ -25,7 +25,7 @@ class _Phase:
     def __init__(self, name: str):
         self.name = name
         self.duration_ms: float = 0.0
-        self.children: list["_Phase"] = []
+        self.children: list[_Phase] = []
 
 
 class StartupProfiler:
