@@ -41,8 +41,11 @@ class MooncakeHostTensorAllocator(HostTensorAllocator):
         self.ptr = None
 
     def free_hugetlb_bytes(self) -> int:
-        # MooncakeHostMemAllocator does its own host allocation and never maps
-        # MAP_HUGETLB from the kernel pool.
+        # Mooncake manages its own host allocation and applies its own hugepage
+        # policy, configured through its own environment variables
+        # (MC_STORE_USE_HUGEPAGE / MC_STORE_HUGEPAGE_SIZE) inside its own arena.
+        # This preflight neither sees nor governs that, so it claims no credit:
+        # 0 means "not this check's budget to spend", not "no hugepages".
         return 0
 
     def allocate(

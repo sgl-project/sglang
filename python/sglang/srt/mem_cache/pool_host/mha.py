@@ -1018,6 +1018,12 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     kernels derive copy sizes from each call's first tensor.
     """
 
+    def _uses_single_host_mapping(self) -> bool:
+        # K and V are two independent mmaps, each rounded up to a whole
+        # hugepage. Their logical sizes can sum to less than the free pool while
+        # the rounded sizes do not fit, so claim no hugetlb credit here.
+        return False
+
     def _init_write_back_staging_buffers(self):
         self.staging_page_capacity = 0
         self.staging_token_capacity = 0

@@ -7,7 +7,11 @@ from collections import defaultdict
 
 import torch
 
-from sglang.srt.mem_cache.storage.mmap import alloc_mmap, free_hugepage_bytes
+from sglang.srt.mem_cache.storage.mmap import (
+    alloc_mmap,
+    free_hugepage_bytes,
+    hugepage_mmap_supported,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +38,12 @@ class HostTensorAllocator:
         allocate() means overriding this too: the answer depends on where the
         memory really comes from, and inheriting it would credit capacity to
         backends that never map MAP_HUGETLB. alloc_mmap honors
-        SGLANG_HUGEPAGE_SIZE, so the pool is spendable here.
+        SGLANG_HUGEPAGE_SIZE, so the pool is spendable here -- but only when
+        libc is loadable, since without it alloc_mmap silently falls back to
+        ordinary pages and the hugetlb pool is never touched.
         """
+        if not hugepage_mmap_supported():
+            return 0
         return free_hugepage_bytes()
 
 
@@ -198,3 +206,22 @@ ALLOC_MEMORY_FUNCS = defaultdict(
         "musa": alloc_with_pin_memory,
     },
 )
+
+
+def alloc_func_uses_allocator(alloc_func) -> bool:
+    """Whether the dispatched allocation function honors the HostTensorAllocator.
+
+    An allowlist, not a denylist: only ``alloc_with_host_register`` is known to
+    route through the selected allocator. ``alloc_with_pin_memory`` (npu/musa)
+    calls ``torch.empty(..., pin_memory=True)`` and ignores it entirely, so
+    anything the allocator reports about where its memory comes from does not
+    describe the allocation that will actually happen. A future dispatch
+    function therefore gets no hugetlb credit until it is added here
+    deliberately.
+    """
+    return alloc_func is alloc_with_host_register
+
+
+def device_uses_allocator(device: str) -> bool:
+    """Whether allocations for ``device`` are dispatched to the selected allocator."""
+    return alloc_func_uses_allocator(ALLOC_MEMORY_FUNCS[device])

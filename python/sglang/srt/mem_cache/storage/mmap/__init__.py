@@ -3,10 +3,16 @@
 
 """Mmap allocator storage backend helpers for SGLang HiCache."""
 
-from .mmap_allocator import alloc_mmap, alloc_shm, free_hugepage_bytes
+from .mmap_allocator import (
+    alloc_mmap,
+    alloc_shm,
+    free_hugepage_bytes,
+    hugepage_mmap_supported,
+)
 
 __all__ = [
     "alloc_mmap",
     "alloc_shm",
     "free_hugepage_bytes",
+    "hugepage_mmap_supported",
 ]

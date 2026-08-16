@@ -68,9 +68,84 @@ def _requested_hugepage_spec():
     return spec
 
 
+def hugepage_mmap_supported() -> bool:
+    """Whether alloc_mmap() can actually issue a MAP_HUGETLB mapping.
+
+    The hugepage path goes through libc's mmap because Python's mmap module
+    cannot pass MAP_HUGETLB. Without libc, alloc_mmap() logs and silently falls
+    back to ordinary pages, so the hugetlb pool is not spendable here.
+    """
+    return _libc is not None
+
+
 def _read_pool_counter(pool_dir: str, name: str) -> int:
     with open(f"{pool_dir}/{name}") as f:
         return int(f.read().strip())
+
+
+def _mems_allowed_nodes() -> Optional[set]:
+    """NUMA nodes this process may allocate from, or None if unknown.
+
+    A ``--membind`` policy (SGLang applies one per scheduler when
+    SGLANG_NUMA_BIND_V2 is on) restricts allocation to a subset of nodes, but
+    the pool counters under /sys/kernel/mm/hugepages are global. Crediting the
+    global pool to a membound process would count pages it cannot allocate.
+    """
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("Mems_allowed_list:"):
+                    value = line.split(":", 1)[1].strip()
+                    nodes = set()
+                    for part in value.split(","):
+                        if not part:
+                            continue
+                        if "-" in part:
+                            lo, hi = part.split("-", 1)
+                            nodes.update(range(int(lo), int(hi) + 1))
+                        else:
+                            nodes.add(int(part))
+                    return nodes
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _hugepage_numa_nodes(page_size: int) -> Optional[set]:
+    """NUMA nodes that have a hugetlb pool of ``page_size``, or None if unknown."""
+    node_root = "/sys/devices/system/node"
+    try:
+        entries = os.listdir(node_root)
+    except OSError:
+        # No per-node view (e.g. non-NUMA kernel or a restricted container).
+        return None
+    nodes = set()
+    for entry in entries:
+        if not entry.startswith("node") or not entry[4:].isdigit():
+            continue
+        pool = f"{node_root}/{entry}/hugepages/hugepages-{page_size // 1024}kB"
+        try:
+            if _read_pool_counter(pool, "free_hugepages") > 0:
+                nodes.add(int(entry[4:]))
+        except (OSError, ValueError):
+            continue
+    return nodes
+
+
+def _numa_policy_allows_whole_pool(page_size: int) -> bool:
+    """Whether every hugepage this process could see is one it may allocate.
+
+    Conservative: returns False whenever the answer cannot be established.
+    """
+    allowed = _mems_allowed_nodes()
+    if allowed is None:
+        return False
+    with_pages = _hugepage_numa_nodes(page_size)
+    if with_pages is None:
+        # No per-node counters to compare against. Only safe if the process is
+        # unrestricted, which on a single-node system it effectively is.
+        return len(allowed) <= 1
+    return with_pages.issubset(allowed)
 
 
 def free_hugepage_bytes(page_size: Optional[int] = None) -> int:
@@ -91,6 +166,10 @@ def free_hugepage_bytes(page_size: Optional[int] = None) -> int:
             return 0
         page_size = spec[0]
     pool_dir = f"{_HUGEPAGE_SYSFS_DIR}/hugepages-{page_size // 1024}kB"
+    if not _numa_policy_allows_whole_pool(page_size):
+        # A membound process cannot spend pages sitting on other nodes, and the
+        # counters here are global. Rather than guess a share, credit nothing.
+        return 0
     try:
         free_pages = _read_pool_counter(pool_dir, "free_hugepages")
     except (OSError, ValueError):
@@ -102,7 +181,11 @@ def free_hugepage_bytes(page_size: Optional[int] = None) -> int:
         # the top rather than handing them out twice.
         reserved = _read_pool_counter(pool_dir, "resv_hugepages")
     except (OSError, ValueError):
-        reserved = 0
+        # free_hugepages was readable but resv_hugepages was not, so there is no
+        # way to tell committed pages apart from spendable ones. Fail closed:
+        # crediting the raw free count here would admit an allocation that the
+        # pool has already promised elsewhere.
+        return 0
     return max(free_pages - reserved, 0) * page_size
 
 

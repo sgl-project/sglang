@@ -11,7 +11,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 import torch
 
@@ -189,11 +189,14 @@ class TestFreeHugepageBytes(unittest.TestCase):
             self._fake_pool(root, 2048, 4, reserved_count=9)
             self.assertEqual(self._read("2MB", root), 0)
 
-    def test_missing_reservation_counter_is_treated_as_zero(self):
+    def test_missing_reservation_counter_fails_closed(self):
+        # Without resv_hugepages there is no way to tell committed pages apart
+        # from spendable ones, and crediting the raw free count would admit an
+        # allocation the pool has already promised elsewhere.
         with tempfile.TemporaryDirectory() as root:
             self._fake_pool(root, 2048, 8)
             os.remove(os.path.join(root, "hugepages-2048kB", "resv_hugepages"))
-            self.assertEqual(self._read("2MB", root), 8 * 2 * 1024 * 1024)
+            self.assertEqual(self._read("2MB", root), 0)
 
     def test_reads_1gb_pool(self):
         with tempfile.TemporaryDirectory() as root:
@@ -300,6 +303,351 @@ class TestAllocatorHugetlbCapacity(unittest.TestCase):
                     f"{cls.__name__} overrides allocate() but inherits "
                     "free_hugetlb_bytes()",
                 )
+
+
+class TestHostKVCacheHugetlbAdmission(unittest.TestCase):
+    """The real HostKVCache.__init__ admission decision, not just its helpers.
+
+    Reverting the base.py gate must break something here; the helper tests alone
+    do not cover the site where the credit is actually spent.
+    """
+
+    GB = 1024**3
+    # 1 GiB per token keeps the pool a handful of tokens wide, so clear()
+    # allocates tiny bookkeeping tensors while the byte budgets stay realistic.
+    BYTES_PER_TOKEN = GB
+
+    def _pool_class(self, device="cuda", single_mapping=True):
+        from sglang.srt.mem_cache.pool_host.base import HostKVCache
+
+        outer = self
+
+        class _FakeHostKVCache(HostKVCache):
+            layer_num = 1
+            target_layer_num = 1
+
+            def get_size_per_token(self):
+                return outer.BYTES_PER_TOKEN
+
+            def init_kv_buffer(self):
+                outer.allocated = True
+                return torch.zeros(1)
+
+            def _uses_single_host_mapping(self):
+                return single_mapping
+
+            # Transfer-path abstract methods, unused by the admission check.
+            def get_data_page(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def get_dummy_flat_data_page(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def set_from_flat_data_page(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def load_to_device_per_layer(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def backup_from_device_all_layer(self, *args, **kwargs):
+                raise NotImplementedError
+
+        return _FakeHostKVCache
+
+    def _build(self, requested_bytes, available_bytes, hugetlb_bytes, **kwargs):
+        """Construct a pool with fully controlled memory budgets."""
+        from sglang.srt.mem_cache.pool_host import base as base_mod
+
+        device = kwargs.pop("device", "cuda")
+        cls = self._pool_class(device=device, **kwargs)
+        self.allocated = False
+
+        tokens = requested_bytes // self.BYTES_PER_TOKEN
+        assert tokens >= 1, "requested_bytes must be a whole number of tokens"
+        device_pool = SimpleNamespace(
+            store_dtype=torch.uint8,
+            # page_size 1 rounds the pool up by exactly one page/token.
+            size=tokens - 1,
+            start_layer=0,
+            end_layer=1,
+            layer_num=1,
+            layer_shard_enabled=False,
+            device=device,
+        )
+        allocator = SimpleNamespace(free_hugetlb_bytes=lambda: hugetlb_bytes, fd=None)
+
+        # available_bytes = MemAvailable - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        vm = SimpleNamespace(
+            available=available_bytes + base_mod.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        )
+        with patch.object(base_mod.psutil, "virtual_memory", return_value=vm), patch(
+            "sglang.srt.mem_cache.pool_host.base.get_allocator_from_storage",
+            return_value=allocator,
+        ):
+            return cls(
+                device_pool=device_pool,
+                host_to_device_ratio=1.0,
+                host_size=0,
+                page_size=1,
+                layout="page_first",
+                pin_memory=False,
+                device="cpu",
+            )
+
+    def test_hugetlb_pool_admits_when_plain_memory_is_short(self):
+        # Eligible single-mapping path on a device that dispatches to the
+        # allocator: the hugetlb pool is the memory the mmap will really use.
+        pool = self._build(
+            requested_bytes=8 * self.GB,
+            available_bytes=1 * self.GB,
+            hugetlb_bytes=64 * self.GB,
+        )
+        self.assertTrue(self.allocated)
+        self.assertGreater(pool.size, 0)
+
+    def test_rejects_and_reports_the_pool_when_both_budgets_are_short(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._build(
+                requested_bytes=8 * self.GB,
+                available_bytes=1 * self.GB,
+                hugetlb_bytes=2 * self.GB,
+            )
+        message = str(ctx.exception)
+        self.assertIn("Not enough host memory available", message)
+        self.assertIn("hugetlb pool", message)
+
+    def test_no_hugetlb_note_when_the_pool_is_empty(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._build(
+                requested_bytes=8 * self.GB,
+                available_bytes=1 * self.GB,
+                hugetlb_bytes=0,
+            )
+        self.assertNotIn("hugetlb pool", str(ctx.exception))
+
+    def test_budgets_are_alternatives_not_additive(self):
+        # The whole premise: the pool is ONE mapping that either fits the
+        # hugetlb pool or falls back to plain pages. Summing the two budgets
+        # would admit a request that neither path alone can satisfy.
+        with self.assertRaises(ValueError):
+            self._build(
+                requested_bytes=8 * self.GB,
+                available_bytes=5 * self.GB,
+                hugetlb_bytes=6 * self.GB,
+            )
+
+    def test_admission_is_exclusive_at_the_boundary(self):
+        # requested == budget must be admitted, not rejected.
+        pool = self._build(
+            requested_bytes=8 * self.GB,
+            available_bytes=1 * self.GB,
+            hugetlb_bytes=8 * self.GB,
+        )
+        self.assertTrue(self.allocated)
+        self.assertGreater(pool.size, 0)
+
+    def test_the_diagnostic_reports_the_hugetlb_figure_not_the_plain_one(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._build(
+                requested_bytes=8 * self.GB,
+                available_bytes=1 * self.GB,
+                hugetlb_bytes=2 * self.GB,
+            )
+        message = str(ctx.exception)
+        # 2 GB free in the pool, 1 GB of plain memory: the note must not quote
+        # the plain figure back to the operator.
+        self.assertIn(f"{2 * self.GB / 1e9:.2f} GB free in the hugetlb pool", message)
+
+    def test_npu_rejects_because_it_never_reaches_the_allocator(self):
+        # ALLOC_MEMORY_FUNCS maps npu/musa to alloc_with_pin_memory, which calls
+        # torch.empty(pin_memory=True) and ignores the selected allocator, so
+        # whatever the allocator reports does not describe this allocation.
+        for device in ("npu", "musa"):
+            with self.subTest(device=device):
+                with self.assertRaises(ValueError):
+                    self._build(
+                        requested_bytes=8 * self.GB,
+                        available_bytes=1 * self.GB,
+                        hugetlb_bytes=64 * self.GB,
+                        device=device,
+                    )
+
+    def test_split_mapping_rejects_on_aggregate_logical_bytes(self):
+        # Two mappings are each rounded up to a whole hugepage, so the sum of
+        # the logical sizes fitting the pool does not mean both mappings fit.
+        with self.assertRaises(ValueError):
+            self._build(
+                requested_bytes=8 * self.GB,
+                available_bytes=1 * self.GB,
+                hugetlb_bytes=64 * self.GB,
+                single_mapping=False,
+            )
+
+
+class TestSplitMappingPoolsAreExcluded(unittest.TestCase):
+    """Pools that issue more than one host mapping must declare it."""
+
+    def test_ordinary_single_mapping_pools_keep_the_credit(self):
+        # The other half of the gate: the default must stay True, or the fix
+        # silently stops helping the very configurations it targets. Asserted
+        # on the real class, not on the base or on a test double.
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+        for layout in ("layer_first", "page_first", "page_first_direct", "page_head"):
+            self.assertTrue(
+                MHATokenToKVPoolHost._uses_single_host_mapping(
+                    SimpleNamespace(layout=layout)
+                ),
+                f"layout={layout!r}",
+            )
+
+    def test_the_override_is_on_the_asymmetric_class_itself(self):
+        # Calling the method through the MRO would still pass if the override
+        # were moved up to the symmetric parent, which would wrongly zero the
+        # credit for every ordinary MHA pool.
+        from sglang.srt.mem_cache.pool_host.mha import (
+            AsymmetricMHATokenToKVPoolHost,
+            MHATokenToKVPoolHost,
+        )
+
+        self.assertIn(
+            "_uses_single_host_mapping", AsymmetricMHATokenToKVPoolHost.__dict__
+        )
+        self.assertNotIn("_uses_single_host_mapping", MHATokenToKVPoolHost.__dict__)
+
+    def test_multi_mapping_pools_do_not_silently_inherit_the_credit(self):
+        # Mirrors test_every_allocator_answers_for_its_own_backing: any pool
+        # that reaches the base preflight must answer for its own mapping
+        # count rather than inherit the single-mapping default.
+        import sglang.srt.mem_cache.memory_pool_host  # noqa: F401  (registers subclasses)
+        from sglang.srt.mem_cache.pool_host.base import HostKVCache
+
+        pending, subclasses = list(HostKVCache.__subclasses__()), []
+        while pending:
+            cls = pending.pop()
+            subclasses.append(cls)
+            pending.extend(cls.__subclasses__())
+        self.assertTrue(subclasses, "no HostKVCache subclasses were imported")
+        for cls in subclasses:
+            init = cls.__dict__.get("__init__")
+            if init is None:
+                continue
+            names = init.__code__.co_names
+            # Pools with their own preflight never reach the base gate.
+            if "virtual_memory" in names:
+                continue
+            self.assertIn(
+                "_uses_single_host_mapping",
+                {n for klass in cls.__mro__ for n in klass.__dict__},
+                f"{cls.__name__} reaches the base preflight",
+            )
+
+    def test_asymmetric_mha_is_not_single_mapping(self):
+        from sglang.srt.mem_cache.pool_host.mha import AsymmetricMHATokenToKVPoolHost
+
+        self.assertFalse(
+            AsymmetricMHATokenToKVPoolHost._uses_single_host_mapping(
+                SimpleNamespace(layout="page_first")
+            )
+        )
+
+    def test_mla_kv_split_layout_is_not_single_mapping(self):
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        read = MLATokenToKVPoolHost._uses_single_host_mapping
+        self.assertFalse(read(SimpleNamespace(layout="page_first_kv_split")))
+        self.assertTrue(read(SimpleNamespace(layout="page_first")))
+
+
+class TestDispatchCapability(unittest.TestCase):
+    def test_only_pin_memory_devices_bypass_the_allocator(self):
+        from sglang.srt.mem_cache.pool_host.common import device_uses_allocator
+
+        self.assertFalse(device_uses_allocator("npu"))
+        self.assertFalse(device_uses_allocator("musa"))
+        self.assertTrue(device_uses_allocator("cuda"))
+        self.assertTrue(device_uses_allocator("cpu"))
+
+    def test_an_unknown_dispatch_function_gets_no_credit(self):
+        # Allowlist, not denylist: a future bypassing dispatch function must
+        # not inherit the credit just by not being alloc_with_pin_memory.
+        from sglang.srt.mem_cache.pool_host.common import alloc_func_uses_allocator
+
+        def some_future_direct_allocator(*args, **kwargs):
+            raise NotImplementedError
+
+        self.assertFalse(alloc_func_uses_allocator(some_future_direct_allocator))
+
+
+class TestHugepageMmapRequiresLibc(unittest.TestCase):
+    def test_default_allocator_reports_zero_without_libc(self):
+        # Without libc, alloc_mmap() cannot pass MAP_HUGETLB and silently falls
+        # back to ordinary pages, so the pool is not capacity it can spend.
+        with tempfile.TemporaryDirectory() as root:
+            TestFreeHugepageBytes._fake_pool(root, 2048, 8)
+            with patch.object(mmap_allocator, "_HUGEPAGE_SYSFS_DIR", root):
+                with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                    with patch.object(mmap_allocator, "_libc", None):
+                        self.assertEqual(HostTensorAllocator().free_hugetlb_bytes(), 0)
+                    self.assertEqual(
+                        HostTensorAllocator().free_hugetlb_bytes(), 8 * 2 * 1024 * 1024
+                    )
+
+
+class TestNumaPolicyGate(unittest.TestCase):
+    """A membound process must not be credited pages on nodes it cannot use."""
+
+    def _pool(self, root, free_count=8):
+        TestFreeHugepageBytes._fake_pool(root, 2048, free_count)
+        return patch.object(mmap_allocator, "_HUGEPAGE_SYSFS_DIR", root)
+
+    def _read(self, root, allowed, with_pages):
+        with self._pool(root):
+            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                with patch.object(
+                    mmap_allocator, "_mems_allowed_nodes", return_value=allowed
+                ), patch.object(
+                    mmap_allocator, "_hugepage_numa_nodes", return_value=with_pages
+                ):
+                    return mmap_allocator.free_hugepage_bytes()
+
+    def test_credits_when_every_hugepage_node_is_allowed(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(
+                self._read(root, allowed={0, 1}, with_pages={0}), 8 * 2 * 1024 * 1024
+            )
+
+    def test_zero_when_pages_sit_on_a_forbidden_node(self):
+        # --membind=0 while the pool lives on node 1: the global counter says
+        # the pages are free, but this process can never allocate them.
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(self._read(root, allowed={0}, with_pages={0, 1}), 0)
+
+    def test_zero_when_the_policy_cannot_be_determined(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(self._read(root, allowed=None, with_pages={0}), 0)
+
+    def test_multi_node_without_per_node_counters_is_not_credited(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(self._read(root, allowed={0, 1}, with_pages=None), 0)
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(
+                self._read(root, allowed={0}, with_pages=None), 8 * 2 * 1024 * 1024
+            )
+
+    def test_mems_allowed_list_parsing(self):
+        read = mmap_allocator._mems_allowed_nodes
+        for value, expected in (
+            ("0", {0}),
+            ("0-3", {0, 1, 2, 3}),
+            ("0,2", {0, 2}),
+            ("0-1,4", {0, 1, 4}),
+        ):
+            with patch(
+                "builtins.open",
+                mock_open(read_data=f"Mems_allowed_list:\t{value}\n"),
+            ):
+                self.assertEqual(read(), expected, f"value={value!r}")
 
 
 if __name__ == "__main__":

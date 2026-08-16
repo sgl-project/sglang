@@ -12,6 +12,7 @@ import torch
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
+    device_uses_allocator,
     get_allocator_from_storage,
 )
 from sglang.srt.utils import is_cuda, is_hip
@@ -143,10 +144,12 @@ class HostKVCache(abc.ABC):
         requested_bytes = self.size * self.size_per_token
         available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
         # Reserved hugepages are excluded from MemAvailable by design, so when
-        # the pool will be mapped from hugetlb the two budgets are alternatives
-        # rather than additive: the allocation is a single mmap that either
-        # fits in the hugetlb pool or falls back to plain pages.
-        hugetlb_bytes = self.allocator.free_hugetlb_bytes()
+        # the pool will really be mapped from hugetlb the two budgets are
+        # alternatives rather than additive: a single mmap either fits in the
+        # hugetlb pool or falls back to plain pages. That equivalence only holds
+        # for the narrow set of paths this credit is enabled for; see
+        # _hugetlb_admission_bytes().
+        hugetlb_bytes = self._hugetlb_admission_bytes()
         if requested_bytes > max(available_bytes, hugetlb_bytes):
             hugetlb_note = (
                 f" ({hugetlb_bytes / 1e9:.2f} GB free in the hugetlb pool)"
@@ -187,6 +190,32 @@ class HostKVCache(abc.ABC):
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
         self.clear()
+
+    def _uses_single_host_mapping(self) -> bool:
+        """Whether init_kv_buffer() issues exactly one host allocation.
+
+        The hugetlb admission credit compares one logical byte total against the
+        free pool, but every mapping is rounded up to a whole hugepage
+        independently. With more than one mapping the sum of the logical sizes
+        can fit while the sum of the rounded sizes does not, so multi-mapping
+        pools get no credit rather than a wrong one.
+        """
+        return True
+
+    def _hugetlb_admission_bytes(self) -> int:
+        """Hugetlb-pool bytes that may be credited against this pool's request.
+
+        Deliberately conservative: credit is granted only when the hugetlb pool
+        is genuinely the memory this pool will be built from. It is zeroed when
+        the allocation dispatch bypasses the selected allocator (npu/musa go
+        through torch's pin_memory path) or when the pool needs more than one
+        mapping and per-mapping hugepage rounding could exceed the pool.
+        """
+        if not device_uses_allocator(self.device_pool.device):
+            return 0
+        if not self._uses_single_host_mapping():
+            return 0
+        return self.allocator.free_hugetlb_bytes()
 
     def destroy(self):
         """Unregister pinned host buffers in userspace before process exit.
