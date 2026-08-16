@@ -27,7 +27,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
-from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
+from sglang.multimodal_gen.runtime.loader.fsdp_load import (
+    register_fsdp_entrypoints,
+    shard_model,
+)
 from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
     skip_init_modules,
@@ -49,6 +52,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_config,
     get_diffusers_component_config,
+    load_dict,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
@@ -341,6 +345,9 @@ class TextEncoderLoader(ComponentLoader):
 
         encoder_config = server_args.pipeline_config.text_encoder_configs[encoder_index]
         encoder_config.update_model_arch(model_config)
+        encoder_config.generation_config = load_dict(
+            os.path.join(component_model_path, "generation_config.json")
+        )
 
         if encoder_index == 0:
             for key, value in diffusers_pretrained_config.__dict__.items():
@@ -499,6 +506,7 @@ class TextEncoderLoader(ComponentLoader):
                         or getattr(model, "_fsdp_shard_conditions", None),
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )
+                    register_fsdp_entrypoints(model)
                 else:
                     model = model.to("cpu")
             else:

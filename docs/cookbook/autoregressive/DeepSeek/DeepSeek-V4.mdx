@@ -1,6 +1,6 @@
 ---
 title: DeepSeek-V4
-description: "Deploy DeepSeek-V4 with SGLang — verified launch commands, benchmarks, and tuning for Flash Official (0731), Flash, and Pro."
+description: "Deploy DeepSeek-V4 with SGLang — verified launch commands, benchmarks, and tuning for Flash Official (0731), Flash, Pro, and Pro Official (0813)."
 tag: NEW
 ---
 
@@ -127,7 +127,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**DeepSeek-V4** is the next-generation Mixture-of-Experts model from DeepSeek, released 2026-04-24 under an **MIT License**. The 0731 Flash refresh adds a checkpoint with a bundled DSpark draft head:
+**DeepSeek-V4** is the next-generation Mixture-of-Experts model from DeepSeek, released 2026-04-24 under an **MIT License**. The 0731 Flash and 0813 Pro refreshes add checkpoints with a bundled DSpark draft head:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -163,6 +163,12 @@ import { Playground } from "/src/snippets/_playground.jsx";
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>49B</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>high-capacity: B200 / B300 (TP=8) · GB300 (TP=4) · H200 FP4 (TP=8) · GB200 (2-node, TP=8) · H200 FP8 (2-node, TP=16) · H100 (2-node, TP=16)</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813">DeepSeek-V4-Pro-0813</a></strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>1.65T</strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>49B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Pro Official (0813), with a bundled DSpark draft head; verified on 4×GB300 (TP=4) · B200 / B300 / H200 FP4 (TP=8) · GB200 (2-node, TP=8) · H100 (2-node, TP=16) · MI355X</td>
+    </tr>
   </tbody>
 </table>
 
@@ -172,7 +178,7 @@ The Instruct checkpoints ship as **FP4 MoE experts + FP8 attention / dense** (on
 
 **Recommended generation:** `temperature=1.0`, `top_p=1.0`.
 
-**Resources:** HuggingFace · [Flash Official (0731)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) · [Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)  ·  ModelScope · [Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro).
+**Resources:** HuggingFace · [Flash Official (0731)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) · [Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) · [Pro Official (0813)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813)  ·  ModelScope · [Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro).
 
 ## 2. Configuration Tips
 
@@ -186,7 +192,11 @@ The generator currently picks values on the **conservative** side (mirroring an 
 
 **Speculative decoding**
 
-The original Flash and Pro recipes use EAGLE. Flash Official (0731) uses the bundled DSpark draft head; see [DSpark](#3-4-dspark-speculative-decoding) for its launch and tuning notes.
+The original Flash and Pro recipes use EAGLE. Flash Official (0731) and Pro Official (0813) use the bundled DSpark draft head; see [DSpark](#3-4-dspark-speculative-decoding) for its launch and tuning notes.
+
+<Warning>
+  Do not use EAGLE on the checkpoints that bundle a DSpark head. On 0813, `--speculative-algorithm EAGLE` starts and serves without any error, but the draft head it binds accepts nothing — every decode batch logs `accept len: 1.00, accept rate: 0.00`, so you pay the draft cost for zero speedup. Output stays correct, which is what makes it easy to miss. Switch to `--speculative-algorithm DSPARK`; the startup log then reports `Draft checkpoint bundles a DSpark head`.
+</Warning>
 
 For the original Flash and Pro checkpoints:
 
@@ -562,9 +572,13 @@ For more details, see the [HiCache documentation](../../../docs/advanced_feature
 
 ### 3.4 DSpark (Speculative Decoding)
 
-Flash Official (0731) bundles a DSpark draft head in `deepseek-ai/DeepSeek-V4-Flash-0731`. The target and draft weights therefore come from the same checkpoint: enable DSpark with `--speculative-algorithm DSPARK` and do not set a separate `--speculative-draft-model-path`.
+Flash Official (0731) and Pro Official (0813) bundle a DSpark draft head in `deepseek-ai/DeepSeek-V4-Flash-0731` and `deepseek-ai/DeepSeek-V4-Pro-0813`. The target and draft weights therefore come from the same checkpoint: enable DSpark with `--speculative-algorithm DSPARK` and do not set a separate `--speculative-draft-model-path`.
 
 Unlike the EAGLE recipes for the original Flash and Pro checkpoints, this recipe omits `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`. SGLang reads the DSpark shape from the checkpoint.
+
+<Note>
+  The Pro Official (0813) low-latency speed numbers in the Deploy panel were measured with `SGLANG_SIMULATE_ACC_LEN=4`, which pins the DSpark accept length at exactly 4.00. The recipe as shipped earns **4.678** on the same engine, so those rows read slightly conservative. The GSM8K figure for that cell is from the shipped command.
+</Note>
 
 The verified 4×GB300 FP4 low-latency command is:
 
@@ -584,7 +598,7 @@ sglang serve \
 
 Keep `--mem-fraction-static 0.90` on this topology to leave enough headroom for the batch-256 verify graph. The first cold start can take 10–15 minutes while FlashInfer autotunes and SGLang captures the draft and verify graphs; later starts reuse the cache. This path is verified end-to-end on 4×GB300 with SGLang v0.5.16.
 
-**Tune proposed draft tokens.** `--speculative-dspark-block-size N` asks DSpark to propose `N` tokens per step; the target verifies a window of `N + 1`. If the flag is omitted, SGLang reads the value from the checkpoint. The current 0731 checkpoint resolves to five proposed tokens, which is the verified default. Use the **DSpark Proposed Draft Tokens** slider in the [Playground](#playground) to sweep one through five.
+**Tune proposed draft tokens.** `--speculative-dspark-block-size N` asks DSpark to propose `N` tokens per step; the target verifies a window of `N + 1`. If the flag is omitted, SGLang reads the value from the checkpoint. Both the 0731 and 0813 checkpoints resolve to five proposed tokens (the startup log reports `gamma=5, verify_num_draft_tokens=6`), which is the verified default. Use the **DSpark Proposed Draft Tokens** slider in the [Playground](#playground) to sweep one through five.
 
 Larger blocks can improve decode latency when acceptance stays high, but they also increase verification work and graph memory. Start from the checkpoint default, then sweep downward under the real prompt-length and concurrency distribution. The gain is usually largest for short interactive traffic and narrows as prefill dominates. Track P50/P99 TTFT and TPOT, total throughput, accepted length, GPU memory, and stop rate rather than choosing from acceptance alone.
 
