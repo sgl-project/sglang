@@ -5772,13 +5772,9 @@ class ServerArgs:
                 "extra_buffer_lazy unsupported under PD disaggregation; use "
                 "--mamba-radix-cache-strategy extra_buffer."
             )
-            algo = (view.speculative_algorithm or "").upper()
-            # dspark verifies through prepare_mamba_track_for_verify (lazy plan
-            # wired); dflash bypasses that hook, so it stays unsupported.
-            assert algo != "DFLASH", (
-                f"extra_buffer_lazy unsupported with {view.speculative_algorithm}; "
-                "use --mamba-radix-cache-strategy extra_buffer."
-            )
+            # eagle/ngram/dspark/dflash all verify through
+            # prepare_mamba_track_for_verify (lazy plan wired); dflash gained
+            # the hook in DFlashVerifyInput.prepare_for_verify.
         if view.speculative_num_draft_tokens is not None:
             assert view.mamba_track_interval >= view.speculative_num_draft_tokens
         if view.page_size is not None:

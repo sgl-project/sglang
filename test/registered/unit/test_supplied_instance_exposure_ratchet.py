@@ -148,7 +148,6 @@ _EXPOSED = {
     ("disaggregation/common/conn.py", "disaggregation_bootstrap_port"),
     ("disaggregation/common/conn.py", "pp_size"),
     ("disaggregation/decode_kvcache_offload_manager.py", "hicache_io_backend"),
-    ("disaggregation/decode_kvcache_offload_manager.py", "hicache_mem_layout"),
     ("disaggregation/decode_kvcache_offload_manager.py", "served_model_name"),
     ("disaggregation/encode_receiver.py", "disaggregation_ib_device"),
     ("disaggregation/encode_receiver.py", "encoder_transfer_backend"),

@@ -45,7 +45,7 @@ class DiffusionDecoderLoader(ComponentLoader):
         server_args.model_paths[component_name] = component_model_path
         model_cls, _ = ModelRegistry.resolve_model_cls(class_name)
         target_device = self.target_device(
-            server_args.should_cpu_offload_component(component_name)
+            server_args.should_start_component_on_cpu(component_name)
         )
         dtype = resolve_precision(
             server_args, component_name, precision_attr="vae_precision"
