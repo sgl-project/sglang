@@ -20,6 +20,7 @@ import platform
 import unittest
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.test_utils import CustomTestCase
 
 # Registered on the CPU suite but skipped wherever mlx is absent; runs for real
 # only on Apple Silicon. Also registered under stage-a-unit-test-mlx, which the
@@ -106,7 +107,7 @@ _ROUNDED_MAX_ULP = {
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
-class TestFusedCombine(unittest.TestCase):
+class TestFusedCombine(CustomTestCase):
     """Bit-exact / correctly-rounded verification for ``fused_combine``."""
 
     # (combo, shape, standard, max_ulp, fused_fired, passed) rows for the table.
@@ -416,7 +417,7 @@ class TestFusedCombine(unittest.TestCase):
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
-class TestFusedMoeCombineKernelOp(unittest.TestCase):
+class TestFusedMoeCombineKernelOp(CustomTestCase):
     """Decorator plus class registration surface of the combine op."""
 
     def test_op_class_shape(self):
@@ -439,7 +440,7 @@ class TestFusedMoeCombineKernelOp(unittest.TestCase):
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
-class TestPatchMoeCombine(unittest.TestCase):
+class TestPatchMoeCombine(CustomTestCase):
     """patch_moe_combine_with_fused: subclass swap with no-op idempotency."""
 
     def _tiny_model(self):

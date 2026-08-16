@@ -12,6 +12,7 @@ import platform
 import unittest
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.test_utils import CustomTestCase
 
 # Registered on the CPU suite but skipped wherever mlx is absent; runs for real
 # only on Apple Silicon. Also registered under stage-a-unit-test-mlx, which the
@@ -35,7 +36,7 @@ _ADD_ONE_SOURCE = r"""
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
-class TestMetalJitKernel(unittest.TestCase):
+class TestMetalJitKernel(CustomTestCase):
     def _make(self):
         return metal_jit.MetalJitKernel(
             name_template="metal_jit_test_add_one_{0}",
@@ -96,7 +97,7 @@ class TestMetalJitKernel(unittest.TestCase):
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
-class TestMetalJitRegistry(unittest.TestCase):
+class TestMetalJitRegistry(CustomTestCase):
     """Name-keyed registry: @kernel registration, get()/warm_once() dispatch."""
 
     def _register(self, name):
@@ -154,7 +155,7 @@ class TestMetalJitRegistry(unittest.TestCase):
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
-class TestMetalJitOpDecorator(unittest.TestCase):
+class TestMetalJitOpDecorator(CustomTestCase):
     """@metal_jit.kernel validation and the MetalJitOp default surface."""
 
     def _decorate(self, name, cls_body_source=_ADD_ONE_SOURCE):
@@ -235,7 +236,7 @@ class TestMetalJitOpDecorator(unittest.TestCase):
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
-class TestMetalJitOpDispatchTemplate(unittest.TestCase):
+class TestMetalJitOpDispatchTemplate(CustomTestCase):
     """Base dispatch routes through can_fuse to the fused or fallback hook."""
 
     def _stub_op(self, eligible):
