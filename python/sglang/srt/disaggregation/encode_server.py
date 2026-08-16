@@ -844,6 +844,7 @@ class MMEncoder:
         return (
             self.encoder_media_processor_config.artifact_cache_for(modality) is not None
             and self.mm_preprocess_cache.enabled
+            and not envs.SGLANG_MM_SKIP_COMPUTE_HASH.get()
         )
 
     def _encoder_artifact_metadata(

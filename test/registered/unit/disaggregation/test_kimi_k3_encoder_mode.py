@@ -534,6 +534,19 @@ def _cache_enabled_encoder(*, trust_content_hashes=False):
     return encoder
 
 
+def test_skip_compute_hash_disables_encoder_artifact_reuse():
+    encoder = _cache_enabled_encoder()
+    try:
+        with patch(
+            "sglang.srt.disaggregation.encode_server."
+            "envs.SGLANG_MM_SKIP_COMPUTE_HASH.get",
+            return_value=True,
+        ):
+            assert not encoder._supports_encoder_artifact_cache(Modality.IMAGE)
+    finally:
+        encoder.io_executor.shutdown()
+
+
 def test_kimi_k3_epd_trusted_metadata_hit_skips_media_read():
     payload = b"jpeg"
     digest = snapshot_media(payload).content_digest
