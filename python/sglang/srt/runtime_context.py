@@ -1155,6 +1155,7 @@ ROLE_NAMESPACE_SETS: dict[str, frozenset[str] | None] = {
     # a wrong set fails a request rather than a test.
     "tokenizer": None,
     # Deployment shapes not exercised locally; audit before restricting.
+    "detokenizer": None,
     "encoder": None,
     "expert_backup": None,
     "weight_cache_daemon": None,
@@ -1259,9 +1260,8 @@ def _dump_recorded_namespace_reads() -> None:
 def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
     """Install process-wide config for this OS process.
 
-    Records the process ``role`` (``tokenizer`` / ``scheduler`` /
-    ``dp_controller`` / ``encoder`` / ``expert_backup`` /
-    ``weight_cache_daemon`` / ``test``) and
+    Records the process ``role`` — one of the ``ROLE_NAMESPACE_SETS`` keys,
+    which is the one place the roles are enumerated — and
     projects the config bags. Draft workers skip publish (they must not clobber
     the target). ``role`` is provenance, and — when ``SGLANG_ROLE_NAMESPACES``
     is ``enforce`` — the key into ``ROLE_NAMESPACE_SETS`` for fail-closed
