@@ -149,11 +149,9 @@ def init_tokenizer_manager(
     port_args: PortArgs,
     TokenizerManagerClass: Optional[TokenizerManager] = None,
 ) -> Tuple[TokenizerManager, TemplateManager]:
-    # Launch tokenizer process
     TokenizerManagerClass = TokenizerManagerClass or TokenizerManager
     tokenizer_manager = TokenizerManagerClass(server_args, port_args)
 
-    # Initialize templates
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
@@ -161,37 +159,6 @@ def init_tokenizer_manager(
         chat_template=server_args.chat_template,
         completion_template=server_args.completion_template,
     )
-
-    # Resolve any remaining auto parsers using template manager's detection results
-    for attr, suggested, label in (
-        (
-            "reasoning_parser",
-            template_manager.suggested_reasoning_parser,
-            "reasoning parser",
-        ),
-        (
-            "tool_call_parser",
-            template_manager.suggested_tool_call_parser,
-            "tool-call parser",
-        ),
-    ):
-        if tokenizer_manager.config_value(attr) != "auto":
-            continue
-        if suggested is not None:
-            tokenizer_manager.record_config_updates(
-                "template-detection", **{attr: suggested}
-            )
-            logger.info(
-                f"Auto-detected --{attr.replace('_', '-')} as '{suggested}' from chat template"
-            )
-        else:
-            logger.warning(
-                f"--{attr.replace('_', '-')}=auto specified but could not detect "
-                f"{label} from chat template. Disabling {label}."
-            )
-            tokenizer_manager.record_config_updates(
-                "template-detection", **{attr: None}
-            )
 
     return tokenizer_manager, template_manager
 
@@ -1103,12 +1070,6 @@ class Engine(EngineScoreMixin, EngineBase):
                 host=server_args.host, port=bootstrap_port
             )
 
-        if (
-            server_args.reasoning_parser == "auto"
-            or server_args.tool_call_parser == "auto"
-        ):
-            resolve_auto_parsers(server_args)
-
         # Launch daemons (daemon mode only). Handles are threaded back to the
         # owning Engine instance (not a class attr) so two Engines in one process
         # don't clobber each other's daemon list.
@@ -1197,13 +1158,17 @@ class Engine(EngineScoreMixin, EngineBase):
         for p in detoken_procs:
             scheduler_init_result.all_child_pids.append(p.pid)
 
-        # Init tokenizer manager first, as the bootstrap server is initialized here
         if server_args.tokenizer_worker_num == 1:
             tokenizer_manager, template_manager = init_tokenizer_manager_func(
                 server_args, port_args
             )
+            resolve_auto_parsers(
+                server_args,
+                tokenizer_manager.tokenizer,
+                processor=tokenizer_manager.processor,
+                config_writer=tokenizer_manager.record_config_updates,
+            )
         else:
-            # Launch multi-tokenizer router
             tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
             template_manager = None
 

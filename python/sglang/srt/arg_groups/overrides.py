@@ -222,14 +222,9 @@ def _apply_fields(server_args: Any, fields: Dict[str, Any]) -> None:
 def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> None:
     """Resolve fields on a config that is **not published yet**.
 
-    A few resolution rules cannot run inside ``__post_init__``: LoRA
-    normalization and the auto-parser detection need the launcher's validation
-    stage (and, for the parsers, a tokenizer / chat-template load). They still
-    belong to the resolution pipeline — they decide what the process will run
-    with — so they write the fields in place, before anything publishes the
-    object. Writing in place is the point: every holder of that instance (the
-    HTTP server, the multi-tokenizer workers it serializes for, the schedulers
-    it forks) must see the resolved value.
+    Some resolution rules need values unavailable during ``__post_init__``, such
+    as a loaded tokenizer's chat template. They may write only an unpublished
+    config; publishing roles use their runtime or control-plane overlays.
 
     Refuses to touch the published instance: after publish the bags exist and a
     field write would desync them, which is what ``get_context().override`` is

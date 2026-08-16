@@ -633,7 +633,6 @@ def _detect_auto_parser(
     rules: Tuple[DetectionRule, ...],
     label: str,
 ) -> Optional[str]:
-    """The parser one auto field resolves to (``None`` disables it)."""
     detected = match_rules(ctx, rules, label)
     if detected:
         logger.info(
@@ -655,6 +654,45 @@ def _load_explicit_jinja_template(chat_template_arg: Optional[str]) -> Optional[
         return f.read().replace("\\n", "\n")
 
 
+def resolve_hf_chat_template(
+    tokenizer,
+    *,
+    processor=None,
+    preferred_name: Optional[str] = None,
+) -> Optional[str]:
+    try:
+        template = getattr(processor, "chat_template", None) or getattr(
+            tokenizer, "chat_template", None
+        )
+        if template is None:
+            logger.warning("No HuggingFace chat template found")
+            return None
+        if not isinstance(template, dict):
+            return template
+        if not template:
+            raise ValueError("Empty templates dict provided")
+
+        available_names = list(template)
+        logger.info(
+            "Multiple HuggingFace chat templates available: %s", available_names
+        )
+        if preferred_name:
+            if preferred_name not in template:
+                raise ValueError(
+                    f"Specified template '{preferred_name}' not found. "
+                    f"Available templates: {available_names}"
+                )
+            logger.info("Using specified chat template: '%s'", preferred_name)
+            return template[preferred_name]
+
+        first_name = available_names[0]
+        logger.info("Using first available template: '%s'", first_name)
+        return template[first_name]
+    except Exception as e:
+        logger.warning("Error getting chat template: %s", e)
+        return None
+
+
 def _log_undetected_parser(attr: str, label: str) -> None:
     logger.warning(
         f"--{attr.replace('_', '-')}=auto specified but could not detect "
@@ -663,7 +701,6 @@ def _log_undetected_parser(attr: str, label: str) -> None:
 
 
 def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str, str]:
-    """The parsers the model architecture implies, for the fields still on auto."""
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     config = get_config(
@@ -699,15 +736,14 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
     return resolved
 
 
-def resolve_auto_parsers(server_args) -> None:
-    """Resolve ``--reasoning-parser=auto`` / ``--tool-call-parser=auto`` from the
-    chat template, in place, before anything publishes ``server_args``.
-
-    Performs a lightweight tokenizer load, so it runs once in engine init. In
-    place because everyone who holds this instance must see the resolved value:
-    the schedulers it forks, the HTTP server, and the tokenizer workers it is
-    serialized for.
-    """
+def resolve_auto_parsers(
+    server_args,
+    tokenizer,
+    *,
+    processor=None,
+    config_writer: Optional[Callable[..., None]] = None,
+) -> None:
+    """Resolve auto parsers using a tokenizer already owned by the caller."""
     needs = tuple(
         attr
         for attr in ("reasoning_parser", "tool_call_parser")
@@ -715,8 +751,6 @@ def resolve_auto_parsers(server_args) -> None:
     )
     if not needs:
         return
-
-    from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
     chat_template_arg = getattr(server_args, "chat_template", None)
     try:
@@ -728,24 +762,18 @@ def resolve_auto_parsers(server_args) -> None:
         chat_template_arg is not None and explicit_jinja_template is None
     )
 
-    tokenizer = None
-    try:
-        tokenizer = get_tokenizer(
-            server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-        )
-    except Exception as e:
-        logger.warning(f"Failed to load tokenizer for auto-detection: {e}")
-
     template = explicit_jinja_template
-    if template is None and tokenizer is not None:
-        template = getattr(tokenizer, "chat_template", None)
+    if template is None:
+        template = resolve_hf_chat_template(
+            tokenizer,
+            processor=processor,
+            preferred_name=getattr(server_args, "hf_chat_template_name", None),
+        )
 
     force_reasoning, reasoning_config = detect_reasoning_pattern(template)
     ctx = build_detection_context(
         template, tokenizer, reasoning_config, force_reasoning
     )
-
     detected: Dict[str, Optional[str]] = {}
     if ctx is None:
         if has_explicit_template_without_detection:
@@ -778,4 +806,7 @@ def resolve_auto_parsers(server_args) -> None:
                 detected[attr] = _detect_auto_parser(attr, ctx, rules, label)
 
     if detected:
-        declare_late_resolution(server_args, "template-detection", **detected)
+        if config_writer is None:
+            declare_late_resolution(server_args, "template-detection", **detected)
+        else:
+            config_writer("template-detection", **detected)

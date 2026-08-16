@@ -15,9 +15,12 @@ Usage:
     python -m pytest test_base_grammar_backend.py -v
 """
 
+import sys
 import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from sglang.srt.constrained.base_grammar_backend import (
     GRAMMAR_BACKEND_REGISTRY,
@@ -360,12 +363,17 @@ class TestCreateGrammarBackend(unittest.TestCase):
         mock_backend = MagicMock(spec=BaseGrammarBackend)
         mock_backend.is_support_token_filter = False
         mock_outlines_cls.return_value = mock_backend
-        args = self._make_server_args("outlines", reasoning_parser="deepseek-r1")
+        args = self._make_server_args("outlines", reasoning_parser="auto")
         tokenizer = MagicMock()
-        # encode must return a single-token list for think_start/end tokens
         tokenizer.encode.return_value = [42]
 
-        result = create_grammar_backend(args, tokenizer, 32000, think_end_ids=[42])
+        result = create_grammar_backend(
+            args,
+            tokenizer,
+            32000,
+            think_end_ids=[42],
+            reasoning_parser="deepseek-r1",
+        )
         self.assertIsInstance(result, ReasonerGrammarBackend)
         self.assertIs(result.grammar_backend, mock_backend)
 
@@ -441,4 +449,4 @@ class TestLlguidanceStructuralTagTriggerPairing(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))

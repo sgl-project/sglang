@@ -26,6 +26,7 @@ from sglang.srt.managers.utils import (
     compute_num_reserved_tokens,
     msgpack_decode_explained,
 )
+from sglang.srt.runtime_context import get_serving
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
     NestedRowColumns,
@@ -708,6 +709,8 @@ class RustServer:
         server (carries the already-resolved ``model_config``)."""
 
         server_args = dict(vars(scheduler.server_args))
+        server_args["reasoning_parser"] = get_serving().reasoning_parser
+        server_args["tool_call_parser"] = get_serving().tool_call_parser
         model_config = dict(vars(scheduler.model_config))
         model_config["hf_config"] = None  # HF config is not JSON-serializable
         # Resolved default sampling params (generation_config.json when
