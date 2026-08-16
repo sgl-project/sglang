@@ -480,21 +480,20 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             getattr(draft_hf_config, "text_config", None) or draft_hf_config
         )
         layer_types = get_dflash_layer_types(draft_hf_config)
-        num_layers = getattr(draft_text_config, "num_hidden_layers", None)
-        all_sliding = (
-            layer_types
-            and len(layer_types) == num_layers
-            and set(layer_types) == {"sliding_attention"}
-        )
-        all_causal = getattr(draft_text_config, "is_causal", False) is True
-        if not (all_sliding or all_causal):
+        has_sliding = bool(layer_types and "sliding_attention" in layer_types)
+        # Three-valued, like the model's own resolution (models/dflash.py:46-52):
+        # an absent key leaves a sliding layer on its causal default, so only an
+        # explicit False builds the layer trtllm cannot represent.
+        is_causal = getattr(draft_text_config, "is_causal", None)
+        if has_sliding and is_causal is False:
             logger.warning(
-                "DFLASH only enables 'trtllm_mha' when all layers use sliding "
-                "attention or the draft is explicitly causal; got "
-                "layer_types=%r, is_causal=%r. "
-                "Falling back to '%s'.",
+                "DFLASH 'trtllm_mha' cannot represent a sliding layer that is "
+                "not causal: the verify kernel is causal in-window, so the "
+                "backend expands the block into single-query rows that share "
+                "one window, anchored at the block's last position. Got "
+                "layer_types=%r, is_causal=%r. Falling back to '%s'.",
                 layer_types,
-                getattr(draft_text_config, "is_causal", None),
+                is_causal,
                 fallback_backend,
             )
             draft_backend = fallback_backend
