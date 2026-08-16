@@ -2367,6 +2367,79 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def _apply_router_kv_hints(self, hints: Optional[dict]) -> None:
+        """Execute valid storage actions as advisory engine-local work."""
+        if not isinstance(hints, dict):
+            return
+        if hints.get("protocol_version") != "0.1":
+            logger.warning("Ignoring KV hints with unsupported protocol version")
+            return
+        actions = hints.get("actions")
+        if not isinstance(actions, list) or len(actions) > 64:
+            logger.warning("Ignoring malformed KV hint actions")
+            return
+
+        for index, action in enumerate(actions):
+            if not isinstance(action, dict):
+                logger.warning("Ignoring malformed KV hint action index=%s", index)
+                continue
+            if (
+                action.get("action_type") != "kv.demote"
+                or action.get("action_version") != "1.0"
+            ):
+                continue
+            action_id = action.get("action_id")
+            payload = action.get("payload")
+            if not isinstance(payload, dict):
+                logger.warning("Ignoring malformed KV demote action index=%s", index)
+                continue
+            session_id = payload.get("session_id")
+            generation = payload.get("session_generation")
+            if (
+                not isinstance(action_id, str)
+                or not action_id
+                or len(action_id) > 512
+                or not isinstance(session_id, str)
+                or not session_id
+                or len(session_id) > 512
+                or (
+                    generation is not None
+                    and (
+                        isinstance(generation, bool)
+                        or not isinstance(generation, int)
+                        or generation < 0
+                    )
+                )
+            ):
+                logger.warning("Ignoring malformed KV demote action index=%s", index)
+                continue
+            if not self.enable_session_radix_cache or not hasattr(
+                self.tree_cache, "demote_session_to_storage"
+            ):
+                logger.warning(
+                    "Ignoring KV demote because session radix cache with storage is unavailable"
+                )
+                continue
+            try:
+                result = self.tree_cache.demote_session_to_storage(
+                    action_id, session_id, generation=generation
+                )
+            except Exception:
+                logger.exception(
+                    "KV demote failed open action_id=%s session_id=%s",
+                    action_id,
+                    session_id,
+                )
+                continue
+            logger.info(
+                "Applied KV demote action_id=%s session_id=%s state=%s selected_tokens=%s message=%s",
+                action_id,
+                session_id,
+                result.get("state"),
+                result.get("selected_tokens", 0),
+                result.get("message", ""),
+            )
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -2507,6 +2580,8 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        self._apply_router_kv_hints(recv_req.kv_hints)
+        req.kv_hints = recv_req.kv_hints
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
@@ -2698,6 +2773,13 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
+            hints = getattr(req, "kv_hints", None)
+            force_prefetch = isinstance(hints, dict) and any(
+                isinstance(action, dict)
+                and action.get("action_type") == "kv.prefetch"
+                and action.get("action_version") == "1.0"
+                for action in hints.get("actions", ())
+            )
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             if tree_cache.is_backuped(req.last_host_node) or tree_cache.is_root(
@@ -2713,13 +2795,17 @@ class Scheduler(
                     if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                tree_cache.prefetch_from_storage(
+                args = (
                     req.rid,
                     req.last_host_node,
                     new_input_tokens,
                     tree_cache.get_last_hash_value(req.last_host_node),
                     prefix_keys,
                 )
+                if force_prefetch and hasattr(tree_cache, "demote_session_to_storage"):
+                    tree_cache.prefetch_from_storage(*args, force=True)
+                else:
+                    tree_cache.prefetch_from_storage(*args)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):

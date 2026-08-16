@@ -48,6 +48,32 @@ message DisaggregatedParams {
   int64 bootstrap_room = 3;
 }
 
+// Advisory actions attached by a router after it selects an engine. The
+// envelope is backend-neutral: storage implementation is engine configuration,
+// not a wire-level choice.
+message KvHints {
+  string protocol_version = 1;
+  string message_id = 2;
+  repeated KvHintAction actions = 3;
+}
+
+message KvHintAction {
+  string action_id = 1;
+  string action_type = 2;
+  string action_version = 3;
+  oneof payload {
+    KvDemotePayload demote = 4;
+    KvPrefetchPayload prefetch = 5;
+  }
+}
+
+message KvDemotePayload {
+  string session_id = 1;
+  optional uint64 session_generation = 2;
+}
+
+message KvPrefetchPayload {}
+
 // Sampling parameters shared across text and tokenized RPCs.
 message SamplingParams {
   optional float temperature = 1;
@@ -103,6 +129,7 @@ message TextGenerateRequest {
   optional int32 priority = 15;
   optional bool require_reasoning = 16;
   optional uint32 max_thinking_tokens = 17;
+  optional KvHints kv_hints = 18;
 }
 
 message TextGenerateResponse {
@@ -130,6 +157,7 @@ message GenerateRequest {
   optional int32 priority = 14;
   optional bool require_reasoning = 15;
   optional uint32 max_thinking_tokens = 16;
+  optional KvHints kv_hints = 17;
 }
 
 message GenerateResponse {

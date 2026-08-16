@@ -164,6 +164,9 @@ class GenerateReqInput:
     # Stable identity shared by requests in the same session. Unlike
     # session_params, this does not alter or reconstruct the prompt.
     session_id: Optional[str] = field(default=None, kw_only=True)
+    # Router-produced, versioned KV-cache actions for this request. This is an
+    # internal engine surface; public API clients do not construct it.
+    kv_hints: Optional[Dict[str, Any]] = field(default=None, kw_only=True)
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text.
@@ -851,6 +854,7 @@ class GenerateReqInput:
         sub = GenerateReqInput(
             rid=self.rid[i],
             session_id=self.session_id,
+            kv_hints=self.kv_hints,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=(
@@ -977,6 +981,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Session info for continual prompting
     session_id: Optional[str] = None
+    kv_hints: Optional[Dict[str, Any]] = None
     session_params: Optional[SessionParams] = None
 
     # LoRA related

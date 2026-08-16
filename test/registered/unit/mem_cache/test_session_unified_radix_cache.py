@@ -9,6 +9,7 @@ import unittest
 from array import array
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -216,6 +217,57 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         self.assertEqual(match_len(self.cache, [7, 8, 9]), 0)
         self.assertEqual(match_len(self.cache, [1, 2, 3, 4]), 4)
         self.assertEqual(self.full.session_ref(referenced), 1)
+
+    def test_storage_demote_waits_for_ack_before_releasing_device_kv(self):
+        leaf = insert(self.cache, [1, 2, 3, 4])
+        generation = self.cache.open_radix_session("s1")
+        register(self.cache, [1, 2, 3, 4], "s1", generation)
+        leaf.component_data[ComponentType.FULL].host_value = torch.arange(4)
+        self.cache.enable_storage = True
+        self.cache.cache_controller = MagicMock()
+
+        next_backup_id = 100
+
+        def queue_storage_backup(node_id):
+            nonlocal next_backup_id
+            backup_id = next_backup_id
+            next_backup_id += 1
+            self.cache.ongoing_backup[backup_id] = (node_id, MagicMock())
+            return backup_id
+
+        with patch.object(
+            self.cache, "write_backup_storage", side_effect=queue_storage_backup
+        ):
+            result = self.cache.demote_session_to_storage("demote-1", "s1", generation)
+
+        self.assertEqual(result["state"], "pending")
+        self.cache._poll_session_storage_demotions()
+        self.assertFalse(leaf.evicted)
+        self.assertEqual(self.full.session_ref(leaf), 1)
+
+        state = self.cache.ongoing_session_storage_demotions["demote-1"]
+        state.backup_acks.update({backup_id: True for backup_id in state.backup_ids})
+        self.cache._poll_session_storage_demotions()
+
+        self.assertTrue(leaf.evicted)
+        self.assertTrue(leaf.backuped)
+        self.assertEqual(self.full.session_ref(leaf), 0)
+
+    def test_forced_storage_prefetch_bypasses_benefit_threshold(self):
+        self.cache.enable_storage = True
+        self.cache.prefetch_threshold = 256
+        self.cache.cache_controller = MagicMock()
+        self.cache.cache_controller.prefetch_tokens_occupied = 0
+        self.cache.cache_controller.prefetch.return_value = MagicMock()
+        root_id = self.cache.tree_core.root_node.id
+
+        self.cache.prefetch_from_storage("ordinary", root_id, [1, 2, 3, 4])
+        self.cache.cache_controller.prefetch.assert_not_called()
+
+        self.cache.prefetch_from_storage("forced", root_id, [1, 2, 3, 4], force=True)
+
+        self.cache.cache_controller.prefetch.assert_called_once()
+        self.assertTrue(self.cache.ongoing_prefetch["forced"].operation.force_prefetch)
 
 
 if __name__ == "__main__":

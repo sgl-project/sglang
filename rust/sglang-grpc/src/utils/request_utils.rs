@@ -178,6 +178,69 @@ fn insert_disaggregated_params(
     }
 }
 
+fn insert_kv_hints(
+    request: &mut HashMap<String, serde_json::Value>,
+    hints: &Option<proto::KvHints>,
+) {
+    let Some(hints) = hints else {
+        return;
+    };
+    if hints.protocol_version != "0.1" || hints.message_id.len() > 512 || hints.actions.len() > 64 {
+        tracing::warn!(
+            protocol_version = %hints.protocol_version,
+            action_count = hints.actions.len(),
+            "Ignoring malformed KV hint envelope"
+        );
+        return;
+    }
+
+    let actions = hints
+        .actions
+        .iter()
+        .filter_map(|action| {
+            if action.action_id.is_empty()
+                || action.action_id.len() > 512
+                || action.action_version != "1.0"
+            {
+                return None;
+            }
+            let payload = match (action.action_type.as_str(), action.payload.as_ref()) {
+                ("kv.demote", Some(proto::kv_hint_action::Payload::Demote(demote)))
+                    if !demote.session_id.is_empty() && demote.session_id.len() <= 512 =>
+                {
+                    let mut payload = serde_json::Map::new();
+                    payload.insert("session_id".into(), serde_json::json!(demote.session_id));
+                    if let Some(generation) = demote.session_generation {
+                        payload.insert("session_generation".into(), serde_json::json!(generation));
+                    }
+                    serde_json::Value::Object(payload)
+                }
+                ("kv.prefetch", Some(proto::kv_hint_action::Payload::Prefetch(_))) => {
+                    serde_json::Value::Object(serde_json::Map::new())
+                }
+                _ => return None,
+            };
+            Some(serde_json::json!({
+                "action_id": action.action_id,
+                "action_type": action.action_type,
+                "action_version": action.action_version,
+                "payload": payload,
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    if !actions.is_empty() {
+        request.insert(
+            "kv_hints".into(),
+            serde_json::json!({
+                "protocol_version": "0.1",
+                "message_id": hints.message_id,
+                "actions": actions,
+            }),
+        );
+    }
+}
+
 fn now_timestamp() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -250,6 +313,7 @@ pub(crate) fn build_text_generate_dict(
         req.max_thinking_tokens,
     );
     insert_disaggregated_params(&mut d, &req.disaggregated_params);
+    insert_kv_hints(&mut d, &req.kv_hints);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
     }
@@ -304,6 +368,7 @@ pub(crate) fn build_generate_dict(
         req.max_thinking_tokens,
     );
     insert_disaggregated_params(&mut d, &req.disaggregated_params);
+    insert_kv_hints(&mut d, &req.kv_hints);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
     }
@@ -398,6 +463,62 @@ mod tests {
                 .unwrap()
                 .get("session_id"),
             Some(&serde_json::json!("session-1"))
+        );
+    }
+
+    #[test]
+    fn generate_dicts_preserve_supported_kv_actions() {
+        let hints = Some(proto::KvHints {
+            protocol_version: "0.1".to_string(),
+            message_id: "message-1".to_string(),
+            actions: vec![
+                proto::KvHintAction {
+                    action_id: "demote-1".to_string(),
+                    action_type: "kv.demote".to_string(),
+                    action_version: "1.0".to_string(),
+                    payload: Some(proto::kv_hint_action::Payload::Demote(
+                        proto::KvDemotePayload {
+                            session_id: "session-1".to_string(),
+                            session_generation: Some(7),
+                        },
+                    )),
+                },
+                proto::KvHintAction {
+                    action_id: "prefetch-1".to_string(),
+                    action_type: "kv.prefetch".to_string(),
+                    action_version: "1.0".to_string(),
+                    payload: Some(proto::kv_hint_action::Payload::Prefetch(
+                        proto::KvPrefetchPayload {},
+                    )),
+                },
+            ],
+        });
+        let request = proto::GenerateRequest {
+            kv_hints: hints,
+            ..Default::default()
+        };
+
+        let mapped = build_generate_dict("request-1", &request).unwrap();
+        assert_eq!(
+            mapped.get("kv_hints"),
+            Some(&serde_json::json!({
+                "protocol_version": "0.1",
+                "message_id": "message-1",
+                "actions": [
+                    {
+                        "action_id": "demote-1",
+                        "action_type": "kv.demote",
+                        "action_version": "1.0",
+                        "payload": {"session_id": "session-1", "session_generation": 7},
+                    },
+                    {
+                        "action_id": "prefetch-1",
+                        "action_type": "kv.prefetch",
+                        "action_version": "1.0",
+                        "payload": {},
+                    },
+                ],
+            }))
         );
     }
 

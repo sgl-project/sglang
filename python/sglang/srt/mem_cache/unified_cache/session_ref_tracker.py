@@ -10,6 +10,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.mem_cache.unified_cache.component_type import BASE_COMPONENT_TYPE
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_cache.components.tree_component import (
@@ -95,6 +97,32 @@ class UnifiedSessionRefTracker:
         if generation is None:
             generation = self.open_radix_session(session_id)
         return generation
+
+    def snapshot_session_nodes(
+        self, session_id: str, generation: Optional[int] = None
+    ) -> tuple[Optional[int], tuple[int, ...]]:
+        """Return a stable full-KV session path, or an empty snapshot."""
+        current_generation = self._session_generations.get(session_id)
+        if (
+            current_generation is None
+            or session_id in self._closed_session_ids
+            or (generation is not None and generation != current_generation)
+        ):
+            return current_generation, ()
+
+        full = next(
+            component
+            for component in self.components
+            if component.component_type == BASE_COMPONENT_TYPE
+        )
+        nodes = set()
+        root = self.tree_core.root_node
+        for leaf in full.session_leaves(session_id):
+            node = leaf
+            while node is not root:
+                nodes.add(node)
+                node = node.parent
+        return current_generation, tuple(sorted(node.id for node in nodes))
 
     def release_radix_session(self, session_id: str) -> int:
         if not self.enable_session_radix_cache or session_id is None:

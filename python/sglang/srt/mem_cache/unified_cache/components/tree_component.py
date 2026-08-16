@@ -125,6 +125,10 @@ class TreeComponent(ABC):
     def reset_session_state(self) -> None:
         self._session_leaves = defaultdict(set)
 
+    def session_leaves(self, session_id: str) -> tuple[UnifiedTreeNode, ...]:
+        """Return the session's frontiers without exposing the mutable index."""
+        return tuple(self._session_leaves.get(session_id, ()))
+
     def session_ref(self, node: UnifiedTreeNode) -> int:
         return node.component_data[self.component_type].session_ref
 
