@@ -226,6 +226,9 @@ class PipelineConfig:
     vae_precision: str = "fp32"
     vae_decode_precision: str | None = None
     vae_tiling: bool = True
+    # Bounds the attention grid the diffusion decoder's stages see, which is
+    # what makes a full-length decode tractable.
+    diffusion_decoder_tiling: bool = True
     vae_slicing: bool = False
     vae_sp: bool = True
 
@@ -266,6 +269,21 @@ class PipelineConfig:
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         # return the model-specific config for optimal deployment setting
         return ModelDeploymentConfig()
+
+    def validate_server_args(self, server_args: Any) -> None:
+        """Validate model-owned constraints after server args are normalized."""
+
+        del server_args
+
+    def supports_action_endpoint(self) -> bool:
+        """Whether this pipeline exposes the generic action generation API."""
+
+        return self.task_type.is_action_gen()
+
+    def supports_openpi_endpoint(self) -> bool:
+        """Whether this pipeline implements the OpenPI policy websocket."""
+
+        return False
 
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
@@ -394,8 +412,21 @@ class PipelineConfig:
         """
         return self.task_type in (ModelTaskType.T2I, ModelTaskType.T2V)
 
+    def supports_disaggregation(self) -> bool:
+        """Return whether multi-service disaggregated deployment is supported."""
+
+        return True
+
     def supports_native_grouped_requests(self):
         """Return whether dynamic batches should run as grouped Req lists."""
+        return False
+
+    def supports_sequential_dit_inference(self):
+        """Return whether batched AR is followed by per-request DiT inference."""
+        return False
+
+    def supports_sequential_multi_output_inference(self):
+        """Return whether one request's outputs run through DiT/VAE sequentially."""
         return False
 
     def estimate_request_cost(self, batch) -> float:
@@ -816,6 +847,13 @@ class PipelineConfig:
             dest=f"{prefix_with_dot.replace('-', '_')}vae_tiling",
             default=PipelineConfig.vae_tiling,
             help="Enable VAE tiling",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}diffusion-decoder-tiling",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}diffusion_decoder_tiling",
+            default=PipelineConfig.diffusion_decoder_tiling,
+            help="Enable tiling for the LTX-2.5 diffusion decoder",
         )
         parser.add_argument(
             f"--{prefix_with_dot}vae-slicing",
