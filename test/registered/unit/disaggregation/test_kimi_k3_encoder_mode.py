@@ -86,6 +86,110 @@ def test_epd_language_only_rejects_missing_dispatched_embedding():
     assert getattr(exc_info.value, "status_code", None) == 503
 
 
+def test_epd_rejection_reads_the_resolved_transfer_backend():
+    """Tripwire for step 12: this guard fires on the *resolved* backend.
+
+    The record is produced by actual resolution -- a language-only Kimi-K3
+    launch at TP2, whose `encoder_transfer_backend` starts at the argument
+    default `"auto"` (`ENCODER_TRANSFER_BACKEND_CHOICES[0]`) and is filled in
+    by `resolve_encoder_transfer_backend` to `"zmq_to_tokenizer"`. Today the
+    guard therefore rejects. When step 12 makes the instance raw, this same
+    launch hands the guard a record still at `"auto"`, the rejection silently
+    stops, and *this test fails* -- which is the signal to give this reader
+    the resolved value (per-engine overlay or bag) rather than the record.
+    Fixed doubles cannot trip on that change, so the record here must come
+    from resolution, not a SimpleNamespace.
+    """
+    import json
+    import os
+    import shutil
+    import tempfile
+
+    from sglang.srt.server_args import ServerArgs
+
+    def env_field_flags():
+        from sglang.srt.environ import EnvField, envs
+
+        return {
+            name: field._set_to_none
+            for klass in reversed(type(envs).__mro__)
+            for name, field in vars(klass).items()
+            if isinstance(field, EnvField)
+        }
+
+    config_dir = tempfile.mkdtemp(prefix="epd_tripwire_")
+    try:
+        payload = {
+            "architectures": ["KimiK3ForConditionalGeneration"],
+            "model_type": "kimi_k3",
+            "text_config": {
+                "architectures": ["DeepseekV3ForCausalLM"],
+                "model_type": "deepseek_v3",
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "moe_intermediate_size": 32,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 2,
+                "n_routed_experts": 8,
+                "n_shared_experts": 1,
+                "num_experts_per_tok": 2,
+                "first_k_dense_replace": 1,
+                "vocab_size": 128,
+                "max_position_embeddings": 2048,
+                "kv_lora_rank": 8,
+                "q_lora_rank": 8,
+                "qk_nope_head_dim": 8,
+                "qk_rope_head_dim": 8,
+                "v_head_dim": 8,
+                "topk_method": "greedy",
+                "scoring_func": "softmax",
+            },
+            "vision_config": {
+                "model_type": "kimi_k3_vision",
+                "hidden_size": 16,
+                "num_heads": 2,
+                "depth": 2,
+                "patch_size": 14,
+                "merge_kernel_size": [2, 2],
+            },
+        }
+        with open(os.path.join(config_dir, "config.json"), "w") as handle:
+            json.dump(payload, handle)
+        environ_before = dict(os.environ)
+        flags_before = env_field_flags()
+        try:
+            resolved = ServerArgs(
+                model_path=config_dir,
+                device="cuda",
+                random_seed=42,
+                language_only=True,
+                tp_size=2,
+                # Resolution branches on the host device for the hybrid
+                # state-cache sizing (extra_buffer asserts a GPU stack, which
+                # the CPU CI runner does not have); the guard under test reads
+                # `encoder_transfer_backend`, independent of that branch, so
+                # pin the strategy every host can resolve.
+                mamba_radix_cache_strategy="no_buffer",
+                disable_overlap_schedule=True,
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(environ_before)
+            from sglang.srt.environ import envs
+
+            for name, was_none in flags_before.items():
+                getattr(type(envs), name)._set_to_none = was_none
+    finally:
+        shutil.rmtree(config_dir, ignore_errors=True)
+
+    assert resolved.encoder_transfer_backend == "zmq_to_tokenizer"
+    request = SimpleNamespace(need_wait_for_mm_inputs=True)
+    with pytest.raises(HTTPException) as exc_info:
+        _reject_missing_dispatched_encoder_embedding(resolved, request, None)
+    assert getattr(exc_info.value, "status_code", None) == 503
+
+
 def test_epd_allows_local_processing_when_request_was_not_dispatched():
     server_args = SimpleNamespace(
         language_only=True,

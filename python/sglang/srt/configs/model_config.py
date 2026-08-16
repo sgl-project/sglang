@@ -125,6 +125,15 @@ def is_kimi_k3(config) -> bool:
     return _hf_arch(config) == "KimiK3ForConditionalGeneration"
 
 
+def is_qwen3_5(config) -> bool:
+    return _hf_arch(config) in (
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+    )
+
+
 def is_deepseek_v4(config) -> bool:
     return _hf_arch(config) in (
         "DeepseekV4ForCausalLM",
