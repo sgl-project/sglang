@@ -957,7 +957,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
     @property
     def last_shared_read_runner(self):
-        # Multi-layer eagle has no draft but draft-extend only
+        # Multi-layer eagle has no draft forward, only draft extend.
         return self._draft_worker.draft_runner
 
     @property
