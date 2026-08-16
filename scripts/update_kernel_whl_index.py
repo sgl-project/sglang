@@ -17,7 +17,7 @@ def check_wheel_cuda_version(path_name, target_cuda_version):
     if re.search(r"\+(rocm|musa)", path_name) or path_name.startswith(
         "sglang_kernel_xpu-"
     ):
-    return False
+        return False
 
     # For other CUDA versions, the wheel path name will contain the cuda version suffix, e.g. sglang_kernel-0.4.0+cu130-cp310-abi3-manylinux2014_x86_64.whl
     if target_cuda_version != DEFAULT_CUDA_VERSION:
