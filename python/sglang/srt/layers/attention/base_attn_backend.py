@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC
-from enum import Enum, auto
+from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -22,10 +22,10 @@ if TYPE_CHECKING:
 class SharedReadEnds(Enum):
     """Where an attention backend finishes reading the shared data"""
 
-    PRE_REPLAY = auto()  # After the init_forward_metadata_out_graph
-    IN_REPLAY = auto()  # After the init_forward_metadata_in_graph
-    POST_REPLAY = auto()  # Metadata snapshot not implemented
-    UNKNOWN = auto()  # not audited -> coarse whole-forward fence
+    PRE_REPLAY = 1  # After the init_forward_metadata_out_graph
+    IN_REPLAY = 2  # After the init_forward_metadata_in_graph
+    POST_REPLAY = 3  # Metadata snapshot not implemented
+    UNKNOWN = 4  # not audited -> coarse whole-forward fence
 
     @staticmethod
     def max_of(items: list[SharedReadEnds]) -> SharedReadEnds:
