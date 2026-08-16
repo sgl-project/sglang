@@ -1435,18 +1435,23 @@ class UnifiedSWAKVPool(SWAKVPool):
         return  # no-op in shared mode (the swa-side v2p IS the mapping)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
-        """Virtual token ids -> swa-physical token ids (int32)."""
+        """Virtual token ids -> swa kernel-facing ids (int64; physical until
+        the sub-pools expose dense views).
+
+        This is the surface the attention backends reach through
+        `token_to_kv_pool`; `UnifiedSWATokenToKVPoolAllocator` exposes the same
+        translation to the callers holding the allocator instead (radix cache,
+        disaggregation). Both delegate to the swa sub-allocator, which owns the
+        v2p table — including its tombstone clamp, which routes a freed (-1)
+        entry to the reserved padding sink (0) rather than a negative id.
+        Shape-preserving: backends translate whole page tables here, not just
+        flat id runs.
+        """
         assert self._swa_allocator is not None, (
             "UnifiedSWAKVPool.translate_loc_from_full_to_swa called before "
             "attach_allocators"
         )
-        ps = self._swa_allocator.page_size
-        if ps == 1:
-            return self._swa_allocator.virtual_to_physical[kv_indices].to(torch.int32)
-        virt_pages = kv_indices // ps
-        offsets = kv_indices % ps
-        swa_phys_pages = self._swa_allocator.virtual_to_physical[virt_pages]
-        return (swa_phys_pages * ps + offsets).to(torch.int32)
+        return self._swa_allocator.translate_kv_loc_dense(kv_indices)
 
     def get_state_buf_infos(self):
         return self.swa_kv_pool.get_contiguous_buf_infos()
