@@ -24,7 +24,8 @@ from sglang.srt.disaggregation.common.conn import (
     KVTransferError,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
-    STAGING_WATERMARK_WAIT_S,
+    STAGING_MAX_WAIT_S,
+    STAGING_READY_SPIN_S,
     DecodeStagingContext,
     PrefillStagingContext,
     StagingTransferInfo,
@@ -431,6 +432,81 @@ class MooncakeKVManager(CommonKVManager):
             is_ipv6=na.is_ipv6,
         )
 
+    def _fragmented_groups(self, src_indices, dst_indices) -> int:
+        """Concurrent-contiguity group count, same criterion as
+        group_concurrent_contiguous but light (numpy diff only).
+
+        Fragmentation (issue #5450) appears when either side has holes, so a
+        group is a maximal run where src AND dst advance by exactly 1.
+        """
+        if src_indices is None or dst_indices is None:
+            return 1
+        if len(src_indices) < 2 or len(src_indices) != len(dst_indices):
+            return 1
+        return 1 + int(
+            np.count_nonzero((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))
+        )
+
+    def _ensure_equal_tp_staging_req(self, kv_chunk, req) -> None:
+        """Request decode-side staging allocation for a fragmented equal-TP
+        chunk (issue #5450). The batch prefetch gate skips equal-TP rooms, so
+        the first fragmented chunk must poke the STAGING_REQ itself.
+
+        Requests ONLY this chunk, not the whole room: prefetching every chunk
+        of the room would allocate staging for chunks that take the direct
+        path, wasting the decode ring and scattering garbage into unfragmented
+        chunks' KV.
+
+        Idempotent per (room, chunk_idx, session_id) via
+        self._staging_ctx.prefetch_requested.
+        """
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            staging_grid_tokens,
+        )
+        from sglang.srt.utils.network import NetworkAddress
+
+        page_size = self.kv_buffer_tensors["page_size"]
+        cps = self.server_args.chunked_prefill_size or 8192
+        full_chunk_pages = max(1, staging_grid_tokens(cps, page_size) // page_size)
+        # Chunk identity = the folded grid index, the same formula
+        # PrefillStagingStrategy.check_ready uses, so the STAGING_RSP offset
+        # lands exactly where check_ready looks it up. The sender aligns chunk
+        # ends to the staging grid (send_kv_chunk), so start // full_chunk_pages
+        # is a stable identity across the chunk queue.
+        chunk_idx = kv_chunk.index_slice.start // full_chunk_pages
+        stg_key = (kv_chunk.room, chunk_idx, req.mooncake_session_id)
+        if stg_key in self._staging_ctx.prefetch_requested:
+            return
+        self._staging_ctx.prefetch_requested.add(stg_key)
+        try:
+            na = NetworkAddress(req.endpoint, req.dst_port)
+            ep = na.to_tcp()
+            if ep not in self._staging_ctx.prefetch_sockets:
+                sock = zmq.Context().socket(zmq.PUSH)
+                if na.is_ipv6:
+                    sock.setsockopt(zmq.IPV6, 1)
+                sock.connect(ep)
+                self._staging_ctx.prefetch_sockets[ep] = sock
+            self._staging_ctx.prefetch_sockets[ep].send_multipart(
+                [
+                    b"STAGING_REQ",
+                    str(kv_chunk.room).encode("ascii"),
+                    str(chunk_idx).encode("ascii"),
+                    str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
+                    req.mooncake_session_id.encode("ascii"),
+                    # Same field as the batch prefetch (requester_pp_rank):
+                    # decode filters the STAGING_RSP recipients by it.
+                    str(self.pp_rank).encode("ascii"),
+                ]
+            )
+        except Exception as e:
+            logger.warning(
+                "[Staging] equal-TP staging prefetch failed room=%s chunk=%s: %s",
+                kv_chunk.room,
+                chunk_idx,
+                e,
+            )
+
     def _do_staging_transfer(
         self,
         staging_strategy,
@@ -466,13 +542,58 @@ class MooncakeKVManager(CommonKVManager):
                     "reduce chunked_prefill_size."
                 )
                 return (-1, False)
-            # Not ready yet: wait (bounded) for a watermark advance, then
-            # re-enqueue to retry. A plain block-until-ready would head-of-line
-            # block other rooms on this single worker thread.
-            with self._staging_ctx.watermark_cv:
-                self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
-            queue.put(kv_chunk)
-            return (-1, True)
+            # Not ready yet (allocation in flight or watermark pending). Bounded
+            # spin: STAGING_REQ was just sent and the decode-side allocation +
+            # STAGING_RSP land within ms, so re-checking beats re-enqueueing.
+            # Re-enqueueing immediately moves this chunk behind every other
+            # queued chunk (~seconds under load), and lets later chunks of the
+            # same room transfer before it -- their SUCCESS then fires before
+            # this chunk's data has been sent, dropping its scatter on decode.
+            # Blocking this worker for the spin is cheaper than that.
+            deadline = time.monotonic() + STAGING_READY_SPIN_S
+            while time.monotonic() < deadline:
+                ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
+                    req,
+                    kv_chunk.index_slice.start,
+                    len(kv_chunk.prefill_kv_indices),
+                )
+                if ready:
+                    break
+                if c_offset == StagingAllocator.ALLOC_OVERSIZED:
+                    logger.warning_once(
+                        "[Staging] a chunk exceeds the staging ring; failing "
+                        "affected requests. Increase "
+                        "SGLANG_DISAGG_STAGING_POOL_SIZE_MB or reduce "
+                        "chunked_prefill_size."
+                    )
+                    return (-1, False)
+                with self._staging_ctx.watermark_cv:
+                    self._staging_ctx.watermark_cv.wait(0.01)
+            if not ready:
+                # Persistent unreadiness (ring exhausted): re-enqueue, bounded
+                # by the caller's deferral loop, so other rooms still progress.
+                # Bound the wait wall-clock: a decode-side allocation leak
+                # (watermark frozen) would otherwise re-enqueue forever until
+                # the decode's own 300s poll timeout. Fail the room after
+                # STAGING_MAX_WAIT_S so the decode's release_room frees the
+                # staging allocation promptly.
+                if kv_chunk.staging_first_attempt is None:
+                    kv_chunk.staging_first_attempt = time.monotonic()
+                elif (
+                    time.monotonic() - kv_chunk.staging_first_attempt
+                    > STAGING_MAX_WAIT_S
+                ):
+                    logger.warning_once(
+                        "[Staging] chunk never became ready in %.0fs "
+                        "(decode-side staging allocator likely wedged); "
+                        "failing room=%s chunk=%s",
+                        STAGING_MAX_WAIT_S,
+                        kv_chunk.room,
+                        kv_chunk.index_slice.start,
+                    )
+                    return (-1, False)
+                queue.put(kv_chunk)
+                return (-1, True)
 
         ret = staging_strategy.transfer(
             req.mooncake_session_id,
@@ -1773,6 +1894,45 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info.dst_kv_layer_ids
                                 ),
                             )
+                        elif (
+                            not (self.is_mla_backend or self.is_hybrid_mla_backend)
+                            and self.attn_tp_size
+                            == target_rank_registration_info.dst_attn_tp_size
+                            and self.enable_staging
+                            and staging_strategy is not None
+                            and (
+                                target_rank_registration_info.staging_base_ptr != 0
+                                or target_rank_registration_info.staging_total_size != 0
+                            )
+                            and (
+                                self._fragmented_groups(
+                                    kv_chunk.prefill_kv_indices,
+                                    chunked_dst_kv_indice,
+                                )
+                                >= envs.SGLANG_DISAGG_STAGING_MIN_GROUPS.get()
+                                or envs.SGLANG_DISAGG_STAGING_ALWAYS.get()
+                            )
+                        ):
+                            # Equal-TP fragmented chunk (#5450): GxL per-entry
+                            # overheads collapse bandwidth; stage it instead
+                            # (gather -> 1 bulk -> scatter). Staging allocation
+                            # is requested on demand; check_ready spins until
+                            # the decode-side STAGING_RSP lands.
+                            self._ensure_equal_tp_staging_req(kv_chunk, req)
+                            ret, deferred = self._do_staging_transfer(
+                                staging_strategy,
+                                kv_chunk,
+                                req,
+                                target_rank_registration_info,
+                                chunked_dst_kv_indice,
+                                executor,
+                                queue,
+                                prefill_unique_rank,
+                            )
+                            if deferred:
+                                staging_deferred = True
+                                # Chunk re-enqueued; stop processing remaining reqs for this chunk
+                                break
                         elif (
                             self.is_mla_backend
                             or self.is_hybrid_mla_backend

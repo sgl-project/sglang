@@ -679,7 +679,15 @@ class Envs:
     # ===================================================================
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
+    # Equal-TP fragmented KV transfer (#5450): route a chunk through staging
+    # when its concurrent-contiguity group count reaches this threshold.
+    SGLANG_DISAGG_STAGING_MIN_GROUPS = EnvInt(8)
+    # Route every equal-TP chunk through staging regardless of fragmentation.
+    SGLANG_DISAGG_STAGING_ALWAYS = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    # Pinned host staging buffer (Phase 2): mooncake TCP host->host is ~2.5x
+    # faster than its device path, verified on 0.5.17 (TTFT -23%, E2E -18%).
+    SGLANG_DISAGG_STAGING_HOST_MEM = EnvBool(False)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)

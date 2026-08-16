@@ -252,8 +252,13 @@ def poll_and_all_reduce_with_staging(
     server_args: Optional[ServerArgs] = None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
+    # Gate on is_staging_room rather than kv_receiver.require_staging (hetero-TP
+    # only): equal-TP fragmented transfers (#5450) also stage, and a registered
+    # room that never staged completes through advance_scatter (empty chunk
+    # infos) instead of being demoted forever.
     for decode_req in decode_reqs:
-        if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
+        room = decode_req.req.bootstrap_room
+        if staging_handler.is_staging_room(room) and not staging_handler.is_done(
             decode_req
         ):
             staging_handler.advance_scatter(decode_req)
@@ -262,7 +267,8 @@ def poll_and_all_reduce_with_staging(
     receivers = [dr.kv_receiver for dr in decode_reqs]
     raw_polls = _poll_with_failure_injection(receivers)
     for i, decode_req in enumerate(decode_reqs):
-        if decode_req.kv_receiver.require_staging and staging_handler.is_failed(
+        room = decode_req.req.bootstrap_room
+        if staging_handler.is_staging_room(room) and staging_handler.is_failed(
             decode_req
         ):
             # Staging completion timed out; KVPoll.Failed == 0 propagates
@@ -270,7 +276,7 @@ def poll_and_all_reduce_with_staging(
             raw_polls[i] = int(KVPoll.Failed)
             continue
         if raw_polls[i] == int(KVPoll.Success):
-            if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
+            if staging_handler.is_staging_room(room) and not staging_handler.is_done(
                 decode_req
             ):
                 raw_polls[i] = int(KVPoll.Transferring)

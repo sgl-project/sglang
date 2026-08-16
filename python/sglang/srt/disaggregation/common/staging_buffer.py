@@ -133,14 +133,24 @@ class StagingBuffer:
         self.device = device
         self.gpu_id = gpu_id
 
-        torch.cuda.set_device(gpu_id)
-        if custom_mem_pool is not None:
-            with torch.cuda.use_mem_pool(custom_mem_pool):
-                self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
-            alloc_method = "custom_mem_pool (cuMemCreate)"
+        if device == "cpu":
+            # Pinned host staging (Phase 2): mooncake TCP host->host is ~2.5x
+            # faster than its device path; gather/scatter then use torch copies.
+            self.buffer = torch.empty(
+                size_bytes, dtype=torch.uint8, device="cpu", pin_memory=True
+            )
+            alloc_method = "cudaHostAlloc (pinned)"
         else:
-            self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
-            alloc_method = "cudaMalloc"
+            torch.cuda.set_device(gpu_id)
+            if custom_mem_pool is not None:
+                with torch.cuda.use_mem_pool(custom_mem_pool):
+                    self.buffer = torch.empty(
+                        size_bytes, dtype=torch.uint8, device=device
+                    )
+                alloc_method = "custom_mem_pool (cuMemCreate)"
+            else:
+                self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
+                alloc_method = "cudaMalloc"
         self.data_ptr = self.buffer.data_ptr()
 
         logger.info(
@@ -288,7 +298,13 @@ def gather_kv_head_slices(
         staging_tensor: Output tensor, shape [num_tokens, num_heads, head_dim].
     """
     src = kv_buffer_tensor[:, head_start : head_start + num_heads, :]
-    torch.gather(src, 0, gather_idx, out=staging_tensor)
+    if staging_tensor.is_cuda:
+        torch.gather(src, 0, gather_idx, out=staging_tensor)
+    else:
+        # Host staging (Phase 2): torch.gather's out= must share the input
+        # device, so gather on CUDA then copy D2H (pinned, ~6.5 GB/s under
+        # load). The copy runs on the caller's current stream.
+        staging_tensor.copy_(torch.gather(src, 0, gather_idx))
 
 
 def scatter_kv_head_slices(
@@ -310,6 +326,11 @@ def scatter_kv_head_slices(
         page_size: Number of tokens per page.
     """
     head_dim = kv_buffer_tensor.shape[-1]
+    # Host staging (Phase 2): fancy-index assignment requires src and dst on
+    # the same device, so move the staging slice to the KV device first (H2D
+    # copy; staging is pinned so this is fast).
+    if staging_tensor.device != kv_buffer_tensor.device:
+        staging_tensor = staging_tensor.to(kv_buffer_tensor.device)
     if page_size == 1:
         num_tokens = page_indices.shape[0]
         data = staging_tensor.reshape(num_tokens, num_heads, head_dim)
