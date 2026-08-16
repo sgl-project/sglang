@@ -452,18 +452,21 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
         )
         self._forward_method = self.dispatch_forward()
 
-        try:
-            import attentions  # noqa: F401
-        except ImportError:
-            from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+        if _is_npu:
+            try:
+                import attentions  # noqa: F401
+            except ImportError:
+                from sglang.multimodal_gen.runtime.utils.logging_utils import (
+                    init_logger,
+                )
 
-            logger = init_logger(__name__)  # pylint: disable=invalid-name
-            logger.warning(
-                "The 'attentions' library is not installed. Falling back to native layernorm. "
-                "Installing this library may improve performance on NPU."
-                "See: sgl-project/sgl-kernel-npu"
-            )
-            self._forward_method = self.forward_native
+                logger = init_logger(__name__)  # pylint: disable=invalid-name
+                logger.warning(
+                    "The 'attentions' library is not installed. Falling back to native layernorm. "
+                    "Installing this library may improve performance on NPU."
+                    "See: sgl-project/sgl-kernel-npu"
+                )
+                self._forward_method = self.forward_native
 
     def _cached_fp32_param(
         self, attr: str, param: torch.Tensor | None, device: torch.device
@@ -969,8 +972,17 @@ def apply_qk_norm_rope(
     positions: Optional[torch.Tensor] = None,
     position_offset: int = 0,
     allow_inplace: bool = True,
+    allow_strided_qk: bool = False,
+    round_norm_before_rope: bool = False,
+    cache_has_full_width: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply QK RMSNorm followed by RoPE, fusing both on supported CUDA/XPU shapes."""
+    """Apply QK RMSNorm followed by RoPE, fusing supported CUDA/XPU shapes.
+
+    Strided packed-QKV views require an explicit opt-in because selecting the fused
+    kernel changes the numerical path for models that historically used the fallback.
+    ``cache_has_full_width`` describes ``[full cos, full sin]`` cache rows and
+    requires the fused CUDA path; the ordinary cache stores half-width cos/sin.
+    """
 
     from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
         apply_flashinfer_rope_qk_inplace,
@@ -996,7 +1008,12 @@ def apply_qk_norm_rope(
     batch_size, seq_len, _, _ = q.shape
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
-    rope_dim = cos_sin_cache.size(-1)
+    cache_width = cos_sin_cache.size(-1)
+    if cache_has_full_width and cache_width % 2:
+        raise ValueError(
+            f"full-width cos/sin cache must have even width, got {cache_width}"
+        )
+    rope_dim = cache_width // 2 if cache_has_full_width else cache_width
     if rope_dim % 2 != 0 or rope_dim > head_dim:
         raise ValueError(
             f"cos_sin_cache width must be even and <= head_dim, got {rope_dim} vs {head_dim}"
@@ -1007,6 +1024,17 @@ def apply_qk_norm_rope(
         "off",
         "no",
     }
+    q_has_supported_layout = q.is_contiguous()
+    k_has_supported_layout = k.is_contiguous()
+    if allow_strided_qk:
+        q_has_supported_layout = (
+            q.stride(-1) == 1
+            and q.stride(-2) == k.stride(-2)
+            and q.stride(0) == seq_len * q.stride(1)
+        )
+        k_has_supported_layout = k.stride(-1) == 1 and k.stride(
+            0
+        ) == seq_len * k.stride(1)
 
     if positions is None:
         pos_1d = torch.arange(
@@ -1030,15 +1058,24 @@ def apply_qk_norm_rope(
         and allow_inplace
         and (q_eps == k_eps)
         and q.dtype in (torch.float16, torch.bfloat16)
+        and k.dtype == q.dtype
         and q_norm.weight.dtype == q.dtype
         and k_norm.weight.dtype == k.dtype
-        and q.is_contiguous()
-        and k.is_contiguous()
-        and can_use_fused_inplace_qknorm_rope(head_dim, rope_dim, is_neox, q.dtype)
+        and q_has_supported_layout
+        and k_has_supported_layout
+        and can_use_fused_inplace_qknorm_rope(
+            head_dim=head_dim,
+            rope_dim=rope_dim,
+            is_neox=is_neox,
+            dtype=q.dtype,
+            cache_dtype=cos_sin_cache.dtype,
+            round_norm_before_rope=round_norm_before_rope,
+            cache_has_full_width=cache_has_full_width,
+        )
     ):
         fused_inplace_qknorm_rope(
-            q=q.reshape(-1, q.shape[-2], head_dim),
-            k=k.reshape(-1, k.shape[-2], head_dim),
+            q=q.view(-1, q.shape[-2], head_dim),
+            k=k.view(-1, k.shape[-2], head_dim),
             q_weight=q_norm.weight,
             k_weight=k_norm.weight,
             cos_sin_cache=cos_sin_cache,
@@ -1047,11 +1084,14 @@ def apply_qk_norm_rope(
             eps=q_eps,
             head_dim=head_dim,
             rope_dim=rope_dim,
+            round_norm_before_rope=round_norm_before_rope,
+            cache_has_full_width=cache_has_full_width,
         )
         return q, k
 
-    # TODO: Once CUDA fused_inplace_qknorm_rope supports last-dimension-contiguous q/k,
-    # merge this path with the CUDA fused qknorm+rope branch.
+    if cache_has_full_width:
+        raise RuntimeError("full-width cos/sin cache requires fused QKNorm+RoPE")
+
     if (
         _is_xpu
         and allow_inplace

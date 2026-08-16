@@ -670,9 +670,29 @@ class LogicalHostPool:
     @synchronized
     def clear(self):
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        # Match HostKVCache's lazy release path: defer large free-list merges
+        # until an allocation needs the released slots.
+        self.release_slots = []
+        self.num_release_slots = 0
+
+    def destroy(self) -> None:
+        """Logical anchors own no backing buffers or registrations to release."""
+        return None
 
     def available_size(self):
-        return len(self.free_slots)
+        return len(self.free_slots) + self.num_release_slots
+
+    def _merge_release_slots(self):
+        if self.num_release_slots == 0:
+            return
+
+        if len(self.free_slots) == 0 and len(self.release_slots) == 1:
+            self.free_slots = self.release_slots[0]
+        else:
+            self.free_slots = torch.cat([self.free_slots, *self.release_slots])
+
+        self.release_slots = []
+        self.num_release_slots = 0
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
@@ -683,6 +703,10 @@ class LogicalHostPool:
             )
         if need_size > self.available_size():
             return None
+
+        if need_size > len(self.free_slots):
+            self._merge_release_slots()
+
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
         return select_index
@@ -694,9 +718,12 @@ class LogicalHostPool:
                 "LogicalHostPool free must be page-aligned, "
                 f"got len(indices)={len(indices)}, page_size={self.page_size}"
             )
-        self.free_slots = torch.cat(
-            [self.free_slots, indices.to(dtype=torch.int64, device="cpu").flatten()]
-        )
+        indices_cpu = indices.to(dtype=torch.int64, device="cpu").flatten()
+        if indices_cpu.numel() == 0:
+            return 0
+
+        self.release_slots.append(indices_cpu)
+        self.num_release_slots += len(indices_cpu)
         return len(indices)
 
     def backup_from_device_all_layer(
@@ -1718,15 +1745,17 @@ class HostPoolGroup:
         pool_transfers: Optional[list] = None,
     ) -> None:
         # 1. Anchor (KV) backup
-        anchor_host_indices, anchor_device_indices = self._normalize_backup_indices(
-            self.anchor_entry, host_indices, device_indices, io_backend
-        )
-        self.anchor_entry.host_pool.backup_from_device_all_layer(
-            self.anchor_entry.device_pool,
-            anchor_host_indices,
-            anchor_device_indices,
-            io_backend,
-        )
+        # A zero-length anchor denotes a component-only backup.
+        if host_indices.numel() > 0:
+            anchor_host_indices, anchor_device_indices = self._normalize_backup_indices(
+                self.anchor_entry, host_indices, device_indices, io_backend
+            )
+            self.anchor_entry.host_pool.backup_from_device_all_layer(
+                self.anchor_entry.device_pool,
+                anchor_host_indices,
+                anchor_device_indices,
+                io_backend,
+            )
         # 2. Extra pool backup
         for transfer in pool_transfers or []:
             entry = self.entry_map.get(transfer.name)
