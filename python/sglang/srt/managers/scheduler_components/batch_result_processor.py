@@ -59,6 +59,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
     )
+    from sglang.srt.managers.scheduler_components.sensenova_u1_interleave import (
+        SenseNovaU1InterleaveController,
+    )
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.managers.utils import (
         EmbeddingBatchResult,
@@ -93,6 +96,9 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+    sensenova_u1_interleave_controller: Optional[
+        SenseNovaU1InterleaveController
+    ] = None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -195,7 +201,8 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        skip_stream_req = None
+        skip_stream_reqs = set()
+        completed_interleave_children = []
         self.token_to_kv_pool_allocator.free_group_begin()
 
         if self.is_generation:
@@ -271,7 +278,15 @@ class SchedulerBatchResultProcessor:
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
                     req.update_finish_state()
-                    if req.finished():
+                    interleave_parked = (
+                        self.sensenova_u1_interleave_controller is not None
+                        and self.sensenova_u1_interleave_controller.maybe_park_parent(
+                            req
+                        )
+                    )
+                    if interleave_parked:
+                        skip_stream_reqs.add(req)
+                    elif req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
@@ -282,6 +297,15 @@ class SchedulerBatchResultProcessor:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
                     self._maybe_collect_customized_info(i, req, logits_output)
+                    if (
+                        self.sensenova_u1_interleave_controller is not None
+                        and self.sensenova_u1_interleave_controller.is_internal_child(
+                            req
+                        )
+                    ):
+                        skip_stream_reqs.add(req)
+                        if req.finished():
+                            completed_interleave_children.append(req)
 
                     if batch.return_logprob:
                         logprob_pt = self._apply_prefill_logprobs(
@@ -310,7 +334,7 @@ class SchedulerBatchResultProcessor:
                     # There is only at most one request being currently chunked.
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
-                    skip_stream_req = req
+                    skip_stream_reqs.add(req)
 
                     # Incrementally update input logprobs.
                     if batch.return_logprob:
@@ -363,8 +387,11 @@ class SchedulerBatchResultProcessor:
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
         self.token_to_kv_pool_allocator.free_group_end()
+        if self.sensenova_u1_interleave_controller is not None:
+            for child in completed_interleave_children:
+                self.sensenova_u1_interleave_controller.complete_child(child)
         self.output_streamer.stream_output(
-            batch.reqs, batch.return_logprob, skip_stream_req
+            batch.reqs, batch.return_logprob, skip_stream_reqs
         )
 
         can_run_cuda_graph = result.can_run_cuda_graph
@@ -843,6 +870,7 @@ class SchedulerBatchResultProcessor:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
+        skip_stream_reqs = set()
 
         for i, req in enumerate(batch.reqs):
             req: Req
@@ -865,6 +893,11 @@ class SchedulerBatchResultProcessor:
             self._maybe_update_reasoning_tokens(req, next_token_id)
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
+            if (
+                self.sensenova_u1_interleave_controller is not None
+                and self.sensenova_u1_interleave_controller.maybe_park_parent(req)
+            ):
+                skip_stream_reqs.add(req)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
@@ -903,7 +936,11 @@ class SchedulerBatchResultProcessor:
                     self._accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
 
-        self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        self.output_streamer.stream_output(
+            batch.reqs,
+            batch.return_logprob,
+            skip_stream_reqs,
+        )
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.forward_ct_decode = (

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -12,7 +13,6 @@ from typing import (
 
 import torch
 import zmq
-
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -104,7 +104,7 @@ class SchedulerOutputStreamer:
         self,
         reqs: List[Req],
         return_logprob: bool,
-        skip_req: Optional[Req] = None,
+        skip_req: Req | Collection[Req] | None = None,
     ):
         """Stream the output to detokenizer."""
         if self.is_generation:
@@ -130,20 +130,26 @@ class SchedulerOutputStreamer:
         self,
         reqs: List[Req],
         return_logprob: bool,
-        skip_req: Optional[Req] = None,
+        skip_req: Req | Collection[Req] | None = None,
         is_idle_batch: bool = False,
     ):
+        if skip_req is None:
+            skip_reqs = set()
+        elif isinstance(skip_req, (list, set, tuple, frozenset)):
+            skip_reqs = set(skip_req)
+        else:
+            skip_reqs = {skip_req}
         return_hidden_states = any(
-            req.return_hidden_states for req in reqs if req is not skip_req
+            req.return_hidden_states for req in reqs if req not in skip_reqs
         )
         return_routed_experts = any(
-            req.return_routed_experts for req in reqs if req is not skip_req
+            req.return_routed_experts for req in reqs if req not in skip_reqs
         )
         return_indexer_topk = any(
-            req.return_indexer_topk for req in reqs if req is not skip_req
+            req.return_indexer_topk for req in reqs if req not in skip_reqs
         )
         return_sampling_mask = any(
-            req.return_sampling_mask for req in reqs if req is not skip_req
+            req.return_sampling_mask for req in reqs if req not in skip_reqs
         )
 
         acc = _GenerationStreamAccumulator(
@@ -160,7 +166,7 @@ class SchedulerOutputStreamer:
             rust_server_mode=self.rust_server is not None,
         )
         for req in reqs:
-            if req is skip_req:
+            if req in skip_reqs:
                 continue
             if req.finished() and req.finished_output:
                 # With the overlap schedule, a request will try to output twice and hit this line twice

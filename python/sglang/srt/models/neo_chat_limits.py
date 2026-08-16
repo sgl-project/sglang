@@ -10,6 +10,7 @@ U1_FLOW_CUSTOM_PARAM = "sensenova_u1_flow"
 U1_FLOW_BATCH_ISOLATION_PARAM = "__sglang_batch_isolation_key"
 U1_FLOW_RADIX_PREFIX_LIMIT_PARAM = "__sglang_radix_cache_prefix_limit"
 U1_FLOW_PREFILL_GRAPH_VARIANT_PARAM = "__sglang_prefill_cuda_graph_variant"
+U1_INTERLEAVE_CUSTOM_PARAM = "sensenova_u1_interleave"
 U1_IMAGE_CONDITIONING_CUSTOM_PARAM = "sensenova_u1_image_conditioning"
 U1_IMAGE_CONDITIONING_MIN_PIXELS = 512 * 512
 U1_IMAGE_CONDITIONING_MAX_PIXELS = 2048 * 2048
@@ -17,6 +18,7 @@ U1_IMAGE_SIZE_DIVISOR = 32
 U1_MAX_IMAGE_DIMENSION = 2048
 U1_MAX_IMAGE_PIXELS = 1024 * 1024
 U1_MAX_FLOW_STEPS = 64
+U1_MAX_INTERLEAVE_IMAGES = 8
 
 
 def parse_u1_int(value: Any, *, name: str) -> int:
@@ -139,6 +141,77 @@ def normalize_u1_flow_request(
     }
 
 
+def normalize_u1_interleave_request(
+    spec: Any,
+    *,
+    input_token_count: int,
+    max_new_tokens: int,
+    context_len: int,
+    img_start_token_id: int,
+    img_context_token_id: int,
+    img_end_token_id: int,
+) -> dict[str, Any]:
+    if not isinstance(spec, dict):
+        raise TypeError("sensenova_u1_interleave must be an object")
+
+    width, height = validate_u1_image_size(
+        spec.get("width", 256),
+        spec.get("height", 256),
+    )
+    num_steps = validate_u1_flow_steps(spec.get("num_steps", 2))
+    max_images = parse_u1_int(spec.get("max_images", 1), name="max_images")
+    if max_images <= 0:
+        raise ValueError("max_images must be positive")
+    if max_images > U1_MAX_INTERLEAVE_IMAGES:
+        raise ValueError(
+            f"max_images exceeds the maximum {U1_MAX_INTERLEAVE_IMAGES}: {max_images}"
+        )
+
+    seed = parse_u1_int(spec.get("seed", 0), name="seed")
+    if seed < 0 or seed >= 2**63:
+        raise ValueError("seed must be in [0, 2**63)")
+    timestep_shift = float(spec.get("timestep_shift", 1.0))
+    if not math.isfinite(timestep_shift) or timestep_shift <= 0:
+        raise ValueError("timestep_shift must be a positive finite number")
+    enable_timestep_shift = spec.get("enable_timestep_shift", True)
+    return_images = spec.get("return_images", True)
+    if not isinstance(enable_timestep_shift, bool):
+        raise TypeError("enable_timestep_shift must be a boolean")
+    if not isinstance(return_images, bool):
+        raise TypeError("return_images must be a boolean")
+
+    token_width = width // U1_IMAGE_SIZE_DIVISOR
+    token_height = height // U1_IMAGE_SIZE_DIVISOR
+    image_tokens = token_width * token_height
+    image_span_tokens = image_tokens + 1  # Context tokens plus </img>.
+    reserved_tokens = (
+        input_token_count + max_new_tokens + max_images * image_span_tokens
+    )
+    if reserved_tokens > context_len:
+        raise ValueError(
+            "SenseNova U1 interleave request exceeds the context window after "
+            f"reserving image spans: {reserved_tokens} > {context_len}"
+        )
+
+    return {
+        "width": width,
+        "height": height,
+        "num_steps": num_steps,
+        "max_images": max_images,
+        "seed": seed,
+        "timestep_shift": timestep_shift,
+        "enable_timestep_shift": enable_timestep_shift,
+        "return_images": return_images,
+        "image_tokens": image_tokens,
+        "image_span_tokens": image_span_tokens,
+        "token_height": token_height,
+        "token_width": token_width,
+        "img_start_token_id": int(img_start_token_id),
+        "img_context_token_id": int(img_context_token_id),
+        "img_end_token_id": int(img_end_token_id),
+    }
+
+
 __all__ = [
     "U1_FLOW_BATCH_ISOLATION_PARAM",
     "U1_FLOW_CUSTOM_PARAM",
@@ -148,10 +221,13 @@ __all__ = [
     "U1_IMAGE_CONDITIONING_MAX_PIXELS",
     "U1_IMAGE_CONDITIONING_MIN_PIXELS",
     "U1_IMAGE_SIZE_DIVISOR",
+    "U1_INTERLEAVE_CUSTOM_PARAM",
     "U1_MAX_FLOW_STEPS",
     "U1_MAX_IMAGE_DIMENSION",
     "U1_MAX_IMAGE_PIXELS",
+    "U1_MAX_INTERLEAVE_IMAGES",
     "normalize_u1_flow_request",
+    "normalize_u1_interleave_request",
     "parse_u1_int",
     "validate_u1_flow_steps",
     "validate_u1_image_size",

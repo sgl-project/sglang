@@ -254,6 +254,9 @@ from sglang.srt.managers.scheduler_components.recv_skipper import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.managers.scheduler_components.sensenova_u1_interleave import (
+    SenseNovaU1InterleaveController,
+)
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -650,6 +653,8 @@ class Scheduler(
         self.init_load_inquirer()
 
         self.init_output_streamer()
+
+        self.init_sensenova_u1_interleave_controller()
 
         self.init_batch_result_processor()
 
@@ -2151,6 +2156,13 @@ class Scheduler(
             rust_server=self.rust_server,
         )
 
+    def init_sensenova_u1_interleave_controller(self) -> None:
+        self.sensenova_u1_interleave_controller = (
+            SenseNovaU1InterleaveController(self)
+            if self.model_config.hf_config.model_type == "neo_chat"
+            else None
+        )
+
     def init_batch_result_processor(self) -> None:
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
@@ -2173,6 +2185,9 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
+            sensenova_u1_interleave_controller=(
+                self.sensenova_u1_interleave_controller
+            ),
         )
 
     def init_req_max_new_tokens(self, req):
@@ -2681,9 +2696,20 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self.sensenova_u1_interleave_controller is not None:
+            interleave_error = (
+                self.sensenova_u1_interleave_controller.register_parent(req)
+            )
+            if interleave_error is not None:
+                req.set_finish_with_abort(interleave_error)
+                self._add_request_to_queue(req)
+                return
+
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
-            self._add_request_to_queue(req)
+            if not self._add_request_to_queue(req):
+                if self.sensenova_u1_interleave_controller is not None:
+                    self.sensenova_u1_interleave_controller.discard_parent(req)
 
     def handle_batch_generate_request(
         self,
@@ -2721,12 +2747,12 @@ class Scheduler(
                     prefix_keys,
                 )
 
-    def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+    def _add_request_to_queue(self, req: Req, is_retracted: bool = False) -> bool:
         if not self._set_or_validate_priority(req):
-            return
+            return False
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
-                return
+                return False
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
@@ -2744,6 +2770,27 @@ class Scheduler(
                 req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+        return True
+
+    def _add_internal_request_to_queue(self, req: Req) -> bool:
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            return False
+        if (
+            self.max_queued_requests is not None
+            and len(self.waiting_queue) + 1 > self.max_queued_requests
+        ):
+            return False
+        if not self._set_or_validate_priority(req):
+            return False
+        self._prefetch_kvcache(req)
+        self.waiting_queue.append(req)
+        req.time_stats.set_wait_queue_entry_time()
+        return True
+
+    def _resume_interleave_parent(self, req: Req) -> None:
+        if req not in self.waiting_queue:
+            self.waiting_queue.append(req)
+            req.time_stats.set_wait_queue_entry_time()
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -2805,17 +2852,31 @@ class Scheduler(
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
-        self.ipc_channels.send_to_tokenizer.send_output(
-            AbortReq(
-                finished_reason={
-                    "type": "abort",
-                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                    "message": message,
-                },
-                rid=req_to_abort.rid,
-            ),
-            req_to_abort,
+        interleave_controller = getattr(
+            self,
+            "sensenova_u1_interleave_controller",
+            None,
         )
+        if (
+            interleave_controller is not None
+            and interleave_controller.is_internal_child(req_to_abort)
+        ):
+            interleave_controller.fail_internal_child(
+                req_to_abort,
+                message,
+            )
+        else:
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                        "message": message,
+                    },
+                    rid=req_to_abort.rid,
+                ),
+                req_to_abort,
+            )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
 
@@ -2825,23 +2886,37 @@ class Scheduler(
 
         deleted_reqs = set()
         deadline = time.perf_counter() - timeout_s
+        interleave_controller = getattr(
+            self,
+            "sensenova_u1_interleave_controller",
+            None,
+        )
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    AbortReq(
-                        finished_reason={
-                            "type": "abort",
-                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                            "message": "Request waiting timeout reached.",
-                        },
-                        rid=req.rid,
-                    ),
-                    req,
-                )
+                if (
+                    interleave_controller is not None
+                    and interleave_controller.is_internal_child(req)
+                ):
+                    interleave_controller.fail_internal_child(
+                        req,
+                        "SenseNova U1 internal flow waiting timeout reached.",
+                    )
+                else:
+                    self.ipc_channels.send_to_tokenizer.send_output(
+                        AbortReq(
+                            finished_reason={
+                                "type": "abort",
+                                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                                "message": "Request waiting timeout reached.",
+                            },
+                            rid=req.rid,
+                        ),
+                        req,
+                    )
                 deleted_reqs.add(req)
 
         if deleted_reqs:
@@ -3027,6 +3102,7 @@ class Scheduler(
             self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout(running_batch)
+        self._filter_parked_interleave_reqs(running_batch)
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
@@ -3154,6 +3230,18 @@ class Scheduler(
                 ret.fpm_start_time = self._fpm_batch_t0
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    @staticmethod
+    def _filter_parked_interleave_reqs(running_batch: ScheduleBatch) -> None:
+        initial_bs = running_batch.batch_size()
+        if not any(
+            getattr(req, "_sensenova_u1_interleave_parked", False)
+            for req in running_batch.reqs
+        ):
+            return
+        running_batch.filter_batch()
+        if running_batch.batch_size() < initial_bs:
+            running_batch.batch_is_full = False
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_parallel().pp_max_micro_batch_size - running_bs
@@ -3955,6 +4043,14 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
+        interleave_controller = getattr(
+            self,
+            "sensenova_u1_interleave_controller",
+            None,
+        )
+        if interleave_controller is not None:
+            interleave_controller.cleanup_finished(batch.reqs)
+
         self._record_step_counters(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
@@ -4452,6 +4548,22 @@ class Scheduler(
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        direct_interleave_aborts = []
+        interleave_controller = getattr(
+            self,
+            "sensenova_u1_interleave_controller",
+            None,
+        )
+        if interleave_controller is not None:
+            direct_interleave_aborts = interleave_controller.before_abort(recv_req)
+        for req in direct_interleave_aborts:
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(rid=req.rid),
+                req,
+            )
+            if req.multimodal_inputs is not None and req.session is None:
+                req.multimodal_inputs.release_features()
+
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
@@ -4472,7 +4584,14 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            if not (
+                interleave_controller is not None
+                and interleave_controller.is_internal_child(req)
+            ):
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(rid=req.rid),
+                    req,
+                )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)

@@ -948,6 +948,9 @@ class PrefillAdder:
         )
 
     def _req_inc_lock_ref(self, req: Req):
+        if getattr(req, "_sensenova_u1_reuse_prefix_lock_once", False):
+            req._sensenova_u1_reuse_prefix_lock_once = False
+            return
         result = self.tree_cache.inc_lock_ref(req.last_node)
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock

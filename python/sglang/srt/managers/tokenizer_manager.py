@@ -1397,10 +1397,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 U1_FLOW_CUSTOM_PARAM,
                 U1_FLOW_PREFILL_GRAPH_VARIANT_PARAM,
                 U1_FLOW_RADIX_PREFIX_LIMIT_PARAM,
+                U1_INTERLEAVE_CUSTOM_PARAM,
                 normalize_u1_flow_request,
+                normalize_u1_interleave_request,
             )
 
             flow_spec = sampling_params.custom_params.get(U1_FLOW_CUSTOM_PARAM)
+            interleave_spec = sampling_params.custom_params.get(
+                U1_INTERLEAVE_CUSTOM_PARAM
+            )
+            if flow_spec is not None and interleave_spec is not None:
+                raise ValueError(
+                    "SenseNova U1 flow and interleave modes are mutually exclusive"
+                )
             if flow_spec is not None:
                 if input_ids is None:
                     raise ValueError("SenseNova U1 flow requires input_ids")
@@ -1420,6 +1429,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "sensenova_u1_flow"
                 )
                 sampling_params.custom_params = custom_params
+            elif interleave_spec is not None:
+                if input_ids is None:
+                    raise ValueError("SenseNova U1 interleave requires input_ids")
+                img_start_token_id = self.tokenizer.convert_tokens_to_ids("<img>")
+                img_context_token_id = self.tokenizer.convert_tokens_to_ids(
+                    "<IMG_CONTEXT>"
+                )
+                img_end_token_id = self.tokenizer.convert_tokens_to_ids("</img>")
+                normalized_interleave_spec = normalize_u1_interleave_request(
+                    interleave_spec,
+                    input_token_count=len(input_ids),
+                    max_new_tokens=int(sampling_params.max_new_tokens or 0),
+                    context_len=int(self.model_config.context_len),
+                    img_start_token_id=img_start_token_id,
+                    img_context_token_id=img_context_token_id,
+                    img_end_token_id=img_end_token_id,
+                )
+                custom_params = dict(sampling_params.custom_params)
+                custom_params[U1_INTERLEAVE_CUSTOM_PARAM] = (
+                    normalized_interleave_spec
+                )
+                sampling_params.custom_params = custom_params
+                stop_token_ids = set(sampling_params.stop_token_ids or ())
+                stop_token_ids.add(img_start_token_id)
+                sampling_params.stop_token_ids = stop_token_ids
+                sampling_params.ignore_eos = False
 
         # Build return object
         if isinstance(obj, GenerateReqInput):

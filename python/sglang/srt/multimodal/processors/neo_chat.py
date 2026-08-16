@@ -114,6 +114,47 @@ def load_image_native(
     return pixel_values, torch.tensor([[grid_height, grid_width]], dtype=torch.long)
 
 
+def generated_u1_image_to_native_feature(
+    image_tensor: torch.Tensor,
+    *,
+    patch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    tensor = image_tensor.detach().to(device="cpu", dtype=torch.float32)
+    if tensor.ndim == 4:
+        if tensor.shape[0] != 1:
+            raise ValueError("generated image tensor batch size must be 1")
+        tensor = tensor[0]
+    if tensor.ndim != 3 or tensor.shape[0] != 3:
+        raise ValueError("generated image tensor must have shape [3,H,W] or [1,3,H,W]")
+
+    _, height, width = tensor.shape
+    if height % patch_size or width % patch_size:
+        raise ValueError(
+            f"generated image shape {(height, width)} must be divisible by "
+            f"patch_size={patch_size}"
+        )
+
+    raw_image = tensor * 0.5 + 0.5
+    mean = torch.tensor(IMAGENET_MEAN, dtype=raw_image.dtype).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, dtype=raw_image.dtype).view(3, 1, 1)
+    pixel_values = (raw_image - mean) / std
+    grid_height = height // patch_size
+    grid_width = width // patch_size
+    pixel_values = (
+        pixel_values.view(
+            3,
+            grid_height,
+            patch_size,
+            grid_width,
+            patch_size,
+        )
+        .permute(1, 3, 0, 2, 4)
+        .reshape(grid_height * grid_width, 3 * patch_size**2)
+        .contiguous()
+    )
+    return pixel_values, torch.tensor([[grid_height, grid_width]], dtype=torch.long)
+
+
 def build_u1_mrope_positions(
     input_ids: torch.Tensor,
     *,
@@ -335,6 +376,7 @@ class NEOChatMultimodalProcessor(BaseMultimodalProcessor):
 __all__ = [
     "NEOChatMultimodalProcessor",
     "build_u1_mrope_positions",
+    "generated_u1_image_to_native_feature",
     "load_image_native",
     "smart_resize",
 ]

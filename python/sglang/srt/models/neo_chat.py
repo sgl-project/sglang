@@ -1180,6 +1180,8 @@ class NEOChatModel(nn.Module):
                 [float(value) for value in timesteps.detach().cpu().tolist()]
             ],
         }
+        if bool(spec.get("return_image_tensor_raw", False)):
+            output.customized_info["sensenova_u1_flow_image_tensor"] = [final_image]
         logger.info(
             "SenseNova U1 bounded flow complete: steps=%d total_delta_l2=%.6f",
             num_steps,
