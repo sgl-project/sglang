@@ -496,7 +496,7 @@ class MHATokenToKVPool(KVCache):
                 ]
                 self.k_scale_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim // 32),
+                        (self.size + self.page_size, self.head_num, self.head_dim // 16),
                         dtype=torch.uint8,
                         device=self.device,
                     )
@@ -504,7 +504,7 @@ class MHATokenToKVPool(KVCache):
                 ]
                 self.v_scale_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim // 32),
+                        (self.size + self.page_size, self.head_num, self.head_dim // 16),
                         dtype=torch.uint8,
                         device=self.device,
                     )

@@ -15,22 +15,31 @@
 #include <cstdint>
 
 #define MXFP4_HEAD_DIM 128
-#define MXFP4_BLOCK 32
+#define MXFP4_BLOCK 16  // scale granularity (16 or 32); buffer shape adapts
 
 // E2M1 positive magnitudes: 0, 0.5, 1, 1.5, 2, 3, 4, 6
 __constant__ float c_e2m1_lut[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
 
 __device__ __forceinline__ uint8_t float_to_e2m1(float x) {
-  // Round-to-nearest magnitude index via 7 comparisons, sign bit = bit 3.
+  // Round-to-nearest-even magnitude index via 7 comparisons, sign bit = bit 3.
+  // Midpoint values (exactly on a boundary) round to the even index.
   float ax = fabsf(x);
   uint8_t mag = 0;
-  mag += (ax >= 0.25f);
-  mag += (ax >= 0.75f);
-  mag += (ax >= 1.25f);
-  mag += (ax >= 1.75f);
-  mag += (ax >= 2.5f);
-  mag += (ax >= 3.5f);
-  mag += (ax >= 5.0f);
+  mag += (ax > 0.25f);
+  mag += (ax > 0.75f);
+  mag += (ax > 1.25f);
+  mag += (ax > 1.75f);
+  mag += (ax > 2.5f);
+  mag += (ax > 3.5f);
+  mag += (ax > 5.0f);
+  // Half-way cases: round to even magnitude index (LSB 0) -> odd rounds up.
+  if (ax == 0.25f && (mag & 1)) mag++;
+  else if (ax == 0.75f && (mag & 1)) mag++;
+  else if (ax == 1.25f && (mag & 1)) mag++;
+  else if (ax == 1.75f && (mag & 1)) mag++;
+  else if (ax == 2.5f && (mag & 1)) mag++;
+  else if (ax == 3.5f && (mag & 1)) mag++;
+  else if (ax == 5.0f && (mag & 1)) mag++;
   uint8_t sign = (x < 0.0f) ? 0x8 : 0x0;
   // Preserve -0.0 as -0.0 for exact round-trip.
   if (x == 0.0f && __float_as_uint(x) & 0x80000000u) sign = 0x8;
@@ -78,16 +87,15 @@ __global__ void mxfp4_quantize_store_kernel(
   const int lane = threadIdx.x & 31;
   const int row_in_warp = lane >> 4;    // 0..1
   const int sub_lane = lane & 15;       // 0..15
-  const int blk = sub_lane >> 2;        // block32 index 0..3
-  const int sub_blk = sub_lane & 3;     // thread within block32
+  // block = MXFP4_BLOCK/8 threads' 8 elements each; 16 -> 2 threads, 32 -> 4
+  const int blk = sub_lane / (MXFP4_BLOCK / 8);
+  const int sub_blk = sub_lane % (MXFP4_BLOCK / 8);
 
   const int row = blockIdx.x * ROWS_PER_CTA + warp_id * 2 + row_in_warp;
   if (row >= T * H) return;
   const int token = row / H;
   const int head = row % H;
   const int slot = (int)loc[token];
-
-  // Load 8 bf16 (128-bit) starting at element sub_lane*8.
 
   // Load 8 bf16 (128-bit) starting at element sub_lane*8.
   const int elem0 = sub_lane * 8;
@@ -100,10 +108,11 @@ __global__ void mxfp4_quantize_store_kernel(
     for (int i = 0; i < 8; i++) vals[i] = __bfloat162float(h[i]);
   }
 
-  // Block32 abs-max over the 4 threads (sub_blk 0..3, all in one warp).
+  // Block abs-max over the MXFP4_BLOCK/8 threads (all in one warp).
   float m = block_absmax4(vals);
   m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1, 16));
-  m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2, 16));
+  if (MXFP4_BLOCK == 32)
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2, 16));
   const int exp_ = exp_from_max(m);
   const float inv_scale = exp2f(-(float)exp_);
 
@@ -140,8 +149,8 @@ __global__ void mxfp4_dequantize_kernel(
   const int lane = threadIdx.x & 31;
   const int row_in_warp = lane >> 4;
   const int sub_lane = lane & 15;
-  const int blk = sub_lane >> 2;
-  const int sub_blk = sub_lane & 3;
+  const int blk = sub_lane / (MXFP4_BLOCK / 8);
+  const int sub_blk = sub_lane % (MXFP4_BLOCK / 8);
 
   const int row = blockIdx.x * ROWS_PER_CTA + warp_id * 2 + row_in_warp;
   if (row >= T * H) return;
@@ -185,7 +194,7 @@ __global__ void mxfp4_dequantize_indices_kernel(
   const int lane = threadIdx.x & 31;
   const int row_in_warp = lane >> 4;
   const int sub_lane = lane & 15;
-  const int blk = sub_lane >> 2;
+  const int blk = sub_lane / (MXFP4_BLOCK / 8);
 
   const int out_row = blockIdx.x * ROWS_PER_CTA + warp_id * 2 + row_in_warp;
   if (out_row >= I * H) return;

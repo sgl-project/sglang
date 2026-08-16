@@ -557,8 +557,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     indices = self.cur_kv_indices
                     n = self.cur_kv_len
                     ws_k, ws_v = self._get_dequant_workspace(n)
-                    dequantize_indices(k_data, k_scale, indices, ws_k)
-                    dequantize_indices(v_data, v_scale, indices, ws_v)
+                    dequantize_indices(k_data, k_scale, indices[:n], ws_k)
+                    dequantize_indices(v_data, v_scale, indices[:n], ws_v)
                     kv = (ws_k[:n], ws_v[:n])
                 else:
                     kv = forward_batch.token_to_kv_pool.get_kv_buffer(

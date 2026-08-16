@@ -105,10 +105,11 @@ _LOC_BUF_CAP = 1 << 20  # 1M slots = 8MB, plain cudaMalloc
 _IDX_BUF_CAP = 1 << 20  # 1M indices = 4MB, plain cudaMalloc
 _buffers = {}  # name -> base tensor; slices keep the base alive here
 # copy_ is async; the source (possibly a temporary from .contiguous()/.to())
-# must stay referenced until the copy kernel has run. Keep one source per
-# staged buffer name; same-stream ordering guarantees the previous copy with
-# the same name finished before the next call.
+# must stay referenced until the copy kernel has run. Multiple stages of the
+# same buffer can be in flight back-to-back (e.g. K then V dequant), so keep a
+# small ring of sources per buffer name instead of overwriting.
 _keepalive = {}
+_keepalive_ring = {}
 
 
 def _stage(name: str, tensor: torch.Tensor, cap: int, dtype=None) -> torch.Tensor:
@@ -121,7 +122,9 @@ def _stage(name: str, tensor: torch.Tensor, cap: int, dtype=None) -> torch.Tenso
     if buf is None:
         buf = torch.empty(cap, dtype=tensor.dtype, device="cuda")
         _buffers[name] = buf
-    _keepalive[name] = tensor
+    slot = _keepalive_ring.get(name, 0)
+    _keepalive_ring[name] = (slot + 1) % 8
+    _keepalive[(name, slot)] = tensor
     buf[:n].view(tensor.shape).copy_(tensor)
     return buf[:n]
 
@@ -168,10 +171,10 @@ def dequantize_indices(
     ext.mxfp4_dequantize_indices(data, scale, indices, out, i, h)
 
 
-def reference_quantize(x: torch.Tensor) -> tuple:
-    """Torch reference (block32 MXFP4), for kernel validation."""
+def reference_quantize(x: torch.Tensor, block: int = 16) -> tuple:
+    """Torch reference (MXFP4, block 16 or 32), for kernel validation."""
     b, m, n = x.shape
-    reshaped = x.view(b, m * n // 32, 32)
+    reshaped = x.view(b, m * n // block, block).float()  # full-precision max, like the kernel
     block_max = reshaped.abs().max(dim=-1, keepdim=True).values
     # exp = ceil(log2(block_max / 6)); block_max == 0 -> -127
     safe = torch.clamp(block_max / 6.0, min=1e-10)
@@ -183,7 +186,11 @@ def reference_quantize(x: torch.Tensor) -> tuple:
     sign_bits = (scaled < 0).to(torch.uint8) << 3
     abs_vals = scaled.abs()
     bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
-    magnitude_bits = torch.sum(abs_vals.unsqueeze(-1) >= bounds, dim=-1).to(torch.uint8)
+    magnitude_bits = torch.sum(abs_vals.unsqueeze(-1) > bounds, dim=-1).to(torch.uint8)
+    # Round-to-nearest-even at exact midpoints (odd index rounds up).
+    for bound in bounds:
+        mid = (abs_vals == bound) & (magnitude_bits % 2 == 1)
+        magnitude_bits = magnitude_bits + mid.to(torch.uint8)
     fp4 = (sign_bits + magnitude_bits).view(b, m, n)
     packed = (fp4[..., 1::2] << 4) + fp4[..., 0::2]
-    return packed, scale_bits.view(b, m, n // 32)
+    return packed, scale_bits.view(b, m, n // block)
