@@ -5,7 +5,9 @@ import pytest
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.model_executor.runner_utils import maybe_publish_prefill_war_read_done
+from sglang.srt.model_executor.runner_utils import (
+    maybe_publish_prefill_shared_read_done,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -27,7 +29,7 @@ def _model_runner(*, spec_algorithm=SpeculativeAlgorithm.NONE, compliant=True):
     return SimpleNamespace(
         spec_algorithm=spec_algorithm,
         attn_backend=SimpleNamespace(shared_read_boundary=lambda mode: boundary),
-        war_fastpath_read_done_event=None,
+        shared_read_done_event=None,
     )
 
 
@@ -41,16 +43,16 @@ def _batch(mode=ForwardMode.EXTEND):
 def test_publishes_recorded_event_when_enabled():
     runner = _model_runner()
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
-        maybe_publish_prefill_war_read_done(runner, _batch(), _DEVICE_MODULE)
-    published = runner.war_fastpath_read_done_event
+        maybe_publish_prefill_shared_read_done(runner, _batch(), _DEVICE_MODULE)
+    published = runner.shared_read_done_event
     assert isinstance(published, _Event) and published.recorded
 
 
 def test_disabled_when_flag_is_false():
     runner = _model_runner()
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(False):
-        maybe_publish_prefill_war_read_done(runner, _batch(), _DEVICE_MODULE)
-    assert runner.war_fastpath_read_done_event is None
+        maybe_publish_prefill_shared_read_done(runner, _batch(), _DEVICE_MODULE)
+    assert runner.shared_read_done_event is None
 
 
 def test_gates_exclude_non_prefill_unsupported_algorithm_and_noncompliant_backend():
@@ -65,8 +67,8 @@ def test_gates_exclude_non_prefill_unsupported_algorithm_and_noncompliant_backen
             # Backend has not declared a pre-replay prefill read boundary.
             (_model_runner(compliant=False), _batch()),
         ):
-            maybe_publish_prefill_war_read_done(runner, batch, _DEVICE_MODULE)
-            assert runner.war_fastpath_read_done_event is None
+            maybe_publish_prefill_shared_read_done(runner, batch, _DEVICE_MODULE)
+            assert runner.shared_read_done_event is None
 
 
 if __name__ == "__main__":

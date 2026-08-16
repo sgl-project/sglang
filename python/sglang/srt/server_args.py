@@ -70,6 +70,7 @@ from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
+    configure_media_url_security,
     get_device,
     get_device_memory_capacity,
     get_device_sm,
@@ -1305,6 +1306,12 @@ class ServerArgs:
         "Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. Requires 'pip install sglang[http2]'.",
         NS("serving"),
     ] = False
+    http2_max_concurrent_streams: A[
+        int,
+        "Maximum number of concurrent streams advertised on each HTTP/2 "
+        "connection (1 to 2^32 - 1). Only applies with --enable-http2.",
+        NS("serving"),
+    ] = 200
 
     # -------------------------------------------------------------------------
     # SSL/TLS
@@ -2764,6 +2771,19 @@ class ServerArgs:
         "environment override when this argument is 0.",
         NS("mm"),
     ] = 0
+    allowed_media_domains: A[
+        List[str],
+        "Restrict client-supplied HTTP(S) image, video, and audio URLs to these "
+        "exact hostnames. Redirect destinations are checked against the same "
+        "allowlist. When unset, remote media from any domain is allowed.",
+        NS("mm"),
+    ] = dataclasses.field(default_factory=list)
+    media_url_max_file_size_mb: A[
+        int,
+        "Maximum size in MiB for one client-supplied remote media download. "
+        "The limit is enforced while streaming; set to 0 to disable it.",
+        NS("mm"),
+    ] = 64
     mm_preprocess_cache_size_mb: A[
         Optional[int],
         "CPU memory budget for content-addressed multimodal preprocessing "
@@ -3561,6 +3581,7 @@ class ServerArgs:
 
         self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()
+        self._handle_media_url_security()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -4014,6 +4035,12 @@ class ServerArgs:
             )
 
         if self.enable_http2:
+            if not 0 < self.http2_max_concurrent_streams < 2**32:
+                raise ValueError(
+                    "--http2-max-concurrent-streams must be between 1 and "
+                    "4294967295."
+                )
+
             try:
                 import granian  # noqa: F401
             except ImportError:
@@ -4050,6 +4077,13 @@ class ServerArgs:
                         f"mm_process_config['{key}'] must be a dict, "
                         f"but got {type(self.mm_process_config[key])}"
                     )
+
+    def _handle_media_url_security(self):
+        """Normalize and publish the media URL policy before workers start."""
+        self.allowed_media_domains = configure_media_url_security(
+            self.allowed_media_domains,
+            self.media_url_max_file_size_mb,
+        )
 
     def _handle_deprecated_args(self):
         if self.disable_fast_image_processor:
@@ -5738,13 +5772,9 @@ class ServerArgs:
                 "extra_buffer_lazy unsupported under PD disaggregation; use "
                 "--mamba-radix-cache-strategy extra_buffer."
             )
-            algo = (view.speculative_algorithm or "").upper()
-            # dspark verifies through prepare_mamba_track_for_verify (lazy plan
-            # wired); dflash bypasses that hook, so it stays unsupported.
-            assert algo != "DFLASH", (
-                f"extra_buffer_lazy unsupported with {view.speculative_algorithm}; "
-                "use --mamba-radix-cache-strategy extra_buffer."
-            )
+            # eagle/ngram/dspark/dflash all verify through
+            # prepare_mamba_track_for_verify (lazy plan wired); dflash gained
+            # the hook in DFlashVerifyInput.prepare_for_verify.
         if view.speculative_num_draft_tokens is not None:
             assert view.mamba_track_interval >= view.speculative_num_draft_tokens
         if view.page_size is not None:
