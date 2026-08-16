@@ -447,6 +447,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             event.record()
 
     def _replay_attn_backend(self) -> AttentionBackend:
+        # Under pdmux self.attn_backend only holds the workspace and never replays.
         if self.enable_pdmux:
             return self.model_runner.decode_attn_backend_group[get_current_stream_idx()]
         return self.attn_backend

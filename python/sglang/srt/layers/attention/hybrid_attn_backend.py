@@ -87,7 +87,7 @@ class HybridAttnBackend(AttentionBackend):
             return self.prefill_backend
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
-        # The selected child is the one that actually reads; answer for it.
+        # Only the selected child reads; the wrapper must not answer for itself.
         return self._select_backend(fm).shared_read_ends(fm)
 
     @property

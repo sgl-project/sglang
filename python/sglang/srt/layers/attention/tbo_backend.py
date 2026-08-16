@@ -121,7 +121,7 @@ class TboAttnBackend(AttentionBackend):
             )
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
-        # Both the primary and the two children read; the record must cover all.
+        # Primary and children all read; the record must cover the latest.
         return SharedReadEnds.max_of(
             b.shared_read_ends(fm) for b in (self.primary, *self.children)
         )

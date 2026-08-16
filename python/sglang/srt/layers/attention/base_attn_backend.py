@@ -29,6 +29,7 @@ class SharedReadEnds(Enum):
 
     @staticmethod
     def max_of(items: Iterable[SharedReadEnds]) -> SharedReadEnds:
+        # Values are ordered by lateness, so the max covers every child.
         return max(items, key=lambda x: x.value)
 
 
@@ -128,9 +129,10 @@ class AttentionBackend(ABC):
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
-        """Declare where this backend's scheduler-shared reads end per mode."""
+        """Declare where this backend's scheduler-shared reads end per mode.
+        Override only for audited deviations from this conservative default."""
         if fm.is_decode() or fm.is_target_verify():
-            # Default to IN_REPLAY, we assume shared data still reads during the in-graph hook
+            # Assume shared data is still read through the in-graph hook.
             return SharedReadEnds.IN_REPLAY
         return SharedReadEnds.UNKNOWN
 
