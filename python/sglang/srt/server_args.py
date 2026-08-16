@@ -4520,13 +4520,14 @@ class ServerArgs:
         if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
             return
 
-        # Breakable is the general CUDA default, but it is not compatible with
-        # multimodal prefill. Models on this allowlist have had their decoder
-        # prefill validated under tc_piecewise; the vision encoder remains
-        # eager outside the captured LM forward.
+        # Breakable is the CUDA default but not multimodal-compatible;
+        # piecewise-allowlisted archs run their validated decoder prefill
+        # there instead. Archs also on the breakable allowlist keep it --
+        # this runs first, so piecewise would otherwise silently win.
         if (
             self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
             and self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
+            and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported
             # Keep trtllm_mla on the preferred breakable path, which now serves
             # MLA by falling back to the flashinfer MLA impl for extend.
             and self._resolved_attention_backends()[0] != "trtllm_mla"
