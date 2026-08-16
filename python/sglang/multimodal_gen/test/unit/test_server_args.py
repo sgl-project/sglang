@@ -1154,7 +1154,7 @@ class TestOffloadDefaults(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "native SGLang backend"):
             resolve_diffusers_pipeline_offload({"all": LAYERWISE_OFFLOAD})
 
-    def test_vae_cpu_offload_defaults_false_on_low_memory_gpu(self):
+    def test_memory_mode_layerwise_offloads_vae_on_low_memory_gpu(self):
         args = self._from_dict_with_task_type(
             ModelTaskType.T2V,
             memory_gb=16,
@@ -1169,6 +1169,22 @@ class TestOffloadDefaults(unittest.TestCase):
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder", "vae"],
         )
+        self.assertEqual(args.residency_mode("vae"), LAYERWISE_OFFLOAD)
+
+    def test_memory_mode_preserves_explicit_vae_residency(self):
+        for kwargs, expected_mode in (
+            ({"component_residency": ["vae=resident"]}, RESIDENT),
+            ({"vae_cpu_offload": True}, COMPONENT_OFFLOAD),
+        ):
+            with self.subTest(expected_mode=expected_mode):
+                args = self._from_dict_with_task_type(
+                    ModelTaskType.T2V,
+                    memory_gb=16,
+                    kwargs={"performance_mode": "memory", **kwargs},
+                )
+
+                self.assertNotIn("vae", args.layerwise_offload_components or [])
+                self.assertEqual(args.residency_mode("vae"), expected_mode)
 
     def test_explicit_vae_cpu_offload_true_is_preserved_by_default_layerwise(
         self,
@@ -2204,6 +2220,8 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.dit_layerwise_offload)
         self.assertIn("text_encoder", args.layerwise_offload_components or [])
         self.assertIn("vae", args.layerwise_offload_components or [])
+        self.assertFalse(args.vae_cpu_offload)
+        self.assertEqual(args.residency_mode("vae"), LAYERWISE_OFFLOAD)
 
     def test_minimax_h3_rejects_explicit_cfg_parallel(self):
         with self.assertRaisesRegex(
