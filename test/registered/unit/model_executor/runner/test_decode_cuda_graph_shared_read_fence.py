@@ -50,6 +50,8 @@ def _backend(declared: SharedReadEnds):
         (VERIFY, True, SharedReadEnds.IN_REPLAY, True, SharedReadEnds.IN_REPLAY),
         # A backend that keeps reading through the graph is never advanced.
         (VERIFY, True, SharedReadEnds.POST_REPLAY, True, SharedReadEnds.POST_REPLAY),
+        # Plain decode, marker available: the declaration is honored as-is.
+        (DECODE, False, SharedReadEnds.IN_REPLAY, True, SharedReadEnds.IN_REPLAY),
         # Nowhere to record in-graph -> fall back to the pre-replay record.
         (DECODE, False, SharedReadEnds.IN_REPLAY, False, SharedReadEnds.PRE_REPLAY),
     ],

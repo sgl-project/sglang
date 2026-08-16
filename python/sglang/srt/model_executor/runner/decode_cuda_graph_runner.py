@@ -44,7 +44,10 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -442,6 +445,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # Stays None without external-event support, so the read-end
             # resolution below never hands out an unrecorded event.
             event.record()
+
+    def _replay_attn_backend(self) -> AttentionBackend:
+        if self.enable_pdmux:
+            return self.model_runner.decode_attn_backend_group[get_current_stream_idx()]
+        return self.attn_backend
 
     def _resolve_shared_read_ends(self, attn_backend, forward_mode) -> SharedReadEnds:
         """Where this replay records its shared-read-done event: the backend's
@@ -1269,11 +1277,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and forward_batch.spec_info is not None
         ):
             forward_batch.spec_info.custom_mask = buffers.custom_mask
-        if self.enable_pdmux:
-            stream_idx = get_current_stream_idx()
-            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
-        else:
-            attn_backend = self.attn_backend
+
+        attn_backend = self._replay_attn_backend()
         fb_view = build_replay_fb_view(
             forward_batch=forward_batch,
             buffers=buffers,
@@ -1315,7 +1320,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.device_timer, forward_batch.forward_mode.name.lower()
         )
         shared_read_ends = self._resolve_shared_read_ends(
-            self.attn_backend, forward_batch.forward_mode
+            self._replay_attn_backend(), forward_batch.forward_mode
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
