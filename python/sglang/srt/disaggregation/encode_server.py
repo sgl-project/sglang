@@ -85,6 +85,7 @@ from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     add_prometheus_middleware,
     configure_logger,
+    configure_media_url_security,
     load_audio,
     load_image,
     load_video,
@@ -308,6 +309,10 @@ class MMEncoder:
         argument."""
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
+        configure_media_url_security(
+            server_args.allowed_media_domains,
+            server_args.media_url_max_file_size_mb,
+        )
         publish(server_args, role="encoder")
         self.rank = rank
         # DP rank for metric labels; overridden by run_dp_worker in DP mode.

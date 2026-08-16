@@ -13,7 +13,7 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
 
 _is_musa = is_musa()
@@ -351,7 +351,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             LightningAttentionBackend,
         )
         from sglang.srt.layers.attention.linear.utils import (
-            initialize_linear_attn_config,
+            resolve_linear_attn_backends,
         )
         from sglang.srt.utils import (
             is_blackwell,
@@ -383,13 +383,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         prefill_default = None
         if hybrid_gdn_config(runner.model_config) is not None and not is_npu():
             prefill_default = flashinfer_gdn_prefill_default(runner)
-        if prefill_default is not None:
-            get_context().override(
-                "gdn_backend.sm100_flashinfer_default",
-                linear_attn_prefill_backend=prefill_default,
-            )
-        initialize_linear_attn_config(
-            runner.server_args, prefill_default=prefill_default
+        runner.linear_attn_backends = resolve_linear_attn_backends(
+            prefill_default=prefill_default
         )
         hybrid_backend_cls = HybridLinearAttnBackend
         if hybrid_gdn_config(runner.model_config) is not None:
