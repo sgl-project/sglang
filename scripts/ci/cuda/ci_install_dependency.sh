@@ -812,7 +812,7 @@ print(f"sglang resolves to {spec.origin}")
 # so a .so that cannot load passes find_spec and only fails inside some suite.
 import importlib
 for mod in ("server", "grpc", "multimodal"):
-    name = f"sglang.srt.{mod}._core"
+    name = f"sglang.srt.rust_extensions._{mod}"
     try:
         importlib.import_module(name)
     except Exception as exc:
