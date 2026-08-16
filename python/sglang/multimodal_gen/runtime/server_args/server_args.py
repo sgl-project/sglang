@@ -86,7 +86,7 @@ from sglang.multimodal_gen.utils import (
 logger = init_logger(__name__)
 
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "resident")
-LTX2_TWO_STAGE_DEVICE_MODE_CHOICES = (*LTX2_TWO_STAGE_DEVICE_MODES, "snapshot")
+LTX2_TWO_STAGE_DEVICE_MODE_CHOICES = LTX2_TWO_STAGE_DEVICE_MODES
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
@@ -100,15 +100,7 @@ RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn")
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
     if mode is None:
         return None
-    mode = mode.lower()
-    if mode == "snapshot":
-        logger.warning(
-            "ltx2_two_stage_device_mode=snapshot is deprecated and is treated "
-            "as original. Please use ltx2_two_stage_device_mode=original or "
-            "resident instead. This alias may be removed after two release cycles."
-        )
-        return "original"
-    return mode
+    return mode.lower()
 
 
 def is_ltx2_two_stage_pipeline_name(pipeline_class_name: str | None) -> bool:
@@ -166,7 +158,9 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ideogram-ai/ideogram-4-fp8",
         "ideogram-ai/ideogram-4-nf4",
         "lightricks/ltx-2",
+        "lightricks/ltx-2.3",
         "ltx-2",
+        "ltx-2.3",
         "minimax-h3",
         "minimaxai/minimax-h3",
         "qwen/qwen-image",
@@ -186,6 +180,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
         "LTX2PipelineConfig",
+        "LTX23PipelineConfig",
         "MiniMaxH3PipelineConfig",
         "QwenImagePipelineConfig",
         "SanaPipelineConfig",
@@ -2211,8 +2206,6 @@ class ServerArgs(DisaggServerArgsMixin):
                 "LTX-2.3 two-stage device residency mode: "
                 "'original' keeps official two-stage semantics without premerged stage2, "
                 "'resident' keeps both transformers resident on GPU. "
-                "'snapshot' is deprecated, treated as 'original', and may be "
-                "removed after two release cycles. "
                 "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
             ),
         )
