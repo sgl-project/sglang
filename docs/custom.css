@@ -738,13 +738,13 @@ html.dark table tbody tr:nth-child(even) td,
   .sgd-builder-output-rail { display: contents; }
   .sgd-builder-controls { order: 0; }
   .sgd-builder-output { width: calc(100% - 24px); margin: 12px 12px 16px; order: 1; }
-  .sgd-builder-main[data-scope="base"] .sgd-builder-output[data-output="serve"],
   .sgd-builder-main[data-scope="serve"] .sgd-builder-output[data-output="serve"],
   .sgd-builder-main[data-scope="request"] .sgd-builder-output[data-output="request"] { order: -1; }
 }
 
 @container command-builder (min-width: 718px) and (max-width: 957px) {
   .sgd-builder-output-rail { order: -1; padding-top: 12px; }
+  .sgd-builder-main[data-scope="base"] .sgd-builder-output-rail { order: 1; padding-top: 0; }
   .sgd-builder-output[data-emphasized="false"] { order: 1; }
 }
 
