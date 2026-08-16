@@ -249,7 +249,19 @@ Mooncake cache are distinct. An encoder embedding hit still has to deliver the
 embedding to the language service using the selected EPD transfer backend; it
 does not consume a CUDA IPC/VMM processor-feature pool.
 
-## Failure behavior
+## Metrics and failure behavior
+
+With `--enable-metrics`, use these low-cardinality metric families:
+
+- `sglang:mm_preprocess_cache_requests_total` and
+  `sglang:encoder_preprocess_cache_items_total`
+- `sglang:mm_content_identity_total` and
+  `sglang:encoder_content_identity_total`
+- `sglang:mm_preprocess_phase_seconds`
+- `sglang:mm_embedding_cache_acquire_total`
+- `sglang:mm_cache_skipped_stages_total` and
+  `sglang:encoder_cache_skipped_stages_total`
+- preprocess-cache entries, CPU bytes, evictions, and single-flight joins
 
 Cache eviction changes performance, not correctness. If metadata and a newly
 computed feature hash disagree, SGLang discards the entry and rejects reuse.

@@ -24,6 +24,7 @@ media, a prompt-specific ``MultimodalDataItem``, or a ViT embedding-cache entry.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol, runtime_checkable
@@ -106,6 +107,7 @@ class MediaArtifactLookup:
     artifact_key: str
     snapshot: Optional[MediaSnapshot]
     cached_artifact: Optional[MediaArtifact]
+    identity_source: str
 
 
 class MediaArtifactCacheMixin:
@@ -250,11 +252,15 @@ class MediaArtifactCacheMixin:
         self, entries: Sequence[MediaArtifactInput]
     ) -> list[MediaArtifact]:
         """Run model preprocessing locally or on the processor worker pool, return the artifact"""
-        if self.mm_processor_executor is None:
-            return self.prepare_artifact_batch(entries)
-        return await self.mm_processor_executor.run(
-            self.prepare_artifact_batch, entries
-        )
+        start = time.perf_counter()
+        try:
+            if self.mm_processor_executor is None:
+                return self.prepare_artifact_batch(entries)
+            return await self.mm_processor_executor.run(
+                self.prepare_artifact_batch, entries
+            )
+        finally:
+            self.observe_preprocess_phase("processor", time.perf_counter() - start)
 
     def _get_cached_artifact(
         self,
@@ -329,6 +335,7 @@ class MediaArtifactCacheMixin:
                         artifact_key=key,
                         snapshot=None,
                         cached_artifact=artifact,
+                        identity_source="trusted",
                     )
                     continue
             read_indices.append(index)
@@ -360,6 +367,7 @@ class MediaArtifactCacheMixin:
                     modality,
                     allow_featureless=True,
                 ),
+                identity_source="server_computed",
             )
 
         if any(lookup is None for lookup in lookups):
@@ -398,6 +406,7 @@ class MediaArtifactCacheMixin:
                 )
                 for lookup in lookups
             ),
+            identity_sources=tuple(lookup.identity_source for lookup in lookups),
         )
 
     async def prepare_media_artifacts(
@@ -569,22 +578,28 @@ class MediaArtifactCacheMixin:
         try:
             # 1. decode (load media) each unique miss
             missed_media = []
-            for missed in misses_to_compute:
-                index = first_index_by_key[missed.key]
-                snapshot = snapshots[index]
-                assert snapshot is not None
-                media = await asyncio.wrap_future(
-                    self.io_executor.submit(
-                        self.decode_media_snapshot, snapshot, modality
+            decode_start = time.perf_counter()
+            try:
+                for missed in misses_to_compute:
+                    index = first_index_by_key[missed.key]
+                    snapshot = snapshots[index]
+                    assert snapshot is not None
+                    media = await asyncio.wrap_future(
+                        self.io_executor.submit(
+                            self.decode_media_snapshot, snapshot, modality
+                        )
                     )
-                )
-                missed_media.append(
-                    MediaArtifactInput(
-                        content_digest=snapshot.content_digest,
-                        artifact_key=missed.key,
-                        modality=modality,
-                        media=media,
+                    missed_media.append(
+                        MediaArtifactInput(
+                            content_digest=snapshot.content_digest,
+                            artifact_key=missed.key,
+                            modality=modality,
+                            media=media,
+                        )
                     )
+            finally:
+                self.observe_preprocess_phase(
+                    "decode", time.perf_counter() - decode_start
                 )
 
             # 2. preprocess all decoded misses as one model batch
