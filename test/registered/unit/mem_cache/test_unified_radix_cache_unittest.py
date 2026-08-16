@@ -6476,5 +6476,86 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         cache.sanity_check()
 
 
+class TestSWAWindowUnderBigramKey(CustomTestCase):
+    """`cache_unfinished_req` has to leave the leaf it inserts holding a full
+    sliding window of live SWA. Otherwise the match that follows the insert
+    refuses that leaf, `cache_protected_len` never advances, and the next insert
+    frees KV the tree already owns as if it were the request's duplicate.
+
+    An EAGLE bigram key holds one entry less than the tokens it spans, so the
+    leaf stops at page_floor(len(key)) rather than page_floor(seq_len), a page
+    lower. The eviction frontier has to be measured against the key.
+    """
+
+    cfg = CacheConfig(
+        page_size=4,
+        components=(ComponentType.FULL, ComponentType.SWA),
+        sliding_window_size=7,
+        is_eagle=True,
+        kv_size=256,
+        max_context_len=64,
+    )
+
+    def _alloc_paged(self, allocator, need_size):
+        ps = self.cfg.page_size
+        aligned = ((need_size + ps - 1) // ps) * ps
+        full_indices = allocator.full_attn_allocator.alloc(aligned)
+        swa_indices = allocator.swa_attn_allocator.alloc(aligned)
+        self.assertIsNotNone(full_indices)
+        self.assertIsNotNone(swa_indices)
+        allocator.full_to_swa_index_mapping[full_indices] = swa_indices
+        return full_indices[:need_size]
+
+    def test_match_after_insert_reaches_the_new_leaf(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        page_size = self.cfg.page_size
+        # Page-aligned length is the shape that costs the bigram key a page.
+        seq_len = 4 * page_size
+
+        req = Req(
+            rid=0,
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req_to_token_pool.alloc([req])
+        tokens = list(range(1, seq_len + 1))
+        req.origin_input_ids = tokens
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        kv_indices = self._alloc_paged(allocator, seq_len)
+        req_to_token_pool.write((req.req_pool_idx, slice(0, seq_len)), kv_indices)
+        req.kv_committed_len = seq_len
+        req.last_node = cache.root_node.id
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
+
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            cache.cache_unfinished_req(req)
+
+        boundary = (seq_len - 1) // page_size * page_size
+        self.assertGreaterEqual(
+            boundary - req.kv.swa_evicted_seqlen,
+            self.cfg.sliding_window_size,
+            f"leaf ending at {boundary} keeps only "
+            f"{boundary - req.kv.swa_evicted_seqlen} live SWA tokens against a "
+            f"{self.cfg.sliding_window_size} window",
+        )
+        self.assertEqual(
+            req.cache_protected_len,
+            boundary,
+            "the match after the insert must reach the leaf the insert created",
+        )
+
+        cache.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        )
+        cache.sanity_check()
+
+
 if __name__ == "__main__":
     unittest.main()

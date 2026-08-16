@@ -22,8 +22,7 @@ class LTX2TextConnectorStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        stage_name = self._component_stage_name(stage_name)
-        return [ComponentUse(stage_name=stage_name, component_name="connectors")]
+        return [ComponentUse(self._component_stage_name(stage_name), "connectors")]
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         # Input: batch.prompt_embeds (from Gemma, [B, S, D])
@@ -67,8 +66,7 @@ class LTX2TextConnectorStage(PipelineStage):
                     "and attention mask when classifier-free guidance is enabled."
                 )
 
-            # Official LTX-2.3 processes positive and negative prompts through
-            # the connector independently; batching shifts output numerics.
+            # Official LTX-2.3 processes positive and negative prompts separately.
             dtype = prompt_embeds.dtype
             pos_additive_mask = (prompt_attention_mask.to(torch.int64) - 1).to(
                 dtype
@@ -97,7 +95,6 @@ class LTX2TextConnectorStage(PipelineStage):
             batch.negative_audio_prompt_embeds = [neg_audio_embeds]
             batch.negative_attention_mask = neg_mask
         else:
-            # Prepare additive mask for connectors (as per diffusers implementation)
             dtype = prompt_embeds.dtype
             additive_attention_mask = (prompt_attention_mask.to(torch.int64) - 1).to(
                 dtype

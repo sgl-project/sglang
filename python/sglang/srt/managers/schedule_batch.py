@@ -378,21 +378,13 @@ class MultimodalDataItem:
         if self.pad_value is not None:
             return
 
-        from sglang.srt.managers.mm_utils import hash_feature
+        from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 
-        if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
-            import uuid
-
-            self.hash = uuid.uuid4().int
-            self.pad_value = _compute_pad_value(self.hash)
-            return
-        if self.hash is None:
-            if self.feature is not None:
-                hashed_feature = self.feature
-            else:
-                hashed_feature = self.precomputed_embeddings
-            self.hash = hash_feature(hashed_feature)
-        assert self.hash is not None
+        self.hash = resolve_multimodal_item_hash(
+            existing_hash=self.hash,
+            feature=self.feature,
+            precomputed_embeddings=self.precomputed_embeddings,
+        )
         self.pad_value = _compute_pad_value(self.hash)
 
     def is_modality(self, modality: Modality) -> bool:
@@ -3386,6 +3378,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             is_chunk_cache=self.tree_cache.is_chunk_cache(),
+            retain_floor=self.tree_cache.swa_retain_floor(req),
         )
 
     def __str__(self):

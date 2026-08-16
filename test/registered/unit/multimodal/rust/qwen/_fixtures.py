@@ -69,8 +69,11 @@ def make_processor(config, image_processor_cls=None):
         model_impl="sglang",
         keep_mm_feature_on_device=False,
         mm_feature_transport="cpu",
+        image_processor_backend="auto",
         disable_fast_image_processor=True,
         skip_tokenizer_init=False,
+        mm_preprocess_cache_size_mb=0,
+        trust_mm_content_hashes=False,
         # Read by NativeMmHost._use_feature_shm (single-rank fixture → the
         # inline zero-copy transport, like the 1-GPU e2e).
         tp_size=1,
@@ -80,6 +83,9 @@ def make_processor(config, image_processor_cls=None):
         mm_processor_worker_num=1,
         tokenizer_worker_num=1,
         base_gpu_id=0,
+        rl_on_policy_target=None,
+        allowed_media_domains=[],
+        media_url_max_file_size_mb=64,
     )
     return QwenVLImageProcessor(
         hf_config, server_args, processor, None, skip_mm_pool=True
