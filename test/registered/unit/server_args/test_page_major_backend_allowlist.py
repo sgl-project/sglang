@@ -43,6 +43,8 @@ def _accepts(
     use_mla: bool,
     unified: bool = True,
     linear_backend: str = "triton",
+    linear_decode: str | None = None,
+    linear_prefill: str | None = None,
 ) -> bool:
     """Run just `_handle_page_major_kv_layout` against a minimal stand-in.
 
@@ -59,8 +61,8 @@ def _accepts(
         "prefill_attention_backend": None,
         "decode_attention_backend": None,
         "linear_attn_backend": linear_backend,
-        "linear_attn_decode_backend": None,
-        "linear_attn_prefill_backend": None,
+        "linear_attn_decode_backend": linear_decode,
+        "linear_attn_prefill_backend": linear_prefill,
         "mamba_backend": "triton",
     }.items():
         object.__setattr__(sa, name, value)
@@ -123,6 +125,17 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 self.assertFalse(
                     _accepts(backend, use_mla=use_mla),
                     f"{backend} has no dense-id remapping and must be rejected",
+                )
+
+    def test_helion_linear_attention_is_kda_only(self):
+        for unified in (True, False):
+            for phase in ("decode", "prefill"):
+                kwargs = {f"linear_{phase}": "helion"}
+                self.assertTrue(
+                    _accepts("triton", use_mla=True, unified=unified, **kwargs)
+                )
+                self.assertFalse(
+                    _accepts("triton", use_mla=False, unified=unified, **kwargs)
                 )
 
 
