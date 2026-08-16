@@ -1,4 +1,5 @@
 import unittest
+from itertools import product
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
@@ -521,30 +522,48 @@ class TestDSAIndexer(CustomTestCase):
             device=self.device,
         ).reshape(num_rows, max_len // page_size)
 
-        for topk in (512, 1024):
-            for with_raw_output in (False, True):
-                with self.subTest(topk=topk, with_raw_output=with_raw_output):
-                    scores.copy_(
-                        torch.arange(max_len, dtype=torch.float32, device=self.device)
-                        .unsqueeze(0)
-                        .expand(num_rows, -1)
-                    )
-                    seq_lens = torch.full(
-                        (num_rows,), max_len, dtype=torch.int32, device=self.device
-                    )
-                    out_page_indices = torch.empty(
-                        (num_rows, topk), dtype=torch.int32, device=self.device
-                    )
-                    out_raw_indices = (
-                        torch.empty_like(out_page_indices) if with_raw_output else None
-                    )
+        for fuse_topk, topk, with_raw_output in product(
+            (False, True), (512, 1024), (False, True)
+        ):
+            with self.subTest(
+                fuse_topk=fuse_topk,
+                topk=topk,
+                with_raw_output=with_raw_output,
+            ):
+                scores.copy_(
+                    torch.arange(max_len, dtype=torch.float32, device=self.device)
+                    .unsqueeze(0)
+                    .expand(num_rows, -1)
+                )
+                seq_lens = torch.full(
+                    (num_rows,), max_len, dtype=torch.int32, device=self.device
+                )
+                out_page_indices = torch.empty(
+                    (num_rows, topk), dtype=torch.int32, device=self.device
+                )
+                out_raw_indices = (
+                    torch.empty_like(out_page_indices) if with_raw_output else None
+                )
 
-                    # Capture with every output slot valid so shrinking lengths on
-                    # replay leaves meaningful stale values in any unwritten suffix.
-                    with (
-                        envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.override(True),
-                        envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("small"),
-                    ):
+                # Capture with every output slot valid so shrinking lengths on
+                # replay leaves meaningful stale values in any unwritten suffix.
+                with (
+                    envs.SGLANG_DSA_FUSE_TOPK.override(fuse_topk),
+                    envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.override(True),
+                    envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("small"),
+                ):
+                    topk_transform_512_flashinfer(
+                        scores,
+                        seq_lens,
+                        page_table,
+                        out_page_indices,
+                        page_size,
+                        out_raw_indices,
+                    )
+                    torch.cuda.synchronize()
+
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
                         topk_transform_512_flashinfer(
                             scores,
                             seq_lens,
@@ -553,45 +572,33 @@ class TestDSAIndexer(CustomTestCase):
                             page_size,
                             out_raw_indices,
                         )
-                        torch.cuda.synchronize()
 
-                        graph = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(graph):
-                            topk_transform_512_flashinfer(
-                                scores,
-                                seq_lens,
-                                page_table,
-                                out_page_indices,
-                                page_size,
-                                out_raw_indices,
-                            )
-
-                        scores.copy_(
-                            torch.arange(
-                                max_len, 0, -1, dtype=torch.float32, device=self.device
-                            )
-                            .unsqueeze(0)
-                            .expand(num_rows, -1)
+                    scores.copy_(
+                        torch.arange(
+                            max_len, 0, -1, dtype=torch.float32, device=self.device
                         )
-                        page_table.add_(100)
-                        seq_lens.copy_(
-                            torch.tensor(
-                                [0, topk - 1, topk + 73, max_len],
-                                dtype=torch.int32,
-                                device=self.device,
-                            )
-                        )
-                        graph.replay()
-                        torch.cuda.synchronize()
-
-                    self._assert_dsv4_compact_topk_result(
-                        scores,
-                        seq_lens,
-                        page_table,
-                        out_page_indices,
-                        out_raw_indices,
-                        page_size,
+                        .unsqueeze(0)
+                        .expand(num_rows, -1)
                     )
+                    page_table.add_(100)
+                    seq_lens.copy_(
+                        torch.tensor(
+                            [0, topk - 1, topk + 73, max_len],
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                    )
+                    graph.replay()
+                    torch.cuda.synchronize()
+
+                self._assert_dsv4_compact_topk_result(
+                    scores,
+                    seq_lens,
+                    page_table,
+                    out_page_indices,
+                    out_raw_indices,
+                    page_size,
+                )
 
     def _run_unfused_topk_backend_validity_test(
         self,
