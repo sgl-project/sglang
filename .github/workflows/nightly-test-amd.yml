@@ -66,6 +66,8 @@ on:
           - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion
           - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4
           - nightly-8-gpu-mi35x-deepseek-r1-hicache
+          # 8-GPU Kimi-K2.6 (MI30x)
+          - nightly-8-gpu-kimi-k26
           # 8-GPU Qwen3-235B (MI30x + MI35x MXFP4)
           - nightly-8-gpu-qwen3-235b
           - nightly-8-gpu-mi35x-qwen3-235b-mxfp4
@@ -1273,6 +1275,46 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
+  # 8-GPU Kimi-K2.6 (MI30x)
+  #
+  # Kept on MI30x: Kimi-K3 needs gfx95x for its native MXFP4 weights, so it
+  # cannot take over here the way it does on MI35x.
+  # ==============================================================================
+
+  nightly-8-gpu-kimi-k26:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-kimi-k26,'))
+    runs-on: linux-mi300-8gpu-sglang
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Accuracy Test (8-GPU Kimi-K2.6)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-kimi-k26 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ==============================================================================
   # 8-GPU Qwen3-235B (MI30x + MI35x MXFP4)
   # ==============================================================================
 
@@ -1833,6 +1875,8 @@ jobs:
       - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion
       - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4
       - nightly-8-gpu-mi35x-deepseek-r1-hicache
+      # 8-GPU Kimi-K2.6 (MI30x)
+      - nightly-8-gpu-kimi-k26
       # 8-GPU Qwen3-235B (MI30x + MI35x MXFP4)
       - nightly-8-gpu-qwen3-235b
       - nightly-8-gpu-mi35x-qwen3-235b-mxfp4
