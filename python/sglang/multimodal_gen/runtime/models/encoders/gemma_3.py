@@ -4,6 +4,7 @@
 # Adapted from sglang: python/sglang/srt/models/gemma3_causal.py
 
 import logging
+from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
@@ -11,7 +12,10 @@ from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders.base import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
-from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed import get_tp_group, get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    patch_tensor_parallel_group,
+)
 from sglang.multimodal_gen.runtime.layers.activation import GeluAndMul
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
@@ -683,9 +687,11 @@ class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin)
 
     param_names_mapping = {
         r"^(vision_tower\.)(embeddings|encoder|post_layernorm|head)\.": r"\1vision_model.\2.",
+        r"^(vision_tower\.vision_model\.encoder\.layers\.\d+\.self_attn\.)out_proj\.": r"\1proj.",
     }
     reverse_param_names_mapping = {
         r"^(vision_tower\.)vision_model\.(embeddings|encoder|post_layernorm|head)\.": r"\1\2.",
+        r"^(vision_tower\.vision_model\.encoder\.layers\.\d+\.self_attn\.)proj\.": r"\1out_proj.",
     }
 
     def __init__(
@@ -698,6 +704,7 @@ class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin)
         self.config = config
         self.quant_config = quant_config
         self.text_config = config.text_config
+        self._vision_tensor_parallel_group = get_tp_group()
 
         # Vision Tower
         self.vision_tower = SiglipVisionModel(
@@ -712,6 +719,11 @@ class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin)
 
         # Text Model
         self.language_model = Gemma3TextModel(config)
+
+    def _vision_parallel_context(self):
+        if get_tp_group() is self._vision_tensor_parallel_group:
+            return nullcontext()
+        return patch_tensor_parallel_group(self._vision_tensor_parallel_group)
 
     def get_placeholder_mask(
         self,
@@ -765,7 +777,8 @@ class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin)
             elif pixel_values.dim() != 4:
                 raise ValueError(f"Unexpected pixel_values shape: {pixel_values.shape}")
 
-            vision_outputs = self.vision_tower(pixel_values)
+            with self._vision_parallel_context():
+                vision_outputs = self.vision_tower(pixel_values)
             image_features = self.multi_modal_projector(vision_outputs)
             image_features = image_features.to(
                 device=inputs_embeds.device, dtype=inputs_embeds.dtype

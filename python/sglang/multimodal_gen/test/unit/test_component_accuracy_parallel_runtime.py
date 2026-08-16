@@ -2,11 +2,17 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
+import torch
+from torch import nn
+
 from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
     IPC_A2A,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_groups import PROCESS_GROUP
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.engine import (
+    AccuracyEngine,
+)
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     initialize_parallel_runtime,
 )
@@ -170,3 +176,31 @@ def test_srt_tp_groups_follow_encoder_folding_context():
         assert parallel_state._TP is original_tp_group
         assert srt_parallel_state._TP is original_tp_group
         assert srt_parallel_state._ATTN_TP is original_tp_group
+
+
+def test_weight_transfer_uses_loader_for_implicit_srt_shard():
+    source = nn.Module()
+    source.weight = nn.Parameter(torch.arange(8, dtype=torch.float32).reshape(4, 2))
+    target = nn.Module()
+    target.weight = nn.Parameter(torch.empty(2, 2))
+
+    def load_first_shard(param, loaded_weight):
+        param.data.copy_(loaded_weight[:2])
+
+    target.weight.weight_loader = load_first_shard
+
+    with patch(
+        "sglang.multimodal_gen.test.single_test_file.component_accuracy.engine.model_parallel_is_initialized",
+        return_value=False,
+    ):
+        AccuracyEngine.transfer_weights(
+            source,
+            target,
+            min_match_ratio=1.0,
+            target_device=torch.device("cpu"),
+        )
+
+    torch.testing.assert_close(
+        target.weight,
+        source.weight[:2].to(dtype=torch.bfloat16),
+    )
