@@ -249,19 +249,19 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         plan = WeightLoadPlan.for_component(
             checkpoint_load_device=device,
             needs_device_weight_postprocess=True,
-            component_cpu_offload=True,
+            component_starts_on_cpu=True,
         )
 
         self.assertEqual(plan.checkpoint_load_device, device)
         self.assertEqual(plan.weight_postprocess_device, device)
-        self.assertTrue(plan.defer_component_cpu_offload)
+        self.assertTrue(plan.defer_cpu_placement)
         self.assertFalse(plan.load_full_state_dict_on_device)
 
     def test_weight_load_plan_can_keep_full_state_dict_on_device(self):
         plan = WeightLoadPlan.for_component(
             checkpoint_load_device=torch.device("cuda:0"),
             needs_device_weight_postprocess=False,
-            component_cpu_offload=False,
+            component_starts_on_cpu=False,
             load_full_state_dict_on_device=True,
         )
 
@@ -270,7 +270,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
     def test_unquantized_cpu_offload_loads_checkpoint_on_cpu(self):
         device = _resolve_checkpoint_load_device(
             torch.device("cuda:0"),
-            component_cpu_offload=True,
+            component_starts_on_cpu=True,
             runtime_quant_config=None,
         )
 
@@ -280,7 +280,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         runtime_device = torch.device("cuda:0")
         device = _resolve_checkpoint_load_device(
             runtime_device,
-            component_cpu_offload=True,
+            component_starts_on_cpu=True,
             runtime_quant_config=object(),
         )
 
@@ -290,7 +290,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         runtime_device = torch.device("cuda:0")
         device = _resolve_checkpoint_load_device(
             runtime_device,
-            component_cpu_offload=False,
+            component_starts_on_cpu=False,
             runtime_quant_config=None,
         )
 
@@ -313,6 +313,13 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             _warn_if_expected_param_dtype_missing(model, torch.bfloat16)
 
         warning.assert_called_once()
+
+    def test_modelopt_fp8_serialized_checkpoint_needs_device_postprocess(self):
+        self.assertTrue(
+            _needs_device_weight_postprocess(
+                ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+            )
+        )
 
     def test_online_fp8_needs_device_weight_postprocess(self):
         self.assertTrue(_needs_device_weight_postprocess(Fp8Config()))
