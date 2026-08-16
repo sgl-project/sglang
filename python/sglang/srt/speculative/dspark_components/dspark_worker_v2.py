@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -18,7 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -88,7 +89,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.device = target_worker.device
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
@@ -229,7 +230,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and is_cuda()
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
-                max_bs=max(server_args.cuda_graph_config.decode.bs),
+                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
                 commit_ctx=CommitInjectCtx(
@@ -350,11 +351,18 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         with self._draft_context():
             if capture_decode_cuda_graph:
-                self._draft_sampler = self._maybe_build_draft_sampler()
-                if self._draft_sampler is not None:
-                    self.draft_model_runner.capture_tail_hooks.append(
-                        make_draft_sampler_capture_hook(self._draft_sampler)
-                    )
+                # Keep the draft model graph enabled when folded proposal is
+                # disabled, but do not capture the proposal head as a tail
+                # hook. The proposer will compute base logits and the Markov
+                # block eagerly from the graph's hidden states instead. Apart
+                # from being the intended precision fallback, skipping the
+                # unused hook avoids paying for two proposal computations.
+                if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
+                    self._draft_sampler = self._maybe_build_draft_sampler()
+                    if self._draft_sampler is not None:
+                        self.draft_model_runner.capture_tail_hooks.append(
+                            make_draft_sampler_capture_hook(self._draft_sampler)
+                        )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
@@ -398,17 +406,25 @@ class DSparkWorkerV2(BaseSpecWorker):
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
+    def _linear_accept_indices(self, bs: int) -> torch.Tensor:
+        num_indices = bs * self.verify_num_draft_tokens
+        if (
+            self._linear_accept_index_cache is None
+            or self._linear_accept_index_cache.numel() < num_indices
+        ):
+            self._linear_accept_index_cache = torch.arange(
+                num_indices, dtype=torch.int64, device=self.device
+            )
+        return self._linear_accept_index_cache[:num_indices].view(
+            bs, self.verify_num_draft_tokens
+        )
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
     ) -> GenerationBatchResult:
-        if getattr(batch, "return_logprob", False):
-            raise ValueError(
-                "DSpark speculative decoding does not support return_logprob yet."
-            )
-
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
@@ -701,6 +717,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        if batch.return_logprob:
+            compute_spec_v2_logprobs(
+                batch,
+                logits_output,
+                accept.out_tokens.reshape(-1),
+                self._linear_accept_indices(bs),
+                self.verify_num_draft_tokens - 1,
+            )
+
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)

@@ -11,10 +11,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
     ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
     LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_VAE_GROUP,
+    normalize_layerwise_offload_components,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -44,10 +46,7 @@ class ServerArgsAutoTuner:
 
     def __init__(self, server_args: ServerArgs):
         self.server_args = server_args
-        self._explicit_memory_policy = self._has_explicit_memory_policy()
-        self._explicit_layerwise_replacement_policy = (
-            self._has_explicit_layerwise_replacement_policy()
-        )
+        self._explicit_dit_residency = self._has_explicit_dit_residency()
 
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
@@ -122,12 +121,27 @@ class ServerArgsAutoTuner:
 
     def maybe_adjust_auto_component_residency_after_offload(self) -> None:
         args = self.server_args
-        if (
-            args.performance_mode != "auto"
-            or self._explicit_memory_policy
-            or current_platform.is_cpu()
-        ):
+        if args.performance_mode != "auto" or current_platform.is_cpu():
             return
+
+        # Explicit placement is component-scoped; unmatched components still
+        # receive automatic defaults.
+
+        explicit_layerwise_components = (
+            normalize_layerwise_offload_components(args.layerwise_offload_components)
+            if args.is_arg_explicitly_set("layerwise_offload_components")
+            else None
+        )
+        explicit_dit_layerwise = bool(
+            args.is_arg_explicitly_set("dit_layerwise_offload")
+            and args.dit_layerwise_offload
+        ) or bool(
+            explicit_layerwise_components
+            and (
+                LAYERWISE_OFFLOAD_DIT_GROUP in explicit_layerwise_components
+                or LAYERWISE_OFFLOAD_ALL_COMPONENTS in explicit_layerwise_components
+            )
+        )
 
         min_available_gb = self._get_min_available_device_memory_gb()
         deployment_config = self._deployment_config()
@@ -140,7 +154,9 @@ class ServerArgsAutoTuner:
             and min_available_gb >= disable_threshold_gb
         ):
             changed = []
-            components = deployment_config.keep_resident_components
+            components = set(deployment_config.keep_resident_components)
+            if args.pipeline_config.task_type.is_image_gen():
+                components.add(LAYERWISE_OFFLOAD_DIT_GROUP)
             if (
                 args.layerwise_offload_components is not None
                 and not args.is_arg_explicitly_set("layerwise_offload_components")
@@ -158,28 +174,29 @@ class ServerArgsAutoTuner:
             if (
                 args.dit_cpu_offload
                 and "dit" in components
-                and not args.is_arg_explicitly_set("dit_cpu_offload")
+                and args.explicit_residency_mode("transformer") is None
+                and not explicit_dit_layerwise
             ):
                 args.dit_cpu_offload = False
                 changed.append("dit_cpu_offload=False")
             if (
                 args.text_encoder_cpu_offload
                 and LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP in components
-                and not args.is_arg_explicitly_set("text_encoder_cpu_offload")
+                and args.explicit_residency_mode("text_encoder") is None
             ):
                 args.text_encoder_cpu_offload = False
                 changed.append("text_encoder_cpu_offload=False")
             if (
                 args.image_encoder_cpu_offload
                 and LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP in components
-                and not args.is_arg_explicitly_set("image_encoder_cpu_offload")
+                and args.explicit_residency_mode("image_encoder") is None
             ):
                 args.image_encoder_cpu_offload = False
                 changed.append("image_encoder_cpu_offload=False")
             if (
                 args.vae_cpu_offload
                 and LAYERWISE_OFFLOAD_VAE_GROUP in components
-                and not args.is_arg_explicitly_set("vae_cpu_offload")
+                and args.explicit_residency_mode("vae") is None
             ):
                 args.vae_cpu_offload = False
                 changed.append("vae_cpu_offload=False")
@@ -208,14 +225,21 @@ class ServerArgsAutoTuner:
 
         # high-memory resident mode keeps both DiTs on GPU; unset auxiliary
         # placement should stay resident instead of using default layerwise
-        for arg_name in (
-            "text_encoder_cpu_offload",
-            "image_encoder_cpu_offload",
-            "vae_cpu_offload",
+        if (
+            args.text_encoder_cpu_offload
+            and args.explicit_residency_mode("text_encoder") is None
         ):
-            if getattr(args, arg_name) and not args.is_arg_explicitly_set(arg_name):
-                setattr(args, arg_name, False)
-                changed.append(f"{arg_name}=False")
+            args.text_encoder_cpu_offload = False
+            changed.append("text_encoder_cpu_offload=False")
+        if (
+            args.image_encoder_cpu_offload
+            and args.explicit_residency_mode("image_encoder") is None
+        ):
+            args.image_encoder_cpu_offload = False
+            changed.append("image_encoder_cpu_offload=False")
+        if args.vae_cpu_offload and args.explicit_residency_mode("vae") is None:
+            args.vae_cpu_offload = False
+            changed.append("vae_cpu_offload=False")
 
         if changed:
             logger.info(
@@ -228,7 +252,7 @@ class ServerArgsAutoTuner:
         if (
             args.performance_mode == "auto"
             and args.num_gpus >= 2
-            and not self._explicit_memory_policy
+            and not self._explicit_dit_residency
             and self._auto_uses_dit_offload()
             and self._can_apply_fsdp_policy(require_memory_headroom=True)
         ):
@@ -273,12 +297,12 @@ class ServerArgsAutoTuner:
         args = self.server_args
         if (
             not self.could_override_server_args()
-            or self._explicit_layerwise_replacement_policy
             or current_platform.is_cpu()
             or not current_platform.is_cuda()
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference
             or args.layerwise_offload_components is not None
+            or args.dit_layerwise_offload is True
         ):
             return
 
@@ -287,17 +311,19 @@ class ServerArgsAutoTuner:
             layerwise_components.append(LAYERWISE_OFFLOAD_DIT_GROUP)
 
         changed: list[str] = []
-        if args.text_encoder_cpu_offload and not args.is_arg_explicitly_set(
-            "text_encoder_cpu_offload"
+        if (
+            args.text_encoder_cpu_offload
+            and args.explicit_residency_mode("text_encoder") is None
         ):
             layerwise_components.append(LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP)
             changed.append(LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP)
-        if args.image_encoder_cpu_offload and not args.is_arg_explicitly_set(
-            "image_encoder_cpu_offload"
+        if (
+            args.image_encoder_cpu_offload
+            and args.explicit_residency_mode("image_encoder") is None
         ):
             layerwise_components.append(LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP)
             changed.append(LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP)
-        if args.vae_cpu_offload and not args.is_arg_explicitly_set("vae_cpu_offload"):
+        if args.vae_cpu_offload and args.explicit_residency_mode("vae") is None:
             layerwise_components.append(LAYERWISE_OFFLOAD_VAE_GROUP)
             changed.append(LAYERWISE_OFFLOAD_VAE_GROUP)
 
@@ -421,12 +447,12 @@ class ServerArgsAutoTuner:
         components = [
             component_name
             for component_name, arg_name in DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES
-            if not args.is_arg_explicitly_set(arg_name)
+            if args.explicit_residency_mode(component_name) is None
         ]
         components = self._filter_high_memory_resident_components(components)
         if self._should_auto_enable_dit_layerwise_offload():
             components.insert(0, LAYERWISE_OFFLOAD_DIT_GROUP)
-            self._set_default_wan_dit_offload_prefetch_size()
+            self._set_default_dit_offload_prefetch_size()
         return components
 
     def _filter_high_memory_resident_components(
@@ -465,52 +491,30 @@ class ServerArgsAutoTuner:
 
     def _should_auto_enable_dit_layerwise_offload(self) -> bool:
         args = self.server_args
-
-        # only for wan for now
-        if not self._is_wan_pipeline_config():
-            return False
-        if not self._deployment_config().auto_dit_layerwise_offload:
+        deployment_config = self._deployment_config()
+        if args.performance_mode not in deployment_config.dit_layerwise_offload_modes:
             return False
 
         if (
             args.pipeline_config.dmd_denoising_steps is not None
-            or not current_platform.enable_dit_layerwise_offload_for_wan_by_default()
+            or not current_platform.enable_dit_layerwise_offload_by_default()
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference
-            or args.is_arg_explicitly_set("dit_cpu_offload")
+            or args.explicit_residency_mode("transformer") is not None
         ):
             return False
 
-        # memory mode is memory-first: keep the broad Wan DiT layerwise policy
-        # unless a guard above says it conflicts with another placement path
-        if args.performance_mode == "memory":
-            return True
+        return True
 
-        # auto mode is performance-first: profiling only showed clear wins for
-        # Wan2.2 A14B, where coarse DiT CPU offload creates large step spikes
-        return (
-            args.performance_mode == "auto" and self._is_wan2_2_a14b_pipeline_config()
-        )
-
-    def _is_wan2_2_a14b_pipeline_config(self) -> bool:
-        config_name = self.server_args.pipeline_config.__class__.__name__
-        return config_name.startswith("Wan2_2_") and "A14B" in config_name
-
-    def _set_default_wan_dit_offload_prefetch_size(self) -> None:
+    def _set_default_dit_offload_prefetch_size(self) -> None:
         args = self.server_args
+        prefetch_size = self._deployment_config().auto_dit_offload_prefetch_size
         if (
             args.performance_mode == "auto"
-            and self._is_wan2_2_a14b_pipeline_config()
+            and prefetch_size is not None
             and not args.is_arg_explicitly_set("dit_offload_prefetch_size")
         ):
-            # p2 was the fastest stable default in the Wan2.2 A14B sweep
-            args.dit_offload_prefetch_size = 2
-
-    def _is_wan_pipeline_config(self) -> bool:
-        return any(
-            cls.__module__.endswith(".wan")
-            for cls in self.server_args.pipeline_config.__class__.mro()
-        )
+            args.dit_offload_prefetch_size = prefetch_size
 
     def _auto_uses_dit_offload(self) -> bool:
         args = self.server_args
@@ -536,26 +540,11 @@ class ServerArgsAutoTuner:
             )
         )
 
-    def _has_explicit_memory_policy(self) -> bool:
+    def _has_explicit_dit_residency(self) -> bool:
         args = self.server_args
-        return any(
-            args.is_arg_explicitly_set(arg_name)
-            for arg_name in (
-                "use_fsdp_inference",
-                "dit_cpu_offload",
-                "dit_layerwise_offload",
-                "layerwise_offload_components",
-            )
-        )
-
-    def _has_explicit_layerwise_replacement_policy(self) -> bool:
-        args = self.server_args
-        return any(
-            args.is_arg_explicitly_set(arg_name)
-            for arg_name in (
-                "dit_layerwise_offload",
-                "layerwise_offload_components",
-            )
+        return bool(
+            args.is_arg_explicitly_set("use_fsdp_inference")
+            or args.explicit_residency_mode("transformer") is not None
         )
 
     def _has_explicit_parallel_policy(self) -> bool:
