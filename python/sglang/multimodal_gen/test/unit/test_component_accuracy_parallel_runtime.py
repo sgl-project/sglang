@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_groups import PROCESS_GR
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     initialize_parallel_runtime,
 )
+from sglang.srt.distributed import parallel_state as srt_parallel_state
 
 _UTILS = "sglang.multimodal_gen.test.single_test_file.component_accuracy.utils"
 
@@ -113,3 +114,59 @@ def test_destroy_releases_sequence_parallel_subgroups_after_partial_init():
         assert destroy_group.call_args_list == [call(ulysses_group), call(ring_group)]
         assert PROCESS_GROUP.ULYSSES_PG is None
         assert PROCESS_GROUP.RING_PG is None
+
+
+def test_srt_attention_tp_group_tracks_diffusion_tp_group():
+    tp_group = object()
+
+    with (
+        patch.object(parallel_state, "_TP", tp_group),
+        patch.object(srt_parallel_state, "_TP", None),
+        patch.object(srt_parallel_state, "_ATTN_TP", None),
+    ):
+        parallel_state._sync_srt_tp_group()
+
+        assert srt_parallel_state._TP is tp_group
+        assert srt_parallel_state._ATTN_TP is tp_group
+
+        parallel_state._clear_srt_tp_group()
+
+        assert srt_parallel_state._TP is None
+        assert srt_parallel_state._ATTN_TP is None
+
+
+def test_srt_owned_groups_are_not_overwritten_or_cleared():
+    diffusion_tp_group = object()
+    srt_tp_group = object()
+    srt_attention_tp_group = object()
+
+    with (
+        patch.object(parallel_state, "_TP", diffusion_tp_group),
+        patch.object(srt_parallel_state, "_TP", srt_tp_group),
+        patch.object(srt_parallel_state, "_ATTN_TP", srt_attention_tp_group),
+    ):
+        parallel_state._sync_srt_tp_group()
+        parallel_state._clear_srt_tp_group()
+
+        assert srt_parallel_state._TP is srt_tp_group
+        assert srt_parallel_state._ATTN_TP is srt_attention_tp_group
+
+
+def test_srt_tp_groups_follow_encoder_folding_context():
+    original_tp_group = object()
+    folding_tp_group = object()
+
+    with (
+        patch.object(parallel_state, "_TP", original_tp_group),
+        patch.object(parallel_state, "_TP_STATE_PATCHED", False),
+        patch.object(srt_parallel_state, "_TP", original_tp_group),
+        patch.object(srt_parallel_state, "_ATTN_TP", original_tp_group),
+    ):
+        with parallel_state.patch_tensor_parallel_group(folding_tp_group):
+            assert parallel_state._TP is folding_tp_group
+            assert srt_parallel_state._TP is folding_tp_group
+            assert srt_parallel_state._ATTN_TP is folding_tp_group
+
+        assert parallel_state._TP is original_tp_group
+        assert srt_parallel_state._TP is original_tp_group
+        assert srt_parallel_state._ATTN_TP is original_tp_group
