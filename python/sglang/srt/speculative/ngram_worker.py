@@ -480,15 +480,11 @@ class NGRAMWorker(BaseSpecWorker):
                 self.token_to_kv_pool_allocator,
             )
             if batch.return_logprob:
-                # The last arg is the accept_index row width minus 1. NGRAM's
-                # accept_index is (bs, draft_token_num) -- the tree depth is not
-                # bounded by spec_steps like EAGLE's (bs, spec_steps + 1).
                 compute_spec_v2_logprobs(
                     batch,
                     logits_output,
                     predict,
-                    accept_index,
-                    self.draft_token_num - 1,
+                    accept_index=accept_index,
                 )
 
             if on_publish is not None:

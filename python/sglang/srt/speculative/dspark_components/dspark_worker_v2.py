@@ -127,7 +127,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
-        self._linear_accept_index_cache = None
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
@@ -405,19 +404,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
-
-    def _linear_accept_indices(self, bs: int) -> torch.Tensor:
-        num_indices = bs * self.verify_num_draft_tokens
-        if (
-            self._linear_accept_index_cache is None
-            or self._linear_accept_index_cache.numel() < num_indices
-        ):
-            self._linear_accept_index_cache = torch.arange(
-                num_indices, dtype=torch.int64, device=self.device
-            )
-        return self._linear_accept_index_cache[:num_indices].view(
-            bs, self.verify_num_draft_tokens
-        )
 
     def forward_batch_generation(
         self,
@@ -722,8 +708,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 batch,
                 logits_output,
                 accept.out_tokens.reshape(-1),
-                self._linear_accept_indices(bs),
-                self.verify_num_draft_tokens - 1,
+                chain_stride=self.verify_num_draft_tokens,
             )
 
         if on_publish is not None:

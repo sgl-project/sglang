@@ -1897,15 +1897,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             new_seq_lens = None
 
         if batch.return_logprob:
-            output_indices = torch.arange(
-                bs * block_size, dtype=torch.int64, device=device
-            ).view(bs, block_size)
             compute_spec_v2_logprobs(
                 batch,
                 logits_output,
                 out_tokens.reshape(-1),
-                output_indices,
-                block_size - 1,
+                chain_stride=block_size,
             )
 
         if self._need_mamba_verify_commit:
