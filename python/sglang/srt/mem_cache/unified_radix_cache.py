@@ -306,6 +306,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
+        self._next_load_back_transfer_id = 0
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
@@ -1094,11 +1095,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 return False
 
         # Load H→D
+        transfer_id = self._next_load_back_transfer_id
+        self._next_load_back_transfer_id += 1
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         device_indices = self.cache_controller.load(
             host_indices=kv_xfer.host_indices,
-            node_id=node_id,
+            node_id=transfer_id,
             extra_pools=aux_xfers or None,
         )
 
@@ -1110,11 +1113,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # Commit the loaded KV back onto the node + apply its emitted actions.
         self._apply_cache_actions(
             self.tree_core.commit_load_back(
-                node_id, device_indices, kv_xfer, comp_xfers
+                transfer_id, node_id, device_indices, kv_xfer, comp_xfers
             )
         )
 
-        self.ongoing_load_back[node_id] = _OngoingLoadBack(
+        self.ongoing_load_back[transfer_id] = _OngoingLoadBack(
             node_id,
             self.inc_lock_ref(node_id).to_dec_params(),
             host_anchor_params,
@@ -1960,12 +1963,14 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
-            for ack_id in ack.node_ids:
-                node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
+            for transfer_id in ack.node_ids:
+                node, lock_params, host_lock_params = self.ongoing_load_back.pop(
+                    transfer_id
+                )
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
                 # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
-                self.tree_core.finish_load_back(node)
+                self.tree_core.finish_load_back(transfer_id, node)
 
             if self.metrics_collector is not None:
                 for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
@@ -2224,7 +2229,8 @@ class UnifiedRadixCache(BasePrefixCache):
             (nid, wt.node_id) for nid, wt in self.ongoing_write_through.items()
         ]
         ongoing_load_back = [
-            (nid, lb.node_id) for nid, lb in self.ongoing_load_back.items()
+            (transfer_id, lb.node_id)
+            for transfer_id, lb in self.ongoing_load_back.items()
         ]
         self.tree_core.sanity_check(ongoing_write_through, ongoing_load_back)
 

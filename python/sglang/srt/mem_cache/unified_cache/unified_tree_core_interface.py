@@ -454,6 +454,7 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     @abstractmethod
     def commit_load_back(
         self,
+        transfer_id: int,
         node_id: NodeId,
         device_indices: torch.Tensor,
         kv_xfer: PoolTransfer,
@@ -463,7 +464,7 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
-    def finish_load_back(self, anchor_node_id: NodeId) -> None:
+    def finish_load_back(self, transfer_id: int, anchor_node_id: NodeId) -> None:
         """Clear the in-flight H->D marks on the anchor's root path at ack time."""
         ...
 
@@ -514,6 +515,7 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         """Verify tree invariants and raise AssertionError on any violation.
 
         ongoing_write_through/ongoing_load_back are (id, node_id) pairs for in-flight ops.
+        A load-back id is its transfer id, while node_id is its anchor.
         """
         ...
 

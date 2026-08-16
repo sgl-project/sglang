@@ -51,6 +51,7 @@ class ComponentData:
     metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
     host_value: Optional[torch.Tensor] = None
     host_lock_ref: int = 0
+    load_back_pending_transfer_ids: set[int] = dataclasses.field(default_factory=set)
     session_ref: int = 0
     session_ids: Optional[set[str]] = None
 
