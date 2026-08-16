@@ -25,6 +25,9 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     component_name_to_loader_cls,
     get_memory_usage_of_component,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+    is_fsdp_managed_module,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
     is_layerwise_offloaded_module,
@@ -92,10 +95,14 @@ class ComponentLoader(ABC):
         self.component_architecture: str | None = None
 
     def should_offload(
-        self, server_args: ServerArgs, model_config: ModelConfig | None = None
+        self,
+        server_args: ServerArgs,
+        model_config: ModelConfig | None = None,
+        component_name: str | None = None,
     ):
-        # not offload by default
-        return False
+        return component_name is not None and server_args.should_cpu_offload_component(
+            component_name
+        )
 
     def target_device(self, should_offload):
         if should_offload:
@@ -215,7 +222,7 @@ class ComponentLoader(ABC):
                 transformers_or_diffusers,
                 component_name,
             )
-        should_offload = self.should_offload(server_args)
+        should_offload = self.should_offload(server_args, component_name=component_name)
         target_device = self.target_device(should_offload)
         return component.to(device=target_device)
 
@@ -301,6 +308,12 @@ class ComponentLoader(ABC):
         else:
             if isinstance(component, nn.Module):
                 component = component.eval()
+                if (
+                    server_args.cpu_offload_components is not None
+                    and server_args.should_cpu_offload_component(component_name)
+                    and not is_fsdp_managed_module(component)
+                ):
+                    component = component.to("cpu")
             current_gpu_mem = current_platform.get_available_gpu_memory()
             model_size = get_memory_usage_of_component(component) or "NA"
             consumed = gpu_mem_before_loading - current_gpu_mem
@@ -403,7 +416,14 @@ class ComponentLoader(ABC):
         self, transformers_or_diffusers: str, component_name: str
     ) -> str:
         # NOTE(FlamingoPg): special for LTX-2 models
-        if component_name == "vocoder" or component_name == "connectors":
+        # `model_index.json` records these under an `ltx2` library that is not a
+        # real importable package; SGLang implements them natively.
+        if component_name in (
+            "vocoder",
+            "connectors",
+            "duration_head",
+            "diffusion_decoder",
+        ):
             transformers_or_diffusers = "diffusers"
 
         # NOTE(CloudRipple): special for MOVA models
@@ -420,6 +440,9 @@ class ComponentLoader(ABC):
             component_name == "scheduler"
             and transformers_or_diffusers == "mova.diffusion.schedulers.flow_match_pair"
         ):
+            transformers_or_diffusers = "diffusers"
+
+        if transformers_or_diffusers.startswith("lingbot_video"):
             transformers_or_diffusers = "diffusers"
 
         return transformers_or_diffusers
@@ -477,13 +500,15 @@ class ImageProcessorLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
-        return AutoImageProcessor.from_pretrained(component_model_path, use_fast=True)
+        return AutoImageProcessor.from_pretrained(
+            component_model_path, backend="torchvision"
+        )
 
 
 class AutoProcessorLoader(ComponentLoader):
     """Loader for auto processor."""
 
-    component_names = ["processor"]
+    component_names = ["processor", "text_processor"]
     expected_library = "transformers"
 
     def load_customized(

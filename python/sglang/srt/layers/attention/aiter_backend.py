@@ -65,7 +65,10 @@ from sglang.kernels.ops.attention.utils import (
     launch_reshape_and_cache_flash,
     pad_sequence_with_mask,
 )
-from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    fp8_dtype,
+    scaled_fp8_quant,
+)
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
@@ -128,6 +131,11 @@ _AITER_PARTITION_SIZE_ROCM = 256
 
 
 class AiterAttnBackend(AttentionBackend):
+
+    # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
+    # can never carry more seqs than the pool.
+    extend_dummy_seqs_capped_by_req_pool: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -2339,8 +2347,7 @@ class AiterAttnBackend(AttentionBackend):
                 window_size = (layer.sliding_window_size, -1)
 
             if (
-                get_bool_env_var("SGLANG_AITER_FMHA_FP8_ASM", "False")
-                and is_gfx95_supported()
+                is_gfx95_supported()
                 and forward_batch.forward_mode.is_extend()
                 and forward_batch.extend_prefix_lens_cpu is not None
                 and not any(forward_batch.extend_prefix_lens_cpu)
@@ -2361,9 +2368,9 @@ class AiterAttnBackend(AttentionBackend):
                     q_c.to(fp8_dtype),
                     k_c.to(fp8_dtype),
                     v_c.to(fp8_dtype),
-                    fp8_q_descale,
-                    k_descale,
-                    v_descale,
+                    fp8_q_descale.reshape(1),
+                    k_descale.reshape(1),
+                    v_descale.reshape(1),
                     self.qo_indptr[:bs0],
                     self.qo_indptr[:bs0],
                     self.forward_metadata.max_q_len,
@@ -2601,6 +2608,12 @@ class AiterAttnBackend(AttentionBackend):
                         page_table = self.forward_metadata.swa_page_table
 
                 max_kv_len = page_table.shape[1] * self.page_size
+                q_descale = None
+                if self.kv_cache_dtype == fp8_dtype:
+                    q_descale = (
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
+                    )
+                    q, _ = scaled_fp8_quant(q, q_descale)
 
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -2620,7 +2633,7 @@ class AiterAttnBackend(AttentionBackend):
                     window_size=window_size,
                     block_table=page_table,
                     softcap=0,
-                    q_descale=None,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     sinks=sinks,
