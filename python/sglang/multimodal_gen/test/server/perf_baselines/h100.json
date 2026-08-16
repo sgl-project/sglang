@@ -2115,7 +2115,10 @@
                 "Hunyuan3DShapeBeforeDenoisingStage": 56.06,
                 "Hunyuan3DShapeDenoisingStage": 1738.44,
                 "Hunyuan3DShapeExportStage": 6011.97,
-                "Hunyuan3DShapeSaveStage": 684.0
+                "Hunyuan3DShapeSaveStage": 684.0,
+                "Hunyuan3DPaintPreprocessStage": 256020.36,
+                "Hunyuan3DPaintTexGenStage": 23764.05,
+                "Hunyuan3DPaintPostprocessStage": 7095.01
             },
             "denoise_step_ms": {
                 "0": 131.29,
@@ -2169,7 +2172,7 @@
                 "48": 31.47,
                 "49": 31.6
             },
-            "expected_e2e_ms": 8544.38,
+            "expected_e2e_ms": 300141.39,
             "expected_avg_denoise_ms": 33.53,
             "expected_median_denoise_ms": 31.45,
             "estimated_full_test_time_s": 420.1
