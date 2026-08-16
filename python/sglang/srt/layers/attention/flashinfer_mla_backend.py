@@ -202,6 +202,13 @@ class FlashInferMhaChunkKVRunner:
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
             )
+        if forward_batch.mha_return_lse or forward_batch.attn_attend_prefix_cache:
+            # flashinfer's forward_return_lse yields base-2 LSE, while
+            # sgl_kernel.merge_state_v2 (chunked-prefix merge) expects the
+            # natural-log LSE — convert at this boundary.
+            out, lse = o
+            lse = lse * 0.6931471805599453  # ln(2)
+            return out, lse
         return o
 
 
