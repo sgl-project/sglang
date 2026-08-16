@@ -3,6 +3,8 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm10 -t v0.5.10.post1-rocm10-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm10 -t v0.5.10.post1-rocm10-mi35x -f rocm.Dockerfile .
 
 # Usage (to build SGLang ROCm + Mori docker image):
 # remove --build-arg NIC_BACKEND=ainic since new MoRI JIT will do NIC auto detection on target
@@ -25,6 +27,12 @@ ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+# ROCm 10 ships no rocm/pytorch image, so the stack is assembled from the ROCm
+# pip channels on a plain Ubuntu base. AMD publishes a prebuilt ROCm 10 image
+# (rocm/sgl-dev:...-py3.14-rocm10rc2) but it is Python 3.14, where four srt_hip
+# deps (st_attn, vsa, petit_kernel, wave-lang) have neither a cp314 wheel nor an
+# sdist, so `pip install -e python[dev_hip]` cannot resolve at all.
+ARG BASE_IMAGE_ROCM10="ubuntu:24.04"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -64,6 +72,100 @@ ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 FROM $BASE_IMAGE_950_ROCM720 AS gfx950-rocm720
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+
+# ===============================
+# Shared ROCm 10 base: Ubuntu 24.04 + Python 3.12 + the ROCm 10 pip stack.
+#
+# Python 3.12 rather than the 3.14 of AMD's own ROCm 10 image: st_attn==0.0.7,
+# vsa==0.0.4, petit_kernel==0.0.2 and wave-lang==3.8.2 publish wheels only up to
+# cp313 (petit_kernel only cp310/cp312) and no sdist, so on 3.14 pip has no
+# candidate at all and gives up with resolution-too-deep.
+#
+# The version is a 10.0 nightly rather than plain `10.0.0`: the release version
+# exists in the devreleases channel, but its only torch builds are named
+# +devrocm10.0.0.dev0.<sha>, which is not a pin worth carrying. 10.0.0a20260730
+# is the last build of the 10.0 line and pairs with a clean torch version.
+FROM $BASE_IMAGE_ROCM10 AS rocm10-base
+
+ARG ROCM_VERSION="10.0.0a20260730"
+ARG TORCH_VERSION="2.12.0"
+ARG TORCHVISION_VERSION="0.27.0"
+ARG ROCM_INDEX_URL="https://rocm.nightlies.amd.com/whl-multi-arch/"
+ARG ROCM_EXTRA_INDEX_URL="https://rocm.devreleases.amd.com/whl-multi-arch/"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        gnupg \
+        libstdc++-12-dev \
+        python-is-python3 \
+        python3 \
+        python3-dev \
+        python3-pip \
+        python3.12-venv \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3 -m venv "$VIRTUAL_ENV"
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
+
+# Both arches' device wheels land in the shared base, matching AMD's own ROCm 10
+# image. They must be named explicitly: passing several device extras in one spec
+# (torch[device-gfx942,device-gfx950]) silently installs only the first, and the
+# missing arch then fails at runtime with hipErrorInvalidImage.
+RUN python3 -m pip install --no-cache-dir --pre \
+        --index-url ${ROCM_INDEX_URL} \
+        --extra-index-url ${ROCM_EXTRA_INDEX_URL} \
+        "rocm[libraries,devel,device-gfx942,device-gfx950]==${ROCM_VERSION}" \
+        "torch==${TORCH_VERSION}+rocm${ROCM_VERSION}" \
+        "torchvision==${TORCHVISION_VERSION}+rocm${ROCM_VERSION}" \
+        "amd-torch-device-gfx942==${TORCH_VERSION}+rocm${ROCM_VERSION}" \
+        "amd-torch-device-gfx950==${TORCH_VERSION}+rocm${ROCM_VERSION}" \
+        "amd-torchvision-device-gfx942==${TORCHVISION_VERSION}+rocm${ROCM_VERSION}" \
+        "amd-torchvision-device-gfx950==${TORCHVISION_VERSION}+rocm${ROCM_VERSION}"
+
+RUN rocm-sdk init && rocm-sdk targets
+
+ENV ROCM_HOME=$VIRTUAL_ENV/lib/python3.12/site-packages/_rocm_sdk_devel
+ENV ROCM_PATH=$ROCM_HOME
+ENV CPATH=$ROCM_HOME/include
+ENV LIBRARY_PATH=$ROCM_HOME/lib
+ENV LD_LIBRARY_PATH=$ROCM_HOME/lib
+RUN echo 'export PATH=$ROCM_HOME/llvm/bin:$ROCM_HOME/bin:$PATH' >> /etc/bash.bashrc
+
+# The SDK's hsakmtTargets.cmake hardcodes /usr/lib64/libc.so from its own build
+# host; Ubuntu keeps libc in /lib/x86_64-linux-gnu, so cmake would fail with
+# "ninja: error: /usr/lib64/libc.so missing and no known rule to make it".
+RUN mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.so
+
+# ROCm lives in site-packages here, but AITER shells out to
+# /opt/rocm/llvm/bin/amdgpu-arch at runtime to pick DEFAULT_GPU_ARCH, and the
+# rest of this Dockerfile refers to /opt/rocm throughout.
+RUN ln -s ${ROCM_HOME} /opt/rocm
+
+# ===============================
+# Base image 942 with rocm10 and args
+FROM rocm10-base AS gfx942-rocm10
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="0"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+
+# ===============================
+# Base image 950 with rocm10 and args
+FROM rocm10-base AS gfx950-rocm10
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
@@ -162,6 +264,9 @@ RUN set -eux; \
       *rocm720*) \
         echo "ROCm 7.2 (GPU_ARCH=${GPU_ARCH}): libdrm-amdgpu packages already present, skipping"; \
         ;; \
+      *rocm10*) \
+        echo "ROCm 10 (GPU_ARCH=${GPU_ARCH}): libdrm comes with the pip ROCm SDK, skipping"; \
+        ;; \
       *) \
         echo "ROCm 7.0 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu packages"; \
         curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
@@ -184,16 +289,17 @@ RUN python -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which sccache)"
 
 # Install AMD SMI Python package from ROCm distribution.
-# The ROCm 7.2 base image (rocm/pytorch) does not pre-install this package.
+# Neither the ROCm 7.2 base image (rocm/pytorch) nor the pip-installed ROCm 10
+# SDK pre-installs this package.
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm720*) \
-        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
+      *rocm720*|*rocm10*) \
+        echo "ROCm 7.2 / 10 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
         cd /opt/rocm/share/amd_smi \
         && python3 -m pip install --no-cache-dir . \
         ;; \
       *) \
-        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip amdsmi installation"; \
+        echo "Not rocm720/rocm10 (GPU_ARCH=${GPU_ARCH}), skip amdsmi installation"; \
         ;; \
     esac
 
