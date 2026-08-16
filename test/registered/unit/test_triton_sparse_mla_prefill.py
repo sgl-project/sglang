@@ -60,7 +60,7 @@ class TestTritonSparseMLAValidator(CustomTestCase):
 class TestTritonSparseMLAAdapter(CustomTestCase):
     """The backend method forwards exactly what the kernel expects."""
 
-    def _call_forward(self, *, union=0, dense=False, capturing=False):
+    def _call_forward(self, *, union=0, capturing=False):
         from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
         captured = {}
@@ -73,7 +73,6 @@ class TestTritonSparseMLAAdapter(CustomTestCase):
 
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
         backend.dsa_triton_union = union
-        backend.dsa_triton_dense_prefix = dense
 
         with patch(
             "sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill.sparse_mla_prefill",
@@ -100,23 +99,20 @@ class TestTritonSparseMLAAdapter(CustomTestCase):
         self.assertEqual(captured["d_v"], 512)
         self.assertEqual(tuple(out.shape), (4, 8, 512))
 
-    def test_fast_paths_off_unless_requested(self):
+    def test_union_off_unless_requested(self):
         captured, _ = self._call_forward()
         self.assertEqual(captured["union"], 0)
-        self.assertFalse(captured["dense"])
 
-    def test_fast_paths_are_plumbed_through(self):
-        captured, _ = self._call_forward(union=4, dense=True)
+    def test_union_is_plumbed_through(self):
+        captured, _ = self._call_forward(union=4)
         self.assertEqual(captured["union"], 4)
-        self.assertTrue(captured["dense"])
 
     def test_union_is_disabled_under_cuda_graph_capture(self):
         # The union path reads the index range back to the host to size its
         # scratch, which cannot be captured. It must degrade to the per-token
         # path (same result) rather than break capture.
-        captured, _ = self._call_forward(union=4, dense=True, capturing=True)
+        captured, _ = self._call_forward(union=4, capturing=True)
         self.assertEqual(captured["union"], 0)
-        self.assertTrue(captured["dense"], "dense has no host sync; keep it on")
 
 
 class TestTritonSparseMLATopkTransformRouting(CustomTestCase):
@@ -169,7 +165,6 @@ class TestTritonSparseMLARegistration(CustomTestCase):
         args = ServerArgs(model_path="dummy")
         self.assertNotEqual(args.dsa_prefill_backend, "triton_sparse_mla")
         self.assertEqual(args.dsa_triton_union, 0)
-        self.assertFalse(args.dsa_triton_dense_prefix)
 
 
 if __name__ == "__main__":

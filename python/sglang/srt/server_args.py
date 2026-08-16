@@ -1791,16 +1791,6 @@ class ServerArgs:
         ),
         NS("exec.kernel"),
     ] = 0
-    dsa_triton_dense_prefix: A[
-        bool,
-        Arg(
-            help="Enable the dense-prefix identity fast path for "
-            "--dsa-prefill-backend triton_sparse_mla: tokens whose top-k covers "
-            "the entire causal prefix skip the gather. Guarded by an exact set "
-            "check that falls back to the sparse path.",
-        ),
-        NS("exec.kernel"),
-    ] = False
     dsa_decode_backend: A[
         Optional[str],
         Arg(

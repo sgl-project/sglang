@@ -372,11 +372,8 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.dsa_prefill_backend
         )
         self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
-        # Opt-in exact fast paths for the Triton sparse-MLA prefill kernel.
+        # Opt-in exact fast path for the Triton sparse-MLA prefill kernel.
         self.dsa_triton_union: int = model_runner.server_args.dsa_triton_union
-        self.dsa_triton_dense_prefix: bool = (
-            model_runner.server_args.dsa_triton_dense_prefix
-        )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
@@ -2095,7 +2092,11 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif dsa_impl in ("flashmla_sparse", "flashmla_sparse_q8"):
+        elif dsa_impl in (
+            "flashmla_sparse",
+            "flashmla_sparse_q8",
+            "triton_sparse_mla",
+        ):
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 _has_prefix = any(forward_batch.extend_prefix_lens_cpu)
                 page_table_1 = topk_indices
@@ -2152,7 +2153,9 @@ class DeepseekSparseAttnBackend(
                         layer_id=layer.layer_id,
                     )
 
-                # bf16 path (dsa_impl == "flashmla_sparse").
+                # bf16 path: `flashmla_sparse` and `triton_sparse_mla` take the
+                # same inputs (concatenated q, dequantized bf16 KV, top-k list
+                # as the slot table) and differ only in the kernel they call.
                 if _has_prefix:
                     page_table_1_flattened = (
                         self.forward_metadata.page_table_1_flattened
@@ -2166,6 +2169,14 @@ class DeepseekSparseAttnBackend(
 
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if dsa_impl == "triton_sparse_mla":
+                return self._forward_triton_sparse_mla(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                )
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2173,31 +2184,6 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
                 topk_length=metadata.dsa_cache_seqlens_int32,
-            )
-        elif dsa_impl == "triton_sparse_mla":
-            # Fused per-token Triton sparse-MLA prefill (CUDA SM90/SM120).
-            # Same input prep as flashmla_sparse: concatenated q, dequantized
-            # bf16 KV, and the top-k list used directly as the slot table.
-            if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            if topk_transform_method == TopkTransformMethod.RAGGED:
-                if any(forward_batch.extend_prefix_lens_cpu):
-                    page_table_1_flattened = (
-                        self.forward_metadata.page_table_1_flattened
-                    )
-                    assert page_table_1_flattened is not None
-                    kv_cache = dequantize_k_cache_paged(
-                        kv_cache, page_table_1_flattened
-                    )
-                else:
-                    kv_cache = _cat([k, k_rope], dim=-1)
-                page_table_1 = topk_indices
-            return self._forward_triton_sparse_mla(
-                q_all=q_all,
-                kv_cache=kv_cache,
-                page_table_1=page_table_1,
-                sm_scale=layer.scaling,
-                v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_rope is not None:
@@ -2869,7 +2855,6 @@ class DeepseekSparseAttnBackend(
             sm_scale,
             v_head_dim,
             union=union,
-            dense=self.dsa_triton_dense_prefix,
         )
 
     def _forward_flashinfer_sparse_mla(
