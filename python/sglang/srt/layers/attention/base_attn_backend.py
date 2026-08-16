@@ -29,7 +29,7 @@ class SharedReadEnds(Enum):
 
     @staticmethod
     def max_of(items: Iterable[SharedReadEnds]) -> SharedReadEnds:
-        # Values are ordered by lateness, so the max covers every child.
+        # Ordered by lateness: the latest end covers every child.
         return max(items, key=lambda x: x.value)
 
 
@@ -132,7 +132,6 @@ class AttentionBackend(ABC):
         """Declare where this backend's scheduler-shared reads end per mode.
         Override only for audited deviations from this conservative default."""
         if fm.is_decode() or fm.is_target_verify():
-            # Assume shared data is still read through the in-graph hook.
             return SharedReadEnds.IN_REPLAY
         return SharedReadEnds.UNKNOWN
 

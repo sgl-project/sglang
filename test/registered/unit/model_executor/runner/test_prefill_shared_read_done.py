@@ -28,7 +28,7 @@ class _Event:
 
 def _model_runner(*, spec_algorithm=SpeculativeAlgorithm.NONE, compliant=True):
     declared = SharedReadEnds.PRE_REPLAY if compliant else SharedReadEnds.UNKNOWN
-    # Spec'd against the real ABC: a renamed method fails here, not at runtime.
+    # Spec'd against the real ABC so a rename fails here, not at runtime.
     attn_backend = create_autospec(AttentionBackend, instance=True)
     attn_backend.shared_read_ends.return_value = declared
     return SimpleNamespace(

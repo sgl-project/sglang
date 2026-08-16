@@ -33,7 +33,7 @@ def _runner(*, owns_verify: bool = False, has_marker: bool = False):
 
 
 def _backend(declared: SharedReadEnds):
-    # Spec'd against the real ABC: a renamed method fails here, not at runtime.
+    # Spec'd against the real ABC so a rename fails here, not at runtime.
     backend = create_autospec(AttentionBackend, instance=True)
     backend.shared_read_ends.return_value = declared
     return backend
