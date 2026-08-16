@@ -5,7 +5,7 @@ import base64
 import io
 import json
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import pytest
@@ -55,11 +55,14 @@ class _FakeTokenizer:
 
 
 class _FakeTokenizerManager:
-    def __init__(self):
+    def __init__(self, *, media_url_max_file_size_mb=1):
         self.model_config = SimpleNamespace(
             hf_config=SimpleNamespace(model_type="neo_chat")
         )
         self.tokenizer = _FakeTokenizer()
+        self.server_args = SimpleNamespace(
+            media_url_max_file_size_mb=media_url_max_file_size_mb
+        )
         self.requests = []
         self.raw_requests = []
         self.aborted_rids = []
@@ -115,6 +118,154 @@ class _TrackingBytesIO(io.BytesIO):
         chunk = super().read(size)
         self.bytes_read += len(chunk)
         return chunk
+
+
+_DEFAULT_CONTENT_LENGTH = object()
+
+
+def _multipart_body(boundary, parts):
+    body = bytearray()
+    for part in parts:
+        body.extend(f"--{boundary}\r\n".encode())
+        disposition = f'form-data; name="{part["name"]}"'
+        filename = part.get("filename")
+        if filename is not None:
+            disposition += f'; filename="{filename}"'
+        body.extend(f"Content-Disposition: {disposition}\r\n".encode())
+        content_type = part.get("content_type")
+        if content_type is not None:
+            body.extend(f"Content-Type: {content_type}\r\n".encode())
+        body.extend(b"\r\n")
+        body.extend(part["value"])
+        body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode())
+    return bytes(body)
+
+
+def _image_edit_multipart_body(
+    *,
+    boundary="u1-boundary",
+    image=b"image-bytes",
+    mask=None,
+    padding_size=None,
+):
+    parts = [
+        {"name": "prompt", "value": b"edit this image"},
+        {
+            "name": "image",
+            "filename": "image.png",
+            "content_type": "image/png",
+            "value": image,
+        },
+    ]
+    if mask is not None:
+        parts.append(
+            {
+                "name": "mask",
+                "filename": "mask.png",
+                "content_type": "image/png",
+                "value": mask,
+            }
+        )
+    if padding_size is not None:
+        parts.append({"name": "padding", "value": b"p" * padding_size})
+    return _multipart_body(boundary, parts)
+
+
+def _image_edit_multipart_at_request_limit(http_server):
+    file_limit = http_server._u1_image_edit_file_limit_bytes()
+    request_limit = http_server._u1_image_edit_request_limit_bytes()
+    base = _image_edit_multipart_body(
+        image=b"i" * file_limit,
+        mask=b"m" * file_limit,
+        padding_size=0,
+    )
+    body = _image_edit_multipart_body(
+        image=b"i" * file_limit,
+        mask=b"m" * file_limit,
+        padding_size=request_limit - len(base),
+    )
+    assert len(body) == request_limit
+    return body
+
+
+async def _asgi_request(
+    *,
+    path,
+    body,
+    content_type,
+    content_length=_DEFAULT_CONTENT_LENGTH,
+    receive_messages=None,
+    extra_headers=(),
+):
+    from sglang.srt.entrypoints import http_server
+
+    headers = [
+        (b"host", b"testserver"),
+        (b"content-type", content_type.encode()),
+        *extra_headers,
+    ]
+    if content_length is _DEFAULT_CONTENT_LENGTH:
+        headers.append((b"content-length", str(len(body)).encode()))
+    elif content_length is not None:
+        headers.append((b"content-length", str(content_length).encode()))
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": headers,
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+    }
+    pending = list(
+        receive_messages
+        if receive_messages is not None
+        else [{"type": "http.request", "body": body, "more_body": False}]
+    )
+    receive_calls = 0
+    sent = []
+
+    async def receive():
+        nonlocal receive_calls
+        receive_calls += 1
+        if pending:
+            return pending.pop(0)
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    await http_server.app(scope, receive, send)
+    status_code = next(
+        message["status"]
+        for message in sent
+        if message["type"] == "http.response.start"
+    )
+    response_body = b"".join(
+        message.get("body", b"")
+        for message in sent
+        if message["type"] == "http.response.body"
+    )
+    return SimpleNamespace(
+        status_code=status_code,
+        body=response_body,
+        receive_calls=receive_calls,
+    )
+
+
+def _image_edit_route_dependant(http_server):
+    return next(
+        route.dependant
+        for route in http_server.app.routes
+        if getattr(route, "path", None) == "/v1/images/edits"
+    )
 
 
 class _BlockingTokenizerManager(_FakeTokenizerManager):
@@ -431,6 +582,270 @@ def test_u1_image_edit_rejects_oversized_multipart_and_closes_upload() -> None:
     )
     assert source.bytes_read == 1
     assert upload.file.closed
+
+
+def test_u1_image_edit_asgi_accepts_exact_total_multipart_limit() -> None:
+    async def scenario():
+        from sglang.srt.entrypoints import http_server
+
+        manager = _FakeTokenizerManager(media_url_max_file_size_mb=1)
+        global_state = SimpleNamespace(tokenizer_manager=manager)
+        with patch.object(http_server, "_global_state", global_state):
+            body = _image_edit_multipart_at_request_limit(http_server)
+            return await _asgi_request(
+                path="/v1/images/edits",
+                body=body,
+                content_type="multipart/form-data; boundary=u1-boundary",
+            )
+
+    response = asyncio.run(scenario())
+
+    assert response.status_code == 400
+    assert (
+        "image masks are not yet supported"
+        in json.loads(response.body)["error"]["message"]
+    )
+
+
+def test_u1_image_edit_asgi_rejects_declared_limit_plus_one_before_read() -> None:
+    async def scenario():
+        from sglang.srt.entrypoints import http_server
+
+        manager = _FakeTokenizerManager(media_url_max_file_size_mb=1)
+        global_state = SimpleNamespace(tokenizer_manager=manager)
+        endpoint = AsyncMock(return_value={"unexpected": True})
+        route_dependant = _image_edit_route_dependant(http_server)
+        with (
+            patch.object(http_server, "_global_state", global_state),
+            patch.object(route_dependant, "call", endpoint),
+        ):
+            body = _image_edit_multipart_at_request_limit(http_server) + b"x"
+            response = await _asgi_request(
+                path="/v1/images/edits",
+                body=body,
+                content_type="multipart/form-data; boundary=u1-boundary",
+            )
+        return response, endpoint
+
+    response, endpoint = asyncio.run(scenario())
+
+    assert response.status_code == 413
+    assert response.receive_calls == 0
+    endpoint.assert_not_awaited()
+    assert (
+        "multipart body exceeds the maximum"
+        in json.loads(response.body)["error"]["message"]
+    )
+
+
+def test_u1_image_edit_asgi_rejects_receive_stream_overflow() -> None:
+    async def scenario():
+        from sglang.srt.entrypoints import http_server
+
+        manager = _FakeTokenizerManager(media_url_max_file_size_mb=1)
+        global_state = SimpleNamespace(tokenizer_manager=manager)
+        endpoint = AsyncMock(return_value={"unexpected": True})
+        route_dependant = _image_edit_route_dependant(http_server)
+        with (
+            patch.object(http_server, "_global_state", global_state),
+            patch.object(route_dependant, "call", endpoint),
+        ):
+            request_limit = http_server._u1_image_edit_request_limit_bytes()
+            body = _image_edit_multipart_at_request_limit(http_server)
+            response = await _asgi_request(
+                path="/v1/images/edits",
+                body=body + b"x",
+                content_type="multipart/form-data; boundary=u1-boundary",
+                content_length=request_limit,
+                receive_messages=[
+                    {"type": "http.request", "body": body, "more_body": True},
+                    {"type": "http.request", "body": b"x", "more_body": False},
+                ],
+            )
+        return response, endpoint
+
+    response, endpoint = asyncio.run(scenario())
+
+    assert response.status_code == 413
+    assert response.receive_calls == 2
+    endpoint.assert_not_awaited()
+
+
+def test_u1_image_edit_asgi_rejects_absent_content_length() -> None:
+    async def scenario():
+        from sglang.srt.entrypoints import http_server
+
+        manager = _FakeTokenizerManager(media_url_max_file_size_mb=1)
+        global_state = SimpleNamespace(tokenizer_manager=manager)
+        body = _image_edit_multipart_body()
+        with patch.object(http_server, "_global_state", global_state):
+            return await _asgi_request(
+                path="/v1/images/edits",
+                body=body,
+                content_type="multipart/form-data; boundary=u1-boundary",
+                content_length=None,
+            )
+
+    response = asyncio.run(scenario())
+
+    assert response.status_code == 411
+    assert response.receive_calls == 0
+
+
+@pytest.mark.parametrize("declared_delta", [-1, 1])
+def test_u1_image_edit_asgi_rejects_misleading_content_length(
+    declared_delta,
+) -> None:
+    async def scenario():
+        from sglang.srt.entrypoints import http_server
+
+        manager = _FakeTokenizerManager(media_url_max_file_size_mb=1)
+        global_state = SimpleNamespace(tokenizer_manager=manager)
+        body = _image_edit_multipart_body()
+        with patch.object(http_server, "_global_state", global_state):
+            return await _asgi_request(
+                path="/v1/images/edits",
+                body=body,
+                content_type="multipart/form-data; boundary=u1-boundary",
+                content_length=len(body) + declared_delta,
+            )
+
+    response = asyncio.run(scenario())
+
+    assert response.status_code == 400
+    assert "Content-Length" in json.loads(response.body)["error"]["message"]
+
+
+def test_u1_image_edit_asgi_parses_image_and_mask_within_limit() -> None:
+    async def scenario():
+        from sglang.srt.entrypoints import http_server
+
+        manager = _FakeTokenizerManager(media_url_max_file_size_mb=1)
+        global_state = SimpleNamespace(tokenizer_manager=manager)
+        body = _image_edit_multipart_body(mask=b"mask-bytes")
+        with patch.object(http_server, "_global_state", global_state):
+            return await _asgi_request(
+                path="/v1/images/edits",
+                body=body,
+                content_type="multipart/form-data; boundary=u1-boundary",
+            )
+
+    response = asyncio.run(scenario())
+
+    assert response.status_code == 400
+    assert (
+        "image masks are not yet supported"
+        in json.loads(response.body)["error"]["message"]
+    )
+
+
+def test_u1_image_edit_asgi_rejects_interrupted_stream() -> None:
+    async def scenario():
+        from sglang.srt.entrypoints import http_server
+
+        manager = _FakeTokenizerManager(media_url_max_file_size_mb=1)
+        global_state = SimpleNamespace(tokenizer_manager=manager)
+        body = _image_edit_multipart_body()
+        with patch.object(http_server, "_global_state", global_state):
+            return await _asgi_request(
+                path="/v1/images/edits",
+                body=body,
+                content_type="multipart/form-data; boundary=u1-boundary",
+                receive_messages=[
+                    {
+                        "type": "http.request",
+                        "body": body[: len(body) // 2],
+                        "more_body": True,
+                    },
+                    {"type": "http.disconnect"},
+                ],
+            )
+
+    response = asyncio.run(scenario())
+
+    assert response.status_code == 400
+    assert response.receive_calls == 2
+    assert "upload was interrupted" in json.loads(response.body)["error"]["message"]
+
+
+def test_u1_image_edit_asgi_rejects_truncated_multipart() -> None:
+    async def scenario():
+        from sglang.srt.entrypoints import http_server
+
+        manager = _FakeTokenizerManager(media_url_max_file_size_mb=1)
+        global_state = SimpleNamespace(tokenizer_manager=manager)
+        body = _image_edit_multipart_body()
+        truncated = body[: -len(b"--u1-boundary--\r\n")]
+        bounded_read = AsyncMock(return_value=b"image-bytes")
+        with (
+            patch.object(http_server, "_global_state", global_state),
+            patch.object(
+                http_server,
+                "_read_upload_file_limited",
+                bounded_read,
+            ),
+        ):
+            response = await _asgi_request(
+                path="/v1/images/edits",
+                body=truncated,
+                content_type="multipart/form-data; boundary=u1-boundary",
+            )
+        return response, bounded_read
+
+    response, bounded_read = asyncio.run(scenario())
+
+    assert response.status_code in {400, 422}
+    bounded_read.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "num_steps", "expected_status", "message"),
+    [
+        (2048, 512, 2, 200, None),
+        (2049, 512, 2, 400, "width exceeds the maximum 2048"),
+        (1024, 1024, 2, 200, None),
+        # Dimensions are 32-aligned, so this is the first public geometry over
+        # the 1024 * 1024 pixel limit.
+        (1056, 1024, 2, 400, "image pixel count exceeds the maximum 1048576"),
+        (64, 64, 64, 200, None),
+        (64, 64, 65, 400, "num_steps exceeds the maximum 64"),
+    ],
+)
+def test_u1_public_image_generation_boundaries(
+    width,
+    height,
+    num_steps,
+    expected_status,
+    message,
+) -> None:
+    async def scenario():
+        from sglang.srt.entrypoints import http_server
+
+        _clear_u1_prefix_cache_for_test()
+        manager = _FakeTokenizerManager()
+        global_state = SimpleNamespace(tokenizer_manager=manager)
+        body = json.dumps(
+            {
+                "prompt": "boundary test",
+                "width": width,
+                "height": height,
+                "num_inference_steps": num_steps,
+                "response_format": "b64_json",
+                "seed": 0,
+            }
+        ).encode()
+        with patch.object(http_server, "_global_state", global_state):
+            return await _asgi_request(
+                path="/v1/images/generations",
+                body=body,
+                content_type="application/json",
+            )
+
+    response = asyncio.run(scenario())
+
+    assert response.status_code == expected_status
+    if message is not None:
+        assert message in json.loads(response.body)["error"]["message"]
 
 
 def test_u1_flow_selects_matching_prefill_cuda_graph_variant() -> None:
