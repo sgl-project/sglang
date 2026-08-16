@@ -276,7 +276,9 @@ class SiglipVisionTransformer(nn.Module):
         self,
         pixel_values: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_states = self.embeddings(pixel_values.to(self.device))
+        hidden_states = self.embeddings(pixel_values.to(self.device)).to(
+            self.post_layernorm.weight.dtype
+        )
 
         return_all_hidden_states = False
 
