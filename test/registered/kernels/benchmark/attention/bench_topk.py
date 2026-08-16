@@ -67,7 +67,7 @@ def _build_fn(provider: str, batch_size: int, seq_len: int, k: int):
     return fn, (scores, seq_lens, page_table)
 
 
-@marker.parametrize("k", [512, 1024, 2048], [512])
+@marker.parametrize("k", [512, 1024, 2048], [512, 1024, 2048])
 @marker.parametrize("seq_len", [2**x for x in range(10, 19)], [4096, 65536])
 @marker.parametrize("batch_size", [2**x for x in range(13)], [1, 128, 1024])
 @marker.benchmark("provider", ["jit_v1", "jit_v2", "flashinfer", "torch"])
