@@ -8,30 +8,27 @@
 
 namespace sglang {
 
-#if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
+#if defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70100000
+using MemcpyBatchPtr = void*;
+using HipMemcpyBatchAsyncFn =
+    hipError_t (*)(void**, void**, size_t*, size_t, hipMemcpyAttributes*, size_t*, size_t, size_t*, hipStream_t);
+
+inline auto get_hip_memcpy_batch_async() -> HipMemcpyBatchAsyncFn {
+  static HipMemcpyBatchAsyncFn hip_memcpy_batch_async = []() {
+    void* symbol = dlsym(RTLD_DEFAULT, "hipMemcpyBatchAsync");
+    return reinterpret_cast<HipMemcpyBatchAsyncFn>(symbol);
+  }();
+  return hip_memcpy_batch_async;
+}
+#elif defined(CUDA_VERSION) && CUDA_VERSION >= 12080
 #if CUDA_VERSION >= 13000
-using CudaMemcpyBatchPtr = const void*;
+using MemcpyBatchPtr = const void*;
 using CudaMemcpyBatchAsyncFn = cudaError_t (*)(
-    CudaMemcpyBatchPtr*,
-    CudaMemcpyBatchPtr*,
-    const size_t*,
-    size_t,
-    cudaMemcpyAttributes*,
-    size_t*,
-    size_t,
-    cudaStream_t);
+    MemcpyBatchPtr*, MemcpyBatchPtr*, const size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, cudaStream_t);
 #else
-using CudaMemcpyBatchPtr = void*;
+using MemcpyBatchPtr = void*;
 using CudaMemcpyBatchAsyncFn = cudaError_t (*)(
-    CudaMemcpyBatchPtr*,
-    CudaMemcpyBatchPtr*,
-    size_t*,
-    size_t,
-    cudaMemcpyAttributes*,
-    size_t*,
-    size_t,
-    size_t*,
-    cudaStream_t);
+    MemcpyBatchPtr*, MemcpyBatchPtr*, size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, size_t*, cudaStream_t);
 #endif
 
 inline auto get_cuda_memcpy_batch_async() -> CudaMemcpyBatchAsyncFn {
@@ -44,8 +41,8 @@ inline auto get_cuda_memcpy_batch_async() -> CudaMemcpyBatchAsyncFn {
 
 inline auto call_cuda_memcpy_batch_async(
     CudaMemcpyBatchAsyncFn copy_fn,
-    CudaMemcpyBatchPtr* dsts,
-    CudaMemcpyBatchPtr* srcs,
+    MemcpyBatchPtr* dsts,
+    MemcpyBatchPtr* srcs,
     size_t* sizes,
     size_t count,
     cudaMemcpyAttributes* attrs,
@@ -99,15 +96,22 @@ inline bool try_copy_page_first_pages_batch(
     int64_t page_size,
     int device_id,
     cudaStream_t stream) {
-#if defined(USE_ROCM) || !defined(CUDA_VERSION) || (CUDA_VERSION < 12080)
+#if (defined(USE_ROCM) && (!defined(HIP_VERSION) || HIP_VERSION < 70100000)) || \
+    (!defined(USE_ROCM) && (!defined(CUDA_VERSION) || CUDA_VERSION < 12080))
   return false;
 #else
   host::RuntimeCheck(src_ptrs.size() == dst_ptrs.size(), "Source and destination tensors must have the same count");
   constexpr size_t kLargeCopyThresholdBytes = 128 * 1024;
-  thread_local std::vector<CudaMemcpyBatchPtr> batch_srcs;
-  thread_local std::vector<CudaMemcpyBatchPtr> batch_dsts;
+  thread_local std::vector<MemcpyBatchPtr> batch_srcs;
+  thread_local std::vector<MemcpyBatchPtr> batch_dsts;
   thread_local std::vector<size_t> batch_sizes;
 
+#if defined(USE_ROCM)
+  auto copy_fn = get_hip_memcpy_batch_async();
+  if (copy_fn == nullptr) {
+    return false;
+  }
+#else
   int driver_version = 0;
   cudaError_t driver_version_err = cudaDriverGetVersion(&driver_version);
   if (driver_version_err != cudaSuccess || driver_version < 12080) {
@@ -118,6 +122,7 @@ inline bool try_copy_page_first_pages_batch(
   if (copy_fn == nullptr) {
     return false;
   }
+#endif
 
   const size_t num_copies = static_cast<size_t>(src_ptrs.size()) * static_cast<size_t>(num_pages);
   batch_srcs.clear();
@@ -155,6 +160,16 @@ inline bool try_copy_page_first_pages_batch(
     return false;
   }
 
+#if defined(USE_ROCM)
+  size_t fail_idx = std::numeric_limits<size_t>::max();
+  hipError_t err = copy_fn(
+      batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), num_copies, nullptr, nullptr, 0, &fail_idx, stream);
+  if (err == hipErrorNotSupported || err == hipErrorInvalidValue) {
+    (void)hipGetLastError();
+    return false;
+  }
+  host::RuntimeCheck(err == hipSuccess, "hipMemcpyBatchAsync failed. error=", hipGetErrorString(err));
+#else
   std::vector<size_t> attrs_idxs(1, 0);
   cudaMemcpyAttributes attrs{};
   attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
@@ -179,6 +194,7 @@ inline bool try_copy_page_first_pages_batch(
     return false;
   }
   host::RuntimeCheck(err == cudaSuccess, "cudaMemcpyBatchAsync failed. error=", cudaGetErrorString(err));
+#endif
   return true;
 #endif
 }
