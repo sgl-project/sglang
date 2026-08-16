@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     VLADensePrefixCache,
 )
 from sglang.srt.models.siglip import SiglipVisionModel
+from sglang.srt.runtime_context import get_context
 
 
 def _prefix_context(value: float, digest: str | None) -> PrefixContext:
@@ -195,12 +196,13 @@ def test_pi05_siglip_reuses_srt_model_with_layerwise_groups():
         num_channels=3,
         hidden_act="gelu_pytorch_tanh",
     )
-    model = Pi05SiglipVisionModel(
-        config,
-        act_layer=lambda: nn.GELU(approximate="tanh"),
-        qkv_backend="sdpa",
-        use_data_parallel=True,
-    )
+    with get_context().override_server_args():
+        model = Pi05SiglipVisionModel(
+            config,
+            act_layer=lambda: nn.GELU(approximate="tanh"),
+            qkv_backend="sdpa",
+            use_data_parallel=True,
+        )
 
     state_keys = set(model.state_dict())
     prefix = "vision_model.encoder.layers.0.self_attn"
