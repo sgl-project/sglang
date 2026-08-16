@@ -617,6 +617,14 @@ class Envs:
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
+    # Deferred decode-side KV release: when a decode request is aborted while its
+    # prefill->decode KV transfer may still be in flight, hold its KV pages and
+    # req-pool slot instead of freeing them immediately. The prefill signals (via
+    # ABORT_ACK) once the transfer has drained, and only then does decode release.
+    # If no signal arrives, the slot is force-released after the timeout below.
+    # Off by default: zero behavior/perf impact when disabled.
+    SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(False)
+    SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
 
     # ===================================================================
     # Distributed and model-parallel runtime

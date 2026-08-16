@@ -160,6 +160,9 @@ class CommonKVManager(BaseKVManager):
         self.is_hybrid_mla_backend = getattr(args, "is_hybrid_mla_backend", False)
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
+        self.enable_deferred_decode_kv_release = (
+            envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+        )
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -251,6 +254,11 @@ class CommonKVManager(BaseKVManager):
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
             self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
+            # Deferred KV release: prefill ranks that have confirmed (via
+            # ABORT_ACK) their in-flight transfer for an aborted room has
+            # drained. A room is safe to release once every required prefill
+            # rank has acked (mirrors prefill_response_tracker for Success).
+            self._deferred_abort_ack_tracker: Dict[int, Set[int]] = defaultdict(set)
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
@@ -334,6 +342,26 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def note_abort_ack(self, bootstrap_room: int, prefill_rank: int) -> None:
+        """Record that ``prefill_rank`` has drained its in-flight transfer for an
+        aborted room (called from the decode receiver thread on ABORT_ACK).
+
+        Kept independent of ``required_prefill_response_num_table``: the failing
+        request's receiver clears that table before the scheduler defers, so the
+        required count is snapshotted at defer time (see is_abort_release_safe)."""
+        self._deferred_abort_ack_tracker[bootstrap_room].add(prefill_rank)
+
+    def is_abort_release_safe(self, bootstrap_room: int, required_acks: int) -> bool:
+        """True once every prefill rank that could still be writing to this
+        room's KV pages has acked the drain."""
+        return (
+            len(self._deferred_abort_ack_tracker.get(bootstrap_room, ()))
+            >= required_acks
+        )
+
+    def clear_deferred_abort_state(self, bootstrap_room: int) -> None:
+        self._deferred_abort_ack_tracker.pop(bootstrap_room, None)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
