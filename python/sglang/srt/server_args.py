@@ -2361,11 +2361,14 @@ class ServerArgs:
         "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
         NS("exec.moe"),
     ] = "auto"
+    # None is the pre-resolution "not explicitly supplied" sentinel. The
+    # post-init compatibility handler resolves it to the CLI default or the
+    # deprecated environment-variable fallback.
     fuseep_mode: A[
-        Literal[1, 2],
+        Optional[Literal[1, 2]],
         "Select the mode when enable Ascend FuseEP MoE, 1 -> dispatch_gmm_combine_decode is executed；2 -> dispatch_ffn_combine is executed (support hybrid deployment when 2).",
         NS("exec.moe"),
-    ] = 2
+    ] = None
     deepep_dispatcher_output_dtype: A[
         Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
         "Select DeepEP dispatcher output dtype",
@@ -3579,6 +3582,7 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._handle_fuseep_mode_env_compat()
         self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
@@ -3749,6 +3753,27 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+
+    def _handle_fuseep_mode_env_compat(self) -> None:
+        if self.fuseep_mode is not None:
+            return
+
+        if not envs.SGLANG_NPU_FUSED_MOE_MODE.is_set():
+            self.fuseep_mode = 2
+            return
+
+        fuseep_mode = envs.SGLANG_NPU_FUSED_MOE_MODE.get()
+        if fuseep_mode not in (1, 2):
+            raise ValueError(
+                f"Wrong value of SGLANG_NPU_FUSED_MOE_MODE={fuseep_mode}, "
+                "the NPU only supports 1 or 2."
+            )
+
+        logger.warning(
+            "The env variable SGLANG_NPU_FUSED_MOE_MODE is deprecated and will be "
+            "removed in a future release. Please use --fuseep-mode instead."
+        )
+        self.fuseep_mode = fuseep_mode
 
     def _handle_moe_runner_backend_alias(self):
         if self.moe_runner_backend != "megamoe":
@@ -9646,32 +9671,6 @@ def get_global_server_args() -> ServerArgs:
     return get_context().server_args
 
 
-def _has_cli_arg(argv: List[str], flag: str) -> bool:
-    return any(arg == flag or arg.startswith(f"{flag}=") for arg in argv)
-
-
-def _apply_fuseep_mode_env_compat(
-    raw_args: argparse.Namespace, argv: List[str]
-) -> None:
-    if not envs.SGLANG_NPU_FUSED_MOE_MODE.is_set() or _has_cli_arg(
-        argv, "--fuseep-mode"
-    ):
-        return
-
-    fuseep_mode = envs.SGLANG_NPU_FUSED_MOE_MODE.get()
-    if fuseep_mode not in (1, 2):
-        raise ValueError(
-            f"Wrong value of SGLANG_NPU_FUSED_MOE_MODE={fuseep_mode}, "
-            "the NPU only supports 1 or 2."
-        )
-
-    logger.warning(
-        "The env variable SGLANG_NPU_FUSED_MOE_MODE is deprecated and will be "
-        "removed in a future release. Please use --fuseep-mode instead."
-    )
-    raw_args.fuseep_mode = fuseep_mode
-
-
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -9705,8 +9704,6 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
-
-    _apply_fuseep_mode_env_compat(raw_args, argv)
 
     return ServerArgs.from_cli_args(raw_args)
 
