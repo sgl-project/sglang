@@ -176,8 +176,7 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         if tensor is not None and tensor.device.type != "cpu":
             module.to(
                 "cpu",
-                non_blocking=current_platform.is_cuda()
-                or current_platform.is_rocm(),
+                non_blocking=current_platform.is_cuda() or current_platform.is_rocm(),
             )
         self._ready_events.pop(use.component_name, None)
 
