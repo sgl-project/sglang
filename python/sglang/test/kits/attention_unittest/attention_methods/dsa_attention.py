@@ -404,6 +404,9 @@ class DSAMockModelRunner(ModelRunner):
             kv_cache_dim=pool_kv_cache_dim,
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        # The attention backends read their KV ids through the runner's
+        # translator; build the real one (passthrough on a static pool).
+        self.init_kv_index_translator()
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
