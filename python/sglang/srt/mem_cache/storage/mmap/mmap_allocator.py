@@ -42,6 +42,53 @@ _MAP_HUGE_1GB = 30 << 26  # 0x78000000
 _MAP_FAILED = ctypes.c_void_p(-1).value
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
 
+# Accepted SGLANG_HUGEPAGE_SIZE values -> (page size in bytes, mmap flags).
+_HUGEPAGE_SPECS = {
+    "2MB": (2 * 1024 * 1024, _MAP_HUGETLB | _MAP_HUGE_2MB),
+    "1GB": (1024 * 1024 * 1024, _MAP_HUGETLB | _MAP_HUGE_1GB),
+}
+
+# Per-size hugetlb pool counters, e.g. hugepages-2048kB/free_hugepages.
+_HUGEPAGE_SYSFS_DIR = "/sys/kernel/mm/hugepages"
+
+
+def _requested_hugepage_spec():
+    """(page size, mmap flags) alloc_mmap would use, or None for plain pages."""
+    hugepage_size = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
+    if hugepage_size == "":
+        return None
+    spec = _HUGEPAGE_SPECS.get(hugepage_size)
+    if spec is None:
+        logger.warning(
+            "Unrecognized SGLANG_HUGEPAGE_SIZE=%r; expected '2MB' or '1GB'. "
+            "Falling back to plain page-size mmap.",
+            envs.SGLANG_HUGEPAGE_SIZE.get(),
+        )
+    return spec
+
+
+def free_hugepage_bytes() -> int:
+    """Bytes currently free in the hugetlb pool alloc_mmap() would draw from.
+
+    Reserved hugepages are deliberately excluded from MemAvailable, so callers
+    sizing an allocation against available host memory undercount by the size
+    of the pool. Returns 0 whenever hugepages would not be used at all -- not
+    requested, an unknown size, or no hugetlb pool on this platform -- so the
+    result is always safe to treat as "no extra capacity".
+    """
+    spec = _requested_hugepage_spec()
+    if spec is None:
+        return 0
+    page_size = spec[0]
+    try:
+        with open(
+            f"{_HUGEPAGE_SYSFS_DIR}/hugepages-{page_size // 1024}kB/free_hugepages"
+        ) as f:
+            return int(f.read().strip()) * page_size
+    except (OSError, ValueError):
+        # No hugetlb support, pool not configured, or unreadable counter.
+        return 0
+
 
 def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.Array:
     """Call mmap via libc with hugepage flags and return an owning ctypes array.
@@ -79,19 +126,11 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     hugepage_size = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
     n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
 
-    if hugepage_size == "":
+    spec = _requested_hugepage_spec()
+    if spec is None:
         page_size, extra_flags = mmap.PAGESIZE, 0
-    elif hugepage_size == "2MB":
-        page_size, extra_flags = 2 * 1024 * 1024, _MAP_HUGETLB | _MAP_HUGE_2MB
-    elif hugepage_size == "1GB":
-        page_size, extra_flags = 1024 * 1024 * 1024, _MAP_HUGETLB | _MAP_HUGE_1GB
     else:
-        logger.warning(
-            "Unrecognized SGLANG_HUGEPAGE_SIZE=%r; expected '2MB' or '1GB'. "
-            "Falling back to plain page-size mmap.",
-            envs.SGLANG_HUGEPAGE_SIZE.get(),
-        )
-        page_size, extra_flags = mmap.PAGESIZE, 0
+        page_size, extra_flags = spec
 
     alloc_bytes = math.ceil(n_bytes / page_size) * page_size
 

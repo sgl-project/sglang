@@ -13,6 +13,10 @@ logger = logging.getLogger(__name__)
 
 
 class HostTensorAllocator:
+    # alloc_mmap honors SGLANG_HUGEPAGE_SIZE and maps MAP_HUGETLB when set, so
+    # the hugetlb pool is spendable capacity for this allocator.
+    uses_hugetlb = True
+
     def __init__(self):
         """Initialize the HostTensorAllocator."""
         self.dtype = None
@@ -28,6 +32,10 @@ class HostTensorAllocator:
 
 
 class ShmHostTensorAllocator(HostTensorAllocator):
+    # alloc_shm maps a memfd/dev-shm object, which cannot come from hugetlb
+    # unless hugetlbfs is mounted there; it warns and uses plain pages instead.
+    uses_hugetlb = False
+
     def __init__(self):
         super().__init__()
         self.fds = []
