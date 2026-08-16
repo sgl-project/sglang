@@ -183,7 +183,7 @@ class Qwen3VLVisionTransformer(nn.Module):
         self.spatial_merge_size = config.spatial_merge_size
         self.spatial_merge_unit = config.spatial_merge_size**2
         self.patch_size = config.patch_size
-        self.patch_embed = Qwen3VLVisionPatchEmbed(config)
+        self.patch_embed = Qwen3VLVisionPatchEmbed(config, disable_linear=True)
         self.pos_embed = nn.Embedding(
             config.num_position_embeddings, config.hidden_size
         )

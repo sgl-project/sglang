@@ -432,6 +432,7 @@ class RMSNorm(BaseFusedOp):
         weight_dtype: Optional = None,
         override_orig_dtype: Optional = None,
         x_pad_to_multiple: int = 0,
+        deterministic: bool = False,
     ) -> None:
         super().__init__()
         self.has_weight = has_weight
@@ -467,6 +468,8 @@ class RMSNorm(BaseFusedOp):
                 except ImportError:
                     self._fused_pad_kernel = None
             self._forward_method = self.forward_aiter
+        if deterministic:
+            self._forward_method = self.forward_native
 
     def forward_cuda(
         self,

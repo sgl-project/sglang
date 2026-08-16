@@ -89,6 +89,7 @@ class Qwen2_5_VisionPatchEmbed(nn.Module):
         temporal_patch_size: int,
         in_channels: int,
         embed_dim: int,
+        disable_linear: bool = False,
     ) -> None:
         super().__init__()
         self.patch_size = patch_size
@@ -102,6 +103,7 @@ class Qwen2_5_VisionPatchEmbed(nn.Module):
             kernel_size=kernel_size,
             stride=kernel_size,
             bias=False,
+            disable_linear=disable_linear,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -137,19 +139,39 @@ class Qwen2_5_VLMLP(nn.Module):
         prefix: str = "",
         use_data_parallel: bool = False,
         deterministic_activation: Optional[bool] = None,
+        fuse_gate_up: bool = True,
     ):
         super().__init__()
         self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
         self.tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
-        self.gate_up_proj = MergedColumnParallelLinear(
-            input_size=in_features,
-            output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
-            bias=bias,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-        )
+        self.fuse_gate_up = fuse_gate_up
+        if fuse_gate_up:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                input_size=in_features,
+                output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
+                bias=bias,
+                quant_config=quant_config,
+                prefix=add_prefix("gate_up_proj", prefix),
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+            )
+        else:
+            projection_kwargs = dict(
+                input_size=in_features,
+                output_size=hidden_features,
+                bias=bias,
+                quant_config=quant_config,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+            )
+            self.gate_proj = ColumnParallelLinear(
+                **projection_kwargs,
+                prefix=add_prefix("gate_proj", prefix),
+            )
+            self.up_proj = ColumnParallelLinear(
+                **projection_kwargs,
+                prefix=add_prefix("up_proj", prefix),
+            )
         self.down_proj = RowParallelLinear(
             hidden_features,
             in_features,
@@ -172,7 +194,12 @@ class Qwen2_5_VLMLP(nn.Module):
             self.act = _act_fn
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
+        if self.fuse_gate_up:
+            gate_up, _ = self.gate_up_proj(x)
+        else:
+            gate, _ = self.gate_proj(x)
+            up, _ = self.up_proj(x)
+            gate_up = torch.cat((gate, up), dim=-1)
         x = self.act(gate_up)
         x_down, _ = self.down_proj(x)
         return x_down
@@ -267,11 +294,18 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        cast_x_before_out_mul: bool = False,
+        deterministic_norm: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.padded_context_dim = padded_context_dim * (spatial_merge_size**2)
-        self.ln_q = RMSNorm(context_dim, eps=1e-6)
+        self.ln_q = RMSNorm(
+            context_dim,
+            eps=1e-6,
+            cast_x_before_out_mul=cast_x_before_out_mul,
+            deterministic=deterministic_norm,
+        )
         tp_size = 1 if use_data_parallel else get_parallel().tp_size
         tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
         self.mlp = nn.ModuleList(

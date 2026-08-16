@@ -169,7 +169,7 @@ class Qwen3_VisionMLP(nn.Module):
 
 
 class Qwen3VLVisionPatchEmbed(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config, disable_linear: bool = False) -> None:
         super().__init__()
         self.patch_size = config.patch_size
         self.temporal_patch_size = config.temporal_patch_size
@@ -183,6 +183,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
             kernel_size=kernel_size,
             stride=kernel_size,
             bias=True,
+            disable_linear=disable_linear,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

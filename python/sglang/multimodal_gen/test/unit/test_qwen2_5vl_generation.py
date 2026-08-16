@@ -92,11 +92,15 @@ def test_native_vision_reuses_srt_modules():
         mlp = Qwen2_5_VLMLP(
             16,
             24,
-            deterministic_activation=False,
+            deterministic_activation=True,
+            fuse_gate_up=False,
         )
 
     assert isinstance(model.patch_embed, Qwen2_5_VisionPatchEmbed)
     assert isinstance(model.merger, Qwen2_5_VisionPatchMerger)
+    assert not mlp.fuse_gate_up
+    assert hasattr(mlp, "gate_proj")
+    assert hasattr(mlp, "up_proj")
     assert mlp.act is not None
 
 

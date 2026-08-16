@@ -31,21 +31,31 @@ from sglang.srt.models.qwen2_5_vl import (
 class Qwen2_5VLVisionBlock(nn.Module):
     def __init__(self, config: Any, layer_idx: int) -> None:
         super().__init__()
-        self.norm1 = RMSNorm(config.hidden_size, eps=1e-6)
-        self.norm2 = RMSNorm(config.hidden_size, eps=1e-6)
+        self.norm1 = RMSNorm(
+            config.hidden_size,
+            eps=1e-6,
+            cast_x_before_out_mul=True,
+            deterministic=True,
+        )
+        self.norm2 = RMSNorm(
+            config.hidden_size,
+            eps=1e-6,
+            cast_x_before_out_mul=True,
+            deterministic=True,
+        )
         self.attn = QwenVLVisionAttention(
             config,
             prefix=f"visual.blocks.{layer_idx}.attn",
             model_name="Qwen2.5-VL",
         )
-        mlp_hidden_size = (config.intermediate_size + 7) // 8 * 8
         self.mlp = Qwen2_5_VLMLP(
             config.hidden_size,
-            mlp_hidden_size,
+            config.intermediate_size,
             bias=True,
             hidden_act=config.hidden_act,
             prefix=f"visual.blocks.{layer_idx}.mlp",
-            deterministic_activation=False,
+            deterministic_activation=True,
+            fuse_gate_up=False,
         )
 
     def forward(
@@ -164,6 +174,7 @@ class Qwen2_5VLVisionTransformer(nn.Module):
             temporal_patch_size=config.temporal_patch_size,
             in_channels=config.in_channels,
             embed_dim=config.hidden_size,
+            disable_linear=True,
         )
         head_dim = config.hidden_size // config.num_heads
         self.rotary_pos_emb = Qwen2_5VLVisionRotaryEmbedding(head_dim // 2)
@@ -176,6 +187,8 @@ class Qwen2_5VLVisionTransformer(nn.Module):
             padded_context_dim=config.hidden_size,
             spatial_merge_size=config.spatial_merge_size,
             prefix="visual.merger",
+            cast_x_before_out_mul=True,
+            deterministic_norm=True,
         )
 
     @property

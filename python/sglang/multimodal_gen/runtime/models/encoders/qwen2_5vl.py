@@ -1435,11 +1435,13 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
                 ):
                     if weight_name not in name:
                         continue
-                    name = name.replace(weight_name, ".gate_up_proj.")
-                    param = params_dict[name]
+                    fused_name = name.replace(weight_name, ".gate_up_proj.")
+                    if fused_name not in params_dict:
+                        continue
+                    param = params_dict[fused_name]
                     loaded_weight = loaded_weight.to(param.dtype)
                     param.weight_loader(param, loaded_weight, shard_id)
-                    loaded_params.add(name)
+                    loaded_params.add(fused_name)
                     loaded_stacked_param = True
                     break
                 if loaded_stacked_param:
