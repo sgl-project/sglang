@@ -9,7 +9,7 @@ from typing import Any
 U1_FLOW_CUSTOM_PARAM = "sensenova_u1_flow"
 U1_FLOW_BATCH_ISOLATION_PARAM = "__sglang_batch_isolation_key"
 U1_FLOW_RADIX_PREFIX_LIMIT_PARAM = "__sglang_radix_cache_prefix_limit"
-U1_FLOW_DISABLE_PREFILL_GRAPH_PARAM = "__sglang_disable_prefill_cuda_graph"
+U1_FLOW_PREFILL_GRAPH_VARIANT_PARAM = "__sglang_prefill_cuda_graph_variant"
 U1_IMAGE_CONDITIONING_CUSTOM_PARAM = "sensenova_u1_image_conditioning"
 U1_IMAGE_CONDITIONING_MIN_PIXELS = 512 * 512
 U1_IMAGE_CONDITIONING_MAX_PIXELS = 2048 * 2048
@@ -142,7 +142,7 @@ def normalize_u1_flow_request(
 __all__ = [
     "U1_FLOW_BATCH_ISOLATION_PARAM",
     "U1_FLOW_CUSTOM_PARAM",
-    "U1_FLOW_DISABLE_PREFILL_GRAPH_PARAM",
+    "U1_FLOW_PREFILL_GRAPH_VARIANT_PARAM",
     "U1_FLOW_RADIX_PREFIX_LIMIT_PARAM",
     "U1_IMAGE_CONDITIONING_CUSTOM_PARAM",
     "U1_IMAGE_CONDITIONING_MAX_PIXELS",

@@ -388,6 +388,24 @@ class NEOChatAttention(nn.Module):
         hidden_states, _ = projection(hidden_states)
         return hidden_states
 
+    def _forward_one_path(
+        self,
+        hidden_states: torch.Tensor,
+        indexes: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        use_mot_gen: bool,
+    ) -> torch.Tensor:
+        q, k, v = self._qkv(
+            hidden_states,
+            indexes,
+            use_mot_gen=use_mot_gen,
+        )
+        return self._output_projection(
+            self.attn(q, k, v, forward_batch),
+            use_mot_gen=use_mot_gen,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -396,24 +414,18 @@ class NEOChatAttention(nn.Module):
         image_gen_indicators: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if image_gen_indicators is None or not image_gen_indicators.any():
-            q, k, v = self._qkv(
+            return self._forward_one_path(
                 hidden_states,
                 indexes,
-                use_mot_gen=False,
-            )
-            return self._output_projection(
-                self.attn(q, k, v, forward_batch),
+                forward_batch,
                 use_mot_gen=False,
             )
 
         if image_gen_indicators.all():
-            q, k, v = self._qkv(
+            return self._forward_one_path(
                 hidden_states,
                 indexes,
-                use_mot_gen=True,
-            )
-            return self._output_projection(
-                self.attn(q, k, v, forward_batch),
+                forward_batch,
                 use_mot_gen=True,
             )
 
@@ -502,19 +514,11 @@ class NEOChatDecoderLayer(nn.Module):
             self.input_layernorm_mot_gen if use_mot_gen else self.input_layernorm
         )
         hidden_states = _rms_norm(input_norm, hidden_states)
-        hidden_states = self.self_attn(
+        hidden_states = self.self_attn._forward_one_path(
             hidden_states,
             indexes,
             forward_batch,
-            image_gen_indicators=(
-                torch.ones(
-                    hidden_states.shape[0],
-                    dtype=torch.bool,
-                    device=hidden_states.device,
-                )
-                if use_mot_gen
-                else None
-            ),
+            use_mot_gen=use_mot_gen,
         )
         hidden_states = residual + hidden_states
 
@@ -627,6 +631,11 @@ class NEOChatTextModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm_mot_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.is_mrope_enabled = True
+        self.prefill_cuda_graph_capture_variant = "sensenova_u1_flow"
+        self.prefill_cuda_graph_capture_flag = (
+            "force_mot_gen_for_prefill_graph_capture"
+        )
+        self.force_mot_gen_for_prefill_graph_capture = False
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -654,6 +663,18 @@ class NEOChatTextModel(nn.Module):
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
         indexes = self._indexes(positions, forward_batch)
+        if (
+            self.force_mot_gen_for_prefill_graph_capture
+            and image_gen_indicators is None
+        ):
+            for layer in self.layers:
+                hidden_states = layer._forward_one_path(
+                    hidden_states,
+                    indexes,
+                    forward_batch,
+                    use_mot_gen=True,
+                )
+            return _rms_norm(self.norm_mot_gen, hidden_states)
         if image_gen_indicators is not None:
             image_gen_indicators = image_gen_indicators.flatten().bool()
 
@@ -826,6 +847,7 @@ class NEOChatModel(nn.Module):
 
     def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
         forward_batch.model_specific_states = None
+        forward_batch.cross_attention_custom_mask = None
 
         flow_specs = (
             self._flow_specs(forward_batch)
@@ -850,6 +872,7 @@ class NEOChatModel(nn.Module):
                 force_custom_mask=True,
             )
             forward_batch.mrope_positions = indexes
+            forward_batch.cross_attention_custom_mask = custom_mask
             forward_batch.model_specific_states = {
                 "indexes": indexes,
                 "image_token_tag": image_token_tag,
@@ -912,6 +935,7 @@ class NEOChatModel(nn.Module):
             forward_batch.extend_prefix_lens_cpu,
             force_custom_mask=forward_batch.contains_mm_inputs(),
         )
+        forward_batch.cross_attention_custom_mask = custom_mask
         forward_batch.model_specific_states = {
             "indexes": indexes,
             "image_token_tag": image_token_tag,
@@ -944,6 +968,18 @@ class NEOChatModel(nn.Module):
         spec = flow_specs[0]
         image_gen_indicators = states["image_gen_indicators"]
         image_token_count = int(image_gen_indicators.sum().item())
+        metadata = get_attn_backend().forward_metadata
+        metadata_custom_mask = getattr(metadata, "custom_mask", None)
+        expected_custom_mask = states["custom_mask"]
+        if (
+            metadata_custom_mask is None
+            or expected_custom_mask is None
+            or metadata_custom_mask.numel() != expected_custom_mask.numel()
+        ):
+            raise RuntimeError(
+                "SenseNova U1 flow hybrid attention mask was not attached "
+                "to backend metadata"
+            )
 
         width, height = validate_u1_image_size(
             spec["width"],
@@ -1133,6 +1169,9 @@ class NEOChatModel(nn.Module):
             "sensenova_u1_flow_image_b64": [image_b64],
             "sensenova_u1_flow_noise_scale": [noise_scale],
             "sensenova_u1_flow_compute_seconds": [flow_compute_seconds],
+            "sensenova_u1_flow_custom_mask_numel": [
+                int(metadata_custom_mask.numel())
+            ],
             "sensenova_u1_flow_step_delta_l2": [step_delta_l2],
             "sensenova_u1_flow_total_delta_l2": [
                 float((image_prediction - initial_prediction).float().norm().item())
@@ -1155,6 +1194,12 @@ class NEOChatModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor | None = None,
     ):
+        if (
+            forward_batch.model_specific_states is None
+            and forward_batch.forward_mode.is_extend()
+            and self._flow_specs(forward_batch) is not None
+        ):
+            self.prepare_forward_batch(forward_batch)
         image_gen_indicators = None
         if forward_batch.model_specific_states is not None:
             self._install_hybrid_mask(forward_batch)

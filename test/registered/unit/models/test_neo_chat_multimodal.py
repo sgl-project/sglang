@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from PIL import Image
 from sglang.kernels.ops.attention.extend_attention import (
     _custom_mask_dense_attention_fwd,
     extend_attention_fwd,
@@ -33,6 +34,7 @@ from sglang.srt.models.neo_chat_vision import (
 from sglang.srt.multimodal.processors.neo_chat import (
     NEOChatMultimodalProcessor,
     build_u1_mrope_positions,
+    load_image_native,
 )
 
 
@@ -325,6 +327,20 @@ def test_neo_chat_flow_image_profile_uses_reference_pixel_bounds() -> None:
         65536,
         262144,
     )
+
+
+def test_neo_chat_flow_image_profile_matches_reference_grid() -> None:
+    image = Image.new("RGB", (512, 289))
+
+    _, grid_hw = load_image_native(
+        image,
+        patch_size=16,
+        downsample_ratio=0.5,
+        min_pixels=262144,
+        max_pixels=4194304,
+    )
+
+    assert grid_hw.tolist() == [[26, 44]]
 
 
 def test_short_custom_mask_dense_attention_matches_reference() -> None:

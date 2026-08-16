@@ -86,6 +86,50 @@ class CudaGraphsCapture(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
+def capture_prefill_graph_for_model(
+    *,
+    model_runner: ModelRunner,
+    eager_runner: EagerRunner,
+    force_for_draft_worker: bool = False,
+) -> GraphCapture:
+    """Capture prefill under an optional model-declared graph variant."""
+
+    text_model = getattr(
+        getattr(model_runner.model, "language_model", None),
+        "model",
+        None,
+    )
+    variant = getattr(
+        text_model,
+        "prefill_cuda_graph_capture_variant",
+        None,
+    )
+    capture_flag = getattr(
+        text_model,
+        "prefill_cuda_graph_capture_flag",
+        None,
+    )
+    force_variant = (
+        variant is not None
+        and capture_flag is not None
+        and hasattr(text_model, capture_flag)
+        and model_runner.server_args.cuda_graph_config.prefill.backend
+        != Backend.DISABLED
+    )
+    if force_variant:
+        model_runner.prefill_cuda_graph_variant = variant
+        setattr(text_model, capture_flag, True)
+    try:
+        return capture_prefill_graph(
+            model_runner=model_runner,
+            eager_runner=eager_runner,
+            force_for_draft_worker=force_for_draft_worker,
+        )
+    finally:
+        if force_variant:
+            setattr(text_model, capture_flag, False)
+
+
 def capture_cuda_graphs(
     *, model_runner: ModelRunner, capture_decode_cuda_graph: bool = True
 ) -> CudaGraphsCapture:
@@ -163,7 +207,7 @@ def capture_cuda_graphs(
     # cuda-graph capture: prefill before decode, so both coalesce onto the
     # eager buffer allocated above. (capture_prefill_graph routes prefill
     # to the eager runner when the prefill graph is disabled.)
-    prefill = capture_prefill_graph(
+    prefill = capture_prefill_graph_for_model(
         model_runner=model_runner, eager_runner=eager_runner
     )
 

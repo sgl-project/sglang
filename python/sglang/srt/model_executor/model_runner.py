@@ -116,7 +116,7 @@ from sglang.srt.model_executor.model_runner_components.attention_backend_setup i
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_cuda_graphs,
     capture_decode_graph,
-    capture_prefill_graph,
+    capture_prefill_graph_for_model,
 )
 from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
     compute_post_capture_kv_resize,
@@ -1379,7 +1379,7 @@ class ModelRunner:
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         self.prefill_cuda_graph_runner = None
-        capture = capture_prefill_graph(
+        capture = capture_prefill_graph_for_model(
             model_runner=self,
             eager_runner=self.eager_runner,
             force_for_draft_worker=force_for_draft_worker,
@@ -1696,6 +1696,29 @@ class ModelRunner:
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.
             self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
+
+            custom_params = (
+                None
+                if forward_batch.sampling_info is None
+                else forward_batch.sampling_info.custom_params
+            )
+            prefill_cuda_graph_variant = getattr(
+                self,
+                "prefill_cuda_graph_variant",
+                None,
+            )
+            if (
+                prefill_cuda_graph_variant is not None
+                and custom_params is not None
+                and all(
+                    isinstance(params, dict)
+                    and params.get("__sglang_prefill_cuda_graph_variant")
+                    == prefill_cuda_graph_variant
+                    for params in custom_params
+                )
+                and hasattr(self.model, "prepare_forward_batch")
+            ):
+                self.model.prepare_forward_batch(forward_batch)
 
             dwdp_mgr = get_global_dwdp_manager()
             if dwdp_mgr is not None:

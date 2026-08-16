@@ -1079,17 +1079,52 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        sampling_info = getattr(forward_batch, "sampling_info", None)
         custom_params = (
             None
-            if forward_batch.sampling_info is None
-            else forward_batch.sampling_info.custom_params
+            if sampling_info is None
+            else sampling_info.custom_params
         )
-        if custom_params is not None and any(
-            isinstance(params, dict)
-            and params.get("__sglang_disable_prefill_cuda_graph")
-            for params in custom_params
+        captured_variant = getattr(
+            getattr(self, "model_runner", None),
+            "prefill_cuda_graph_variant",
+            None,
+        )
+        if captured_variant is not None and (
+            custom_params is None
+            or any(
+                not isinstance(params, dict)
+                or params.get("__sglang_prefill_cuda_graph_variant")
+                != captured_variant
+                for params in custom_params
+            )
         ):
             return False
+        if captured_variant == "sensenova_u1_flow":
+            if forward_batch.batch_size != 1 or len(custom_params) != 1:
+                return False
+            params = custom_params[0]
+            flow_spec = params.get("sensenova_u1_flow")
+            if not isinstance(flow_spec, dict):
+                return False
+            image_tokens = flow_spec.get("image_tokens")
+            image_start = flow_spec.get("image_start")
+            if (
+                not isinstance(image_tokens, int)
+                or isinstance(image_tokens, bool)
+                or image_tokens <= 0
+                or not isinstance(image_start, int)
+                or isinstance(image_start, bool)
+                or image_start < 0
+            ):
+                return False
+            if (
+                forward_batch.extend_seq_lens_cpu != [image_tokens]
+                or forward_batch.extend_prefix_lens_cpu != [image_start]
+                or len(forward_batch.input_ids) != image_tokens
+                or image_tokens not in self.capture_num_tokens
+            ):
+                return False
 
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
@@ -1647,6 +1682,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # logits_processor eagerly.
         full_path = self._is_full_backend
         ie_idx = self._input_embeds_arg_idx
+        flow_graph_replay = (
+            getattr(self.model_runner, "prefill_cuda_graph_variant", None)
+            == "sensenova_u1_flow"
+        )
 
         def replay_layer_forward(*args, **layer_kwargs):
             # The captured body graph reads activations from the static
@@ -1673,7 +1712,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # For Full, run the eager tail against the raw user-facing batch so it
         # uses real request metadata instead of padded slots. BCG has no
         # request-slot padding, so static_forward_batch is already the serving batch.
-        tail_batch = forward_batch if full_path else static_forward_batch
+        tail_batch = (
+            forward_batch
+            if full_path or flow_graph_replay
+            else static_forward_batch
+        )
         try:
             with self._prefill_forward_context(
                 static_forward_batch,
@@ -1734,6 +1777,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             input_top_logprobs_idx=output.input_top_logprobs_idx,
             input_token_ids_logprobs_val=output.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=output.input_token_ids_logprobs_idx,
+            customized_info=output.customized_info,
             mm_input_embeds=mm_input_embeds,
         )
 
