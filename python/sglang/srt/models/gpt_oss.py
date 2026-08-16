@@ -418,12 +418,10 @@ class GptOssAttention(nn.Module):
             prefix=add_prefix("qkv_proj", prefix),
         )
 
-        # Choose dtype of sinks based on attention backend: trtllm_mha requires float32,
-        # others can use bfloat16
-        attn_backend = get_exec().kernel.attention_backend
-        sinks_dtype = torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
+        # The checkpoint sinks dtype is bfloat16 (FA4 asserts it); trtllm_mha
+        # upcasts at its call site.
         self.sinks = nn.Parameter(
-            torch.empty(self.num_heads, dtype=sinks_dtype), requires_grad=False
+            torch.empty(self.num_heads, dtype=torch.bfloat16), requires_grad=False
         )
 
         self.o_proj = RowParallelLinear(
