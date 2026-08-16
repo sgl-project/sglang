@@ -7,16 +7,12 @@ from collections import defaultdict
 
 import torch
 
-from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+from sglang.srt.mem_cache.storage.mmap import alloc_mmap, free_hugepage_bytes
 
 logger = logging.getLogger(__name__)
 
 
 class HostTensorAllocator:
-    # alloc_mmap honors SGLANG_HUGEPAGE_SIZE and maps MAP_HUGETLB when set, so
-    # the hugetlb pool is spendable capacity for this allocator.
-    uses_hugetlb = True
-
     def __init__(self):
         """Initialize the HostTensorAllocator."""
         self.dtype = None
@@ -30,16 +26,29 @@ class HostTensorAllocator:
         self.dims = dims
         return alloc_mmap(dims, dtype)
 
+    def free_hugetlb_bytes(self) -> int:
+        """Free hugetlb-pool bytes this allocator could actually spend.
+
+        Reserved hugepages are excluded from MemAvailable, so a caller sizing an
+        allocation against available host memory has to add them back. Overriding
+        allocate() means overriding this too: the answer depends on where the
+        memory really comes from, and inheriting it would credit capacity to
+        backends that never map MAP_HUGETLB. alloc_mmap honors
+        SGLANG_HUGEPAGE_SIZE, so the pool is spendable here.
+        """
+        return free_hugepage_bytes()
+
 
 class ShmHostTensorAllocator(HostTensorAllocator):
-    # alloc_shm maps a memfd/dev-shm object, which cannot come from hugetlb
-    # unless hugetlbfs is mounted there; it warns and uses plain pages instead.
-    uses_hugetlb = False
-
     def __init__(self):
         super().__init__()
         self.fds = []
         self.mms = []
+
+    def free_hugetlb_bytes(self) -> int:
+        # alloc_shm maps a memfd/dev-shm object, which cannot come from hugetlb
+        # unless hugetlbfs is mounted there; it warns and uses plain pages.
+        return 0
 
     @property
     def fd(self):

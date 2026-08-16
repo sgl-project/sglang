@@ -40,6 +40,11 @@ class MooncakeHostTensorAllocator(HostTensorAllocator):
         self.allocator = MooncakeHostMemAllocator()
         self.ptr = None
 
+    def free_hugetlb_bytes(self) -> int:
+        # MooncakeHostMemAllocator does its own host allocation and never maps
+        # MAP_HUGETLB from the kernel pool.
+        return 0
+
     def allocate(
         self, dims: tuple, dtype: torch.dtype, device: str = "cpu"
     ) -> torch.Tensor:

@@ -14,7 +14,6 @@ from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
 )
-from sglang.srt.mem_cache.storage.mmap import free_hugepage_bytes
 from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
@@ -147,11 +146,7 @@ class HostKVCache(abc.ABC):
         # the pool will be mapped from hugetlb the two budgets are alternatives
         # rather than additive: the allocation is a single mmap that either
         # fits in the hugetlb pool or falls back to plain pages.
-        hugetlb_bytes = (
-            free_hugepage_bytes()
-            if getattr(self.allocator, "uses_hugetlb", False)
-            else 0
-        )
+        hugetlb_bytes = self.allocator.free_hugetlb_bytes()
         if requested_bytes > max(available_bytes, hugetlb_bytes):
             hugetlb_note = (
                 f" ({hugetlb_bytes / 1e9:.2f} GB free in the hugetlb pool)"

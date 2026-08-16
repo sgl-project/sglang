@@ -6,6 +6,7 @@ import mmap
 import os
 import uuid
 import weakref
+from typing import Optional
 
 import torch
 
@@ -67,27 +68,42 @@ def _requested_hugepage_spec():
     return spec
 
 
-def free_hugepage_bytes() -> int:
-    """Bytes currently free in the hugetlb pool alloc_mmap() would draw from.
+def _read_pool_counter(pool_dir: str, name: str) -> int:
+    with open(f"{pool_dir}/{name}") as f:
+        return int(f.read().strip())
+
+
+def free_hugepage_bytes(page_size: Optional[int] = None) -> int:
+    """Bytes currently free in a hugetlb pool.
 
     Reserved hugepages are deliberately excluded from MemAvailable, so callers
     sizing an allocation against available host memory undercount by the size
-    of the pool. Returns 0 whenever hugepages would not be used at all -- not
-    requested, an unknown size, or no hugetlb pool on this platform -- so the
-    result is always safe to treat as "no extra capacity".
+    of the pool. ``page_size`` selects which per-size pool to read, for callers
+    that map hugepages themselves; the default reads the pool alloc_mmap()
+    would draw from for the current SGLANG_HUGEPAGE_SIZE. Returns 0 whenever
+    hugepages would not be used at all -- not requested, an unknown size, or no
+    hugetlb pool on this platform -- so the result is always safe to treat as
+    "no extra capacity".
     """
-    spec = _requested_hugepage_spec()
-    if spec is None:
-        return 0
-    page_size = spec[0]
+    if page_size is None:
+        spec = _requested_hugepage_spec()
+        if spec is None:
+            return 0
+        page_size = spec[0]
+    pool_dir = f"{_HUGEPAGE_SYSFS_DIR}/hugepages-{page_size // 1024}kB"
     try:
-        with open(
-            f"{_HUGEPAGE_SYSFS_DIR}/hugepages-{page_size // 1024}kB/free_hugepages"
-        ) as f:
-            return int(f.read().strip()) * page_size
+        free_pages = _read_pool_counter(pool_dir, "free_hugepages")
     except (OSError, ValueError):
         # No hugetlb support, pool not configured, or unreadable counter.
         return 0
+    try:
+        # free_hugepages still counts pages the kernel has promised to an
+        # existing mapping but not yet faulted, so take reservations back off
+        # the top rather than handing them out twice.
+        reserved = _read_pool_counter(pool_dir, "resv_hugepages")
+    except (OSError, ValueError):
+        reserved = 0
+    return max(free_pages - reserved, 0) * page_size
 
 
 def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.Array:
