@@ -25,6 +25,10 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedMambaTokenToKVPoolAllocator,
+    UnifiedSWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -181,13 +185,35 @@ class TritonAttnBackend(AttentionBackend):
         # byte-identical to the slot-based envelope.
         self.page_size = getattr(model_runner, "page_size", 1) or 1
         # Unified pool v2p hook (None = no-op): req_to_token holds VIRTUAL ids but
-        # kernels need the kernel-facing id space — PHYSICAL for MHA, DENSE for the
-        # dense-view MLA pool (translate_kv_loc_dense falls back to the physical
-        # translate when kernel_page_multiplier == 1, so preferring it is exact for
-        # both). Applied eagerly so the captured graph has no translate.
-        self._translate_kv_loc = getattr(
-            self.token_to_kv_pool_allocator, "translate_kv_loc_dense", None
-        ) or getattr(self.token_to_kv_pool_allocator, "translate_kv_loc", None)
+        # kernels need the kernel-facing id space. `translate_kv_loc_dense` is
+        # exact for both layouts — it collapses onto the plain physical
+        # translate at kernel_page_multiplier 1 (strided views) — so it is the
+        # only handle needed. Applied eagerly so the captured graph carries no
+        # translate.
+        #
+        # Two conditions, and BOTH are required. The allocator must be one of
+        # the unified composites (they are the only allocators that mint
+        # virtual ids; everything else already hands out kernel-facing ones)...
+        #
+        # ...and this runner's pool must be the one those ids address. A
+        # speculative DRAFT runner is handed the TARGET's allocator — it shares
+        # the virtual id space and req_to_token — while owning a SEPARATE KV
+        # pool, direct-indexed by those virtual ids and sized to that virtual
+        # space. Translating there maps the draft's indices into the TARGET's
+        # kernel-facing space and then applies them to a pool that expects the
+        # raw virtual id: out of bounds on both rails. Probing the allocator
+        # alone is what makes DSPARK + --enable-unified-memory fault.
+        _alloc = self.token_to_kv_pool_allocator
+        if (
+            isinstance(
+                _alloc,
+                (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWATokenToKVPoolAllocator),
+            )
+            and _alloc.get_kvcache() is self.token_to_kv_pool
+        ):
+            self._translate_kv_loc = _alloc.translate_kv_loc_dense
+        else:
+            self._translate_kv_loc = None
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = get_spec().speculative_eagle_topk or 0
