@@ -58,7 +58,7 @@ class Qwen3MLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported."
             )
-        self.act_fn = SiluAndMul()
+        self.act_fn = SiluAndMul(deterministic=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x, _ = self.gate_up_proj(x)

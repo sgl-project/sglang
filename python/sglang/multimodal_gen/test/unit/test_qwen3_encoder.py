@@ -2,7 +2,9 @@ from types import SimpleNamespace
 
 import torch
 
+import sglang.multimodal_gen.runtime.models.encoders.qwen3 as qwen3
 from sglang.multimodal_gen.runtime.models.encoders.qwen3 import Qwen3ForCausalLM
+from sglang.srt.layers.activation import SiluAndMul
 
 
 class _CaptureLayer(torch.nn.Module):
@@ -24,6 +26,18 @@ class _IdentityNorm(torch.nn.Module):
         if residual is not None:
             hidden_states = hidden_states + residual
         return hidden_states, None
+
+
+def test_mlp_reuses_srt_activation_without_server_context(monkeypatch):
+    def make_linear(*_args, **_kwargs):
+        return torch.nn.Identity()
+
+    monkeypatch.setattr(qwen3, "MergedColumnParallelLinear", make_linear)
+    monkeypatch.setattr(qwen3, "RowParallelLinear", make_linear)
+
+    mlp = qwen3.Qwen3MLP(16, 24, "silu")
+
+    assert isinstance(mlp.act_fn, SiluAndMul)
 
 
 def test_default_position_ids_batch_shape():
