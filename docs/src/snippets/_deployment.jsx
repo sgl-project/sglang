@@ -2055,7 +2055,11 @@ export const Deployment = ({ config, benchmarks }) => {
             <div className="sgd-builder-output-index">{serve ? "1" : "2"}</div>
             <div className="sgd-builder-output-title">
               <strong>{serve ? "Serve" : "Request"}</strong>
-              <span>{serve ? (activeRunMode === "docker" ? "Docker" : "Python") : "cURL"}</span>
+              <span>
+                {serve
+                  ? `${sel.hw.toUpperCase()} · ${activeRunMode === "docker" ? "Docker" : "Python"}`
+                  : "cURL"}
+              </span>
             </div>
             {renderStatus(status)}
           </header>

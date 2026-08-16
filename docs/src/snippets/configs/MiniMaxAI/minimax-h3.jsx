@@ -177,11 +177,11 @@ export const config = {
       options: [
         {
           id: "platform",
-          label: "Platform default",
+          label: "Automatic",
           flags: (s) => ["mi300x", "mi355x"].includes(s.hw) ? ["--attention-backend aiter"] : [],
           env: (s) => ["mi300x", "mi355x"].includes(s.hw) ? ["SGLANG_USE_AITER=1"] : [],
           recommended: true,
-          description: "Uses the verified CUDA default, or AITER packed attention on AMD.",
+          description: "Applies the verified backend policy for the selected hardware.",
         },
         {
           id: "fa",
@@ -504,6 +504,15 @@ export const config = {
         warnings.push("The 2× RTX 5090 path requires a 384 GiB-class host and prioritizes capacity over latency.");
       }
 
+      let automaticAttention = "FlashAttention (auto)";
+      if (["mi300x", "mi355x"].includes(s.hw)) {
+        automaticAttention = "AITER (auto)";
+      } else if (topology.ring_degree === 1 && ["b200", "b300"].includes(s.hw)) {
+        automaticAttention = "Dynamic cuDNN / FA (auto)";
+      } else if (topology.ring_degree === 1 && s.hw === "rtx5090") {
+        automaticAttention = "Torch SDPA (auto)";
+      }
+
       return {
         match: { hw: s.hw },
         nnodes: Number(s.nodes),
@@ -521,9 +530,7 @@ export const config = {
           },
           resolvedSettings: {
             placement: { resident: "Resident", fsdp: "FSDP", offload: "Layerwise offload" }[resolvedPlacement],
-            attention: s.attention === "platform"
-              ? (["mi300x", "mi355x"].includes(s.hw) ? "AITER (platform default)" : "Platform default")
-              : undefined,
+            attention: s.attention === "platform" ? automaticAttention : undefined,
             encoder: s.encoder === "auto" ? (s.nodes > 1 ? "Replicate (auto)" : "Auto") : undefined,
           },
         },
