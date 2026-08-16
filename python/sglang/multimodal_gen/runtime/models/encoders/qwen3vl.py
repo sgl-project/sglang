@@ -1262,6 +1262,8 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+            if "visual." in name:
+                name = name.replace(".attn.qkv.", ".attn.qkv_proj.")
 
             try:
                 param = params_dict[name]

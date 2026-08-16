@@ -16,6 +16,11 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     _vision_cu_seqlens,
     _vision_position_ids,
 )
+from sglang.srt.models.qwen3_vl import (
+    Qwen3VLMoeVisionPatchMerger,
+    Qwen3VLVisionPatchEmbed,
+)
+from sglang.srt.runtime_context import get_parallel
 
 
 def test_native_vision_layout_matches_qwen3_merge_order():
@@ -53,7 +58,11 @@ def test_native_vision_keeps_checkpoint_parameter_names():
         out_hidden_size=12,
         deepstack_visual_indexes=[],
     )
-    model = Qwen3VLVisionTransformer(config)
+    with get_parallel().override(tp_size=1, tp_rank=0):
+        model = Qwen3VLVisionTransformer(config)
+
+    assert isinstance(model.patch_embed, Qwen3VLVisionPatchEmbed)
+    assert isinstance(model.merger, Qwen3VLMoeVisionPatchMerger)
 
     assert set(model.state_dict()) == {
         "patch_embed.proj.weight",

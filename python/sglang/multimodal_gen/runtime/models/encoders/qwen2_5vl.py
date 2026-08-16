@@ -1426,6 +1426,24 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
                 if not self.enable_image_understanding:
                     continue
                 name = name.replace("visual.", "model.visual.")
+                name = name.replace(".attn.qkv.", ".attn.qkv_proj.")
+
+                loaded_stacked_param = False
+                for weight_name, shard_id in (
+                    (".gate_proj.", 0),
+                    (".up_proj.", 1),
+                ):
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, ".gate_up_proj.")
+                    param = params_dict[name]
+                    loaded_weight = loaded_weight.to(param.dtype)
+                    param.weight_loader(param, loaded_weight, shard_id)
+                    loaded_params.add(name)
+                    loaded_stacked_param = True
+                    break
+                if loaded_stacked_param:
+                    continue
             try:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:

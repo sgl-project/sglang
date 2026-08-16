@@ -128,9 +128,16 @@ logger = logging.getLogger(__name__)
 
 
 class SiluAndMul(BaseFusedOp):
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        deterministic: Optional[bool] = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
-        if get_exec().deterministic.rl_on_policy_target is not None:
+        if deterministic is None:
+            deterministic = get_exec().deterministic.rl_on_policy_target is not None
+        if deterministic:
             self._forward_method = self.forward_native
         elif _use_aiter and envs.SGLANG_OPT_USE_AITER_SILU_MUL.get():
             self._forward_method = self.forward_aiter
