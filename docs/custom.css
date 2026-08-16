@@ -537,7 +537,23 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-context-note a { display: inline-block; margin-top: 6px; color: var(--sgdb-serve); font-size: 11px; font-weight: 500; text-decoration: none; }
 .sgd-builder-scope-panel[data-scope="request"] .sgd-builder-context-note a { color: var(--sgdb-request); }
 .sgd-builder-request-stepper { display: grid; grid-template-columns: 40px 52px 40px auto; gap: 6px; align-items: center; margin-top: 14px; }
-.sgd-builder-request-stepper output { font-size: 18px; font-weight: 590; text-align: center; }
+.sgd-builder-request-stepper input {
+  width: 52px;
+  min-width: 0;
+  height: 34px;
+  padding: 0 4px;
+  border: 1px solid var(--sgdb-line);
+  border-radius: 6px;
+  appearance: textfield;
+  background: var(--sgdb-surface);
+  color: var(--sgdb-ink);
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 590;
+  text-align: center;
+}
+.sgd-builder-request-stepper input::-webkit-inner-spin-button,
+.sgd-builder-request-stepper input::-webkit-outer-spin-button { margin: 0; appearance: none; }
 .sgd-builder-request-stepper > span { margin-left: 4px; color: var(--sgdb-muted); font-size: 11px; }
 .sgd-builder-request-setting { border-bottom: 1px solid var(--sgdb-line); }
 .sgd-builder-request-setting:last-child { border-bottom: 0; }

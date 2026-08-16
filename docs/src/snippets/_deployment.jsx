@@ -1455,28 +1455,40 @@ export const Deployment = ({ config, benchmarks }) => {
     return out;
   };
 
+  const recommendedBuilderRecipe = (hw) => {
+    const recipes = commandBuilder.resource?.verifiedRecipes || [];
+    return recipes.find((entry) => entry.hw === hw && entry.default)
+      || recipes.find((entry) => entry.hw === hw);
+  };
+
   const handleSelect = (dim, value) => {
     if (commandBuilder) {
       setSel((prev) => {
         let next = { ...prev, [dim]: value };
         if (dim === "hw") {
-          const recipes = commandBuilder.resource?.verifiedRecipes || [];
-          const recipe = recipes.find((entry) => entry.hw === value && entry.default)
-            || recipes.find((entry) => entry.hw === value);
-          const recommended = recipe?.selection || recipe || {};
+          const currentRecipe = recommendedBuilderRecipe(prev.hw);
+          const nextRecipe = recommendedBuilderRecipe(value);
+          const resourcesFollowPlatformDefault = !!currentRecipe
+            && Number(prev.nodes) === Number(currentRecipe.nodes)
+            && Number(prev.gpus_per_node) === Number(currentRecipe.gpus_per_node);
           next = {
             ...next,
-            nodes: recommended.nodes ?? next.nodes,
-            gpus_per_node: recommended.gpus_per_node ?? next.gpus_per_node,
+            nodes: resourcesFollowPlatformDefault
+              ? (nextRecipe?.nodes ?? next.nodes)
+              : next.nodes,
+            gpus_per_node: resourcesFollowPlatformDefault
+              ? (nextRecipe?.gpus_per_node ?? next.gpus_per_node)
+              : next.gpus_per_node,
             topology_mode: "auto",
-            tp_size: recommended.tp_size ?? 1,
-            ulysses_degree: recommended.ulysses_degree ?? 1,
-            ring_degree: recommended.ring_degree ?? 1,
-            placement: recommended.placement ?? "auto",
-            attention: "platform",
-            precision: "native",
-            encoder: recommended.encoder ?? "auto",
-            execution: "eager",
+            tp_size: resourcesFollowPlatformDefault
+              ? (nextRecipe?.tp_size ?? 1)
+              : next.tp_size,
+            ulysses_degree: resourcesFollowPlatformDefault
+              ? (nextRecipe?.ulysses_degree ?? 1)
+              : next.ulysses_degree,
+            ring_degree: resourcesFollowPlatformDefault
+              ? (nextRecipe?.ring_degree ?? 1)
+              : next.ring_degree,
           };
         }
         return reseatHiddenPicks(normalizeBuilderSelection(next));
@@ -1491,6 +1503,40 @@ export const Deployment = ({ config, benchmarks }) => {
       ),
     );
   };
+
+  const commitBuilderNumber = (event, currentValue, bounds, commit) => {
+    const parsed = Number(event.currentTarget.value);
+    if (!Number.isInteger(parsed)) {
+      event.currentTarget.value = String(currentValue);
+      return;
+    }
+    const value = Math.min(bounds.max, Math.max(bounds.min, parsed));
+    event.currentTarget.value = String(value);
+    commit(value);
+  };
+
+  const renderBuilderNumberInput = ({ identity, value, min, max, label, onCommit }) => (
+    <input
+      key={identity}
+      type="number"
+      inputMode="numeric"
+      min={min}
+      max={max}
+      step="1"
+      defaultValue={value}
+      aria-label={label}
+      onFocus={(event) => event.currentTarget.select()}
+      onBlur={(event) => commitBuilderNumber(
+        event,
+        value,
+        { min, max },
+        onCommit,
+      )}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") event.currentTarget.blur();
+      }}
+    />
+  );
 
   const updateBuilderResource = (key, delta) => {
     if (!commandBuilder) return;
@@ -1647,9 +1693,7 @@ export const Deployment = ({ config, benchmarks }) => {
       || selectedOption(dim)?.label
       || sel[dim.id]
       || "—";
-    const verifiedRecipes = commandBuilder.resource?.verifiedRecipes || [];
-    const recommendedRecipe = verifiedRecipes.find((recipe) => recipe.hw === sel.hw && recipe.default)
-      || verifiedRecipes.find((recipe) => recipe.hw === sel.hw);
+    const recommendedRecipe = recommendedBuilderRecipe(sel.hw);
     const recommendedInUse = !!recommendedRecipe
       && Number(sel.nodes) === recommendedRecipe.nodes
       && Number(sel.gpus_per_node) === recommendedRecipe.gpus_per_node
@@ -1743,17 +1787,14 @@ export const Deployment = ({ config, benchmarks }) => {
               disabled={Number(sel[key]) <= bounds.min}
               onClick={() => updateBuilderResource(key, -1)}
             >−</button>
-            <input
-              type="number"
-              inputMode="numeric"
-              min={bounds.min}
-              max={bounds.max}
-              step="1"
-              value={sel[key]}
-              aria-label={label}
-              onFocus={(event) => event.currentTarget.select()}
-              onChange={(event) => setBuilderResource(key, event.target.value)}
-            />
+            {renderBuilderNumberInput({
+              identity: `${key}-${sel[key]}`,
+              value: sel[key],
+              min: bounds.min,
+              max: bounds.max,
+              label,
+              onCommit: (value) => setBuilderResource(key, value),
+            })}
             <button
               type="button"
               aria-label={`Increase ${label}`}
@@ -1898,14 +1939,27 @@ export const Deployment = ({ config, benchmarks }) => {
                 type="button"
                 aria-label={`Decrease ${dim.title}`}
                 disabled={Number(sel[dim.id]) <= dim.min}
-                onClick={() => setSel((prev) => ({ ...prev, [dim.id]: Math.max(dim.min, Number(prev[dim.id]) - 1) }))}
+                onClick={() => setSel((prev) => ({
+                  ...prev,
+                  [dim.id]: Math.max(dim.min, Number(prev[dim.id]) - 1),
+                }))}
               >−</button>
-              <output aria-live="polite">{sel[dim.id]}</output>
+              {renderBuilderNumberInput({
+                identity: `${dim.id}-${sel[dim.id]}`,
+                value: sel[dim.id],
+                min: dim.min,
+                max: dim.max,
+                label: dim.title,
+                onCommit: (value) => setSel((prev) => ({ ...prev, [dim.id]: value })),
+              })}
               <button
                 type="button"
                 aria-label={`Increase ${dim.title}`}
                 disabled={Number(sel[dim.id]) >= dim.max}
-                onClick={() => setSel((prev) => ({ ...prev, [dim.id]: Math.min(dim.max, Number(prev[dim.id]) + 1) }))}
+                onClick={() => setSel((prev) => ({
+                  ...prev,
+                  [dim.id]: Math.min(dim.max, Number(prev[dim.id]) + 1),
+                }))}
               >+</button>
               <span>{dim.unit || "outputs"}</span>
             </div>
@@ -2027,13 +2081,14 @@ export const Deployment = ({ config, benchmarks }) => {
               </label>
               <label>
                 <span>Node rank</span>
-                <input
-                  type="number"
-                  min="0"
-                  max={Number(sel.nodes) - 1}
-                  value={builderNodeRank}
-                  onChange={(event) => setBuilderNodeRank(Math.min(Number(sel.nodes) - 1, Math.max(0, Number(event.target.value) || 0)))}
-                />
+                {renderBuilderNumberInput({
+                  identity: `node-rank-${builderNodeRank}-${sel.nodes}`,
+                  value: builderNodeRank,
+                  min: 0,
+                  max: Number(sel.nodes) - 1,
+                  label: "Node rank",
+                  onCommit: setBuilderNodeRank,
+                })}
               </label>
             </div>
           )}
