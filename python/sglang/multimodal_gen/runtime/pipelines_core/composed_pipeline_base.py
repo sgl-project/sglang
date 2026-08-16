@@ -558,10 +558,11 @@ class ComposedPipelineBase(ABC):
                     attn_backend.name.lower(),
                     matched_backend_key,
                 )
-            with startup_phase(f"load_component.{module_name}"), (
+            with (
+                startup_phase(f"load_component.{module_name}"),
                 component_attn_backend_context_manager(
                     attn_backend, component_name=matched_backend_key or module_name
-                )
+                ),
             ):
                 module, memory_usage = PipelineComponentLoader.load_component(
                     component_name=load_module_name,

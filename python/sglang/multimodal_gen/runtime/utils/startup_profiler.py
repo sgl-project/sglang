@@ -11,7 +11,10 @@ from contextlib import contextmanager
 from typing import Iterator
 
 import sglang.multimodal_gen.envs as envs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    get_is_main_process,
+    init_logger,
+)
 
 logger = init_logger(__name__)
 
@@ -84,8 +87,10 @@ def startup_phase(name: str):
 
 
 def log_startup_summary() -> None:
+    """Log the breakdown once. Every rank runs the same startup path, so only
+    rank 0 reports -- otherwise an 8-GPU launch prints eight identical trees."""
     profiler = get_startup_profiler()
-    if not profiler.enabled:
+    if not profiler.enabled or not get_is_main_process():
         return
     summary = profiler.render()
     if summary:
