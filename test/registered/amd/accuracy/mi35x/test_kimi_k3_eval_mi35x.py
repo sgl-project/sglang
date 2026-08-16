@@ -12,7 +12,7 @@ cell for this topology is still published as `verified: false`. So the recipe
 is known to run at speed; what is missing, and what this test supplies, is
 evidence that it produces correct tokens.
 
-First green run on 8xMI355X scored 0.956 with 0.2% unparseable, against the
+First green run on 8xMI355X scored 0.956 with 0.2% unparsable, against the
 0.92 threshold, in about 74 minutes end to end.
 
 K3's native MXFP4 weights need gfx95x, so this runs on MI35x only -- mxfp4
