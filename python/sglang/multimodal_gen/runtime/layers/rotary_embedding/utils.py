@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.diffusion.triton.rotary import apply_rotary_embedding
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
