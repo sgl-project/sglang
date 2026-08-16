@@ -349,7 +349,7 @@ def get_token_ids_logprobs_chunk(
     return next_split_pruned_len
 
 
-def compute_spec_v2_logprobs(
+def compute_spec_logprobs(
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
     predict: torch.Tensor,
