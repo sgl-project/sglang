@@ -8,7 +8,7 @@ Two groups:
     cache skip them (stage-a sets HF_HUB_OFFLINE=1, so they stay skipped there).
   * Synthetic eligibility (no model, MLX only): the learned-bias fallback. The
     fused kernel recomputes the gate matmul and has no slot for the per-expert
-    learned bias QuantizedSwitchLinear adds after the matmul, so ``can_fuse``
+    learned bias QuantizedSwitchLinear adds after the matmul, so ``can_patch``
     must exclude a gate carrying one, and the patch must leave such a layer
     unfused. These run wherever MLX is available (Apple Silicon).
 
@@ -67,13 +67,13 @@ def test_fused_gate_qmv_silu_mul_matches_unfused():
     from mlx_lm import load
 
     from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import (
-        can_fuse,
+        can_patch,
         fused_gate_qmv_silu_mul,
     )
 
     model, _ = load(os.environ["SGLANG_MLX_TEST_MODEL"])
     sw = model.model.layers[0].mlp.switch_mlp
-    assert can_fuse(sw), "layer 0 not eligible for fused swiglu"
+    assert can_patch(sw), "layer 0 not eligible for fused swiglu"
 
     up = sw.up_proj
     gate = sw.gate_proj
@@ -166,15 +166,15 @@ def _quantized_switch_glu(in_dim, hidden, n_experts, gate_bias):
 
 
 def test_can_fuse_excludes_learned_gate_bias():
-    """can_fuse: False for a gate with a learned bias, True when bias-free."""
-    from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import can_fuse
+    """can_patch: False for a gate with a learned bias, True when bias-free."""
+    from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import can_patch
 
     sw_free = _quantized_switch_glu(512, 64, 8, gate_bias=False)
     sw_bias = _quantized_switch_glu(512, 64, 8, gate_bias=True)
     assert "bias" not in sw_free.gate_proj
     assert "bias" in sw_bias.gate_proj
-    assert can_fuse(sw_free) is True, "bias-free gate in regime should fuse"
-    assert can_fuse(sw_bias) is False, "gate with learned bias must fall back"
+    assert can_patch(sw_free) is True, "bias-free gate in regime should fuse"
+    assert can_patch(sw_bias) is False, "gate with learned bias must fall back"
 
 
 def test_patch_falls_back_on_gate_bias():
@@ -260,15 +260,15 @@ def test_fused_matches_unfused_synthetic():
 
 
 def test_can_fuse_declines_nonstock_call():
-    """can_fuse: False when SwitchGLU.__call__ is overridden (the fused subclass
+    """can_patch: False when SwitchGLU.__call__ is overridden (the fused subclass
     would impose stock semantics and silently bypass the override), True for stock."""
     from mlx_lm.models.switch_layers import SwitchGLU
 
-    from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import can_fuse
+    from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import can_patch
 
     # hidden=64 keeps down_proj's input dim divisible by the quant group size.
     sw_stock = _quantized_switch_glu(512, 64, 4, gate_bias=False)
-    assert can_fuse(sw_stock) is True, "stock in-regime SwitchGLU should fuse"
+    assert can_patch(sw_stock) is True, "stock in-regime SwitchGLU should fuse"
 
     class _CustomSwitchGLU(SwitchGLU):
         def __call__(self, x, indices):  # overridden forward
@@ -276,11 +276,11 @@ def test_can_fuse_declines_nonstock_call():
 
     sw_custom = _quantized_switch_glu(512, 64, 4, gate_bias=False)
     sw_custom.__class__ = _CustomSwitchGLU  # same swap mechanism the patch uses
-    assert can_fuse(sw_custom) is False, "non-stock __call__ must fall back"
+    assert can_patch(sw_custom) is False, "non-stock __call__ must fall back"
 
 
 def test_can_fuse_declines_non_silu_activation():
-    """can_fuse: False for a non SiLU activation (the kernel and the fallback
+    """can_patch: False for a non SiLU activation (the kernel and the fallback
     both bake in silu, which would silently replace the module's formula),
     True for the stock SwiGLU control."""
     import types
@@ -289,7 +289,7 @@ def test_can_fuse_declines_non_silu_activation():
     from mlx_lm.models.switch_layers import SwitchGLU
 
     from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import (
-        can_fuse,
+        can_patch,
         patch_switch_glu_with_fused_swiglu,
     )
 
@@ -299,7 +299,7 @@ def test_can_fuse_declines_non_silu_activation():
     for name in ("up_proj", "gate_proj", "down_proj"):
         proj = getattr(sw, name)
         setattr(sw, name, proj.to_quantized(group_size=64, bits=4, mode="affine"))
-    assert can_fuse(sw) is False, "non SiLU activation must fall back"
+    assert can_patch(sw) is False, "non SiLU activation must fall back"
 
     mlp = types.SimpleNamespace(switch_mlp=sw, top_k=4)
     layer = types.SimpleNamespace(mlp=mlp)
@@ -307,7 +307,7 @@ def test_can_fuse_declines_non_silu_activation():
     assert patch_switch_glu_with_fused_swiglu(model) == 0, "gelu module must not patch"
 
     sw_stock = _quantized_switch_glu(512, 64, 4, gate_bias=False)
-    assert can_fuse(sw_stock) is True, "stock SwiGLU activation should fuse"
+    assert can_patch(sw_stock) is True, "stock SwiGLU activation should fuse"
 
 
 def test_fused_forward_falls_back_on_dtype_mismatch():
@@ -569,7 +569,7 @@ def test_matched_fp32_triple_falls_back_with_membership_message(monkeypatch, cap
 
 
 def test_patch_skips_warm_and_logs_for_out_of_regime_dtype(monkeypatch, caplog):
-    """A matched fp32 SwitchGLU is eligible per can_fuse (which does not check
+    """A matched fp32 SwitchGLU is eligible per can_patch (which does not check
     dtype membership) and must still patch successfully; _aot_warm_kernel has
     to catch the membership NotFusable at warm time, skip warming, and log
     it, rather than letting the patch crash."""
@@ -580,7 +580,7 @@ def test_patch_skips_warm_and_logs_for_out_of_regime_dtype(monkeypatch, caplog):
 
     mx.random.seed(0)
     # in_dim=512 -> K=512 (%512==0), hidden=64 -> N=64 (%8==0): in regime for
-    # can_fuse, which does not check dtype membership against _DTYPES.
+    # can_patch, which does not check dtype membership against _DTYPES.
     in_dim, hidden, n_experts, top_k = 512, 64, 4, 4
     sw = _quantized_switch_glu(in_dim, hidden, n_experts, gate_bias=False)
     assert sw.gate_proj.scales.dtype == mx.float32

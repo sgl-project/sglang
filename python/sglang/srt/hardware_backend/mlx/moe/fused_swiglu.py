@@ -430,7 +430,7 @@ def _aot_warm_kernel(switch_mlp, top_k: int) -> None:
                 "affine_gather_qmv_silu_mul_4bit_gs64", (dtype, K, N, T), _dispatch
             )
         except NotFusable as e:
-            # can_fuse already validated K/N before the patch loop reaches
+            # can_patch already validated K/N before the patch loop reaches
             # here, so this is the dtype membership check: skip the warm for
             # out-of-regime dtypes and let the runtime path fall back.
             logger.debug(
@@ -453,7 +453,7 @@ def _aot_warm_kernel(switch_mlp, top_k: int) -> None:
             )
 
 
-def can_fuse(switch_mlp) -> bool:
+def can_patch(switch_mlp) -> bool:
     """Cheap structural check: does this SwitchGLU match the Path B v1 regime?"""
     try:
         from mlx_lm.models.switch_layers import (
@@ -527,7 +527,7 @@ _fallback_warned = False
 def _fused_gate_or_fallback(gate_proj, x, idx, x_up, sorted_indices=False):
     """silu(gate_qmv(x)) * x_up via the fused kernel; on NotFusable fall back to
     the unfused gate projection. gather_qmm tolerates the activation dtype the
-    fused kernel rejects, which can_fuse cannot pre-check at patch time. Warns
+    fused kernel rejects, which can_patch cannot pre-check at patch time. Warns
     once.
     """
     # Kernel layout only: the Metal kernel reads T from indices.shape[-1], and
@@ -618,7 +618,7 @@ def patch_switch_glu_with_fused_swiglu(model) -> int:
         sw = getattr(mlp, "switch_mlp", None)
         if not isinstance(sw, SwitchGLU):
             continue
-        if not can_fuse(sw):
+        if not can_patch(sw):
             continue
         # Idempotent: skip if already patched.
         if getattr(sw, "_path_b_installed", False):
@@ -632,7 +632,7 @@ def patch_switch_glu_with_fused_swiglu(model) -> int:
         # One-off SwitchGLU subclass rather than rewriting up_proj/gate_proj: the
         # activation fusion folds silu(gate)*x_up into the gate matmul, which has
         # to intercept the forward (the projection level can't express it).
-        # can_fuse declines a non-stock __call__, so a customized forward falls
+        # can_patch declines a non-stock __call__, so a customized forward falls
         # back unpatched. Python resolves __call__ on the type, so swap
         # sw.__class__ to a subclass; cache it on the exact class (cls.__dict__,
         # not hasattr which walks the MRO) so a SwitchGLU subclass gets its own
