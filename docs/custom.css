@@ -225,36 +225,46 @@ html.dark table tbody tr:nth-child(even) td,
    browser viewport whenever either navigation rail is present. */
 .sgd-command-builder {
   container: command-builder / inline-size;
-  --sgdb-surface: oklch(98.5% 0.008 70);
-  --sgdb-raised: oklch(99.5% 0.004 70);
-  --sgdb-ink: oklch(24% 0.018 255);
-  --sgdb-muted: oklch(52% 0.018 255);
-  --sgdb-line: oklch(88% 0.012 70);
+  --sgdb-surface: white;
+  --sgdb-raised: white;
+  --sgdb-ink: oklch(22% 0.02 258);
+  --sgdb-muted: oklch(50% 0.02 258);
+  --sgdb-line: oklch(90% 0.008 258);
   --sgdb-brand: oklch(57% 0.15 35);
   --sgdb-serve: oklch(51% 0.09 255);
   --sgdb-request: oklch(57% 0.12 45);
   --sgdb-ok: oklch(52% 0.11 153);
   --sgdb-warn: oklch(59% 0.12 78);
   --sgdb-error: oklch(53% 0.16 25);
-  /* Segmented-control pair. The selected option is marked by a raised thumb
-     against a recessed well, so `well` and `thumb` must keep a real lightness
-     gap — they are redeclared for dark, where `raised` alone lands on top of
-     the well and the selection disappears. */
-  --sgdb-well: color-mix(in oklch, var(--sgdb-ink) 7.5%, transparent);
-  --sgdb-thumb: white;
-  --sgdb-thumb-ring: color-mix(in oklch, var(--sgdb-ink) 8%, transparent);
-  --sgdb-thumb-cast: color-mix(in oklch, var(--sgdb-ink) 20%, transparent);
+  /* Glass material system. A recessed well is a cool translucent tint (warm
+     greys read muddy); the raised thumb is a glass slab: gradient fill, a
+     specular top edge, a hairline ring, and a soft cast. The pair is
+     redeclared for dark, where the glass is built from white overlays. */
+  --sgdb-well: oklch(45% 0.03 258 / 0.08);
+  --sgdb-well-inset: inset 0 1px 2px oklch(30% 0.03 258 / 0.07);
+  --sgdb-thumb-bg: linear-gradient(180deg, white, oklch(98.5% 0.003 258));
+  --sgdb-thumb-shadow: 0 0 0 0.5px oklch(30% 0.02 258 / 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9),
+    0 1px 1px oklch(30% 0.02 258 / 0.07),
+    0 4px 12px oklch(30% 0.02 258 / 0.1);
   /* Hover tone for anything that sits inside a tinted well. */
-  --sgdb-pick-hover: color-mix(in oklch, var(--sgdb-ink) 4%, transparent);
-  /* Decelerating curve — motion settles rather than stopping flat. */
+  --sgdb-pick-hover: oklch(45% 0.03 258 / 0.05);
+  --sgdb-code-bg: oklch(97.5% 0.004 258);
+  --sgdb-code-inset: oklch(30% 0.03 258 / 0.06);
+  /* Colours settle on a decelerating curve; things that move get a spring —
+     a touch of overshoot is what reads as alive rather than mechanical. */
   --sgdb-ease: cubic-bezier(0.32, 0.72, 0, 1);
   --sgdb-ease-dur: 200ms;
+  --sgdb-spring: cubic-bezier(0.3, 1.35, 0.45, 1);
+  --sgdb-spring-dur: 460ms;
   max-width: 100%;
   margin: 24px 0 40px;
   overflow: clip;
   border: 1px solid var(--sgdb-line);
-  border-radius: 14px;
+  border-radius: 16px;
   background: var(--sgdb-surface);
+  box-shadow: 0 1px 2px oklch(30% 0.03 258 / 0.04),
+    0 12px 32px -12px oklch(30% 0.03 258 / 0.12);
   color: var(--sgdb-ink);
 }
 
@@ -267,18 +277,41 @@ html.dark table tbody tr:nth-child(even) td,
    `.sgd-builder-text-action` asked for 11px/680 and rendered 16px/400. */
 .sgd-command-builder :where(button, input, select) { font: inherit; }
 
+/* Segmented control with one glass pill that glides between scopes — the
+   pill is a single ::before positioned off the active button via :has(),
+   so the slide is pure CSS and springs into place. */
 .sgd-builder-scope-tabs {
+  position: relative;
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  padding: 0 12px;
-  border-bottom: 1px solid var(--sgdb-line);
-  background: var(--sgdb-raised);
+  margin: 12px 12px 0;
+  padding: 3px;
+  border-radius: 11px;
+  background: var(--sgdb-well);
+  box-shadow: var(--sgdb-well-inset);
 }
+
+.sgd-builder-scope-tabs::before {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  left: 3px;
+  width: calc((100% - 6px) / 3);
+  border-radius: 8px;
+  background: var(--sgdb-thumb-bg);
+  box-shadow: var(--sgdb-thumb-shadow);
+  content: "";
+  transition: transform var(--sgdb-spring-dur) var(--sgdb-spring);
+}
+
+.sgd-builder-scope-tabs:has(> button:nth-child(2)[data-active="true"])::before { transform: translateX(100%); }
+.sgd-builder-scope-tabs:has(> button:nth-child(3)[data-active="true"])::before { transform: translateX(200%); }
 
 .sgd-builder-scope-tabs button {
   position: relative;
+  z-index: 1;
   min-width: 0;
-  min-height: 44px;
+  min-height: 34px;
   padding: 0 4px;
   border: 0;
   background: transparent;
@@ -287,23 +320,10 @@ html.dark table tbody tr:nth-child(even) td,
   font-size: 12px;
   font-weight: 590;
   white-space: nowrap;
-}
-
-.sgd-builder-scope-tabs button::after {
-  position: absolute;
-  right: 8px;
-  bottom: -1px;
-  left: 8px;
-  height: 2px;
-  background: var(--sgdb-brand);
-  content: "";
-  opacity: 0;
-  transform: scaleX(0.7);
-  transition: opacity 160ms ease-out, transform 160ms ease-out;
+  transition: color var(--sgdb-ease-dur) var(--sgdb-ease);
 }
 
 .sgd-builder-scope-tabs button[data-active="true"] { color: var(--sgdb-ink); }
-.sgd-builder-scope-tabs button[data-active="true"]::after { opacity: 1; transform: scaleX(1); }
 .sgd-builder-main { display: flex; min-width: 0; flex-direction: column; }
 .sgd-builder-controls, .sgd-builder-output-rail { min-width: 0; }
 .sgd-builder-controls { container: builder-controls / inline-size; padding: 4px 16px 20px; }
@@ -339,6 +359,7 @@ html.dark table tbody tr:nth-child(even) td,
   padding: 3px;
   border-radius: 11px;
   background: var(--sgdb-well);
+  box-shadow: var(--sgdb-well-inset);
 }
 .sgd-builder-hardware, .sgd-builder-choice {
   position: relative;
@@ -372,8 +393,8 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-choice-dot { display: none; }
 
 .sgd-builder-hardware[data-selected="true"], .sgd-builder-choice[data-selected="true"] {
-  background: var(--sgdb-thumb);
-  box-shadow: 0 1px 3px var(--sgdb-thumb-cast), 0 0 0 0.5px var(--sgdb-thumb-ring);
+  background: var(--sgdb-thumb-bg);
+  box-shadow: var(--sgdb-thumb-shadow);
   color: var(--sgdb-ink);
 }
 
@@ -413,6 +434,7 @@ html.dark table tbody tr:nth-child(even) td,
   border: 0;
   border-radius: 10px;
   background: var(--sgdb-well);
+  box-shadow: var(--sgdb-well-inset);
 }
 .sgd-builder-stepper-field > div:first-child { display: grid; gap: 2px; }
 .sgd-builder-stepper-field span { font-size: 12px; font-weight: 500; }
@@ -424,8 +446,8 @@ html.dark table tbody tr:nth-child(even) td,
   grid-template-columns: 28px 40px 28px;
   align-items: center;
   border-radius: 8px;
-  background: var(--sgdb-thumb);
-  box-shadow: 0 1px 3px var(--sgdb-thumb-cast), 0 0 0 0.5px var(--sgdb-thumb-ring);
+  background: var(--sgdb-thumb-bg);
+  box-shadow: var(--sgdb-thumb-shadow);
 }
 .sgd-builder-stepper button, .sgd-builder-request-stepper button {
   min-width: 28px;
@@ -569,14 +591,19 @@ html.dark table tbody tr:nth-child(even) td,
   flex-direction: column;
   overflow: hidden;
   border: 1px solid var(--sgdb-line);
-  border-radius: 9px;
+  border-radius: 12px;
   background: var(--sgdb-raised);
+  box-shadow: 0 1px 2px oklch(30% 0.03 258 / 0.05);
   transition: border-color 160ms ease-out, transform 160ms ease-out;
 }
 .sgd-builder-output[data-output="request"] { --output-accent: var(--sgdb-request); }
 .sgd-builder-output[data-emphasized="true"] { border-color: color-mix(in oklch, var(--output-accent) 24%, var(--sgdb-line)); }
 .sgd-builder-output > header { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; gap: 8px; align-items: center; min-height: 50px; padding: 8px 10px; border-bottom: 1px solid var(--sgdb-line); }
-.sgd-builder-output[data-emphasized="true"] > header { background: color-mix(in oklch, var(--output-accent) 4%, var(--sgdb-raised)); }
+.sgd-builder-output[data-emphasized="true"] > header {
+  background: linear-gradient(180deg,
+    color-mix(in oklch, var(--output-accent) 7%, transparent),
+    color-mix(in oklch, var(--output-accent) 2%, transparent));
+}
 /* Neutral step disc — the accents stay reserved for state (active tab, status),
    so a static ordinal does not compete with them. */
 .sgd-builder-output-index { display: grid; width: 20px; height: 20px; place-items: center; border: 0; border-radius: 50%; background: var(--sgdb-well); color: var(--sgdb-muted); font-size: 10px; font-weight: 590; font-variant-numeric: tabular-nums; }
@@ -584,7 +611,13 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-output-title strong { font-size: 13px; font-weight: 590; }
 .sgd-builder-output-title span { color: var(--sgdb-muted); font-size: 10.5px; }
 .sgd-builder-status { display: inline-flex; gap: 5px; align-items: center; color: var(--sgdb-muted); font-size: 10px; white-space: nowrap; }
-.sgd-builder-status > span { width: 6px; height: 6px; border-radius: 50%; background: var(--sgdb-warn); }
+.sgd-builder-status > span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--sgdb-warn);
+  box-shadow: 0 0 6px color-mix(in oklch, var(--sgdb-warn) 60%, transparent);
+}
 .sgd-builder-status[data-status="verified"] > span { background: var(--sgdb-ok); }
 .sgd-builder-status[data-status="error"] > span { background: var(--sgdb-error); }
 .sgd-builder-output-tabs { display: flex; min-height: 38px; padding: 5px 10px; gap: 14px; align-items: center; border-bottom: 1px solid var(--sgdb-line); }
@@ -606,7 +639,8 @@ html.dark table tbody tr:nth-child(even) td,
   overflow: auto;
   border: 0;
   border-radius: 0;
-  background: color-mix(in oklch, var(--sgdb-surface) 65%, var(--sgdb-raised));
+  background: var(--sgdb-code-bg);
+  box-shadow: inset 0 1px 3px var(--sgdb-code-inset);
   color: var(--sgdb-ink);
   font-size: clamp(11.5px, 1.2cqi, 12.5px);
   line-height: 1.55;
@@ -631,24 +665,25 @@ html.dark table tbody tr:nth-child(even) td,
   padding: 0;
   border: 0;
   border-radius: 7px;
-  background: color-mix(in oklch, var(--sgdb-raised) 82%, transparent);
-  -webkit-backdrop-filter: blur(6px);
-  backdrop-filter: blur(6px);
-  box-shadow: 0 0 0 0.5px var(--sgdb-thumb-ring);
+  background: var(--sgdb-thumb-bg);
+  -webkit-backdrop-filter: blur(8px) saturate(1.4);
+  backdrop-filter: blur(8px) saturate(1.4);
+  box-shadow: var(--sgdb-thumb-shadow);
   color: var(--sgdb-muted);
   cursor: pointer;
   opacity: 0;
   place-items: center;
+  transform: translateY(2px) scale(0.9);
   transition: opacity var(--sgdb-ease-dur) var(--sgdb-ease),
     color var(--sgdb-ease-dur) var(--sgdb-ease),
-    background-color var(--sgdb-ease-dur) var(--sgdb-ease);
+    transform var(--sgdb-spring-dur) var(--sgdb-spring);
 }
 .sgd-builder-code:hover > .sgd-builder-copy,
 .sgd-builder-copy:focus-visible,
-.sgd-builder-copy[data-copied="true"] { opacity: 1; }
+.sgd-builder-copy[data-copied="true"] { opacity: 1; transform: translateY(0) scale(1); }
 /* No hover on touch — the control must stay visible. */
 @media (hover: none) {
-  .sgd-builder-copy { opacity: 1; }
+  .sgd-builder-copy { opacity: 1; transform: none; }
 }
 .sgd-builder-copy:disabled { cursor: not-allowed; color: color-mix(in oklch, var(--sgdb-muted) 45%, transparent); }
 /* Both glyphs share the cell; the swap is a settle-in scale rather than a
@@ -667,7 +702,7 @@ html.dark table tbody tr:nth-child(even) td,
    whole grid twitch as the pointer crossed it. */
 @media (hover: hover) and (pointer: fine) {
   .sgd-command-builder button:not(:disabled):not([data-blocked="true"]):hover { color: var(--sgdb-ink); }
-  .sgd-builder-scope-tabs button:not(:disabled):hover { background: var(--sgdb-pick-hover); }
+  .sgd-builder-scope-tabs button:not(:disabled):hover { color: var(--sgdb-ink); }
   .sgd-builder-hardware:not(:disabled):not([data-selected="true"]):hover,
   .sgd-builder-choice:not(:disabled):not([data-blocked="true"]):not([data-selected="true"]):hover {
     background: var(--sgdb-pick-hover);
@@ -675,7 +710,7 @@ html.dark table tbody tr:nth-child(even) td,
   .sgd-builder-setting-row:not(:disabled):hover { background: color-mix(in oklch, var(--sgdb-serve) 5%, transparent); }
   .sgd-builder-stepper button:not(:disabled):hover,
   .sgd-builder-request-stepper button:not(:disabled):hover { background: var(--sgdb-pick-hover); }
-  .sgd-builder-copy:not(:disabled):hover { background: var(--sgdb-raised); color: var(--sgdb-ink); }
+  .sgd-builder-copy:not(:disabled):hover { color: var(--sgdb-ink); }
   .sgd-builder-copy[data-copied="true"]:hover { color: var(--sgdb-ok); }
   .sgd-builder-text-action:not(:disabled):hover { color: var(--output-accent, var(--sgdb-brand)); }
 }
@@ -711,7 +746,7 @@ html.dark table tbody tr:nth-child(even) td,
 }
 
 @container command-builder (min-width: 418px) {
-  .sgd-builder-scope-tabs { padding-inline: 16px; }
+  .sgd-builder-scope-tabs { margin-inline: 16px; }
   .sgd-builder-scope-tabs button { font-size: 13px; }
   .sgd-builder-hardware-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .sgd-builder-resource-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -729,7 +764,7 @@ html.dark table tbody tr:nth-child(even) td,
 }
 
 @container command-builder (min-width: 958px) {
-  .sgd-builder-scope-tabs { padding-inline: 20px; }
+  .sgd-builder-scope-tabs { margin-inline: 20px; }
   .sgd-builder-scope-tabs button { font-size: 14px; }
   .sgd-builder-main { display: grid; grid-template-columns: minmax(0, 38fr) minmax(0, 62fr); }
   .sgd-builder-controls { padding: 8px 20px 24px; border-right: 1px solid var(--sgdb-line); }
@@ -743,25 +778,32 @@ html.dark table tbody tr:nth-child(even) td,
 }
 
 html.dark .sgd-command-builder, [data-theme="dark"] .sgd-command-builder {
-  --sgdb-surface: oklch(20% 0.014 255);
-  --sgdb-raised: oklch(24% 0.014 255);
-  --sgdb-ink: oklch(92% 0.009 70);
-  --sgdb-muted: oklch(68% 0.012 255);
-  --sgdb-line: oklch(32% 0.014 255);
-  --sgdb-brand: oklch(69% 0.14 38);
-  --sgdb-serve: oklch(72% 0.08 255);
-  --sgdb-request: oklch(72% 0.11 48);
-  --sgdb-ok: oklch(72% 0.1 153);
-  --sgdb-warn: oklch(75% 0.11 78);
-  --sgdb-error: oklch(72% 0.14 25);
-  /* On dark, `raised` sits at the same lightness the well mixes to, so the
-     thumb needs its own step up. Cast goes to black (a light shadow would
-     glow), and the ring carries most of the edge definition. */
-  --sgdb-well: color-mix(in oklch, black 26%, transparent);
-  --sgdb-thumb: oklch(31% 0.015 255);
-  --sgdb-thumb-ring: color-mix(in oklch, white 11%, transparent);
-  --sgdb-thumb-cast: color-mix(in oklch, black 40%, transparent);
-  --sgdb-pick-hover: color-mix(in oklch, white 6%, transparent);
+  --sgdb-surface: oklch(24% 0.015 258);
+  --sgdb-raised: oklch(27% 0.015 258);
+  --sgdb-ink: oklch(94% 0.006 80);
+  --sgdb-muted: oklch(71% 0.012 258);
+  --sgdb-line: rgba(255, 255, 255, 0.09);
+  --sgdb-brand: oklch(70% 0.14 40);
+  --sgdb-serve: oklch(73% 0.08 255);
+  --sgdb-request: oklch(73% 0.11 48);
+  --sgdb-ok: oklch(74% 0.11 153);
+  --sgdb-warn: oklch(76% 0.11 78);
+  --sgdb-error: oklch(73% 0.14 25);
+  /* Dark glass is built from white overlays: the thumb is a translucent
+     gradient with a specular top edge, wells recess into real black, and
+     the panel carries its own top highlight so it reads as a lit slab
+     rather than a flat grey rectangle on a near-identical page. */
+  --sgdb-well: rgba(0, 0, 0, 0.32);
+  --sgdb-well-inset: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+  --sgdb-thumb-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.07));
+  --sgdb-thumb-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.13),
+    0 2px 8px rgba(0, 0, 0, 0.35);
+  --sgdb-pick-hover: rgba(255, 255, 255, 0.06);
+  --sgdb-code-bg: oklch(18% 0.012 258);
+  --sgdb-code-inset: rgba(0, 0, 0, 0.5);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 16px 40px -16px rgba(0, 0, 0, 0.5);
 }
 
 @media (prefers-reduced-motion: reduce) {
