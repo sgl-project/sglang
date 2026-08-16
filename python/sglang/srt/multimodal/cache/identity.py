@@ -9,13 +9,16 @@ import struct
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Protocol, runtime_checkable
 from urllib.parse import unquote, urlparse
 
 import numpy as np
 import torch
 import transformers
 from PIL import Image
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 CONTENT_HASH_PREFIX = "sha256:"
 _SHA256_HEX_LENGTH = 64
@@ -376,7 +379,7 @@ def resolve_multimodal_item_hash(
 def build_processor_fingerprint(
     processor: Any,
     hf_config: Any,
-    server_args: Any,
+    server_args: ServerArgs,
     *,
     extra: Optional[Mapping[str, Any]] = None,
 ) -> str:
@@ -393,7 +396,7 @@ def build_processor_fingerprint(
         "model_type": hf_payload.get("model_type"),
         "architectures": hf_payload.get("architectures"),
         "model_revision": server_args.revision,
-        "tokenizer_revision": server_args.tokenizer_revision,
+        "processor_revision": server_args.revision,
         "disable_fast_image_processor": server_args.disable_fast_image_processor,
         "mm_process_config": server_args.mm_process_config or {},
         "processor": processor_payload,

@@ -4,7 +4,6 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -22,6 +21,7 @@ from sglang.srt.multimodal.cache import (
     resolve_multimodal_item_hash,
     snapshot_media,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -216,20 +216,20 @@ class TestMediaIdentity(unittest.TestCase):
                 return {"model_type": "vlm", "architectures": ["VLM"]}
 
         config = Config()
-        args = SimpleNamespace(
+        args = ServerArgs(
+            model_path="dummy",
             revision="model-revision",
-            tokenizer_revision="tokenizer-revision",
             disable_fast_image_processor=False,
             mm_process_config={"image": {"max_pixels": 1024}},
         )
         base = build_processor_fingerprint(Processor("gpu"), config, args)
 
         changed_backend = build_processor_fingerprint(Processor("cpu"), config, args)
-        changed_args = SimpleNamespace(
-            **{
-                **vars(args),
-                "mm_process_config": {"image": {"max_pixels": 2048}},
-            }
+        changed_args = ServerArgs(
+            model_path="dummy",
+            revision="model-revision",
+            disable_fast_image_processor=False,
+            mm_process_config={"image": {"max_pixels": 2048}},
         )
         changed_config = build_processor_fingerprint(
             Processor("gpu"), config, changed_args

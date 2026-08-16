@@ -506,7 +506,7 @@ class KimiK3ImageProcessor(
         deferred: Optional[KimiK3DeferredPreprocessing] = None,
     ) -> KimiK3ImagePreprocessArtifact:
         """Freeze one image's prompt-independent preprocessing result."""
-        # get the hash with feature
+        # Use the same feature-hash contract as MultimodalDataItem.
         feature_hash = resolve_multimodal_item_hash(
             feature=feature, namespace=artifact_key
         )
@@ -529,22 +529,23 @@ class KimiK3ImageProcessor(
         *,
         processor=None,
     ) -> list[KimiK3ImagePreprocessArtifact]:
-        """Preprocess cache-miss images into reusable per-image artifacts.
+        """Preprocess raw cache misses into reusable per-image cache items.
 
-        Return the processed artifacts with processed feature
+        Each entry is a confirmed cache miss. It is either processed now or
+        stored with the metadata needed for deferred GPU preprocessing.
         """
         processor = processor or self._processor
         artifacts: list[Optional[KimiK3ImagePreprocessArtifact]] = [None] * len(entries)
-        # 1. collect inputs preprocessed now instead of deferred to the GPU path
-        deferred_entry_indices = []
-        deferred_images = []
+        # 1. collect inputs that must be preprocessed now instead of deferred
+        eager_entry_indices = []
+        eager_images = []
 
         config = processor.preprocess_config
         for index, entry in enumerate(entries):
             image = entry.media
             if not self._should_defer_gpu_preprocessing([image]):
-                deferred_entry_indices.append(index)
-                deferred_images.append(image)
+                eager_entry_indices.append(index)
+                eager_images.append(image)
                 continue
 
             width, height = _get_image_dimensions(image)
@@ -576,12 +577,12 @@ class KimiK3ImageProcessor(
             )
 
         # 2. preprocess CPU eager inputs as one batch
-        if deferred_images:
+        if eager_images:
             features, sizes, configs, grids = processor.prepare_image_features(
-                deferred_images
+                eager_images
             )
             for index, feature, size, resize_config, grid in zip(
-                deferred_entry_indices, features, sizes, configs, grids
+                eager_entry_indices, features, sizes, configs, grids
             ):
                 entry = entries[index]
                 artifacts[index] = self._make_artifact(
