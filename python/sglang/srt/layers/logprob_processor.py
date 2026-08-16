@@ -13,6 +13,7 @@ from sglang.srt.runtime_context import get_exec
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 logger = logging.getLogger(__name__)
 
@@ -349,23 +350,13 @@ def get_token_ids_logprobs_chunk(
 
 
 def compute_spec_v2_logprobs(
-    batch,
-    logits_output,
+    batch: ScheduleBatch,
+    logits_output: LogitsProcessorOutput,
     predict: torch.Tensor,
     *,
     accept_index: Optional[torch.Tensor] = None,
     chain_stride: Optional[int] = None,
 ):
-    """Compute logprobs for accepted tokens after spec v2 verify sampling.
-
-    Gathers logits at accepted positions, applies log_softmax (temperature-scaled
-    if not greedy), and populates logits_output.next_token_logprobs (plus optional
-    top-k / token-ids logprobs) so they flow through copy_to_cpu().
-
-    Tree algorithms pass ``accept_index`` of shape (bs, max_tree_depth). Linear
-    chains pass ``chain_stride`` instead: their accept slots are already dense at
-    that stride, so both gathers below would be identity.
-    """
     assert (accept_index is None) != (
         chain_stride is None
     ), "pass exactly one of accept_index / chain_stride"
