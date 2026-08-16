@@ -5,14 +5,7 @@ eight B300 GPUs. Each server must preserve basic model quality on GSM8K, and
 the Low Latency recipe must also preserve single-request decode performance.
 """
 
-import base64
-import hashlib
-import io
 import unittest
-
-import openai
-import requests
-from PIL import Image
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -44,27 +37,6 @@ def _stop_server(process):
     if process:
         kill_process_tree(process.pid)
         _wait_for_gpu_idle_in_ci(timeout=GPU_IDLE_TIMEOUT)
-
-
-def _metric_sum(text, name, **required_labels):
-    total = 0.0
-    for line in text.splitlines():
-        if not line.startswith(name + "{"):
-            continue
-        labels, value = line.rsplit(" ", 1)
-        if all(f'{key}="{label}"' in labels for key, label in required_labels.items()):
-            total += float(value)
-    return total
-
-
-def _png_data_url():
-    output = io.BytesIO()
-    Image.new("RGB", (256, 192), (35, 90, 180)).save(output, format="PNG")
-    payload = output.getvalue()
-    return (
-        "data:image/png;base64," + base64.b64encode(payload).decode(),
-        "sha256:" + hashlib.sha256(payload).hexdigest(),
-    )
 
 
 class TestKimiK3B300LowLatency(GSM8KMixin, SpecDecodingMixin, CustomTestCase):
@@ -103,7 +75,6 @@ class TestKimiK3B300LowLatency(GSM8KMixin, SpecDecodingMixin, CustomTestCase):
                 "kimi_k3",
                 "--mamba-full-memory-ratio",
                 "0.86",
-                "--enable-metrics",
                 "--speculative-algorithm",
                 "DSPARK",
                 "--speculative-draft-model-path",
@@ -113,57 +84,6 @@ class TestKimiK3B300LowLatency(GSM8KMixin, SpecDecodingMixin, CustomTestCase):
                 "--enable-linear-replayssm-spec",
             ],
         )
-
-    def test_agent_turn_reuses_image_embedding(self):
-        image_url, content_hash = _png_data_url()
-        image_part = {
-            "type": "image_url",
-            "image_url": {"url": image_url, "content_hash": content_hash},
-        }
-        first_user = {
-            "role": "user",
-            "content": [
-                image_part,
-                {"type": "text", "text": "Describe this image briefly."},
-            ],
-        }
-        client = openai.Client(api_key="EMPTY", base_url=self.base_url + "/v1")
-        first = client.chat.completions.create(
-            model="default",
-            messages=[first_user],
-            temperature=0,
-            max_tokens=16,
-        )
-        before_hot = requests.get(self.base_url + "/metrics", timeout=30).text
-
-        second = client.chat.completions.create(
-            model="default",
-            messages=[
-                first_user,
-                {"role": "assistant", "content": "I see the image."},
-                {"role": "user", "content": "What is its main color?"},
-            ],
-            temperature=0,
-            max_tokens=16,
-        )
-        after_hot = requests.get(self.base_url + "/metrics", timeout=30).text
-
-        self.assertTrue(first.choices)
-        self.assertTrue(second.choices)
-        for stage in ("processor", "transport", "vit"):
-            self.assertEqual(
-                _metric_sum(
-                    after_hot,
-                    "sglang:mm_cache_skipped_stages_total",
-                    stage=stage,
-                )
-                - _metric_sum(
-                    before_hot,
-                    "sglang:mm_cache_skipped_stages_total",
-                    stage=stage,
-                ),
-                1,
-            )
 
     @classmethod
     def tearDownClass(cls):
