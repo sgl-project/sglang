@@ -116,17 +116,25 @@ async fn main() -> Result<()> {
         .transpose()?;
 
     // Build the KV-event index up front so the cache-aware-zmq policy can
-    // share its `HashTree` handle + `BlockSizeOracle`. When no model uses
-    // `cache_aware_zmq`, the index is still constructed (cheap) but no
-    // subscribers are ever added.
+    // share its `HashTree` handle + `BlockSizeOracle`. An external Indexer makes
+    // the local tree irrelevant to routing, so only discover hash metadata rather
+    // than duplicating every KV event.
     let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
-    let kv_index = sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .expect("default http client builds"),
-        Arc::clone(&block_size_oracle),
-    );
+    let kv_event_http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .expect("default http client builds");
+    let kv_index = if prefix_index.is_some() {
+        sgl_router::policies::kv_events::KvEventIndex::new_metadata_only_with_http_and_oracle(
+            kv_event_http,
+            Arc::clone(&block_size_oracle),
+        )
+    } else {
+        sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
+            kv_event_http,
+            Arc::clone(&block_size_oracle),
+        )
+    };
     let policies = Arc::new(
         sgl_router::policies::factory::build_registry(
             &cfg,

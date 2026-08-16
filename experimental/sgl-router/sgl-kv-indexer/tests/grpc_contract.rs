@@ -396,6 +396,41 @@ async fn match_prefix_over_grpc() {
     assert_eq!(resp.matches[1].matched_prefix_blocks, 1);
 }
 
+#[tokio::test]
+async fn prefix_query_scans_more_than_one_apply_chunk_over_grpc() {
+    const APPLY_CHUNK_SIZE: usize = 16_384;
+
+    let mut indexer = start().await;
+    let hashes: Vec<String> = (0..=APPLY_CHUNK_SIZE)
+        .map(|index| format!("large-prefix-{index}"))
+        .collect();
+    for (seq, chunk) in hashes.chunks(APPLY_CHUNK_SIZE).enumerate() {
+        let chunk: Vec<&str> = chunk.iter().map(String::as_str).collect();
+        indexer
+            .apply_external_kv_batch(apply_report(
+                "large-prefix-worker",
+                "10.0.0.1:9000",
+                seq as u64,
+                hbm(),
+                &chunk,
+            ))
+            .await
+            .expect("bounded apply chunk");
+    }
+
+    let response = indexer
+        .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+            hashes,
+            max_blocks: 0,
+        })
+        .await
+        .expect("prefix request larger than one apply chunk")
+        .into_inner();
+
+    assert_eq!(response.best_prefix_blocks as usize, APPLY_CHUNK_SIZE + 1);
+    assert_eq!(response.blocks_read as usize, APPLY_CHUNK_SIZE + 1);
+}
+
 /// Serves an empty backend behind an interceptor that records the `grpc-timeout`
 /// of every request, and returns the router-facing client alongside the capture.
 async fn start_recording_deadlines(

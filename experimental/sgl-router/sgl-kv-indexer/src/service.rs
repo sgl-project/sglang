@@ -16,9 +16,10 @@ use crate::pb::{
 };
 
 /// Protocol-level resource bounds, enforced before a backend sees the request so
-/// no caller can make it allocate work proportional to an unbounded field.
-const MAX_HASHES_PER_REQUEST: usize = 16_384;
-const MAX_ACTIONS_PER_BATCH: usize = 256;
+/// no caller can make it allocate work proportional to an unbounded field. The
+/// prefix query is exempt from the hash bound; see [`validate_hashes`].
+pub(crate) const MAX_HASHES_PER_REQUEST: usize = 16_384;
+pub(crate) const MAX_ACTIONS_PER_BATCH: usize = 256;
 pub const DEFAULT_PREFIX_QUERY_MAX_INFLIGHT: usize = 32;
 
 static OVERLOAD_LOG: RejectionLog = RejectionLog::new();
@@ -167,7 +168,7 @@ where
         request: Request<MatchExternalKvRequest>,
     ) -> Result<Response<MatchExternalKvResponse>, Status> {
         let request = request.into_inner();
-        validate_hashes(&request.hashes)?;
+        validate_hashes_bounded(&request.hashes)?;
         let response = self.backend.match_external_kv(request).await?;
         Ok(Response::new(response))
     }
@@ -200,7 +201,7 @@ where
         request: Request<GetExternalKvHitCountsRequest>,
     ) -> Result<Response<GetExternalKvHitCountsResponse>, Status> {
         let request = request.into_inner();
-        validate_hashes(&request.hashes)?;
+        validate_hashes_bounded(&request.hashes)?;
         let response = self.backend.get_external_kv_hit_counts(request).await?;
         Ok(Response::new(response))
     }
@@ -224,15 +225,26 @@ fn validate_worker_id(worker_id: &str) -> Result<(), Status> {
     Ok(())
 }
 
-fn validate_hashes(hashes: &[String]) -> Result<(), Status> {
-    if hashes.is_empty() {
-        return Err(Status::invalid_argument("hashes must not be empty"));
-    }
+/// Well-formedness plus the per-request hash ceiling, for the RPCs that mutate
+/// state or build a per-hash response.
+fn validate_hashes_bounded(hashes: &[String]) -> Result<(), Status> {
+    validate_hashes(hashes)?;
     if hashes.len() > MAX_HASHES_PER_REQUEST {
         return Err(Status::resource_exhausted(format!(
             "request contains {} hashes; maximum is {MAX_HASHES_PER_REQUEST}",
             hashes.len()
         )));
+    }
+    Ok(())
+}
+
+/// Well-formedness only: no hash ceiling. A prefix scan uses O(1) state per
+/// candidate worker, and truncating it would silently understate a worker's
+/// reusable prefix. Length is bounded by `max_blocks` and the transport limit,
+/// not by the caller's deadline, which cannot cancel a scan already under way.
+fn validate_hashes(hashes: &[String]) -> Result<(), Status> {
+    if hashes.is_empty() {
+        return Err(Status::invalid_argument("hashes must not be empty"));
     }
     if hashes.iter().any(|hash| hash.is_empty()) {
         return Err(Status::invalid_argument(
@@ -269,7 +281,7 @@ fn validate_actions(actions: &[ExternalKvAction]) -> Result<(), Status> {
         validate_tier(action.tier)?;
         match ExternalKvActionType::try_from(action.r#type) {
             Ok(ExternalKvActionType::ActionReport) | Ok(ExternalKvActionType::ActionRevoke) => {
-                validate_hashes(&action.hashes)?;
+                validate_hashes_bounded(&action.hashes)?;
             }
             // CLEAR_ALL_AT_TIER carries only a tier; hashes are ignored.
             Ok(ExternalKvActionType::ActionClearAllAtTier) => {}
@@ -301,7 +313,7 @@ fn validate_aligned(array_len: usize, hashes_len: usize, field: &str) -> Result<
 
 /// Number of leading blocks to consider for a prefix query: bounded by the
 /// request length and, when the caller set one, by `max_blocks` (0 disables the
-/// caller ceiling). Backends may impose their own additional scan cap.
+/// caller ceiling).
 pub(crate) fn prefix_limit(len: usize, max_blocks: u32) -> usize {
     if max_blocks == 0 {
         len
@@ -425,88 +437,165 @@ pub(crate) fn compute_worker_prefix(
     spec: Option<&WorkerCacheSpec>,
     blocks: &[Option<BlockComponents>],
 ) -> u32 {
-    match spec {
-        // No spec: component-aware placement can't be interpreted (fail closed);
-        // a purely legacy worker keeps the whole-block contiguous prefix.
-        None => {
-            if blocks_carry_components(blocks) {
-                0
-            } else {
-                legacy_contiguous_prefix(blocks)
+    let mut scanner = WorkerPrefixScanner::new(spec);
+    for block in blocks {
+        scanner.push(block.as_ref());
+    }
+    scanner.prefix()
+}
+
+/// Incremental form of the component rule engine: one forward pass, one block at
+/// a time, O(1) state. Lets a backend answer a prefix query without materializing
+/// a `workers × request_blocks` placement array.
+#[derive(Debug)]
+pub(crate) struct WorkerPrefixScanner {
+    processed: u32,
+    state: PrefixScanState,
+}
+
+#[derive(Debug)]
+enum PrefixScanState {
+    /// A worker reporting no components: the count of leading blocks it holds,
+    /// unless some block carries a component mask, which fails the whole result
+    /// closed.
+    Legacy {
+        prefix: u32,
+        /// False once a gap appears, after which `prefix` is final.
+        contiguous: bool,
+        saw_components: bool,
+    },
+    /// An unusable spec. Fails closed no matter what blocks arrive.
+    Invalid,
+    /// The largest boundary `N` where every required component's rule holds:
+    ///   * FULL (always required)  — present on every block `0..N`.
+    ///   * SWA (if present)        — an unbroken run ending at `N-1` covering
+    ///     `swa_window_tokens`, or reaching the head.
+    ///   * MAMBA (if present)      — present on block `N-1`.
+    ComponentAware {
+        /// Cleared once FULL is missing, which freezes `best`.
+        active: bool,
+        best: u32,
+        spec: WorkerCacheSpec,
+        /// Contiguous SWA tokens ending at the block just processed.
+        swa_run: u64,
+        swa_head_broken: bool,
+    },
+}
+
+impl WorkerPrefixScanner {
+    pub(crate) fn new(spec: Option<&WorkerCacheSpec>) -> Self {
+        let state = match spec {
+            // No spec to interpret components with: legacy until a block proves
+            // otherwise.
+            None => PrefixScanState::Legacy {
+                prefix: 0,
+                contiguous: true,
+                saw_components: false,
+            },
+            Some(spec) if spec.components == 0 || spec.version > SUPPORTED_SPEC_VERSION => {
+                PrefixScanState::Invalid
+            }
+            Some(spec) if spec.components & COMPONENT_SWA != 0 && spec.swa_window_tokens == 0 => {
+                PrefixScanState::Invalid
+            }
+            Some(spec) => PrefixScanState::ComponentAware {
+                active: true,
+                best: 0,
+                spec: *spec,
+                swa_run: 0,
+                swa_head_broken: false,
+            },
+        };
+        Self {
+            processed: 0,
+            state,
+        }
+    }
+
+    pub(crate) fn push(&mut self, block: Option<&BlockComponents>) {
+        self.processed = self.processed.saturating_add(1);
+        match &mut self.state {
+            PrefixScanState::Legacy {
+                prefix,
+                contiguous,
+                saw_components,
+            } => {
+                // Runs past the gap too: a mask on any later block still fails the
+                // whole result closed.
+                *saw_components |=
+                    block.is_some_and(|block| block.tier_masks.iter().any(|(_, mask)| *mask != 0));
+                if *contiguous {
+                    match block {
+                        Some(_) => *prefix = self.processed,
+                        None => *contiguous = false,
+                    }
+                }
+            }
+            PrefixScanState::Invalid => {}
+            PrefixScanState::ComponentAware {
+                active,
+                best,
+                spec,
+                swa_run,
+                swa_head_broken,
+            } => {
+                if !*active {
+                    return;
+                }
+                // FULL gates contiguity, so a block missing it settles this worker.
+                if !component_available(block, COMPONENT_FULL, spec.full_tier_mask) {
+                    *active = false;
+                    return;
+                }
+                let mut boundary_ok = true;
+                if spec.components & COMPONENT_SWA != 0 {
+                    if component_available(block, COMPONENT_SWA, spec.swa_tier_mask) {
+                        *swa_run += block.map(|block| block.token_count as u64).unwrap_or(0);
+                        // Reaching the head counts as valid, matching the unified
+                        // cache's accumulator seeded at infinity.
+                        boundary_ok &=
+                            !*swa_head_broken || *swa_run >= spec.swa_window_tokens as u64;
+                    } else {
+                        *swa_run = 0;
+                        *swa_head_broken = true;
+                        boundary_ok = false; // boundary block itself must carry SWA
+                    }
+                }
+                if spec.components & COMPONENT_MAMBA != 0 {
+                    boundary_ok &=
+                        component_available(block, COMPONENT_MAMBA, spec.mamba_tier_mask);
+                }
+                if boundary_ok {
+                    *best = self.processed;
+                }
             }
         }
-        // Empty or future-version spec is unusable → fail closed.
-        Some(spec) if spec.components == 0 || spec.version > SUPPORTED_SPEC_VERSION => 0,
-        Some(spec) => component_aware_prefix(spec, blocks),
-    }
-}
-
-/// The count of leading blocks the worker holds (the legacy whole-block prefix).
-fn legacy_contiguous_prefix(blocks: &[Option<BlockComponents>]) -> u32 {
-    blocks.iter().take_while(|block| block.is_some()).count() as u32
-}
-
-/// Whether any held block carries a non-zero component mask — the signal that a
-/// worker is reporting component-aware placement.
-fn blocks_carry_components(blocks: &[Option<BlockComponents>]) -> bool {
-    blocks
-        .iter()
-        .flatten()
-        .any(|block| block.tier_masks.iter().any(|(_, mask)| *mask != 0))
-}
-
-/// The largest boundary `N` such that every required component's fixed rule
-/// holds, in a single forward scan:
-///   * FULL (always required)  — contiguous: present on every block `0..N`.
-///   * SWA (if present)         — trailing window: an unbroken run of SWA ending
-///     at `N-1` covering `swa_window_tokens` tokens, or reaching the head.
-///   * MAMBA (if present)       — exact boundary: present on block `N-1`.
-fn component_aware_prefix(spec: &WorkerCacheSpec, blocks: &[Option<BlockComponents>]) -> u32 {
-    let swa_required = spec.components & COMPONENT_SWA != 0;
-    let mamba_required = spec.components & COMPONENT_MAMBA != 0;
-    let window = spec.swa_window_tokens as u64;
-    // SWA without a positive window is an unusable spec → fail closed.
-    if swa_required && window == 0 {
-        return 0;
     }
 
-    let mut best = 0u32;
-    let mut swa_run = 0u64; // contiguous SWA tokens ending at the current block
-    let mut swa_head_broken = false; // a SWA gap has been seen before this block
-    for (index, block) in blocks.iter().enumerate() {
-        // FULL gates contiguity: the prefix cannot extend past a block missing it.
-        if !component_available(block, COMPONENT_FULL, spec.full_tier_mask) {
-            break;
-        }
-        let mut boundary_ok = true;
-        if swa_required {
-            if component_available(block, COMPONENT_SWA, spec.swa_tier_mask) {
-                swa_run += block.as_ref().map(|b| b.token_count as u64).unwrap_or(0);
-                // Valid if the run reaches the head (never broken) or fills a
-                // window; the head case matches the unified cache's accumulator
-                // seeded at infinity.
-                boundary_ok &= !swa_head_broken || swa_run >= window;
-            } else {
-                swa_run = 0;
-                swa_head_broken = true;
-                boundary_ok = false; // boundary block itself must carry SWA
+    pub(crate) fn prefix(&self) -> u32 {
+        match &self.state {
+            PrefixScanState::Legacy {
+                prefix,
+                saw_components,
+                ..
+            } => {
+                if *saw_components {
+                    0
+                } else {
+                    *prefix
+                }
             }
-        }
-        if mamba_required {
-            boundary_ok &= component_available(block, COMPONENT_MAMBA, spec.mamba_tier_mask);
-        }
-        if boundary_ok {
-            best = (index + 1) as u32;
+            PrefixScanState::Invalid => 0,
+            PrefixScanState::ComponentAware { best, .. } => *best,
         }
     }
-    best
 }
 
 /// Whether `component` (a single bit) is resident on `block` at some tier that is
 /// both declared servable for that component (`spec_tier_mask`) and servable by
 /// the indexer (`SERVABLE_TIER_MASK`).
 fn component_available(
-    block: &Option<BlockComponents>,
+    block: Option<&BlockComponents>,
     component: u32,
     spec_tier_mask: u32,
 ) -> bool {
@@ -522,7 +611,7 @@ fn component_available(
 
 /// Sorts `(worker_id, address, prefix)` entries by prefix descending and builds
 /// the response, so `best_prefix_blocks` and the order come from one place.
-fn assemble_prefix_response(
+pub(crate) fn assemble_prefix_response(
     mut entries: Vec<(String, String, u32)>,
     blocks_read: u32,
 ) -> MatchExternalKvPrefixResponse {
@@ -786,8 +875,15 @@ mod tests {
     #[test]
     fn validate_hashes_rejects_oversized_query() {
         let hashes = vec!["1".to_string(); MAX_HASHES_PER_REQUEST + 1];
-        let error = validate_hashes(&hashes).unwrap_err();
+        let error = validate_hashes_bounded(&hashes).unwrap_err();
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    /// Only the bounded variant rejects on length.
+    #[test]
+    fn validate_hashes_accepts_oversized_prefix_query() {
+        let hashes = vec!["1".to_string(); MAX_HASHES_PER_REQUEST + 1];
+        assert!(validate_hashes(&hashes).is_ok());
     }
 
     #[test]

@@ -164,6 +164,9 @@ impl PrefixIndex for GrpcPrefixIndex {
         let mut request = tonic::Request::new(MatchExternalKvPrefixRequest {
             // The bridge encodes block hashes as decimal strings; mirror it.
             hashes: hashes.iter().map(|hash| hash.to_string()).collect(),
+            // No caller-side truncation. The policy still scores against the full
+            // query, never `blocks_read`, so a partial scan cannot turn a fraction
+            // of the request into a perfect hit.
             max_blocks: 0,
         });
         // On the wire so the indexer can drop a query this caller already stopped

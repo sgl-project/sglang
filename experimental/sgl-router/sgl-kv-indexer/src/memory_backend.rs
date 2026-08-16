@@ -18,10 +18,8 @@ use crate::pb::{
     HitCountEntry, MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse,
     MatchExternalKvRequest, MatchExternalKvResponse, TierHashes, WorkerCacheSpec,
 };
-use crate::service::{compute_prefix_response, prefix_limit};
+use crate::service::{assemble_prefix_response, prefix_limit, WorkerPrefixScanner};
 use crate::{BlockComponents, KvIndexerBackend, WorkerPrefixInput};
-
-const PREFIX_SCAN_CAP: usize = 2_048;
 
 #[derive(Debug, Default)]
 struct BlockRecord {
@@ -52,6 +50,13 @@ struct WorkerView {
     spec: Option<WorkerCacheSpec>,
     hashes_by_tier: BTreeMap<i32, Vec<(String, u32, u32)>>,
     blocks: Vec<Option<BlockComponents>>,
+}
+
+#[derive(Debug)]
+struct PrefixCandidate {
+    worker_id: String,
+    address: String,
+    scanner: WorkerPrefixScanner,
 }
 
 /// Single-process, soft-state KV placement index.
@@ -275,27 +280,94 @@ impl InMemoryKvIndexerBackend {
         &self,
         req: MatchExternalKvPrefixRequest,
     ) -> Result<MatchExternalKvPrefixResponse, Status> {
-        let limit = prefix_limit(req.hashes.len(), req.max_blocks).min(PREFIX_SCAN_CAP);
+        let limit = prefix_limit(req.hashes.len(), req.max_blocks);
         let hashes = &req.hashes[..limit];
         if hashes.is_empty() {
             return Ok(MatchExternalKvPrefixResponse::default());
         }
-        let inputs = {
-            let state = self.read_state()?;
-            if state
-                .blocks
-                .get(&hashes[0])
-                .is_none_or(|block| block.placements.is_empty())
-            {
-                return Ok(MatchExternalKvPrefixResponse {
-                    matches: Vec::new(),
-                    best_prefix_blocks: 0,
-                    blocks_read: 1,
-                });
-            }
-            Self::collect_prefix_inputs_locked(&state, hashes)
+
+        // Only workers holding block zero can own a non-empty prefix, so the
+        // candidate set is fixed up front and each candidate reuses one scanner and
+        // one block view. Allocation is O(first-block holders) whatever the request
+        // length, which is why there is no scan cap: length costs time, not memory.
+        let state = self.read_state()?;
+        let Some(first) = state
+            .blocks
+            .get(&hashes[0])
+            .filter(|block| !block.placements.is_empty())
+        else {
+            return Ok(MatchExternalKvPrefixResponse {
+                matches: Vec::new(),
+                best_prefix_blocks: 0,
+                blocks_read: 1,
+            });
         };
-        Ok(compute_prefix_response(&inputs, limit as u32))
+        let mut seen = HashSet::new();
+        let mut candidates: Vec<PrefixCandidate> = first
+            .placements
+            .keys()
+            .filter(|(worker, _)| seen.insert(worker.as_str()))
+            .map(|(worker, _)| {
+                let metadata = state.workers.get(worker);
+                PrefixCandidate {
+                    address: metadata
+                        .map(|worker| worker.address.clone())
+                        .unwrap_or_default(),
+                    scanner: WorkerPrefixScanner::new(
+                        metadata.and_then(|worker| worker.spec.as_ref()),
+                    ),
+                    worker_id: worker.clone(),
+                }
+            })
+            .collect();
+        let candidate_by_id: HashMap<String, usize> = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| (candidate.worker_id.clone(), index))
+            .collect();
+        let mut present = vec![false; candidates.len()];
+        let mut block_views: Vec<BlockComponents> = (0..candidates.len())
+            .map(|_| BlockComponents {
+                token_count: 0,
+                tier_masks: Vec::new(),
+            })
+            .collect();
+
+        for hash in hashes {
+            present.fill(false);
+            for block in &mut block_views {
+                block.token_count = 0;
+                block.tier_masks.clear();
+            }
+            if let Some(block) = state.blocks.get(hash) {
+                for ((worker, tier), mask) in &block.placements {
+                    let Some(&index) = candidate_by_id.get(worker) else {
+                        continue;
+                    };
+                    present[index] = true;
+                    block_views[index].token_count = block.token_count;
+                    block_views[index].tier_masks.push((*tier, *mask));
+                }
+            }
+            for (index, candidate) in candidates.iter_mut().enumerate() {
+                candidate
+                    .scanner
+                    .push(present[index].then_some(&block_views[index]));
+            }
+        }
+
+        let entries = candidates
+            .into_iter()
+            .filter_map(|candidate| {
+                let prefix = candidate.scanner.prefix();
+                (!candidate.address.is_empty() && prefix > 0).then_some((
+                    candidate.worker_id,
+                    candidate.address,
+                    prefix,
+                ))
+            })
+            .collect();
+        Ok(assemble_prefix_response(entries, limit as u32))
     }
 
     fn do_hit_counts(

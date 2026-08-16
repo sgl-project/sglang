@@ -25,7 +25,7 @@ use crate::pb::kv_indexer_client::KvIndexerClient;
 use crate::pb::{
     ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, TierType, WorkerCacheSpec,
 };
-use crate::service::{component_bit, COMPONENT_SWA};
+use crate::service::{component_bit, COMPONENT_SWA, MAX_ACTIONS_PER_BATCH, MAX_HASHES_PER_REQUEST};
 
 /// Backoff bounds for the reconnect supervisor loop.
 const RECONNECT_MIN_DELAY: Duration = Duration::from_millis(500);
@@ -382,13 +382,15 @@ async fn forward_raw_batch(
     };
 
     let request = build_apply_request(config, seq, actions);
-    if request.actions.is_empty() {
-        return Ok(());
+    // One ZMQ batch can hold more mutations than a single apply RPC admits, so
+    // send the parts in order. A later failure leaves an applied prefix, which
+    // beats rejecting and losing the whole event batch.
+    for request in split_apply_request(request) {
+        client
+            .apply_external_kv_batch(request)
+            .await
+            .map_err(classify_rpc)?;
     }
-    client
-        .apply_external_kv_batch(request)
-        .await
-        .map_err(classify_rpc)?;
     Ok(())
 }
 
@@ -446,6 +448,75 @@ fn build_apply_request(
         worker_address: config.worker_address.clone(),
         cache_spec: config.cache_spec,
     }
+}
+
+/// Splits one decoded ZMQ batch into apply RPCs within the service's action and
+/// hash bounds, preserving action order and per-hash index alignment.
+///
+/// Every part reuses the source `seq`, which is safe because `seq` is
+/// observability only (see the proto): applies are never deduplicated or fenced,
+/// so a repeated `seq` cannot get a part dropped as stale.
+fn split_apply_request(request: ApplyExternalKvBatchRequest) -> Vec<ApplyExternalKvBatchRequest> {
+    let mut template = request;
+    let actions = std::mem::take(&mut template.actions);
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_hashes = 0usize;
+
+    let flush = |actions: &mut Vec<ExternalKvAction>,
+                 batches: &mut Vec<ApplyExternalKvBatchRequest>| {
+        if actions.is_empty() {
+            return;
+        }
+        batches.push(ApplyExternalKvBatchRequest {
+            actions: std::mem::take(actions),
+            ..template.clone()
+        });
+    };
+
+    for action in actions.into_iter().flat_map(split_action) {
+        let action_hashes = action.hashes.len();
+        if !current.is_empty()
+            && (current.len() == MAX_ACTIONS_PER_BATCH
+                || current_hashes + action_hashes > MAX_HASHES_PER_REQUEST)
+        {
+            flush(&mut current, &mut batches);
+            current_hashes = 0;
+        }
+        current_hashes += action_hashes;
+        current.push(action);
+    }
+    flush(&mut current, &mut batches);
+    batches
+}
+
+fn split_action(action: ExternalKvAction) -> Vec<ExternalKvAction> {
+    if action.hashes.len() <= MAX_HASHES_PER_REQUEST {
+        return vec![action];
+    }
+
+    (0..action.hashes.len())
+        .step_by(MAX_HASHES_PER_REQUEST)
+        .map(|start| {
+            let end = (start + MAX_HASHES_PER_REQUEST).min(action.hashes.len());
+            ExternalKvAction {
+                r#type: action.r#type,
+                tier: action.tier,
+                hashes: action.hashes[start..end].to_vec(),
+                component_masks: slice_or_empty(&action.component_masks, start, end),
+                block_sizes: slice_or_empty(&action.block_sizes, start, end),
+            }
+        })
+        .collect()
+}
+
+/// Slices a per-hash array alongside its `hashes` slice. Empty is the legacy
+/// "field absent" signal; non-empty arrays are aligned by `build_apply_request`.
+fn slice_or_empty<T: Clone>(values: &[T], start: usize, end: usize) -> Vec<T> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    values[start..end].to_vec()
 }
 
 /// Maps per-hash component sets to the wire form: an empty vector (the legacy
@@ -913,6 +984,61 @@ mod tests {
         let config = test_config(vec![hbm()]);
         let request = request_of(&config, 0, vec![stored(&[1], "GPU")]);
         assert_eq!(request.worker_address, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn oversized_report_is_split_with_aligned_metadata() {
+        let count = MAX_HASHES_PER_REQUEST + 1;
+        let request = ApplyExternalKvBatchRequest {
+            worker_id: "worker-1".into(),
+            seq: 42,
+            actions: vec![ExternalKvAction {
+                r#type: ExternalKvActionType::ActionReport as i32,
+                tier: hbm(),
+                hashes: (0..count).map(|index| format!("hash-{index}")).collect(),
+                component_masks: (0..count as u32).collect(),
+                block_sizes: (0..count as u32).map(|index| index + 1).collect(),
+            }],
+            worker_address: "http://worker-1".into(),
+            cache_spec: None,
+        };
+
+        let batches = split_apply_request(request);
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].actions[0].hashes.len(), MAX_HASHES_PER_REQUEST);
+        assert_eq!(
+            batches[1].actions[0].hashes,
+            vec![format!("hash-{MAX_HASHES_PER_REQUEST}")]
+        );
+        assert_eq!(
+            batches[1].actions[0].component_masks,
+            vec![MAX_HASHES_PER_REQUEST as u32]
+        );
+        assert_eq!(
+            batches[1].actions[0].block_sizes,
+            vec![MAX_HASHES_PER_REQUEST as u32 + 1]
+        );
+        assert!(batches.iter().all(|batch| batch.seq == 42));
+    }
+
+    #[test]
+    fn too_many_clear_actions_are_split_in_order() {
+        let request = ApplyExternalKvBatchRequest {
+            worker_id: "worker-1".into(),
+            seq: 7,
+            actions: (0..=MAX_ACTIONS_PER_BATCH)
+                .map(|index| clear_at(if index % 2 == 0 { hbm() } else { dram() }))
+                .collect(),
+            worker_address: "http://worker-1".into(),
+            cache_spec: None,
+        };
+
+        let batches = split_apply_request(request);
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].actions.len(), MAX_ACTIONS_PER_BATCH);
+        assert_eq!(batches[1].actions, vec![clear_at(hbm())]);
     }
 
     #[test]

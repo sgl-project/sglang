@@ -124,7 +124,9 @@ message MatchExternalKvPrefixRequest {
   repeated string hashes = 1;
 
   // Caller-supplied ceiling on how many leading blocks to consider. 0 means no
-  // caller ceiling; the server still bounds the scan with its own limit.
+  // caller ceiling: the server considers every block sent. Unlike the mutating
+  // RPCs, a prefix query is not rejected for length; its scan holds O(1) state
+  // per candidate worker, so length costs time rather than memory.
   uint32 max_blocks = 2;
 }
 

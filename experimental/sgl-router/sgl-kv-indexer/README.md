@@ -21,9 +21,12 @@ SGLang worker ── ZMQ PUB ──> bridge ── gRPC ──> in-memory indexe
 - Placement, worker metadata, reverse holdings, and hit counters live in that
   server process behind a single read/write lock.
 
-An apply batch is ordered and atomic within the process, and a query sees a
-consistent snapshot. There is no persistence, replication, or state sharing
-between Indexer servers.
+Each apply RPC is ordered and atomic within the process, and a query sees a
+consistent snapshot. The bridge splits larger worker event batches into
+ordered RPCs of at most 16,384 hashes and 256 actions while keeping per-hash
+metadata aligned. If a later RPC fails, earlier chunks may already be applied;
+there is no rollback or replay. There is no persistence, replication, or state
+sharing between Indexer servers.
 
 ## Operational contract
 
@@ -182,9 +185,18 @@ configured. The per-query deadline defaults to 100ms and can be changed with
 `--kv-indexer-query-timeout-ms`. The Router-side admission bound defaults to 32
 concurrent calls and can be changed with `--kv-indexer-query-max-inflight`.
 
-Prefix queries are capped at 2,048 blocks. A first-block miss returns
-immediately with `blocks_read=1`; otherwise the server computes the
-component-aware result from one consistent in-memory snapshot.
+Prefix queries carry no Indexer-imposed block cap beyond the caller's
+`max_blocks` ceiling — unlike applies and `MatchExternalKv`, which reject above
+16,384 hashes. The in-memory backend scans the request in one pass over a single
+consistent snapshot, holding O(1) matching state per candidate worker and
+considering only workers that hold the first block, so request length costs time
+but not memory. Server work is bounded by `max_blocks` when the caller supplies
+one and by the gRPC message-size limit. The Router's per-query deadline bounds
+how long it waits for an answer, but does not cancel a synchronous scan already
+in progress. A first-block miss returns immediately with `blocks_read=1`.
+
+Long scans hold the read lock throughout. Operators serving very long prompts
+should set `max_blocks` instead of relying on the message-size limit.
 
 ## Overload behavior and observability
 
