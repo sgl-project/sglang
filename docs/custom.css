@@ -231,8 +231,11 @@ html.dark table tbody tr:nth-child(even) td,
   --sgdb-muted: oklch(50% 0.02 258);
   --sgdb-line: oklch(90% 0.008 258);
   --sgdb-brand: oklch(57% 0.15 35);
-  --sgdb-serve: oklch(51% 0.09 255);
-  --sgdb-request: oklch(57% 0.12 45);
+  /* Accents stay in the brand's warm family — the materials are cool
+     neutrals, so identity comes from where the orange lands, not from
+     tinting the surfaces. Serve = brand orange, Request = amber. */
+  --sgdb-serve: oklch(56% 0.13 40);
+  --sgdb-request: oklch(60% 0.12 62);
   --sgdb-ok: oklch(52% 0.11 153);
   --sgdb-warn: oklch(59% 0.12 78);
   --sgdb-error: oklch(53% 0.16 25);
@@ -784,8 +787,8 @@ html.dark .sgd-command-builder, [data-theme="dark"] .sgd-command-builder {
   --sgdb-muted: oklch(71% 0.012 258);
   --sgdb-line: rgba(255, 255, 255, 0.09);
   --sgdb-brand: oklch(70% 0.14 40);
-  --sgdb-serve: oklch(73% 0.08 255);
-  --sgdb-request: oklch(73% 0.11 48);
+  --sgdb-serve: oklch(74% 0.11 45);
+  --sgdb-request: oklch(77% 0.1 64);
   --sgdb-ok: oklch(74% 0.11 153);
   --sgdb-warn: oklch(76% 0.11 78);
   --sgdb-error: oklch(73% 0.14 25);
