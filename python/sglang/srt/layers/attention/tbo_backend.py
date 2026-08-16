@@ -120,10 +120,10 @@ class TboAttnBackend(AttentionBackend):
                 forward_batch=child_fb_view, in_capture=False
             )
 
-    def shared_read_ends(self, forward_mode: ForwardMode) -> SharedReadEnds:
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Both the primary and the two children read; the record must cover all.
         return SharedReadEnds.max_of(
-            b.shared_read_ends(forward_mode) for b in (self.primary, *self.children)
+            b.shared_read_ends(fm) for b in (self.primary, *self.children)
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
