@@ -59,6 +59,7 @@ def _max_rel_diff(a, b):
     return max_abs, max_abs / max(ref_max, 1e-9)
 
 
+@requires_model
 def test_fused_gate_qmv_silu_mul_matches_unfused():
     """Kernel output matches ``nn.silu(gate_qmv) * x_up`` within bf16 ULP."""
     import mlx.nn as nn
