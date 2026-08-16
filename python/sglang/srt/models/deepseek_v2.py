@@ -476,16 +476,11 @@ class MoEGate(nn.Module):
         )
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
-            correction_bias_dtype = torch.float32
-            if quant_config is not None:
-                if _use_aiter and quant_config.get_name() in (
-                    "fp8",
-                    "compressed_tensors",
-                    "quark",
-                ):
-                    correction_bias_dtype = torch.bfloat16
+            # Always fp32: checkpoints store this in fp32, and every router-gemm
+            # branch (CUDA and aiter) now returns fp32 logits, so a bf16 copy here
+            # only loses precision without unblocking any downstream dtype match.
             self.e_score_correction_bias = nn.Parameter(
-                torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
+                torch.empty((config.n_routed_experts), dtype=torch.float32)
             )
         else:
             self.e_score_correction_bias = None
