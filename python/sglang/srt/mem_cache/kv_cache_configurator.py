@@ -288,7 +288,12 @@ class KVCacheConfigurator:
             quant_name,
             num_layers=num_layers,
             device=self.device,
+            page_size=self.page_size,
         )
+        prefill_backend, decode_backend = (
+            self.server_args._resolved_attention_backends()
+        )
+        quant_method.configure_attention_backends(prefill_backend, decode_backend)
         quant_method.load_scales_from_model(self.model)
         return quant_method
 

@@ -30,9 +30,10 @@ SGLang supports the following quantized KV cache formats:
 FP4 quantization is currently experimental.
 </Warning>
 
-[OCP (Open Compute Project)](https://www.opencompute.org) specifies MXFP4 (Microscaling FP4), a 4-bit floating-point format:
+[OCP (Open Compute Project)](https://www.opencompute.org) specifies MXFP4 (Microscaling FP4), a 4-bit floating-point format. SGLang exposes two experimental E2M1 KV-cache recipes:
 
-- **E2M1** (1 sign bit, 2 exponent bits, 1 mantissa bit): Uses block-based microscaling where tensors are divided into blocks of consecutive elements, with each block sharing a single 8-bit exponential scaling factor. While OCP specifies blocks of 32 elements, SGLang's current implementation uses blocks of 16 elements for KV cache quantization.
+- **`nvfp4`**: NVIDIA FP4 with 16-value blocks, E4M3 block scales, and a per-tensor global scale.
+- **`fp4_mx_block16`**: An E2M1 block-size-16 compatibility recipe. It is distinct from the standard OCP MXFP4 block-size-32 format.
 
 ## Usage
 
@@ -61,6 +62,40 @@ python3 -m sglang.launch_server \
     --model-path deepseek-ai/DeepSeek-R1-0528 \
     --kv-cache-dtype fp4_mx_block16 \
 ```
+
+### SM100 native NVFP4 recipes
+
+On SM100, FlashInfer's TRT-LLM GenMHA backend can consume the packed NVFP4 KV cache directly for both prefill and decode. Select the prefill recipe with the existing per-phase attention backend arguments.
+
+For native NVFP4 prefill and decode:
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3.5-35B-A3B-FP8 \
+    --tp-size 1 \
+    --kv-cache-dtype nvfp4 \
+    --prefill-attention-backend trtllm_mha \
+    --decode-attention-backend trtllm_mha \
+    --page-size 16
+```
+
+For FP8 prefill backed by a temporary dequantization workspace, with native NVFP4 decode:
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3.5-35B-A3B-FP8 \
+    --tp-size 1 \
+    --kv-cache-dtype nvfp4 \
+    --prefill-attention-backend flashinfer \
+    --decode-attention-backend trtllm_mha \
+    --page-size 16
+```
+
+The native recipe avoids allocating the FP8 dequantization workspace and its token-linear scale copy. The mixed recipe retains both the token-linear scales needed by FlashInfer prefill and the physical TRT-LLM scale layout needed by native decode. In both recipes, KV data remains stored as packed FP4.
+
+<Note>
+Native NVFP4 prefill requires SM100, a page size divisible by 4, and an attention head dimension divisible by 64. TRT-LLM GenMHA uses FP8 query and output buffers internally; SGLang converts the result back to the model activation dtype. SM120 XQA continues to use its architecture-specific linear scale layout and BF16 query/output path.
+</Note>
 
 ### Scaling Factors
 
@@ -113,6 +148,8 @@ FP4 and FP8 quantization require additional memory for block-based scaling facto
 </Note>
 
 This enables longer context lengths or more concurrent requests within the same memory budget.
+
+For native `nvfp4`, each logical scalar costs 0.5 bytes of packed FP4 data plus 1/16 byte of block-scale storage, compared with 2 bytes for BF16. The resulting theoretical KV-token capacity multiplier is `2 / 0.5625 = 3.56×`. The mixed SM100 recipe owns a second scale layout and a shared one-layer FP8 prefill workspace, so its exact capacity depends on the number of full-attention layers. SGLang includes those auxiliary buffers in its KV-pool sizing calculation.
 
 ### Accuracy Impact
 
