@@ -20,6 +20,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanCo
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
+    LongCatImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
@@ -32,6 +35,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 )
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import (
@@ -1145,6 +1149,32 @@ class TestOffloadDefaults(unittest.TestCase):
         # default keeps only vae resident (encoders are large, dit owned by FSDP)
         self.assertEqual(qwen_deployment.keep_resident_components, ("vae",))
         self.assertIsNone(qwen_deployment.keep_resident_min_available_gb)
+
+    def test_qwen_ar_generation_residency_scales_with_available_memory(self):
+        pipeline_configs = (
+            QwenImageLayeredPipelineConfig(),
+            LongCatImagePipelineConfig(),
+        )
+
+        for pipeline_config in pipeline_configs:
+            high_memory_args = self._from_dict_with_pipeline_config(
+                pipeline_config,
+                memory_gb=80,
+                kwargs={"performance_mode": "auto"},
+            )
+            self.assertNotIn(
+                "text_encoder", high_memory_args.layerwise_offload_components or []
+            )
+            self.assertFalse(high_memory_args.text_encoder_cpu_offload)
+
+            constrained_args = self._from_dict_with_pipeline_config(
+                pipeline_config,
+                memory_gb=60,
+                kwargs={"performance_mode": "auto"},
+            )
+            self.assertIn(
+                "text_encoder", constrained_args.layerwise_offload_components or []
+            )
 
     def test_auto_multi_gpu_sana_wm_prefers_fsdp_and_cfg_parallel(self):
         args = self._from_dict_with_pipeline_config(
