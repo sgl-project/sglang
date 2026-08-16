@@ -106,6 +106,27 @@ class SymmMemGather:
             _NUM_SLOTS,
         )
 
+        # Keep the default gather method untouched. Only opt-in processes bind
+        # the instrumented host path; that path uses the same CUDA operations,
+        # stream, and synchronization order as gather().
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY.get():
+            from sglang.srt.distributed.device_communicators.symm_mem_gather_telemetry import (
+                SymmMemGatherTelemetry,
+                register_symm_mem_gather_telemetry,
+            )
+
+            self._telemetry = SymmMemGatherTelemetry(
+                world_size=world_size,
+                group_rank=rank,
+                max_records=envs.SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY_MAX_RECORDS.get(),
+            )
+            self._host_ready_numpy = self._host_ready.numpy()
+            self._host_out_numpy = self._host_out.numpy()
+            register_symm_mem_gather_telemetry(self._telemetry)
+            self.gather = self._gather_with_telemetry
+
     def gather(self, local_row_cpu: torch.Tensor) -> torch.Tensor:
         """Host row in, (world_size, width) host rows out."""
         slot = self._slot
@@ -179,6 +200,75 @@ class SymmMemGather:
                 ):
                     pass
             if self._host_ready.all().item():
+                return self._host_out
+            if time.monotonic() >= deadline:
+                raise TimeoutError("symmetric-memory completion marker timeout")
+
+    def _gather_with_telemetry(self, local_row_cpu: torch.Tensor) -> torch.Tensor:
+        """Opt-in gather path with host-only observations after existing syncs."""
+        gather_start_ns = time.perf_counter_ns()
+        slot = self._slot
+        self._slot = (slot + 1) % _NUM_SLOTS
+
+        self._host_in.copy_(local_row_cpu)
+        with torch.cuda.stream(self._stream):
+            self._staging.copy_(self._host_in, non_blocking=True)
+            from sglang.srt.distributed.device_communicators.symm_mem_marker import (
+                copy_row_and_publish,
+            )
+
+            self._generation = self._generation % 0xFFFFFFFF + 1
+            copy_row_and_publish(
+                self._peer_row_ptrs[slot],
+                self._peer_marker_ptrs[slot],
+                self._staging,
+                self._generation,
+            )
+
+        record = self._telemetry.begin(
+            generation=self._generation,
+            slot=slot,
+            gather_start_ns=gather_start_ns,
+            local_row=local_row_cpu.numpy(),
+        )
+        from sglang.srt.distributed.device_communicators.symm_mem_marker import (
+            snapshot_rows_acquire,
+        )
+
+        deadline = time.monotonic() + _BARRIER_TIMEOUT_MS / 1000
+        while True:
+            poll_begin_ns = time.perf_counter_ns()
+            with torch.cuda.stream(self._stream):
+                snapshot_rows_acquire(
+                    self._region[slot],
+                    self._marker_region[slot],
+                    self._row_snapshot,
+                    self._ready,
+                    self._generation,
+                )
+                self._host_ready.copy_(self._ready, non_blocking=True)
+                self._host_out.copy_(self._row_snapshot, non_blocking=True)
+            sync_begin_ns = time.perf_counter_ns()
+            self._stream.synchronize()
+            sync_done_ns = time.perf_counter_ns()
+            if record is not None:
+                ready_mask = self._telemetry.note_poll(
+                    record,
+                    ready=self._host_ready_numpy,
+                    poll_begin_ns=poll_begin_ns,
+                    sync_begin_ns=sync_begin_ns,
+                    sync_done_ns=sync_done_ns,
+                )
+                all_ready = ready_mask == (1 << self._telemetry.world_size) - 1
+            else:
+                all_ready = self._host_ready.all().item()
+            if all_ready:
+                if record is not None:
+                    self._telemetry.finish(
+                        record,
+                        gather_done_ns=time.perf_counter_ns(),
+                        peer_rows=self._host_out_numpy,
+                    )
                 return self._host_out
             if time.monotonic() >= deadline:
                 raise TimeoutError("symmetric-memory completion marker timeout")
