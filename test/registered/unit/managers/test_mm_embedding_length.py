@@ -160,3 +160,9 @@ def test_get_embedding_and_mask_falls_back_after_input_ids_rewrite():
     assert result is embedding
     assert result_mask is mask
     assert result_input_ids is rewritten_input_ids
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
