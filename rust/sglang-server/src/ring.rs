@@ -15,19 +15,17 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::message::IngressMsg;
-
 /// Ingress: TokenizerManager → scheduler `recv_requests`.
 /// Producers are Rust TM workers; the single consumer is the Python thread.
-/// Carries [`IngressMsg`] (columnar: scalar header + raw int64 ids cell), not a
-/// single msgpack blob, so the large `input_ids` tensor bypasses msgpack.
+/// Carries each request's msgpack header only — `input_ids` cross via the
+/// [`InputIdsStore`](crate::input_ids_store::InputIdsStore), not the ring.
 #[derive(Clone)]
 pub struct IngressProducer {
-    tx: flume::Sender<IngressMsg>,
+    tx: flume::Sender<Bytes>,
 }
 
 pub struct IngressConsumer {
-    rx: flume::Receiver<IngressMsg>,
+    rx: flume::Receiver<Bytes>,
     /// One-slot buffer holding a message consumed by a blocking [`wait`] so the
     /// scheduler can park on idle without losing it — the next [`drain`] returns
     /// it first. Only ever touched by the single consumer (the Python thread),
@@ -36,52 +34,31 @@ pub struct IngressConsumer {
     ///
     /// [`wait`]: IngressConsumer::wait
     /// [`drain`]: IngressConsumer::drain
-    stash: Mutex<Option<IngressMsg>>,
-}
-
-/// A drained ingress batch in **columnar** (struct-of-arrays) form. The `ids`
-/// cells are kept *un-concatenated* so the pyo3 boundary can copy them straight
-/// into one `PyBytes` (no intermediate buffer); `ids_total` is their summed
-/// length, precomputed for that single allocation.
-#[derive(Default)]
-pub struct IngressColumns {
-    /// Per-request scalar msgpack header (`input_ids` omitted).
-    pub headers: Vec<Bytes>,
-    /// Per-request raw little-endian int64 ids cell (empty for control reqs).
-    pub ids: Vec<Bytes>,
-    /// Per-request token count (`ids` cell length / 8).
-    pub lengths: Vec<u32>,
-    /// Sum of all `ids` cell byte lengths.
-    pub ids_total: usize,
+    stash: Mutex<Option<Bytes>>,
 }
 
 impl IngressProducer {
     /// Non-blocking push. Returns `false` on a full ring (backpressure) so the
     /// caller can fail the request rather than block a worker thread.
     #[inline]
-    pub fn try_push(&self, msg: IngressMsg) -> bool {
+    pub fn try_push(&self, msg: Bytes) -> bool {
         self.tx.try_send(msg).is_ok()
     }
 }
 
 impl IngressConsumer {
-    /// Drain up to `max` messages into a columnar [`IngressColumns`], returning
-    /// immediately when the ring runs dry — mirrors the scheduler's existing
-    /// `zmq.NOBLOCK` loop in `request_receiver._pull_raw_reqs`. Splitting headers
-    /// from ids here (off the GIL) leaves `recv_requests` a thin marshaling shim.
-    ///
-    /// Non-blocking by construction: `try_recv` returns `Err(TryRecvError::Empty)`
-    /// instantly when the ring is empty, and `Err(_) => break` exits the loop
-    /// right away.
-    pub fn drain(&self, max: usize) -> IngressColumns {
-        let mut batch = IngressColumns::default();
+    /// Drain up to `max` headers, returning immediately when the ring runs dry
+    /// — mirrors the scheduler's existing `zmq.NOBLOCK` loop in
+    /// `request_receiver._pull_raw_reqs`.
+    pub fn drain(&self, max: usize) -> Vec<Bytes> {
+        let mut batch = Vec::new();
         // A message parked by a prior blocking `wait` is delivered first.
         if let Some(m) = self.stash.lock().unwrap().take() {
-            push_msg(&mut batch, m);
+            batch.push(m);
         }
-        while batch.headers.len() < max {
+        while batch.len() < max {
             match self.rx.try_recv() {
-                Ok(m) => push_msg(&mut batch, m),
+                Ok(m) => batch.push(m),
                 Err(_) => break, // Empty or Disconnected -> stop now
             }
         }
@@ -106,15 +83,6 @@ impl IngressConsumer {
             Err(_) => false, // Timeout or Disconnected
         }
     }
-}
-
-/// Append one drained message's columnar cells to the batch.
-#[inline]
-fn push_msg(batch: &mut IngressColumns, m: IngressMsg) {
-    batch.ids_total += m.ids.len();
-    batch.lengths.push((m.ids.len() / 8) as u32); // int64 cell → tokens
-    batch.headers.push(m.header);
-    batch.ids.push(m.ids);
 }
 
 /// Egress: scheduler output (`push_chunk`) → Rust egress dispatcher.
@@ -187,13 +155,6 @@ pub fn egress_ring(cap: usize) -> (EgressProducer, EgressConsumer) {
 mod tests {
     use super::*;
 
-    fn msg(h: &'static [u8]) -> IngressMsg {
-        IngressMsg {
-            header: Bytes::from_static(h),
-            ids: Bytes::new(),
-        }
-    }
-
     /// `wait` parks when empty (times out), stashes a pushed message
     /// non-destructively, and the next `drain` returns it.
     #[test]
@@ -202,13 +163,13 @@ mod tests {
         // Empty ring → times out, nothing stashed.
         assert!(!rx.wait(Duration::from_millis(1)));
         // Push one, then wait stashes it (returns true).
-        assert!(tx.try_push(msg(b"a")));
+        assert!(tx.try_push(Bytes::from_static(b"a")));
         assert!(rx.wait(Duration::from_millis(200)));
         // Idempotent: already stashed, returns true without touching the ring.
         assert!(rx.wait(Duration::from_millis(1)));
         // Drain yields the stashed message, then the ring is empty.
-        assert_eq!(rx.drain(16).headers.len(), 1);
-        assert!(rx.drain(16).headers.is_empty());
+        assert_eq!(rx.drain(16).len(), 1);
+        assert!(rx.drain(16).is_empty());
     }
 
     /// A blocked `wait` is woken the instant a producer pushes (no polling).
@@ -217,12 +178,12 @@ mod tests {
         let (tx, rx) = ingress_ring(8);
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
-            let _ = tx.try_push(msg(b"a"));
+            let _ = tx.try_push(Bytes::from_static(b"a"));
         });
         // Generous timeout, but it should return well before it as soon as the
         // push lands.
         assert!(rx.wait(Duration::from_secs(5)));
-        assert_eq!(rx.drain(16).headers.len(), 1);
+        assert_eq!(rx.drain(16).len(), 1);
     }
 
     /// A full egress ring parks the producer until the consumer drains — the

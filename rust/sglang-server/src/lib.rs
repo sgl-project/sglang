@@ -16,6 +16,7 @@ mod environ;
 mod error;
 mod fsm;
 mod ids;
+mod input_ids_store;
 mod message;
 mod mm;
 mod ring;
@@ -49,19 +50,6 @@ struct MmEncodedResult {
     /// Flattened `[3, input_len]`; the drain reshapes to `(3, -1)`.
     mrope: Py<numpy::PyArray1<i64>>,
     mrope_delta: i64,
-}
-
-/// Columnar ingress batch handed to Python by [`Server::recv_requests`].
-/// `frozen`: immutable snapshot, so field access never contends on a borrow.
-#[pyclass(frozen, get_all)]
-struct IngressBatch {
-    /// One msgpack scalar header per request (`input_ids` omitted).
-    headers: Vec<Py<PyBytes>>,
-    /// The raw-data plane today just all requests' raw little-endian int64
-    /// ids, concatenated; sliced per request via `lengths`.
-    data: Py<PyBytes>,
-    /// Per-request token count (0 for control requests).
-    lengths: Vec<u32>,
 }
 
 /// Handle owned by the Python scheduler process. Construct once via
@@ -135,10 +123,9 @@ impl Server {
         Ok(Server { rt })
     }
 
-    /// Non-blocking drain of the ingress ring, returned **columnar** as an
-    /// [`IngressBatch`] so the large `input_ids` tensor never goes through
-    /// msgpack (see the field docs for the layout). The `ids` cells are copied
-    /// **directly into the result `bytes`** (one copy, no intermediate buffer).
+    /// Non-blocking drain of the ingress ring: one msgpack header per request.
+    /// A generate request's `input_ids` never ride the ring — pop them via
+    /// [`Server::take_input_ids`].
     ///
     /// Runs entirely GIL-held, deliberately. `drain` is a `try_recv` loop plus an
     /// uncontended stash lock (the Python thread is the only consumer), so it
@@ -148,29 +135,13 @@ impl Server {
     /// thread was runnable, to cover ~0.2 µs of work. Held, the whole call is a
     /// fraction of a microsecond on an empty ring.
     #[pyo3(signature = (max = 256))]
-    fn recv_requests(&self, py: Python<'_>, max: usize) -> PyResult<IngressBatch> {
-        let cols = self.rt.ingress.drain(max);
-        let headers = cols
-            .headers
+    fn recv_requests(&self, py: Python<'_>, max: usize) -> Vec<Py<PyBytes>> {
+        self.rt
+            .ingress
+            .drain(max)
             .iter()
             .map(|h| PyBytes::new(py, h).unbind())
-            .collect();
-        // Single pass: copy each raw ids cell straight into the output `bytes`.
-        let data = PyBytes::new_with(py, cols.ids_total, |buf| {
-            let mut pos = 0;
-            for cell in &cols.ids {
-                let end = pos + cell.len();
-                buf[pos..end].copy_from_slice(cell);
-                pos = end;
-            }
-            Ok(())
-        })?
-        .unbind();
-        Ok(IngressBatch {
-            headers,
-            data,
-            lengths: cols.lengths,
-        })
+            .collect()
     }
 
     /// Park up to `timeout_ms` for an incoming request so the idle scheduler loop
@@ -262,6 +233,16 @@ impl Server {
         })
     }
 
+    /// Pop the parked `input_ids` for `rid` — parked strictly before the
+    /// header reached the ring, so always present for a drained generate
+    /// request. The vector becomes a 1-D int64 numpy array that takes
+    /// **ownership** — no copy, as `take_mm`.
+    fn take_input_ids(&self, py: Python<'_>, rid: &str) -> Option<Py<numpy::PyArray1<i64>>> {
+        use numpy::IntoPyArray;
+
+        Some(self.rt.input_ids_store.take(rid)?.into_pyarray(py).unbind())
+    }
+
     /// Signal all threads to stop (best effort).
     fn shutdown(&self) {
         self.rt.request_shutdown();
@@ -307,7 +288,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .with_writer(writer)
         .try_init();
     m.add_class::<Server>()?;
-    m.add_class::<IngressBatch>()?;
     m.add_class::<MmEncodedResult>()?;
     Ok(())
 }

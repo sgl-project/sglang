@@ -43,6 +43,9 @@ pub struct Runtime {
     /// MM results parked between a worker's `MmEncoded` and the scheduler drain
     /// (`Server.take_mm`).
     pub mm_results: crate::mm::MmResultStore,
+    /// `input_ids` parked between the ring push and the scheduler drain
+    /// (`Server.take_input_ids`).
+    pub input_ids_store: crate::input_ids_store::InputIdsStore,
     /// Wiring for the late-spawned MM pool ([`Runtime::start_mm_workers`]).
     mm_wiring: crate::mm::MmWiring,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
@@ -186,6 +189,9 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // Shared: MM workers park, the Python drain pops, tm-ingress purges.
     let mm_results: crate::mm::MmResultStore = Default::default();
 
+    // Shared like `mm_results`: the push path parks/purges, the Python drain pops.
+    let input_ids_store = crate::input_ids_store::InputIdsStore::default();
+
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
         // Default: a real tokenizer decodes to text. `None` (→ `Skip`, raw
@@ -271,6 +277,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         };
         let mut parts = Some((tm_rx, ingress_tx)); // moved into the single worker
         let shutdown_rx = shutdown_rx.clone();
+        let ids_store = input_ids_store.clone();
         spawn_pool("tm-ingress", cores, 1, &mut threads, |_| {
             let (tm_rx, ingress_tx) = parts.take().unwrap();
             tokenizer_manager::Ingress::new(
@@ -280,6 +287,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 ingress_tx,
                 limits.clone(),
                 mm.clone(),
+                ids_store.clone(),
                 shutdown_rx.clone(),
             )
         });
@@ -333,6 +341,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         ingress: ingress_rx,
         egress: egress_tx,
         mm_results,
+        input_ids_store,
         mm_wiring: crate::mm::MmWiring {
             mm_rx,
             tm_tx,

@@ -692,16 +692,16 @@ impl GenerateRequest {
         TokenizedGenerateReqInput::from(self).encode()
     }
 
-    /// `input_ids` widened to raw little-endian int64 bytes (the scheduler's
-    /// `array("q")` columnar cell — rides the ingress ring outside msgpack). Empty
-    /// when not tokenized.
-    pub fn encode_data_buf(&self) -> Bytes {
-        let ids = self.input_ids.as_deref().unwrap_or(&[]);
-        let mut buf = Vec::with_capacity(ids.len() * 8);
-        for &id in ids {
-            buf.extend_from_slice(&(id as i64).to_le_bytes());
-        }
-        Bytes::from(buf)
+    /// `input_ids` widened to owned int64 for the `InputIdsStore` (Python
+    /// wraps the vector as the scheduler's int64 `array("q")`). Empty when
+    /// not tokenized.
+    pub fn input_ids_i64(&self) -> Vec<i64> {
+        self.input_ids
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|&id| id as i64)
+            .collect()
     }
 }
 
