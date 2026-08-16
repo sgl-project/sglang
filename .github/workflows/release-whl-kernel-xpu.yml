@@ -18,8 +18,8 @@ concurrency:
 
 jobs:
   build-xpu:
-    if: github.repository == 'sgl-project/sglang'
-    runs-on: sglang-bmg
+    if: github.repository == 'sgl-project/sgl-kernel-xpu'
+    runs-on: x64-docker-build-node
     strategy:
       matrix:
         python-version: ["3.10"]
@@ -48,12 +48,11 @@ jobs:
           echo "Building sgl-kernel-xpu ${TAG_NAME} from ${BRANCH}"
 
       - name: Build native XPU Docker image
-        timeout-minutes: 120
         run: |
           set -euo pipefail
           IMAGE="sglang-xpu-kernel-release:${{ steps.xpu_meta.outputs.version }}"
           docker build . \
-            -f docker/xpu.Dockerfile \
+            -f Dockerfile.xpu_kernel \
             --build-arg PYTHON_VERSION=${{ matrix.python-version }} \
             --build-arg SG_LANG_REPO=https://github.com/sgl-project/sglang.git \
             --build-arg SG_LANG_BRANCH=main \
@@ -64,19 +63,18 @@ jobs:
           echo "XPU_IMAGE=${IMAGE}" >> "$GITHUB_ENV"
 
       - name: Build and export XPU kernel wheels
-        timeout-minutes: 360
         run: |
           set -euo pipefail
           docker rm -f sgl_kernel_xpu_release_build || true
           docker run -dt \
             --device /dev/dri/ \
             --name sgl_kernel_xpu_release_build \
-            -e CMAKE_BUILD_PARALLEL_LEVEL=128 \
-            -e MAX_JOBS=128 \
+            -e CMAKE_BUILD_PARALLEL_LEVEL=64 \
+            -e MAX_JOBS=64 \
             "${XPU_IMAGE}" \
             /bin/bash -lc 'sleep infinity'
           docker exec \
-            -w /sgl-workspace/sgl-kernel-xpu \
+            -w /root/sglang/sgl-kernel-xpu \
             sgl_kernel_xpu_release_build \
             /bin/bash -lc '
               set -exo pipefail
@@ -86,7 +84,7 @@ jobs:
               ls -lh dist
             '
           mkdir -p python/sglang/kernels/aot/dist
-          docker cp sgl_kernel_xpu_release_build:/sgl-workspace/sgl-kernel-xpu/dist/. python/sglang/kernels/aot/dist/
+          docker cp sgl_kernel_xpu_release_build:/root/sglang/sgl-kernel-xpu/dist/. python/sglang/kernels/aot/dist/
           ls -lh python/sglang/kernels/aot/dist/
 
       - name: Cleanup XPU kernel build container
