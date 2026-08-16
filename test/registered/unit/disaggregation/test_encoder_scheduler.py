@@ -8,8 +8,6 @@ from sglang.srt.disaggregation.encode_server import (
     PendingRequest,
     _resolve_encoder_batch_policy,
 )
-from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.multimodal.encoder_preprocessing import EncoderArtifactCacheConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -72,7 +70,6 @@ def test_scheduler_coalesces_concurrent_submissions():
     class FakeEncoder:
         def __init__(self):
             self.encode_dispatch_lock = asyncio.Lock()
-            self.mm_global_cache = None
             self.batches = []
 
         async def batch_encode(self, requests, _modality):
@@ -112,49 +109,16 @@ def test_scheduler_coalesces_concurrent_submissions():
 
 
 @pytest.mark.parametrize(
-    ("config", "configured", "explicit", "expected"),
+    ("model_type", "configured", "explicit", "expected"),
     [
-        (
-            (
-                EncoderArtifactCacheConfig(
-                    modality=Modality.IMAGE,
-                    coalesce_same_turn=True,
-                    default_max_batch_size=2,
-                ),
-            ),
-            8,
-            False,
-            (2, True),
-        ),
-        (
-            (
-                EncoderArtifactCacheConfig(
-                    modality=Modality.IMAGE,
-                    coalesce_same_turn=True,
-                    default_max_batch_size=2,
-                ),
-            ),
-            8,
-            True,
-            (8, True),
-        ),
-        (
-            (
-                EncoderArtifactCacheConfig(
-                    modality=Modality.IMAGE,
-                    coalesce_same_turn=True,
-                    default_max_batch_size=2,
-                ),
-            ),
-            1,
-            False,
-            (1, True),
-        ),
-        ((), 8, False, (8, False)),
+        ("kimi_k3", 8, False, (2, True)),
+        ("kimi_k3", 8, True, (8, True)),
+        ("kimi_k3", 1, False, (1, True)),
+        ("qwen3_vl", 8, False, (8, False)),
     ],
 )
-def test_resolve_encoder_batch_policy(config, configured, explicit, expected):
-    assert _resolve_encoder_batch_policy(config, configured, explicit) == expected
+def test_resolve_encoder_batch_policy(model_type, configured, explicit, expected):
+    assert _resolve_encoder_batch_policy(model_type, configured, explicit) == expected
 
 
 if __name__ == "__main__":

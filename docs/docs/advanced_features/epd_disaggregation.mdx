@@ -94,28 +94,6 @@ Notes:
 - It can be enabled regardless of which `--encoder-transfer-backend` you use.
 - It is most relevant for EPD or encoder-disaggregated VLM deployments where the same images are likely to appear across requests or instances.
 
-### Kimi-K3 preprocessing reuse
-
-Kimi-K3 encoder servers enable a bounded CPU preprocess cache by default. Add
-`--enable-prefix-mm-cache` on the encoder to pair it with the local embedding
-cache: a repeated image can then skip decode, preprocessing, and ViT. It skips
-the source read only with a trusted content-hash metadata hit.
-`--enable-mm-global-cache` adds cross-encoder Mooncake reuse; it does not replace
-the local preprocess cache.
-
-The three mechanisms are independent:
-
-| Mechanism | Location | What a hit skips |
-|---|---|---|
-| Preprocess cache | Encoder CPU | Identity-to-processor metadata work; CPU artifacts when available |
-| Local prefix MM cache | One encoder | Decode, preprocessing, and ViT for a complete hit |
-| Global MM cache | Mooncake | ViT across encoder instances |
-
-The selected EPD backend still transfers the final encoder embedding to the
-language service. Use `--mm-preprocess-cache-size-mb 0` to disable early reuse.
-See [VLM preprocessing and caching](./vlm_preprocessing_cache) for content hashes,
-flush behavior, memory use, and metrics.
-
 #### Qwen VL
 
 - EP Disaggregation

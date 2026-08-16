@@ -72,9 +72,6 @@ feature identities. This prevents the legacy 30-bit multimodal pad sentinel
 from turning a collision into incorrect language-model KV reuse. Requests with
 different media therefore do not share a Radix namespace; repeated turns with
 the same ordered media still do.
-K3 global embedding-cache keys likewise retain the full feature identity. A
-caller-provided legacy cache key is namespaced by that identity and cannot
-replace it.
 Legacy `mm_hashes` can still select the external-router and pad sentinel, but
 K3 keeps its processor-derived embedding key separately so a caller hash cannot
 redirect an embedding lease.
@@ -221,34 +218,6 @@ because it intentionally removes the stable processor-output identity.
 `POST /flush_cache`, model updates that request a cache flush, and server
 shutdown clear preprocess entries and outstanding embedding leases.
 
-## EPD behavior
-
-In EPD, the preprocess cache lives on the encoder server. Add
-`--enable-prefix-mm-cache` to the encoder to let repeated images skip decode,
-encoder preprocessing, and ViT through its local embedding cache. The source
-read is also skipped on a trusted-hash metadata hit. Add
-`--enable-mm-global-cache` when multiple encoder instances should share ViT
-embeddings through Mooncake.
-
-```bash
-# Encoder role
-sglang serve --model-path moonshotai/Kimi-K3 \
-  --encoder-only \
-  --enable-prefix-mm-cache \
-  --port 30000
-
-# Language role
-sglang serve --model-path moonshotai/Kimi-K3 \
-  --language-only \
-  --encoder-urls http://ENCODER_HOST:30000 \
-  --port 30002
-```
-
-The local preprocess cache, local encoder embedding cache, and optional global
-Mooncake cache are distinct. An encoder embedding hit still has to deliver the
-embedding to the language service using the selected EPD transfer backend; it
-does not consume a CUDA IPC/VMM processor-feature pool.
-
 ## Metrics and failure behavior
 
 With `--enable-metrics`, use these low-cardinality metric families:
@@ -270,8 +239,8 @@ internal cold-path retry.
 
 ## Support matrix
 
-| Model and modality | Early per-media artifact reuse | Ordinary serving | EPD |
-|---|---:|---:|---:|
-| Kimi-K3 image | Supported | Supported | Supported |
-| Qwen3-VL image | Planned | Existing cache path only | Existing cache path only |
-| Qwen3-VL video | Planned; requires FPS/frame-sampling identity | Existing cache path only | Existing cache path only |
+| Model and modality | Early per-media artifact reuse | Ordinary serving |
+|---|---:|---:|
+| Kimi-K3 image | Supported | Supported |
+| Qwen3-VL image | Planned | Existing cache path only |
+| Qwen3-VL video | Planned; requires FPS/frame-sampling identity | Existing cache path only |

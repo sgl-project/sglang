@@ -814,15 +814,4 @@ class KimiK3ImageProcessor(
             item.offsets = [(start, start + count - 1)]
             search_start = start + count
 
-        feature_identities = kwargs.get("mm_feature_identities")
-        if feature_identities is not None:
-            if len(feature_identities) != len(output.mm_items):
-                raise ValueError(
-                    "Expected one feature identity for each K3 encoder grid."
-                )
-            for item, identity in zip(output.mm_items, feature_identities):
-                item.model_specific_data[MM_EMBEDDING_CACHE_IDENTITY_KEY] = identity
-                item.model_specific_data[MM_EMBEDDING_CACHE_HASH_KEY] = (
-                    compact_feature_hash(identity)
-                )
         return output
