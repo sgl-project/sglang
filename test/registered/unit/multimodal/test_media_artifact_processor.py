@@ -3,6 +3,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Optional
+from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import MultimodalPreprocessCache, snapshot_media
@@ -45,6 +46,11 @@ class _FutureMediaInput:
     url: str
     content_hash: Optional[str] = None
     frame_sampling: int = 2
+
+
+@dataclass(frozen=True)
+class _Request:
+    mm_content_hashes: Optional[list[Optional[str]]] = None
 
 
 class _Processor(MediaArtifactCacheMixin):
@@ -91,6 +97,23 @@ class _Processor(MediaArtifactCacheMixin):
 
 
 class TestMediaArtifactProcessor(unittest.TestCase):
+    def test_skip_compute_hash_disables_artifact_reuse(self):
+        processor = _Processor()
+        try:
+            with patch(
+                "sglang.srt.multimodal.media_artifacts.base."
+                "envs.SGLANG_MM_SKIP_COMPUTE_HASH.get",
+                return_value=True,
+            ):
+                lookup = asyncio.run(
+                    processor.lookup_preprocess_cache([b"image"], _Request())
+                )
+        finally:
+            processor.close()
+
+        self.assertIsNone(lookup)
+        self.assertEqual(len(processor.mm_preprocess_cache), 0)
+
     def test_unknown_model_option_is_part_of_artifact_identity(self):
         processor = _Processor()
         digest = snapshot_media(b"image").content_digest

@@ -33,6 +33,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import (
     CacheLookup,
@@ -123,6 +124,14 @@ class MediaArtifactCacheMixin:
     artifact_modality: Optional[Modality] = None
     artifact_option_defaults: Mapping[str, Any] = {"detail": "auto"}
     supports_early_mm_cache = True
+
+    @property
+    def media_artifact_cache_enabled(self) -> bool:
+        """Whether stable artifact identities are available for cache reuse."""
+        return (
+            self.mm_preprocess_cache.enabled
+            and not envs.SGLANG_MM_SKIP_COMPUTE_HASH.get()
+        )
 
     def artifact_preprocess_kwargs(
         self, source: Any, modality: Modality
@@ -370,7 +379,7 @@ class MediaArtifactCacheMixin:
     ) -> Optional[PreprocessCacheLookup]:
         """Expose per-media metadata to the scheduler embedding-lease path."""
         if (
-            not self.mm_preprocess_cache.enabled
+            not self.media_artifact_cache_enabled
             or not media_data
             or any(self._is_preprocessed_input(item) for item in media_data)
         ):

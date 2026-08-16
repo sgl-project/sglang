@@ -757,7 +757,7 @@ class KimiK3ImageProcessor(
                 )
         if (
             any(self._is_preprocessed_input(item) for item in image_data)
-            or not self.mm_preprocess_cache.enabled
+            or not self.media_artifact_cache_enabled
         ):
             # 1. keep preprocessed inputs and cache-off requests on the legacy path
             return await self._process_mm_data_uncached(

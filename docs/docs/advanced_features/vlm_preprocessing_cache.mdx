@@ -215,6 +215,9 @@ SGLANG_VLM_CACHE_SIZE_MB=0 sglang serve \
   --mm-preprocess-cache-size-mb 0
 ```
 
+`SGLANG_MM_SKIP_COMPUTE_HASH=1` also bypasses artifact and embedding reuse,
+because it intentionally removes the stable processor-output identity.
+
 `POST /flush_cache`, model updates that request a cache flush, and server
 shutdown clear preprocess entries and outstanding embedding leases.
 
