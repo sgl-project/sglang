@@ -52,6 +52,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_config,
     get_diffusers_component_config,
+    load_dict,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
@@ -344,6 +345,9 @@ class TextEncoderLoader(ComponentLoader):
 
         encoder_config = server_args.pipeline_config.text_encoder_configs[encoder_index]
         encoder_config.update_model_arch(model_config)
+        encoder_config.generation_config = load_dict(
+            os.path.join(component_model_path, "generation_config.json")
+        )
 
         if encoder_index == 0:
             for key, value in diffusers_pretrained_config.__dict__.items():

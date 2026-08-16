@@ -322,6 +322,7 @@ class ImageEncodingStage(PipelineStage):
                             pixel_values=image_inputs.pixel_values,
                             image_grid_thw=image_inputs.image_grid_thw,
                             output_hidden_states=True,
+                            use_cache=False,
                         )
                         if batch.do_classifier_free_guidance:
                             neg_outputs = self.text_encoder(
@@ -330,6 +331,7 @@ class ImageEncodingStage(PipelineStage):
                                 pixel_values=neg_image_inputs.pixel_values,
                                 image_grid_thw=neg_image_inputs.image_grid_thw,
                                 output_hidden_states=True,
+                                use_cache=False,
                             )
 
                 prompt_embeds, prompt_embeds_mask, prompt_seq_lens = (
