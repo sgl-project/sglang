@@ -2,6 +2,7 @@
     "metadata": {
         "model": "Diffusion Server",
         "hardware": "CI RTX 5090 pool",
+        "source_revision": "e9fe58139f48ec2a22fe4000ef604fc6862b1bfe",
         "description": "Reference numbers captured from real 5090 CI runner history (PR 29791 run 28492141274, job 84450974283).",
         "last_updated": "2026-07-01"
     },

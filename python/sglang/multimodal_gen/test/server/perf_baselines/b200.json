@@ -2,6 +2,7 @@
     "metadata": {
         "model": "Diffusion Server",
         "hardware": "CI B200 pool",
+        "source_revision": "e9fe58139f48ec2a22fe4000ef604fc6862b1bfe",
         "description": "Reference estimates for B200-only diffusion cases, split out from the shared diffusion baseline file.",
         "last_updated": "2026-07-01"
     },
