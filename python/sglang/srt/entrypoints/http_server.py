@@ -2688,9 +2688,9 @@ def _start_native_grpc_server_for_runtime(
     scheduler_info,
 ):
     from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
-    from sglang.srt.rust_extension import load_rust_extension
+    from sglang.srt.rust_extensions import load_rust_extension
 
-    grpc_native = load_rust_extension("sglang.srt.grpc._core")
+    grpc_native = load_rust_extension("sglang.srt.rust_extensions._grpc")
 
     runtime_handle = RuntimeHandle(
         tokenizer_manager=tokenizer_manager,

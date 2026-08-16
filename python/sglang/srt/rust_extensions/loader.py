@@ -42,7 +42,7 @@ _BUILD_ENVIRONMENT_VARIABLES = (
     "RUSTFLAGS",
 )
 
-_RUST_WORKSPACE = Path(__file__).resolve().parents[3] / "rust"
+_RUST_WORKSPACE = Path(__file__).resolve().parents[4] / "rust"
 
 
 @dataclass(frozen=True)

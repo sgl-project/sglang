@@ -11,9 +11,9 @@ from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 from transformers.image_utils import ImageInput
 
 from sglang.srt.multimodal.inkling.image_processing import _load_image_bytes
-from sglang.srt.rust_extension import load_rust_extension
+from sglang.srt.rust_extensions import load_rust_extension
 
-_rs = load_rust_extension("sglang.srt.multimodal._core").inkling
+_rs = load_rust_extension("sglang.srt.rust_extensions._multimodal").inkling
 
 
 def _bits_to_bthwc(

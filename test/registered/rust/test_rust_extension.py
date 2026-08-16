@@ -12,7 +12,8 @@ from tempfile import TemporaryDirectory
 from types import ModuleType
 from unittest import mock
 
-from sglang.srt import rust_extension
+from sglang.srt.rust_extensions import load_rust_extension
+from sglang.srt.rust_extensions import loader as rust_extension
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -74,7 +75,7 @@ crate-type = ["cdylib"]
             mock.patch.object(rust_extension, "_cargo_build") as cargo_build,
         ):
             self.assertIs(
-                rust_extension.load_rust_extension(
+                load_rust_extension(
                     "demo._core", mode="auto", workspace=Path("/workspace/not-present")
                 ),
                 bundled,
@@ -318,10 +319,20 @@ crate-type = ["cdylib"]
 
     def test_checked_in_crates_are_discovered_from_wheel_metadata(self):
         for python_module, package, library, features in (
-            ("sglang.srt.server._core", "sglang-server", "sglang_server", ()),
-            ("sglang.srt.grpc._core", "sglang-grpc", "sglang_grpc_core", ()),
             (
-                "sglang.srt.multimodal._core",
+                "sglang.srt.rust_extensions._server",
+                "sglang-server",
+                "sglang_server",
+                (),
+            ),
+            (
+                "sglang.srt.rust_extensions._grpc",
+                "sglang-grpc",
+                "sglang_grpc_core",
+                (),
+            ),
+            (
+                "sglang.srt.rust_extensions._multimodal",
                 "sglang-mm",
                 "sglang_mm_core",
                 ("python", "parallel"),
