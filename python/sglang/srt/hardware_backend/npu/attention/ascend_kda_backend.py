@@ -135,9 +135,9 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         # (transposed from the shared KDA [channels, window]). Expose the
         # transposed shape so _init_track_conv_indices reads
         # conv_states_shape[-1] as the conv window length.
-        conv_pool_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
-        )
+        conv_pool_shape = model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[
+            0
+        ].shape
         self.conv_states_shape = torch.Size(
             (
                 *conv_pool_shape[:-2],
@@ -147,17 +147,20 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         )
         self.kernel_dispatcher.extend_kernel = _AscendKDAExtendKernel()
 
-    def _get_conv_weights_t(self, layer: RadixLinearAttention) -> torch.Tensor:
+    def _get_conv_weights_t(
+        self, layer: RadixLinearAttention, dtype: torch.dtype
+    ) -> torch.Tensor:
         """Transposed conv weights [width, dim], cached on the layer.
 
         The NPU causal_conv1d CANN op expects weight as [width, dim]
         (transposed from layer.conv_weights [dim, width]) and requires
         weight dtype to match the input. KDA keeps conv_weights in FP32
-        while inputs/conv_states are BF16, so cast at call sites.
+        while inputs/conv_states are BF16, so the cached FP32 transpose is
+        cast to the caller's dtype here.
         """
         w = getattr(layer, "_conv_weights_t", None)
         if w is None:
-            w = layer.conv_weights.transpose(0, 1).contiguous()
+            w = layer.conv_weights.transpose(0, 1).contiguous().to(dtype)
             layer._conv_weights_t = w
         return w
 
@@ -180,7 +183,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
 
         qkv = torch.ops.npu.causal_conv1d(
             mixed_qkv.contiguous(),
-            self._get_conv_weights_t(layer).to(mixed_qkv.dtype),
+            self._get_conv_weights_t(layer, mixed_qkv.dtype),
             conv_states=conv_states,
             bias=layer.bias,
             query_start_loc=query_start_loc,
@@ -279,11 +282,9 @@ class AscendKDAAttnBackend(KDAAttnBackend):
 
         kernel_size = layer.conv_weights.shape[-1]
         conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :].contiguous()
-        #if torch.distributed.get_rank() == 0:
-        #    print("************mixed_qkv ",mixed_qkv[:10,:10]," shape ",mixed_qkv.shape,flush=True)
         mixed_qkv = torch.ops.npu.causal_conv1d(
             mixed_qkv.contiguous(),
-            self._get_conv_weights_t(layer).to(mixed_qkv.dtype),
+            self._get_conv_weights_t(layer, mixed_qkv.dtype),
             conv_states=conv_states_for_prefill,
             bias=layer.bias,
             query_start_loc=query_start_loc,
@@ -294,13 +295,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             run_mode=0,
         )
         conv_states[:, -(kernel_size - 1) :, :] = conv_states_for_prefill
-        q, k, v = mixed_qkv.split(
-            [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
-        )
-        #if torch.distributed.get_rank() == 0:
-        #    print("************q ",q[:10,:10]," shape ",q.shape,flush=True)
-        #    print("************k ",k[:10,:10]," shape ",k.shape,flush=True)
-        #    print("************v ",v[:10,:10]," shape ",v.shape,flush=True)
+        q, k, v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
@@ -423,7 +418,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         )
         processed_qkv = torch.ops.npu.causal_conv1d(
             dense_qkv.reshape(num_dense_tokens, -1).contiguous(),
-            self._get_conv_weights_t(layer).to(mixed_qkv.dtype),
+            self._get_conv_weights_t(layer, mixed_qkv.dtype),
             conv_states=conv_states,
             bias=layer.bias,
             query_start_loc=dense_query_start_loc,
