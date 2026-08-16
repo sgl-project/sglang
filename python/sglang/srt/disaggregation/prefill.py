@@ -224,7 +224,13 @@ class PrefillBootstrapQueue:
             else getattr(self.token_to_kv_pool, "end_layer", None)
         )
 
-        if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
+        use_dspark_draft_kv_state = self.scheduler.spec_algorithm.is_dspark()
+
+        if (
+            self.draft_token_to_kv_pool is not None
+            and transfer_draft_cache
+            and not use_dspark_draft_kv_state
+        ):
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -239,7 +245,10 @@ class PrefillBootstrapQueue:
         kv_args.kv_item_lens = kv_item_lens
         kv_args.kv_layer_ids = (
             self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
+            if (
+                self.draft_token_to_kv_pool is None
+                or use_dspark_draft_kv_state
+            )
             and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
             else []
         )
@@ -263,6 +272,7 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
+            use_dspark_draft_kv_state=use_dspark_draft_kv_state,
         )
 
         if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
@@ -1250,9 +1260,21 @@ class SchedulerDisaggregationPrefillMixin:
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
+
+            def _dspark_draft_kv_payload():
+                return (
+                    self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, :transfer_input_len
+                    ]
+                    .cpu()
+                    .numpy()
+                    .astype(np.int32)
+                )
+
             # MINIMAX_INDEX_K reuses _dsa_payload: index rows live at the same loc
             # as main KV on the same page_size.
             payloads = {
+                StateType.DSPARK_DRAFT_KV: _dspark_draft_kv_payload,
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _dsa_payload,

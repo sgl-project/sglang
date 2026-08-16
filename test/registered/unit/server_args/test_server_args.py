@@ -544,6 +544,49 @@ class TestLoadBalanceMethod(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
             server_args._handle_pd_disaggregation()
 
+    def test_pd_prefill_dspark_allows_hierarchical_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            speculative_algorithm="DSPARK",
+            enable_hierarchical_cache=True,
+        )
+        server_args._handle_pd_disaggregation()
+        self.assertTrue(server_args.enable_hierarchical_cache)
+
+    def test_pd_prefill_dspark_rejects_prefill_context_parallel(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            speculative_algorithm="DSPARK",
+            enable_prefill_context_parallel=True,
+        )
+        with self.assertRaisesRegex(ValueError, "--enable-prefill-context-parallel"):
+            server_args._handle_pd_disaggregation()
+
+    def test_pd_dspark_rejects_nixl_transfer_backend(self):
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode=mode,
+                    speculative_algorithm="DSPARK",
+                    disaggregation_transfer_backend="nixl",
+                )
+                with self.assertRaisesRegex(ValueError, "requires .*mooncake"):
+                    server_args._handle_pd_disaggregation()
+
+    def test_pd_dspark_allows_mooncake_transfer_backend(self):
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode=mode,
+                    speculative_algorithm="DSPARK",
+                    disaggregation_transfer_backend="mooncake",
+                )
+                server_args._handle_pd_disaggregation()
+
     def test_pd_decode_radix_cache_rejects_hisparse(self):
         server_args = ServerArgs(
             model_path="dummy",

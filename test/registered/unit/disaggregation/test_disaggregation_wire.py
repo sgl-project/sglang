@@ -31,6 +31,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
@@ -94,6 +95,35 @@ class TestDisaggregationWire(unittest.TestCase):
     def test_empty_inner_list(self):
         packed = pack_int_lists([[]], "I")
         self.assertEqual(unpack_int_lists(packed, "I"), [[]])
+
+    def test_bootstrap_message_session_id(self):
+        cases = [
+            ([b"1", b"host", b"1234", b"normal-session"], "normal-session"),
+            (
+                [b"WATERMARK", b"1", b"2", b"watermark-session"],
+                "watermark-session",
+            ),
+            (
+                [
+                    b"STAGING_RSP",
+                    b"1",
+                    b"2",
+                    b"3",
+                    b"4",
+                    b"5",
+                    b"staging-session",
+                ],
+                "staging-session",
+            ),
+            ([b"ABORT", b"1", b"host", b"1234"], None),
+            ([b"STAGING_RSP", b"1"], None),
+            ([], None),
+        ]
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(
+                    MooncakeKVManager._bootstrap_message_session_id(message), expected
+                )
 
     def test_list_of_buffers_roundtrip(self):
         bufs = [b"abc", b"", b"de", b"x" * 17]
@@ -455,13 +485,37 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                     expected_infos = draft.get_state_buf_infos()
                 kv_args = KVArgs()
 
-                setup_state_kv_args(kv_args, target, draft)
+                setup_state_kv_args(
+                    kv_args,
+                    target,
+                    draft,
+                    use_dspark_draft_kv_state=True,
+                )
 
                 self.assertEqual(kv_args.state_types, expected_types)
                 self.assertEqual(kv_args.state_data_ptrs[:-1], target_ptrs)
                 self.assertEqual(kv_args.state_data_ptrs[-1], expected_infos[0])
                 self.assertEqual(kv_args.state_data_lens[-1], expected_infos[1])
                 self.assertEqual(kv_args.state_item_lens[-1], expected_infos[2])
+
+
+class TestMHADraftStateRegistration(unittest.TestCase):
+    def test_page_item_lens_are_converted_to_token_item_lens(self):
+        draft = object.__new__(MHATokenToKVPool)
+        draft.page_size = 4
+        draft.get_contiguous_buf_infos = lambda: ([11, 12], [111, 112], [32, 48])
+        kv_args = KVArgs()
+
+        setup_state_kv_args(
+            kv_args,
+            SimpleNamespace(),
+            draft,
+            use_dspark_draft_kv_state=True,
+        )
+
+        self.assertEqual(kv_args.state_types, [StateType.DSPARK_DRAFT_KV])
+        self.assertEqual(kv_args.state_item_lens, [[8, 12]])
+        self.assertEqual(kv_args.state_layer_ids, [[0, 1]])
 
 
 if __name__ == "__main__":
