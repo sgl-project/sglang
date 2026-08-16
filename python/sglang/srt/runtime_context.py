@@ -722,34 +722,6 @@ def _build_config_bags(server_args: Any) -> dict:
     return tops
 
 
-def _snapshot_bag_values(bags: dict | None) -> dict | None:
-    """Per-leaf value snapshot of a config-bag tree (bags are mutated in
-    place by ``override``, so reference snapshots alias live state)."""
-    if bags is None:
-        return None
-    snap: dict = {}
-
-    def walk(prefix: str, bag) -> None:
-        snap[prefix] = dict(object.__getattribute__(bag, "_fields"))
-        for name, sub in object.__getattribute__(bag, "_subs").items():
-            walk(f"{prefix}.{name}", sub)
-
-    for name, bag in bags.items():
-        walk(name, bag)
-    return snap
-
-
-def _restore_bag_values(bags: dict, snap: dict) -> None:
-    def walk(prefix: str, bag) -> None:
-        for key, value in snap[prefix].items():
-            bag._set(key, value)
-        for name, sub in object.__getattribute__(bag, "_subs").items():
-            walk(f"{prefix}.{name}", sub)
-
-    for name, bag in bags.items():
-        walk(name, bag)
-
-
 class RuntimeContext:
     """Container for the structured runtime accessors; exposes ``parallel``,
     ``server_args``, the resolved config namespace bags, ``flags``,
@@ -953,12 +925,12 @@ class RuntimeContext:
         ``ServerArgs`` field names, so overlaying them onto the top level of
         either base is exact.
 
-        This covers the process-global bags only. Per-engine control-plane
-        changes (weight version, model path, the tokenizer's HiCache mirror)
-        live on the tokenizer manager — several ``Engine``s can share one
-        process — and ``TokenizerManager.resolved_config_dict`` overlays those
-        for the top-level ``/server_info`` body. The two are separate logs, not
-        one merged dict.
+        This covers the process-global bags only. Control-plane facts the bags
+        do not model (weight version, model path, the tokenizer's HiCache
+        mirror) live on the tokenizer manager, and
+        ``TokenizerManager.resolved_config_dict`` overlays those for the
+        top-level ``/server_info`` body. The two are separate logs, not one
+        merged dict.
         """
         d = dict(vars(self.server_args)) if base is None else dict(base)
         for _source, fields in self._overrides_log:
@@ -986,33 +958,6 @@ class RuntimeContext:
         force one leaf.
         """
         return _ServerArgsOverride(self, fields)
-
-    @contextmanager
-    def preserve_config(self):
-        """Snapshot the full config lifecycle and reinstate it verbatim on exit.
-
-        For nested construction steps that publish a private ``ServerArgs``
-        copy (e.g. a draft-worker build) and must leave the enclosing
-        lifecycle — including its post-publish overrides — untouched.
-        """
-        prev_server_args = self._server_args
-        prev_bags = self._config_bags
-        prev_bag_values = _snapshot_bag_values(prev_bags)
-        prev_overrides_log = list(self._overrides_log)
-        prev_publish_role = self._publish_role
-        prev_parallel_config = self.parallel._config
-        prev_capture = self.flags.capture.enable_torch_compile
-        try:
-            yield
-        finally:
-            self._server_args = prev_server_args
-            self._config_bags = prev_bags
-            if prev_bags is not None:
-                _restore_bag_values(prev_bags, prev_bag_values)
-            self._overrides_log = prev_overrides_log
-            self._publish_role = prev_publish_role
-            self.parallel._config = prev_parallel_config
-            self.flags.capture.enable_torch_compile = prev_capture
 
 
 class _ServerArgsOverride:
@@ -1198,7 +1143,6 @@ def get_observability() -> _ConfigBag:
 ROLE_NAMESPACE_SETS: dict[str, frozenset[str] | None] = {
     # Reads (almost) everything by design — the model-executing process.
     "scheduler": None,
-    "launcher": None,
     "test": None,
     # Audited (record-mode smokes, plain + DP-attention): the DP controller
     # reads only the elastic-EP gate; its module's static read set agrees.
@@ -1317,21 +1261,17 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
 
     Records the process ``role`` (``tokenizer`` / ``scheduler`` /
     ``dp_controller`` / ``encoder`` / ``expert_backup`` /
-    ``weight_cache_daemon`` / ``launcher`` / ``test``) and
+    ``weight_cache_daemon`` / ``test``) and
     projects the config bags. Draft workers skip publish (they must not clobber
     the target). ``role`` is provenance, and — when ``SGLANG_ROLE_NAMESPACES``
     is ``enforce`` — the key into ``ROLE_NAMESPACE_SETS`` for fail-closed
     namespace-read enforcement (``record`` audits the reads instead).
     ``hf_config`` is accepted for forward-compat and currently unused.
 
-    Normally one call per process, but re-publish is allowed and is
-    **last-publish-wins** (bags re-projected, provenance reset, role
-    overwritten). Two sanctioned multi-publish shapes exist: the in-process
-    Engine builds its ``TokenizerManager`` inside the launcher process (the
-    process ends up with the tokenizer publish), and multiple Engines in one
-    process publish in sequence — which is exactly why per-instance managers
-    must read ``self.server_args`` for anything engine-specific rather than
-    the process-global bags.
+    A process holds at most one live config: the bags always describe the
+    engine running now. Re-publish is allowed and is **last-publish-wins**
+    (bags re-projected, provenance reset, role overwritten), which is what
+    lets one process rebuild an engine after shutting the previous one down.
     """
     if _ROLE_NS_MODE == "enforce" and role not in ROLE_NAMESPACE_SETS:
         # Fail closed at publish time, not at the first stray read.
