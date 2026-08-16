@@ -3,30 +3,35 @@
 import asyncio
 import base64
 import io
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 from PIL import Image
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
 )
-from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.entrypoints.openai.serving_sensenova_u1_images import (
     _clear_u1_prefix_cache_for_test,
     _parse_u1_image_size,
+    _single_seed,
     _u1_next_t_index,
     _u1_tensor_bytes_to_png,
+    _validate_u1_image_request,
     serve_sensenova_u1_image_edit,
     serve_sensenova_u1_image_generation,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_prefill_graph_for_model,
 )
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from starlette.datastructures import UploadFile
 
 
 class _FakeTokenizer:
@@ -56,10 +61,12 @@ class _FakeTokenizerManager:
         )
         self.tokenizer = _FakeTokenizer()
         self.requests = []
+        self.raw_requests = []
+        self.aborted_rids = []
 
     async def generate_request(self, request, raw_request):
-        del raw_request
         self.requests.append(request)
+        self.raw_requests.append(raw_request)
         custom_params = request.sampling_params.get("custom_params") or {}
         if "sensenova_u1_flow" not in custom_params:
             prompt_ids = (
@@ -86,6 +93,65 @@ class _FakeTokenizerManager:
                 "sensenova_u1_flow_image_shape": [list(tensor.shape)],
             }
         }
+
+    def abort_request(self, rid):
+        self.aborted_rids.append(rid)
+
+
+class _FakeRawRequest:
+    def __init__(self, disconnected=False):
+        self.disconnected = disconnected
+
+    async def is_disconnected(self):
+        return self.disconnected
+
+
+class _TrackingBytesIO(io.BytesIO):
+    def __init__(self, value):
+        super().__init__(value)
+        self.bytes_read = 0
+
+    def read(self, size=-1):
+        chunk = super().read(size)
+        self.bytes_read += len(chunk)
+        return chunk
+
+
+class _BlockingTokenizerManager(_FakeTokenizerManager):
+    def __init__(self, block_stage):
+        super().__init__()
+        self.block_stage = block_stage
+        self.started = asyncio.Event()
+
+    async def generate_request(self, request, raw_request):
+        custom_params = request.sampling_params.get("custom_params") or {}
+        stage = "flow" if "sensenova_u1_flow" in custom_params else "prefix"
+        if stage == self.block_stage:
+            self.requests.append(request)
+            self.raw_requests.append(raw_request)
+            self.started.set()
+            await asyncio.Future()
+            return
+
+        async for result in super().generate_request(request, raw_request):
+            yield result
+
+
+class _FailingTokenizerManager(_FakeTokenizerManager):
+    def __init__(self, *, disconnected):
+        super().__init__()
+        self.disconnected = disconnected
+
+    async def generate_request(self, request, raw_request):
+        self.requests.append(request)
+        self.raw_requests.append(raw_request)
+        raw_request.disconnected = self.disconnected
+        raise ValueError("stage failed")
+        yield
+
+
+def _raw_request():
+    return _FakeRawRequest()
 
 
 def test_u1_image_size_parsing_prefers_explicit_dimensions() -> None:
@@ -122,6 +188,7 @@ def test_u1_next_t_index_collapses_input_image_span() -> None:
 def test_u1_image_generation_uses_native_flow_contract() -> None:
     _clear_u1_prefix_cache_for_test()
     manager = _FakeTokenizerManager()
+    raw_request = _raw_request()
     response = asyncio.run(
         serve_sensenova_u1_image_generation(
             manager,
@@ -132,10 +199,12 @@ def test_u1_image_generation_uses_native_flow_contract() -> None:
                 seed=7,
                 num_inference_steps=2,
             ),
+            raw_request=raw_request,
         )
     )
 
     assert len(manager.requests) == 2
+    assert manager.raw_requests == [raw_request, raw_request]
     flow_request = manager.requests[1]
     flow = flow_request.sampling_params["custom_params"]["sensenova_u1_flow"]
     assert flow["image_tokens"] == 4
@@ -147,6 +216,7 @@ def test_u1_image_generation_uses_native_flow_contract() -> None:
 def test_u1_image_edit_reuses_multimodal_flow_contract() -> None:
     _clear_u1_prefix_cache_for_test()
     manager = _FakeTokenizerManager()
+    raw_request = _raw_request()
     response = asyncio.run(
         serve_sensenova_u1_image_edit(
             manager,
@@ -158,10 +228,12 @@ def test_u1_image_edit_reuses_multimodal_flow_contract() -> None:
                 num_inference_steps=2,
             ),
             image_data=[b"fake-image"],
+            raw_request=raw_request,
         )
     )
 
     assert len(manager.requests) == 2
+    assert manager.raw_requests == [raw_request, raw_request]
     assert manager.requests[0].image_data == [b"fake-image"]
     assert manager.requests[1].image_data == [b"fake-image"]
     assert manager.requests[1].text.endswith("<|endoftext|>" * 4)
@@ -178,9 +250,22 @@ def test_u1_image_generation_skips_warmed_prefix_prime() -> None:
         seed=7,
         num_inference_steps=2,
     )
+    raw_request = _raw_request()
 
-    asyncio.run(serve_sensenova_u1_image_generation(manager, request))
-    asyncio.run(serve_sensenova_u1_image_generation(manager, request))
+    asyncio.run(
+        serve_sensenova_u1_image_generation(
+            manager,
+            request,
+            raw_request=raw_request,
+        )
+    )
+    asyncio.run(
+        serve_sensenova_u1_image_generation(
+            manager,
+            request,
+            raw_request=raw_request,
+        )
+    )
 
     assert len(manager.requests) == 3
     assert manager.requests[0].sampling_params.get("custom_params") is None
@@ -189,6 +274,163 @@ def test_u1_image_generation_skips_warmed_prefix_prime() -> None:
         in generated_request.sampling_params.get("custom_params", {})
         for generated_request in manager.requests[1:]
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("n", 0, "supports n=1"),
+        ("n", -1, "supports n=1"),
+        ("num_inference_steps", 0, "num_steps must be positive"),
+        ("num_inference_steps", -1, "num_steps must be positive"),
+        ("num_inference_steps", 65, "num_steps exceeds"),
+        ("flow_shift", 0.0, "flow_shift must be a positive finite number"),
+        ("flow_shift", -1.0, "flow_shift must be a positive finite number"),
+        ("flow_shift", float("nan"), "flow_shift must be a positive finite number"),
+        ("flow_shift", float("inf"), "flow_shift must be a positive finite number"),
+        ("guidance_scale", 0.0, "supports guidance_scale=1"),
+        ("guidance_scale", float("nan"), "supports guidance_scale=1"),
+    ],
+)
+def test_u1_image_request_rejects_invalid_numeric_values(
+    field,
+    value,
+    message,
+) -> None:
+    request = ImageGenerationsRequest(prompt="test", **{field: value})
+
+    with pytest.raises(ValueError, match=message):
+        _validate_u1_image_request(request)
+
+
+@pytest.mark.parametrize("seed", [-1, 2**63])
+def test_u1_image_request_rejects_out_of_range_seed(seed) -> None:
+    with pytest.raises(ValueError, match=r"seed must be in \[0, 2\*\*63\)"):
+        _single_seed(seed)
+
+
+def test_u1_image_request_preserves_explicit_valid_zero_seed() -> None:
+    assert _single_seed(0) == 0
+
+
+def test_u1_image_generation_aborts_prefix_on_cancellation() -> None:
+    async def scenario():
+        _clear_u1_prefix_cache_for_test()
+        manager = _BlockingTokenizerManager("prefix")
+        task = asyncio.create_task(
+            serve_sensenova_u1_image_generation(
+                manager,
+                ImageGenerationsRequest(
+                    prompt="a red square",
+                    size="64x64",
+                    response_format="b64_json",
+                ),
+                raw_request=_raw_request(),
+            )
+        )
+        await asyncio.wait_for(manager.started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(manager.aborted_rids) == 1
+        assert manager.aborted_rids[0].endswith("-prefix")
+
+    asyncio.run(scenario())
+
+
+def test_u1_image_generation_aborts_flow_on_cancellation() -> None:
+    async def scenario():
+        _clear_u1_prefix_cache_for_test()
+        manager = _BlockingTokenizerManager("flow")
+        task = asyncio.create_task(
+            serve_sensenova_u1_image_generation(
+                manager,
+                ImageGenerationsRequest(
+                    prompt="a red square",
+                    size="64x64",
+                    response_format="b64_json",
+                ),
+                raw_request=_raw_request(),
+            )
+        )
+        await asyncio.wait_for(manager.started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(manager.aborted_rids) == 1
+        assert manager.aborted_rids[0].endswith("-flow")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("disconnected", "error_type"),
+    [
+        (False, ValueError),
+        (True, asyncio.CancelledError),
+    ],
+)
+def test_u1_image_generation_aborts_active_rid_on_stage_failure(
+    disconnected,
+    error_type,
+) -> None:
+    async def scenario():
+        _clear_u1_prefix_cache_for_test()
+        manager = _FailingTokenizerManager(disconnected=disconnected)
+        with pytest.raises(error_type):
+            await serve_sensenova_u1_image_generation(
+                manager,
+                ImageGenerationsRequest(
+                    prompt="a red square",
+                    size="64x64",
+                    response_format="b64_json",
+                ),
+                raw_request=_raw_request(),
+            )
+        assert len(manager.aborted_rids) == 1
+        assert manager.aborted_rids[0].endswith("-prefix")
+
+    asyncio.run(scenario())
+
+
+def test_u1_image_edit_rejects_oversized_multipart_and_closes_upload() -> None:
+    async def scenario():
+        from sglang.srt.entrypoints import http_server
+
+        source = _TrackingBytesIO(b"x" * 17)
+        upload = UploadFile(
+            source,
+            filename="oversized.png",
+        )
+        manager = SimpleNamespace(
+            server_args=SimpleNamespace(media_url_max_file_size_mb=0)
+        )
+        global_state = SimpleNamespace(tokenizer_manager=manager)
+        with patch.object(http_server, "_global_state", global_state):
+            response = await http_server.sensenova_u1_image_edits(
+                request=_raw_request(),
+                image=upload,
+                prompt="test",
+                n=1,
+                response_format="b64_json",
+                size="64x64",
+                output_format="png",
+                seed=0,
+                guidance_scale=1,
+                num_inference_steps=2,
+                mask=None,
+            )
+        return response, upload, source
+
+    response, upload, source = asyncio.run(scenario())
+
+    assert response.status_code == 400
+    assert (
+        "image upload exceeds the maximum 0 bytes"
+        in json.loads(response.body)["error"]["message"]
+    )
+    assert source.bytes_read == 1
+    assert upload.file.closed
 
 
 def test_u1_flow_selects_matching_prefill_cuda_graph_variant() -> None:
@@ -264,9 +506,7 @@ def test_u1_prefill_graph_trim_preserves_customized_info() -> None:
 def test_u1_prefill_capture_uses_model_declared_variant() -> None:
     text_model = SimpleNamespace(
         prefill_cuda_graph_capture_variant="sensenova_u1_flow",
-        prefill_cuda_graph_capture_flag=(
-            "force_mot_gen_for_prefill_graph_capture"
-        ),
+        prefill_cuda_graph_capture_flag=("force_mot_gen_for_prefill_graph_capture"),
         force_mot_gen_for_prefill_graph_capture=False,
     )
     model_runner = SimpleNamespace(

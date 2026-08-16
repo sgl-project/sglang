@@ -935,14 +935,42 @@ async def sensenova_u1_image_generations(request: Request):
         return await serve_sensenova_u1_image_generation(
             _global_state.tokenizer_manager,
             image_request,
+            raw_request=request,
         )
     except (TypeError, ValueError) as error:
         logger.error("[http_server] SenseNova U1 image error: %s", error)
         return _create_error_response(error)
 
 
+_U1_UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
+
+
+async def _read_upload_file_limited(
+    upload: UploadFile,
+    *,
+    max_bytes: int,
+) -> bytes:
+    if max_bytes < 0:
+        raise ValueError("image upload byte limit must be non-negative")
+
+    content = bytearray()
+    while True:
+        remaining = max_bytes - len(content)
+        chunk = await upload.read(min(_U1_UPLOAD_READ_CHUNK_BYTES, remaining + 1))
+        if not chunk:
+            break
+        if len(content) + len(chunk) > max_bytes:
+            raise ValueError(f"image upload exceeds the maximum {max_bytes} bytes")
+        content.extend(chunk)
+
+    if not content:
+        raise ValueError("image upload is empty")
+    return bytes(content)
+
+
 @app.post("/v1/images/edits")
 async def sensenova_u1_image_edits(
+    request: Request,
     image: UploadFile = File(...),
     prompt: str = Form(...),
     n: int = Form(1),
@@ -959,18 +987,25 @@ async def sensenova_u1_image_edits(
     )
 
     try:
-        if mask is not None:
-            raise ValueError("SenseNova U1 image masks are not yet supported")
-        image_bytes = await image.read()
-        max_bytes = (
-            _global_state.tokenizer_manager.server_args.media_url_max_file_size_mb
-            * 1024
-            * 1024
-        )
-        if not image_bytes:
-            raise ValueError("image upload is empty")
-        if len(image_bytes) > max_bytes:
-            raise ValueError(f"image upload exceeds the maximum {max_bytes} bytes")
+        try:
+            if mask is not None:
+                raise ValueError("SenseNova U1 image masks are not yet supported")
+            max_bytes = (
+                int(
+                    _global_state.tokenizer_manager.server_args.media_url_max_file_size_mb
+                )
+                * 1024
+                * 1024
+            )
+            image_bytes = await _read_upload_file_limited(
+                image,
+                max_bytes=max_bytes,
+            )
+        finally:
+            await image.close()
+            if mask is not None:
+                await mask.close()
+
         image_request = ImageGenerationsRequest(
             prompt=prompt,
             n=n,
@@ -985,6 +1020,7 @@ async def sensenova_u1_image_edits(
             _global_state.tokenizer_manager,
             image_request,
             image_data=[image_bytes],
+            raw_request=request,
         )
     except (TypeError, ValueError) as error:
         logger.error("[http_server] SenseNova U1 image edit error: %s", error)

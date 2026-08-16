@@ -3,14 +3,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import io
+import math
 import time
 import uuid
 from collections import OrderedDict
 
 import numpy as np
+from fastapi import Request
 from PIL import Image
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
@@ -24,6 +27,7 @@ from sglang.srt.models.neo_chat_limits import (
     U1_FLOW_CUSTOM_PARAM,
     U1_IMAGE_CONDITIONING_CUSTOM_PARAM,
     U1_IMAGE_SIZE_DIVISOR,
+    parse_u1_int,
     validate_u1_flow_steps,
     validate_u1_image_size,
 )
@@ -55,7 +59,7 @@ def _parse_u1_image_size(request: ImageGenerationsRequest) -> tuple[int, int]:
             raise ValueError("width and height must be provided together")
         return validate_u1_image_size(request.width, request.height)
 
-    size = request.size or "1024x1024"
+    size = "1024x1024" if request.size is None else request.size
     try:
         width_text, height_text = size.lower().split("x", maxsplit=1)
     except ValueError as error:
@@ -145,8 +149,35 @@ def _clear_u1_prefix_cache_for_test() -> None:
     _U1_PREFIX_IDS_CACHE.clear()
 
 
-async def _run_one_generate(tokenizer_manager, request: GenerateReqInput) -> dict:
-    return await tokenizer_manager.generate_request(request, None).__anext__()
+def _abort_active_requests(tokenizer_manager, active_rids: set[str]) -> None:
+    for rid in tuple(active_rids):
+        tokenizer_manager.abort_request(rid)
+
+
+async def _run_one_generate(
+    tokenizer_manager,
+    request: GenerateReqInput,
+    raw_request: Request,
+    active_rids: set[str],
+) -> dict:
+    if await raw_request.is_disconnected():
+        raise asyncio.CancelledError("image request client disconnected")
+
+    active_rids.add(request.rid)
+    generator = tokenizer_manager.generate_request(request, raw_request)
+    try:
+        return await generator.__anext__()
+    except asyncio.CancelledError:
+        tokenizer_manager.abort_request(request.rid)
+        raise
+    except Exception as error:
+        tokenizer_manager.abort_request(request.rid)
+        if await raw_request.is_disconnected():
+            raise asyncio.CancelledError("image request client disconnected") from error
+        raise
+    finally:
+        active_rids.discard(request.rid)
+        await generator.aclose()
 
 
 def _single_seed(seed: int | list[int] | None) -> int:
@@ -154,14 +185,26 @@ def _single_seed(seed: int | list[int] | None) -> int:
         if len(seed) != 1:
             raise ValueError("SenseNova U1 currently supports exactly one seed")
         seed = seed[0]
-    return 0 if seed is None else int(seed)
+    parsed_seed = 0 if seed is None else parse_u1_int(seed, name="seed")
+    if parsed_seed < 0 or parsed_seed >= 2**63:
+        raise ValueError("seed must be in [0, 2**63)")
+    return parsed_seed
 
 
 def _validate_u1_image_request(request: ImageGenerationsRequest) -> None:
-    if int(request.n or 1) != 1:
+    n = 1 if request.n is None else parse_u1_int(request.n, name="n")
+    if n != 1:
         raise ValueError("SenseNova U1 currently supports n=1")
-    if request.guidance_scale not in (None, 1, 1.0):
-        raise ValueError("SenseNova U1 currently supports guidance_scale=1")
+    if request.guidance_scale is not None:
+        guidance_scale = float(request.guidance_scale)
+        if not math.isfinite(guidance_scale) or guidance_scale != 1.0:
+            raise ValueError("SenseNova U1 currently supports guidance_scale=1")
+    if request.num_inference_steps is not None:
+        validate_u1_flow_steps(request.num_inference_steps)
+    if request.flow_shift is not None:
+        flow_shift = float(request.flow_shift)
+        if not math.isfinite(flow_shift) or flow_shift <= 0:
+            raise ValueError("flow_shift must be a positive finite number")
     if request.output_format not in (None, "png"):
         raise ValueError("SenseNova U1 currently supports output_format=png")
 
@@ -185,7 +228,11 @@ def _u1_flow_response(
         tensor_shape,
     )
     png_b64 = base64.b64encode(png_bytes).decode("ascii")
-    response_format = (request.response_format or "b64_json").lower()
+    response_format = (
+        "b64_json"
+        if request.response_format is None
+        else str(request.response_format).lower()
+    )
     if response_format == "b64_json":
         response_data = ImageResponseData(
             b64_json=png_b64,
@@ -202,7 +249,9 @@ def _u1_flow_response(
         raise ValueError(f"unsupported response_format: {response_format}")
 
     cached_tokens = int(meta_info.get("cached_tokens", 0))
-    flow_compute = meta_info.get("sensenova_u1_flow_compute_seconds") or [elapsed]
+    flow_compute = meta_info.get("sensenova_u1_flow_compute_seconds")
+    if not flow_compute:
+        flow_compute = [elapsed]
     return ImageResponse(
         id=request_id,
         data=[response_data],
@@ -222,6 +271,7 @@ async def _serve_sensenova_u1_image(
     request: ImageGenerationsRequest,
     *,
     image_data: list[bytes] | None,
+    raw_request: Request,
 ) -> ImageResponse:
     if tokenizer_manager.model_config.hf_config.model_type != "neo_chat":
         raise ValueError("the loaded model does not support native SenseNova U1 images")
@@ -230,7 +280,10 @@ async def _serve_sensenova_u1_image(
         raise ValueError("SenseNova U1 currently supports one input image")
 
     width, height = _parse_u1_image_size(request)
-    num_steps = validate_u1_flow_steps(request.num_inference_steps or 2)
+    num_steps = validate_u1_flow_steps(
+        2 if request.num_inference_steps is None else request.num_inference_steps
+    )
+    flow_shift = 1.0 if request.flow_shift is None else float(request.flow_shift)
     seed = _single_seed(request.seed)
     tokenizer = tokenizer_manager.tokenizer
     user_prompt = request.prompt if image_data is None else f"<image>\n{request.prompt}"
@@ -255,97 +308,117 @@ async def _serve_sensenova_u1_image(
             U1_IMAGE_CONDITIONING_CUSTOM_PARAM: True,
         }
 
+    active_rids: set[str] = set()
     start = time.perf_counter()
-    if prefix_ids is None and image_data is None:
-        prefix_ids = tokenizer(prefix, add_special_tokens=False)["input_ids"]
-        await _run_one_generate(
-            tokenizer_manager,
-            GenerateReqInput(
-                rid=f"{request_id}-prefix",
-                input_ids=prefix_ids,
-                sampling_params=sampling,
-                extra_key=extra_key,
-            ),
-        )
-        _put_cached_u1_prefix(prefix_cache_key, prefix_ids)
-    elif prefix_ids is None:
-        prefix_result = await _run_one_generate(
-            tokenizer_manager,
-            GenerateReqInput(
-                rid=f"{request_id}-prefix",
-                text=prefix,
-                image_data=image_data,
-                sampling_params=sampling,
-                extra_key=extra_key,
-                return_prompt_token_ids=True,
-            ),
-        )
-        prefix_ids = prefix_result["prompt_token_ids"]
-        _put_cached_u1_prefix(prefix_cache_key, prefix_ids)
+    try:
+        if prefix_ids is None and image_data is None:
+            prefix_ids = tokenizer(prefix, add_special_tokens=False)["input_ids"]
+            await _run_one_generate(
+                tokenizer_manager,
+                GenerateReqInput(
+                    rid=f"{request_id}-prefix",
+                    input_ids=prefix_ids,
+                    sampling_params=sampling,
+                    extra_key=extra_key,
+                ),
+                raw_request,
+                active_rids,
+            )
+            _put_cached_u1_prefix(prefix_cache_key, prefix_ids)
+        elif prefix_ids is None:
+            prefix_result = await _run_one_generate(
+                tokenizer_manager,
+                GenerateReqInput(
+                    rid=f"{request_id}-prefix",
+                    text=prefix,
+                    image_data=image_data,
+                    sampling_params=sampling,
+                    extra_key=extra_key,
+                    return_prompt_token_ids=True,
+                ),
+                raw_request,
+                active_rids,
+            )
+            prefix_ids = prefix_result["prompt_token_ids"]
+            _put_cached_u1_prefix(prefix_cache_key, prefix_ids)
 
-    flow_sampling = dict(sampling)
-    flow_sampling["custom_params"] = {
-        **dict(sampling.get("custom_params") or {}),
-        U1_FLOW_CUSTOM_PARAM: {
-            "width": width,
-            "height": height,
-            "num_steps": num_steps,
-            "seed": seed,
-            "image_start": len(prefix_ids),
-            "image_tokens": image_tokens,
-            "image_t_index": _u1_next_t_index(
-                prefix_ids,
-                image_start_token_id=image_start_token_id,
-                image_context_token_id=image_context_token_id,
-            ),
-            "token_height": token_height,
-            "token_width": token_width,
-            "timestep_shift": request.flow_shift or 1.0,
-            "enable_timestep_shift": True,
-            "return_image_tensor": True,
-        },
-    }
-    placeholder_id = tokenizer.eos_token_id
-    if placeholder_id is None:
-        raise ValueError("SenseNova U1 requires a tokenizer EOS token")
-    if image_data is None:
-        flow_request = GenerateReqInput(
-            rid=f"{request_id}-flow",
-            input_ids=[*prefix_ids, *([placeholder_id] * image_tokens)],
-            sampling_params=flow_sampling,
-            extra_key=extra_key,
+        flow_sampling = dict(sampling)
+        flow_sampling["custom_params"] = {
+            **dict(sampling.get("custom_params") or {}),
+            U1_FLOW_CUSTOM_PARAM: {
+                "width": width,
+                "height": height,
+                "num_steps": num_steps,
+                "seed": seed,
+                "image_start": len(prefix_ids),
+                "image_tokens": image_tokens,
+                "image_t_index": _u1_next_t_index(
+                    prefix_ids,
+                    image_start_token_id=image_start_token_id,
+                    image_context_token_id=image_context_token_id,
+                ),
+                "token_height": token_height,
+                "token_width": token_width,
+                "timestep_shift": flow_shift,
+                "enable_timestep_shift": True,
+                "return_image_tensor": True,
+            },
+        }
+        placeholder_id = tokenizer.eos_token_id
+        if placeholder_id is None:
+            raise ValueError("SenseNova U1 requires a tokenizer EOS token")
+        if image_data is None:
+            flow_request = GenerateReqInput(
+                rid=f"{request_id}-flow",
+                input_ids=[*prefix_ids, *([placeholder_id] * image_tokens)],
+                sampling_params=flow_sampling,
+                extra_key=extra_key,
+            )
+        else:
+            placeholder_token = tokenizer.convert_ids_to_tokens(placeholder_id)
+            flow_request = GenerateReqInput(
+                rid=f"{request_id}-flow",
+                text=prefix + placeholder_token * image_tokens,
+                image_data=image_data,
+                sampling_params=flow_sampling,
+                extra_key=extra_key,
+            )
+        flow_result = await _run_one_generate(
+            tokenizer_manager,
+            flow_request,
+            raw_request,
+            active_rids,
         )
-    else:
-        placeholder_token = tokenizer.convert_ids_to_tokens(placeholder_id)
-        flow_request = GenerateReqInput(
-            rid=f"{request_id}-flow",
-            text=prefix + placeholder_token * image_tokens,
-            image_data=image_data,
-            sampling_params=flow_sampling,
-            extra_key=extra_key,
+        elapsed = time.perf_counter() - start
+        return _u1_flow_response(
+            request=request,
+            request_id=request_id,
+            prefix_tokens=len(prefix_ids),
+            image_tokens=image_tokens,
+            flow_result=flow_result,
+            elapsed=elapsed,
+            width=width,
+            height=height,
         )
-    flow_result = await _run_one_generate(tokenizer_manager, flow_request)
-    elapsed = time.perf_counter() - start
-    return _u1_flow_response(
-        request=request,
-        request_id=request_id,
-        prefix_tokens=len(prefix_ids),
-        image_tokens=image_tokens,
-        flow_result=flow_result,
-        elapsed=elapsed,
-        width=width,
-        height=height,
-    )
+    except asyncio.CancelledError:
+        _abort_active_requests(tokenizer_manager, active_rids)
+        raise
+    except Exception:
+        _abort_active_requests(tokenizer_manager, active_rids)
+        raise
 
 
 async def serve_sensenova_u1_image_generation(
     tokenizer_manager,
     request: ImageGenerationsRequest,
+    *,
+    raw_request: Request,
 ) -> ImageResponse:
     return await _serve_sensenova_u1_image(
         tokenizer_manager,
         request,
         image_data=None,
+        raw_request=raw_request,
     )
 
 
@@ -354,11 +427,13 @@ async def serve_sensenova_u1_image_edit(
     request: ImageGenerationsRequest,
     *,
     image_data: list[bytes],
+    raw_request: Request,
 ) -> ImageResponse:
     return await _serve_sensenova_u1_image(
         tokenizer_manager,
         request,
         image_data=image_data,
+        raw_request=raw_request,
     )
 
 

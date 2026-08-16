@@ -368,7 +368,8 @@ def test_u1_interleave_rejects_overlap_before_owning_parent_state() -> None:
 
 def test_u1_interleave_cancellation_releases_parked_parent(monkeypatch) -> None:
     _patch_release_kv_cache(monkeypatch)
-    _scheduler, controller, parent, child = _park_parent()
+    scheduler, controller, parent, child = _park_parent()
+    scheduler.waiting_queue.clear()
 
     direct = controller.before_abort(AbortReq(rid=parent.rid))
 
@@ -378,6 +379,7 @@ def test_u1_interleave_cancellation_releases_parked_parent(monkeypatch) -> None:
     assert controller.is_parked(parent)
     assert controller.is_internal_child(child)
     assert controller.complete_child(child) is None
+    assert scheduler.waiting_queue == []
 
 
 def test_u1_interleave_child_failure_finishes_original_parent_only(
