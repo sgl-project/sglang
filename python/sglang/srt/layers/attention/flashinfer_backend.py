@@ -609,7 +609,8 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # Call the wrapped function
         if self.is_mxfp4:
-            from sglang.srt.layers.jit_kernels.mxfp4_kv import dequantize_indices
+            # Fused MXFP4 decode: reads packed fp4 KV directly, no workspace.
+            from sglang.srt.layers.jit_kernels.mxfp4_kv import decode_fused
 
             kv_pool = forward_batch.token_to_kv_pool
             k_data, k_scale, v_data, v_scale = kv_pool.get_kv_fp4_buffers(
@@ -617,22 +618,35 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             indices = self.cur_kv_indices
             n = self.cur_kv_len
-            ws_k, ws_v = self._get_dequant_workspace(n)
-            dequantize_indices(k_data, k_scale, indices, ws_k)
-            dequantize_indices(v_data, v_scale, indices, ws_v)
-            kv = (ws_k[:n], ws_v[:n])
+            # per-request kv boundaries (flashinfer kv_indptr is cumulative)
+            kv_indptr = self.kv_indptr[0]
+            bs = len(q)
+            o = torch.empty_like(q)
+            decode_fused(
+                q.contiguous(),
+                k_data,
+                k_scale,
+                v_data,
+                v_scale,
+                indices[:n],
+                kv_indptr[: bs + 1],
+                o,
+                torch.empty(0, dtype=torch.float32, device=q.device),
+                layer.scaling,
+            )
         else:
             kv = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-        o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            kv,
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-        )
+            o = decode_wrapper.forward(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                kv,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def _get_compact_indices(self, n_tokens: int) -> torch.Tensor:
