@@ -31,13 +31,6 @@ WINDOW = 8  # = 2 * RATIO (overlap + current)
 ATOL = 5e-3
 RTOL = 5e-3
 
-# kv_score arrives either as fp32 or, when the wkv_gate gemm hands its output
-# over directly, as bf16 that the kernel widens on load.
-SRC_DTYPES = [
-    pytest.param(torch.float32, id="src_fp32"),
-    pytest.param(torch.bfloat16, id="src_bf16"),
-]
-
 
 # -----------------------------------------------------------------------------
 # fp64 ground truth (single compress event over a 8-token window).
@@ -114,22 +107,14 @@ def _run_decode(
 
 
 def _make_inputs(
-    num_q: int, head_dim: int, seed: int, src_dtype: torch.dtype = torch.float32
+    num_q: int, head_dim: int, seed: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     g = torch.Generator(device="cpu").manual_seed(seed)
     kv_score_input_cpu = torch.randn(
         num_q, head_dim * 4, generator=g, dtype=torch.float32
     )
-    # Round to the transport dtype up front so the fp64 reference and the kernel
-    # see the same values; what is under test is the compress math, not how far
-    # bf16 rounds the inputs.
-    kv_score_input_cpu = kv_score_input_cpu.to(src_dtype).float()
     ape_cpu = torch.randn(WINDOW, head_dim, generator=g, dtype=torch.float32)
     return kv_score_input_cpu, ape_cpu
-
-
-def _to_src(t: torch.Tensor, src_dtype: torch.dtype) -> torch.Tensor:
-    return t.to(get_device()).to(src_dtype)
 
 
 # -----------------------------------------------------------------------------
@@ -137,10 +122,9 @@ def _to_src(t: torch.Tensor, src_dtype: torch.dtype) -> torch.Tensor:
 # -----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("src_dtype", SRC_DTYPES)
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 @pytest.mark.parametrize("seq_len", [4, 8, 32, 256, 1024])
-def test_prefill_no_context(mode: str, seq_len: int, src_dtype: torch.dtype) -> None:
+def test_prefill_no_context(mode: str, seq_len: int) -> None:
     """Prefill once, no prefix. Every compress event must match fp64 GT."""
     if mode == "legacy":
         ctx: Context = make_legacy_context(
@@ -150,15 +134,13 @@ def test_prefill_no_context(mode: str, seq_len: int, src_dtype: torch.dtype) -> 
         ctx = make_paged_context(bs=1, compress_ratio=RATIO, head_dim=HEAD_DIM)
 
     seq_lens_cpu, extend_lens_cpu, num_q = to_seq_extend([(seq_len, seq_len)])
-    kv_in_cpu, ape_cpu = _make_inputs(
-        num_q, ctx.head_dim, seed=seq_len, src_dtype=src_dtype
-    )
+    kv_in_cpu, ape_cpu = _make_inputs(num_q, ctx.head_dim, seed=seq_len)
 
     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
     out = _run_prefill(
         ctx,
         pool,
-        _to_src(kv_in_cpu, src_dtype),
+        kv_in_cpu.to(get_device()),
         ape_cpu.to(get_device()),
         seq_lens_cpu,
         extend_lens_cpu,
@@ -177,12 +159,9 @@ def test_prefill_no_context(mode: str, seq_len: int, src_dtype: torch.dtype) -> 
         )
 
 
-@pytest.mark.parametrize("src_dtype", SRC_DTYPES)
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 @pytest.mark.parametrize("prefix_len", [4, 256])
-def test_prefill_then_decode(
-    mode: str, prefix_len: int, src_dtype: torch.dtype
-) -> None:
+def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
     """Prefill once, then decode 4 more tokens through one compress boundary."""
     extend_decode = 4
     seq_len = prefix_len + extend_decode
@@ -195,7 +174,7 @@ def test_prefill_then_decode(
         ctx = make_paged_context(bs=1, compress_ratio=RATIO, head_dim=HEAD_DIM)
 
     kv_full_cpu, ape_cpu = _make_inputs(
-        seq_len, ctx.head_dim, seed=seq_len + prefix_len, src_dtype=src_dtype
+        seq_len, ctx.head_dim, seed=seq_len + prefix_len
     )
     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
 
@@ -204,7 +183,7 @@ def test_prefill_then_decode(
     _run_prefill(
         ctx,
         pool,
-        _to_src(kv_full_cpu[:prefix_len], src_dtype),
+        kv_full_cpu[:prefix_len].to(get_device()),
         ape_cpu.to(get_device()),
         seq_lens_cpu,
         extend_lens_cpu,
@@ -217,7 +196,7 @@ def test_prefill_then_decode(
         seq_lens_gpu = torch.tensor(
             [cur_seq_len], dtype=torch.int64, device=get_device()
         )
-        kv_step = _to_src(kv_full_cpu[prefix_len + k : prefix_len + k + 1], src_dtype)
+        kv_step = kv_full_cpu[prefix_len + k : prefix_len + k + 1].to(get_device())
         out = _run_decode(ctx, pool, kv_step, ape_cpu.to(get_device()), seq_lens_gpu)
         if cur_seq_len % RATIO == 0:
             final_out = out
@@ -229,13 +208,10 @@ def test_prefill_then_decode(
     triton.testing.assert_close(final_out[0].cpu(), gt, atol=ATOL, rtol=RTOL)
 
 
-@pytest.mark.parametrize("src_dtype", SRC_DTYPES)
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 @pytest.mark.parametrize("prefix_len", [256, 512, 768])
 @pytest.mark.parametrize("extend_len", [4, 32])
-def test_prefill_then_extend(
-    mode: str, prefix_len: int, extend_len: int, src_dtype: torch.dtype
-) -> None:
+def test_prefill_then_extend(mode: str, prefix_len: int, extend_len: int) -> None:
     """Prefill once, then prefill an extend that crosses one or more compress events.
 
     The first prefill ends at a swa_page boundary (only relevant for paged),
@@ -252,9 +228,7 @@ def test_prefill_then_extend(
         ctx = make_paged_context(bs=1, compress_ratio=RATIO, head_dim=HEAD_DIM)
 
     seq_len = prefix_len + extend_len
-    kv_full_cpu, ape_cpu = _make_inputs(
-        seq_len, ctx.head_dim, seed=prefix_len, src_dtype=src_dtype
-    )
+    kv_full_cpu, ape_cpu = _make_inputs(seq_len, ctx.head_dim, seed=prefix_len)
     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
 
     # First prefill: seq=prefix, ext=prefix.
@@ -262,7 +236,7 @@ def test_prefill_then_extend(
     _run_prefill(
         ctx,
         pool,
-        _to_src(kv_full_cpu[:prefix_len], src_dtype),
+        kv_full_cpu[:prefix_len].to(get_device()),
         ape_cpu.to(get_device()),
         seq_lens_cpu,
         extend_lens_cpu,
@@ -273,7 +247,7 @@ def test_prefill_then_extend(
     out = _run_prefill(
         ctx,
         pool,
-        _to_src(kv_full_cpu[prefix_len:], src_dtype),
+        kv_full_cpu[prefix_len:].to(get_device()),
         ape_cpu.to(get_device()),
         seq_lens_cpu,
         extend_lens_cpu,
@@ -288,8 +262,7 @@ def test_prefill_then_extend(
         )
 
 
-@pytest.mark.parametrize("src_dtype", SRC_DTYPES)
-def test_paged_buffer_intermediate(src_dtype: torch.dtype) -> None:
+def test_paged_buffer_intermediate() -> None:
     """Paged-only: after a multi-page prefill, verify the trailing 4 tokens of
     every swa_page sit in the correct state-pool slots.
 
@@ -306,13 +279,13 @@ def test_paged_buffer_intermediate(src_dtype: torch.dtype) -> None:
     )
     seq_len = 1024  # 4 swa_pages
     seq_lens_cpu, extend_lens_cpu, num_q = to_seq_extend([(seq_len, seq_len)])
-    kv_in_cpu, ape_cpu = _make_inputs(num_q, ctx.head_dim, seed=42, src_dtype=src_dtype)
+    kv_in_cpu, ape_cpu = _make_inputs(num_q, ctx.head_dim, seed=42)
 
     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
     _run_prefill(
         ctx,
         pool,
-        _to_src(kv_in_cpu, src_dtype),
+        kv_in_cpu.to(get_device()),
         ape_cpu.to(get_device()),
         seq_lens_cpu,
         extend_lens_cpu,
@@ -340,9 +313,8 @@ def test_paged_buffer_intermediate(src_dtype: torch.dtype) -> None:
             )
 
 
-@pytest.mark.parametrize("src_dtype", SRC_DTYPES)
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
-def test_prefill_multibatch(mode: str, src_dtype: torch.dtype) -> None:
+def test_prefill_multibatch(mode: str) -> None:
     """Multi-batch prefill, both modes."""
     seq_extend = [(8, 8), (256, 256), (260, 260), (1023, 1023)]
     bs = len(seq_extend)
@@ -354,12 +326,12 @@ def test_prefill_multibatch(mode: str, src_dtype: torch.dtype) -> None:
         ctx = make_paged_context(bs=bs, compress_ratio=RATIO, head_dim=HEAD_DIM)
 
     seq_lens_cpu, extend_lens_cpu, num_q = to_seq_extend(seq_extend)
-    kv_in_cpu, ape_cpu = _make_inputs(num_q, ctx.head_dim, seed=99, src_dtype=src_dtype)
+    kv_in_cpu, ape_cpu = _make_inputs(num_q, ctx.head_dim, seed=99)
     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
     out = _run_prefill(
         ctx,
         pool,
-        _to_src(kv_in_cpu, src_dtype),
+        kv_in_cpu.to(get_device()),
         ape_cpu.to(get_device()),
         seq_lens_cpu,
         extend_lens_cpu,

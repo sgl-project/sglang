@@ -89,44 +89,10 @@ struct Compress128PrefillParams {
   uint32_t num_write;
 };
 
-/// \brief Load one lane's tile and widen it to the type the compressor computes
-/// in. The rows it reads come from two places with two layouts -- the ring
-/// buffer, and the tail of the wkv_gate gemm output that has not been staged yet
-/// -- so each pointer carries its own storage type and is reconciled here rather
-/// than forcing the producer to pre-convert.
-template <typename Dst, uint32_t kTileElements, typename Src>
-SGL_DEVICE device::AlignedVector<Dst, kTileElements> c128_load(const Src* src, const uint32_t lane_id) {
-  using namespace device;
-
-  using StorageSrc = AlignedVector<Src, kTileElements>;
-  const auto gmem = tile::Memory<StorageSrc>{lane_id, kWarpThreads};
-  const auto raw = gmem.load(src);
-
-  if constexpr (std::is_same_v<Dst, Src>) {
-    return raw;
-  } else {
-    AlignedVector<Dst, kTileElements> out;
-#pragma unroll
-    for (int32_t k = 0; k < kTileElements; ++k) {
-      out[k] = cast<Dst>(raw[k]);
-    }
-    return out;
-  }
-}
-
-// SrcFloat is only how kv_score arrives from the wkv_gate gemm; InputFloat stays
-// the compute dtype and the dtype of score_bias (ape). Splitting them lets that
-// gemm hand over bf16 and skip a widening pass, since this kernel widens on load.
-template <
-    typename Trait,
-    bool kUsePDL,
-    typename BufferFloat,
-    typename InputFloat,
-    typename SrcFloat,
-    typename OutFloat>
+template <typename Trait, bool kUsePDL, typename BufferFloat, typename InputFloat, typename OutFloat>
 SGL_DEVICE void c128_forward(
     const BufferFloat* kv_buf,  // [128n, 128n + 127]
-    const SrcFloat* kv_src,     // ragged pointer at position = 128n + 127
+    const InputFloat* kv_src,   // ragged pointer at position = 128n + 127
     OutFloat* kv_out,
     const InputFloat* score_bias,
     const int32_t buffer_len) {
@@ -141,6 +107,7 @@ SGL_DEVICE void c128_forward(
 
   /// NOTE: part 1: load kv + score
   using StorageIn = AlignedVector<InputFloat, kTileElements>;
+  const auto gmem_in = tile::Memory<StorageIn>{lane_id, kWarpThreads};
   StorageIn kv[kElementsPerWarp];
   StorageIn score[kElementsPerWarp];
   StorageIn bias[kElementsPerWarp];
@@ -149,26 +116,42 @@ SGL_DEVICE void c128_forward(
 #pragma unroll
   for (int32_t i = 0; i < kElementsPerWarp; ++i) {
     const int32_t j = i + warp_offset;
-    bias[i] = c128_load<InputFloat, kTileElements>(score_bias + j * Trait::kHeadDim, lane_id);
+    bias[i] = gmem_in.load(score_bias + j * Trait::kHeadDim);
   }
 
   const auto kv_start = kv_src - 127 * Trait::kElementSize;  // point to start
 
-  // The two sources differ in storage type as well as layout -- the ring buffer
-  // holds BufferFloat, the un-staged tail holds SrcFloat -- so each load widens
-  // to InputFloat at its own call site instead of branching on dtype up front.
+  if constexpr (std::is_same_v<BufferFloat, InputFloat>) {
 #pragma unroll
-  for (int32_t i = 0; i < kElementsPerWarp; ++i) {
-    const int32_t j = i + warp_offset;
-    __builtin_assume(j < 128);
-    if (j < buffer_len) {
-      const auto src = kv_buf + j * Trait::kElementSize;
-      kv[i] = c128_load<InputFloat, kTileElements>(src, lane_id);
-      score[i] = c128_load<InputFloat, kTileElements>(src + Trait::kScoreOffset, lane_id);
-    } else {
-      const auto src = kv_start + j * Trait::kElementSize;
-      kv[i] = c128_load<InputFloat, kTileElements>(src, lane_id);
-      score[i] = c128_load<InputFloat, kTileElements>(src + Trait::kScoreOffset, lane_id);
+    for (int32_t i = 0; i < kElementsPerWarp; ++i) {
+      const int32_t j = i + warp_offset;
+      __builtin_assume(j < 128);
+      const auto src = j < buffer_len ? kv_buf : kv_start;
+      kv[i] = gmem_in.load(src + j * Trait::kElementSize);
+      score[i] = gmem_in.load(src + j * Trait::kElementSize + Trait::kScoreOffset);
+    }
+  } else {  // mixed dtype
+    using StorageBuffer = AlignedVector<BufferFloat, Trait::kTileElements>;
+    const auto gmem_buffer = tile::Memory<StorageBuffer>{lane_id, kWarpThreads};
+
+#pragma unroll
+    for (int32_t i = 0; i < kElementsPerWarp; ++i) {
+      const int32_t j = i + warp_offset;
+      __builtin_assume(j < 128);
+      if (j < buffer_len) {
+        const auto src = kv_buf + j * Trait::kElementSize;
+        const auto kv_tmp = gmem_buffer.load(src);
+        const auto score_tmp = gmem_buffer.load(src + Trait::kScoreOffset);
+#pragma unroll
+        for (int32_t k = 0; k < kTileElements; ++k) {
+          kv[i][k] = cast<InputFloat>(kv_tmp[k]);
+          score[i][k] = cast<InputFloat>(score_tmp[k]);
+        }
+      } else {
+        const auto src = kv_start + j * Trait::kElementSize;
+        kv[i] = gmem_in.load(src);
+        score[i] = gmem_in.load(src + Trait::kScoreOffset);
+      }
     }
   }
 
@@ -298,13 +281,7 @@ SGL_DEVICE void c128_write_decode(BufferFloat* kv_buf, const InputFloat* kv_src)
 }
 
 /// \brief Need to reduce register usage to increase occupancy.
-template <
-    int64_t kHeadDim,
-    typename BufferFloat,
-    typename InputFloat,
-    typename SrcFloat,
-    typename OutFloat,
-    bool kUsePDL>
+template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
 C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodeParams params) {
   using namespace device;
   using Trait = C128Trait<kHeadDim>;
@@ -316,7 +293,7 @@ C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodePara
   if (global_bid >= params.batch_size) return;
 
   const auto plan = params.plan_d[global_bid];
-  const auto kv_input = static_cast<const SrcFloat*>(params.kv_input) + split_offset;
+  const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
   const auto kv_output = static_cast<OutFloat*>(params.kv_output) + split_offset;
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
   const auto score_bias = static_cast<const InputFloat*>(params.score_bias) + split_offset;
@@ -329,21 +306,15 @@ C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodePara
   PDLWaitPrimary<kUsePDL>();
   // the write warp must match the load warp in the following `c128_forward`
   if (warp_id == Trait::kNumWarps - 1) {
-    c128_write_decode<Trait, BufferFloat, SrcFloat>(kv_dst, kv_src);
+    c128_write_decode<Trait, BufferFloat, InputFloat>(kv_dst, kv_src);
   }
   if (plan.write_loc % 128 == 127) {
-    c128_forward<Trait, kUsePDL, BufferFloat, InputFloat, SrcFloat, OutFloat>(kv_buf, kv_src, kv_out, score_bias, 128);
+    c128_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(kv_buf, kv_src, kv_out, score_bias, 128);
   }
 }
 
 // compress kernel
-template <
-    int64_t kHeadDim,
-    typename BufferFloat,
-    typename InputFloat,
-    typename SrcFloat,
-    typename OutFloat,
-    bool kUsePDL>
+template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
 C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillParams params) {
   using namespace device;
   using Trait = C128Trait<kHeadDim>;
@@ -354,7 +325,7 @@ C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillPa
   if (global_pid >= params.num_compress) return;
 
   const auto plan = params.plan_c[global_pid];
-  const auto kv_input = static_cast<const SrcFloat*>(params.kv_input) + split_offset;
+  const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
   const auto kv_output = static_cast<OutFloat*>(params.kv_output) + split_offset;
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
   const auto score_bias = static_cast<const InputFloat*>(params.score_bias) + split_offset;
@@ -365,21 +336,14 @@ C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillPa
   const auto kv_out = kv_output + global_pid * Trait::kHeadDim;
   const auto kv_buf = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
   PDLWaitPrimary<kUsePDL>();
-  c128_forward<Trait, kUsePDL, BufferFloat, InputFloat, SrcFloat, OutFloat>(
-      kv_buf, kv_src, kv_out, score_bias, plan.buffer_len);
+  c128_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(kv_buf, kv_src, kv_out, score_bias, plan.buffer_len);
 }
 
-template <
-    int64_t kHeadDim,
-    typename BufferFloat,
-    typename InputFloat,
-    typename SrcFloat,
-    typename OutFloat,
-    bool kUsePDL>
+template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
 WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillParams params) {
   using namespace device;
   using Trait = C128Trait<kHeadDim>;
-  using StorageInput = AlignedVector<SrcFloat, Trait::kTileElements>;
+  using StorageInput = AlignedVector<InputFloat, Trait::kTileElements>;
 
   const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t global_wid = global_tid / kWarpThreads;      // warp id
@@ -391,7 +355,7 @@ WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillP
   if (global_pid >= params.num_write) return;
 
   const auto plan = params.plan_w[global_pid];
-  const auto kv_input = static_cast<const SrcFloat*>(params.kv_input) + split_offset;
+  const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
   if (plan.is_invalid()) return;
 
@@ -407,7 +371,7 @@ WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillP
     data[i] = gmem_input.load(kv_src, i);
   }
 
-  if constexpr (std::is_same_v<BufferFloat, SrcFloat>) {
+  if constexpr (std::is_same_v<BufferFloat, InputFloat>) {
     PDLTriggerSecondary<kUsePDL>();
 #pragma unroll
     for (int32_t i = 0; i < 2; ++i) {
@@ -433,21 +397,12 @@ WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillP
   }
 }
 
-template <
-    int64_t kHeadDim,
-    typename BufferFloat,
-    typename InputFloat,
-    typename SrcFloat,
-    typename OutFloat,
-    bool kUsePDL>
+template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
 struct FlashCompress128Kernel {
   using Trait = C128Trait<kHeadDim>;
-  static constexpr auto decode_kernel =
-      flash_c128_decode<kHeadDim, BufferFloat, InputFloat, SrcFloat, OutFloat, kUsePDL>;
-  static constexpr auto prefill_c_kernel =
-      flash_c128_prefill<kHeadDim, BufferFloat, InputFloat, SrcFloat, OutFloat, kUsePDL>;
-  static constexpr auto prefill_w_kernel =
-      write_c128_prefill<kHeadDim, BufferFloat, InputFloat, SrcFloat, OutFloat, kUsePDL>;
+  static constexpr auto decode_kernel = flash_c128_decode<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
+  static constexpr auto prefill_c_kernel = flash_c128_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
+  static constexpr auto prefill_w_kernel = write_c128_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
 
   static void run_decode(
       const tvm::ffi::TensorView kv_buffer,
@@ -466,7 +421,7 @@ struct FlashCompress128Kernel {
         .with_device(device_)
         .verify(kv_buffer);
     TensorMatcher({N, Trait::kElementSize})  // kv score input
-        .with_dtype<SrcFloat>()
+        .with_dtype<InputFloat>()
         .with_device(device_)
         .verify(kv_input);
     TensorMatcher({N, kHeadDim})  // kv compressed output
@@ -513,7 +468,7 @@ struct FlashCompress128Kernel {
         .with_device(device_)
         .verify(kv_buffer);
     TensorMatcher({N, Trait::kElementSize})  // kv score input (ragged)
-        .with_dtype<SrcFloat>()
+        .with_dtype<InputFloat>()
         .with_device(device_)
         .verify(kv_input);
     TensorMatcher({C, kHeadDim})  // kv compressed output (compact)

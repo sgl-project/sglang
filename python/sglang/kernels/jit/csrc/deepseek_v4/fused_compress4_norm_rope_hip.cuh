@@ -29,6 +29,7 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
+#include <sgl_kernel/deepseek_v4/c4_compress_core.cuh>
 #include <sgl_kernel/deepseek_v4/compress_v2.cuh>
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
@@ -113,168 +114,16 @@ struct FusedC4Trait {
   static_assert(kHeadDim % kTileDim == 0);
 };
 
-/// \brief Load one lane's tile and widen it to the type the compressor computes
-/// in. The rows the compressor reads come from two places with two layouts --
-/// the ring buffer, and the tail of the wkv_gate gemm output that has not been
-/// staged yet -- so each pointer carries its own storage type and is reconciled
-/// here rather than forcing the producer to pre-convert.
-template <typename Trait, typename Dst, typename Src>
-SGL_DEVICE device::AlignedVector<Dst, Trait::kTileElements> fused_c4_load(const Src* src) {
-  using namespace device;
-
-  using StorageSrc = AlignedVector<Src, Trait::kTileElements>;
-  const auto gmem = tile::Memory<StorageSrc>::warp();
-  const auto raw = gmem.load(src);
-
-  if constexpr (std::is_same_v<Dst, Src>) {
-    return raw;
-  } else {
-    AlignedVector<Dst, Trait::kTileElements> out;
-#pragma unroll
-    for (int32_t j = 0; j < Trait::kTileElements; ++j) {
-      out[j] = cast<Dst>(raw[j]);
-    }
-    return out;
-  }
-}
-
-/// \brief Mirror of c4_write_decode: stage this step's kv/score into the ring
-/// buffer. Runs for every token, including the ones that do not compress.
-template <typename Trait, typename BufferFloat, typename InputFloat>
-SGL_DEVICE void fused_c4_write_decode(BufferFloat* kv_buf, const InputFloat* kv_src) {
-  using namespace device;
-
-  using StorageInput = AlignedVector<InputFloat, Trait::kTileElements>;
-  const auto gmem_input = tile::Memory<StorageInput>::warp();
-
-  StorageInput data[4];
-#pragma unroll
-  for (int32_t i = 0; i < 4; ++i) {
-    data[i] = gmem_input.load(kv_src + Trait::kHeadDim * i);
-  }
-
-  if constexpr (std::is_same_v<BufferFloat, InputFloat>) {
-#pragma unroll
-    for (int32_t i = 0; i < 4; ++i) {
-      gmem_input.store(kv_buf + Trait::kHeadDim * i, data[i]);
-    }
-  } else {
-    using StorageBuffer = AlignedVector<BufferFloat, Trait::kTileElements>;
-    const auto gmem_buffer = tile::Memory<StorageBuffer>::warp();
-
-    StorageBuffer data_cast[4];
-#pragma unroll
-    for (int32_t i = 0; i < 4; ++i) {
-#pragma unroll
-      for (int32_t j = 0; j < Trait::kTileElements; ++j) {
-        data_cast[i][j] = cast<BufferFloat>(data[i][j]);
-      }
-      gmem_buffer.store(kv_buf + Trait::kHeadDim * i, data_cast[i]);
-    }
-  }
-}
-
-/// \brief Mirror of c4_forward, but returns the compressed row in registers
-/// instead of storing it. Arithmetic and ordering are kept identical to the
-/// standalone kernel so the fused path stays bit-exact.
-template <typename Trait, typename BufferFloat, typename InputFloat, typename SrcFloat>
-SGL_DEVICE device::AlignedVector<float, Trait::kTileElements> fused_c4_forward(
-    const BufferFloat* kv_buf_0,  // overlap [4n - 4, 4n - 1]
-    const BufferFloat* kv_buf_1,  // normal [4n + 0, 4n + 3]
-    const SrcFloat* kv_src,       // ragged pointer at position = 4n + 3
-    const InputFloat* score_bias,
-    const bool should_overlap,
-    const int32_t buffer_len) {
-  using namespace device;
-
-  using StorageIn = AlignedVector<InputFloat, Trait::kTileElements>;
-  StorageIn kv[8];
-  StorageIn score[8];
-  StorageIn bias[8];
-
-#pragma unroll
-  for (int32_t i = 0; i < 8; ++i) {
-    bias[i] = fused_c4_load<Trait, InputFloat>(score_bias + i * Trait::kHeadDim);
-  }
-
-  const auto kv_start_0 = kv_src - 7 * Trait::kElementSize;  // point to start
-
-#pragma unroll
-  for (int32_t i = 0; i < 4; ++i) {
-    if (should_overlap && i < buffer_len) {
-      const auto base = kv_buf_0 + i * Trait::kElementSize;
-      kv[i] = fused_c4_load<Trait, InputFloat>(base);
-      score[i] = fused_c4_load<Trait, InputFloat>(base + Trait::kScoreOffset);
-    } else if (should_overlap) {
-      const auto base = kv_start_0 + i * Trait::kElementSize;
-      kv[i] = fused_c4_load<Trait, InputFloat>(base);
-      score[i] = fused_c4_load<Trait, InputFloat>(base + Trait::kScoreOffset);
-    } else {
-      [[unlikely]];
-      constexpr float kFloatNegInf = -FLT_MAX;
-      kv[i].fill(cast<InputFloat>(0.0f));
-      score[i].fill(cast<InputFloat>(kFloatNegInf));
-    }
-  }
-
-  const auto kv_start = kv_src - 3 * Trait::kElementSize;  // point to start
-#pragma unroll
-  for (int32_t i = 0; i < 4; ++i) {
-    if (i + 4 < buffer_len) {
-      const auto base = kv_buf_1 + i * Trait::kElementSize + Trait::kOverlapOffset;
-      kv[i + 4] = fused_c4_load<Trait, InputFloat>(base);
-      score[i + 4] = fused_c4_load<Trait, InputFloat>(base + Trait::kScoreOffset);
-    } else {
-      const auto base = kv_start + i * Trait::kElementSize + Trait::kOverlapOffset;
-      kv[i + 4] = fused_c4_load<Trait, InputFloat>(base);
-      score[i + 4] = fused_c4_load<Trait, InputFloat>(base + Trait::kScoreOffset);
-    }
-  }
-
-  /// NOTE: safe online softmax + weighted sum
-  AlignedVector<float, Trait::kTileElements> result;
-  float score_fp32[Trait::kTileElements][8];
-
-#pragma unroll
-  for (int32_t i = 0; i < Trait::kTileElements; ++i) {
-#pragma unroll
-    for (int32_t j = 0; j < 8; ++j) {
-      score_fp32[i][j] = cast<float>(score[j][i]) + cast<float>(bias[j][i]);
-    }
-  }
-
-#pragma unroll
-  for (int32_t i = 0; i < Trait::kTileElements; ++i) {
-    const auto& score = score_fp32[i];
-    float max_value = score[0];
-    float sum_exp_value = 0.0f;
-
-#pragma unroll
-    for (int32_t j = 1; j < 8; ++j) {
-      const auto fp32_score = score[j];
-      max_value = fmaxf(max_value, fp32_score);
-    }
-
-    float sum_product = 0.0f;
-#pragma unroll
-    for (int32_t j = 0; j < 8; ++j) {
-      const auto fp32_score = score[j];
-      const auto exp_score = expf(fp32_score - max_value);
-      sum_product += cast<float>(kv[j][i]) * exp_score;
-      sum_exp_value += exp_score;
-    }
-
-    result[i] = sum_product / sum_exp_value;
-  }
-  return result;
-}
+// The c4 compress load + softmax core and the ring-buffer write are shared with
+// the standalone c4 kernels: this fused HIP epilogue calls c4_compress_core() and
+// c4_write_decode() from c4_compress_core.cuh (included above) so the math stays
+// bit-identical to the two-kernel path and there is no duplicated copy to drift.
 
 /// \brief compress -> RMSNorm -> RoPE / fp8 quant -> paged store, in one launch.
 template <
     int64_t kHeadDim,
     typename BufferFloat,
     typename InputFloat,
-    typename SrcFloat,
     typename DType,
     int32_t kPageBits,
     bool kUsePDL,
@@ -304,7 +153,7 @@ FUSED_C4_KERNEL void flash_c4_decode_norm_rope(const __grid_constant__ FusedComp
   const int64_t split_offset = static_cast<int64_t>(warp_id) * Trait::kTileDim;
 
   const auto plan = params.plan_d[token_id];
-  const auto kv_input = static_cast<const SrcFloat*>(params.kv_input) + split_offset;
+  const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
   const auto score_bias = static_cast<const InputFloat*>(params.score_bias) + split_offset;
 
@@ -314,14 +163,14 @@ FUSED_C4_KERNEL void flash_c4_decode_norm_rope(const __grid_constant__ FusedComp
   const auto kv_dst = kv_buffer + plan.write_loc * Trait::kElementSize;
 
   PDLWaitPrimary<kUsePDL>();
-  fused_c4_write_decode<Trait, BufferFloat, SrcFloat>(kv_dst, kv_src);
+  c4_write_decode<Trait, BufferFloat, InputFloat>(kv_dst, kv_src);
 
   // Matches the standalone pair: compress only emits on ratio boundaries, and
   // the norm/rope kernel returns early on exactly the same condition.
   if (plan.seq_len % params.compress_ratio != 0) return;
 
   const auto need_overlap = plan.seq_len > 4;
-  Float2 data = fused_c4_forward<Trait, BufferFloat, InputFloat, SrcFloat>(
+  Float2 data = c4_compress_core<Trait, BufferFloat, InputFloat>(
       kv_buf_0, kv_buf_1, kv_src, score_bias, need_overlap, 8);
 
   const auto position = static_cast<int32_t>(plan.seq_len - params.compress_ratio);
@@ -407,7 +256,6 @@ template <
     int64_t kHeadDim,
     typename BufferFloat,
     typename InputFloat,
-    typename SrcFloat,
     typename DType,
     uint32_t kPageSize,
     bool kUsePDL,
@@ -417,7 +265,7 @@ struct FusedCompress4NormRopeKernel {
   static constexpr int64_t kPageBytes =
       kBf16Store ? (kHeadDim * 2 * kPageSize) : host::div_ceil(584 * kPageSize, 576) * 576;
   static constexpr auto kernel =
-      flash_c4_decode_norm_rope<kHeadDim, BufferFloat, InputFloat, SrcFloat, DType, kLogPageSize, kUsePDL, kBf16Store>;
+      flash_c4_decode_norm_rope<kHeadDim, BufferFloat, InputFloat, DType, kLogPageSize, kUsePDL, kBf16Store>;
   using Trait = FusedC4Trait<kHeadDim, 2>;
 
   static_assert(kHeadDim == 512, "fused c4 epilogue is defined for flashmla head_dim=512");
@@ -445,7 +293,7 @@ struct FusedCompress4NormRopeKernel {
         .with_device(device_)
         .verify(kv_buffer);
     TensorMatcher({N, Trait::kElementSize})  // kv score input
-        .with_dtype<SrcFloat>()
+        .with_dtype<InputFloat>()
         .with_device(device_)
         .verify(kv_input);
     TensorMatcher({8, kHeadDim})  // ape
@@ -502,7 +350,6 @@ struct FusedCompress4NormRopeKernel {
 template <
     typename BufferFloat,
     typename InputFloat,
-    typename SrcFloat,
     typename DType,
     int32_t kPageBits,
     bool kUsePDL,
@@ -531,7 +378,7 @@ FUSED_C4_KERNEL void flash_c4_decode_norm_rope_indexer(const __grid_constant__ F
   if (token_id >= params.batch_size) return;
 
   const auto plan = params.plan_d[token_id];
-  const auto kv_input = static_cast<const SrcFloat*>(params.kv_input);
+  const auto kv_input = static_cast<const InputFloat*>(params.kv_input);
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer);
   const auto score_bias = static_cast<const InputFloat*>(params.score_bias);
 
@@ -541,12 +388,12 @@ FUSED_C4_KERNEL void flash_c4_decode_norm_rope_indexer(const __grid_constant__ F
   const auto kv_dst = kv_buffer + plan.write_loc * Trait::kElementSize;
 
   PDLWaitPrimary<kUsePDL>();
-  fused_c4_write_decode<Trait, BufferFloat, SrcFloat>(kv_dst, kv_src);
+  c4_write_decode<Trait, BufferFloat, InputFloat>(kv_dst, kv_src);
 
   // Warp-uniform, so the cross-lane butterflies below still see a full warp.
   if (plan.seq_len % params.compress_ratio != 0) return;
 
-  Float4 data = fused_c4_forward<Trait, BufferFloat, InputFloat, SrcFloat>(
+  Float4 data = c4_compress_core<Trait, BufferFloat, InputFloat>(
       kv_buf_0, kv_buf_1, kv_src, score_bias, plan.seq_len > 4, 8);
 
   const auto position = static_cast<int32_t>(plan.seq_len - params.compress_ratio);
@@ -689,7 +536,6 @@ FUSED_C4_KERNEL void flash_c4_decode_norm_rope_indexer(const __grid_constant__ F
 template <
     typename BufferFloat,
     typename InputFloat,
-    typename SrcFloat,
     typename DType,
     int32_t kPageBits,
     bool kUsePDL,
@@ -727,7 +573,7 @@ flash_c4_decode_norm_rope_indexer_w64(const __grid_constant__ FusedCompress4Norm
   const int64_t split_offset = static_cast<int64_t>(split_id) * Trait::kTileDim;
 
   const auto plan = params.plan_d[token_id];
-  const auto kv_input = static_cast<const SrcFloat*>(params.kv_input) + split_offset;
+  const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
   const auto score_bias = static_cast<const InputFloat*>(params.score_bias) + split_offset;
 
@@ -737,12 +583,12 @@ flash_c4_decode_norm_rope_indexer_w64(const __grid_constant__ FusedCompress4Norm
   const auto kv_dst = kv_buffer + plan.write_loc * Trait::kElementSize;
 
   PDLWaitPrimary<kUsePDL>();
-  fused_c4_write_decode<Trait, BufferFloat, SrcFloat>(kv_dst, kv_src);
+  c4_write_decode<Trait, BufferFloat, InputFloat>(kv_dst, kv_src);
 
   // Wave-uniform: all 64 lanes of this token take the same branch.
   if (plan.seq_len % params.compress_ratio != 0) return;
 
-  Float2 data = fused_c4_forward<Trait, BufferFloat, InputFloat, SrcFloat>(
+  Float2 data = c4_compress_core<Trait, BufferFloat, InputFloat>(
       kv_buf_0, kv_buf_1, kv_src, score_bias, plan.seq_len > 4, 8);
 
   const auto position = static_cast<int32_t>(plan.seq_len - params.compress_ratio);
@@ -846,7 +692,6 @@ flash_c4_decode_norm_rope_indexer_w64(const __grid_constant__ FusedCompress4Norm
 template <
     typename BufferFloat,
     typename InputFloat,
-    typename SrcFloat,
     typename DType,
     uint32_t kPageSize,
     bool kUsePDL,
@@ -859,7 +704,6 @@ struct FusedCompress4NormRopeIndexerKernel {
   static constexpr auto kernel = flash_c4_decode_norm_rope_indexer_w64<
       BufferFloat,
       InputFloat,
-      SrcFloat,
       DType,
       kLogPageSize,
       kUsePDL,
@@ -870,7 +714,6 @@ struct FusedCompress4NormRopeIndexerKernel {
   static constexpr auto kernel = flash_c4_decode_norm_rope_indexer<
       BufferFloat,
       InputFloat,
-      SrcFloat,
       DType,
       kLogPageSize,
       kUsePDL,
@@ -903,7 +746,7 @@ struct FusedCompress4NormRopeIndexerKernel {
         .with_device(device_)
         .verify(kv_buffer);
     TensorMatcher({N, Trait::kElementSize})  // kv score input
-        .with_dtype<SrcFloat>()
+        .with_dtype<InputFloat>()
         .with_device(device_)
         .verify(kv_input);
     TensorMatcher({8, kHeadDim})  // ape

@@ -249,8 +249,7 @@ class CompressorBackendMixin:
         if _is_hip and not envs.SGLANG_OPT_USE_JIT_NORM.get():
             self._forward_unified_hip(
                 token_to_kv_pool=token_to_kv_pool,
-                # The triton compressor is not built per input dtype.
-                kv_score_input=kv_score_input.to(compressor.ape.dtype),
+                kv_score_input=kv_score_input,
                 state_pool=state_pool,
                 compressor=compressor,
                 layer_id=layer_id,

@@ -51,14 +51,6 @@ CONFIGS = {
     128: dict(page_size=64, bf16_store=False, store="fp8"),
 }
 
-SRC_DTYPES = [
-    pytest.param(torch.float32, id="src_fp32"),
-    # bf16 source also exercises the kv_score bf16 transport the compressor
-    # kernels widen on load.
-    pytest.param(torch.bfloat16, id="src_bf16"),
-]
-
-
 def _make_ctx(mode: str, head_dim: int) -> Context:
     if mode == "legacy":
         return make_legacy_context(bs=1, compress_ratio=RATIO, head_dim=head_dim)
@@ -66,21 +58,19 @@ def _make_ctx(mode: str, head_dim: int) -> Context:
 
 
 def _make_inputs(
-    num_q: int, head_dim: int, seed: int, src_dtype: torch.dtype
+    num_q: int, head_dim: int, seed: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     g = torch.Generator(device="cpu").manual_seed(seed)
+    # The compressor computes in (and consumes kv_score in) the ape/fp32 dtype.
     kv_score_input_cpu = torch.randn(
         num_q, head_dim * 4, generator=g, dtype=torch.float32
     )
-    # Round to the transport dtype up front so both paths see identical inputs;
-    # what is under test is fused-vs-chain, not how far bf16 rounds the inputs.
-    kv_score_input_cpu = kv_score_input_cpu.to(src_dtype).float()
     ape_cpu = torch.randn(WINDOW, head_dim, generator=g, dtype=torch.float32)
     return kv_score_input_cpu, ape_cpu
 
 
-def _to_src(t: torch.Tensor, src_dtype: torch.dtype) -> torch.Tensor:
-    return t.to(get_device()).to(src_dtype)
+def _to_dev(t: torch.Tensor) -> torch.Tensor:
+    return t.to(get_device())
 
 
 def _make_cache(
@@ -144,10 +134,9 @@ def _assert_cache_close(
 
 @pytest.mark.parametrize("head_dim", list(CONFIGS))
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
-@pytest.mark.parametrize("src_dtype", SRC_DTYPES)
 @pytest.mark.parametrize("prefix_len", [0, 6, 256])
 def test_fused_matches_chain_decode(
-    head_dim: int, mode: str, src_dtype: torch.dtype, prefix_len: int
+    head_dim: int, mode: str, prefix_len: int
 ) -> None:
     """Fused compress+norm+rope+store must match compress_forward + store.
 
@@ -158,7 +147,7 @@ def test_fused_matches_chain_decode(
     """
     cfg = CONFIGS[head_dim]
     device = get_device()
-    torch.manual_seed(head_dim + prefix_len + int(src_dtype == torch.bfloat16))
+    torch.manual_seed(head_dim + prefix_len)
 
     ctx = _make_ctx(mode, head_dim)
     pool_chain = make_state_pool(ctx.num_pages, RATIO, head_dim)
@@ -166,7 +155,7 @@ def test_fused_matches_chain_decode(
 
     seq_len_total = prefix_len + N_DECODE_STEPS
     kv_full_cpu, ape_cpu = _make_inputs(
-        seq_len_total, head_dim, seed=seq_len_total, src_dtype=src_dtype
+        seq_len_total, head_dim, seed=seq_len_total
     )
     ape = ape_cpu.to(device)
     norm_weight = torch.randn(head_dim, dtype=torch.float32, device=device)
@@ -181,7 +170,7 @@ def test_fused_matches_chain_decode(
     # (compress_forward only -- the fused path is decode-only).
     if prefix_len > 0:
         seq_lens_cpu, extend_lens_cpu, _ = to_seq_extend([(prefix_len, prefix_len)])
-        kv_pref = _to_src(kv_full_cpu[:prefix_len], src_dtype)
+        kv_pref = _to_dev(kv_full_cpu[:prefix_len])
         for pool in (pool_chain, pool_fused):
             plan = ctx.make_prefill_plan(seq_lens_cpu, extend_lens_cpu, prefix_len)
             compress_forward(
@@ -194,7 +183,7 @@ def test_fused_matches_chain_decode(
         cur_seq_len = pos + 1
         is_boundary = cur_seq_len % RATIO == 0
         seq_lens_gpu = torch.tensor([cur_seq_len], dtype=torch.int64, device=device)
-        kv_step = _to_src(kv_full_cpu[pos : pos + 1], src_dtype)
+        kv_step = _to_dev(kv_full_cpu[pos : pos + 1])
         out_loc = torch.tensor(
             [next_slot if is_boundary else 0], dtype=torch.int64, device=device
         )

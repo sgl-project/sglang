@@ -141,23 +141,6 @@ def _linear_bf16_fp32_hpc(
     )
 
 
-_KV_SCORE_BF16 = get_bool_env_var("SGLANG_OPT_KV_SCORE_BF16", "false")
-
-
-def linear_kv_score(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """wkv_gate projection feeding the compressor.
-
-    The compressor kernels widen their input on load, so when they are built for
-    a bf16 source there is nothing to gain from materializing an fp32 copy of
-    the gemm output first -- that copy is a separate full-tensor pass whose only
-    effect is to re-expand values the gemm already rounded to bf16. Widening
-    inside the consumer instead is exact, not just close.
-    """
-    if _KV_SCORE_BF16 and _use_aiter and y.dtype == torch.bfloat16:
-        return tgemm.mm(x, y, otype=x.dtype)
-    return linear_bf16_fp32(x, y)
-
-
 def linear_bf16_fp32(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -165,10 +148,6 @@ def linear_bf16_fp32(
     hpc_kernel_min_m: Optional[int] = None,
 ) -> torch.Tensor:
     if _use_aiter and y.dtype == torch.bfloat16:
-        # NOTE: do not "simplify" this to otype=torch.float32. aiter has no fp32
-        # epilogue for these shapes, so it runs the same widening pass internally
-        # and additionally drops off the single-kernel hgemm solution onto a
-        # split-k tensile one, i.e. three kernels instead of two.
         return tgemm.mm(x, y, otype=x.dtype).float()
     elif hpc_kernel_min_m is not None:
         output = _linear_bf16_fp32_hpc(x, y, min_m=hpc_kernel_min_m)
