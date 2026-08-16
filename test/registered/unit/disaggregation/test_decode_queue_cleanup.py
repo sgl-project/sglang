@@ -12,6 +12,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -31,6 +32,14 @@ class FakeReceiver:
 
 class TestDecodeQueueCleanup(CustomTestCase):
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
+        # resume_retracted_reqs reads the retraction backend off the disagg
+        # bag, so the case publishes a config instead of injecting one.
+        override = get_context().override_server_args(
+            disaggregation_decode_retraction_backup="cpu_tensor"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
         page_size = 128
         fill_len = 574
         physical_tokens_per_req = 5 * page_size
@@ -56,10 +65,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.tree_cache = MagicMock()
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,
-            server_args=SimpleNamespace(
-                disable_radix_cache=True,
-                disaggregation_decode_retraction_backup="cpu_tensor",
-            ),
+            server_args=SimpleNamespace(disable_radix_cache=True),
         )
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._swa_aware_allocatable_token_budgets = MagicMock(
