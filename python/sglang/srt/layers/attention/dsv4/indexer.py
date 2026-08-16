@@ -62,6 +62,29 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 
 _arange_cache = {}
+_aiter_logits_workspaces: Dict[Tuple[str, torch.cuda.Stream], torch.Tensor] = {}
+
+
+def _get_aiter_logits_workspace(
+    total_tokens: int,
+    max_seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    assert total_tokens > 0 and max_seq_len > 0
+    required_numel = total_tokens * max_seq_len
+    if torch.cuda.is_current_stream_capturing():
+        return torch.empty(required_numel, dtype=torch.float32, device=device).view(
+            total_tokens, max_seq_len
+        )
+
+    stream = torch.cuda.current_stream(device)
+    key = (str(device), stream)
+    workspace = _aiter_logits_workspaces.get(key)
+    if workspace is None or workspace.numel() < required_numel:
+        capacity = 1 << max(required_numel - 1, 0).bit_length()
+        workspace = torch.empty(capacity, dtype=torch.float32, device=device)
+        _aiter_logits_workspaces[key] = workspace
+    return workspace[:required_numel].view(total_tokens, max_seq_len)
 
 
 def fp8_paged_mqa_logits_torch(
@@ -150,11 +173,10 @@ def _aiter_fp8_paged_mqa_logits(
     total_tokens = batch_size * next_n
     _sl = seq_lens.squeeze(-1) if seq_lens.dim() == 2 else seq_lens
     kv_block_size = kvcache_fp8.shape[1]
-    logits = torch.empty(
+    logits = _get_aiter_logits_workspace(
         total_tokens,
         max_seq_len,
-        dtype=torch.float32,
-        device=q_fp8.device,
+        q_fp8.device,
     )
     deepgemm_fp8_paged_mqa_logits(
         q_fp8,
