@@ -34,6 +34,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     SERVER_WARMUP_MAX_VIDEO_FRAMES,
+    _resolve_calibration_num_frames,
     _resolve_warmup_num_frames,
 )
 
@@ -72,7 +73,7 @@ class TestEstimateDefaultWorkloadPeak:
         )
         assert estimate == record.peak_reserved_bytes
 
-    def test_capped_video_scales_only_the_activation_part(self):
+    def test_single_capped_record_scales_only_the_activation_part(self):
         # Warmup capped to 832x480x17; Wan-class default is 704x1280x121.
         record = _record()
         target_units = 704 * 1280 * 121
@@ -91,6 +92,55 @@ class TestEstimateDefaultWorkloadPeak:
         # weights times the cap ratio and promotion would never trigger.
         naive = int(record.peak_reserved_bytes * ratio)
         assert estimate < naive
+
+    def test_two_point_fit_separates_constant_from_linear(self):
+        # Two calibration sizes let the estimator measure the slope instead
+        # of assuming everything above the baseline scales. Under offload the
+        # baseline is nearly empty, so the single-point formula would scale
+        # the whole peak (~x13 here); the fit extrapolates only the measured
+        # linear part.
+        small = _record(num_frames=9, baseline_gib=1, peak_gib=14)
+        large = _record(num_frames=17, baseline_gib=1, peak_gib=16)
+        target_units = 1280 * 720 * 81
+
+        estimate = estimate_default_workload_peak_bytes(
+            records=[small, large], target_units=target_units
+        )
+        slope = (large.peak_reserved_bytes - small.peak_reserved_bytes) / (
+            large.workload_units() - small.workload_units()
+        )
+        constant = large.peak_reserved_bytes - slope * large.workload_units()
+        expected = int(
+            constant + slope * target_units * ACTIVATION_EXTRAPOLATION_MARGIN
+        )
+        assert estimate == expected
+        single_point = estimate_default_workload_peak_bytes(
+            records=[large], target_units=target_units
+        )
+        assert estimate < single_point
+
+    def test_negative_slope_falls_back_to_single_point_formula(self):
+        small = _record(num_frames=9, peak_gib=16)
+        large = _record(num_frames=17, peak_gib=14)
+        target_units = 1280 * 720 * 81
+        estimate = estimate_default_workload_peak_bytes(
+            records=[small, large], target_units=target_units
+        )
+        fallback = max(
+            estimate_default_workload_peak_bytes(
+                records=[record], target_units=target_units
+            )
+            for record in (small, large)
+        )
+        assert estimate == fallback
+
+    def test_covering_measurement_bounds_the_target(self):
+        capped = _record(num_frames=17, peak_gib=12)
+        full = _record(width=1280, height=720, num_frames=81, peak_gib=30)
+        estimate = estimate_default_workload_peak_bytes(
+            records=[capped, full], target_units=1280 * 720 * 81
+        )
+        assert estimate == full.peak_reserved_bytes
 
     def test_multiple_records_take_the_max(self):
         low = _record(peak_gib=12)
@@ -434,6 +484,58 @@ class TestWarmupFrameAdjustment:
             self._server_args(), self._defaults(), server_based_warmup=False
         )
         assert num_frames == 61
+
+
+class TestCalibrationFrames:
+    def _wan_like_args(self, *, performance_mode: str = "auto") -> SimpleNamespace:
+        return SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                task_type=ModelTaskType.T2V,
+                adjust_num_frames=lambda n: n,
+            ),
+            enable_breakable_cuda_graph=False,
+            performance_mode=performance_mode,
+        )
+
+    def test_capped_video_gets_a_smaller_calibration_size(self):
+        calibration = _resolve_calibration_num_frames(
+            self._wan_like_args(),
+            SimpleNamespace(num_frames=81),
+            17,
+            server_based_warmup=True,
+        )
+        assert calibration == 9
+
+    def test_uncapped_video_needs_no_calibration(self):
+        calibration = _resolve_calibration_num_frames(
+            self._wan_like_args(),
+            SimpleNamespace(num_frames=13),
+            13,
+            server_based_warmup=True,
+        )
+        assert calibration is None
+
+    def test_manual_mode_skips_calibration(self):
+        calibration = _resolve_calibration_num_frames(
+            self._wan_like_args(performance_mode="manual"),
+            SimpleNamespace(num_frames=81),
+            17,
+            server_based_warmup=True,
+        )
+        assert calibration is None
+
+    def test_frame_contract_collapse_skips_calibration(self):
+        # LongLive2 aligns both 17 and 9 to 29 latent-block frames: a second
+        # measurement at the same size adds nothing.
+        args = SimpleNamespace(
+            pipeline_config=LongLive2T2VConfig(),
+            enable_breakable_cuda_graph=False,
+            performance_mode="auto",
+        )
+        calibration = _resolve_calibration_num_frames(
+            args, SimpleNamespace(num_frames=61), 29, server_based_warmup=True
+        )
+        assert calibration is None
 
 
 class TestAutoResidencySkipReason:

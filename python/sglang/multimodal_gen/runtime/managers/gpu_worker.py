@@ -1064,7 +1064,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         local_report = self._build_auto_residency_report(workload=workload)
         reports = self._auto_residency_all_gather(local_report)
         plan = plan_auto_residency(reports=reports)
-        summary = format_plan_summary(plan=plan, workload=workload)
+        summary = format_plan_summary(
+            plan=plan,
+            workload=workload,
+            records=self._auto_residency_warmup_records,
+        )
         if plan.skip_reason is not None or not plan.promotions:
             if self.is_output_rank:
                 logger.info("%s", summary)

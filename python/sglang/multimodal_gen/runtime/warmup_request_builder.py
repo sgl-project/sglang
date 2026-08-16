@@ -39,6 +39,10 @@ SERVER_WARMUP_IMAGE_MAX_AREA = 768 * 768
 SERVER_WARMUP_DIFFUSERS_IMAGE_MAX_AREA = 512 * 512
 SERVER_WARMUP_VIDEO_MAX_AREA = 832 * 480
 SERVER_WARMUP_MAX_VIDEO_FRAMES = 17
+# Second, smaller frame count used to calibrate auto residency: two workload
+# sizes let the estimator fit peak = constant + slope * units instead of
+# scaling one measured peak (whose constant part dominates under offload).
+SERVER_WARMUP_CALIBRATION_VIDEO_FRAMES = 9
 SERVER_WARMUP_IMAGE_STEPS = 2
 SERVER_WARMUP_VIDEO_STEPS = 2
 
@@ -255,6 +259,37 @@ def _resolve_warmup_num_frames(
     return server_args.pipeline_config.adjust_num_frames(capped_num_frames)
 
 
+def _resolve_calibration_num_frames(
+    server_args: ServerArgs,
+    sampling_defaults: SamplingParams,
+    warmup_num_frames: int,
+    *,
+    server_based_warmup: bool,
+) -> int | None:
+    """A second, smaller warmup frame count for auto-residency calibration.
+
+    Only produced when the main video warmup was frame-capped under
+    ``--performance-mode auto``: the auto-residency estimator then has two
+    workload sizes to fit the constant/linear split of the peak. Returns None
+    when a second measurement adds no information (same adjusted frames).
+    """
+    if not server_based_warmup or not _is_video_warmup_task(server_args):
+        return None
+    if server_args.performance_mode != "auto":
+        return None
+    if getattr(server_args, "enable_breakable_cuda_graph", False) is True:
+        return None
+    default_num_frames = getattr(sampling_defaults, "num_frames", 1) or 1
+    if warmup_num_frames >= default_num_frames:
+        return None
+    calibration_num_frames = server_args.pipeline_config.adjust_num_frames(
+        SERVER_WARMUP_CALIBRATION_VIDEO_FRAMES
+    )
+    if calibration_num_frames == warmup_num_frames or calibration_num_frames <= 0:
+        return None
+    return calibration_num_frames
+
+
 def _effective_cfg_scale(sampling_defaults: SamplingParams) -> float | None:
     if getattr(sampling_defaults, "true_cfg_scale", None) is not None:
         return sampling_defaults.true_cfg_scale
@@ -365,6 +400,16 @@ def build_warmup_reqs(
         sampling_defaults,
         server_based_warmup=server_based_warmup,
     )
+    calibration_num_frames = (
+        _resolve_calibration_num_frames(
+            server_args,
+            sampling_defaults,
+            warmup_num_frames,
+            server_based_warmup=server_based_warmup,
+        )
+        if warmup_resolutions is None
+        else None
+    )
 
     # build warmup reqs
     warmup_reqs = []
@@ -398,6 +443,23 @@ def build_warmup_reqs(
             req_kwargs["do_classifier_free_guidance"] = True
         elif negative_prompt is not None and cfg_scale is not None and cfg_scale > 1.0:
             req_kwargs["do_classifier_free_guidance"] = True
+
+        if calibration_num_frames is not None and (width, height) == resolutions[0]:
+            # smaller-workload measurement first; it also pre-warms kernels
+            # so the main warmup measurement is cleaner
+            calibration_kwargs = req_kwargs.copy()
+            calibration_kwargs["sampling_params"] = copy(req_kwargs["sampling_params"])
+            calibration_kwargs["num_frames"] = calibration_num_frames
+            calibration_req = Req(**calibration_kwargs)
+            calibration_req.set_as_warmup(warmup_steps)
+            calibration_req.sampling_params.prepare_synthetic_warmup_request_for_queue(
+                calibration_req, server_args
+            )
+            if return_warmup_result:
+                calibration_req.extra["return_warmup_result"] = True
+            if server_based_warmup:
+                calibration_req.extra["server_based_warmup"] = True
+            warmup_reqs.append(calibration_req)
 
         run_real_path_prewarm = server_based_warmup and server_args.enable_torch_compile
         prompts = (
