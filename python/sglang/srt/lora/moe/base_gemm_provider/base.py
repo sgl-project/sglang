@@ -156,7 +156,7 @@ class MoeBaseProvider:
         act_out: torch.Tensor,
         activation_lora_input: torch.Tensor,
         *,
-        activation: str = "silu_mul",
+        activation: str = "silu",
         consume_base_pdl: bool = False,
     ) -> None:
         raise NotImplementedError

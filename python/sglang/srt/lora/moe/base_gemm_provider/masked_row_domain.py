@@ -222,17 +222,11 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         act_out: torch.Tensor,
         activation_lora_input: torch.Tensor,
         *,
-        activation: str = "silu_mul",
+        activation: str = "silu",
         consume_base_pdl: bool = False,
     ) -> None:
-        if activation not in ("silu_mul", "relu2"):
-            raise ValueError(f"activation={activation!r} is not 'silu_mul' or 'relu2'")
-        expected_slices = 2 if activation == "silu_mul" else 1
-        if expected_slices != self.gate_up_slices:
-            raise ValueError(
-                f"activation {activation!r} needs {expected_slices} gate/up "
-                f"slices but resident w13 carries {self.gate_up_slices}"
-            )
+        if activation not in ("silu", "relu2"):
+            raise ValueError(f"activation={activation!r} is not 'silu' or 'relu2'")
         self._act_kernel(
             gateup_out,
             gate_up_delta,
@@ -297,7 +291,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         """Inject an explicitly forceable provider-local implementation."""
         if family != "b_activation":
             raise ValueError(f"unknown fused-middle family {family!r}")
-        if activation not in ("silu_mul", "relu2"):
+        if activation not in ("silu", "relu2"):
             raise ValueError(f"unknown fused-middle activation {activation!r}")
         if not name or not callable(implementation):
             raise ValueError("a fused-middle implementation needs a name and callable")
@@ -388,14 +382,8 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             activation,
             implementation,
         )
-        if activation not in ("silu_mul", "relu2"):
-            raise ValueError(f"activation={activation!r} is not 'silu_mul' or 'relu2'")
-        expected_slices = 2 if activation == "silu_mul" else 1
-        if expected_slices != self.gate_up_slices:
-            raise ValueError(
-                f"activation {activation!r} and resident w13 slice count "
-                f"{self.gate_up_slices} disagree"
-            )
+        if activation not in ("silu", "relu2"):
+            raise ValueError(f"activation={activation!r} is not 'silu' or 'relu2'")
         invoke(
             family,
             activation=activation,

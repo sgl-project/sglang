@@ -103,7 +103,6 @@ from sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle import (
     MASKED_MIDDLE_TRITON,
     _b_act_kernel,
     _is_power_of_two,
-    _num_slices,
     _require_config,
     _validate_b_inputs,
 )
@@ -635,7 +634,7 @@ def silu_mul_delta_contiguous(
     num_local_experts: int,
     gate_first: bool = True,
     interleaved: bool = False,
-    activation: str = "silu_mul",
+    activation: str = "silu",
     consume_base_pdl: bool = False,
 ) -> None:
     """The masked S3 kernel re-targeted at compact rows through ``src2dst``.
@@ -648,15 +647,20 @@ def silu_mul_delta_contiguous(
     the slab's leading dimension, which the compact 2-D buffer no longer
     carries.
     """
-    if activation not in ("silu_mul", "relu2"):
-        raise ValueError(f"activation={activation!r} is not 'silu_mul' or 'relu2'")
-    num_slices = 2 if activation == "silu_mul" else 1
+    if activation not in ("silu", "relu2"):
+        raise ValueError(f"activation={activation!r} is not 'silu' or 'relu2'")
     num_pairs = topk_ids.numel()
     inter = act_out.shape[-1]
-    if gateup_output.ndim != 2 or gateup_output.shape[-1] != num_slices * inter:
+    if gateup_output.ndim != 2:
         raise ValueError(
-            f"{activation} expects compact [rows, {num_slices * inter}] base "
-            f"columns, got {tuple(gateup_output.shape)}"
+            f"base gate/up must be compact 2-D, got {tuple(gateup_output.shape)}"
+        )
+    # Gating is a resident-shape property, independent of the activation.
+    num_slices = gateup_output.shape[-1] // inter
+    if num_slices not in (1, 2) or num_slices * inter != gateup_output.shape[-1]:
+        raise ValueError(
+            f"gate/up width {gateup_output.shape[-1]} is not 1x or 2x "
+            f"intermediate {inter}"
         )
     if act_out.ndim != 2 or act_out.shape[0] != gateup_output.shape[0]:
         raise ValueError("gate/up and activation compact buffers must share rows")
@@ -683,7 +687,7 @@ def silu_mul_delta_contiguous(
         inter,
         HAS_DELTA=gate_up_delta is not None,
         NUM_SLICES=num_slices,
-        ACT_RELU2=activation == "relu2",
+        ACTIVATION_TYPE=activation,
         GATE_FIRST=gate_first,
         INTERLEAVED=interleaved,
         CONSUME_BASE_PDL=consume_base_pdl,
@@ -732,13 +736,23 @@ def fused_b_act_contiguous(
             f"contiguous fused middle needs route view {ROUTE_ALIGNED!r}, got "
             f"{routing.view!r}"
         )
-    slices = _num_slices(activation)
+    if activation not in MASKED_MIDDLE_ACTIVATIONS:
+        raise ValueError(
+            f"activation={activation!r} is not one of {MASKED_MIDDLE_ACTIVATIONS}"
+        )
     pairs = routing.topk_ids.numel()
     if src2dst.dtype != torch.int32 or src2dst.numel() != pairs:
         raise ValueError(f"src2dst must be int32 with {pairs} entries")
     if act_compact.ndim != 2 or act_compact.shape[1] < 1:
         raise ValueError("act_compact must be compact [m_pad_ceiling, intermediate]")
     width = act_compact.shape[1]
+    # Gating is a resident-shape property, independent of the activation.
+    slices = base_gateup.shape[-1] // width
+    if slices not in (1, 2) or slices * width != base_gateup.shape[-1]:
+        raise ValueError(
+            f"base gate/up width {base_gateup.shape[-1]} is not 1x or 2x "
+            f"activation width {width}"
+        )
     if base_gateup.shape != (act_compact.shape[0], slices * width):
         raise ValueError(
             "base_gateup must share the compact rows and carry "
@@ -821,7 +835,7 @@ def fused_b_act_contiguous(
         width=width,
         rank=gate_rank,
         num_slices=slices,
-        act_relu2=activation == "relu2",
+        activation_type=activation,
         gate_first=gate_first,
         interleaved=interleaved,
         bridge_token_major=bridge_top_k != 1,
@@ -1061,17 +1075,11 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         act_out: torch.Tensor,
         activation_lora_input: torch.Tensor,
         *,
-        activation: str = "silu_mul",
+        activation: str = "silu",
         consume_base_pdl: bool = False,
     ) -> None:
-        if activation not in ("silu_mul", "relu2"):
-            raise ValueError(f"activation={activation!r} is not 'silu_mul' or 'relu2'")
-        expected_slices = 2 if activation == "silu_mul" else 1
-        if expected_slices != self.gate_up_slices:
-            raise ValueError(
-                f"activation {activation!r} needs {expected_slices} gate/up "
-                f"slices but resident w13 carries {self.gate_up_slices}"
-            )
+        if activation not in ("silu", "relu2"):
+            raise ValueError(f"activation={activation!r} is not 'silu' or 'relu2'")
         silu_mul_delta_contiguous(
             gateup_out,
             gate_up_delta,
@@ -1173,12 +1181,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             raise NotImplementedError(
                 f"{self.contract.key} has no {implementation!r} fused-middle "
                 f"implementation for {family!r}/{activation!r}"
-            )
-        expected_slices = 2 if activation == "silu_mul" else 1
-        if expected_slices != self.gate_up_slices:
-            raise ValueError(
-                f"activation {activation!r} and resident w13 slice count "
-                f"{self.gate_up_slices} disagree"
             )
         fused_b_act_contiguous(
             family,

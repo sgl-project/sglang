@@ -25,7 +25,19 @@ import torch
 import triton
 import triton.language as tl
 
-_ACTIVATIONS = ("silu_mul", "relu2")
+_ACTIVATIONS = ("silu", "relu2")
+
+
+@triton.jit
+def apply_activation(x, ACTIVATION_TYPE: tl.constexpr):
+    """Elementwise activation of the gate half; gating is the caller's shape."""
+    if ACTIVATION_TYPE == "silu":
+        return x * tl.sigmoid(x)
+    elif ACTIVATION_TYPE == "relu2":
+        value = tl.maximum(x, 0.0)
+        return value * value
+    else:
+        raise ValueError(f"unsupported activation {ACTIVATION_TYPE}")
 
 
 @triton.jit
@@ -41,7 +53,7 @@ def _activation_delta_masked_kernel(
     inter,
     HAS_DELTA: tl.constexpr,
     NUM_SLICES: tl.constexpr,
-    ACT_RELU2: tl.constexpr,
+    ACTIVATION_TYPE: tl.constexpr,
     GATE_FIRST: tl.constexpr,
     INTERLEAVED: tl.constexpr,
     CONSUME_BASE_PDL: tl.constexpr,
@@ -83,24 +95,23 @@ def _activation_delta_masked_kernel(
             gate_offs, up_offs = up_offs, gate_offs
 
         g = tl.load(gateup_row + gate_offs, mask=mask & valid, other=0.0).to(tl.float32)
-        u = tl.load(gateup_row + up_offs, mask=mask & valid, other=0.0).to(tl.float32)
         if HAS_DELTA:
             # delta is always canonical contiguous [gate | up]
             dg = tl.load(delta_row + offs, mask=mask & valid, other=0.0).to(tl.float32)
             g += dg
-            if NUM_SLICES == 2:
+        act = apply_activation(g, ACTIVATION_TYPE)
+        if NUM_SLICES == 2:
+            u = tl.load(gateup_row + up_offs, mask=mask & valid, other=0.0).to(
+                tl.float32
+            )
+            if HAS_DELTA:
                 du = tl.load(
                     delta_row + inter + offs,
                     mask=mask & valid,
                     other=0.0,
                 ).to(tl.float32)
                 u += du
-
-        if ACT_RELU2:
-            relu = tl.maximum(g, 0.0)
-            act = relu * relu
-        else:
-            act = g * tl.sigmoid(g) * u
+            act = act * u
         act_bf16 = act.to(act_out_ptr.dtype.element_ty)
 
         tl.store(act_out_row + offs, act_bf16, mask=mask & valid)
@@ -120,19 +131,20 @@ def silu_mul_delta_masked(
     topk_ids: torch.Tensor,  # [num_tokens, top_k]
     gate_first: bool = True,
     interleaved: bool = False,
-    activation: str = "silu_mul",
+    activation: str = "silu",
     consume_base_pdl: bool = False,
 ) -> None:
-    """Join base and LoRA delta for gated SiLU or non-gated ReLU2."""
+    """Join base and LoRA delta, then activate; gating comes from the shapes."""
     if activation not in _ACTIVATIONS:
         raise ValueError(f"activation={activation!r} is not one of {_ACTIVATIONS}")
-    num_slices = 2 if activation == "silu_mul" else 1
     num_pairs = topk_ids.numel()
     inter = act_out.shape[-1]
-    if gateup_output.shape[-1] != num_slices * inter:
+    # Gating is a resident-shape property, independent of the activation.
+    num_slices = gateup_output.shape[-1] // inter
+    if num_slices not in (1, 2) or num_slices * inter != gateup_output.shape[-1]:
         raise ValueError(
-            f"{activation} expects {num_slices * inter} base columns, got "
-            f"{gateup_output.shape[-1]}"
+            f"gate/up width {gateup_output.shape[-1]} is not 1x or 2x "
+            f"intermediate {inter}"
         )
     if gate_up_delta is not None and gate_up_delta.shape != (
         *topk_ids.shape,
@@ -156,7 +168,7 @@ def silu_mul_delta_masked(
         inter,
         HAS_DELTA=gate_up_delta is not None,
         NUM_SLICES=num_slices,
-        ACT_RELU2=activation == "relu2",
+        ACTIVATION_TYPE=activation,
         GATE_FIRST=gate_first,
         INTERLEAVED=interleaved,
         CONSUME_BASE_PDL=consume_base_pdl,

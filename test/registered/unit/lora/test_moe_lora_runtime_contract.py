@@ -301,17 +301,21 @@ class TestRunnerAdmission:
         quant_method.runner = SimpleNamespace(runner_backend=runner_backend)
         dispatcher = object.__new__(StandardDispatcher)
         dispatcher.skip_local_expert_mapping = overrides.get("skip_local", False)
+        is_gated = overrides.get("is_gated", True)
+        # Resident gate/up width follows the gating declaration unless a test
+        # forces a disagreement.
+        gateup_width = overrides.get("gateup_width", (2 if is_gated else 1) * 4)
         return SimpleNamespace(
             quant_method=quant_method,
             dispatcher=dispatcher,
-            w13_weight=torch.zeros(2, 8, 4, dtype=torch.bfloat16),
+            w13_weight=torch.zeros(2, gateup_width, 4, dtype=torch.bfloat16),
             w2_weight=torch.zeros(2, 4, 4, dtype=torch.bfloat16),
             should_fuse_routed_scaling_factor_in_topk=overrides.get(
                 "fused_scaling", False
             ),
             moe_runner_config=SimpleNamespace(
                 activation=overrides.get("activation", "silu"),
-                is_gated=overrides.get("is_gated", True),
+                is_gated=is_gated,
                 gemm1_alpha=None,
                 gemm1_clamp_limit=None,
                 swiglu_limit=None,
@@ -334,7 +338,7 @@ class TestRunnerAdmission:
 
     @pytest.mark.parametrize(
         ("activation", "is_gated"),
-        [("silu", True), ("relu2", False)],
+        [("silu", True), ("silu", False), ("relu2", False), ("relu2", True)],
     )
     def test_accepts_supported_activation_contracts(
         self,
@@ -352,11 +356,11 @@ class TestRunnerAdmission:
             ({"fused_scaling": True}, "routed scaling"),
             (
                 {"activation": "gelu", "is_gated": False},
-                "SiLU or non-gated ReLU2",
+                "SiLU or ReLU2",
             ),
             (
-                {"activation": "relu2", "is_gated": True},
-                "SiLU or non-gated ReLU2",
+                {"is_gated": False, "gateup_width": 8},
+                "disagrees with",
             ),
         ],
     )

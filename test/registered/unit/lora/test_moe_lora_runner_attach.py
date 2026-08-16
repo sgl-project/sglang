@@ -256,7 +256,7 @@ class TestEngineAdmission(unittest.TestCase):
             self._admit(fused_scaling=True)
 
     def test_rejects_unsupported_activation(self):
-        with self.assertRaisesRegex(NotImplementedError, "gated SiLU"):
+        with self.assertRaisesRegex(NotImplementedError, "SiLU or ReLU2"):
             self._admit(activation="gelu")
 
 

@@ -33,10 +33,13 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.lora.moe.base_gemm_provider.masked_activation import (
+    apply_activation,
+)
 from sglang.srt.lora.moe.routing import ROUTE_ALIGNED, RouteView
 
 MASKED_MIDDLE_FAMILIES = ("b_activation",)
-MASKED_MIDDLE_ACTIVATIONS = ("silu_mul", "relu2")
+MASKED_MIDDLE_ACTIVATIONS = ("silu", "relu2")
 MASKED_MIDDLE_TRITON = "triton"
 
 FUSED_B_ACT_DEFAULT_CONFIG: dict[str, int] = {
@@ -50,14 +53,6 @@ FUSED_B_ACT_DEFAULT_CONFIG: dict[str, int] = {
 
 def _is_power_of_two(value: int) -> bool:
     return value > 0 and value & (value - 1) == 0
-
-
-def _num_slices(activation: str) -> int:
-    if activation not in MASKED_MIDDLE_ACTIVATIONS:
-        raise ValueError(
-            f"activation={activation!r} is not one of {MASKED_MIDDLE_ACTIVATIONS}"
-        )
-    return 2 if activation == "silu_mul" else 1
 
 
 def _require_config(config: Mapping[str, int]) -> tuple[int, int, int, int, int]:
@@ -101,7 +96,10 @@ def _validate_common(
             f"masked fused middle needs route view {ROUTE_ALIGNED!r}, got "
             f"{routing.view!r}"
         )
-    slices = _num_slices(activation)
+    if activation not in MASKED_MIDDLE_ACTIVATIONS:
+        raise ValueError(
+            f"activation={activation!r} is not one of {MASKED_MIDDLE_ACTIVATIONS}"
+        )
     pairs = routing.topk_ids.numel()
     if src2dst.dtype != torch.int32 or src2dst.numel() != pairs:
         raise ValueError(f"src2dst must be int32 with {pairs} entries")
@@ -112,6 +110,13 @@ def _validate_common(
     ):
         raise ValueError("act_masked must be [num_local_experts, m_max, intermediate]")
     width = act_masked.shape[2]
+    # Gating is a resident-shape property, independent of the activation.
+    slices = base_gateup.shape[-1] // width
+    if slices not in (1, 2) or slices * width != base_gateup.shape[-1]:
+        raise ValueError(
+            f"base gate/up width {base_gateup.shape[-1]} is not 1x or 2x "
+            f"activation width {width}"
+        )
     if base_gateup.shape != (
         num_local_experts,
         act_masked.shape[1],
@@ -183,14 +188,6 @@ def _validate_b_inputs(
     if bridge.dtype != torch.bfloat16:
         raise TypeError("masked BF16 gate/up LoRA factors must be BF16")
     return rank
-
-
-@triton.jit
-def _activation(gate, up, ACT_RELU2: tl.constexpr):
-    if ACT_RELU2:
-        value = tl.maximum(gate, 0.0)
-        return value * value
-    return gate * tl.sigmoid(gate) * up
 
 
 @triton.jit
@@ -284,7 +281,7 @@ def _b_act_kernel(
     width: tl.constexpr,
     rank: tl.constexpr,
     num_slices: tl.constexpr,
-    act_relu2: tl.constexpr,
+    activation_type: tl.constexpr,
     gate_first: tl.constexpr,
     interleaved: tl.constexpr,
     bridge_token_major: tl.constexpr,
@@ -385,20 +382,14 @@ def _b_act_kernel(
         mask=base_valid[:, None] & w_mask[None, :],
         other=0.0,
     ).to(tl.float32)
+    act = apply_activation(base_gate + delta_gate, activation_type)
     if num_slices == 2:
         base_up = tl.load(
             base_ptr + dst_rows[:, None] * stride_pm + up_cols[None, :] * stride_pn,
             mask=base_valid[:, None] & w_mask[None, :],
             other=0.0,
         ).to(tl.float32)
-    else:
-        base_up = base_gate
-
-    act = _activation(
-        base_gate + delta_gate,
-        base_up + delta_up,
-        act_relu2,
-    )
+        act = act * (base_up + delta_up)
     value = act.to(act_masked_ptr.dtype.element_ty)
     tl.store(
         act_masked_ptr + dst_rows[:, None] * stride_am + w_offsets[None, :] * stride_an,
@@ -497,7 +488,7 @@ def run_masked_fused_middle(
         width=width,
         rank=gate_rank,
         num_slices=slices,
-        act_relu2=activation == "relu2",
+        activation_type=activation,
         gate_first=gate_first,
         interleaved=interleaved,
         bridge_token_major=bridge_top_k != 1,

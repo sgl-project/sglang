@@ -259,9 +259,16 @@ class MoeLoraRunner:
             )
 
         config = base_layer.moe_runner_config
-        supported_activation = (config.activation == "silu" and config.is_gated) or (
-            config.activation == "relu2" and not config.is_gated
-        )
+        supported_activation = config.activation in ("silu", "relu2")
+        # Gating is validated as its own axis: the resident gate/up width must
+        # agree with the layer's is_gated declaration.
+        gateup_width = base_layer.w13_weight.shape[1]
+        intermediate = base_layer.w2_weight.shape[2]
+        if gateup_width != (2 if config.is_gated else 1) * intermediate:
+            raise NotImplementedError(
+                f"resident gate/up width {gateup_width} disagrees with "
+                f"is_gated={config.is_gated} at intermediate {intermediate}"
+            )
         if (
             not supported_activation
             or config.gemm1_alpha is not None
@@ -272,9 +279,8 @@ class MoeLoraRunner:
             or config.num_fused_shared_experts
         ):
             raise NotImplementedError(
-                "MoE LoRA BF16 supports canonical gated SiLU or non-gated "
-                "ReLU2 without fused shared experts, with route weighting "
-                "owned by finalize"
+                "MoE LoRA BF16 supports SiLU or ReLU2 (gated or not) without "
+                "fused shared experts, with route weighting owned by finalize"
             )
 
     @staticmethod
@@ -923,7 +929,7 @@ class MoeLoraRunner:
         return state, ws, gateup
 
     def _activation_name(self) -> str:
-        return "silu_mul" if self.activation is ActivationFamily.SWIGLU else "relu2"
+        return "silu" if self.activation is ActivationFamily.SWIGLU else "relu2"
 
     def _run_middle(
         self,

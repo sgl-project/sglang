@@ -260,7 +260,7 @@ class TestMaskedFusionSource(unittest.TestCase):
     def test_middle_pair_store_is_optional_and_masked_store_is_unconditional(self):
         source = _source("masked_fused_middle.py")
         self.assertIn('("b_activation",)', source)
-        self.assertIn('("silu_mul", "relu2")', source)
+        self.assertIn('("silu", "relu2")', source)
         base_columns = _function(source, "_base_columns")
         self.assertIn("interleaved", base_columns)
         self.assertIn("gate_first", base_columns)
@@ -285,9 +285,9 @@ class TestMaskedFusionSource(unittest.TestCase):
         kernel = _function(source, "_activation_delta_masked_kernel")
         wrapper = _function(source, "silu_mul_delta_masked")
         self.assertIn("NUM_SLICES", kernel)
-        self.assertIn("ACT_RELU2", kernel)
-        self.assertIn("tl.maximum", kernel)
-        self.assertIn('("silu_mul", "relu2")', source)
+        self.assertIn("ACTIVATION_TYPE", kernel)
+        self.assertIn("tl.maximum", _function(source, "apply_activation"))
+        self.assertIn('("silu", "relu2")', source)
         self.assertIn("num_slices * inter", wrapper)
 
     def test_shared_rank_finalize_is_fail_closed_and_two_stage(self):
@@ -389,7 +389,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         middle = types.ModuleType(
             "sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle"
         )
-        middle.MASKED_MIDDLE_ACTIVATIONS = ("silu_mul", "relu2")
+        middle.MASKED_MIDDLE_ACTIVATIONS = ("silu", "relu2")
         middle.MASKED_MIDDLE_FAMILIES = ("b_activation",)
         middle.MASKED_MIDDLE_TRITON = "triton"
         middle.run_masked_fused_middle = lambda *_args, **_kwargs: None
