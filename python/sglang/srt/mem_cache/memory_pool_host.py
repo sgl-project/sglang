@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -47,6 +48,38 @@ if _is_npu:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _tensor_version(tensor: torch.Tensor) -> int:
+    return 0 if tensor.is_inference() else tensor._version
+
+
+def _cached_hip_load_indices(owner, host_indices, device_indices, convert):
+    """Reuse CPU page rows across the per-layer calls of one L2 load."""
+    host_version = _tensor_version(host_indices)
+    device_version = _tensor_version(device_indices)
+    cache = getattr(owner, "_hip_load_indices_cache", None)
+    if (
+        cache is not None
+        and cache[0]() is host_indices
+        and cache[1]() is device_indices
+        and cache[2] == host_version
+        and cache[3] == device_version
+    ):
+        return cache[4], cache[5]
+
+    host_rows, device_rows = convert()
+    host_rows = host_rows.cpu()
+    device_rows = device_rows.cpu()
+    owner._hip_load_indices_cache = (
+        weakref.ref(host_indices),
+        weakref.ref(device_indices),
+        host_version,
+        device_version,
+        host_rows,
+        device_rows,
+    )
+    return host_rows, device_rows
 
 
 from sglang.srt.mem_cache.pool_host import HostKVCache
@@ -872,7 +905,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+        self.can_use_write_back_jit = (
+            _is_cuda or _is_hip
+        ) and can_use_write_back_jit_kernel(
             element_size=self.item_bytes * self.dtype.itemsize,
         )
         staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
@@ -1047,9 +1082,36 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 dst_indices=device_indices.to(dtype=torch.int64),
             )
             return
+        if (
+            io_backend == "kernel"
+            and self.layout == "page_first"
+            and _is_hip
+            and self.device_buffers[layer_id].is_cuda
+        ):
+            # HIP-registered mmap storage can have distinct CPU and GPU aliases.
+            # Runtime copies resolve that mapping; a GPU kernel using data_ptr()
+            # directly can fault on the CPU virtual address.
+            host_rows, device_rows = _cached_hip_load_indices(
+                self,
+                host_indices,
+                device_indices,
+                lambda: (
+                    self._to_page_indices(host_indices),
+                    self._to_page_indices(device_indices),
+                ),
+            )
+            transfer_kv_per_layer_direct_pf_lf(
+                src_ptrs=[self.kv_buffer.unsqueeze(2)],
+                dst_ptrs=[self.device_buffers[layer_id]],
+                src_indices=host_rows,
+                dst_indices=device_rows,
+                layer_id=layer_id,
+                page_size=1,
+            )
+            return
+
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
-
         if io_backend == "kernel" and self.layout == "layer_first":
             transfer_kv_per_layer_mla(
                 src=self.data_refs[layer_id],
@@ -1306,7 +1368,9 @@ class DeepSeekV4StateHostPool(HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+        self.can_use_write_back_jit = (
+            _is_cuda or _is_hip
+        ) and can_use_write_back_jit_kernel(
             element_size=self.state_page_bytes * self.dtype.itemsize,
         )
         staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
@@ -1427,6 +1491,31 @@ class DeepSeekV4StateHostPool(HostKVCache):
     ):
         if host_indices is None or device_indices is None:
             return
+        if (
+            io_backend == "kernel"
+            and self.layout == "page_first"
+            and _is_hip
+            and self.device_page_views[layer_id].is_cuda
+        ):
+            host_rows, device_rows = _cached_hip_load_indices(
+                self,
+                host_indices,
+                device_indices,
+                lambda: (
+                    self._to_page_indices(host_indices),
+                    self._to_page_indices(device_indices),
+                ),
+            )
+            transfer_kv_per_layer_direct_pf_lf(
+                src_ptrs=[self.kv_buffer.unsqueeze(2)],
+                dst_ptrs=[self.device_page_views[layer_id]],
+                src_indices=host_rows,
+                dst_indices=device_rows,
+                layer_id=layer_id,
+                page_size=1,
+            )
+            return
+
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
         if io_backend == "kernel" and self.layout == "layer_first":
@@ -1800,7 +1889,9 @@ class DSAIndexerPoolHost(HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+        self.can_use_write_back_jit = (
+            _is_cuda or _is_hip
+        ) and can_use_write_back_jit_kernel(
             element_size=self.indexer_page_stride_size * self.indexer_dtype.itemsize,
         )
         staging_page_capacity = min(
@@ -1851,10 +1942,33 @@ class DSAIndexerPoolHost(HostKVCache):
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
 
+        target_buffer = device_pool.index_k_with_scale_buffer[device_layer_id]
+        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        if (
+            use_kernel
+            and self.layout == "page_first"
+            and _is_hip
+            and target_buffer.is_cuda
+        ):
+            host_page_indices, device_page_indices = _cached_hip_load_indices(
+                self,
+                host_indices,
+                device_indices,
+                lambda: self._get_indexer_page_indices(host_indices, device_indices),
+            )
+            transfer_kv_per_layer_direct_pf_lf(
+                src_ptrs=[self.index_k_with_scale_buffer],
+                dst_ptrs=[target_buffer],
+                src_indices=host_page_indices,
+                dst_indices=device_page_indices,
+                layer_id=host_layer_id,
+                page_size=1,
+            )
+            return
+
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
-        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
@@ -1867,7 +1981,7 @@ class DSAIndexerPoolHost(HostKVCache):
             elif self.layout == "page_first":
                 transfer_kv_per_layer_mla_pf_lf(
                     src=self.index_k_with_scale_buffer,
-                    dst=device_pool.index_k_with_scale_buffer[device_layer_id],
+                    dst=target_buffer,
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
                     layer_id=host_layer_id,

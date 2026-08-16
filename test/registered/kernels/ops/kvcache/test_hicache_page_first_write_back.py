@@ -14,7 +14,17 @@ import pytest
 import torch
 
 from sglang.kernels.ops.kvcache.hicache import can_use_write_back_jit_kernel
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+)
+from sglang.srt.mem_cache.memory_pool_host import (
+    DeepSeekV4PagedHostPool,
+    DeepSeekV4StateHostPool,
+    DSAIndexerPoolHost,
+)
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
@@ -25,7 +35,7 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=90, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -49,11 +59,12 @@ def _token_indices_for_pages(
     pages: torch.Tensor,
     device: str = DEVICE,
     dtype: torch.dtype = torch.int64,
+    page_size: int = PAGE_SIZE,
 ) -> torch.Tensor:
     parts = [
         torch.arange(
-            int(page) * PAGE_SIZE,
-            (int(page) + 1) * PAGE_SIZE,
+            int(page) * page_size,
+            (int(page) + 1) * page_size,
             device=device,
             dtype=dtype,
         )
@@ -62,14 +73,14 @@ def _token_indices_for_pages(
     return torch.cat(parts, dim=0)
 
 
-def _pinned_host_pool(host_pool_cls, **kwargs):
+def _pinned_host_pool(host_pool_cls, page_size: int = PAGE_SIZE, **kwargs):
     original_alloc = ALLOC_MEMORY_FUNCS[DEVICE]
     ALLOC_MEMORY_FUNCS[DEVICE] = alloc_with_pin_memory
     try:
         return host_pool_cls(
             host_to_device_ratio=2.0,
             host_size=0,
-            page_size=PAGE_SIZE,
+            page_size=page_size,
             pin_memory=True,
             device="cpu",
             **kwargs,
@@ -83,6 +94,11 @@ def _fill_with_offset(tensor: torch.Tensor, offset: int) -> None:
         tensor.numel(), device=tensor.device, dtype=tensor.dtype
     ).view_as(tensor)
     tensor.copy_(data + offset)
+
+
+def _fill_byte_rows(tensor: torch.Tensor, offset: int) -> None:
+    data = torch.arange(tensor.numel(), device=tensor.device, dtype=torch.int64)
+    tensor.copy_(((data + offset) % 251).to(torch.uint8).view_as(tensor))
 
 
 def _assert_pages_equal(host_ref, device_ref, host_pages, device_pages) -> None:
@@ -253,6 +269,223 @@ def test_page_first_staged_write_back_mha(element_dim: int, page_count: int) -> 
 @pytest.mark.parametrize("page_count", PAGE_COUNTS)
 def test_page_first_staged_write_back_mla(element_dim: int, page_count: int) -> None:
     _run_mla(element_dim, page_count)
+
+
+def test_dsv4_paged_host_pool_staged_roundtrip() -> None:
+    page_size = 64
+    page_count = 8
+    layer_num = 2
+    item_bytes = 37440
+    device_buffers = [
+        torch.empty(page_count, item_bytes, dtype=torch.uint8, device=DEVICE)
+        for _ in range(layer_num)
+    ]
+    for layer_id, buffer in enumerate(device_buffers):
+        _fill_byte_rows(buffer, layer_id * 37)
+
+    host_pool = DeepSeekV4PagedHostPool(
+        pool_name="dsv4-c4-test",
+        device_buffers=device_buffers,
+        item_bytes=item_bytes,
+        num_host_pages=page_count,
+        slot_page_size=page_size,
+        layout="page_first",
+        pin_memory=True,
+    )
+    assert host_pool.can_use_write_back_jit
+
+    host_pages = torch.tensor([0, 1], dtype=torch.int64)
+    source_pages = torch.tensor([2, 3], dtype=torch.int64, device=DEVICE)
+    host_indices = _token_indices_for_pages(
+        host_pages, device="cpu", page_size=page_size
+    )
+    source_indices = _token_indices_for_pages(source_pages, page_size=page_size)
+    expected = [buffer[source_pages].cpu().clone() for buffer in device_buffers]
+
+    host_pool.backup_from_device_all_layer(None, host_indices, source_indices, "kernel")
+    torch.cuda.synchronize()
+    for layer_id in range(layer_num):
+        assert torch.equal(
+            host_pool.kv_buffer[host_pages, layer_id], expected[layer_id]
+        )
+
+    target_pages = torch.tensor([5, 6], dtype=torch.int64, device=DEVICE)
+    target_indices = _token_indices_for_pages(target_pages, page_size=page_size)
+    for buffer in device_buffers:
+        buffer[target_pages].zero_()
+    host_indices_device = host_indices.to(DEVICE)
+    for layer_id in range(layer_num):
+        host_pool.load_to_device_per_layer(
+            None,
+            host_indices_device,
+            target_indices,
+            layer_id,
+            "kernel",
+        )
+    torch.cuda.synchronize()
+    for layer_id, buffer in enumerate(device_buffers):
+        assert torch.equal(buffer[target_pages].cpu(), expected[layer_id])
+
+    mutated_target_pages = torch.tensor([6, 7], dtype=torch.int64, device=DEVICE)
+    target_indices.copy_(
+        _token_indices_for_pages(mutated_target_pages, page_size=page_size)
+    )
+    for buffer in device_buffers:
+        buffer[mutated_target_pages].zero_()
+    for layer_id in range(layer_num):
+        host_pool.load_to_device_per_layer(
+            None,
+            host_indices_device,
+            target_indices,
+            layer_id,
+            "kernel",
+        )
+    torch.cuda.synchronize()
+    for layer_id, buffer in enumerate(device_buffers):
+        assert torch.equal(buffer[mutated_target_pages].cpu(), expected[layer_id])
+
+
+def test_dsv4_state_host_pool_staged_roundtrip() -> None:
+    swa_page_size = 64
+    page_count = 8
+    ring_size = 8
+    layer_num = 2
+    state_pools = [
+        CompressStatePool(
+            size=page_count * ring_size,
+            ring_size=ring_size,
+            overlap=True,
+            head_dim=64,
+            dtype=torch.bfloat16,
+            device=DEVICE,
+            enable_memory_saver=False,
+            ratio=4,
+            swa_page_size=swa_page_size,
+        )
+        for _ in range(layer_num)
+    ]
+    for layer_id, state_pool in enumerate(state_pools):
+        _fill_byte_rows(
+            state_pool.kv_score_buffer.kv_score.view(torch.uint8), layer_id * 43
+        )
+
+    host_pool = DeepSeekV4StateHostPool(
+        pool_name="dsv4-state-test",
+        state_pools=state_pools,
+        num_host_pages=page_count,
+        swa_page_size=swa_page_size,
+        layout="page_first",
+        pin_memory=True,
+    )
+    assert host_pool.can_use_write_back_jit
+
+    host_pages = torch.tensor([0, 1], dtype=torch.int64)
+    source_pages = torch.tensor([2, 3], dtype=torch.int64, device=DEVICE)
+    host_indices = _token_indices_for_pages(
+        host_pages, device="cpu", page_size=swa_page_size
+    )
+    source_indices = _token_indices_for_pages(source_pages, page_size=swa_page_size)
+    expected = [
+        page_view[source_pages].cpu().clone()
+        for page_view in host_pool.device_page_views
+    ]
+
+    host_pool.backup_from_device_all_layer(None, host_indices, source_indices, "kernel")
+    torch.cuda.synchronize()
+    for layer_id in range(layer_num):
+        assert torch.equal(
+            host_pool.kv_buffer[host_pages, layer_id], expected[layer_id]
+        )
+
+    target_pages = torch.tensor([5, 6], dtype=torch.int64, device=DEVICE)
+    target_indices = _token_indices_for_pages(target_pages, page_size=swa_page_size)
+    for page_view in host_pool.device_page_views:
+        page_view[target_pages].zero_()
+    host_indices_device = host_indices.to(DEVICE)
+    for layer_id in range(layer_num):
+        host_pool.load_to_device_per_layer(
+            None,
+            host_indices_device,
+            target_indices,
+            layer_id,
+            "kernel",
+        )
+    torch.cuda.synchronize()
+    for layer_id, page_view in enumerate(host_pool.device_page_views):
+        assert torch.equal(page_view[target_pages].cpu(), expected[layer_id])
+
+
+def test_dsv4_dsa_indexer_host_pool_staged_roundtrip() -> None:
+    page_size = 64
+    page_count = 8
+    layer_num = 2
+    device_pool = DSATokenToKVPool(
+        size=page_count * page_size,
+        page_size=page_size,
+        kv_lora_rank=128,
+        dtype=torch.bfloat16,
+        qk_rope_head_dim=32,
+        layer_num=layer_num,
+        device=DEVICE,
+        index_head_dim=128,
+        enable_memory_saver=False,
+        kv_cache_dim=576,
+    )
+    anchor_host = _pinned_host_pool(
+        MLATokenToKVPoolHost,
+        page_size=page_size,
+        device_pool=device_pool,
+        layout="page_first",
+        override_kv_cache_dim=device_pool.kv_cache_dim,
+    )
+    host_pool = DSAIndexerPoolHost(
+        device_pool=device_pool,
+        anchor_host=anchor_host,
+        layout="page_first",
+        pin_memory=True,
+    )
+    assert host_pool.can_use_write_back_jit
+
+    for layer_id, buffer in enumerate(device_pool.index_k_with_scale_buffer):
+        _fill_byte_rows(buffer, layer_id * 47)
+
+    host_pages = torch.tensor([0, 1], dtype=torch.int64)
+    source_pages = torch.tensor([2, 3], dtype=torch.int64, device=DEVICE)
+    host_indices = _token_indices_for_pages(
+        host_pages, device="cpu", page_size=page_size
+    )
+    source_indices = _token_indices_for_pages(source_pages, page_size=page_size)
+    expected = [
+        buffer[source_pages].cpu().clone()
+        for buffer in device_pool.index_k_with_scale_buffer
+    ]
+
+    host_pool.backup_from_device_all_layer(
+        device_pool, host_indices, source_indices, "kernel"
+    )
+    torch.cuda.synchronize()
+    for layer_id in range(layer_num):
+        assert torch.equal(
+            host_pool.index_k_with_scale_buffer[host_pages, layer_id, 0],
+            expected[layer_id],
+        )
+
+    target_pages = torch.tensor([5, 6], dtype=torch.int64, device=DEVICE)
+    target_indices = _token_indices_for_pages(target_pages, page_size=page_size)
+    for buffer in device_pool.index_k_with_scale_buffer:
+        buffer[target_pages].zero_()
+    host_indices_device = host_indices.to(DEVICE)
+    for layer_id in range(layer_num):
+        host_pool.load_to_device_per_layer(
+            device_pool,
+            host_indices_device,
+            target_indices,
+            layer_id,
+            "kernel",
+        )
+    torch.cuda.synchronize()
+    for layer_id, buffer in enumerate(device_pool.index_k_with_scale_buffer):
+        assert torch.equal(buffer[target_pages].cpu(), expected[layer_id])
 
 
 if __name__ == "__main__":
