@@ -70,6 +70,9 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    symm_dp_scheduler_loop_entry_ns,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
@@ -2298,6 +2301,10 @@ class SchedulerDisaggregationDecodeMixin:
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
         while True:
+            self._symm_dp_scheduler_loop_entry_ns = (
+                symm_dp_scheduler_loop_entry_ns()
+            )
+
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
             if not self._engine_paused:
@@ -2342,6 +2349,10 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            self._symm_dp_scheduler_loop_entry_ns = (
+                symm_dp_scheduler_loop_entry_ns()
+            )
+
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
             if not self._engine_paused:

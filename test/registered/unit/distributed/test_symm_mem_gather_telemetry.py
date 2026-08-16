@@ -1,5 +1,8 @@
 import json
 
+import pytest
+
+from sglang.srt.disaggregation import decode as disagg_decode
 from sglang.srt.distributed.device_communicators.symm_mem_gather_telemetry import (
     SymmMemGatherTelemetry,
     common_generation_ids,
@@ -211,3 +214,32 @@ def test_scheduler_loop_entry_clock_is_enabled(monkeypatch):
     monkeypatch.setenv("SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY", "true")
     monkeypatch.setattr(dp_attn.time, "perf_counter_ns", lambda: 654_321)
     assert dp_attn.symm_dp_scheduler_loop_entry_ns() == 654_321
+
+
+@pytest.mark.parametrize(
+    "event_loop_name",
+    ("event_loop_normal_disagg_decode", "event_loop_overlap_disagg_decode"),
+)
+def test_disagg_decode_production_loop_samples_scheduler_entry(
+    monkeypatch, event_loop_name
+):
+    class StopLoop(Exception):
+        pass
+
+    class RequestReceiver:
+        def recv_requests(self):
+            raise StopLoop
+
+    class FakeScheduler:
+        request_receiver = RequestReceiver()
+        _symm_dp_scheduler_loop_entry_ns = None
+
+    monkeypatch.setattr(
+        disagg_decode, "symm_dp_scheduler_loop_entry_ns", lambda: 765_432
+    )
+    scheduler = FakeScheduler()
+    with pytest.raises(StopLoop):
+        getattr(
+            disagg_decode.SchedulerDisaggregationDecodeMixin, event_loop_name
+        )(scheduler)
+    assert scheduler._symm_dp_scheduler_loop_entry_ns == 765_432
