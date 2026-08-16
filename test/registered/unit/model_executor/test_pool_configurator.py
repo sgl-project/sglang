@@ -649,6 +649,92 @@ class TestKVarNHybridSWAGuard(unittest.TestCase):
         cfg._validate_kvarn_swa_compat()  # must not raise
 
 
+class TestPrefillRuntimeWorkspaceReserve(unittest.TestCase):
+    """KVCacheConfigurator._profile_available_bytes reserves transient prefill
+    workspace for the target worker (chunk x hidden x dtype x 20), never for
+    the draft worker. Built via __new__ to isolate the slack arithmetic from
+    the dataclass's unrelated construction machinery.
+    """
+
+    def _profile(
+        self,
+        *,
+        hidden_size,
+        is_draft_worker,
+        chunked_prefill_size=8192,
+        kv_cache_dtype="auto",
+    ):
+        import torch
+
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        _publish_config(
+            self,
+            mem_fraction_static=0.875,
+            chunked_prefill_size=chunked_prefill_size,
+            max_prefill_tokens=16384,
+            kv_cache_dtype=kv_cache_dtype,
+            mm_feature_transport=None,
+        )
+        cfg = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        cfg.device = "cpu"
+        cfg.gpu_id = 0
+        cfg.server_args = get_server_args()
+        cfg.model_config = SimpleNamespace(
+            hidden_size=hidden_size, dtype=torch.bfloat16, is_multimodal=False
+        )
+        cfg.is_draft_worker = is_draft_worker
+        cfg.mambaish_config = None
+        cfg.post_capture_kv_active = False
+        with (
+            mock_cpu_env(),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_available_gpu_memory",
+                return_value=20.0,
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_world_group",
+                return_value=SimpleNamespace(world_size=1, cpu_group=None),
+            ),
+        ):
+            return cfg._profile_available_bytes(pre_model_load_memory=24.0)
+
+    def test_reserve_scales_with_chunk_and_hidden(self):
+        # slack = 24 * (1 - 0.875) = 3.0; reserve = 8192*4096*2*20 / 2^30 = 1.25
+        # (_profile_available_bytes returns bytes: GiB x 2^30)
+        self.assertEqual(self._profile(hidden_size=0, is_draft_worker=False), 17 << 30)
+        self.assertEqual(
+            self._profile(hidden_size=4096, is_draft_worker=False),
+            int(15.75 * (1 << 30)),
+        )
+
+    def test_chunk_fallback_to_max_prefill_tokens(self):
+        # chunked_prefill_size=-1 -> max_prefill_tokens (16384): reserve = 2.5
+        self.assertEqual(
+            self._profile(
+                hidden_size=4096, is_draft_worker=False, chunked_prefill_size=-1
+            ),
+            int(14.5 * (1 << 30)),
+        )
+
+    def test_draft_worker_not_reserved(self):
+        self.assertEqual(
+            self._profile(hidden_size=4096, is_draft_worker=True), 17 << 30
+        )
+
+    def test_kvarn_uses_reduced_multiplier(self):
+        # KVarN: multiplier=3 -> reserve = 8192*4096*2*3 / 2^30 = 0.1875
+        # slack=3.0, reserve=0.1875 -> available = 20 - 3.1875 = 16.8125
+        self.assertEqual(
+            self._profile(
+                hidden_size=4096,
+                is_draft_worker=False,
+                kv_cache_dtype="kvarn_k4v2_g128",
+            ),
+            int(16.8125 * (1 << 30)),
+        )
+
+
 class TestFactory(unittest.TestCase):
     def test_default_for_non_swa(self):
         mr = _make_model_runner(self, is_hybrid_swa=False)
