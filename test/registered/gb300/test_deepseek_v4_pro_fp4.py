@@ -2,9 +2,10 @@ import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.gb300_utils import GB300_NCCL_PORT
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings
+from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 
 register_cuda_ci(est_time=7200, stage="nightly", runner_config="4-gpu-gb300")
 
@@ -32,6 +33,8 @@ LOW_LATENCY_ARGS = [
     "0.1",
     "--mem-fraction-static",
     "0.85",
+    "--nccl-port",
+    GB300_NCCL_PORT,
 ]
 
 BALANCED_ARGS = [
@@ -57,6 +60,8 @@ BALANCED_ARGS = [
     "256",
     "--deepep-config",
     DEEPEP_CONFIG,
+    "--nccl-port",
+    GB300_NCCL_PORT,
 ]
 
 HIGH_THROUGHPUT_ARGS = [
@@ -72,6 +77,8 @@ HIGH_THROUGHPUT_ARGS = [
     "128",
     "--max-running-requests",
     "256",
+    "--nccl-port",
+    GB300_NCCL_PORT,
 ]
 
 BALANCED_ENV = {
@@ -89,7 +96,7 @@ PERFORMANCE_BATCH_SIZES = {
 }
 
 
-class TestDeepSeekV4ProFp4(unittest.TestCase):
+class TestDeepSeekV4ProFp4(CustomTestCase):
     """DeepSeek-V4-Pro FP4 on GB300 (4x B200 NVL4, tp=4)."""
 
     def test_deepseek_v4_pro_fp4(self):

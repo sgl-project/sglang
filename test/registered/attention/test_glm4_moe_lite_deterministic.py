@@ -14,6 +14,7 @@ import unittest
 import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.gb300_utils import GB300_NCCL_PORT
 from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
     TestDeterministicBase,
@@ -34,6 +35,8 @@ SERVER_ARGS = COMMON_SERVER_ARGS + [
     "2048",
     "--mem-fraction-static",
     "0.8",
+    "--nccl-port",
+    GB300_NCCL_PORT,
 ]
 
 

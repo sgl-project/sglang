@@ -2,9 +2,10 @@ import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.gb300_utils import GB300_NCCL_PORT
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings
+from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 
 register_cuda_ci(est_time=7200, stage="nightly", runner_config="4-gpu-gb300")
 
@@ -20,6 +21,8 @@ COMMON_ARGS = [
     "--mamba-scheduler-strategy=extra_buffer",
     "--enable-multimodal",
     "--enable-metrics",
+    "--nccl-port",
+    GB300_NCCL_PORT,
 ]
 
 TP_MTP_ARGS = [
@@ -42,7 +45,7 @@ PERFORMANCE_BATCH_SIZES = {
 }
 
 
-class TestQwen35Fp8(unittest.TestCase):
+class TestQwen35Fp8(CustomTestCase):
     """Qwen3.5-397B FP8 on GB300 (4x GB300 NVL4, tp=4)."""
 
     def test_qwen35_fp8(self):

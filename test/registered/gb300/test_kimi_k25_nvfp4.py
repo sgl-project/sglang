@@ -2,9 +2,10 @@ import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.gb300_utils import GB300_NCCL_PORT
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings
+from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 
 register_cuda_ci(est_time=7200, stage="nightly", runner_config="4-gpu-gb300")
 
@@ -24,6 +25,8 @@ COMMON_ARGS = [
     "--speculative-algorithm=EAGLE3",
     f"--speculative-draft-model-path={DRAFT_MODEL_PATH}",
     "--speculative-draft-model-quantization=unquant",
+    "--nccl-port",
+    GB300_NCCL_PORT,
 ]
 
 TP_EAGLE_ARGS = [
@@ -44,7 +47,7 @@ PERFORMANCE_BATCH_SIZES = {
 }
 
 
-class TestKimiK25Nvfp4(unittest.TestCase):
+class TestKimiK25Nvfp4(CustomTestCase):
     """Kimi-K2.5 NVFP4 + EAGLE3 on GB300 (4x GB300 NVL4, tp=4)."""
 
     def test_kimi_k25_nvfp4(self):
