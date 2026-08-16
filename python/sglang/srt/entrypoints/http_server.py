@@ -2354,6 +2354,23 @@ def _wait_and_warmup(
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
+    # Freeze GC after server warmup so static objects skip future GC gen2 collection.
+    # Use /freeze_gc to freeze scheduler and detokenizer as well.
+    freeze_key = server_args.admin_api_key or server_args.api_key
+    freeze_headers = {}
+    if freeze_key:
+        freeze_headers["Authorization"] = f"Bearer {freeze_key}"
+    try:
+        res = requests.post(
+            server_args.url() + "/freeze_gc",
+            headers=freeze_headers,
+            timeout=10,
+            verify=server_args.ssl_verify(),
+        )
+        res.raise_for_status()
+    except requests.exceptions.RequestException:
+        logger.warning("post-warmup freeze_gc failed", exc_info=True)
+
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
 
