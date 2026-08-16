@@ -104,9 +104,6 @@ _UNREAD_ENTRIES: dict = {
     ("multimodal_gen/test/unit/test_disagg_trace.py", "_srt_trace_server_args"): (
         "a trace fixture publishing its own context"
     ),
-    ("srt/managers/detokenizer_manager.py", "run_detokenizer_process"): (
-        "DetokenizerManager reads the handed instance at this revision"
-    ),
 }
 
 # `publish` itself and its named wrappers live here; a call inside them is the

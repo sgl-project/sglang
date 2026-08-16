@@ -1252,9 +1252,7 @@ class Scheduler(
             and not get_schedule().disable_priority_preemption
         )
 
-        self.new_token_ratio_tracker = NewTokenRatioTracker.from_server_args(
-            self.server_args
-        )
+        self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
 
     def init_soft_watchdog(self, server_args: ServerArgs):
         if (x := server_args.soft_watchdog_timeout) is not None:

@@ -42,6 +42,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
     def test_model_class_controls_cuda_vmm_opt_in(self):
         from sglang.srt.managers.tokenizer_manager import TokenizerManager
+        from sglang.srt.runtime_context import get_context
 
         class SupportedModel:
             supports_cuda_vmm_feature_transport = True
@@ -49,8 +50,10 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         class UnsupportedModel:
             pass
 
+        override = get_context().override_server_args(mm_feature_transport="cuda_vmm")
+        override.install()
+        self.addCleanup(override.restore)
         manager = object.__new__(TokenizerManager)
-        manager.server_args = SimpleNamespace(mm_feature_transport="cuda_vmm")
         manager.model_config = object()
 
         with patch(
@@ -70,9 +73,12 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
     def test_cpu_transport_skips_model_opt_in_lookup(self):
         from sglang.srt.managers.tokenizer_manager import TokenizerManager
+        from sglang.srt.runtime_context import get_context
 
+        override = get_context().override_server_args(mm_feature_transport="cpu")
+        override.install()
+        self.addCleanup(override.restore)
         manager = object.__new__(TokenizerManager)
-        manager.server_args = SimpleNamespace(mm_feature_transport="cpu")
         manager.model_config = object()
 
         with patch(
