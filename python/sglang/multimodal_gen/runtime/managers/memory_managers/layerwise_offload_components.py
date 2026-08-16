@@ -29,6 +29,8 @@ DIT_COMPONENT_NAMES = frozenset(
         "video_dit_2",
         "audio_dit",
         "dual_tower_bridge",
+        "delight_transformer",
+        "paint_transformer",
     }
 )
 VAE_COMPONENT_NAMES = frozenset(
@@ -39,6 +41,9 @@ VAE_COMPONENT_NAMES = frozenset(
         "vocoder",
         "spatial_upsampler",
         "condition_image_encoder",
+        "diffusion_decoder",
+        "delight_vae",
+        "paint_vae",
     }
 )
 DEFAULT_LAYERWISE_VAE_COMPONENT_NAMES = frozenset(
@@ -46,6 +51,8 @@ DEFAULT_LAYERWISE_VAE_COMPONENT_NAMES = frozenset(
         "vae",
         "video_vae",
         "condition_image_encoder",
+        "delight_vae",
+        "paint_vae",
     }
 )
 CPU_OFFLOAD_FLAG_NAMES = (

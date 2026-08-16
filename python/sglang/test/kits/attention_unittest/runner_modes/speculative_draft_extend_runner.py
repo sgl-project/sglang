@@ -498,7 +498,6 @@ def _build_eagle_draft_extend_fixture(
         speculative_attention_mode="prefill",
     )
     draft_extend_attn_backend = DraftBackendFactory(
-        fixture.runner.server_args,
         fixture.runner,
         settings.topk,
         settings.speculative_num_steps,
