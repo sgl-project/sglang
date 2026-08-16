@@ -7,10 +7,9 @@
 /// and
 /// https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d_update.cu
 ///
-/// JIT port of the AOT implementation (`kernels/aot/csrc/mamba/causal_conv1d.cu`).
-/// The device kernels are carried over unchanged so the results stay bit-identical;
-/// only the host launchers are adapted to the tvm-ffi `TensorView` API. Strides
-/// remain `uint32_t` elements, as in the AOT `ConvParamsBase`.
+/// The device kernels are carried over unchanged from the AOT implementation, so
+/// results stay bit-identical; only the host launchers are adapted to the tvm-ffi
+/// `TensorView` API.
 
 #pragma once
 
@@ -31,15 +30,14 @@
 
 namespace sglang {
 
-/// Implementation details of the mamba causal conv1d kernels. Nested so the
-/// generic names here cannot collide with the unrelated `causal_conv1d` used by
-/// the Inkling short-conv kernels.
+/// Nested so these generic names cannot collide with the unrelated
+/// `causal_conv1d` of the Inkling short-conv kernels.
 namespace mamba_conv {
 
 /// \brief Runtime parameters shared by the prefill and decode kernels.
 ///
-/// Field-for-field the subset of the AOT `ConvParamsBase` that these two
-/// kernels read. All strides are in elements, not bytes.
+/// The subset of the AOT `ConvParamsBase` these kernels read. Strides are in
+/// elements, not bytes, and stay `uint32_t` as they were there.
 struct MambaConvParams {
   using index_t = uint32_t;
 
@@ -384,8 +382,8 @@ void causal_conv1d_fwd_launch(const MambaConvParams& params, DLDevice device) {
   const dim3 grid(params.batch, params.dim);
   if (is_vec_load) {
     using Ktraits = CausalConv1dFwdTraits<kNThreads, kWidth, true, T>;
-    // The AOT launcher raises the dynamic-smem cap past 48 KB; these traits stay
-    // far below it (~4 KB), so the default limit is enough.
+    // The AOT launcher raised the dynamic-smem cap past 48 KB; these traits stay
+    // near 4 KB, so the default limit is enough.
     static_assert(Ktraits::kSmemSize < 48 * 1024);
     host::LaunchKernel(grid, kNThreads, device, Ktraits::kSmemSize)(causal_conv1d_fwd_kernel<Ktraits>, params);
   } else {
@@ -601,12 +599,17 @@ void causal_conv1d_fwd(
     TensorMatcher({batch_sym}).with_dtype<int32_t>().with_device(device_sym).verify(cache_indices.value());
   }
   if (has_initial_state.has_value()) {
-    // torch bool maps to DLPack `kDLBool`, which has no C++ trait here, so the
-    // dtype is left unchecked (shape and device are what the kernel indexes by).
-    TensorMatcher({batch_sym}).with_device(device_sym).verify(has_initial_state.value());
+    const auto& initial_state_mask = has_initial_state.value();
+    TensorMatcher({batch_sym}).with_device(device_sym).verify(initial_state_mask);
+    // Read as `const bool*` by the kernel. `kDLBool` has no C++ trait here, so
+    // `.with_dtype<bool>()` is unavailable -- check the code directly.
+    CHECK_HOST(initial_state_mask.dtype().code == kDLBool && initial_state_mask.dtype().bits == 8)
+        << "causal_conv1d_fwd: has_initial_state must be a bool tensor, got dtype code "
+        << static_cast<int32_t>(initial_state_mask.dtype().code) << " with "
+        << static_cast<int32_t>(initial_state_mask.dtype().bits) << " bits";
   }
 
-  // `out` aliases `x`: the AOT op is in-place and callers rely on that.
+  // `out` aliases `x`: this op is in-place and callers rely on that.
   auto params = MambaConvParams{};
   params.batch = static_cast<int32_t>(batch);
   params.dim = static_cast<int32_t>(dim);

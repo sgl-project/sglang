@@ -20,12 +20,9 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 )
 from sglang.srt.utils import is_cuda
 
-# The compiled causal conv1d is CUDA-only and now resolves to the JIT kernel
-# through the registry. The sgl_kernel wheel it replaced only ever built this
-# kernel for CUDA too (never the ROCm / MUSA / Metal extensions), which is why
-# the old `torch.ops.sgl_kernel.causal_conv1d_update` probe existed: on every
-# other device it raised and dropped through to the Triton path below. That
-# fallback is now selected directly instead of via a failed import.
+# The compiled causal conv1d is CUDA-only -- the sgl_kernel wheel never built it
+# for ROCm / MUSA either, so the old import probe always fell through to Triton
+# there. Select that fallback directly instead of via a failed import.
 _HAS_CONV1D_KERNEL = is_cuda()
 
 if _HAS_CONV1D_KERNEL:

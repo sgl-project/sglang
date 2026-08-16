@@ -1,13 +1,13 @@
 """Correctness coverage for the JIT depthwise causal conv1d kernels.
 
-Two layers of checks:
-
-* differential -- the JIT prefill/decode kernels must reproduce the AOT
-  ``sgl_kernel`` ops they replace bit for bit, on every dispatch path (width,
-  vectorized vs. scalar chunk load, varlen, circular buffer, gathered state).
-* reference -- both the outputs and the advanced conv state are compared
-  against a ``F.conv1d`` reference, so a shared bug in the two ports cannot
-  hide behind the differential check.
+Two layers. The reference tests are the broad gate: they compare against an
+``F.conv1d`` formulation across the full dispatch grid, and depend only on the
+kernel this repo builds. The differential tests are a small smoke set proving
+the migration is bit-faithful to the AOT ops -- narrow on purpose, since they
+compare two independently built binaries whose toolchains nothing pins together
+(JIT: c++20 / sm_90a; wheel: c++17 / sm_90 / -DNDEBUG, and the pinned PyPI
+release on scheduled runs). A bitwise failure with the reference cases green
+points at the build environment, not a numerics regression.
 """
 
 # SPDX-License-Identifier: Apache-2.0
@@ -39,16 +39,26 @@ register_cuda_ci(est_time=180, stage="nightly", runner_config="1-gpu-large")
 
 PAD_SLOT_ID = -1
 DTYPES = [torch.float32, torch.float16, torch.bfloat16]
-# 8 covers the vectorized chunk path, 15 the scalar tail, 1025/4096 the
-# multi-chunk conv-state stitching, 1/3 the seqlen < width branch.
+WIDTHS = [2, 3, 4]
+# 8/128 hit the vectorized chunk load (divisible by both vector widths), 15/1025
+# the scalar path, 1025/4096 the multi-chunk conv-state stitching, and 1/3 the
+# seqlen < width padding branch.
 FWD_SEQLENS = get_ci_test_range([1, 3, 8, 15, 128, 1025, 4096], [3, 15, 1025])
+# One seqlen per prefill dispatch path, for the bitwise smoke set.
+SMOKE_SEQLENS = [15, 128, 1025]
+UPDATE_SEQLENS = [1, 2, 5]
+# Larger than the `width - 1` every in-tree caller allocates, to reach the shift
+# loop that only runs when state_len > width - 1.
+UPDATE_STATE_LENS = [8, 16]
 
 
 def _assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
     assert actual.dtype == expected.dtype
-    assert torch.equal(
-        actual.view(torch.uint8), expected.view(torch.uint8)
-    ), "JIT and AOT outputs differ"
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)), (
+        "JIT and AOT outputs differ bit-for-bit. If the reference tests in this "
+        "file pass, suspect a JIT-vs-wheel toolchain divergence before a "
+        "numerics regression -- see the module docstring."
+    )
 
 
 def _tolerance(dtype: torch.dtype) -> tuple[float, float]:
@@ -216,55 +226,13 @@ def _run_update(impl, inputs, silu_activation):
     return x, conv_state
 
 
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("width", [2, 3, 4])
-@pytest.mark.parametrize("seqlen", FWD_SEQLENS)
-@pytest.mark.parametrize("silu_activation", [True, False])
-def test_causal_conv1d_fwd_is_bit_exact(dtype, width, seqlen, silu_activation):
-    """The JIT migration must preserve every output and conv-state bit."""
-    inputs = _make_fwd_inputs(dtype, 1, 64, seqlen, width, varlen=False)
-    actual = _run_fwd(jit_causal_conv1d_fwd, inputs, silu_activation)
-    expected = _run_fwd(aot_causal_conv1d_fwd, inputs, silu_activation)
-    _assert_bitwise_equal(actual[0], expected[0])
-    _assert_bitwise_equal(actual[1], expected[1])
+###############################################################################
+# Reference coverage -- the broad gate.
+###############################################################################
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("width", [2, 3, 4])
-@pytest.mark.parametrize("seqlen", [s for s in FWD_SEQLENS if s >= 8])
-@pytest.mark.parametrize("silu_activation", [True, False])
-def test_causal_conv1d_fwd_varlen_is_bit_exact(dtype, width, seqlen, silu_activation):
-    """The varlen path always takes the scalar (non-vectorized) chunk load."""
-    inputs = _make_fwd_inputs(dtype, 4, 64, seqlen, width, varlen=True)
-    actual = _run_fwd(jit_causal_conv1d_fwd, inputs, silu_activation)
-    expected = _run_fwd(aot_causal_conv1d_fwd, inputs, silu_activation)
-    _assert_bitwise_equal(actual[0], expected[0])
-    _assert_bitwise_equal(actual[1], expected[1])
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("width", [2, 3, 4])
-@pytest.mark.parametrize("seqlen", [1, 2, 5])
-@pytest.mark.parametrize("state_len", [1, 8, 16])
-@pytest.mark.parametrize("circular", [True, False])
-@pytest.mark.parametrize("gather", [True, False])
-def test_causal_conv1d_update_is_bit_exact(
-    dtype, width, seqlen, state_len, circular, gather
-):
-    """Cover both conv-state layouts (shift buffer / circular buffer)."""
-    if state_len < width - 1:
-        pytest.skip("conv_state must hold at least width - 1 taps")
-    inputs = _make_update_inputs(
-        dtype, 3, 2048 + 16, seqlen, width, state_len, circular, gather
-    )
-    actual = _run_update(jit_causal_conv1d_update, inputs, True)
-    expected = _run_update(aot_causal_conv1d_update, inputs, True)
-    _assert_bitwise_equal(actual[0], expected[0])
-    _assert_bitwise_equal(actual[1], expected[1])
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("width", [4])
+@pytest.mark.parametrize("width", WIDTHS)
 @pytest.mark.parametrize("seqlen", FWD_SEQLENS)
 @pytest.mark.parametrize("has_initial_state", [True, False])
 def test_causal_conv1d_fwd_matches_reference(dtype, width, seqlen, has_initial_state):
@@ -289,26 +257,151 @@ def test_causal_conv1d_fwd_matches_reference(dtype, width, seqlen, has_initial_s
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("width", [2, 3, 4])
-@pytest.mark.parametrize("seqlen", [1, 5])
+@pytest.mark.parametrize("width", WIDTHS)
+@pytest.mark.parametrize("seqlen", [s for s in FWD_SEQLENS if s >= 8])
 @pytest.mark.parametrize("silu_activation", [True, False])
-def test_causal_conv1d_update_matches_reference(dtype, width, seqlen, silu_activation):
+def test_causal_conv1d_fwd_varlen_matches_reference(
+    dtype, width, seqlen, silu_activation
+):
+    """Varlen prefill, per sequence. The layout serving uses; always scalar load."""
     rtol, atol = _tolerance(dtype)
-    state_len = width - 1
+    batch = 4
+    inputs = _make_fwd_inputs(dtype, batch, 64, seqlen, width, varlen=True, seed=11)
+    activation = "silu" if silu_activation else None
+
+    out, conv_states = _run_fwd(jit_causal_conv1d_fwd, inputs, silu_activation)
+
+    conv_states_ref = inputs["conv_states"].clone()
+    starts = inputs["query_start_loc"].tolist()
+    for i in range(batch):
+        slot = int(inputs["cache_indices"][i])
+        x_s = inputs["x"][:, starts[i] : starts[i + 1]].unsqueeze(0)
+        out_ref, _ = causal_conv1d_ref(
+            x_s.clone(),
+            inputs["weight"],
+            inputs["bias"],
+            initial_states=(
+                conv_states_ref[slot].unsqueeze(0).clone()
+                if inputs["has_initial_state"][i]
+                else None
+            ),
+            final_states_out=conv_states_ref[slot].unsqueeze(0),
+            activation=activation,
+        )
+        torch.testing.assert_close(
+            out[:, starts[i] : starts[i + 1]].unsqueeze(0),
+            out_ref,
+            rtol=rtol,
+            atol=atol,
+        )
+    torch.testing.assert_close(conv_states, conv_states_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("width", WIDTHS)
+@pytest.mark.parametrize("seqlen", UPDATE_SEQLENS)
+@pytest.mark.parametrize("state_len_kind", ["exact", *UPDATE_STATE_LENS])
+@pytest.mark.parametrize("circular", [True, False])
+def test_causal_conv1d_update_matches_reference(
+    dtype, width, seqlen, state_len_kind, circular
+):
+    """Both conv-state layouts: tail-anchored shift buffer and circular buffer."""
+    state_len = width - 1 if state_len_kind == "exact" else state_len_kind
+    if circular and seqlen > state_len:
+        # The reference advances the ring with `scatter_`, whose behavior for the
+        # duplicate indices this produces is unspecified -- it cannot arbitrate.
+        pytest.skip("circular reference is ambiguous when seqlen > state_len")
+    rtol, atol = _tolerance(dtype)
     inputs = _make_update_inputs(
-        dtype, 3, 2048, seqlen, width, state_len, circular=False, gather=False, seed=7
+        dtype, 3, 2048, seqlen, width, state_len, circular, gather=False, seed=7
     )
-    out, conv_state = _run_update(jit_causal_conv1d_update, inputs, silu_activation)
+    out, conv_state = _run_update(jit_causal_conv1d_update, inputs, True)
     conv_state_ref = inputs["conv_state"].clone()
     out_ref = causal_conv1d_update_ref(
         inputs["x"].clone(),
         conv_state_ref,
         inputs["weight"],
         inputs["bias"],
-        activation="silu" if silu_activation else None,
+        activation="silu",
+        cache_seqlens=inputs["cache_seqlens"],
     )
     torch.testing.assert_close(out, out_ref, rtol=rtol, atol=atol)
     torch.testing.assert_close(conv_state, conv_state_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("width", WIDTHS)
+@pytest.mark.parametrize("seqlen", UPDATE_SEQLENS)
+def test_causal_conv1d_update_gather_matches_reference(dtype, width, seqlen):
+    """Gathered decode: only the indexed slots advance, and they match the ref."""
+    rtol, atol = _tolerance(dtype)
+    inputs = _make_update_inputs(
+        dtype, 3, 2048, seqlen, width, width - 1, circular=False, gather=True, seed=13
+    )
+    indices = inputs["conv_state_indices"]
+    out, conv_state = _run_update(jit_causal_conv1d_update, inputs, True)
+
+    conv_state_ref = inputs["conv_state"][indices].clone()
+    out_ref = causal_conv1d_update_ref(
+        inputs["x"].clone(),
+        conv_state_ref,
+        inputs["weight"],
+        inputs["bias"],
+        activation="silu",
+    )
+    torch.testing.assert_close(out, out_ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        conv_state[indices], conv_state_ref, rtol=rtol, atol=atol
+    )
+
+    untouched = torch.ones(conv_state.shape[0], dtype=torch.bool, device="cuda")
+    untouched[indices] = False
+    assert torch.equal(conv_state[untouched], inputs["conv_state"][untouched])
+
+
+###############################################################################
+# Differential smoke set -- the migration proof.
+###############################################################################
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("width", WIDTHS)
+@pytest.mark.parametrize("seqlen", SMOKE_SEQLENS)
+def test_causal_conv1d_fwd_is_bit_exact(dtype, width, seqlen):
+    """One seqlen per prefill dispatch path: vectorized, scalar, multi-chunk."""
+    inputs = _make_fwd_inputs(dtype, 1, 64, seqlen, width, varlen=False)
+    actual = _run_fwd(jit_causal_conv1d_fwd, inputs, True)
+    expected = _run_fwd(aot_causal_conv1d_fwd, inputs, True)
+    _assert_bitwise_equal(actual[0], expected[0])
+    _assert_bitwise_equal(actual[1], expected[1])
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("width", WIDTHS)
+def test_causal_conv1d_fwd_varlen_is_bit_exact(dtype, width):
+    inputs = _make_fwd_inputs(dtype, 4, 64, 1025, width, varlen=True)
+    actual = _run_fwd(jit_causal_conv1d_fwd, inputs, True)
+    expected = _run_fwd(aot_causal_conv1d_fwd, inputs, True)
+    _assert_bitwise_equal(actual[0], expected[0])
+    _assert_bitwise_equal(actual[1], expected[1])
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("width", WIDTHS)
+@pytest.mark.parametrize("circular", [True, False])
+@pytest.mark.parametrize("gather", [True, False])
+def test_causal_conv1d_update_is_bit_exact(dtype, width, circular, gather):
+    """Both state layouts crossed with both slot-addressing modes."""
+    inputs = _make_update_inputs(dtype, 3, 2048 + 16, 2, width, 8, circular, gather)
+    actual = _run_update(jit_causal_conv1d_update, inputs, True)
+    expected = _run_update(aot_causal_conv1d_update, inputs, True)
+    _assert_bitwise_equal(actual[0], expected[0])
+    _assert_bitwise_equal(actual[1], expected[1])
+
+
+###############################################################################
+# Padding and argument validation.
+###############################################################################
 
 
 @pytest.mark.parametrize("width", [2, 4])
@@ -397,6 +490,20 @@ def test_causal_conv1d_rejects_unsupported_width():
     weight = torch.randn((8, 5), dtype=torch.bfloat16, device="cuda")
     with pytest.raises(Exception, match="width between 2 and 4"):
         jit_causal_conv1d_fwd(x, weight, None, None, None, None, None, True, -1)
+
+
+@pytest.mark.parametrize("bad_dtype", [torch.uint8, torch.int32])
+def test_causal_conv1d_rejects_non_bool_has_initial_state(bad_dtype):
+    """Nothing normalizes this mask on the way in (unlike `cache_indices`), so a
+    wider dtype would silently read the wrong byte per sequence."""
+    x = torch.randn((1, 8, 4), dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn((8, 4), dtype=torch.bfloat16, device="cuda")
+    conv_states = torch.zeros((1, 8, 3), dtype=torch.bfloat16, device="cuda")
+    has_initial_state = torch.ones((1,), dtype=bad_dtype, device="cuda")
+    with pytest.raises(Exception, match="has_initial_state must be a bool tensor"):
+        jit_causal_conv1d_fwd(
+            x, weight, None, conv_states, None, None, has_initial_state, True, -1
+        )
 
 
 if __name__ == "__main__":

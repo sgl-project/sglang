@@ -6,21 +6,28 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import FormatSignature, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CapabilityRequirement,
+    FormatSignature,
+    KernelBackend,
+    KernelSpec,
+)
 
 if TYPE_CHECKING:
     import torch
 
-# JIT is the only compiled backend for these two ops. The AOT kernel it replaced
-# was CUDA-only -- `csrc/mamba/causal_conv1d.cu` is built by the CUDA CMakeLists
-# alone, never by the ROCm / MUSA / Metal extensions -- so there is no wheel
-# backend to register for any other device. Everything non-CUDA uses the Triton
-# kernel registered at the bottom of this module, as it already did.
+_CUDA = frozenset({CapabilityRequirement.CUDA})
+
+# JIT is the only backend: the AOT kernel it replaced was built for CUDA alone,
+# never by the ROCm / MUSA / Metal extensions. Non-CUDA resolves nothing here --
+# the Triton fallback is picked by the serving wrapper's `_HAS_CONV1D_KERNEL`
+# branch, not by the registry.
 register_kernel(
     KernelSpec(
         op="mamba.causal_conv1d_fwd",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.mamba.causal_conv1d:causal_conv1d_fwd",
+        capabilities=_CUDA,
         format_signature=FormatSignature(
             in_place=True, description="causal depthwise conv1d forward (prefill)"
         ),
@@ -32,6 +39,7 @@ register_kernel(
         op="mamba.causal_conv1d_update",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.mamba.causal_conv1d:causal_conv1d_update",
+        capabilities=_CUDA,
         format_signature=FormatSignature(
             in_place=True, description="causal depthwise conv1d update (decode)"
         ),

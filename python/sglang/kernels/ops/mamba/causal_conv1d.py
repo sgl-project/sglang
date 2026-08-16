@@ -1,9 +1,7 @@
 """JIT depthwise causal conv1d: prefill (``fwd``) and decode (``update``).
 
-Both entry points keep the in-place, destination-passing contract of the AOT
-``sgl_kernel.causal_conv1d_fwd`` / ``causal_conv1d_update`` ops they replace on
-CUDA: the output is written back into ``x`` and the conv state is advanced in
-place.
+In-place, like the AOT ops they replace on CUDA: the output is written back into
+``x`` and the conv state is advanced in place.
 """
 
 from __future__ import annotations
