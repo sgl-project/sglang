@@ -161,6 +161,18 @@ def estimate_default_workload_peak_bytes(
 ) -> int | None:
     """Extrapolate warmup peaks to the default workload.
 
+    Preference order:
+    1. A measurement at or above the target workload bounds the peak directly.
+    2. Two distinct measured workload sizes fit ``peak = constant + slope *
+       units``; only the fitted linear part is extrapolated (and padded).
+       Under offload the pre-forward baseline is nearly empty, so a
+       single-point split cannot separate constant costs (streamed weights,
+       attention workspace, tiled VAE decode) from workload-linear
+       activations -- measured on Wan2.1-14B, single-point scaling
+       overestimated a ~30 GiB peak as ~183 GiB.
+    3. One usable size: scale everything above the pre-forward allocated
+       baseline (conservative; may block promotion but never over-promotes).
+
     Returns None when there is no usable measurement (no records, or any
     warmup forward failed -- a failed warmup means the measured peak does not
     cover the full request path).
@@ -169,15 +181,42 @@ def estimate_default_workload_peak_bytes(
     if not records or any(not record.succeeded for record in records):
         return None
 
+    peak_by_units: dict[int, int] = {}
+    for record in records:
+        units = record.workload_units()
+        peak_by_units[units] = max(
+            peak_by_units.get(units, 0), record.peak_reserved_bytes
+        )
+
+    if target_units is None:
+        return max(peak_by_units.values())
+
+    covering_peaks = [
+        peak for units, peak in peak_by_units.items() if units >= target_units
+    ]
+    if covering_peaks:
+        return max(covering_peaks)
+
+    if len(peak_by_units) >= 2:
+        # fit on the two largest sizes: closest to the target, best local slope
+        (large_units, large_peak), (small_units, small_peak) = sorted(
+            peak_by_units.items(), reverse=True
+        )[:2]
+        slope = (large_peak - small_peak) / (large_units - small_units)
+        if slope >= 0:
+            constant = large_peak - slope * large_units
+            return int(
+                constant + slope * target_units * ACTIVATION_EXTRAPOLATION_MARGIN
+            )
+        # negative slope is measurement noise; fall through to the
+        # conservative single-point estimate
+
     estimates = []
     for record in records:
         peak = record.peak_reserved_bytes
-        ratio = 1.0 if target_units is None else target_units / record.workload_units()
-        if ratio <= 1.0:
-            estimates.append(peak)
-            continue
         baseline = min(record.baseline_allocated_bytes, peak)
         activation = peak - baseline
+        ratio = target_units / record.workload_units()
         estimates.append(
             baseline + int(activation * ratio * ACTIVATION_EXTRAPOLATION_MARGIN)
         )
@@ -420,7 +459,12 @@ def rollback_promotions(
         torch.get_device_module().empty_cache()
 
 
-def format_plan_summary(*, plan: AutoResidencyPlan, workload: DefaultWorkload) -> str:
+def format_plan_summary(
+    *,
+    plan: AutoResidencyPlan,
+    workload: DefaultWorkload,
+    records: Iterable[WarmupMemoryRecord] = (),
+) -> str:
     """One-line decision summary for the startup log."""
     if plan.skip_reason is not None:
         return f"Auto residency: skipped ({plan.skip_reason})"
@@ -433,9 +477,17 @@ def format_plan_summary(*, plan: AutoResidencyPlan, workload: DefaultWorkload) -
         )
         or "none"
     )
+    measured = ", ".join(
+        f"{record.width}x{record.height}x{record.num_frames}f="
+        f"{record.peak_reserved_bytes / GIB_BYTES:.1f}GiB"
+        for record in records
+        if record.succeeded
+    )
+    measured_part = f"measured=[{measured}], " if measured else ""
     return (
         f"Auto residency: target={workload.describe()} "
         f"steps={workload.num_inference_steps}, "
+        f"{measured_part}"
         f"estimated_peak={plan.estimated_peak_bytes / GIB_BYTES:.1f} GiB, "
         f"reserve={plan.reserve_bytes / GIB_BYTES:.1f} GiB, "
         f"budget={plan.budget_bytes / GIB_BYTES:.1f} GiB, "
