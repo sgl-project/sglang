@@ -1,7 +1,6 @@
 import unittest
 
 import torch
-from utils import precision
 
 from sglang.srt.layers.rotary_embedding import (
     MRotaryEmbedding,
@@ -14,6 +13,7 @@ from sglang.srt.layers.rotary_embedding.rope_variant import (
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb_native_eager
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.cpu_test_utils import precision
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
