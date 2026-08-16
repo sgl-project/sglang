@@ -53,12 +53,27 @@ class TestMakeShmName(unittest.TestCase):
             self.assertEqual(_creator_pid(name), 54321, f"kind={kind!r}")
 
     def test_long_kind_is_still_openable(self):
+        # The truncated name must survive a real shm_open round trip, not just
+        # a length assertion. Pin the pid as well as the limit: without it a
+        # small container pid leaves enough budget that "nodecheck" fits whole,
+        # and the test passes without ever exercising the truncation branch.
+        kind = "nodecheck"
         with patch.object(stale_shm_cleanup, "_MAX_SHM_NAME_LEN", 30):
-            name = make_shm_name("nodecheck")
+            with patch.object(stale_shm_cleanup.os, "getpid", return_value=54321):
+                with patch.object(stale_shm_cleanup, "_truncated_kinds", set()):
+                    name = make_shm_name(kind)
+                    self.assertIn(kind, stale_shm_cleanup._truncated_kinds)
         self.assertLessEqual(len(name), 30)
+        self.assertNotIn(kind, name, "the tag was not actually truncated")
         shm = shared_memory.SharedMemory(create=True, size=128, name=name)
         try:
             self.assertEqual(shm.name.lstrip("/"), name.lstrip("/"))
+            reopened = shared_memory.SharedMemory(name=name)
+            try:
+                shm.buf[:4] = b"ping"
+                self.assertEqual(bytes(reopened.buf[:4]), b"ping")
+            finally:
+                reopened.close()
         finally:
             shm.close()
             shm.unlink()
