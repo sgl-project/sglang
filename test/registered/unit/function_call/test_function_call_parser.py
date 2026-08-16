@@ -2339,6 +2339,27 @@ class TestQwen3CoderDetector(unittest.TestCase):
                     },
                 ),
             ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="write_file",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "content": {"type": "string"},
+                            "note": {
+                                "anyOf": [
+                                    {"type": "string"},
+                                    {"type": "null"},
+                                ]
+                            },
+                            "overwrite": {"type": "boolean"},
+                        },
+                        "required": ["file_path", "content"],
+                    },
+                ),
+            ),
         ]
         self.detector = Qwen3CoderDetector()
 
@@ -2447,6 +2468,107 @@ class TestQwen3CoderDetector(unittest.TestCase):
             params = json.loads(collected_params)
             self.assertEqual(params["location"], "Boston")
             self.assertEqual(params["unit"], "celsius")
+
+    def test_streaming_string_parameter_emits_before_closing_tag(self):
+        """String argument deltas should arrive while the XML value is open."""
+        content_chunks = [
+            'const quote = "hello";\n',
+            "const slash = \\\\server;\n",
+            "const unicode = '你好';\n",
+        ]
+        chunks = [
+            "<tool_call><function=write_file>",
+            "<parameter=file_path>/tmp/demo.js</parameter>",
+            "<parameter=content>\n",
+            *content_chunks,
+            "\n</para",
+            "meter><parameter=overwrite>false</parameter>",
+            "</function></tool_call>",
+        ]
+
+        detector = Qwen3CoderDetector()
+        results = [
+            detector.parse_streaming_increment(chunk, self.tools) for chunk in chunks
+        ]
+
+        content_results = results[3 : 3 + len(content_chunks)]
+        self.assertTrue(all(result.calls for result in content_results))
+
+        arguments = "".join(
+            call.parameters for result in results for call in result.calls
+        )
+        self.assertEqual(
+            json.loads(arguments),
+            {
+                "file_path": "/tmp/demo.js",
+                "content": "".join(content_chunks),
+                "overwrite": False,
+            },
+        )
+
+    def test_streaming_large_string_parameter_keeps_buffer_bounded(self):
+        """An open string argument should not accumulate in the parser buffer."""
+        detector = Qwen3CoderDetector()
+        results = [
+            detector.parse_streaming_increment(
+                "<tool_call><function=write_file><parameter=content>", self.tools
+            )
+        ]
+
+        content_chunks = [f"chunk-{index:03d}:" + "x" * 1013 for index in range(128)]
+        for content_chunk in content_chunks:
+            result = detector.parse_streaming_increment(content_chunk, self.tools)
+            self.assertTrue(result.calls)
+            self.assertLessEqual(
+                len(detector._buffer), len(detector.parameter_end_token)
+            )
+            results.append(result)
+
+        results.append(
+            detector.parse_streaming_increment(
+                "</parameter></function></tool_call>", self.tools
+            )
+        )
+        arguments = "".join(
+            call.parameters for result in results for call in result.calls
+        )
+        self.assertEqual(
+            json.loads(arguments),
+            {"content": "".join(content_chunks)},
+        )
+
+    def test_streaming_nullable_string_preserves_null_conversion(self):
+        """Disambiguating string streaming must preserve JSON null values."""
+        detector = Qwen3CoderDetector()
+        chunks = [
+            "<tool_call><function=write_file><parameter=note>\n",
+            "nu",
+            "ll\n",
+            "</parameter></function></tool_call>",
+        ]
+        results = [
+            detector.parse_streaming_increment(chunk, self.tools) for chunk in chunks
+        ]
+        arguments = "".join(
+            call.parameters for result in results for call in result.calls
+        )
+        self.assertEqual(json.loads(arguments), {"note": None})
+
+        detector = Qwen3CoderDetector()
+        chunks = [
+            "<tool_call><function=write_file><parameter=note>",
+            "null",
+            " value",
+            "</parameter></function></tool_call>",
+        ]
+        results = [
+            detector.parse_streaming_increment(chunk, self.tools) for chunk in chunks
+        ]
+        self.assertTrue(results[2].calls)
+        arguments = "".join(
+            call.parameters for result in results for call in result.calls
+        )
+        self.assertEqual(json.loads(arguments), {"note": "null value"})
 
     def test_streaming_with_text_and_tool(self):
         """
