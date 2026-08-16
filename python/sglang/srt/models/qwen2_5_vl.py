@@ -51,6 +51,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -166,6 +167,21 @@ class Qwen2_5_VLMLP(nn.Module):
                 tp_size=self.tp_size,
                 tp_rank=self.tp_rank,
             )
+        elif self.tp_size == 1:
+            projection_kwargs = dict(
+                input_size=in_features,
+                output_size=hidden_features,
+                bias=bias,
+                quant_config=quant_config,
+            )
+            self.gate_proj = ReplicatedLinear(
+                **projection_kwargs,
+                prefix=add_prefix("gate_proj", prefix),
+            )
+            self.up_proj = ReplicatedLinear(
+                **projection_kwargs,
+                prefix=add_prefix("up_proj", prefix),
+            )
         else:
             projection_kwargs = dict(
                 input_size=in_features,
@@ -183,15 +199,24 @@ class Qwen2_5_VLMLP(nn.Module):
                 **projection_kwargs,
                 prefix=add_prefix("up_proj", prefix),
             )
-        self.down_proj = RowParallelLinear(
-            hidden_features,
-            in_features,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-        )
+        if not self.fuse_gate_up and self.tp_size == 1:
+            self.down_proj = ReplicatedLinear(
+                hidden_features,
+                in_features,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=add_prefix("down_proj", prefix),
+            )
+        else:
+            self.down_proj = RowParallelLinear(
+                hidden_features,
+                in_features,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=add_prefix("down_proj", prefix),
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+            )
         self.hidden_act = hidden_act
         if self.fuse_gate_up and self.hidden_act == "silu":
             self.act = SiluAndMul(deterministic=deterministic_activation)

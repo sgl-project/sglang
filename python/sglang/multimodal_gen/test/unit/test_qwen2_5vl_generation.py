@@ -26,7 +26,7 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_vision import (
     _vision_window_index,
 )
 from sglang.multimodal_gen.runtime.pipelines.longcat_image import LongCatImagePipeline
-from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.linear import ReplicatedLinear, RowParallelLinear
 from sglang.srt.models.qwen2_5_vl import (
     Qwen2_5_VisionPatchEmbed,
     Qwen2_5_VisionPatchMerger,
@@ -98,12 +98,15 @@ def test_native_vision_reuses_srt_modules():
             deterministic_activation=True,
             fuse_gate_up=False,
         )
+        fused_mlp = Qwen2_5_VLMLP(16, 24, deterministic_activation=True)
 
     assert isinstance(model.patch_embed, Qwen2_5_VisionPatchEmbed)
     assert isinstance(model.merger, Qwen2_5_VisionPatchMerger)
     assert not mlp.fuse_gate_up
-    assert hasattr(mlp, "gate_proj")
-    assert hasattr(mlp, "up_proj")
+    assert isinstance(mlp.gate_proj, ReplicatedLinear)
+    assert isinstance(mlp.up_proj, ReplicatedLinear)
+    assert isinstance(mlp.down_proj, ReplicatedLinear)
+    assert isinstance(fused_mlp.down_proj, RowParallelLinear)
     assert mlp.act is not None
     assert isinstance(
         _make_column_linear(16, 24, bias=False, use_tensor_parallel=False),
@@ -113,6 +116,30 @@ def test_native_vision_reuses_srt_modules():
         _make_row_linear(24, 16, bias=False, use_tensor_parallel=False),
         ReplicatedLinear,
     )
+
+
+def test_text_mlp_falls_back_when_intermediate_size_is_not_tp_divisible(
+    monkeypatch,
+):
+    monkeypatch.setattr(qwen2_5vl, "Qwen2_5_VLAttention", lambda *_args: nn.Identity())
+    monkeypatch.setattr(qwen2_5vl, "_tp_world_size", lambda: 3)
+    monkeypatch.setattr(qwen2_5vl, "_tp_rank", lambda: 2)
+    config = SimpleNamespace(
+        hidden_size=16,
+        intermediate_size=25,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        use_sliding_window=False,
+        _attn_implementation="flash_attention_2",
+        layer_types=["full_attention"],
+    )
+
+    layer = qwen2_5vl.Qwen2_5_VLDecoderLayer(config, layer_idx=0)
+
+    assert layer.mlp.tp_size == 1
+    assert layer.mlp.tp_rank == 0
+    assert isinstance(layer.mlp.gate_proj, ReplicatedLinear)
+    assert isinstance(layer.mlp.down_proj, ReplicatedLinear)
 
 
 def test_explicit_attention_mask_is_limited_to_cached_generation(monkeypatch):

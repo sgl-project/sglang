@@ -350,6 +350,9 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
             )
         self.self_attn = Qwen2_5_VLAttention(config, layer_idx)
 
+        mlp_tp_size = _tp_world_size()
+        if config.intermediate_size % mlp_tp_size != 0:
+            mlp_tp_size = 1
         self.mlp = Qwen2_5_VLMLP(
             config.hidden_size,
             config.intermediate_size,
@@ -357,8 +360,8 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             prefix=f"model.language_model.layers.{layer_idx}.mlp",
             fuse_gate_up=False,
-            tp_size=_tp_world_size(),
-            tp_rank=_tp_rank(),
+            tp_size=mlp_tp_size,
+            tp_rank=_tp_rank() if mlp_tp_size > 1 else 0,
         )
         norm_kwargs = dict(
             eps=config.rms_norm_eps,
