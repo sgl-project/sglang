@@ -421,8 +421,10 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
-    def prefetch_anchor_info(self, node_id: NodeId) -> Optional[str]:
-        """The anchor node's key extra_key."""
+    def prefetch_anchor_info(
+        self, node_id: NodeId
+    ) -> tuple[Optional[str], Optional[str]]:
+        """The anchor node's key extra_key and cache_salt."""
         ...
 
     @abstractmethod
