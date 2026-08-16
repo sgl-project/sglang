@@ -90,6 +90,12 @@ Rows are grouped when a family shares the same runtime path or optimization supp
             <td><span className="sgd-muted">No dedicated optimization listed</span></td>
           </tr>
           <tr>
+            <td>LingBot Video MoE</td>
+            <td><div className="sgd-id-list"><code>robbyant/lingbot-video-moe-30b-a3b</code></div></td>
+            <td>T2V, 480p</td>
+            <td><span className="sgd-muted">No dedicated optimization listed</span></td>
+          </tr>
+          <tr>
             <td>Wan2.2</td>
             <td><div className="sgd-id-list"><code>Wan-AI/Wan2.2-TI2V-5B-Diffusers</code><code>Wan-AI/Wan2.2-T2V-A14B-Diffusers</code><code>nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4</code><code>Wan-AI/Wan2.2-I2V-A14B-Diffusers</code></div></td>
             <td>TI2V / T2V / I2V, 480p / 720p</td>
@@ -279,6 +285,21 @@ Optimization columns are abbreviated to keep the matrix readable:
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SANA-Video 2B</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Efficient-Large-Model/SANA-Video_2B_480p_diffusers</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>480p</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>LingBot Video MoE 30B-A3B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>robbyant/lingbot-video-moe-30b-a3b</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>480p</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
@@ -699,7 +720,6 @@ Optimization columns are abbreviated to keep the matrix readable:
    - `original` keeps official two-stage semantics without the premerged stage-2 transformer path.
    - `resident` usually provides the best latency/throughput but uses much more VRAM.
    - Default is auto: `resident` on H200/high-memory CUDA GPUs, otherwise `original`.
-   - Deprecated compatibility: `snapshot` is accepted as an alias for `original` and may be removed after two release cycles.
 5. Cosmos3 ships in two sizes — `nvidia/Cosmos3-Nano` (16B) and
    `nvidia/Cosmos3-Super` (64B). Both share the same pipeline; the only
    difference is transformer depth and width, picked up from
