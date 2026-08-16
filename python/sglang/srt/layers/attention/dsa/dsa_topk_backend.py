@@ -289,8 +289,6 @@ def _topk_transform_v2_paged(
     assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
 
     page_table = attn_metadata.real_page_table
-    assert page_table.dtype == torch.int32
-    lengths_i32 = lengths.to(torch.int32)
 
     # The plan is preprocessed once per forward (DSAMetadata.topk_v2_plan,
     # refreshed in-place under CUDA graph) and reused across layers. A missing or
@@ -302,8 +300,8 @@ def _topk_transform_v2_paged(
     ), "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
 
     page_size = attn_metadata.page_size
-    out = logits.new_full((num_rows, topk), -1, dtype=torch.int32)
-    topk_transform_512_v2(logits, lengths_i32, page_table, out, page_size, plan)
+    out = logits.new_empty((num_rows, topk), dtype=torch.int32)
+    topk_transform_512_v2(logits, lengths, page_table, out, page_size, plan)
     return out
 
 
