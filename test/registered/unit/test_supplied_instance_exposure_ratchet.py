@@ -349,8 +349,6 @@ _EXPOSED = {
     ("speculative/standalone_worker_v2.py", "speculative_eagle_topk"),
     ("speculative/standalone_worker_v2.py", "speculative_num_draft_tokens"),
     ("speculative/standalone_worker_v2.py", "speculative_num_steps"),
-    ("utils/common.py", "page_size"),
-    ("utils/common.py", "speculative_eagle_topk"),
     ("utils/common.py", "speculative_num_draft_tokens"),
     ("utils/common.py", "speculative_num_steps"),
     ("utils/cuda_vmm_transport_utils.py", "mm_feature_transport"),

@@ -741,11 +741,21 @@ async def model_info():
     model_config = _global_state.tokenizer_manager.model_config
     result = {
         "model_path": _global_state.tokenizer_manager.model_path,
+        # Manager-owned, and moved by a weight update alongside `model_path`:
+        # this is where a client reads the identity the server answers under.
+        "served_model_name": _global_state.tokenizer_manager.served_model_name,
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
         "weight_version": _global_state.tokenizer_manager.config_value(
             "weight_version"
+        ),
+        "load_format": _global_state.tokenizer_manager.config_value("load_format"),
+        "reasoning_parser": _global_state.tokenizer_manager.config_value(
+            "reasoning_parser"
+        ),
+        "tool_call_parser": _global_state.tokenizer_manager.config_value(
+            "tool_call_parser"
         ),
         "has_image_understanding": model_config.is_image_understandable_model,
         "has_audio_understanding": model_config.is_audio_understandable_model,
@@ -785,7 +795,14 @@ async def get_server_info():
 
 @app.get("/server_info")
 async def server_info():
-    """Get the server information."""
+    """The startup configuration, plus live scheduler state.
+
+    The `ServerArgs` fields here are the record: what the launcher was given,
+    with resolution written back into it. Fields the control plane changes
+    after publication -- the model a weight update swapped in, its load format,
+    an operator-set weight version -- are reported by `/model_info`, and the
+    HiCache mirror by `GET /hicache/storage-backend`.
+    """
     # Returns internal states per DP.
     internal_states: List[Dict[Any, Any]] = (
         await _global_state.tokenizer_manager.get_internal_state()
@@ -796,9 +813,7 @@ async def server_info():
     # server_args.model_config is not serializable but should be excluded by asdict.
     return msgspec_to_builtins(
         {
-            **_global_state.tokenizer_manager.resolved_config_dict(
-                dataclasses.asdict(server_args)
-            ),
+            **dataclasses.asdict(server_args),
             **_global_state.scheduler_info,
             "startup_time": _global_state.tokenizer_manager.startup_time,
             "internal_states": internal_states,
