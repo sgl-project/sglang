@@ -11,7 +11,7 @@ One container owns process-static runtime state: `sglang.srt.runtime_context.Run
 | Tier | Accessor | Holds | Lifecycle |
 |------|----------|-------|-----------|
 | raw config seed | `get_server_args()` | the published `ServerArgs` — the startup record, for debugging, dumps and provenance. **Business code does not read fields off it**: the read ratchet pins that at zero, and "Reading config: the seed is off limits" below says what to read instead, which forms the ratchet sees, and what is outside it by construction (a runtime-computed name; a whole-object hand-off) | published at process entry; re-publish is **last-publish-wins** (the tokenizer publish in the launcher process; sequential engine rebuild in one process, e.g. unit tests) and re-projects the bags; read-only |
-| resolved config | `get_exec()` `get_memory()` `get_schedule()` `get_model()` `get_spec()` `get_serving()` `get_observability()` `get_disagg()` `get_lora()` `get_mm()` `get_device()` | namespace **config bags** — the single source of truth for resolved config; leaves are real attributes (dynamo-traceable) | projected from `server_args` at `publish`; mutated only via `get_context().override` |
+| resolved config | `get_exec()` `get_memory()` `get_schedule()` `get_model()` `get_spec()` `get_serving()` `get_observability()` `get_disagg()` `get_lora()` `get_mm()` `get_device()` | namespace **config bags** — the single source of truth for resolved config; leaves are real attributes (dynamo-traceable). Each is a **module function of no arguments**, and a module binds the name once: `manager.get_disagg()`, `self.get_disagg = get_disagg`, or a same-named import next to the bag one (`from model_loader import get_model`) all import fine and fail only when that path runs. `ruff --select F811` catches the import collision; `RuntimeContext` has no bag-named member and no `__getattr__`, so the member-call shapes are an `AttributeError` at call time — give it a delegating `__getattr__` and they go silent instead | projected from `server_args` at `publish`; mutated only via `get_context().override` |
 | runtime flags | `get_flags()` | state that is *not* a pure function of config: `capture` (cuda-graph lifecycle), `moe` (ACTIVE backends, swappable), `dp` (DP-attention runtime flags) | materialized at subsystem init; groups offer `override()` for tests |
 | resources | `get_resources()`, `get_stream(name)`, `get_buffer(name, factory)` | process-level handles: graph pools, EPLB state, EP dispatcher state, named side streams, workspace buffers | lazy; cleared by `reset_context()` |
 | per-forward | `get_forward()` | forward-scoped flags (multi-stream switch, MoE output buffer, attn-TP inputs, extend-in-batch) | contextvar-backed; `scoped(**kw)` restores on exit; new threads see defaults |
@@ -108,13 +108,14 @@ bag to override at all.
   the scope. When there is a runner in hand, read its
   stamp; that is a different rule from "read the instance".
 - **Per-instance boundaries** — the tokenizer-manager family, everything under
-  `entrypoints/`, and the tokenizer-process multimodal processors still read
-  `self.server_args` today. The old justification ("several `Engine`s can share
-  one process, bags are last-publish-wins across them") is **retracted** — owner
-  ruling (2026-08-15): a process holds at most one live config at a time
-  (concurrent multi-Engine is unsupported; sequential rebuild stays legal, unit
-  tests rely on it). These reads are scheduled to become bag reads in the
-  bag-read series; treat them as pinned debt, not as a boundary to imitate. What
+  `entrypoints/`, and the tokenizer-process multimodal processors read the bags.
+  The old justification for keeping them on `self.server_args` ("several
+  `Engine`s can share one process, bags are last-publish-wins across them") is
+  **retracted** — owner ruling (2026-08-15): a process holds at most one live
+  config at a time (concurrent multi-Engine is unsupported; sequential rebuild
+  stays legal, unit tests rely on it). What still reads the instance in those
+  files is pinned pair by pair in the exposure ratchet, each with its own
+  disposition; none of it is a boundary to imitate. What
   genuinely stays per-instance is what differs per *worker* within one engine:
   `base_gpu_id` travels as a constructor argument (`MMEncoder(gpu_id=...)`;
   `BaseMultimodalProcessor._fast_image_processor_device` is the shape to copy).
@@ -226,24 +227,28 @@ this).
 "Reads that legitimately stay on a ServerArgs instance" above for the full set —
 per-instance boundaries and whole-object passes; there are no per-runner config
 copies to read any more). The allow-list is `GrammarManager` and `MMEncoder`;
-the tokenizer-manager family, `entrypoints/`, and the tokenizer-process
-multimodal processors sit beside it only as pinned debt — not for one single
-reason:
+what sits beside it is residue, not a family — and not for one single reason:
 
-- the tokenizer-manager family and `entrypoints/` are **pinned debt awaiting
-  conversion to bag reads** (the old multi-Engine justification is retracted —
-  one process, one live config); the reads still work today because the
-  instance carries resolved values;
-- `GrammarManager` is a handed instance — it is constructed with the config its
-  owner hands it and never assumes a published namespace;
+- the tokenizer-manager family and `entrypoints/` **read the bags**; what is
+  left of them in the exposure ratchet is a handful of individually-dispositioned
+  pairs, not a family awaiting conversion. Read the ratchet for the current set
+  rather than assuming a directory is off-limits;
+- `GrammarManager` is a handed instance for its residual `self.server_args`
+  reads, but backend selection is **not** on the instance any more:
+  `create_grammar_backend` reads `get_exec().kernel.grammar_backend`, and
+  `__init__` calls that factory whenever `skip_tokenizer_init` is false. In
+  production the scheduler process has published; a test that constructs one
+  without publishing has to keep patching the factory (or publish itself);
 - `MMEncoder` publishes the very instance it is handed (`publish(server_args,
   role="encoder")`) and takes its per-worker device as a separate `gpu_id`
   argument, so its `self.server_args` reads and the bag agree today. They are on
   this list as a construction-path convention rather than a semantic exception —
   and the residual is real: a post-publish `override` would not reach them.
 
-Their tests tell you the same thing: they construct the object standalone, so a
-bag read turns into "config namespace not published".
+Their tests are not one story: a `GrammarManager` built standalone turns the
+factory's bag read into "config namespace not published" unless the test patches
+it or publishes, while `MMEncoder` publishes in its own `__init__` and so needs
+no such arrangement.
 
 **Test doubles publish, they do not inject.** A stand-in that carries
 `server_args=SimpleNamespace(field=...)` stops working the moment production reads

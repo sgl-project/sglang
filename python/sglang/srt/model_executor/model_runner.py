@@ -726,7 +726,6 @@ class ModelRunner:
             self._token_oracle_manager = None
             return
         self._token_oracle_manager = install_token_oracle_from_env(
-            server_args=self.server_args,
             vocab_size=self.model_config.vocab_size,
         )
 
