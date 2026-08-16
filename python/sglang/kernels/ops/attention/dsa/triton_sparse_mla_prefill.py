@@ -13,16 +13,20 @@ so on NVIDIA the DSA prefill never takes it.
 
 This module is the CUDA-side sibling: bf16 (the FP8 path quantises ``P`` before
 the ``PV`` product; this one does not), no shape pin, a concatenated ``q``
-matching the FlashMLA entry signature, and two exact fast paths the gfx950 path
+matching the FlashMLA entry signature, and one exact fast path the gfx950 path
 does not have. On the base path the two are within ~10% of each other on real
 captured indices; the separation comes from ``union`` (see below).
 
 Against the kernels NVIDIA DSA prefill actually dispatches to, it removes two
 structural costs:
 
-* ``flash_mla_sparse_fwd`` requires ``num_heads % 64`` (Hopper) or ``% 128``
-  (Blackwell). After TP the model has far fewer heads (8 at TP8), so the head
-  dim is zero-padded and 7/8 (resp. 15/16) of the tensor-core work is wasted.
+* ``flash_mla_sparse_fwd`` accepts exactly 64 or 128 heads — its Hopper tile is
+  ``B_H = 64`` on ``GMMA::MMA_64x*x16``, i.e. wgmma's 64-row ``M``. After TP the
+  model has far fewer heads (8 at TP8), so the head dim is zero-padded and 7/8
+  (resp. 15/16) of the tensor-core work is wasted. Measured on H20 at T=8192
+  with captured indices: 17.7 ms at 64 heads and 35.2 at 128 (i.e. linear in
+  heads) against 7.1 ms here, of which 4.5 ms is the gather every kernel of this
+  shape must pay.
 * The split-decode form writes ``O(T * splits)`` partials to HBM and merges
   them in a second kernel.
 
@@ -47,13 +51,9 @@ cannot, so this holds for every DSA caller; it is stated because ``union``
 gathers the distinct union of G rows and weights each position once, whereas
 the base path would weight a repeat twice.
 
-Optional exact fast paths (opt-in, default off; both are algebraically
-equivalent to the base path, not approximations):
+Optional exact fast path (opt-in, default off; algebraically equivalent to the
+base path, not an approximation):
 
-``dense_prefix``
-    Tokens whose top-k selects the whole causal prefix (``t + 1 <= topk``) are
-    dense causal attention by definition; run FA-style tiles with zero gather
-    behind an exact count/min/max guard that re-verifies the selection set.
 ``union``
     ``G`` adjacent query tokens share one gathered union index set; a per-row
     ownership bitmask restores the exact per-token softmax. This is where the
@@ -180,134 +180,6 @@ def _nsa_prefill_kernel(
         acc.to(o_ptr.dtype.element_ty),
         mask=hmask[:, None],
     )
-
-
-# ---------------------------------------------------------------------------
-# Dense-prefix fast path (opt-in: GLM_NSA_DENSE_PREFIX=1). DSA semantics: token
-# t with t+1 <= topk selects its ENTIRE prefix -> exact dense causal attention,
-# FA2-tiled (M rows 100% real, zero gather). Guarded by an exact set check
-# (count+min+max pin the selected set to base+{0..t} under unique indices) and
-# rebased for pool-row offsets. Evidence: docs/dense-prefix-report.md (1.84x on
-# the prefix region; +12%/+5% total at 4k/8k; whole-request 1.84x for T<=2048).
-# ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _dense_prefix_kernel(
-    q_ptr,
-    kv_ptr,
-    o_ptr,
-    sm_scale,
-    P,
-    H: tl.constexpr,
-    D_QK: tl.constexpr,
-    D_V: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    h = tl.program_id(1)
-    D_TAIL: tl.constexpr = D_QK - D_V
-
-    m0 = pid_m * BLOCK_M
-    m = tl.arange(0, BLOCK_M)
-    rows = m0 + m
-    rmask = rows < P
-    dv = tl.arange(0, D_V)
-    dt = tl.arange(0, D_TAIL)
-
-    qb = q_ptr + (rows * H + h).to(tl.int64)[:, None] * D_QK
-    q_main = tl.load(qb + dv[None, :], mask=rmask[:, None], other=0.0)
-    q_tail = tl.load(qb + (D_V + dt)[None, :], mask=rmask[:, None], other=0.0)
-
-    m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
-    l_i = tl.zeros([BLOCK_M], tl.float32)
-    acc = tl.zeros([BLOCK_M, D_V], tl.float32)
-    n = tl.arange(0, BLOCK_N)
-
-    # phase-1 may only cover WHOLE blocks strictly below m0; the remainder
-    # [safe_lo, hi) goes through the causal-masked phase-2 (any BLOCK_M/BLOCK_N).
-    safe_lo = (m0 // BLOCK_N) * BLOCK_N
-    for k0 in tl.range(0, safe_lo, BLOCK_N):  # fully-unmasked blocks
-        kb = kv_ptr + (k0 + n).to(tl.int64)[:, None] * D_QK
-        kv_main = tl.load(kb + dv[None, :])
-        kv_tail = tl.load(kb + (D_V + dt)[None, :])
-        qk = tl.dot(q_main, tl.trans(kv_main))
-        qk = tl.dot(q_tail, tl.trans(kv_tail), qk) * sm_scale
-        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(qk - m_new[:, None])
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p.to(kv_main.dtype), kv_main)
-        m_i = m_new
-
-    hi = tl.minimum(m0 + BLOCK_M, P)
-    for k0 in tl.range(safe_lo, hi, BLOCK_N):  # causal boundary blocks
-        cmask = (k0 + n) < P
-        kb = kv_ptr + tl.where(cmask, k0 + n, 0).to(tl.int64)[:, None] * D_QK
-        kv_main = tl.load(kb + dv[None, :], mask=cmask[:, None], other=0.0)
-        kv_tail = tl.load(kb + (D_V + dt)[None, :], mask=cmask[:, None], other=0.0)
-        qk = tl.dot(q_main, tl.trans(kv_main))
-        qk = tl.dot(q_tail, tl.trans(kv_tail), qk) * sm_scale
-        causal = (k0 + n)[None, :] <= rows[:, None]
-        qk = tl.where(causal & cmask[None, :], qk, -float("inf"))
-        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
-        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
-        alpha = tl.exp(m_i - m_safe)
-        p = tl.exp(qk - m_safe[:, None])
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p.to(kv_main.dtype), kv_main)
-        m_i = m_new
-
-    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
-    acc = acc / l_safe[:, None]
-    ob = o_ptr + (rows * H + h).to(tl.int64)[:, None] * D_V
-    tl.store(ob + dv[None, :], acc.to(o_ptr.dtype.element_ty), mask=rmask[:, None])
-
-
-def _dense_prefix_path(q, kv, indices, sm_scale, d_v, out, dense_config=None):
-    """Handle rows [0, P) densely when they provably selected their full prefix.
-    Returns P (rows handled; 0 = not applicable). Exact-set gate: with unique
-    indices, count==t+1 & min==base & max==base+t pin the set to base+{0..t}."""
-    T, h, d_qk = q.shape
-    topk = indices.shape[-1]
-    P = min(topk, T)
-    if P < 128:
-        return 0
-    pre = indices[:P]
-    valid = pre >= 0
-    counts = valid.sum(dim=-1, dtype=torch.int32)
-    want = torch.arange(P, dtype=torch.int32, device=indices.device)
-    vmax = pre.amax(dim=-1)
-    vmin = torch.where(valid, pre, pre.new_full((), 2**31 - 1)).amin(dim=-1)
-    base = vmin[0]
-    ok = (counts == want + 1).all() & (vmin == base).all() & (vmax == base + want).all()
-    if not bool(ok):
-        return 0
-    b = int(base)
-    if b + P > kv.shape[0]:
-        return 0
-    if dense_config is not None:
-        bm, bn, warps, stages = dense_config
-    else:
-        _cap = torch.cuda.get_device_capability()
-        # SM90: 228KB smem; SM120: 99KB -> smaller tiles (validated on-box 2026-07-22)
-        bm, bn, warps, stages = (32, 64, 4, 2) if _cap[0] == 9 else (16, 32, 8, 2)
-    _dense_prefix_kernel[(triton.cdiv(P, bm), h)](
-        q[:P],
-        kv[b:],
-        out[:P],
-        sm_scale,
-        P,
-        H=h,
-        D_QK=d_qk,
-        D_V=d_v,
-        BLOCK_M=bm,
-        BLOCK_N=bn,
-        num_warps=warps,
-        num_stages=stages,
-    )
-    return P
 
 
 # ---------------------------------------------------------------------------
@@ -627,10 +499,8 @@ def sparse_mla_prefill(
     topk_length=None,
     out=None,
     union=0,
-    dense=False,
     config=None,
     union_config=None,
-    dense_config=None,
     int64_indexing=None,
 ):
     """Fused sparse-MLA prefill. Returns ``out`` ``[T, H, d_v]`` bf16.
@@ -649,12 +519,9 @@ def sparse_mla_prefill(
         union: 0 (off), 2 or 4 — share one gathered union index set across ``G``
             adjacent query tokens. Exact, not an approximation: an ownership
             bitmask restores each token's own softmax support.
-        dense: enable the dense-prefix identity fast path for tokens whose top-k
-            covers the whole causal prefix. Guarded by an exact set check; falls
-            back to the sparse path if the guard fails.
-        config / union_config / dense_config: optional tile overrides
-            ``(BLOCK_N, num_warps, num_stages)`` (dense takes ``(BM, BN, warps,
-            stages)``). Defaults are the per-arch tuned entries in ``_PINNED``.
+        config / union_config: optional tile overrides
+            ``(BLOCK_N, num_warps, num_stages)``. Defaults are the per-arch
+            tuned entries in ``_PINNED``.
     """
     if kv.dim() == 3:  # [S, 1, D] -> [S, D]
         assert kv.shape[1] == 1
@@ -667,23 +534,6 @@ def sparse_mla_prefill(
     q, kv, indices = q.contiguous(), kv.contiguous(), indices.contiguous()
     if out is None:
         out = torch.empty(T, h, d_v, dtype=torch.bfloat16, device=q.device)
-
-    if dense:
-        P = _dense_prefix_path(q, kv, indices, sm_scale, d_v, out, dense_config)
-        if P >= T:
-            return out
-        if P > 0:  # remainder continues through the normal (or union) path below
-            sparse_mla_prefill(
-                q[P:],
-                kv,
-                indices[P:],
-                sm_scale,
-                d_v,
-                out=out[P:],
-                union=union,
-                dense=False,
-            )
-            return out
 
     if union in (2, 4) and _union_path(
         q, kv, indices, sm_scale, d_v, out, union, union_config

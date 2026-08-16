@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Numerical correctness for the fused Triton sparse-MLA prefill kernel.
 
-Gates the base path and both opt-in exact fast paths against an fp32 reference
+Gates the base path and the opt-in union fast path against an fp32 reference
 over the sparse-MLA contract. Each case guards a distinct failure mode:
 
 - ``-1`` index padding and ragged rows (the indexer emits fewer than ``topk``
@@ -11,9 +11,6 @@ over the sparse-MLA contract. Each case guards a distinct failure mode:
   B's softmax. A mask bug here is invisible unless the shared set is genuinely
   larger than either token's own set, so the fixture builds overlapping-but-
   unequal sets rather than uniform-random ones.
-- The dense-prefix identity: when ``t + 1 <= topk`` the selection is the whole
-  causal prefix, and the kernel switches to a dense causal tile. Wrong guard =
-  silently attending to the wrong rows.
 - Head counts whose tuned tile exceeds the device shared-memory budget. Guards
   the h=32-on-SM120 launch failure (100 KB/CTA): the launcher must step the tile
   down, not propagate OutOfResources to the request.
@@ -139,19 +136,6 @@ class TestDSATritonSparseMLAPrefill(CustomTestCase):
                 f"union G={group}",
             )
 
-    def test_dense_prefix_identity(self):
-        T, topk = 2048, 2048
-        q, kv, _ = _qkv(T, T, 8, seed=3)
-        idx = torch.full((T, topk), -1, dtype=torch.int32, device="cuda")
-        for t in range(T):
-            n = min(t + 1, topk)
-            idx[t, :n] = torch.arange(n, dtype=torch.int32, device="cuda")
-        self._assert_matches(
-            sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V, dense=True),
-            _reference(q, kv, idx),
-            "dense-prefix",
-        )
-
     def test_large_head_count_steps_down_instead_of_oom(self):
         T, topk, S = 256, 512, 520
         q, kv, g = _qkv(T, S, 32, seed=9)
@@ -233,12 +217,11 @@ class TestDSATritonPrefillBackendAdapter(CustomTestCase):
     a different rank here would corrupt every downstream projection.
     """
 
-    def _backend(self, *, union=0, dense=False):
+    def _backend(self, *, union=0):
         from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
         backend.dsa_triton_union = union
-        backend.dsa_triton_dense_prefix = dense
         return backend
 
     def test_forward_matches_reference_and_output_contract(self):
@@ -247,11 +230,9 @@ class TestDSATritonPrefillBackendAdapter(CustomTestCase):
         idx = _overlapping_indices(T, topk, S, g)
         ref = _reference(q, kv, idx)
 
-        for union, dense in ((0, False), (4, False), (0, True)):
-            with self.subTest(union=union, dense=dense):
-                out = self._backend(
-                    union=union, dense=dense
-                )._forward_triton_sparse_mla(
+        for union in (0, 2, 4):
+            with self.subTest(union=union):
+                out = self._backend(union=union)._forward_triton_sparse_mla(
                     q_all=q,
                     kv_cache=kv,
                     page_table_1=idx,
@@ -265,7 +246,7 @@ class TestDSATritonPrefillBackendAdapter(CustomTestCase):
                     "_forward_flashmla_sparse returns to the same caller",
                 )
                 self.assertEqual(out.dtype, torch.bfloat16)
-                _assert_matches(self, out, ref, f"backend union={union} dense={dense}")
+                _assert_matches(self, out, ref, f"backend union={union}")
 
 
 if __name__ == "__main__":
