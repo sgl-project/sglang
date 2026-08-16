@@ -45,9 +45,13 @@ fn sampling_params_to_map(
             if let Some(v) = p.repetition_penalty {
                 map.insert("repetition_penalty".into(), serde_json::json!(v));
             }
-            if let Some(v) = p.max_new_tokens {
-                map.insert("max_new_tokens".into(), serde_json::json!(v));
-            }
+            // Keep an omitted protobuf field distinct from SGLang's Python
+            // default of 128 generated tokens.
+            map.insert(
+                "max_new_tokens".into(),
+                p.max_new_tokens
+                    .map_or(serde_json::Value::Null, serde_json::Value::from),
+            );
             if let Some(v) = p.min_new_tokens {
                 map.insert("min_new_tokens".into(), serde_json::json!(v));
             }
