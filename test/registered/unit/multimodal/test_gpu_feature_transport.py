@@ -314,6 +314,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
 
         manager = object.__new__(tokenizer_manager.TokenizerManager)
+        manager._mm_cache_retry_contexts = {}
         transport = MagicMock()
         manager._dispatch_to_scheduler = MagicMock()
         time_stats = MagicMock()
