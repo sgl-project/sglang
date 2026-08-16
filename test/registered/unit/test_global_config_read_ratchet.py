@@ -112,6 +112,12 @@ _CONFIGURED_SIZE_CALL_SITES = {
         "the encode server's launch entry sizes its workers before it has "
         "spawned any of them"
     ),
+    ("srt/utils/common.py", "configured_tp_size"): (
+        "the require_*_tp_gather predicates compared the configured tp_size "
+        "when they read the record; the live property answers a different "
+        "question wherever the groups alias, so the configured accessor is the "
+        "mechanical substitution and the live one would be a semantic change"
+    ),
     ("srt/model_loader/loader.py", "configured_moe_dp_size"): (
         "the same dict already carries the live moe_dp_size under 'dp'; this entry "
         "is the configured intent"
