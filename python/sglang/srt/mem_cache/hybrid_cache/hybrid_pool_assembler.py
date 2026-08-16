@@ -930,9 +930,15 @@ def build_full_draft_pools(
     server_args: ServerArgs,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build draft KV/DSA sidecars whose indices follow target full KV."""
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import (
+        DSATokenToKVPool,
+        HybridLinearKVPool,
+    )
 
     pool = draft_kv_pool
+    if isinstance(pool, HybridLinearKVPool):
+        # Hybrid draft runners keep their sole attention layer in this sub-pool.
+        pool = pool.full_kv_pool
     if pool.layer_num == 0:
         return [], []
 

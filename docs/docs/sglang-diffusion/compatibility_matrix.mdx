@@ -38,6 +38,10 @@ Rows are grouped when a family shares the same runtime path or optimization supp
             <td><div className="sgd-id-list"><code>Qwen/Qwen-Image</code><code>Qwen/Qwen-Image-2512</code><code>Qwen/Qwen-Image-Edit</code><code>Qwen/Qwen-Image-Edit-2509</code><code>Qwen/Qwen-Image-Edit-2511</code><code>Qwen/Qwen-Image-Layered</code></div></td>
           </tr>
           <tr>
+            <td>LongCat-Image</td>
+            <td><div className="sgd-id-list"><code>meituan-longcat/LongCat-Image</code></div></td>
+          </tr>
+          <tr>
             <td>SD3 / SD3.5</td>
             <td><div className="sgd-id-list"><code>stabilityai/stable-diffusion-3-medium</code><code>stabilityai/stable-diffusion-3-medium-diffusers</code><code>stabilityai/stable-diffusion-3.5-medium</code><code>stabilityai/stable-diffusion-3.5-medium-diffusers</code><code>stabilityai/stable-diffusion-3.5-large</code><code>stabilityai/stable-diffusion-3.5-large-diffusers</code></div></td>
           </tr>
@@ -143,6 +147,12 @@ Rows are grouped when a family shares the same runtime path or optimization supp
             <td>LTX-2</td>
             <td><div className="sgd-id-list"><code>Lightricks/LTX-2</code><code>Lightricks/LTX-2.3</code></div></td>
             <td>One-stage, two-stage, TI2V, HQ</td>
+            <td><span className="sgd-muted">No dedicated optimization listed</span></td>
+          </tr>
+          <tr>
+            <td>LTX-2.5</td>
+            <td><div className="sgd-id-list"><code>Lightricks/LTX-2.5-Diffusers</code></div></td>
+            <td>One-stage, two-stage, TI2V, auto-duration, diffusion decode</td>
             <td><span className="sgd-muted">No dedicated optimization listed</span></td>
           </tr>
           <tr>
@@ -606,6 +616,21 @@ Optimization columns are abbreviated to keep the matrix readable:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>LTX-2.5 (one/two-stage/TI2V)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Lightricks/LTX-2.5-Diffusers</code></td>
+      <td style={{padding: "9px 8px", backgroundColor: "rgba(255,255,255,0.02)"}}>960×544 (default)<br />1920×1088 (two-stage)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Cosmos3-Nano (T2V / I2V / T2I)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>nvidia/Cosmos3-Nano</code></td>
       <td style={{padding: "9px 8px", backgroundColor: "rgba(255,255,255,0.02)"}}>720p · 480p<br />1024×1024 (T2I)</td>
@@ -820,7 +845,7 @@ The entries below simply reflect configurations that have been manually validate
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-H3</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`larryvrh/MiniMax-H3-Turbo-Lora`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`larryvrh/MiniMax-H3-Turbo-Lora`<br />`lightx2v/Minimax-h3-Turbo`<br />`fal/MiniMax-H3-Realism-People-LoRA`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan2.2</td>

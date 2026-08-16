@@ -42,7 +42,7 @@ jobs:
         include:
           - arch: x86_64
             runner: x64-kernel-build-node
-            source-branch: sgl-deepep-x86
+            source-branch: sgl-deepep-cu12-x86
           - arch: aarch64
             runner: arm-kernel-build-node
             source-branch: sgl-deepep-cu12-arm
@@ -107,10 +107,10 @@ jobs:
         include:
           - arch: x86_64
             runner: x64-kernel-build-node
-            source-branch: sgl-deepep-x86
+            source-branch: sgl-deepep
           - arch: aarch64
             runner: arm-kernel-build-node
-            source-branch: sgl-deepep-arm
+            source-branch: sgl-deepep
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Clean workspace

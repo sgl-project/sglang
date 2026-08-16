@@ -18,7 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -88,7 +88,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.device = target_worker.device
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
@@ -229,7 +229,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and is_cuda()
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
-                max_bs=max(server_args.cuda_graph_config.decode.bs),
+                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
                 commit_ctx=CommitInjectCtx(
@@ -350,11 +350,18 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         with self._draft_context():
             if capture_decode_cuda_graph:
-                self._draft_sampler = self._maybe_build_draft_sampler()
-                if self._draft_sampler is not None:
-                    self.draft_model_runner.capture_tail_hooks.append(
-                        make_draft_sampler_capture_hook(self._draft_sampler)
-                    )
+                # Keep the draft model graph enabled when folded proposal is
+                # disabled, but do not capture the proposal head as a tail
+                # hook. The proposer will compute base logits and the Markov
+                # block eagerly from the graph's hidden states instead. Apart
+                # from being the intended precision fallback, skipping the
+                # unused hook avoids paying for two proposal computations.
+                if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
+                    self._draft_sampler = self._maybe_build_draft_sampler()
+                    if self._draft_sampler is not None:
+                        self.draft_model_runner.capture_tail_hooks.append(
+                            make_draft_sampler_capture_hook(self._draft_sampler)
+                        )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph

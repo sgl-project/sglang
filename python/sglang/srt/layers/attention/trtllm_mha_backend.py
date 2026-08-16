@@ -171,7 +171,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Speculative decoding
         # Only support topk <= 1 for now.
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_step_id = speculative_step_id
         self.target_verify_metadata = {}
 

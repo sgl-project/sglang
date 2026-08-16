@@ -117,6 +117,8 @@ class UnifiedTreeNode:
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
         self.hash_value = None
+        # Namespace-aware hashes used only for external KV events.
+        self.event_hash_value: Optional[list[str]] = None
         self.hit_count = 0
         self.priority = priority
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
@@ -1065,6 +1067,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
+            child.event_hash_value, split_len, self.page_size
+        )
 
         for component in self.components:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
@@ -1867,10 +1872,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 comp_xfers[comp.component_type] = t
         return kv_xfer, comp_xfers
 
-    def prefetch_anchor_info(self, node_id: NodeId) -> Optional[str]:
-        """The anchor node's key extra_key."""
+    def prefetch_anchor_info(
+        self, node_id: NodeId
+    ) -> tuple[Optional[str], Optional[str]]:
+        """The anchor node's key extra_key and cache_salt."""
         node = self.node_by_id(node_id)
-        return node.key.extra_key if node.key else None
+        if node.key is None:
+            return None, None
+        return node.key.extra_key, node.key.cache_salt
 
     def _build_backup_kv_action(
         self, node: UnifiedTreeNode, write_back: bool = False
