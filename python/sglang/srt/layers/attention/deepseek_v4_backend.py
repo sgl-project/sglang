@@ -506,7 +506,11 @@ class DeepseekV4AttnBackend(
 
     def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
         # Breakable-graph verify rereads shared state across segments.
+        # DSPARK verify replays one full (non-breakable) graph that honors the
+        # out-graph/in-graph init contract, so the base IN_REPLAY bound holds.
         if forward_mode.is_target_verify():
+            if self.model_runner.spec_algorithm.is_dspark():
+                return SharedReadBoundary.IN_REPLAY
             return SharedReadBoundary.POST_REPLAY
         return super().shared_read_boundary(forward_mode)
 

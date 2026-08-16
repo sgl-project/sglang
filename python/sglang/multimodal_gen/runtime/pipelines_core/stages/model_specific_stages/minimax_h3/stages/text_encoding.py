@@ -6,7 +6,11 @@ import torch
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+    MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY,
     MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.replica_broadcast import (
+    minimax_h3_replica_ctx,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES,
@@ -18,6 +22,8 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+_MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY = "minimax_h3_single_rank_text_encode"
 
 
 class MiniMaxH3TextEncodingStage(TextEncodingStage):
@@ -54,6 +60,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                     minimax_h3_cleanup_temp_dirs,
                 )
 
+                batch.extra.pop(MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY, None)
                 minimax_h3_cleanup_temp_dirs(batch)
                 raise
             return batch
@@ -135,7 +142,15 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             payload = None
             if dp_group.rank_in_group == owner:
                 try:
-                    first_result = self(first_batch, server_args)
+                    first_batch.extra[_MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY] = (
+                        True
+                    )
+                    try:
+                        first_result = self(first_batch, server_args)
+                    finally:
+                        first_batch.extra.pop(
+                            _MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY, None
+                        )
                     payload = first_result.extra.get(
                         MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY
                     )
@@ -255,7 +270,6 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             raise ValueError(
                 "MiniMaxH3TextEncodingStage direct encode requires a tokenizer component"
             )
-        self._manage_text_encoder_use(0)
         with set_forward_context(current_timestep=0, attn_metadata=None):
             if plan.task == "ref2va":
                 embeddings = self._encode_ref2va(batch, plan, encode_ids)
@@ -360,7 +374,17 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             in ("video.reference_preserve", "video_audio.reference_preserve")
             for material in plan.materials
         ):
-            prepared_videos = minimax_h3_prepared_reference_videos(batch, plan)
+            world, _ = minimax_h3_replica_ctx()
+            prepared_videos = minimax_h3_prepared_reference_videos(
+                batch,
+                plan,
+                share_across_replicas=(
+                    world > 1
+                    and not bool(
+                        batch.extra.get(_MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY)
+                    )
+                ),
+            )
         video_has_audio: dict[int, bool] = {}
         for video_index, item in enumerate((prepared_videos or {}).get("videos") or []):
             if item.get("condition_index") is None:
@@ -512,6 +536,8 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             pixel_values_videos=pixel_values_videos,
             video_grid_thw=video_grid_thw,
         )
+        if batch.extra.get(_MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY):
+            batch.extra.pop(MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY, None)
         return {
             "positive": {
                 "hidden_states": pos_hidden,

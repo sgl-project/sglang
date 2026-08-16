@@ -2392,6 +2392,7 @@ def _run_granian_server(
     host,
     port,
     log_level,
+    http2_max_concurrent_streams,
     tokenizer_worker_num=1,
     ssl_certfile=None,
     ssl_keyfile=None,
@@ -2415,6 +2416,7 @@ def _run_granian_server(
 
     from granian import Granian
     from granian.constants import HTTPModes, Interfaces, Loops
+    from granian.http import HTTP2Settings
     from granian.server.embed import Server as GranianEmbeddedServer
 
     Server = GranianEmbeddedServer if tokenizer_worker_num == 1 else Granian
@@ -2427,6 +2429,9 @@ def _run_granian_server(
         port=port,
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
+        http2_settings=HTTP2Settings(
+            max_concurrent_streams=http2_max_concurrent_streams
+        ),
         log_level=log_level,
         ssl_cert=ssl_certfile,
         ssl_key=ssl_keyfile,
@@ -2556,6 +2561,9 @@ def _setup_and_run_http_server(
                     host=server_args.host,
                     port=server_args.port,
                     log_level=server_args.log_level_http or server_args.log_level,
+                    http2_max_concurrent_streams=(
+                        server_args.http2_max_concurrent_streams
+                    ),
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_keyfile=server_args.ssl_keyfile,
                     ssl_ca_certs=server_args.ssl_ca_certs,
@@ -2640,6 +2648,9 @@ def _setup_and_run_http_server(
                     host=server_args.host,
                     port=server_args.port,
                     log_level=server_args.log_level_http or server_args.log_level,
+                    http2_max_concurrent_streams=(
+                        server_args.http2_max_concurrent_streams
+                    ),
                     tokenizer_worker_num=server_args.tokenizer_worker_num,
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_keyfile=server_args.ssl_keyfile,
