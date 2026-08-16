@@ -438,8 +438,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/mamba
    */
-  // Compatibility API: SGLang CUDA serving dispatches to the JIT implementation,
-  // but ROCm and external sgl_kernel consumers still rely on these exported ops.
+  // Compatibility API: SGLang dispatches to the JIT implementation, but external
+  // sgl_kernel consumers still rely on these exported CUDA ops, and the JIT-vs-AOT
+  // differential test compares against them. CUDA-only, as they have always been:
+  // csrc/mamba/causal_conv1d.cu is in the CUDA CMakeLists SOURCES and in no other
+  // extension's source list.
   m.def(
       "causal_conv1d_update(Tensor! x,"
       "Tensor! conv_state,"

@@ -20,25 +20,21 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 )
 from sglang.srt.utils import is_cuda
 
-if is_cuda():
-    # CUDA resolves to the JIT kernel through the registry; no wheel involved.
+# The compiled causal conv1d is CUDA-only and now resolves to the JIT kernel
+# through the registry. The sgl_kernel wheel it replaced only ever built this
+# kernel for CUDA too (never the ROCm / MUSA / Metal extensions), which is why
+# the old `torch.ops.sgl_kernel.causal_conv1d_update` probe existed: on every
+# other device it raised and dropped through to the Triton path below. That
+# fallback is now selected directly instead of via a failed import.
+_HAS_CONV1D_KERNEL = is_cuda()
+
+if _HAS_CONV1D_KERNEL:
     from sglang.kernels.ops.mamba import (
         causal_conv1d_fwd,
     )
     from sglang.kernels.ops.mamba import (
         causal_conv1d_update as causal_conv1d_update_kernel,
     )
-
-    _HAS_CONV1D_KERNEL = True
-else:
-    try:
-        from sgl_kernel import causal_conv1d_fwd
-        from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
-
-        torch.ops.sgl_kernel.causal_conv1d_update
-        _HAS_CONV1D_KERNEL = True
-    except (ImportError, AttributeError):
-        _HAS_CONV1D_KERNEL = False
 
 
 def _get_seq_lens_cpu(query_start_loc, x):
@@ -88,8 +84,8 @@ def causal_conv1d_fn(
 
     out: (batch, dim, seqlen)
     """
-    # Use Triton when: (1) no CUDA/ROCm conv1d kernel is available, or (2) input
-    # is non-contiguous and seq_lens_cpu is already pre-computed by caller.
+    # Use Triton when: (1) there is no compiled conv1d kernel for this device,
+    # or (2) input is non-contiguous and seq_lens_cpu is pre-computed by caller.
     # The Triton kernel accepts arbitrary strides, avoiding a .contiguous()
     # copy that can cost >0.6 ms/layer on large prefill batches.
     use_triton = not _HAS_CONV1D_KERNEL or (

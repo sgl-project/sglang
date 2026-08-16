@@ -6,37 +6,21 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import (
-    CapabilityRequirement,
-    FormatSignature,
-    KernelBackend,
-    KernelSpec,
-)
+from sglang.kernels.spec import FormatSignature, KernelBackend, KernelSpec
 
 if TYPE_CHECKING:
     import torch
 
-_CUDA = frozenset({CapabilityRequirement.CUDA})
-_HIP = frozenset({CapabilityRequirement.HIP})
-
-register_kernel(
-    KernelSpec(
-        op="mamba.causal_conv1d_fwd",
-        backend=KernelBackend.AOT,
-        target="sgl_kernel.mamba:causal_conv1d_fwd",
-        capabilities=_HIP,
-        format_signature=FormatSignature(
-            in_place=True, description="causal depthwise conv1d forward (prefill)"
-        ),
-        description="Causal conv1d forward (sgl_kernel ROCm wheel).",
-    )
-)
+# JIT is the only compiled backend for these two ops. The AOT kernel it replaced
+# was CUDA-only -- `csrc/mamba/causal_conv1d.cu` is built by the CUDA CMakeLists
+# alone, never by the ROCm / MUSA / Metal extensions -- so there is no wheel
+# backend to register for any other device. Everything non-CUDA uses the Triton
+# kernel registered at the bottom of this module, as it already did.
 register_kernel(
     KernelSpec(
         op="mamba.causal_conv1d_fwd",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.mamba.causal_conv1d:causal_conv1d_fwd",
-        capabilities=_CUDA,
         format_signature=FormatSignature(
             in_place=True, description="causal depthwise conv1d forward (prefill)"
         ),
@@ -46,21 +30,8 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="mamba.causal_conv1d_update",
-        backend=KernelBackend.AOT,
-        target="sgl_kernel.mamba:causal_conv1d_update",
-        capabilities=_HIP,
-        format_signature=FormatSignature(
-            in_place=True, description="causal depthwise conv1d update (decode)"
-        ),
-        description="Causal conv1d update (sgl_kernel ROCm wheel).",
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="mamba.causal_conv1d_update",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.mamba.causal_conv1d:causal_conv1d_update",
-        capabilities=_CUDA,
         format_signature=FormatSignature(
             in_place=True, description="causal depthwise conv1d update (decode)"
         ),
@@ -81,7 +52,7 @@ def causal_conv1d_fwd(
     pad_slot_id: int,
 ):
     """Causal depthwise conv1d forward (prefill)."""
-    return get_kernel("mamba.causal_conv1d_fwd")(
+    return get_kernel("mamba.causal_conv1d_fwd", KernelBackend.JIT)(
         x,
         weight,
         bias_,
@@ -105,7 +76,7 @@ def causal_conv1d_update(
     pad_slot_id: int,
 ):
     """Causal depthwise conv1d update (decode)."""
-    return get_kernel("mamba.causal_conv1d_update")(
+    return get_kernel("mamba.causal_conv1d_update", KernelBackend.JIT)(
         x,
         conv_state,
         weight,
