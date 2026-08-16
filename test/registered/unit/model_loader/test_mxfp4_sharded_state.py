@@ -34,6 +34,7 @@ def _new_method():
     method = Mxfp4MoEMethod.__new__(Mxfp4MoEMethod)
     method.use_marlin = False
     method.use_deep_gemm = False
+    method.use_mega_moe = False
     method._fi_kernel = None
     method.use_flashinfer = False
     method.use_triton_kernels = True
