@@ -174,7 +174,11 @@ class PELoader(ComponentLoader):
             trust_remote_code=server_args.trust_remote_code,
         )
 
-        device = get_local_torch_device()
+        device = (
+            torch.device("cpu")
+            if server_args.should_start_component_on_cpu(component_name)
+            else get_local_torch_device()
+        )
         model = model.to(device).eval()
 
         logger.info(

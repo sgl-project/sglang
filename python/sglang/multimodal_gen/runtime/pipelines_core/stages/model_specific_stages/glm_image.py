@@ -235,6 +235,19 @@ class GlmImageAR(PipelineStage):
         self.processor = processor
         self.vision_language_encoder = vision_language_encoder
 
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        if not isinstance(self.vision_language_encoder, torch.nn.Module):
+            return []
+        return [
+            ComponentUse(
+                self._component_stage_name(stage_name),
+                "vision_language_encoder",
+                memory_intensive=True,
+            )
+        ]
+
     @property
     def parallelism_type(self) -> StageParallelismType:
         return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
@@ -759,7 +772,7 @@ class GlmImageAR(PipelineStage):
         prior_token_id = torch.cat(prior_token_ids, dim=0)
         prior_token_id = prior_token_id.to(device=device)
         time_end = time.time()
-        logger.info(f"generate_prior_tokens time: {time_end - time_start}")
+        logger.debug("generate_prior_tokens time: %.3fs", time_end - time_start)
 
         batch.prior_token_id = prior_token_id
         batch.prior_token_image_ids = prior_token_image_ids
@@ -827,7 +840,9 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         stage_name = self._component_stage_name(stage_name)
-        uses: list[ComponentUse] = []
+        uses = [ComponentUse(stage_name, "text_encoder", memory_intensive=True)]
+        if self.vae is not None:
+            uses.append(ComponentUse(stage_name, "vae", phase="condition_image"))
         if self.transformer is not None:
             uses.append(
                 ComponentUse(
@@ -1120,6 +1135,9 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         prior_token_id = _repeat_to_batch(prior_token_id, batch_size)
 
         # 3. Encode input prompt
+        self.begin_declared_component_use(
+            component_name="text_encoder", module=self.text_encoder
+        )
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
             prompt,
             do_classifier_free_guidance,
@@ -1175,6 +1193,11 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             latents_mean = latents_mean.to(device=device, dtype=vae_dtype)
             latents_std = latents_std.to(device=device, dtype=vae_dtype)
 
+            self.begin_declared_component_use(
+                component_name="vae",
+                module=self.vae,
+                phase="condition_image",
+            )
             for condition_image, condition_image_prior_token_id in zip(
                 ar_condition_images, prior_token_image_ids
             ):
@@ -1182,7 +1205,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                     condition_image, self.vae, device=device
                 )
                 condition_image = _repeat_to_batch(condition_image, batch_size)
-
                 condition_latent = retrieve_latents(
                     self.vae.encode(condition_image),
                     generator=generator,
