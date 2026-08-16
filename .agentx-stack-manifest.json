@@ -24,6 +24,18 @@
       "callsite_audit": "pass: graph and eager metadata initialization are mutually exclusive and each invokes the preparation once per forward"
     }
   },
+  "candidate_overlay": {
+    "parent_change_commit": "8aa2c4360c17cfba569e0fdc156d7527e4748fb6",
+    "local_commit": "9bff6da59b65ae2efaee825a58da73bd2a7b19ff",
+    "file": "python/sglang/kernels/ops/attention/fla/gdn_replayssm_spec_fold.py",
+    "baseline_sha256": "fb79ad9e12ec1e485cc65e12d6394debee69fb21a14c50e1bb84a809f6a46e28",
+    "candidate_sha256": "4edb7dcc60d8bd22a4840dd2509626f47fdb9541b84cecd02c17b6c4b62dad09",
+    "change": "Reduce the raw ReplaySSM GDN fold value tile from 32 to 16; recurrence, ABI, warps and pipeline stages are unchanged.",
+    "targeted_validation": {
+      "gb300_micro_job": "3071746: pass, 3.781210 to 2.883568 ms at B53/T6/AL4.792/45 layers",
+      "correctness_job": "3071785: pass, 6 tests"
+    }
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
