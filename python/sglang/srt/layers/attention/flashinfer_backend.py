@@ -610,7 +610,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # Call the wrapped function
         if self.is_mxfp4:
             # Fused MXFP4 decode: reads packed fp4 KV directly, no workspace.
-            from sglang.srt.layers.jit_kernels.mxfp4_kv import decode_fused
+            from sglang.srt.layers.jit_kernels.mxfp4_kv import alloc_output, decode_fused
 
             kv_pool = forward_batch.token_to_kv_pool
             k_data, k_scale, v_data, v_scale = kv_pool.get_kv_fp4_buffers(
@@ -621,7 +621,9 @@ class FlashInferAttnBackend(AttentionBackend):
             # per-request kv boundaries (flashinfer kv_indptr is cumulative)
             kv_indptr = self.kv_indptr[0]
             bs = len(q)
-            o = torch.empty_like(q)
+            # plain-cudaMalloc slice: torch.empty would land in the small-object
+            # / graph pool that custom kernels cannot safely touch on this driver
+            o = alloc_output(q.shape, q.dtype)
             decode_fused(
                 q.contiguous(),
                 k_data,

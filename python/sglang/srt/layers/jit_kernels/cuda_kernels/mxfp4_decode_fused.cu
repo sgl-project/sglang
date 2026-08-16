@@ -62,7 +62,7 @@ __constant__ float c_e2m1_mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.
 // ---------------------------------------------------------------------------
 // fp4 KV -> fp16 SMEM tile.
 // Each thread loads 8 elements (4 packed bytes) + the shared E8M0 scale byte
-// (one per block16 = 2 threads), dequantizes in registers, stores fp16.
+// (one per block32 = 4 threads), dequantizes in registers, stores fp16.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void load_fp4_tile(
     const uint8_t* __restrict__ data, const uint8_t* __restrict__ scale,
@@ -73,8 +73,8 @@ __device__ __forceinline__ void load_fp4_tile(
   // data row = slot*H + head, 64 bytes: thread tx reads 4B at tx*4.
   const uint32_t packed = *reinterpret_cast<const uint32_t*>(
       data + row * (kHeadDim / 2) + tx * 4);
-  // E8M0 scale: one byte per 16 elements (block16), 2 threads share one.
-  const uint8_t s = scale[row * (kHeadDim / 16) + tx / 2];
+  // E8M0 scale: one byte per 32 elements (block32), 4 threads share one.
+  const uint8_t s = scale[row * (kHeadDim / 32) + tx / 4];
   const float sscale = __int_as_float((uint32_t)s << 23);
 #pragma unroll
   for (uint32_t i = 0; i < kVecSize; ++i) {

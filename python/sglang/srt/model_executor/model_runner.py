@@ -1112,6 +1112,19 @@ class ModelRunner:
                 * num_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+        elif self.server_args.kv_cache_dtype == "fp4_mx_block32":
+            # MXFP4: packed E2M1 data (head_dim//2 B/head) + E8M0 exponent-only
+            # scale (head_dim//block B/head), per K and V.
+            block_size = int(self.server_args.kv_cache_dtype.rsplit("block", 1)[1])
+            cell_size = (
+                self.model_config.get_num_kv_heads(get_attention_tp_size())
+                * (
+                    self.model_config.head_dim // 2
+                    + self.model_config.head_dim // block_size
+                )
+                * num_layers
+                * 2
+            )
         else:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())

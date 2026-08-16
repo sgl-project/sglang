@@ -15,7 +15,7 @@
 #include <cstdint>
 
 #define MXFP4_HEAD_DIM 128
-#define MXFP4_BLOCK 16  // scale granularity (16 or 32); buffer shape adapts
+#define MXFP4_BLOCK 32  // MXFP4 standard scale granularity; buffer shape adapts
 
 // E2M1 positive magnitudes: 0, 0.5, 1, 1.5, 2, 3, 4, 6
 __constant__ float c_e2m1_lut[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};

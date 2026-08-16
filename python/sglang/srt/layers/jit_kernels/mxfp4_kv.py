@@ -26,14 +26,14 @@ _FUSED_SRC = os.path.join(_HERE, "cuda_kernels", "mxfp4_decode_fused.cu")
 _CPP_SRC = r"""
 #include <torch/extension.h>
 void mxfp4_quantize_store(torch::Tensor, torch::Tensor, torch::Tensor,
-                          torch::Tensor, int64_t, int64_t);
+                          torch::Tensor, int64_t, int64_t, int64_t);
 void mxfp4_dequantize(torch::Tensor, torch::Tensor, torch::Tensor,
-                      int64_t, int64_t);
+                      int64_t, int64_t, int64_t);
 void mxfp4_dequantize_indices(torch::Tensor, torch::Tensor, torch::Tensor,
-                              torch::Tensor, int64_t, int64_t);
+                              torch::Tensor, int64_t, int64_t, int64_t);
 void mxfp4_decode_fused(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                         torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-                        torch::Tensor, int64_t, int64_t, double);
+                        torch::Tensor, int64_t, int64_t, double, int64_t);
 """
 
 # Launch wrappers: 256-thread CTA, 16 (token, head) rows per CTA.
@@ -41,32 +41,39 @@ _CUDA_WRAPPER_SRC = r"""
 #include <torch/extension.h>
 #include <cstdint>
 
+// All kernels must launch on the caller's current stream: sglang runs its
+// forward on a non-default CUDA stream, while a bare <<<>>> launch goes to the
+// NULL (legacy default) stream with no ordering vs. torch ops (e.g. the
+// staging copy_ above) — that silently corrupts the input data.
+static cudaStream_t cur_stream(int64_t s) { return (cudaStream_t)s; }
+
 void mxfp4_quantize_store(torch::Tensor cache_kv, torch::Tensor loc,
                           torch::Tensor data, torch::Tensor scale,
-                          int64_t t, int64_t h) {
+                          int64_t t, int64_t h, int64_t stream) {
   const int rows = (int)(t * h);
   const int grid = (rows + 15) / 16;
-  mxfp4_quantize_store_kernel<<<grid, 256>>>(
+  mxfp4_quantize_store_kernel<<<grid, 256, 0, cur_stream(stream)>>>(
       (const __nv_bfloat16*)cache_kv.data_ptr(),
       (int64_t*)loc.data_ptr(), (uint8_t*)data.data_ptr(),
       (uint8_t*)scale.data_ptr(), (int)t, (int)h);
 }
 
 void mxfp4_dequantize(torch::Tensor data, torch::Tensor scale,
-                      torch::Tensor out, int64_t t, int64_t h) {
+                      torch::Tensor out, int64_t t, int64_t h,
+                      int64_t stream) {
   const int rows = (int)(t * h);
   const int grid = (rows + 15) / 16;
-  mxfp4_dequantize_kernel<<<grid, 256>>>(
+  mxfp4_dequantize_kernel<<<grid, 256, 0, cur_stream(stream)>>>(
       (const uint8_t*)data.data_ptr(), (const uint8_t*)scale.data_ptr(),
       (__nv_bfloat16*)out.data_ptr(), (int)t, (int)h);
 }
 
 void mxfp4_dequantize_indices(torch::Tensor data, torch::Tensor scale,
                               torch::Tensor indices, torch::Tensor out,
-                              int64_t i, int64_t h) {
+                              int64_t i, int64_t h, int64_t stream) {
   const int rows = (int)(i * h);
   const int grid = (rows + 15) / 16;
-  mxfp4_dequantize_indices_kernel<<<grid, 256>>>(
+  mxfp4_dequantize_indices_kernel<<<grid, 256, 0, cur_stream(stream)>>>(
       (const uint8_t*)data.data_ptr(), (const uint8_t*)scale.data_ptr(),
       (const int*)indices.data_ptr(), (__nv_bfloat16*)out.data_ptr(),
       (int)i, (int)h);
@@ -76,7 +83,7 @@ void mxfp4_decode_fused(torch::Tensor q, torch::Tensor k_data, torch::Tensor k_s
                         torch::Tensor v_data, torch::Tensor v_scale,
                         torch::Tensor kv_indices, torch::Tensor kv_indptr,
                         torch::Tensor o, torch::Tensor lse, int64_t num_qo_heads,
-                        int64_t num_kv_heads, double sm_scale) {
+                        int64_t num_kv_heads, double sm_scale, int64_t stream) {
   flashinfer::Mxfp4DecodeParams params;
   params.q = (const __nv_bfloat16*)q.data_ptr();
   // DEBUG passthrough mode: k_data/v_data are bf16 tensors
@@ -101,7 +108,7 @@ void mxfp4_decode_fused(torch::Tensor q, torch::Tensor k_data, torch::Tensor k_s
                       2 * (flashinfer::kBdz * flashinfer::kBdy * flashinfer::kHeadDim *
                                sizeof(float) +
                            flashinfer::kBdz * flashinfer::kBdy * 2 * sizeof(float));
-  mxfp4_decode_fused_kernel<<<grid, block, smem>>>(
+  mxfp4_decode_fused_kernel<<<grid, block, smem, cur_stream(stream)>>>(
       *reinterpret_cast<flashinfer::Mxfp4DecodeParams*>(&params));
 }
 """
@@ -144,13 +151,23 @@ def _load_ext():
 _KV_BUF_CAP = 32 << 20  # 32M bf16 elements = 64MB, plain cudaMalloc
 _LOC_BUF_CAP = 1 << 20  # 1M slots = 8MB, plain cudaMalloc
 _IDX_BUF_CAP = 1 << 20  # 1M indices = 4MB, plain cudaMalloc
+_Q_BUF_CAP = 8 << 20  # 8M bf16 elements = 16MB (>= 2048 x 32 heads x 128 dim), plain cudaMalloc
 _buffers = {}  # name -> base tensor; slices keep the base alive here
 # copy_ is async; the source (possibly a temporary from .contiguous()/.to())
-# must stay referenced until the copy kernel has run. Multiple stages of the
-# same buffer can be in flight back-to-back (e.g. K then V dequant), so keep a
-# small ring of sources per buffer name instead of overwriting.
+# must stay referenced until the copy kernel has run. A forward stages K/V for
+# every layer (36 layers x K+V = 72 calls per forward), and with the
+# per-call synchronize removed (CUDA-graph capture forbids it) the copies stay
+# in flight behind the GPU; the ring must never recycle a still-referenced
+# source. 256 slots cover several concurrent forwards (overlap schedule).
+# References cost no memory; only _buffers holds real allocations.
 _keepalive = {}
 _keepalive_ring = {}
+
+
+def _ring_next(name: str) -> int:
+    slot = _keepalive_ring.get(name, 0)
+    _keepalive_ring[name] = (slot + 1) % 256
+    return slot
 
 
 def _stage(name: str, tensor: torch.Tensor, cap: int, dtype=None) -> torch.Tensor:
@@ -163,11 +180,32 @@ def _stage(name: str, tensor: torch.Tensor, cap: int, dtype=None) -> torch.Tenso
     if buf is None:
         buf = torch.empty(cap, dtype=tensor.dtype, device="cuda")
         _buffers[name] = buf
-    slot = _keepalive_ring.get(name, 0)
-    _keepalive_ring[name] = (slot + 1) % 8
+    slot = _ring_next(name)
     _keepalive[(name, slot)] = tensor
     buf[:n].view(tensor.shape).copy_(tensor)
     return buf[:n]
+
+
+_out_ring = []  # ring of large plain-cudaMalloc buffers for kernel outputs
+
+
+def alloc_output(shape, dtype) -> torch.Tensor:
+    """Fresh slice of a large plain-cudaMalloc buffer for a kernel output.
+
+    Same rationale as _stage: outputs allocated during CUDA graph capture land
+    in the graph memory pool (cudaMemMap-backed), which custom kernels cannot
+    safely read/write under this driver (CUDA 12.6 / 570). A small ring keeps
+    concurrent forwards (overlap schedule) from reusing a live buffer.
+    """
+    n = 1
+    for s in shape:
+        n *= s
+    if not _out_ring:
+        for _ in range(8):
+            _out_ring.append(torch.empty(_Q_BUF_CAP, dtype=dtype, device="cuda"))
+    buf = _out_ring[_ring_next("out") % 8]
+    assert n <= buf.numel(), f"output too large: {n} > {buf.numel()}"
+    return buf[:n].view(shape)
 
 
 def quantize_and_store(
@@ -182,9 +220,9 @@ def quantize_and_store(
     assert d == 128, "MXFP4 KV kernel only supports head_dim=128"
     cache_kv = _stage("kv", cache_kv.contiguous(), _KV_BUF_CAP)
     loc = _stage("loc", loc, _LOC_BUF_CAP, dtype=torch.int64)
-    ext.mxfp4_quantize_store(cache_kv, loc, data, scale, t, h)
-    # TODO(M1): kernel is async; sync until CUDA-graph path is supported.
-    torch.cuda.synchronize()
+    ext.mxfp4_quantize_store(
+        cache_kv, loc, data, scale, t, h, torch.cuda.current_stream().cuda_stream
+    )
 
 
 def dequantize(
@@ -195,7 +233,9 @@ def dequantize(
     """Dequantize contiguous rows."""
     ext = _load_ext()
     t, h, _ = data.shape
-    ext.mxfp4_dequantize(data, scale, out, t, h)
+    ext.mxfp4_dequantize(
+        data, scale, out, t, h, torch.cuda.current_stream().cuda_stream
+    )
 
 
 def dequantize_indices(
@@ -209,13 +249,15 @@ def dequantize_indices(
     i = indices.numel()
     h = data.shape[1]
     indices = _stage("idx", indices, _IDX_BUF_CAP, dtype=torch.int32)
-    ext.mxfp4_dequantize_indices(data, scale, indices, out, i, h)
+    ext.mxfp4_dequantize_indices(
+        data, scale, indices, out, i, h, torch.cuda.current_stream().cuda_stream
+    )
 
 
 def decode_fused(
     q: torch.Tensor,       # [batch, qo_heads, 128] bf16
     k_data: torch.Tensor,  # [S, H, 64] u8
-    k_scale: torch.Tensor, # [S, H, 8] u8
+    k_scale: torch.Tensor, # [S, H, 4] u8
     v_data: torch.Tensor,
     v_scale: torch.Tensor,
     kv_indices: torch.Tensor,  # [n] int32 pool slots
@@ -227,17 +269,23 @@ def decode_fused(
     """Fused MXFP4 decode attention (reads packed fp4 KV directly)."""
     ext = _load_ext()
     batch = kv_indptr.numel() - 1
-    qh = q.shape[1]
+    # q arrives as flat [bs, qh*head_dim] from the attention backend (or
+    # [bs, qh, head_dim] in unit tests); derive qh so per-request q offsets
+    # (bx * qh + head) * head_dim stay in range for batch > 1.
+    qh = q.shape[1] // 128 if q.dim() == 2 else q.shape[1]
     kh = k_data.shape[1]
+    # Stage q too: under CUDA graphs the query comes from a small graph-input
+    # buffer (cudaMemMap small-object pool) which custom kernels cannot read.
+    q = _stage("fused_q", q.contiguous(), _Q_BUF_CAP)
     kv_indices = _stage("fused_idx", kv_indices, _IDX_BUF_CAP, dtype=torch.int32)
     kv_indptr = _stage("fused_indptr", kv_indptr, 1 << 16, dtype=torch.int32)
     ext.mxfp4_decode_fused(
-        q.contiguous(), k_data, k_scale, v_data, v_scale, kv_indices, kv_indptr,
-        o, lse, qh, kh, sm_scale,
+        q, k_data, k_scale, v_data, v_scale, kv_indices, kv_indptr,
+        o, lse, qh, kh, sm_scale, torch.cuda.current_stream().cuda_stream,
     )
 
 
-def reference_quantize(x: torch.Tensor, block: int = 16) -> tuple:
+def reference_quantize(x: torch.Tensor, block: int = 32) -> tuple:
     """Torch reference (MXFP4, block 16 or 32), for kernel validation."""
     b, m, n = x.shape
     reshaped = x.view(b, m * n // block, block).float()  # full-precision max, like the kernel
