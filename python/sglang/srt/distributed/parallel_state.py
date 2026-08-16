@@ -2984,8 +2984,7 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
         name = recv[0]
 
         if rank == source_rank:
-            if name is not None:
-                is_in_the_same_node[rank] = 1
+            is_in_the_same_node[rank] = 1
         elif name is not None:
             with contextlib.suppress(OSError):
                 # try to open the shared memory segment

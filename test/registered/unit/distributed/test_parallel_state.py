@@ -77,7 +77,7 @@ def _run_probe_with_unavailable_shm(rank: int, port: int) -> None:
                 result = parallel_state.in_the_same_node_as(dist.group.WORLD)
         else:
             result = parallel_state.in_the_same_node_as(dist.group.WORLD)
-        assert result == [False, False]
+        assert result == [True, False]
     finally:
         dist.destroy_process_group()
 
