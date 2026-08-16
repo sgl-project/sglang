@@ -32,18 +32,19 @@ def _init_npu_conv_state(
     if speculative_num_draft_tokens is not None:
         extra_conv_len = speculative_num_draft_tokens - 1
 
-    # Mamba shapes are (channels, window), while KDA shapes are
-    # (window, channels). NPU kernels consume KDA state as
-    # [layers, pool, channels, window] and other Mamba state as
-    # [layers, pool, window, channels]. KDA keeps the base window fixed;
-    # speculative per-step windows live in the intermediate cache.
+    # Both KDA and Mamba/GDN NPU conv states use the unified
+    # [layers, pool, window, channels] layout. KDA shapes arrive as
+    # (window, channels) while Mamba/GDN shapes arrive as (channels, window);
+    # resolve the correct axis ordering and extend the window by
+    # speculative_num_draft_tokens - 1 so that verify can write all draft
+    # token conv states directly into conv_states (GDN rollback scheme).
     conv_state = [
         torch.zeros(
             size=(
                 conv_state_in.shape[0],
                 conv_state_in.shape[1],
-                conv_shape[1] if is_kda else conv_shape[1] + extra_conv_len,
-                conv_shape[0],
+                (conv_shape[0] if is_kda else conv_shape[1]) + extra_conv_len,
+                conv_shape[1] if is_kda else conv_shape[0],
             ),
             dtype=conv_state_in.dtype,
             device=conv_state_in.device,
