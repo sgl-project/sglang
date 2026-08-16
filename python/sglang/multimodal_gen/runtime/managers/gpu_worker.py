@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterator, List, Union
 
 import numpy as np
 import torch
+import torch.nn as nn
 from setproctitle import setproctitle
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import (  # isort: skip
@@ -42,11 +43,39 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tp_group,
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
+    get_world_group,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     materialize_output_sample,
     post_process_sample,
     save_outputs,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+    GIB_BYTES,
+    PROMOTION_STATUS_PROMOTED,
+    PROMOTION_STATUS_ROLLBACK_FAILED,
+    PROMOTION_STATUS_ROLLED_BACK,
+    PROMOTION_STATUS_SKIPPED,
+    AppliedPromotion,
+    DefaultWorkload,
+    RankResidencyReport,
+    WarmupMemoryRecord,
+    apply_promotions,
+    collect_promotion_candidates,
+    component_resident_size_bytes,
+    estimate_default_workload_peak_bytes,
+    format_plan_summary,
+    plan_auto_residency,
+    plan_summary_payload,
+    resolve_default_workload,
+    rollback_promotions,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    peek_global_component_residency_manager,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    COMPONENT_OFFLOAD,
+    LAYERWISE_OFFLOAD,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
@@ -162,6 +191,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.cfg_cpu_group = self.cfg_group.cpu_group
         self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
         self.memory_occupation: MemoryOccupationController | None = None
+        # per-rank memory measurements of server warmup forwards; consumed by
+        # the auto-residency promotion decision before the server turns ready
+        self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
+        self._auto_residency_applied: list[AppliedPromotion] = []
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
@@ -465,9 +498,19 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         output_batch = None
         forward_failed = False
+        measure_server_warmup = (
+            bool(req.extra.get("server_based_warmup")) and not current_platform.is_cpu()
+        )
+        warmup_baseline_allocated_bytes = 0
         try:
-            if self.is_output_rank and not current_platform.is_cpu():
+            if (
+                self.is_output_rank or measure_server_warmup
+            ) and not current_platform.is_cpu():
                 torch.get_device_module().reset_peak_memory_stats()
+            if measure_server_warmup:
+                warmup_baseline_allocated_bytes = (
+                    torch.get_device_module().memory_allocated()
+                )
 
             start_time = (
                 execution_start_time
@@ -573,7 +616,29 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             # clean cache if OOM
             if not current_platform.is_cpu():
                 torch.get_device_module().empty_cache()
+        if measure_server_warmup and output_batch is not None:
+            self._record_server_warmup_memory(
+                req=req,
+                baseline_allocated_bytes=warmup_baseline_allocated_bytes,
+                succeeded=output_batch.error is None,
+            )
         return output_batch
+
+    def _record_server_warmup_memory(
+        self, *, req: Req, baseline_allocated_bytes: int, succeeded: bool
+    ) -> None:
+        self._auto_residency_warmup_records.append(
+            WarmupMemoryRecord(
+                width=int(req.width or 0),
+                height=int(req.height or 0),
+                num_frames=int(req.num_frames or 1),
+                baseline_allocated_bytes=int(baseline_allocated_bytes),
+                peak_reserved_bytes=int(
+                    torch.get_device_module().max_memory_reserved()
+                ),
+                succeeded=succeeded,
+            )
+        )
 
     def _materialize_output_transport(
         self,
@@ -963,33 +1028,184 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not self.pipeline:
             return can_stay_resident
 
-        memory_usages = self.pipeline.memory_usages
+        # Size from the live modules, not pipeline.memory_usages: the loader
+        # records the GPU-load delta, which is ~0 for exactly the offloaded
+        # components this recommendation is about.
+        modules = self.pipeline.modules
         ordered_names = [
-            name
-            for name in OFFLOAD_DISABLE_RECOMMENDATION_ORDER
-            if name in memory_usages
+            name for name in OFFLOAD_DISABLE_RECOMMENDATION_ORDER if name in modules
         ]
         ordered_names.extend(
-            name
-            for name in memory_usages
-            if name not in OFFLOAD_DISABLE_RECOMMENDATION_ORDER
+            name for name in modules if name not in OFFLOAD_DISABLE_RECOMMENDATION_ORDER
         )
         for name in ordered_names:
-            usage = memory_usages[name]
-            if not (
-                self.server_args.should_cpu_offload_component(name)
-                or self.server_args.should_configure_layerwise_offload_for_lazy_component(
-                    name
-                )
-            ):
+            module = modules[name]
+            if not isinstance(module, nn.Module):
                 continue
-            if usage is None:
+            residency_mode = self.server_args.residency_mode(name)
+            if residency_mode not in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD):
                 continue
-            if usage <= remaining_gpu_mem_gb:
+            usage_gb = component_resident_size_bytes(module, residency_mode) / GIB_BYTES
+            if 0 < usage_gb <= remaining_gpu_mem_gb:
                 can_stay_resident.append(name)
-                remaining_gpu_mem_gb -= usage
+                remaining_gpu_mem_gb -= usage_gb
 
         return can_stay_resident
+
+    def apply_auto_residency(self) -> OutputBatch:
+        """Apply the warmup-calibrated residency promotion on this replica.
+
+        Every rank executes this handler at the same queue position; the plan
+        is computed from all-gathered rank reports so each rank reaches the
+        same decision. A failure on any rank rolls every rank back to the
+        original strategy.
+        """
+        workload = resolve_default_workload(self.server_args)
+        local_report = self._build_auto_residency_report(workload=workload)
+        reports = self._auto_residency_all_gather(local_report)
+        plan = plan_auto_residency(reports=reports)
+        summary = format_plan_summary(plan=plan, workload=workload)
+        if plan.skip_reason is not None or not plan.promotions:
+            if self.is_output_rank:
+                logger.info("%s", summary)
+            return OutputBatch(
+                output=plan_summary_payload(
+                    plan=plan, workload=workload, status=PROMOTION_STATUS_SKIPPED
+                )
+            )
+
+        apply_error: str | None = None
+        try:
+            self._auto_residency_applied = apply_promotions(
+                plan=plan,
+                modules=self.pipeline.modules,
+                server_args=self.server_args,
+            )
+        except Exception as e:  # this rank already rolled itself back
+            logger.error(
+                "Auto residency promotion failed on rank %d: %s",
+                self.rank,
+                e,
+                exc_info=True,
+            )
+            self._auto_residency_applied = []
+            apply_error = str(e)
+
+        rank_errors = [
+            error for error in self._auto_residency_all_gather(apply_error) if error
+        ]
+        if rank_errors:
+            return self._rollback_auto_residency_after_failure(cause=rank_errors[0])
+
+        self._invalidate_component_strategies(
+            [candidate.component_name for candidate in plan.promotions]
+        )
+        if self.is_output_rank:
+            logger.info("%s", summary)
+        return OutputBatch(
+            output=plan_summary_payload(
+                plan=plan, workload=workload, status=PROMOTION_STATUS_PROMOTED
+            )
+        )
+
+    def rollback_auto_residency(self) -> OutputBatch:
+        """Restore the pre-promotion residency (post-promotion re-warm failed)."""
+        rollback_error = self._rollback_applied_promotions()
+        rank_errors = [
+            error for error in self._auto_residency_all_gather(rollback_error) if error
+        ]
+        if rank_errors:
+            return OutputBatch(
+                error=f"auto residency rollback failed: {rank_errors[0]}",
+                output={"status": PROMOTION_STATUS_ROLLBACK_FAILED},
+            )
+        return OutputBatch(output={"status": PROMOTION_STATUS_ROLLED_BACK})
+
+    def _build_auto_residency_report(
+        self, *, workload: DefaultWorkload
+    ) -> RankResidencyReport:
+        records = list(self._auto_residency_warmup_records)
+        skip_reason = None if records else "no server warmup measurements"
+        estimated_peak_bytes = estimate_default_workload_peak_bytes(
+            records=records, target_units=workload.workload_units()
+        )
+        # What this process may still grow into: free VRAM plus what its
+        # allocator already reserved. Unlike the raw device total, this
+        # excludes memory held by other processes on a shared GPU.
+        free_bytes, _ = torch.get_device_module().mem_get_info()
+        budget_bytes = int(free_bytes) + int(
+            torch.get_device_module().memory_reserved()
+        )
+        candidates = collect_promotion_candidates(
+            modules=self.pipeline.modules,
+            residency_mode_of=self.server_args.residency_mode,
+            explicit_residency_mode_of=self.server_args.explicit_residency_mode,
+            custom_strategy_names=self.pipeline.component_residency_strategies,
+            num_inference_steps=workload.num_inference_steps,
+        )
+        return RankResidencyReport(
+            rank=self.rank,
+            budget_bytes=budget_bytes,
+            estimated_peak_bytes=estimated_peak_bytes,
+            candidates=candidates,
+            skip_reason=skip_reason,
+        )
+
+    def _auto_residency_all_gather(self, obj: Any) -> list[Any]:
+        world_group = get_world_group()
+        if world_group.world_size == 1:
+            return [obj]
+        gathered: list[Any] = [None] * world_group.world_size
+        torch.distributed.all_gather_object(gathered, obj, group=world_group.cpu_group)
+        return gathered
+
+    def _rollback_applied_promotions(self) -> str | None:
+        if not self._auto_residency_applied:
+            return None
+        applied = self._auto_residency_applied
+        try:
+            rollback_promotions(
+                applied=applied,
+                modules=self.pipeline.modules,
+                server_args=self.server_args,
+            )
+        except Exception as e:
+            logger.error(
+                "Auto residency rollback failed on rank %d: %s",
+                self.rank,
+                e,
+                exc_info=True,
+            )
+            return str(e)
+        self._invalidate_component_strategies(
+            [promotion.component_name for promotion in applied]
+        )
+        self._auto_residency_applied = []
+        return None
+
+    def _rollback_auto_residency_after_failure(self, *, cause: str) -> OutputBatch:
+        rollback_error = self._rollback_applied_promotions()
+        rank_errors = [
+            error for error in self._auto_residency_all_gather(rollback_error) if error
+        ]
+        if rank_errors:
+            return OutputBatch(
+                error=(
+                    f"auto residency promotion failed ({cause}) and rollback "
+                    f"failed: {rank_errors[0]}"
+                ),
+                output={"status": PROMOTION_STATUS_ROLLBACK_FAILED},
+            )
+        return OutputBatch(
+            error=f"auto residency promotion failed; original strategy restored: {cause}",
+            output={"status": PROMOTION_STATUS_ROLLED_BACK},
+        )
+
+    @staticmethod
+    def _invalidate_component_strategies(component_names: List[str]) -> None:
+        manager = peek_global_component_residency_manager()
+        if manager is not None:
+            manager.invalidate_component_strategies(component_names)
 
     def set_lora(
         self,

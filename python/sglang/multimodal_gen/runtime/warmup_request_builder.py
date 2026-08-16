@@ -247,7 +247,12 @@ def _resolve_warmup_num_frames(
     if getattr(server_args, "enable_breakable_cuda_graph", False) is True:
         return num_frames
 
-    return min(num_frames, SERVER_WARMUP_MAX_VIDEO_FRAMES)
+    capped_num_frames = min(num_frames, SERVER_WARMUP_MAX_VIDEO_FRAMES)
+    # Warmup requests skip SamplingParams._adjust, so the cap must re-apply
+    # the model frame contract itself. Without this, e.g. LongLive2's capped
+    # 17 frames map to 5 latent frames (not divisible by its 8-frame causal
+    # block) and every server warmup fails silently under fail-open.
+    return server_args.pipeline_config.adjust_num_frames(capped_num_frames)
 
 
 def _effective_cfg_scale(sampling_defaults: SamplingParams) -> float | None:

@@ -1442,6 +1442,10 @@ class ServerArgs(DisaggServerArgsMixin):
             )
         self._required_resident_components.add(component_name)
 
+    def release_required_component_residency(self, component_name: str) -> None:
+        """Undo ``require_component_resident`` (auto-residency rollback)."""
+        self._required_resident_components.discard(component_name)
+
     def should_use_fsdp_for_component(self, component_name: str) -> bool:
         return bool(
             self.use_fsdp_inference

@@ -849,6 +849,9 @@ class LayerwiseOffloadableModuleMixin:
         if self.layerwise_offload_managers is None:
             return
         for manager in self.layerwise_offload_managers:
+            if manager.enabled:
+                # already armed; re-registering would double the forward hooks
+                continue
             if manager._configured:
                 manager.enabled = True
                 manager.sync_all_layers_to_cpu()

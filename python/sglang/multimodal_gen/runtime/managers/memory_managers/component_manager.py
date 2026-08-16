@@ -1,4 +1,4 @@
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Mapping, MutableMapping, Protocol, Sequence
@@ -152,6 +152,16 @@ class ComponentResidencyManager:
         if server_args is not self.server_args:
             self._strategy_cache.clear()
         self.server_args = server_args
+
+    def invalidate_component_strategies(self, component_names: Iterable[str]) -> None:
+        """Drop cached strategies after an in-place residency change.
+
+        The cache only auto-invalidates when the ``server_args`` object
+        identity changes; runtime promotions mutate residency on the same
+        object and must invalidate explicitly.
+        """
+        for component_name in component_names:
+            self._strategy_cache.pop(component_name, None)
 
     def begin_request(
         self,
@@ -656,6 +666,11 @@ class ComponentResidencyManager:
 
 
 _GLOBAL_COMPONENT_RESIDENCY_MANAGER: ComponentResidencyManager | None = None
+
+
+def peek_global_component_residency_manager() -> ComponentResidencyManager | None:
+    """Return the process-global manager without creating one."""
+    return _GLOBAL_COMPONENT_RESIDENCY_MANAGER
 
 
 def get_global_component_residency_manager(

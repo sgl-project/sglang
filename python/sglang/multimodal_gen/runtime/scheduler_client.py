@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     UpdateWeightFromTensorReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    AutoResidencyReq,
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
@@ -39,6 +40,7 @@ logger = init_logger(__name__)
 # Control ops mutate replica state (weights, LoRA, memory, shutdown), so with
 # DP they must reach every replica rather than one.
 _CONTROL_REQ_TYPES = (
+    AutoResidencyReq,
     SetLoraReq,
     MergeLoraWeightsReq,
     UnmergeLoraWeightsReq,
