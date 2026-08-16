@@ -708,17 +708,6 @@ class MHATokenToKVPool(KVCache):
             quantize_and_store(
                 cache_v, loc, self.v_data_buffer[local_id], self.v_scale_buffer[local_id]
             )
-            if layer_id == 0:  # DEBUG: prefill write check
-                from sglang.srt.layers.jit_kernels.mxfp4_kv import dequantize_indices
-
-                chk = torch.zeros(loc.numel(), cache_k.shape[1], 128, dtype=torch.bfloat16, device="cuda")
-                dequantize_indices(
-                    self.k_data_buffer[local_id], self.k_scale_buffer[local_id],
-                    loc.to(torch.int32), chk,
-                )
-                torch.cuda.synchronize()
-                me = (chk.float() - cache_k.float()).abs().mean().item()
-                print(f"[FP4DBG] batch-prefill layer{layer_id} nloc={loc.numel()} meandiff={me:.4f}", flush=True)
             return
 
         if cache_k.dtype != self.dtype:

@@ -102,12 +102,16 @@ void mxfp4_decode_fused(torch::Tensor q, torch::Tensor k_data, torch::Tensor k_s
   const int batch = (int)kv_indptr.numel() - 1;
   dim3 grid(batch, num_kv_heads);
   dim3 block(flashinfer::kBdx, flashinfer::kBdy, flashinfer::kBdz);
-  // K/V fp16 tiles (2 stages x K+V) + float merge area for sync_states.
-  const size_t smem = 2 * flashinfer::kStages * flashinfer::kBdz * flashinfer::kBdy *
-                      flashinfer::kTile * flashinfer::kHeadDim * sizeof(__half) +
-                      2 * (flashinfer::kBdz * flashinfer::kBdy * flashinfer::kHeadDim *
-                               sizeof(float) +
-                           flashinfer::kBdz * flashinfer::kBdy * 2 * sizeof(float));
+  // raw fp4 tiles (K+V) + K/V fp16 tiles (2 stages) + float merge area.
+  const size_t kRowBytes = flashinfer::kHeadDim / 2 + 4;
+  const size_t kTileRows = flashinfer::kBdz * flashinfer::kBdy * flashinfer::kTile;
+  const size_t smem =
+      2 * flashinfer::kStages * kTileRows * kRowBytes +  // raw fp4 (K+V)
+      2 * flashinfer::kStages * flashinfer::kBdz * flashinfer::kBdy *
+          flashinfer::kTile * flashinfer::kHeadDim * sizeof(__half) +
+      2 * (flashinfer::kBdz * flashinfer::kBdy * flashinfer::kHeadDim *
+               sizeof(float) +
+           flashinfer::kBdz * flashinfer::kBdy * 2 * sizeof(float));
   mxfp4_decode_fused_kernel<<<grid, block, smem, cur_stream(stream)>>>(
       *reinterpret_cast<flashinfer::Mxfp4DecodeParams*>(&params));
 }
@@ -150,7 +154,7 @@ def _load_ext():
 # alive across the async kernel launch.
 _KV_BUF_CAP = 32 << 20  # 32M bf16 elements = 64MB, plain cudaMalloc
 _LOC_BUF_CAP = 1 << 20  # 1M slots = 8MB, plain cudaMalloc
-_IDX_BUF_CAP = 1 << 20  # 1M indices = 4MB, plain cudaMalloc
+_IDX_BUF_CAP = 4 << 20  # 4M indices = 16MB, plain cudaMalloc (>= max bs * context len)
 _Q_BUF_CAP = 8 << 20  # 8M bf16 elements = 16MB (>= 2048 x 32 heads x 128 dim), plain cudaMalloc
 _buffers = {}  # name -> base tensor; slices keep the base alive here
 # copy_ is async; the source (possibly a temporary from .contiguous()/.to())
@@ -265,8 +269,14 @@ def decode_fused(
     o: torch.Tensor,           # [batch, qo_heads, 128] bf16 out
     lse: torch.Tensor,         # [batch, qo_heads] float out
     sm_scale: float,
+    staged=None,
 ) -> None:
-    """Fused MXFP4 decode attention (reads packed fp4 KV directly)."""
+    """Fused MXFP4 decode attention (reads packed fp4 KV directly).
+
+    ``staged`` = (q, kv_indices, kv_indptr) already staged by the caller
+    (flashinfer backend stages once per forward for all layers); when None,
+    stages internally (unit tests).
+    """
     ext = _load_ext()
     batch = kv_indptr.numel() - 1
     # q arrives as flat [bs, qh*head_dim] from the attention backend (or
@@ -274,15 +284,27 @@ def decode_fused(
     # (bx * qh + head) * head_dim stay in range for batch > 1.
     qh = q.shape[1] // 128 if q.dim() == 2 else q.shape[1]
     kh = k_data.shape[1]
-    # Stage q too: under CUDA graphs the query comes from a small graph-input
-    # buffer (cudaMemMap small-object pool) which custom kernels cannot read.
-    q = _stage("fused_q", q.contiguous(), _Q_BUF_CAP)
-    kv_indices = _stage("fused_idx", kv_indices, _IDX_BUF_CAP, dtype=torch.int32)
-    kv_indptr = _stage("fused_indptr", kv_indptr, 1 << 16, dtype=torch.int32)
+    if staged is None:
+        # Stage q too: under CUDA graphs the query comes from a small
+        # graph-input buffer (cudaMemMap small-object pool) which custom
+        # kernels cannot read.
+        q = _stage("fused_q", q.contiguous(), _Q_BUF_CAP)
+        kv_indices = _stage("fused_idx", kv_indices, _IDX_BUF_CAP, dtype=torch.int32)
+        kv_indptr = _stage("fused_indptr", kv_indptr, 1 << 16, dtype=torch.int32)
+    else:
+        q, kv_indices, kv_indptr = staged
     ext.mxfp4_decode_fused(
         q, k_data, k_scale, v_data, v_scale, kv_indices, kv_indptr,
         o, lse, qh, kh, sm_scale, torch.cuda.current_stream().cuda_stream,
     )
+
+
+def stage_decode_inputs(q, kv_indices, kv_indptr):
+    """Stage the per-forward decode inputs once (all layers share them)."""
+    q = _stage("fused_q", q.contiguous(), _Q_BUF_CAP)
+    kv_indices = _stage("fused_idx", kv_indices, _IDX_BUF_CAP, dtype=torch.int32)
+    kv_indptr = _stage("fused_indptr", kv_indptr, 1 << 16, dtype=torch.int32)
+    return q, kv_indices, kv_indptr
 
 
 def reference_quantize(x: torch.Tensor, block: int = 32) -> tuple:

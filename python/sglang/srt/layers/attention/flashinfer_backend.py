@@ -624,17 +624,31 @@ class FlashInferAttnBackend(AttentionBackend):
             # plain-cudaMalloc slice: torch.empty would land in the small-object
             # / graph pool that custom kernels cannot safely touch on this driver
             o = alloc_output(q.shape, q.dtype)
+            # Pass the full indices tensor (not sliced): under CUDA graphs the
+            # captured stage-copy size is fixed at capture time (dummy n=1), so a
+            # slice would leave the staged buffer under-filled at replay; the
+            # kernel segments by kv_indptr anyway. Stage inputs once per forward
+            # (layer 0) and reuse for all layers to cut per-layer launches.
+            if layer.layer_id == 0:
+                from sglang.srt.layers.jit_kernels.mxfp4_kv import (
+                    stage_decode_inputs,
+                )
+
+                self._fp4_staged = stage_decode_inputs(
+                    q.contiguous(), indices, kv_indptr[: bs + 1]
+                )
             decode_fused(
                 q.contiguous(),
                 k_data,
                 k_scale,
                 v_data,
                 v_scale,
-                indices[:n],
+                indices,
                 kv_indptr[: bs + 1],
                 o,
                 torch.empty(0, dtype=torch.float32, device=q.device),
                 layer.scaling,
+                staged=self._fp4_staged,
             )
         else:
             kv = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)

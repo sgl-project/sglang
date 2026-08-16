@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_pipeline.h>
 #include <cstdint>
 #include <cooperative_groups.h>
 
@@ -35,7 +36,7 @@ constexpr uint32_t kHeadDim = 128;
 constexpr uint32_t kVecSize = 8;
 constexpr uint32_t kBdx = kHeadDim / kVecSize;  // 16 threads along head_dim
 constexpr uint32_t kBdy = 4;                    // GQA group size (32/8)
-constexpr uint32_t kBdz = 2;                    // pipeline depth
+constexpr uint32_t kBdz = 4;                    // split-KV parallelism
 constexpr uint32_t kTile = 1;                   // tokens per (bdx,bdy,bdz) tile
 constexpr uint32_t kStages = 2;
 constexpr uint32_t kNumThreads = kBdx * kBdy * kBdz;  // 128
@@ -60,21 +61,37 @@ struct Mxfp4DecodeParams {
 __constant__ float c_e2m1_mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
 
 // ---------------------------------------------------------------------------
-// fp4 KV -> fp16 SMEM tile.
-// Each thread loads 8 elements (4 packed bytes) + the shared E8M0 scale byte
-// (one per block32 = 4 threads), dequantizes in registers, stores fp16.
+// Async fp4 KV -> raw SMEM tile (cp.async pipeline).
+// Each tile holds 8 (token, head) rows (kBdz x kBdy, kTile=1); one row = 64B
+// packed data + 4B E8M0 scale. The 16 tx threads each copy 4B of data;
+// thread (0, ty, tz) copies the 4B scale row. Dequantization happens later
+// (dequant_raw_tile) right before compute, so the load latency is hidden.
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ void load_fp4_tile(
+constexpr uint32_t kRowBytes = kHeadDim / 2 + 4;  // 68
+constexpr uint32_t kTileRows = kBdz * kBdy * kTile;  // 8 rows per tile
+
+__device__ __forceinline__ void load_fp4_tile_async(
     const uint8_t* __restrict__ data, const uint8_t* __restrict__ scale,
     const int* __restrict__ kv_indices, uint32_t token_idx, uint32_t kv_head,
-    uint32_t kv_heads, __half* __restrict__ smem_dst, uint32_t tx) {
+    uint32_t kv_heads, uint8_t* __restrict__ raw_dst, uint32_t tx,
+    uint32_t ty, uint32_t tz) {
   const int slot = kv_indices[token_idx];
   const long long row = (long long)slot * kv_heads + kv_head;
-  // data row = slot*H + head, 64 bytes: thread tx reads 4B at tx*4.
-  const uint32_t packed = *reinterpret_cast<const uint32_t*>(
-      data + row * (kHeadDim / 2) + tx * 4);
-  // E8M0 scale: one byte per 32 elements (block32), 4 threads share one.
-  const uint8_t s = scale[row * (kHeadDim / 32) + tx / 4];
+  const uint8_t* src = data + row * (kHeadDim / 2) + tx * 4;
+  __pipeline_memcpy_async(raw_dst + tx * 4, src, 4);
+  if (tx == 0) {
+    __pipeline_memcpy_async(raw_dst + kHeadDim / 2,
+                            scale + row * (kHeadDim / 32), 4);
+  }
+}
+
+// Dequantize one raw tile into an fp16 SMEM tile (called after wait).
+__device__ __forceinline__ void dequant_raw_tile(
+    const uint8_t* __restrict__ raw, __half* __restrict__ smem_dst,
+    uint32_t tx) {
+  const uint8_t* src = raw + tx * 4;
+  const uint32_t packed = *reinterpret_cast<const uint32_t*>(src);
+  const uint8_t s = src[kHeadDim / 2 + tx / 4];
   const float sscale = __int_as_float((uint32_t)s << 23);
 #pragma unroll
   for (uint32_t i = 0; i < kVecSize; ++i) {
@@ -176,13 +193,16 @@ __global__ void mxfp4_decode_fused_kernel(const Mxfp4DecodeParams params) {
   const uint32_t chunk_end = params.kv_indptr[bx + 1];
   const uint32_t chunk_size = chunk_end - chunk_start;
 
-  // SMEM layout: 2 stages of K and V, each [bdz, bdy, tile, head_dim] fp16,
-  // plus float merge area for sync_states (o and m/d per (tz, ty)).
-  __half* k_smem = reinterpret_cast<__half*>(smem);
+  // SMEM layout: raw fp4 tiles (2 stages x 8 rows x 68B, K and V), fp16 K/V
+  // tiles [stage][tz][ty][head_dim], plus float merge area for sync_states.
+  uint8_t* raw_k_smem = reinterpret_cast<uint8_t*>(smem);
+  uint8_t* raw_v_smem = raw_k_smem + kStages * kTileRows * kRowBytes;
+  __half* k_smem = reinterpret_cast<__half*>(raw_v_smem + kStages * kTileRows * kRowBytes);
   __half* v_smem = k_smem + kStages * kBdz * kBdy * kTile * kHeadDim;
   const uint32_t smem_md_off = kStages * kBdz * kBdy * kTile * kHeadDim;
   float* smem_o =
-      reinterpret_cast<float*>(smem + smem_md_off * 2 * sizeof(__half));
+      reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(v_smem) +
+                               smem_md_off * sizeof(__half));
   float* smem_md = smem_o + kBdz * kBdy * kHeadDim;
 
   // q load (bf16 -> float)
@@ -193,8 +213,6 @@ __global__ void mxfp4_decode_fused_kernel(const Mxfp4DecodeParams params) {
   state_t<kVecSize> st;
   float s[kBdy * kTile];
 
-  // 2-stage pipeline: preload tile 0..1, then loop.
-  uint32_t stage_idx = 0;
   const uint32_t num_iters = (chunk_size + kBdy * kBdz * kTile - 1) / (kBdy * kBdz * kTile);
   if (num_iters == 0) {
     // empty chunk: emit zero output / -inf lse
@@ -210,27 +228,40 @@ __global__ void mxfp4_decode_fused_kernel(const Mxfp4DecodeParams params) {
   }
 
   const uint32_t token_base = chunk_start;
+  // cp.async pipeline: preload tiles 0..kStages-1 (raw bytes), then loop.
+  uint32_t stage_idx = 0;
 #pragma unroll
   for (uint32_t iter = 0; iter < kStages; ++iter) {
     if (iter < num_iters) {
       const uint32_t tile_token = iter * kBdy * kBdz * kTile + (tz * kBdy + ty) * kTile;
-      load_fp4_tile(params.k_data, params.k_scale, params.kv_indices, token_base + tile_token, by,
-                    params.num_kv_heads,
-                    k_smem + (stage_idx * kBdz + tz) * kBdy * kTile * kHeadDim +
-                        (ty * kTile) * kHeadDim + tx * kVecSize,
-                    tx);
-      load_fp4_tile(params.v_data, params.v_scale, params.kv_indices, token_base + tile_token, by,
-                    params.num_kv_heads,
-                    v_smem + (stage_idx * kBdz + tz) * kBdy * kTile * kHeadDim +
-                        (ty * kTile) * kHeadDim + tx * kVecSize,
-                    tx);
+      load_fp4_tile_async(params.k_data, params.k_scale, params.kv_indices,
+                          token_base + tile_token, by, params.num_kv_heads,
+                          raw_k_smem + (stage_idx * kTileRows + tz * kBdy + ty) * kRowBytes,
+                          tx, ty, tz);
+      load_fp4_tile_async(params.v_data, params.v_scale, params.kv_indices,
+                          token_base + tile_token, by, params.num_kv_heads,
+                          raw_v_smem + (stage_idx * kTileRows + tz * kBdy + ty) * kRowBytes,
+                          tx, ty, tz);
     }
     stage_idx = (stage_idx + 1) % kStages;
   }
+  __pipeline_commit();
+  __pipeline_wait_prior(kStages);
   __syncthreads();
 
   for (uint32_t iter = 0; iter < num_iters; ++iter) {
     const uint32_t stage = stage_idx;
+    const uint32_t raw_off = (stage * kTileRows + tz * kBdy + ty) * kRowBytes;
+    // dequantize this stage's raw tile into fp16 SMEM, then compute.
+    dequant_raw_tile(raw_k_smem + raw_off,
+                     k_smem + (stage * kBdz + tz) * kBdy * kTile * kHeadDim +
+                         (ty * kTile) * kHeadDim + tx * kVecSize,
+                     tx);
+    dequant_raw_tile(raw_v_smem + raw_off,
+                     v_smem + (stage * kBdz + tz) * kBdy * kTile * kHeadDim +
+                         (ty * kTile) * kHeadDim + tx * kVecSize,
+                     tx);
+    __syncthreads();
     compute_qk<kBdy * kTile>(params, k_smem + (stage * kBdz + tz) * kBdy * kTile * kHeadDim,
                              q_vec, iter * kBdy * kBdz * kTile, chunk_size, s, st, tx, tz);
     __syncthreads();
@@ -238,22 +269,20 @@ __global__ void mxfp4_decode_fused_kernel(const Mxfp4DecodeParams params) {
         v_smem + (stage * kBdz + tz) * kBdy * kTile * kHeadDim, s, st, tx);
     __syncthreads();
 
-    // prefetch next tile
+    // prefetch next tile into the stage we just consumed (ring of kStages)
     const uint32_t next_iter = iter + kStages;
     if (next_iter < num_iters) {
       const uint32_t tile_token =
           next_iter * kBdy * kBdz * kTile + (tz * kBdy + ty) * kTile;
-      load_fp4_tile(params.k_data, params.k_scale, params.kv_indices, token_base + tile_token, by,
-                    params.num_kv_heads,
-                    k_smem + (stage * kBdz + tz) * kBdy * kTile * kHeadDim +
-                        (ty * kTile) * kHeadDim + tx * kVecSize,
-                    tx);
-      load_fp4_tile(params.v_data, params.v_scale, params.kv_indices, token_base + tile_token, by,
-                    params.num_kv_heads,
-                    v_smem + (stage * kBdz + tz) * kBdy * kTile * kHeadDim +
-                        (ty * kTile) * kHeadDim + tx * kVecSize,
-                    tx);
+      load_fp4_tile_async(params.k_data, params.k_scale, params.kv_indices,
+                          token_base + tile_token, by, params.num_kv_heads,
+                          raw_k_smem + raw_off, tx, ty, tz);
+      load_fp4_tile_async(params.v_data, params.v_scale, params.kv_indices,
+                          token_base + tile_token, by, params.num_kv_heads,
+                          raw_v_smem + raw_off, tx, ty, tz);
     }
+    __pipeline_commit();
+    __pipeline_wait_prior(kStages);
     __syncthreads();
     stage_idx = (stage_idx + 1) % kStages;
   }
