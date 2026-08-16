@@ -263,6 +263,20 @@ def _coerce_optional_float_list(value: Any) -> list[float] | None:
     return [float(value)]
 
 
+def _coerce_optional_bool(value: Any) -> bool | None:
+    value = _parse_form_extra_value(value)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError(f"Invalid boolean value: {value!r}")
+    return bool(value)
+
+
 def _coerce_optional_str_list(value: Any) -> str | list[str] | None:
     """Coerce a control_path/control_hint value to str or list[str].
 
@@ -355,6 +369,25 @@ def _cosmos3_sampling_param_kwargs(
     )
     if control_guidance_interval is not None:
         kwargs["control_guidance_interval"] = tuple(control_guidance_interval)
+
+    for name in (
+        "num_video_frames_per_chunk",
+        "num_conditional_frames",
+        "num_first_chunk_conditional_frames",
+        "max_frames",
+    ):
+        value = _parse_form_extra_value(_request_value(req, name))
+        if value is not None and value != "":
+            kwargs[name] = int(value)
+
+    for name in (
+        "show_control_condition",
+        "show_input",
+        "share_vision_temporal_positions",
+    ):
+        value = _coerce_optional_bool(_request_value(req, name))
+        if value is not None:
+            kwargs[name] = value
 
     for name in (
         "condition_video_keep",

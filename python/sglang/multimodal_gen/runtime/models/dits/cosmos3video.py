@@ -1303,21 +1303,29 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
         control_frames: int | Sequence[int] = 0,
+        share_vision_temporal_positions: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute mRoPE position IDs for UND text and GEN tokens.
 
-        The GEN sequence is ordered ``[control, video, action, sound]``. When
-        control clips are present they are prepended in order; each shares the
-        video's temporal coordinate frame (``share_vision_temporal_positions``)
-        so control frame ``t`` aligns with target frame ``t``.
-        ``control_frames`` is the per-clip latent frame count: an ``int`` for a
-        single control clip, or a sequence (one entry per clip) for the
-        multi-hint (e.g. edge + depth) case.
+        The GEN sequence is ordered ``[control, video, action, sound]``.
+        Control and target videos either share matching temporal coordinates or
+        occupy consecutive temporal ranges, according to
+        ``share_vision_temporal_positions``.
         """
         B = text_mask.shape[0]
         S_text = text_mask.shape[1]
         text_lengths = text_mask.sum(dim=1).long()
         effective_fps = fps if fps is not None and T > 1 else None
+        control_frame_counts = (
+            [control_frames]
+            if isinstance(control_frames, int) and control_frames > 0
+            else (
+                [int(count) for count in control_frames if int(count) > 0]
+                if not isinstance(control_frames, int)
+                else []
+            )
+        )
+        vision_frame_counts = [*control_frame_counts, T]
 
         text_pos_list = []
         vis_pos_list = []
@@ -1327,16 +1335,28 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 real_len, temporal_offset=0, device=device
             )
             media_offset = t_offset + self.temporal_margin
-            v_pos, _ = compute_mrope_position_ids_vision(
-                T,
-                Hp,
-                Wp,
-                temporal_offset=media_offset,
-                device=device,
-                fps=effective_fps,
-                base_fps=self.base_fps,
-                temporal_compression_factor=self.temporal_compression_factor,
-            )
+            vision_offset = media_offset
+            vision_pos_blocks = []
+            for frame_count in vision_frame_counts:
+                temporal_offset = (
+                    media_offset if share_vision_temporal_positions else vision_offset
+                )
+                vision_pos, vision_offset = compute_mrope_position_ids_vision(
+                    frame_count,
+                    Hp,
+                    Wp,
+                    temporal_offset=temporal_offset,
+                    device=device,
+                    fps=effective_fps,
+                    base_fps=self.base_fps,
+                    temporal_compression_factor=self.temporal_compression_factor,
+                )
+                vision_pos_blocks.append(vision_pos)
+
+            pos_dtype = vision_pos_blocks[0].dtype
+            for pos in vision_pos_blocks[1:]:
+                pos_dtype = torch.promote_types(pos_dtype, pos.dtype)
+            v_pos = torch.cat([pos.to(pos_dtype) for pos in vision_pos_blocks], dim=1)
             if action_frames > 0:
                 a_pos, _ = compute_mrope_position_ids_action(
                     action_frames,
@@ -1360,39 +1380,6 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 )
                 pos_dtype = torch.promote_types(v_pos.dtype, s_pos.dtype)
                 v_pos = torch.cat([v_pos.to(pos_dtype), s_pos.to(pos_dtype)], dim=1)
-            if control_frames:
-                # Control clips prefix the GEN sequence and share the video's
-                # temporal positions (same media_offset, T-grid, and fps
-                # modulation), so control frame t aligns with target frame t.
-                # Build all clip blocks in packing order ([c0, c1, ...]) and
-                # prepend them as a single contiguous block so the position IDs
-                # match the hidden layout produced in ``forward``.
-                cf_list = (
-                    [control_frames]
-                    if isinstance(control_frames, int)
-                    else [int(c) for c in control_frames]
-                )
-                c_pos_blocks = []
-                for cf in cf_list:
-                    if cf <= 0:
-                        continue
-                    c_pos, _ = compute_mrope_position_ids_vision(
-                        cf,
-                        Hp,
-                        Wp,
-                        temporal_offset=media_offset,
-                        device=device,
-                        fps=effective_fps,
-                        base_fps=self.base_fps,
-                        temporal_compression_factor=self.temporal_compression_factor,
-                    )
-                    c_pos_blocks.append(c_pos)
-                if c_pos_blocks:
-                    c_pos_all = torch.cat(c_pos_blocks, dim=1)
-                    pos_dtype = torch.promote_types(v_pos.dtype, c_pos_all.dtype)
-                    v_pos = torch.cat(
-                        [c_pos_all.to(pos_dtype), v_pos.to(pos_dtype)], dim=1
-                    )
             if real_len < S_text:
                 t_pos = torch.cat(
                     [
@@ -1406,9 +1393,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             text_pos_list.append(t_pos)
             vis_pos_list.append(v_pos)
 
-        text_pos_ids = torch.stack(text_pos_list, dim=1).to(device)  # [3, B, S_text]
-        vis_pos_ids = torch.stack(vis_pos_list, dim=1).to(device)  # [3, B, S_gen]
-
+        text_pos_ids = torch.stack(text_pos_list, dim=1).to(device)
+        vis_pos_ids = torch.stack(vis_pos_list, dim=1).to(device)
         return text_pos_ids, vis_pos_ids
 
     def reset_cache(self, cache_key: str | None = None):
@@ -1456,6 +1442,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
         control_latents: torch.Tensor | list[torch.Tensor] | None = None,
+        transfer_share_vision_temporal_positions: bool = True,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Forward pass for denoising.
@@ -1696,6 +1683,9 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 action_fps=action_fps if action_fps is not None else fps,
                 action_start_frame_offset=action_start_frame_offset,
                 control_frames=control_frame_counts,
+                share_vision_temporal_positions=(
+                    transfer_share_vision_temporal_positions
+                ),
             )
             # UND K/V cache is kept FULL on all ranks (not sharded). Text
             # sequence is short, so memory impact is minimal, and the GEN

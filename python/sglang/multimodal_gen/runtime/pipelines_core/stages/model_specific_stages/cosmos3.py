@@ -11,6 +11,7 @@ per-request from ``batch.data_type`` and the presence of
 
 import copy
 import json
+import math
 from typing import Any
 
 import numpy as np
@@ -129,6 +130,31 @@ def _pil_to_normalized_tensor(image: PIL.Image.Image) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
 
+def _pil_to_uint8_tensor(image: PIL.Image.Image) -> torch.Tensor:
+    arr = np.asarray(image, dtype=np.uint8).copy()
+    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+
+
+def _pad_transfer_frames(video: torch.Tensor, target_frames: int) -> torch.Tensor:
+    """Pad ``[1, 3, T, H, W]`` with reflected temporal content."""
+    if video.ndim != 5 or video.shape[0] != 1 or video.shape[1] != 3:
+        raise ValueError(
+            "Transfer video must have shape [1, 3, T, H, W], got "
+            f"{tuple(video.shape)}"
+        )
+    if target_frames <= 0:
+        raise ValueError("Transfer target frame count must be positive")
+    video = video[:, :, :target_frames]
+    if video.shape[2] == 0:
+        raise ValueError("Transfer video cannot be empty")
+    while video.shape[2] < target_frames:
+        remaining = target_frames - video.shape[2]
+        reflected = video.flip(dims=[2])
+        pad_len = min(max(video.shape[2] - 1, 1), remaining)
+        video = torch.cat([video, reflected[:, :, :pad_len]], dim=2)
+    return video.contiguous()
+
+
 class Cosmos3ImagePreprocessStage(PipelineStage):
     """Load, aspect-resize, and center-crop the conditioning input.
 
@@ -145,37 +171,104 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         return VerificationResult()
 
     def _load_control_video(
-        self, control_path: str, target_w: int, target_h: int, num_frames: int
+        self,
+        control_path: str,
+        target_w: int,
+        target_h: int,
+        max_frames: int,
     ) -> torch.Tensor:
-        """Load a control video and return ``[1, 3, num_frames, H, W]`` in [-1, 1].
-
-        Unlike the V2V conditioning input (which only locks a few frames), the
-        control map spans the whole clip, so it is resized/cropped per frame and
-        truncated to exactly ``num_frames``.
-
-        The control video must be at least ``num_frames`` long. Padding a short
-        control video (e.g. by repeating its last frame) would silently freeze
-        the control signal over the tail of the generated clip and misalign
-        control/target frames, so a too-short control video is rejected instead.
-        """
+        """Load transfer media as CPU ``uint8 [1, 3, T, H, W]``."""
         frames = load_video(control_path)
         if not frames:
-            raise ValueError(f"No frames decoded from control video: {control_path!r}")
-        if len(frames) < num_frames:
-            raise ValueError(
-                f"Control video {control_path!r} has {len(frames)} frame(s) but the "
-                f"target clip needs {num_frames}. Provide a control video at least as "
-                f"long as the requested output (num_frames={num_frames}); short "
-                "control inputs are rejected to avoid silently misaligned frames."
-            )
-        frames = frames[:num_frames]
+            raise ValueError(f"No frames decoded from transfer video: {control_path!r}")
+        frames = frames[:max_frames]
         processed = [
-            _pil_to_normalized_tensor(
-                _resize_crop_pil(f.convert("RGB"), target_w, target_h)
+            _pil_to_uint8_tensor(
+                _resize_crop_pil(frame.convert("RGB"), target_w, target_h)
             )
-            for f in frames
+            for frame in frames
         ]
         return torch.stack(processed, dim=1).unsqueeze(0).contiguous()
+
+    @staticmethod
+    def _get_transfer_num_chunks(
+        total_frames: int, frames_per_chunk: int, conditional_frames: int
+    ) -> tuple[int, int]:
+        if total_frames <= frames_per_chunk:
+            return 1, frames_per_chunk
+        stride = frames_per_chunk - conditional_frames
+        if stride <= 0:
+            raise ValueError(
+                "num_conditional_frames must be smaller than "
+                "num_video_frames_per_chunk"
+            )
+        remaining = total_frames - frames_per_chunk
+        return 1 + math.ceil(remaining / stride), stride
+
+    def _prepare_transfer_plan(
+        self,
+        batch: Req,
+        control_paths: list[str],
+        source_video_path: str | None,
+    ) -> None:
+        max_frames = int(batch.sampling_params.max_frames)
+        controls = [
+            self._load_control_video(
+                path, batch.width, batch.height, max_frames=max_frames
+            )
+            for path in control_paths
+        ]
+        total_frames = min(batch.num_frames, controls[0].shape[2], max_frames)
+        if total_frames <= 0:
+            raise ValueError("Cosmos3 transfer requires at least one control frame")
+
+        requested_chunk_frames = int(batch.sampling_params.num_video_frames_per_chunk)
+        chunk_frames = (
+            1
+            if total_frames == 1
+            else (math.ceil((requested_chunk_frames - 1) / 4) * 4 + 1)
+        )
+        num_chunks, stride = self._get_transfer_num_chunks(
+            total_frames,
+            chunk_frames,
+            int(batch.sampling_params.num_conditional_frames),
+        )
+        padded_frames = max(total_frames, chunk_frames)
+        controls = [
+            _pad_transfer_frames(control, padded_frames) for control in controls
+        ]
+
+        source_video = None
+        if source_video_path:
+            source_video = self._load_control_video(
+                source_video_path,
+                batch.width,
+                batch.height,
+                max_frames=max_frames,
+            )
+            source_video = _pad_transfer_frames(source_video, padded_frames)
+        if (
+            batch.sampling_params.num_first_chunk_conditional_frames > 0
+            and source_video is None
+        ):
+            raise ValueError(
+                "num_first_chunk_conditional_frames > 0 requires video_path"
+            )
+
+        batch.num_frames = total_frames
+        batch.extra["preprocessed_control"] = controls
+        batch.extra["preprocessed_transfer_video"] = source_video
+        batch.extra["transfer_plan"] = {
+            "total_frames": total_frames,
+            "chunk_frames": chunk_frames,
+            "num_chunks": num_chunks,
+            "stride": stride,
+        }
+        self.log_info(
+            f"Prepared transfer plan with {len(controls)} control(s), "
+            f"{total_frames} output frames, {num_chunks} chunk(s) of "
+            f"{chunk_frames} frames"
+        )
 
     @staticmethod
     def _normalize_control_paths(control_path: Any) -> list[str]:
@@ -206,27 +299,23 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         )
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        control_paths = self._normalize_control_paths(
-            getattr(batch.sampling_params, "control_path", None)
-        )
-        if control_paths:
-            control_tensors = [
-                self._load_control_video(p, batch.width, batch.height, batch.num_frames)
-                for p in control_paths
-            ]
-            batch.extra["preprocessed_control"] = control_tensors
-            self.log_info(
-                f"Preprocessed {len(control_tensors)} control video(s) to "
-                f"{control_tensors[0].shape[2]} frames at "
-                f"{batch.width}x{batch.height}"
-            )
-
         image_path = batch.image_path
         if isinstance(image_path, list):
             image_path = image_path[0] if image_path else None
         video_path = batch.video_path
         if isinstance(video_path, list):
             video_path = video_path[0] if video_path else None
+
+        control_paths = self._normalize_control_paths(
+            getattr(batch.sampling_params, "control_path", None)
+        )
+        if control_paths:
+            if image_path is not None:
+                raise ValueError(
+                    "Cosmos3 transfer accepts an optional source video, not an image"
+                )
+            self._prepare_transfer_plan(batch, control_paths, video_path)
+            return batch
 
         if image_path and video_path:
             raise ValueError(
@@ -414,7 +503,9 @@ class Cosmos3TokenizationStage(PipelineStage):
                 server_args.pipeline_config, "use_system_prompt", False
             )
         fps = batch.fps or 24.0
-        num_frames = batch.num_frames
+        num_frames = batch.extra.get("transfer_plan", {}).get(
+            "chunk_frames", batch.num_frames
+        )
         is_image_gen = batch.data_type == DataType.IMAGE
         system_prompt = (
             COSMOS3_IMAGE_SYSTEM_PROMPT if is_image_gen else COSMOS3_VIDEO_SYSTEM_PROMPT
@@ -537,8 +628,12 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4)
         vae_scale_factor_spatial = getattr(self.vae.config, "scale_factor_spatial", 16)
 
+        transfer_plan = batch.extra.get("transfer_plan")
+        pixel_num_frames = (
+            transfer_plan["chunk_frames"] if transfer_plan else batch.num_frames
+        )
         num_channels_latents = self.transformer.latent_channel
-        num_latent_frames = (batch.num_frames - 1) // vae_scale_factor_temporal + 1
+        num_latent_frames = (pixel_num_frames - 1) // vae_scale_factor_temporal + 1
         height_latent = batch.height // vae_scale_factor_spatial
         width_latent = batch.width // vae_scale_factor_spatial
 
@@ -549,6 +644,19 @@ class Cosmos3LatentPreparationStage(PipelineStage):
             height_latent,
             width_latent,
         )
+
+        if transfer_plan is not None:
+            batch.latents = torch.empty(shape, device=device, dtype=dtype)
+            batch.raw_latent_shape = shape
+            batch.extra["video_shape"] = (
+                num_latent_frames,
+                height_latent,
+                width_latent,
+            )
+            batch.extra["vae_scale_factor_temporal"] = vae_scale_factor_temporal
+            batch.extra["vae_scale_factor_spatial"] = vae_scale_factor_spatial
+            self.log_info(f"Prepared transfer latent shape {shape}")
+            return batch
 
         generator = batch.generator
         if generator is None and batch.seed is not None:
@@ -901,11 +1009,18 @@ class Cosmos3DenoisingStage(PipelineStage):
 
     parallelism_type = StageParallelismType.REPLICATED
 
-    def __init__(self, transformer, scheduler, server_args: ServerArgs | None = None):
+    def __init__(
+        self,
+        transformer,
+        scheduler,
+        server_args: ServerArgs | None = None,
+        vae=None,
+    ):
         super().__init__()
         self.transformer = transformer
         self.scheduler = scheduler
         self.server_args = server_args
+        self.vae = vae
         self._logged_parallel_config = False
         self._logged_cfg_split = False
 
@@ -1038,6 +1153,9 @@ class Cosmos3DenoisingStage(PipelineStage):
                 action_fps=action_fps,
                 action_start_frame_offset=action_start_frame_offset,
                 control_latents=control_latents,
+                transfer_share_vision_temporal_positions=getattr(
+                    self, "_share_vision_temporal_positions", True
+                ),
             )
 
     def _manage_device_placement(self, server_args: ServerArgs):
@@ -1069,10 +1187,205 @@ class Cosmos3DenoisingStage(PipelineStage):
         lo, hi = interval
         return lo <= t_scalar <= hi
 
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        """Run the denoising loop with CFG and optional I2V conditioning."""
-        self._manage_device_placement(server_args)
+    def _normalize_transfer_video(
+        self, video: torch.Tensor, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        return video.to(device=device, dtype=dtype).div(127.5).sub(1.0)
 
+    def _encode_transfer_video(
+        self, video: torch.Tensor, output_dtype: torch.dtype
+    ) -> torch.Tensor:
+        vae_dtype = next(self.vae.parameters()).dtype
+        with torch.no_grad():
+            latent = self.vae.encode(video.to(dtype=vae_dtype)).mode()
+        mean = (
+            torch.as_tensor(self.vae.config.latents_mean)
+            .view(1, -1, 1, 1, 1)
+            .to(latent.device, latent.dtype)
+        )
+        std = (
+            torch.as_tensor(self.vae.config.latents_std)
+            .view(1, -1, 1, 1, 1)
+            .to(latent.device, latent.dtype)
+        )
+        return ((latent - mean) / std).to(output_dtype)
+
+    def _decode_transfer_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        vae_dtype = next(self.vae.parameters()).dtype
+        latents = latents.to(vae_dtype)
+        mean = (
+            torch.as_tensor(self.vae.config.latents_mean)
+            .view(1, -1, 1, 1, 1)
+            .to(latents.device, vae_dtype)
+        )
+        std = (
+            torch.as_tensor(self.vae.config.latents_std)
+            .view(1, -1, 1, 1, 1)
+            .to(latents.device, vae_dtype)
+        )
+        with torch.no_grad():
+            decoded = self.vae.decode(latents * std + mean)
+        if hasattr(decoded, "sample"):
+            decoded = decoded.sample
+        elif isinstance(decoded, tuple):
+            decoded = decoded[0]
+        return decoded
+
+    def _prepare_transfer_chunk(
+        self,
+        batch: Req,
+        chunk_id: int,
+        previous_output: torch.Tensor | None,
+        generator: torch.Generator | None,
+    ) -> int:
+        plan = batch.extra["transfer_plan"]
+        chunk_frames = int(plan["chunk_frames"])
+        start_frame = chunk_id * int(plan["stride"])
+        end_frame = min(start_frame + chunk_frames, int(plan["total_frames"]))
+        device = batch.latents.device
+        latent_dtype = batch.latents.dtype
+        vae_dtype = next(self.vae.parameters()).dtype
+
+        control_norms = [
+            self._normalize_transfer_video(
+                _pad_transfer_frames(
+                    control[:, :, start_frame:end_frame], chunk_frames
+                ),
+                device,
+                vae_dtype,
+            )
+            for control in batch.extra["preprocessed_control"]
+        ]
+        target_norm = torch.zeros_like(control_norms[0])
+        current_conditional_frames = 0
+
+        source_video = batch.extra.get("preprocessed_transfer_video")
+        if (
+            chunk_id == 0
+            and batch.sampling_params.num_first_chunk_conditional_frames > 0
+        ):
+            current_conditional_frames = min(
+                int(batch.sampling_params.num_first_chunk_conditional_frames),
+                source_video.shape[2],
+                chunk_frames,
+            )
+            source_norm = self._normalize_transfer_video(
+                source_video[:, :, :current_conditional_frames], device, vae_dtype
+            )
+            target_norm[:, :, :current_conditional_frames] = source_norm
+        elif chunk_id > 0 and previous_output is not None:
+            current_conditional_frames = min(
+                int(batch.sampling_params.num_conditional_frames),
+                previous_output.shape[2],
+                chunk_frames,
+            )
+            if current_conditional_frames > 0:
+                target_norm[:, :, :current_conditional_frames] = previous_output[
+                    :, :, -current_conditional_frames:
+                ].to(target_norm)
+
+        if 0 < current_conditional_frames < chunk_frames:
+            target_norm[:, :, current_conditional_frames:] = target_norm[
+                :, :, current_conditional_frames - 1 : current_conditional_frames
+            ].expand(-1, -1, chunk_frames - current_conditional_frames, -1, -1)
+
+        control_latents = [
+            self._encode_transfer_video(control, latent_dtype)
+            for control in control_norms
+        ]
+        condition_latents = self._encode_transfer_video(target_norm, latent_dtype)
+        noise = torch.randn(
+            condition_latents.shape,
+            generator=generator,
+            device=device,
+            dtype=latent_dtype,
+        )
+        condition_mask = torch.zeros(
+            1,
+            1,
+            condition_latents.shape[2],
+            1,
+            1,
+            device=device,
+            dtype=latent_dtype,
+        )
+        if current_conditional_frames > 0:
+            temporal_scale = int(batch.extra["vae_scale_factor_temporal"])
+            latent_conditional_frames = (
+                current_conditional_frames - 1
+            ) // temporal_scale + 1
+            condition_mask[:, :, :latent_conditional_frames] = 1.0
+
+        velocity_mask = 1.0 - condition_mask
+        batch.latents = condition_mask * condition_latents + velocity_mask * noise
+        batch.raw_latent_shape = tuple(batch.latents.shape)
+        batch.extra["video_shape"] = tuple(batch.latents.shape[2:])
+        batch.extra["condition_latents"] = condition_mask * condition_latents
+        batch.extra["velocity_mask"] = velocity_mask
+        batch.extra["control_latents"] = control_latents
+        return current_conditional_frames
+
+    def _forward_transfer(self, batch: Req, server_args: ServerArgs) -> Req:
+        if self.vae is None:
+            raise RuntimeError("Cosmos3 Transfer denoising requires the pipeline VAE")
+
+        self._manage_device_placement(server_args)
+        device = batch.latents.device
+        if next(self.vae.parameters()).device != device:
+            self.vae.to(device)
+
+        generator = batch.generator
+        if generator is None and batch.seed is not None:
+            generator = torch.Generator(device=device).manual_seed(batch.seed)
+
+        plan = batch.extra["transfer_plan"]
+        output_chunks = []
+        previous_output = None
+        for chunk_id in range(int(plan["num_chunks"])):
+            current_conditional_frames = self._prepare_transfer_chunk(
+                batch, chunk_id, previous_output, generator
+            )
+            self.scheduler.set_timesteps(
+                batch.num_inference_steps, device=batch.latents.device
+            )
+            batch.timesteps = self.scheduler.timesteps
+            self._denoise_once(
+                batch,
+                server_args,
+                generator=generator,
+                manage_device=False,
+            )
+            previous_output = self._decode_transfer_latents(batch.latents).clamp(-1, 1)
+            if chunk_id == 0:
+                output_chunks.append(previous_output)
+            else:
+                output_chunks.append(previous_output[:, :, current_conditional_frames:])
+
+        batch.extra["transfer_decoded_output"] = torch.cat(output_chunks, dim=2)[
+            :, :, : int(plan["total_frames"])
+        ]
+        if server_args.vae_cpu_offload and not getattr(batch, "is_warmup", False):
+            self.vae.to("cpu", non_blocking=True)
+        return batch
+
+    def _denoise_once(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        generator: torch.Generator | None = None,
+        manage_device: bool = True,
+    ) -> Req:
+        """Run one denoising loop with CFG and optional conditioning."""
+        if manage_device:
+            self._manage_device_placement(server_args)
+
+        self._share_vision_temporal_positions = bool(
+            getattr(
+                batch.sampling_params,
+                "share_vision_temporal_positions",
+                True,
+            )
+        )
         latents = batch.latents
         sound_latents = batch.audio_latents
         action_latents = getattr(batch, "action_latents", None)
@@ -1088,7 +1401,8 @@ class Cosmos3DenoisingStage(PipelineStage):
         # Seed the scheduler's stochastic (SDE) noise from the request seed so it
         # is identical on every sequence-parallel rank; otherwise each rank draws
         # its own noise and the sharded latents diverge at the shard boundary.
-        generator = batch.generator
+        if generator is None:
+            generator = batch.generator
         if generator is None and batch.seed is not None:
             generator = torch.Generator(device=latents.device).manual_seed(batch.seed)
 
@@ -1393,6 +1707,11 @@ class Cosmos3DenoisingStage(PipelineStage):
             batch.audio_latents = sound_latents
         self.log_info("Denoising complete")
         return batch
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        if batch.extra.get("transfer_plan") is not None:
+            return self._forward_transfer(batch, server_args)
+        return self._denoise_once(batch, server_args)
 
     def _predict_noise_cfg(
         self,
@@ -1760,6 +2079,32 @@ class Cosmos3DecodingStage(PipelineStage):
             return video.squeeze(2).permute(0, 2, 3, 1).cpu().numpy()
         return video.permute(0, 2, 3, 4, 1).cpu().numpy()
 
+    @staticmethod
+    def _compose_transfer_display(output: torch.Tensor, batch: Req) -> torch.Tensor:
+        plan = batch.extra.get("transfer_plan")
+        if plan is None:
+            return output
+        total_frames = int(plan["total_frames"])
+        if batch.sampling_params.show_control_condition:
+            controls = batch.extra["preprocessed_control"]
+            controls = controls if isinstance(controls, list) else [controls]
+            normalized_controls = [
+                control[:, :, :total_frames]
+                .to(device=output.device, dtype=output.dtype)
+                .div(255.0)
+                for control in controls
+            ]
+            output = torch.cat([*normalized_controls, output], dim=-1)
+        source = batch.extra.get("preprocessed_transfer_video")
+        if batch.sampling_params.show_input and source is not None:
+            normalized_source = (
+                source[:, :, :total_frames]
+                .to(device=output.device, dtype=output.dtype)
+                .div(255.0)
+            )
+            output = torch.cat([normalized_source, output], dim=-1)
+        return output
+
     def forward(self, batch: Req, server_args: ServerArgs):
         """Decode latents to video, or to a single image for T2I."""
         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
@@ -1824,17 +2169,18 @@ class Cosmos3DecodingStage(PipelineStage):
         )
 
         device = batch.latents.device
-        if server_args.vae_cpu_offload:
-            self.vae.to(device)
-
-        with torch.no_grad():
-            decoded = self._decode_latents(batch.latents)
-
-        if server_args.vae_cpu_offload and not getattr(batch, "is_warmup", False):
-            self.vae.to("cpu", non_blocking=True)
+        decoded = batch.extra.get("transfer_decoded_output")
+        if decoded is None:
+            if server_args.vae_cpu_offload:
+                self.vae.to(device)
+            with torch.no_grad():
+                decoded = self._decode_latents(batch.latents)
+            if server_args.vae_cpu_offload and not getattr(batch, "is_warmup", False):
+                self.vae.to("cpu", non_blocking=True)
 
         self.log_info(f"Decoded tensor shape: {decoded.shape}")
         output = self._postprocess_tensor(decoded)
+        output = self._compose_transfer_display(output, batch)
 
         if self._guardrails and batch.use_guardrails is not False:
             from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (

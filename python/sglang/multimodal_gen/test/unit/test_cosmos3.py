@@ -62,6 +62,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     Cosmos3TimestepPreparationStage,
     Cosmos3TokenizationStage,
     _inject_caption_metadata,
+    _pad_transfer_frames,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
     EMBODIMENT_TO_DOMAIN_ID,
@@ -705,6 +706,13 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
             "control_hint",
             "control_guidance",
             "control_guidance_interval",
+            "num_video_frames_per_chunk",
+            "num_conditional_frames",
+            "num_first_chunk_conditional_frames",
+            "max_frames",
+            "show_control_condition",
+            "show_input",
+            "share_vision_temporal_positions",
             "action_mode",
             "domain_id",
             "domain_name",
@@ -743,6 +751,13 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
             control_hint=["edge", "depth"],
             control_guidance=1.5,
             control_guidance_interval=[0.0, 500.0],
+            num_video_frames_per_chunk=97,
+            num_conditional_frames=5,
+            num_first_chunk_conditional_frames=2,
+            max_frames=1200,
+            show_control_condition="true",
+            show_input="false",
+            share_vision_temporal_positions="false",
         )
 
         self.assertEqual(_resolve_video_path(req), "https://example.com/input.mp4")
@@ -760,6 +775,13 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
         self.assertEqual(kwargs["control_hint"], ["edge", "depth"])
         self.assertEqual(kwargs["control_guidance"], 1.5)
         self.assertEqual(kwargs["control_guidance_interval"], (0.0, 500.0))
+        self.assertEqual(kwargs["num_video_frames_per_chunk"], 97)
+        self.assertEqual(kwargs["num_conditional_frames"], 5)
+        self.assertEqual(kwargs["num_first_chunk_conditional_frames"], 2)
+        self.assertEqual(kwargs["max_frames"], 1200)
+        self.assertTrue(kwargs["show_control_condition"])
+        self.assertFalse(kwargs["show_input"])
+        self.assertFalse(kwargs["share_vision_temporal_positions"])
 
     def test_cosmos3_multipart_extras_are_model_specific(self):
         raw_form = {
@@ -972,6 +994,117 @@ class TestCosmos3Transfer(unittest.TestCase):
         self.assertTrue(torch.equal(c1, vid))
         self.assertTrue(torch.equal(vid, base))
 
+    def test_control_positions_can_be_sequential(self):
+        model = self._transformer_self()
+        text_mask = torch.ones(1, 4)
+        T, Hp, Wp = 3, 1, 1
+
+        _, positions = model._compute_rope_position_ids(
+            text_mask,
+            T,
+            Hp,
+            Wp,
+            fps=None,
+            device=self.DEVICE,
+            control_frames=[T, T],
+            share_vision_temporal_positions=False,
+        )
+        c0 = positions[0, 0, :T]
+        c1 = positions[0, 0, T : 2 * T]
+        video = positions[0, 0, 2 * T :]
+        self.assertLess(c0.max().item(), c1.min().item())
+        self.assertLess(c1.max().item(), video.min().item())
+
+    def test_transfer_chunk_count_and_reflection_padding(self):
+        self.assertEqual(
+            Cosmos3ImagePreprocessStage._get_transfer_num_chunks(93, 93, 1),
+            (1, 93),
+        )
+        self.assertEqual(
+            Cosmos3ImagePreprocessStage._get_transfer_num_chunks(186, 93, 1),
+            (3, 92),
+        )
+        frames = torch.tensor([0, 1, 2], dtype=torch.uint8).view(1, 1, 3, 1, 1)
+        frames = frames.expand(1, 3, 3, 1, 1)
+        padded = _pad_transfer_frames(frames, 5)
+        self.assertEqual(padded[0, 0, :, 0, 0].tolist(), [0, 1, 2, 2, 1])
+
+    def test_transfer_chunks_stitch_without_duplicate_overlap(self):
+        class Scheduler:
+            def __init__(self):
+                self.timesteps = torch.tensor([])
+                self.calls = 0
+
+            def set_timesteps(self, steps, device):
+                self.calls += 1
+                self.timesteps = torch.arange(steps, device=device)
+
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+        stage.vae = torch.nn.Linear(1, 1, bias=False)
+        stage.scheduler = Scheduler()
+        stage._manage_device_placement = mock.Mock()
+        stage._prepare_transfer_chunk = mock.Mock(side_effect=[0, 1])
+        stage._denoise_once = mock.Mock(side_effect=lambda batch, *_a, **_k: batch)
+        stage._decode_transfer_latents = mock.Mock(
+            side_effect=[
+                torch.arange(5).view(1, 1, 5, 1, 1).float() / 10,
+                torch.arange(5, 10).view(1, 1, 5, 1, 1).float() / 10,
+            ]
+        )
+        generator = torch.Generator(device="cpu").manual_seed(7)
+        batch = types.SimpleNamespace(
+            latents=torch.zeros(1),
+            generator=generator,
+            seed=7,
+            num_inference_steps=2,
+            is_warmup=False,
+            extra={
+                "transfer_plan": {
+                    "num_chunks": 2,
+                    "total_frames": 9,
+                }
+            },
+        )
+        server_args = types.SimpleNamespace(vae_cpu_offload=False)
+
+        stage._forward_transfer(batch, server_args)
+
+        stitched = batch.extra["transfer_decoded_output"].flatten()
+        self.assertTrue(
+            torch.allclose(
+                stitched,
+                torch.tensor([0.0, 0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9]),
+            )
+        )
+        self.assertEqual(stage.scheduler.calls, 2)
+        for call in stage._prepare_transfer_chunk.call_args_list:
+            self.assertIs(call.args[3], generator)
+        for call in stage._denoise_once.call_args_list:
+            self.assertIs(call.kwargs["generator"], generator)
+
+    def test_transfer_display_composes_input_controls_and_output(self):
+        output = torch.full((1, 3, 2, 1, 2), 0.5)
+        control = torch.full((1, 3, 2, 1, 2), 255, dtype=torch.uint8)
+        source = torch.zeros((1, 3, 2, 1, 2), dtype=torch.uint8)
+        batch = types.SimpleNamespace(
+            sampling_params=types.SimpleNamespace(
+                show_control_condition=True,
+                show_input=True,
+            ),
+            extra={
+                "transfer_plan": {"total_frames": 2},
+                "preprocessed_control": [control],
+                "preprocessed_transfer_video": source,
+            },
+        )
+
+        composed = Cosmos3DecodingStage._compose_transfer_display(output, batch)
+
+        self.assertEqual(tuple(composed.shape), (1, 3, 2, 1, 6))
+        self.assertTrue(torch.equal(composed[..., :2], torch.zeros_like(output)))
+        self.assertTrue(torch.equal(composed[..., 2:4], torch.ones_like(output)))
+        self.assertTrue(torch.equal(composed[..., 4:], output))
+
     def test_control_cfg_blend_math(self):
         stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
 
@@ -1126,6 +1259,31 @@ class TestCosmos3Transfer(unittest.TestCase):
         self.assertEqual(sp.control_guidance, 1.5)
         self.assertEqual(sp.guidance_scale, 3.0)
         self.assertEqual(sp.flow_shift, 10.0)
+
+    def test_wsm_uses_transfer_spec_defaults(self):
+        sp = Cosmos3SamplingParams(
+            prompt="t", control_path="wsm.mp4", control_hint="wsm"
+        )
+        sp._explicit_fields = {"prompt", "control_path", "control_hint"}
+        sp._apply_transfer_hint_defaults()
+        self.assertEqual(sp.guidance_scale, 1.0)
+        self.assertEqual(sp.control_guidance, 3.0)
+        self.assertEqual(sp.flow_shift, 10.0)
+        self.assertEqual(sp.num_frames, 101)
+        self.assertEqual(sp.fps, 10)
+        self.assertEqual(sp.num_video_frames_per_chunk, 101)
+
+        lowered = Cosmos3SamplingParams.lower_video_request_kwargs(
+            types.SimpleNamespace(num_frames=None, fps=None),
+            {
+                "control_path": "wsm.mp4",
+                "control_hint": "wsm",
+                "num_frames": 121,
+                "fps": 24,
+            },
+        )
+        self.assertEqual(lowered["num_frames"], 101)
+        self.assertEqual(lowered["fps"], 10)
 
     def test_explicit_value_overrides_hint_default(self):
         sp = Cosmos3SamplingParams(
