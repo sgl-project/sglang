@@ -5016,6 +5016,8 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+    # Publish before anything in this process reads configuration.
+    publish(server_args, role="scheduler")
     dp_rank = configure_scheduler_process(
         server_args,
         gpu_id,
@@ -5029,9 +5031,6 @@ def run_scheduler_process(
         display_dp_rank=display_dp_rank,
         display_moe_ep_rank=display_moe_ep_rank,
     )
-    # Scheduler.__init__ reads the config namespaces before the model
-    # worker's own publish.
-    publish(server_args, role="scheduler")
     parent_process = psutil.Process().parent()
 
     # Set up tracing

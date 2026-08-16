@@ -309,13 +309,15 @@ class MMEncoder:
         ``base_gpu_id + rank`` — the DP launcher's per-worker placement. It is
         this instance's value, not a config change, so it travels as an
         argument."""
+        # The DP and TP encoder workers are spawned, so this constructor is
+        # the first publish in those processes.
+        publish(server_args, role="encoder")
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
         configure_media_url_security(
             server_args.allowed_media_domains,
             server_args.media_url_max_file_size_mb,
         )
-        publish(server_args, role="encoder")
         self.rank = rank
         # DP rank for metric labels; overridden by run_dp_worker in DP mode.
         # 0 in the single-instance (non-DP) path.
@@ -3952,6 +3954,9 @@ def _unregister_encoder_url_from_bootstrap(server_args: ServerArgs):
 
 def launch_server(server_args: ServerArgs):
     configure_logger(server_args, prefix=" encode_server")
+    # Publish before the launch path reads configuration; the encoder built
+    # below re-projects the same object.
+    publish(server_args, role="encoder")
     if server_args.dp_size > 1:
         _launch_server_dp(server_args)
         return
