@@ -4911,7 +4911,7 @@ class ServerArgs:
             if self.post_capture_kv_sizing_planned():
                 # Post-capture sizing measures free memory after graph capture, so
                 # skip the graph/activation reserve; keep only the floor + parallel slack.
-                reserved_mem = 512
+                reserved_mem = 1536
                 reserved_mem += self.tp_size * self.pp_size / 8 * 1024
             else:
                 # Tokens the activation working set scales with (per serving mode).
