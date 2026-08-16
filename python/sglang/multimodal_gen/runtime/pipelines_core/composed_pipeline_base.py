@@ -59,6 +59,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.startup_profiler import startup_phase
 
 logger = init_logger(__name__)
 
@@ -146,7 +147,8 @@ class ComposedPipelineBase(ABC):
         self.memory_usages: dict[str, float] = {}
         # Load modules directly in initialization
         logger.info("Loading pipeline modules...")
-        self.modules = self.load_modules(server_args, loaded_modules)
+        with startup_phase("load_modules"):
+            self.modules = self.load_modules(server_args, loaded_modules)
 
         self.__post_init__()
 
@@ -161,10 +163,12 @@ class ComposedPipelineBase(ABC):
 
     def __post_init__(self) -> None:
         assert self.server_args is not None, "server_args must be set"
-        self.initialize_pipeline(self.server_args)
+        with startup_phase("initialize_pipeline"):
+            self.initialize_pipeline(self.server_args)
 
         logger.info("Creating pipeline stages...")
-        self.create_pipeline_stages(self.server_args)
+        with startup_phase("create_pipeline_stages"):
+            self.create_pipeline_stages(self.server_args)
 
     def get_module(self, module_name: str, default_value: Any = None) -> Any:
         return self.modules.get(module_name, default_value)
@@ -554,8 +558,10 @@ class ComposedPipelineBase(ABC):
                     attn_backend.name.lower(),
                     matched_backend_key,
                 )
-            with component_attn_backend_context_manager(
-                attn_backend, component_name=matched_backend_key or module_name
+            with startup_phase(f"load_component.{module_name}"), (
+                component_attn_backend_context_manager(
+                    attn_backend, component_name=matched_backend_key or module_name
+                )
             ):
                 module, memory_usage = PipelineComponentLoader.load_component(
                     component_name=load_module_name,
