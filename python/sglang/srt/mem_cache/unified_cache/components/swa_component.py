@@ -427,6 +427,11 @@ class SWAComponent(TreeComponent):
         new_parent.component_data[self.component_type].lock_ref = child.component_data[
             self.component_type
         ].lock_ref
+        new_parent.component_data[
+            self.component_type
+        ].load_back_pending_transfer_ids = child.component_data[
+            self.component_type
+        ].load_back_pending_transfer_ids.copy()
         new_parent.component_data[self.component_type].session_ref = (
             child.component_data[self.component_type].session_ref
         )

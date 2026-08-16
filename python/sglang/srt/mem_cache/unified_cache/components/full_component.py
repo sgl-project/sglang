@@ -140,6 +140,9 @@ class FullComponent(TreeComponent):
     ):
         ct = self.component_type
         new_parent.component_data[ct].lock_ref = child.component_data[ct].lock_ref
+        new_parent.component_data[ct].load_back_pending_transfer_ids = (
+            child.component_data[ct].load_back_pending_transfer_ids.copy()
+        )
         new_parent.component_data[ct].session_ref = child.component_data[ct].session_ref
         child_cd = child.component_data[ct]
         assert new_parent.component_data[ct].session_ids is None

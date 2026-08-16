@@ -59,12 +59,15 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
     SWARebuild,
 )
+from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
+from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
 from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DecSwaLockOnlyResult,
     DemoteResult,
@@ -252,6 +255,179 @@ class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
         n4.parent = n3
         n4.hash_value = ["h4"]
         self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
+
+
+class TestWriteBackComponentScopedLoadBack(CustomTestCase):
+    def _build_core(self):
+        component_types = (ComponentType.FULL, ComponentType.SWA)
+        root = UnifiedTreeNode(component_types)
+        shared = UnifiedTreeNode(component_types)
+        anchor_a = UnifiedTreeNode(component_types)
+        anchor_b = UnifiedTreeNode(component_types)
+        shared.parent = root
+        anchor_a.parent = shared
+        anchor_b.parent = shared
+
+        nodes = {node.id: node for node in (root, shared, anchor_a, anchor_b)}
+        core = mock.Mock()
+        core.is_write_back = True
+        core.component_types = component_types
+        core.root_node = root
+        core.node_by_id.side_effect = nodes.__getitem__
+        core.components_by_type = {ct: mock.Mock() for ct in component_types}
+        core.full_host_duplicates = {}
+        core._has_pending_full_load_back.side_effect = (
+            lambda node: UnifiedTreeCore._has_pending_full_load_back(core, node)
+        )
+        core._is_settled_full_host_duplicate.side_effect = (
+            lambda node: UnifiedTreeCore._is_settled_full_host_duplicate(core, node)
+        )
+        core._update_duplicate_tracking.side_effect = (
+            lambda node: UnifiedTreeCore._update_duplicate_tracking(core, node)
+        )
+        return core, shared, anchor_a, anchor_b
+
+    def test_different_anchors_load_different_components_on_same_node(self):
+        core, shared, anchor_a, anchor_b = self._build_core()
+        full_transfer = PoolTransfer(
+            name=PoolName.KV,
+            host_indices=torch.tensor([1], dtype=torch.int64),
+            nodes_to_load=[shared.id],
+        )
+        UnifiedTreeCore.commit_load_back(
+            core,
+            101,
+            anchor_a.id,
+            torch.tensor([2], dtype=torch.int64),
+            full_transfer,
+            {},
+        )
+
+        empty_full_transfer = PoolTransfer(
+            name=PoolName.KV,
+            host_indices=torch.empty((0,), dtype=torch.int64),
+            nodes_to_load=[],
+        )
+        swa_transfer = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=torch.tensor([3], dtype=torch.int64),
+            device_indices=torch.tensor([4], dtype=torch.int64),
+            nodes_to_load=[shared.id],
+        )
+        UnifiedTreeCore.commit_load_back(
+            core,
+            102,
+            anchor_b.id,
+            torch.empty((0,), dtype=torch.int64),
+            empty_full_transfer,
+            {ComponentType.SWA: [swa_transfer]},
+        )
+
+        self.assertEqual(
+            shared.component_data[ComponentType.FULL].load_back_pending_transfer_ids,
+            {101},
+        )
+        self.assertEqual(
+            shared.component_data[ComponentType.SWA].load_back_pending_transfer_ids,
+            {102},
+        )
+
+        UnifiedTreeCore.finish_load_back(core, 101, anchor_a.id)
+        self.assertFalse(
+            shared.component_data[ComponentType.FULL].load_back_pending_transfer_ids
+        )
+        self.assertEqual(
+            shared.component_data[ComponentType.SWA].load_back_pending_transfer_ids,
+            {102},
+        )
+        UnifiedTreeCore.finish_load_back(core, 102, anchor_b.id)
+        self.assertFalse(
+            shared.component_data[ComponentType.SWA].load_back_pending_transfer_ids
+        )
+
+    def test_same_component_tracks_multiple_transfer_ids_until_each_ack(self):
+        core, shared, anchor_a, anchor_b = self._build_core()
+        full_transfer = PoolTransfer(
+            name=PoolName.KV,
+            host_indices=torch.tensor([1], dtype=torch.int64),
+            nodes_to_load=[shared.id],
+        )
+        for transfer_id, anchor in ((111, anchor_a), (112, anchor_b)):
+            UnifiedTreeCore.commit_load_back(
+                core,
+                transfer_id,
+                anchor.id,
+                torch.tensor([2], dtype=torch.int64),
+                full_transfer,
+                {},
+            )
+
+        pending_ids = shared.component_data[
+            ComponentType.FULL
+        ].load_back_pending_transfer_ids
+        self.assertEqual(pending_ids, {111, 112})
+
+        UnifiedTreeCore.finish_load_back(core, 111, anchor_a.id)
+        self.assertEqual(pending_ids, {112})
+        UnifiedTreeCore.finish_load_back(core, 112, anchor_b.id)
+        self.assertFalse(pending_ids)
+
+    def test_l3_refill_duplicate_is_tracked_after_full_load_back_ack(self):
+        core, shared, anchor_a, _ = self._build_core()
+        full = shared.component_data[ComponentType.FULL]
+        full.host_value = torch.tensor([1], dtype=torch.int64)
+        full_transfer = PoolTransfer(
+            name=PoolName.KV,
+            host_indices=full.host_value,
+            nodes_to_load=[shared.id],
+        )
+        UnifiedTreeCore.commit_load_back(
+            core,
+            201,
+            anchor_a.id,
+            torch.tensor([2], dtype=torch.int64),
+            full_transfer,
+            {},
+        )
+        full.value = torch.tensor([2], dtype=torch.int64)
+
+        self.assertNotIn(shared.id, core.full_host_duplicates)
+        UnifiedTreeCore.finish_load_back(core, 201, anchor_a.id)
+        self.assertIn(shared.id, core.full_host_duplicates)
+
+    def test_split_copies_pending_ids_for_split_components(self):
+        component_types = (ComponentType.FULL, ComponentType.SWA)
+        child = UnifiedTreeNode(component_types)
+        new_parent = UnifiedTreeNode(component_types)
+        child.key = RadixKey([1, 2, 3, 4], extra_key=None)
+        new_parent.key = RadixKey([1, 2], extra_key=None)
+
+        for component_type in component_types:
+            child_data = child.component_data[component_type]
+            child_data.value = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+            child_data.host_value = torch.tensor([5, 6, 7, 8], dtype=torch.int64)
+            child_data.load_back_pending_transfer_ids.add(301)
+
+        full_component = mock.Mock(component_type=ComponentType.FULL)
+        FullComponent.redistribute_on_node_split(full_component, new_parent, child)
+
+        swa_component = mock.Mock(component_type=ComponentType.SWA)
+        host_lru = mock.Mock()
+        host_lru.in_list.return_value = True
+        swa_component.tree_core.host_lru_lists = {ComponentType.SWA: host_lru}
+        SWAComponent.redistribute_on_node_split(swa_component, new_parent, child)
+
+        for component_type in component_types:
+            self.assertEqual(
+                new_parent.component_data[
+                    component_type
+                ].load_back_pending_transfer_ids,
+                {301},
+            )
+            self.assertEqual(
+                child.component_data[component_type].load_back_pending_transfer_ids,
+                {301},
+            )
 
 
 def _write_backup(cache, node, write_back: bool = False) -> int:
@@ -2456,11 +2632,15 @@ class UnifiedRadixCacheSuite:
         cache.sanity_check()
 
     def test_hicache_l3_prefetch(self):
-        """L3 round trip: write with one tree, prefetch into a fresh tree.
+        """L3 round trip under write-through."""
+        self._run_hicache_l3_prefetch_round_trip(write_policy="write_through")
 
-        Uses two independent trees that share the same file storage dir so the
-        prefetch path genuinely reloads from L3 (no host/device residue).
-        """
+    def test_hicache_l3_prefetch_write_back(self):
+        """L3→Host→Device round trip preserves write-back load-back state."""
+        self._run_hicache_l3_prefetch_round_trip(write_policy="write_back")
+
+    def _run_hicache_l3_prefetch_round_trip(self, *, write_policy: str):
+        """Reload a stored prefix into a fresh tree and explicitly sanity-check it."""
         if self._skip_unsupported_hicache_test():
             return
         if self.cfg.has_mamba:
@@ -2486,6 +2666,7 @@ class UnifiedRadixCacheSuite:
             storage_backend="file",
             storage_dir=storage_dir,
             prefetch_threshold=1,
+            write_policy=write_policy,
         )
         self._insert(prod, prod_alloc, prod_rtp, seq)
         mp = prod.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
@@ -2503,8 +2684,9 @@ class UnifiedRadixCacheSuite:
             storage_backend="file",
             storage_dir=storage_dir,
             prefetch_threshold=1,
+            write_policy=write_policy,
         )
-        req_id = "l3-prefetch-req"
+        req_id = f"l3-prefetch-{write_policy}"
         cons.prefetch_from_storage(
             req_id, cons.root_node.id, array("q", seq), None, None
         )

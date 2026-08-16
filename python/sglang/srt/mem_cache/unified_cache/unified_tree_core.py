@@ -1160,6 +1160,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         else:
             self.full_host_duplicates.pop(node.id, None)
 
+    def _has_pending_full_load_back(self, node: UnifiedTreeNode) -> bool:
+        if self.is_write_back:
+            return bool(
+                node.component_data[BASE_COMPONENT_TYPE].load_back_pending_transfer_ids
+            )
+        return node.load_back_pending_id is not None
+
     def _is_settled_full_host_duplicate(self, node: UnifiedTreeNode) -> bool:
         """Full KV present on both tiers with no in-flight DMA on the node's
         host slots; mid-transfer nodes join the tracking at their ack."""
@@ -1169,7 +1176,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             and cd.value is not None
             and cd.host_value is not None
             and node.write_through_pending_id is None
-            and node.load_back_pending_id is None
+            and not self._has_pending_full_load_back(node)
         )
 
     def _for_each_component_lru(
@@ -1407,7 +1414,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return False
         if (
             node.write_through_pending_id is not None
-            or node.load_back_pending_id is not None
+            or self._has_pending_full_load_back(node)
         ):
             return False
         return cd.host_lock_ref == 0
@@ -1949,6 +1956,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def commit_load_back(
         self,
+        transfer_id: int,
         node_id: NodeId,
         device_indices: torch.Tensor,
         kv_xfer: PoolTransfer,
@@ -1958,19 +1966,26 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         rebuild is deferred to the orchestration layer."""
         node = self.node_by_id(node_id)
         cache_actions: list[CacheAction | ComponentAction] = []
-        # Pin every node whose host slots the in-flight DMA reads (including
-        # aux-only nodes) against reclaim until the ack.
-        for xfers in ([kv_xfer], *comp_xfers.values()):
-            for xfer in xfers:
-                for nid in xfer.nodes_to_load or ():
-                    pinned = self.node_by_id(nid)
-                    # One live load-back per node; only the same anchor may
-                    # re-pin (a node can sit in Full and aux transfer lists).
-                    assert pinned.load_back_pending_id in (None, node_id), (
-                        f"node {nid} pinned by load-back "
-                        f"{pinned.load_back_pending_id}, new anchor {node_id}"
-                    )
-                    pinned.load_back_pending_id = node_id
+        component_xfers = {BASE_COMPONENT_TYPE: [kv_xfer], **comp_xfers}
+        if self.is_write_back:
+            for component_type, xfers in component_xfers.items():
+                for xfer in xfers:
+                    for nid in xfer.nodes_to_load or ():
+                        self.node_by_id(nid).component_data[
+                            component_type
+                        ].load_back_pending_transfer_ids.add(transfer_id)
+        else:
+            # Preserve the existing write-through behavior. The dedicated
+            # write-through fix is intentionally handled in a separate change.
+            for xfers in component_xfers.values():
+                for xfer in xfers:
+                    for nid in xfer.nodes_to_load or ():
+                        pinned = self.node_by_id(nid)
+                        assert pinned.load_back_pending_id in (None, node_id), (
+                            f"node {nid} pinned by load-back "
+                            f"{pinned.load_back_pending_id}, new anchor {node_id}"
+                        )
+                        pinned.load_back_pending_id = node_id
         kv_xfer.device_indices = device_indices
         self.components_by_type[BASE_COMPONENT_TYPE].commit_hicache_transfer(
             node,
@@ -1990,12 +2005,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_evictable_leaf_sets(node)
         return cache_actions
 
-    def finish_load_back(self, anchor_node_id: NodeId) -> None:
+    def finish_load_back(self, transfer_id: int, anchor_node_id: NodeId) -> None:
         """Clear the in-flight H->D marks along the anchor's root path at ack
         time; split fragments stay on the path, so the walk covers them."""
         node = self.node_by_id(anchor_node_id)
         while node is not None and node is not self.root_node:
-            if node.load_back_pending_id == anchor_node_id:
+            if self.is_write_back:
+                full_pending_ids = node.component_data[
+                    BASE_COMPONENT_TYPE
+                ].load_back_pending_transfer_ids
+                full_cleared = transfer_id in full_pending_ids
+                for component_type in self.component_types:
+                    node.component_data[
+                        component_type
+                    ].load_back_pending_transfer_ids.discard(transfer_id)
+                if full_cleared:
+                    self._update_duplicate_tracking(node)
+            elif node.load_back_pending_id == anchor_node_id:
                 node.load_back_pending_id = None
                 # The loaded copies become tracked duplicates only now.
                 self._update_duplicate_tracking(node)
@@ -2281,16 +2307,30 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 )
         # Every in-flight H->D mark must belong to a live load-back; a leaked
         # mark would pin the node's host copy against reclaim forever.
-        ongoing_load_ids = {node_id for _, node_id in ongoing_load_back}
-        for node in all_nodes:
-            if (
-                node.load_back_pending_id is not None
-                and node.load_back_pending_id not in ongoing_load_ids
-            ):
-                E(
-                    f"[Ongoing] node {node.id} load_back_pending_id="
-                    f"{node.load_back_pending_id} has no live load-back"
-                )
+        if self.is_write_back:
+            ongoing_transfer_ids = {transfer_id for transfer_id, _ in ongoing_load_back}
+            for node in all_nodes:
+                for component_type in self.component_types:
+                    pending_ids = node.component_data[
+                        component_type
+                    ].load_back_pending_transfer_ids
+                    leaked_ids = pending_ids - ongoing_transfer_ids
+                    if leaked_ids:
+                        E(
+                            f"[Ongoing] node {node.id} component={component_type} "
+                            f"load-back transfers {sorted(leaked_ids)} are not live"
+                        )
+        else:
+            ongoing_anchor_ids = {node_id for _, node_id in ongoing_load_back}
+            for node in all_nodes:
+                if (
+                    node.load_back_pending_id is not None
+                    and node.load_back_pending_id not in ongoing_anchor_ids
+                ):
+                    E(
+                        f"[Ongoing] node {node.id} load_back_pending_id="
+                        f"{node.load_back_pending_id} has no live load-back"
+                    )
 
         if errors:
             msg = (
