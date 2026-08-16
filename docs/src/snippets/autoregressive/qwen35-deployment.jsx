@@ -20,7 +20,7 @@ export const Qwen35Deployment = () => {
   //   35B-A3B:   H100 tp=1, H200 tp=1, B200 tp=1, B300 tp=1, MI300X tp=1, MI325X tp=1, MI355X tp=1
   //   27B:       tp=1 on all hardware (including MI300X, MI325X, MI355X)
   //
-  // FP4 (397B only): NVFP4 on Blackwell B200/B300 tp=4; AMD MXFP4 on MI355X tp=2
+  // FP4 (397B only): NVFP4 on Blackwell B200 tp=4 (tp=2 ep=2 w/ MTP) / B300 tp=4; AMD MXFP4 on MI355X tp=2
 
   const MOE_MODELS = new Set(['397b', '122b', '35b']);
   const FP8_MODELS = new Set(['397b', '122b', '35b', '27b']);
@@ -314,6 +314,11 @@ export const Qwen35Deployment = () => {
     // 122B H100 FP8 with MTP: bump TP to 4 and skip --mem-fraction-static.
     if (model === '122b' && hardware === 'h100' && quantization === 'fp8' && speculative === 'enabled') {
       hwConfig = { ...hwConfig, tp: 4, mem: undefined };
+    }
+    // 397B B200 NVFP4 with MTP: tp=2 with expert parallelism 2 (TEP2) beats
+    // tp=4 across the concurrency sweep.
+    if (model === '397b' && hardware === 'b200' && quantization === 'fp4' && speculative === 'enabled') {
+      hwConfig = { ...hwConfig, tp: 2, ep: 2, mem: 0.8 };
     }
 
     let modelName;

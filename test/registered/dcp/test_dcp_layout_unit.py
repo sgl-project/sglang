@@ -21,6 +21,7 @@ import torch
 
 from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
@@ -95,6 +96,107 @@ class TestGetDcpLens(CustomTestCase):
     def test_dcp_size_one_is_identity(self):
         lens = torch.tensor(LENS, dtype=torch.int32)
         self.assertTrue(torch.equal(get_dcp_lens(lens, 1, 0), lens))
+
+    def test_gqa_current_chunk_selects_kv_for_the_global_dcp_head_layout(self):
+        """A local Q shard must not restart GQA mapping at KV head zero."""
+
+        class FakeDcpGroup:
+            world_size = 4
+            rank_in_group = 1
+
+            def __init__(self):
+                self.all_gather_calls = 0
+
+            def all_gather(self, tensor, dim):
+                self.all_gather_calls += 1
+                return torch.cat((tensor, tensor + 10), dim=dim)
+
+        group = FakeDcpGroup()
+        backend = TritonAttnBackend.__new__(TritonAttnBackend)
+        backend.forward_metadata = SimpleNamespace(
+            custom_mask=None,
+            kv_indptr=torch.zeros(2, dtype=torch.int32),
+            kv_indices=torch.empty(0, dtype=torch.int64),
+            max_extend_len=1,
+            qo_indptr=torch.tensor([0, 1], dtype=torch.int64),
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _layer_id: torch.empty(0),
+            get_value_buffer=lambda _layer_id: torch.empty(0),
+        )
+
+        kernel_q_shapes = []
+        kernel_k = []
+
+        def fake_extend_attention(q, k, _v, out, *_args, lse_extend, **_kwargs):
+            kernel_q_shapes.append(q.shape)
+            kernel_k.append(k.clone())
+            out.copy_(q.float())
+            lse_extend.zero_()
+
+        backend.extend_attention_fwd = fake_extend_attention
+        layer = SimpleNamespace(
+            sliding_window_size=-1,
+            tp_q_head_num=2,
+            tp_k_head_num=2,
+            qk_head_dim=2,
+            v_head_dim=2,
+            k_scale=None,
+            v_scale=None,
+            layer_id=0,
+            scaling=1.0,
+            xai_temperature_len=-1,
+        )
+        q = torch.arange(4, dtype=torch.bfloat16).view(1, 4)
+        k = torch.tensor([[[0.0, 1.0], [10.0, 11.0]]])
+
+        with rc.get_parallel().override(dcp_group=group):
+            out = backend._forward_extend_dcp(
+                q=q,
+                k=k,
+                v=k.clone(),
+                layer=layer,
+                forward_batch=SimpleNamespace(),
+                causal=True,
+                logits_soft_cap=0.0,
+                sinks=None,
+            )
+
+        self.assertEqual(group.all_gather_calls, 0)
+        self.assertEqual(kernel_q_shapes, [torch.Size([1, 2, 2])])
+        # In TP4/DCP4 with two KV heads, ranks 0 and 1 both belong to KV head 0.
+        self.assertTrue(torch.equal(kernel_k[0], k[:, 0:1]))
+        self.assertTrue(torch.equal(out, q))
+
+    def test_dense_q_indptr_matches_the_arange_it_replaces(self):
+        from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+
+        max_bs = 16
+        for num_draft_tokens in (1, 2, 8):
+            backend = object.__new__(TRTLLMMLABackend)
+            backend.q_indptr_decode = torch.arange(0, max_bs + 1, dtype=torch.int32)
+            backend.num_draft_tokens = num_draft_tokens
+            backend.dense_q_indptr_verify = backend.q_indptr_decode * num_draft_tokens
+            # Equal hits the precomputed buffer, +1 hits the fallback.
+            for draft_token_num in (num_draft_tokens, num_draft_tokens + 1):
+                for bs in (1, 3, max_bs):
+                    with self.subTest(
+                        num_draft_tokens=num_draft_tokens,
+                        draft_token_num=draft_token_num,
+                        bs=bs,
+                    ):
+                        got = backend._dense_q_indptr(bs, draft_token_num)
+                        expected = torch.arange(
+                            0,
+                            (bs + 1) * draft_token_num,
+                            draft_token_num,
+                            dtype=torch.int32,
+                        )
+                        self.assertEqual(got.dtype, torch.int32)
+                        self.assertTrue(
+                            torch.equal(got, expected),
+                            f"{got.tolist()} != {expected.tolist()}",
+                        )
 
     def test_paged_allocator_exposes_dcp_virtual_capacity(self):
         real_kv_size = 1024
