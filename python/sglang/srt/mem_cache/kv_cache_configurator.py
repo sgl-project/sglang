@@ -361,6 +361,30 @@ class KVCacheConfigurator:
             c128_state_dtype=c128_state_dtype,
         )
 
+    def _validate_kvarn_swa_compat(self) -> None:
+        """Reject KVarN + hybrid SWA with an actionable error.
+
+        KVarN KV-cache quantization packs K/V into a single compressed
+        per-token record, which is fundamentally incompatible with the
+        hybrid-SWA pool that splits full-attention and sliding-window layers
+        into separate sub-pools (BaseSWAKVPool). Without this guard the SWA
+        allocator's `assert isinstance(kvcache, BaseSWAKVPool)` fails at
+        runtime with an opaque AssertionError.
+        """
+        if self.is_hybrid_swa and self.server_args.kv_cache_dtype.startswith("kvarn_"):
+            raise ValueError(
+                "--kv-cache-dtype='kvarn_*' is not supported with hybrid "
+                "sliding-window attention (SWA). KVarN compresses K/V into a "
+                "single per-token record, while SWA requires separate "
+                "full-attention and sliding-window sub-pools, and the two pool "
+                "models are incompatible. Options: (1) drop "
+                "--kv-cache-dtype to use the default (bf16) cache, or pick a "
+                "non-KVarN dtype such as 'fp8_e4m3' or 'nvfp4'; (2) pass "
+                "--disable-hybrid-swa-memory to treat the model as a single "
+                "full-attention pool (gives up the SWA memory savings but "
+                "enables KVarN)."
+            )
+
     def _init_pools(
         self,
         *,
@@ -370,6 +394,8 @@ class KVCacheConfigurator:
     ) -> _InitializedPools:
         """Initialize the memory pools."""
         token_to_kv_pool = None
+
+        self._validate_kvarn_swa_compat()
 
         # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
         # from one byte buffer, then return. Gated to the target worker

@@ -613,6 +613,42 @@ class TestEagleConfigurator(unittest.TestCase):
         self.assertLessEqual(used, available)
 
 
+class TestKVarNHybridSWAGuard(unittest.TestCase):
+    """KVarN + hybrid SWA must be rejected with an actionable error, not an
+    opaque AssertionError from the SWA allocator."""
+
+    def _make_kvarn_configurator(self, *, is_hybrid_swa, kv_cache_dtype):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        cfg = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        cfg.is_hybrid_swa = is_hybrid_swa
+        cfg.server_args = SimpleNamespace(kv_cache_dtype=kv_cache_dtype)
+        return cfg
+
+    def test_guard_raises_for_kvarn_swa(self):
+        cfg = self._make_kvarn_configurator(
+            is_hybrid_swa=True, kv_cache_dtype="kvarn_k4v2_g128"
+        )
+        with self.assertRaises(ValueError) as ctx:
+            cfg._validate_kvarn_swa_compat()
+        self.assertIn("kvarn_", str(ctx.exception).lower())
+        self.assertIn("swa", str(ctx.exception).lower())
+
+    def test_no_guard_for_kvarn_non_swa(self):
+        # KVarN on a plain (non-SWA) model must NOT trip the guard.
+        cfg = self._make_kvarn_configurator(
+            is_hybrid_swa=False, kv_cache_dtype="kvarn_k4v2_g128"
+        )
+        cfg._validate_kvarn_swa_compat()  # must not raise
+
+    def test_no_guard_for_non_kvarn_swa(self):
+        # SWA with a non-KVarN dtype must NOT trip the guard.
+        cfg = self._make_kvarn_configurator(
+            is_hybrid_swa=True, kv_cache_dtype="fp8_e4m3"
+        )
+        cfg._validate_kvarn_swa_compat()  # must not raise
+
+
 class TestFactory(unittest.TestCase):
     def test_default_for_non_swa(self):
         mr = _make_model_runner(self, is_hybrid_swa=False)
