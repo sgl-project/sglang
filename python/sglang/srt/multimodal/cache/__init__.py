@@ -18,11 +18,12 @@ from sglang.srt.multimodal.cache.identity import (
     compact_feature_hash,
     media_preprocess_kwargs,
     parse_content_hash,
+    resolve_multimodal_item_hash,
     snapshot_media,
 )
 from sglang.srt.multimodal.cache.preprocess_cache import (
     CacheLookup,
-    CacheReservation,
+    CacheMiss,
     CacheSizeProvider,
     MultimodalPreprocessCache,
     estimate_cache_size_bytes,
@@ -32,7 +33,7 @@ __all__ = [
     "CONTENT_HASH_PREFIX",
     "CacheSizeProvider",
     "CacheLookup",
-    "CacheReservation",
+    "CacheMiss",
     "EncoderMediaLookup",
     "EncoderPreprocessArtifact",
     "MediaSnapshot",
@@ -49,5 +50,6 @@ __all__ = [
     "estimate_cache_size_bytes",
     "media_preprocess_kwargs",
     "parse_content_hash",
+    "resolve_multimodal_item_hash",
     "snapshot_media",
 ]

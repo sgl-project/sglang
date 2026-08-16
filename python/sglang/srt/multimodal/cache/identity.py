@@ -9,13 +9,16 @@ import struct
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Protocol, runtime_checkable
 from urllib.parse import unquote, urlparse
 
 import numpy as np
 import torch
 import transformers
 from PIL import Image
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 CONTENT_HASH_PREFIX = "sha256:"
 _SHA256_HEX_LENGTH = 64
@@ -322,6 +325,38 @@ def build_artifact_key(
     return _digest_bytes(_canonical_json(payload))
 
 
+def resolve_multimodal_item_hash(
+    *,
+    existing_hash: Optional[int] = None,
+    feature: Any = None,
+    precomputed_embeddings: Any = None,
+    namespace: Optional[str] = None,
+) -> int:
+    """Unified helper for resolving a hash for MultimodalDataItem cache, optionally scoped to an artifact identity.
+
+    Args:
+        namespace: Optional SHA-256 identity covering every input that can change the preprocessing result.
+            It scopes the feature hash so downstream caches cannot reuse embeddings across different preprocessing settings.
+    """
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+        import uuid
+
+        item_hash = uuid.uuid4().int
+    elif existing_hash is not None:
+        # if exists, reuse
+        item_hash = existing_hash
+    else:
+        # hash from feature
+        from sglang.srt.managers.mm_utils import hash_feature
+
+        value = feature if feature is not None else precomputed_embeddings
+        item_hash = hash_feature(value)
+
+    return item_hash if namespace is None else build_feature_hash(namespace, item_hash)
+
+
 def build_feature_identity(artifact_key: str, processor_output_hash: int) -> str:
     """Bind a processor output to its complete, prompt-independent artifact."""
     artifact_key = parse_content_hash(artifact_key)
@@ -410,7 +445,7 @@ def build_mm_global_cache_key(
 def build_processor_fingerprint(
     processor: Any,
     hf_config: Any,
-    server_args: Any,
+    server_args: ServerArgs,
     *,
     extra: Optional[Mapping[str, Any]] = None,
 ) -> str:
@@ -427,7 +462,7 @@ def build_processor_fingerprint(
         "model_type": hf_payload.get("model_type"),
         "architectures": hf_payload.get("architectures"),
         "model_revision": server_args.revision,
-        "tokenizer_revision": server_args.tokenizer_revision,
+        "processor_revision": server_args.revision,
         "disable_fast_image_processor": server_args.disable_fast_image_processor,
         "mm_process_config": server_args.mm_process_config or {},
         "processor": processor_payload,

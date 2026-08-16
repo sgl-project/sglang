@@ -639,11 +639,12 @@ def _try_save_cuda_video_direct(
                     stderr=stderr_file.read(),
                 )
         return True
-    except Exception as e:
-        logger.warning(
-            "Direct CUDA video save failed; falling back to imageio: %s",
-            str(e),
+    except Exception:
+        logger.warning_once(
+            "Direct CUDA video save failed; falling back to imageio. "
+            "Enable debug logging for exception details."
         )
+        logger.debug("Direct CUDA video save failure", exc_info=True)
         return False
     finally:
         if tmp_wav_path:
@@ -725,11 +726,12 @@ def _try_save_cuda_videos_direct(
     try:
         with ThreadPoolExecutor(max_workers=_MAX_PARALLEL_CUDA_VIDEO_SAVES) as pool:
             return list(pool.map(save_one, range(len(samples))))
-    except Exception as exc:
-        logger.warning(
-            "Parallel CUDA video save failed; falling back to serial output: %s",
-            str(exc),
+    except Exception:
+        logger.warning_once(
+            "Parallel CUDA video save failed; falling back to serial output. "
+            "Enable debug logging for exception details."
         )
+        logger.debug("Parallel CUDA video save failure", exc_info=True)
         return None
 
 

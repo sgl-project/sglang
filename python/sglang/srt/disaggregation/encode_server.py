@@ -61,7 +61,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.srt.model_loader import get_model
 from sglang.srt.multimodal.cache import (
     CacheLookup,
-    CacheReservation,
+    CacheMiss,
     EncoderMediaLookup,
     EncoderPreprocessArtifact,
     MultimodalPreprocessCache,
@@ -104,6 +104,8 @@ from sglang.srt.server_args import (
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     add_prometheus_middleware,
+    configure_logger,
+    configure_media_url_security,
     load_audio,
     load_image,
     load_video,
@@ -357,6 +359,10 @@ class MMEncoder:
         argument."""
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
+        configure_media_url_security(
+            server_args.allowed_media_domains,
+            server_args.media_url_max_file_size_mb,
+        )
         publish(server_args, role="encoder")
         self.rank = rank
         # DP rank for metric labels; overridden by run_dp_worker in DP mode.
@@ -1401,16 +1407,18 @@ class MMEncoder:
                 first_index_by_key = {}
                 for index in metadata_miss_indices:
                     first_index_by_key.setdefault(lookups[index].artifact_key, index)
-                reservations = dict(
+                cache_results = dict(
                     zip(
                         first_index_by_key,
-                        self.mm_preprocess_cache.reserve_many(list(first_index_by_key)),
+                        self.mm_preprocess_cache.lookup_or_claim_many(
+                            list(first_index_by_key)
+                        ),
                     )
                 )
                 owner_indices = [
                     first_index_by_key[key]
-                    for key, reservation in reservations.items()
-                    if isinstance(reservation, CacheReservation) and reservation.owner
+                    for key, result in cache_results.items()
+                    if isinstance(result, CacheMiss) and result.should_compute
                 ]
                 try:
                     if owner_indices:
@@ -1436,8 +1444,8 @@ class MMEncoder:
                             store=False,
                         )
                         for index, artifact in zip(owner_indices, prepared_artifacts):
-                            reservation = reservations[artifact.artifact_key]
-                            self.mm_preprocess_cache.fulfill(reservation, artifact)
+                            miss = cache_results[artifact.artifact_key]
+                            self.mm_preprocess_cache.complete_miss(miss, artifact)
                             cached_artifacts[index] = artifact
                         prepared_index_map = {
                             request_index: prepared_index
@@ -1447,29 +1455,29 @@ class MMEncoder:
                         }
 
                     resolved_by_key = {}
-                    for key, reservation in reservations.items():
-                        if isinstance(reservation, CacheLookup):
-                            resolved_by_key[key] = reservation.value
-                        elif reservation.owner:
+                    for key, result in cache_results.items():
+                        if isinstance(result, CacheLookup):
+                            resolved_by_key[key] = result.value
+                        elif result.should_compute:
                             resolved_by_key[key] = cached_artifacts[
                                 first_index_by_key[key]
                             ]
                         else:
-                            resolved_by_key[key] = await self.mm_preprocess_cache.wait(
-                                reservation
+                            resolved_by_key[key] = (
+                                await self.mm_preprocess_cache.wait_for_miss(result)
                             )
                     for index in metadata_miss_indices:
                         artifact = resolved_by_key[lookups[index].artifact_key]
                         cached_artifacts[index] = artifact
                         lookups[index] = replace(lookups[index], artifact=artifact)
                 except BaseException as error:
-                    for reservation in reservations.values():
+                    for result in cache_results.values():
                         if (
-                            isinstance(reservation, CacheReservation)
-                            and reservation.owner
-                            and not reservation.future.done()
+                            isinstance(result, CacheMiss)
+                            and result.should_compute
+                            and not result.future.done()
                         ):
-                            self.mm_preprocess_cache.fail(reservation, error)
+                            self.mm_preprocess_cache.fail_miss(result, error)
                     raise
 
             if any(artifact is None for artifact in cached_artifacts):

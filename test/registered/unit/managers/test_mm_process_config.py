@@ -87,6 +87,8 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         server_args.mm_preprocess_cache_size_mb = None
         server_args.tokenizer_worker_num = 1
         server_args.trust_mm_content_hashes = False
+        server_args.allowed_media_domains = []
+        server_args.media_url_max_file_size_mb = 64
 
         hf_config = MagicMock()
         mock_hf_processor = MagicMock()
@@ -125,12 +127,14 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
 
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SGLANG_IO_WORKERS", None)
-            with patch.object(
-                BaseMultimodalProcessor, "auto_mm_processor_worker_num", 4
-            ), patch.object(
-                BaseMultimodalProcessor, "auto_mm_io_worker_num", 16
-            ), patch.object(
-                BaseMultimodalProcessor, "supports_mm_processor_concurrency", True
+            with (
+                patch.object(
+                    BaseMultimodalProcessor, "auto_mm_processor_worker_num", 4
+                ),
+                patch.object(BaseMultimodalProcessor, "auto_mm_io_worker_num", 16),
+                patch.object(
+                    BaseMultimodalProcessor, "supports_mm_processor_concurrency", True
+                ),
             ):
                 proc = self._make_processor({})
         try:
@@ -182,6 +186,8 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
             base_gpu_id=2,
             tp_size=8,
             rl_on_policy_target=None,
+            allowed_media_domains=[],
+            media_url_max_file_size_mb=64,
         )
 
     @staticmethod
@@ -195,9 +201,13 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
         # transport policy must still resolve from the instance's ServerArgs.
         from sglang.srt.multimodal.processors import base_processor
 
-        with envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(True), patch.object(
-            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
-        ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
+        with (
+            envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(True),
+            patch.object(
+                base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+            ),
+            patch.object(base_processor, "MmItemMemoryPool") as memory_pool,
+        ):
             processor = base_processor.BaseMultimodalProcessor(
                 hf_config=MagicMock(),
                 server_args=self._server_args("cuda_ipc"),
@@ -213,9 +223,13 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
     def test_cuda_ipc_pool_handle_cache_can_be_disabled(self):
         from sglang.srt.multimodal.processors import base_processor
 
-        with envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(False), patch.object(
-            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
-        ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
+        with (
+            envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(False),
+            patch.object(
+                base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+            ),
+            patch.object(base_processor, "MmItemMemoryPool") as memory_pool,
+        ):
             processor = base_processor.BaseMultimodalProcessor(
                 hf_config=MagicMock(),
                 server_args=self._server_args("cuda_ipc"),
@@ -230,9 +244,13 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
     def test_cpu_transport_does_not_allocate_ipc_pool(self):
         from sglang.srt.multimodal.processors import base_processor
 
-        with envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(True), patch.object(
-            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
-        ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
+        with (
+            envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(True),
+            patch.object(
+                base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+            ),
+            patch.object(base_processor, "MmItemMemoryPool") as memory_pool,
+        ):
             processor = base_processor.BaseMultimodalProcessor(
                 hf_config=MagicMock(),
                 server_args=self._server_args("cpu"),
@@ -251,9 +269,12 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
         hf_processor = self._processor()
         feature = torch.empty(1, device="meta")
         hf_processor.return_value = {"pixel_values": feature}
-        with patch.object(
-            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
-        ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
+        with (
+            patch.object(
+                base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+            ),
+            patch.object(base_processor, "MmItemMemoryPool") as memory_pool,
+        ):
             processor = base_processor.BaseMultimodalProcessor(
                 hf_config=MagicMock(),
                 server_args=self._server_args("cuda_vmm"),
@@ -365,9 +386,10 @@ class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
             BaseMultimodalProcessor,
         )
 
-        with patch.object(
-            BaseMultimodalProcessor, "__abstractmethods__", set()
-        ), patch.object(BaseMultimodalProcessor, "__init__", lambda self: None):
+        with (
+            patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()),
+            patch.object(BaseMultimodalProcessor, "__init__", lambda self: None),
+        ):
             processor = BaseMultimodalProcessor()
         processor.precompute_hash_before_cpu_transfer = enabled
         processor.use_cuda_ipc = False
@@ -409,9 +431,10 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
             MultimodalProcessorExecutor,
         )
 
-        with patch.object(
-            BaseMultimodalProcessor, "__abstractmethods__", set()
-        ), patch.object(BaseMultimodalProcessor, "__init__", lambda self: None):
+        with (
+            patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()),
+            patch.object(BaseMultimodalProcessor, "__init__", lambda self: None),
+        ):
             processor = BaseMultimodalProcessor()
 
         processor.mm_processor_executor = MultimodalProcessorExecutor(
@@ -438,9 +461,10 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
             BaseMultimodalProcessor,
         )
 
-        with patch.object(
-            BaseMultimodalProcessor, "__abstractmethods__", set()
-        ), patch.object(BaseMultimodalProcessor, "__init__", lambda self: None):
+        with (
+            patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()),
+            patch.object(BaseMultimodalProcessor, "__init__", lambda self: None),
+        ):
             processor = BaseMultimodalProcessor()
 
         processor.mm_processor_executor = None
@@ -777,6 +801,8 @@ class TestDoubleBosGuard(CustomTestCase):
         server_args.mm_preprocess_cache_size_mb = None
         server_args.tokenizer_worker_num = 1
         server_args.trust_mm_content_hashes = False
+        server_args.allowed_media_domains = []
+        server_args.media_url_max_file_size_mb = 64
 
         mock_hf_processor = MagicMock()
         mock_hf_processor.__class__.__name__ = "TestProcessor"

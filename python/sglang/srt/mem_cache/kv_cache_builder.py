@@ -39,10 +39,9 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     get_resolved_model_impl,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_schedule
 
 if TYPE_CHECKING:
-
     from torch.distributed import ProcessGroup
 
     from sglang.srt.configs.model_config import ModelConfig
@@ -232,7 +231,7 @@ def build_kv_cache(
                 "with Mamba/SSM models"
             )
 
-    effective_chunked_prefill_size = server_args.chunked_prefill_size
+    effective_chunked_prefill_size = get_schedule().chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
         effective_chunked_prefill_size = None
 

@@ -1,6 +1,10 @@
 """CPU coverage for Kimi-K2.5/K2.7 encoder-DP wiring."""
 
 import asyncio
+import base64
+import functools
+import io
+import pickle
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -32,9 +36,19 @@ from sglang.srt.models.kimi_k25 import (
     mm_projection_auto,
 )
 from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
-from sglang.srt.multimodal.cache import MultimodalPreprocessCache, snapshot_media
+from sglang.srt.multimodal.cache import (
+    MultimodalPreprocessCache,
+    resolve_multimodal_item_hash,
+    snapshot_media,
+)
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
+    KimiK3DeferredPreprocessing,
+)
+from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
+    KimiK3ImagePreprocessArtifact,
+    KimiK3PreprocessConfig,
+    KimiK3ResizeConfig,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
@@ -44,12 +58,6 @@ from sglang.srt.multimodal.processors.kimi_k3 import (
     KimiK3ImageProcessor,
     _expand_k3_image_prompt_text,
     _expand_k3_image_prompt_token_ids,
-)
-from sglang.srt.multimodal.processors.kimi_k3_artifact import (
-    KimiK3DeferredConfig,
-    KimiK3ImageArtifact,
-    KimiK3PreprocessConfig,
-    KimiK3ResizeConfig,
 )
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
@@ -64,6 +72,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     CudaIpcTensorTransportProxy,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -340,8 +349,9 @@ def test_dp_helper_supports_moonvit3d_packed_embeddings_on_tp1():
 
     # The IPC consumer count asks for the *configured* TP size (matching
     # MmItemMemoryPool.try_to_recycle), so the double publishes one too.
-    with get_context().override_server_args(tp_size=1), get_parallel().override(
-        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+    with (
+        get_context().override_server_args(tp_size=1),
+        get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0),
     ):
         output = run_dp_sharded_mrope_vision_model(
             tower, pixel_values, [[1, 2, 2]], rope_type="rope_2d_packed"
@@ -358,8 +368,9 @@ def test_dp_helper_can_lazily_load_kimi_features_on_tp1():
 
     # The IPC consumer count asks for the *configured* TP size (matching
     # MmItemMemoryPool.try_to_recycle), so the double publishes one too.
-    with get_context().override_server_args(tp_size=1), get_parallel().override(
-        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+    with (
+        get_context().override_server_args(tp_size=1),
+        get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0),
     ):
         output = run_dp_sharded_mrope_vision_model(
             tower,
@@ -510,8 +521,9 @@ def test_kimi_non_dp_keeps_grid_thws_on_the_host():
 
     # The IPC consumer count asks for the *configured* TP size (matching
     # MmItemMemoryPool.try_to_recycle), so the double publishes one too.
-    with get_context().override_server_args(tp_size=1), get_parallel().override(
-        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+    with (
+        get_context().override_server_args(tp_size=1),
+        get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0),
     ):
         model.get_image_feature(items)
 
@@ -602,6 +614,15 @@ class _HFProcessor:
         )
 
 
+class _AnySizeTokenizer:
+    def encode(self, text, allowed_special=None):
+        if text.startswith("<|media_begin|>image "):
+            return [10, 11]
+        if text == "<|media_end|>":
+            return [14]
+        return []
+
+
 def _k3_preprocess_config(
     *, patch_size=14, in_patch_limit=16384
 ) -> KimiK3PreprocessConfig:
@@ -638,6 +659,8 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
         trust_mm_content_hashes=False,
         base_gpu_id=0,
         rl_on_policy_target=None,
+        allowed_media_domains=[],
+        media_url_max_file_size_mb=64,
     )
     processor = processor_cls(
         hf_config=SimpleNamespace(media_placeholder_token_id=42),
@@ -746,7 +769,7 @@ def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
 
 
 def _cached_k3_artifact(content_digest, artifact_key, value=1):
-    return KimiK3ImageArtifact(
+    return KimiK3ImagePreprocessArtifact(
         content_digest=content_digest,
         artifact_key=artifact_key,
         feature_identity="sha256:" + "34" * 32,
@@ -836,18 +859,121 @@ def test_kimi_k3_cached_deferred_artifact_has_model_contract():
         },
         grid_thw=(1, 1, 1),
         feature=feature,
-        deferred=KimiK3DeferredConfig(
+        deferred=KimiK3DeferredPreprocessing(
             backend="gpu",
-            feature_layout="chw",
-            image_mean=(0.5, 0.5, 0.5),
-            image_std=(0.5, 0.5, 0.5),
+            image_mean=[0.5, 0.5, 0.5],
+            image_std=[0.5, 0.5, 0.5],
             transparent_bg_config=None,
+            resize_config={
+                "num_tokens": 1,
+                "new_width": 2,
+                "new_height": 2,
+                "pad_width": 0,
+                "pad_height": 0,
+            },
         ),
     )
 
-    config = artifact.deferred.as_dict(artifact.resize_config)
-    assert config["backend"] == "gpu"
-    assert config["feature_layout"] == "chw"
+    config = artifact.deferred
+    assert config.backend == "gpu"
+    assert config.resize_config["new_width"] == 2
+
+
+def test_kimi_k3_normal_cache_path_connects_real_producer_to_model_consumer():
+    hf_processor = _HFProcessor()
+    hf_processor.tokenizer = _AnySizeTokenizer()
+    hf_config = SimpleNamespace(
+        media_placeholder_token_id=42,
+        to_dict=lambda: {
+            "model_type": "kimi_k3",
+            "architectures": ["KimiK3ForConditionalGeneration"],
+        },
+    )
+    server_args = ServerArgs(
+        model_path="dummy",
+        mm_feature_transport="cpu",
+        mm_process_config={},
+        mm_io_worker_num=1,
+        mm_processor_worker_num=0,
+        tokenizer_worker_num=1,
+        mm_preprocess_cache_size_mb=1,
+    )
+    processor = KimiK3ImageProcessor(
+        hf_config=hf_config,
+        server_args=server_args,
+        _processor=hf_processor,
+        transport_mode=None,
+    )
+    image = Image.new("RGB", (28, 28), color=(1, 2, 3))
+    encoded_image = io.BytesIO()
+    image.save(encoded_image, format="PNG")
+    image_data = ImageData(
+        url="data:image/png;base64,"
+        + base64.b64encode(encoded_image.getvalue()).decode()
+    )
+    request = SimpleNamespace(video_data=None, mm_content_hashes=None)
+
+    class _Tower(nn.Module):
+        device = torch.device("cpu")
+        patch_size = 14
+
+        def __init__(self):
+            super().__init__()
+            self.patch_embed = SimpleNamespace(
+                proj=SimpleNamespace(weight=torch.empty(1, dtype=torch.float32))
+            )
+
+        def forward(self, pixel_values, _grid_thws):
+            return pixel_values
+
+    model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.use_data_parallel = False
+    model.vision_tower = _Tower()
+    model.mm_projector = _Projector()
+
+    try:
+        with (
+            patch(
+                "sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True
+            ),
+            patch.object(
+                processor,
+                "prepare_artifact_batch",
+                wraps=processor.prepare_artifact_batch,
+            ) as prepare_artifacts,
+        ):
+            cold = asyncio.run(
+                processor.process_mm_data_async([image_data], [1, 42, 2], request)
+            )
+            hot = asyncio.run(
+                processor.process_mm_data_async([image_data], [3, 42, 4], request)
+            )
+        cold_items = pickle.loads(pickle.dumps(cold.mm_items))
+        hot_items = pickle.loads(pickle.dumps(hot.mm_items))
+
+        with (
+            patch("sglang.srt.models.kimi_k3.configured_tp_size", return_value=1),
+            patch(
+                "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
+                return_value=(
+                    torch.ones((4, 3), dtype=torch.float32),
+                    torch.tensor([[1, 2, 2]], dtype=torch.int64),
+                ),
+            ),
+        ):
+            cold_features = model.get_image_feature(cold_items)
+            hot_features = model.get_image_feature(hot_items)
+    finally:
+        processor.shutdown()
+
+    assert prepare_artifacts.call_count == 1
+    assert cold.mm_items[0].hash == hot.mm_items[0].hash
+    assert cold.mm_items[0].offsets == hot.mm_items[0].offsets == [(3, 3)]
+    assert (
+        cold_items[0].model_specific_data[DEFERRED_PREPROCESSING_KEY].backend == "gpu"
+    )
+    torch.testing.assert_close(cold_features, hot_features)
 
 
 def test_kimi_k3_model_accepts_mixed_cached_eager_and_deferred_artifacts():
@@ -871,20 +997,21 @@ def test_kimi_k3_model_accepts_mixed_cached_eager_and_deferred_artifacts():
     model.mm_projector = _Projector()
     eager = _image_item(torch.ones((1, 3)), [[1, 1, 1]])
     deferred = _image_item(torch.zeros((3, 2, 2), dtype=torch.uint8), [[1, 1, 1]])
-    deferred.model_specific_data[DEFERRED_PREPROCESSING_KEY] = {
-        "backend": "gpu",
-        "feature_layout": "chw",
-        "image_mean": [0.5, 0.5, 0.5],
-        "image_std": [0.5, 0.5, 0.5],
-        "transparent_bg_config": None,
-        "resize_config": {
-            "num_tokens": 1,
-            "new_width": 2,
-            "new_height": 2,
-            "pad_width": 0,
-            "pad_height": 0,
-        },
-    }
+    deferred.model_specific_data[DEFERRED_PREPROCESSING_KEY] = (
+        KimiK3DeferredPreprocessing(
+            backend="gpu",
+            image_mean=[0.5, 0.5, 0.5],
+            image_std=[0.5, 0.5, 0.5],
+            transparent_bg_config=None,
+            resize_config={
+                "num_tokens": 1,
+                "new_width": 2,
+                "new_height": 2,
+                "pad_width": 0,
+                "pad_height": 0,
+            },
+        )
+    )
 
     with (
         patch("sglang.srt.models.kimi_k3.configured_tp_size", return_value=1),
@@ -911,7 +1038,7 @@ def test_kimi_k3_trusted_hot_hit_skips_media_read():
 
     try:
         with patch(
-            "sglang.srt.multimodal.processors.media_artifact.snapshot_media",
+            "sglang.srt.multimodal.media_artifacts.base.snapshot_media",
             side_effect=AssertionError("trusted cache hit must not read media"),
         ):
             result = asyncio.run(
@@ -980,7 +1107,7 @@ def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
     async def prepare(_entries):
         return [new]
 
-    processor._run_artifact_batch = prepare
+    processor._run_preprocess_and_build_artifact_batch = prepare
     try:
         with pytest.raises(ValueError, match="feature identity or hash changed"):
             asyncio.run(processor.prepare_media_artifacts([image]))
@@ -990,13 +1117,16 @@ def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
     assert key not in processor.mm_preprocess_cache
 
 
-def test_kimi_k3_feature_hash_is_namespaced_by_artifact_identity():
+def test_kimi_k3_artifact_and_data_item_share_hash_resolution():
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_feature_transport = "cpu"
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor._tokenizer = _Tokenizer()
+    processor.use_cuda_ipc = False
     feature = torch.zeros((4, 3), dtype=torch.float32)
     digest = "sha256:" + "ab" * 32
 
-    first = processor._make_artifact(
+    artifact = processor._make_artifact(
         content_digest=digest,
         artifact_key="sha256:" + "01" * 32,
         original_size=(2, 2),
@@ -1010,22 +1140,18 @@ def test_kimi_k3_feature_hash_is_namespaced_by_artifact_identity():
         grid_thw=(1, 1, 1),
         feature=feature,
     )
-    second = processor._make_artifact(
-        content_digest=digest,
-        artifact_key="sha256:" + "02" * 32,
-        original_size=(4, 1),
-        resize_config={
-            "num_tokens": 1,
-            "new_width": 4,
-            "new_height": 1,
-            "pad_width": 0,
-            "pad_height": 1,
-        },
-        grid_thw=(1, 1, 1),
-        feature=feature,
-    )
+    direct_item = MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
+    direct_item.set_pad_value()
+    composed_item = processor.compose_request([1, 99, 2], [artifact]).mm_items[0]
 
-    assert first.feature_hash != second.feature_hash
+    expected_hash = resolve_multimodal_item_hash(
+        existing_hash=direct_item.hash,
+        namespace=artifact.artifact_key,
+    )
+    expected_item = MultimodalDataItem(modality=Modality.IMAGE, hash=expected_hash)
+    expected_item.set_pad_value()
+    assert artifact.feature_hash == composed_item.hash == expected_hash
+    assert composed_item.pad_value == expected_item.pad_value
 
 
 def test_kimi_k3_untrusted_path_change_is_a_cache_miss():
@@ -1046,7 +1172,7 @@ def test_kimi_k3_untrusted_path_change_is_a_cache_miss():
             for entry in entries
         ]
 
-    processor._run_artifact_batch = prepare
+    processor._run_preprocess_and_build_artifact_batch = prepare
     try:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mutable.png"
@@ -1093,7 +1219,7 @@ def test_kimi_k3_partial_hits_deduplicate_misses_and_preserve_order():
             for entry in entries
         ]
 
-    processor._run_artifact_batch = prepare
+    processor._run_preprocess_and_build_artifact_batch = prepare
     try:
         artifacts = asyncio.run(
             processor.prepare_media_artifacts(
@@ -1143,7 +1269,7 @@ def test_kimi_k3_cancelled_artifact_owner_does_not_fail_joiner():
             for entry in entries
         ]
 
-    processor._run_artifact_batch = prepare
+    processor._run_preprocess_and_build_artifact_batch = prepare
 
     async def run():
         owner = asyncio.create_task(processor.prepare_media_artifacts([image]))
@@ -1166,10 +1292,6 @@ def test_kimi_k3_cancelled_artifact_owner_does_not_fail_joiner():
 
 
 def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
-    from sglang.srt.multimodal.kimi_k3_image_processing import (
-        DEFERRED_PREPROCESSING_KEY,
-    )
-
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
     processor.mm_feature_transport = "cpu"
@@ -1195,11 +1317,13 @@ def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
                         "pad_height": 2,
                     },
                 ],
-                {
-                    "image_mean": [0.5, 0.5, 0.5],
-                    "image_std": [0.5, 0.5, 0.5],
-                    "transparent_bg_config": None,
-                },
+                functools.partial(
+                    KimiK3DeferredPreprocessing,
+                    backend="gpu",
+                    image_mean=[0.5, 0.5, 0.5],
+                    image_std=[0.5, 0.5, 0.5],
+                    transparent_bg_config=None,
+                ),
             )
         ),
     )
@@ -1229,10 +1353,13 @@ def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
     ]
     assert all(item.hash is not None for item in output.mm_items)
     assert all(item.pad_value is not None for item in output.mm_items)
-    assert all(
-        DEFERRED_PREPROCESSING_KEY in item.model_specific_data
-        for item in output.mm_items
-    )
+    deferred = [
+        item.model_specific_data[DEFERRED_PREPROCESSING_KEY] for item in output.mm_items
+    ]
+    # The staged features are CHW uint8, so the config has to route them to the
+    # GPU arm of `materialize_item_features`.
+    assert [config.backend for config in deferred] == ["gpu", "gpu"]
+    assert [config.resize_config["new_width"] for config in deferred] == [4, 2]
 
 
 @pytest.mark.parametrize(
@@ -1282,7 +1409,7 @@ def test_kimi_k3_eager_preprocessing_preserves_float_tensor_support():
     assert output.shape == (3, 4, 4)
 
 
-@pytest.mark.parametrize("transport", ["cuda_ipc", "fabric"])
+@pytest.mark.parametrize("transport", ["cuda_ipc", "cuda_vmm"])
 def test_kimi_k3_keeps_gpu_transport_preprocessing_eager(transport):
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_feature_transport = transport

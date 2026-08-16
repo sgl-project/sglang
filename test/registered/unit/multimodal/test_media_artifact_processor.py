@@ -6,7 +6,7 @@ from typing import Optional
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import MultimodalPreprocessCache, snapshot_media
-from sglang.srt.multimodal.processors.media_artifact import (
+from sglang.srt.multimodal.media_artifacts import (
     MediaArtifactCacheMixin,
     MediaArtifactInput,
 )
@@ -34,6 +34,7 @@ class _Artifact:
         return (
             self.content_digest,
             self.artifact_key,
+            self.feature_identity,
             self.feature_hash,
             self.feature,
         )
@@ -46,7 +47,7 @@ class _FutureMediaInput:
     frame_sampling: int = 2
 
 
-class _Processor(MediaArtifactCacheMixin[_Artifact]):
+class _Processor(MediaArtifactCacheMixin):
     artifact_modality = Modality.IMAGE
     artifact_option_defaults = {"detail": "auto", "frame_sampling": 2}
 
@@ -189,7 +190,7 @@ class TestMediaArtifactProcessor(unittest.TestCase):
             artifact = processor.prepare_artifact_batch(entries)[0]
             return [replace(artifact, artifact_key="sha256:" + "0" * 64)]
 
-        processor._run_artifact_batch = wrong_identity
+        processor._run_preprocess_and_build_artifact_batch = wrong_identity
         try:
             with self.assertRaisesRegex(ValueError, "changed the media artifact key"):
                 asyncio.run(processor.prepare_media_artifacts([b"image"]))

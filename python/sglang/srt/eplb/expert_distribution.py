@@ -35,6 +35,7 @@ from sglang.srt.observability.metrics_collector import (
     ExpertDispatchCollector,
     resolve_collector_class,
 )
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_device, get_int_env_var
 
@@ -390,7 +391,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
             (
                 expert_location_metadata.num_layers,
                 # TODO determine the max number
-                server_args.chunked_prefill_size * 8,
+                get_schedule().chunked_prefill_size * 8,
                 self._TOP_K_NUM,
             ),
             dtype=torch.int32,

@@ -8,6 +8,7 @@ images onto the checkpoint-configured background
 at load time.
 """
 
+import functools
 import math
 import re
 from typing import Dict, List, Optional, Union
@@ -28,18 +29,28 @@ from sglang.srt.mem_cache.multimodal_cache import (
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.multimodal.cache import (
-    build_feature_hash,
     build_feature_identity,
     compact_feature_hash,
+    resolve_multimodal_item_hash,
 )
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
+    KimiK3DeferredPreprocessing,
 )
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     fill_transparent_bg as _fill_transparent_bg,
 )
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     to_chw_uint8,
+)
+from sglang.srt.multimodal.media_artifacts import (
+    MediaArtifactCacheMixin,
+    MediaArtifactInput,
+)
+from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
+    KimiK3ImagePreprocessArtifact,
+    KimiK3PreprocessConfig,
+    KimiK3ResizeConfig,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -48,22 +59,12 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
-from sglang.srt.multimodal.processors.kimi_k3_artifact import (
-    KimiK3DeferredConfig,
-    KimiK3ImageArtifact,
-    KimiK3PreprocessConfig,
-    KimiK3ResizeConfig,
-)
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
     _get_image_dimensions,
     _gpu_preprocess_images,
     _grid_thw_from_resize_config,
     navit_resize_config,
-)
-from sglang.srt.multimodal.processors.media_artifact import (
-    MediaArtifactCacheMixin,
-    MediaArtifactInput,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
@@ -308,12 +309,16 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         input_ids = self._prepare_input_ids(
             input_text, resize_configs, original_input_ids, image_sizes
         )
-        deferred_config = {
-            "image_mean": list(self._image_mean),
-            "image_std": list(self._image_std),
-            "transparent_bg_config": self._transparent_bg_config,
-        }
-        return input_ids, resize_configs, deferred_config
+        # This path only ever defers GPU preprocessing: the caller gates on
+        # `_should_defer_gpu_preprocessing` and stages CHW uint8 features.
+        deferred_preprocessing = functools.partial(
+            KimiK3DeferredPreprocessing,
+            backend="gpu",
+            image_mean=list(self._image_mean),
+            image_std=list(self._image_std),
+            transparent_bg_config=self._transparent_bg_config,
+        )
+        return input_ids, resize_configs, deferred_preprocessing
 
     def prepare_image_features(self, images):
         """Prepare prompt-independent, per-image features in one processor call."""
@@ -369,7 +374,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
 
 class KimiK3ImageProcessor(
     KimiGridMMDataMixin,
-    MediaArtifactCacheMixin[KimiK3ImageArtifact],
+    MediaArtifactCacheMixin,
     SGLangBaseProcessor,
 ):
     models = [KimiK3ForConditionalGeneration]
@@ -407,6 +412,9 @@ class KimiK3ImageProcessor(
         self.mm_tokens = mm_tokens
 
     def _should_defer_gpu_preprocessing(self, images) -> bool:
+        """
+        when raw_bytes <= processed_bytes, preprocess first would introduce larger payload, so deferring gpu preprocessing would benefit
+        """
         if (
             not images
             or self.mm_feature_transport != "cpu"
@@ -453,7 +461,11 @@ class KimiK3ImageProcessor(
         return raw_bytes <= processed_bytes
 
     def _build_deferred_output(self, base_output):
-        input_ids, resize_configs, deferred_config = self._processor.prepare_deferred(
+        (
+            input_ids,
+            resize_configs,
+            deferred_preprocessing,
+        ) = self._processor.prepare_deferred(
             base_output.input_text,
             base_output.images,
             base_output.input_ids,
@@ -477,10 +489,9 @@ class KimiK3ImageProcessor(
                 offsets=[offset],
                 model_specific_data={
                     "image_grid_thw": torch.tensor([grid_thw], dtype=torch.int64),
-                    DEFERRED_PREPROCESSING_KEY: {
-                        **deferred_config,
-                        "resize_config": resize_config,
-                    },
+                    DEFERRED_PREPROCESSING_KEY: deferred_preprocessing(
+                        resize_config=resize_config
+                    ),
                 },
             )
             items.append(item)
@@ -501,15 +512,15 @@ class KimiK3ImageProcessor(
         resize_config: dict,
         grid_thw: tuple[int, int, int],
         feature: torch.Tensor,
-        deferred: Optional[KimiK3DeferredConfig] = None,
-    ) -> KimiK3ImageArtifact:
-        item = MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
-        item.set_pad_value()
-        feature_identity = build_feature_identity(artifact_key, item.hash)
-        feature_hash = build_feature_hash(artifact_key, item.hash)
+        deferred: Optional[KimiK3DeferredPreprocessing] = None,
+    ) -> KimiK3ImagePreprocessArtifact:
+        """Freeze one image's prompt-independent preprocessing result."""
+        processor_output_hash = resolve_multimodal_item_hash(feature=feature)
+        feature_identity = build_feature_identity(artifact_key, processor_output_hash)
+        feature_hash = compact_feature_hash(feature_identity)
         if not self.keep_mm_features_on_device and feature.device.type != "cpu":
             feature = feature.cpu()
-        return KimiK3ImageArtifact(
+        return KimiK3ImagePreprocessArtifact(
             content_digest=content_digest,
             artifact_key=artifact_key,
             feature_identity=feature_identity,
@@ -526,18 +537,23 @@ class KimiK3ImageProcessor(
         entries: list[MediaArtifactInput],
         *,
         processor=None,
-    ) -> list[KimiK3ImageArtifact]:
-        """Process cache misses as one batch while preserving image order."""
+    ) -> list[KimiK3ImagePreprocessArtifact]:
+        """Preprocess raw cache misses into reusable per-image cache items.
+
+        Each entry is a confirmed cache miss. It is either processed now or
+        stored with the metadata needed for deferred GPU preprocessing.
+        """
         processor = processor or self._processor
-        artifacts: list[Optional[KimiK3ImageArtifact]] = [None] * len(entries)
-        eager_indices = []
+        artifacts: list[Optional[KimiK3ImagePreprocessArtifact]] = [None] * len(entries)
+        # 1. collect inputs that must be preprocessed now instead of deferred
+        eager_entry_indices = []
         eager_images = []
 
         config = processor.preprocess_config
         for index, entry in enumerate(entries):
             image = entry.media
             if not self._should_defer_gpu_preprocessing([image]):
-                eager_indices.append(index)
+                eager_entry_indices.append(index)
                 eager_images.append(image)
                 continue
 
@@ -560,21 +576,22 @@ class KimiK3ImageProcessor(
                 resize_config=resize_config,
                 grid_thw=grid_thw,
                 feature=feature,
-                deferred=KimiK3DeferredConfig(
+                deferred=KimiK3DeferredPreprocessing(
                     backend="gpu",
-                    feature_layout="chw",
-                    image_mean=config.image_mean,
-                    image_std=config.image_std,
+                    image_mean=list(config.image_mean),
+                    image_std=list(config.image_std),
                     transparent_bg_config=config.transparent_bg_config,
+                    resize_config=resize_config,
                 ),
             )
 
+        # 2. preprocess CPU eager inputs as one batch
         if eager_images:
             features, sizes, configs, grids = processor.prepare_image_features(
                 eager_images
             )
             for index, feature, size, resize_config, grid in zip(
-                eager_indices, features, sizes, configs, grids
+                eager_entry_indices, features, sizes, configs, grids
             ):
                 entry = entries[index]
                 artifacts[index] = self._make_artifact(
@@ -586,6 +603,7 @@ class KimiK3ImageProcessor(
                     feature=feature,
                 )
 
+        # 3. return artifacts in the original processor-input order
         if any(artifact is None for artifact in artifacts):
             raise RuntimeError("Kimi-K3 artifact batch did not produce every image")
         return [artifact for artifact in artifacts if artifact is not None]
@@ -593,17 +611,28 @@ class KimiK3ImageProcessor(
     def compose_request(
         self,
         input_text,
-        artifacts: list[KimiK3ImageArtifact],
+        artifacts: list[KimiK3ImagePreprocessArtifact],
         *,
         featureless_hit_mask: Optional[list[bool]] = None,
         embedding_lease_id: Optional[str] = None,
     ) -> MultimodalProcessorOutput:
+        """Compose the current request from its prompt and ordered artifacts.
+
+        ``prepare_media_artifacts`` has already returned one artifact for each
+        processor input, either from the preprocess cache or from fresh
+        preprocessing. This method expands the current prompt's image tokens
+        and converts each artifact into its request-specific
+        ``MultimodalDataItem`` with offsets, grid metadata, feature, and feature
+        hash. It does not read raw media or access the preprocess cache.
+        """
         if featureless_hit_mask is None:
             featureless_hit_mask = [False] * len(artifacts)
         if len(featureless_hit_mask) != len(artifacts):
             raise ValueError("featureless_hit_mask must align with artifacts")
         if any(featureless_hit_mask) and embedding_lease_id is None:
             raise ValueError("featureless cache hits require an embedding lease")
+
+        # 1. rebuild prompt-specific tokens and offsets
         original_ids = (
             input_text
             if isinstance(input_text, (list, torch.Tensor))
@@ -620,6 +649,7 @@ class KimiK3ImageProcessor(
         if len(offsets) != len(artifacts):
             raise ValueError("Expected one Kimi-K3 image span for each image")
 
+        # 2. build request-owned items from prompt-independent artifacts
         items = []
         for artifact, offset, featureless in zip(
             artifacts, offsets, featureless_hit_mask
@@ -628,9 +658,7 @@ class KimiK3ImageProcessor(
                 "image_grid_thw": torch.tensor([artifact.grid_thw], dtype=torch.int64)
             }
             if artifact.deferred is not None:
-                model_specific_data[DEFERRED_PREPROCESSING_KEY] = (
-                    artifact.deferred.as_dict(artifact.resize_config)
-                )
+                model_specific_data[DEFERRED_PREPROCESSING_KEY] = artifact.deferred
             if featureless:
                 model_specific_data[MM_EMBEDDING_CACHE_LEASE_ID_KEY] = (
                     embedding_lease_id
@@ -731,10 +759,12 @@ class KimiK3ImageProcessor(
             any(self._is_preprocessed_input(item) for item in image_data)
             or not self.mm_preprocess_cache.enabled
         ):
+            # 1. keep preprocessed inputs and cache-off requests on the legacy path
             return await self._process_mm_data_uncached(
                 image_data, input_text, request_obj, **kwargs
             )
 
+        # 2. resolve per-image artifacts before composing the current prompt
         featureless_hit_mask = kwargs.get("featureless_hit_mask")
         artifacts = await self.prepare_media_artifacts(
             image_data,
