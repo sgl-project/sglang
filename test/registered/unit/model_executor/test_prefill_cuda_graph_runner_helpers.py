@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    PrefillCudaGraphRunner,
     _resolve_transformer_layer_model,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
@@ -22,6 +23,26 @@ class _LayerModel:
 
 
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
+    def test_input_embeds_hidden_size_uses_explicit_value(self):
+        """An explicit buffer width must take precedence over the default."""
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(
+            model=SimpleNamespace(input_embeds_hidden_size=7),
+            model_config=SimpleNamespace(hidden_size=5),
+        )
+
+        self.assertEqual(runner._input_embeds_hidden_size(), 7)
+
+    def test_input_embeds_hidden_size_uses_default_value(self):
+        """The configured hidden size remains the default buffer width."""
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(
+            model=SimpleNamespace(),
+            model_config=SimpleNamespace(hidden_size=5),
+        )
+
+        self.assertEqual(runner._input_embeds_hidden_size(), 5)
+
     def test_resolve_layer_model_from_language_model_wrapper(self):
         layer_model = _LayerModel()
         model = SimpleNamespace(language_model=SimpleNamespace(model=layer_model))

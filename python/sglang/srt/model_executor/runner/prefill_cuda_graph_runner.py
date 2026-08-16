@@ -296,13 +296,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
         # --- buffers ---------------------------------------------------
+        # Resolve once so both graph buffer owners use the same width.
+        input_embeds_hidden_size = self._input_embeds_hidden_size()
         self.buffers: PrefillInputBuffers = PrefillInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
             max_num_tokens=self.max_num_tokens,
             cache_loc_dtype=self._cache_loc_dtype(),
             is_multimodal=self.is_multimodal,
-            hidden_size=self.model_runner.model_config.hidden_size,
+            hidden_size=input_embeds_hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
         )
@@ -316,7 +318,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             max_num_token=self.max_num_tokens,
             cache_loc_dtype=self._cache_loc_dtype(),
             is_multimodal=self.is_multimodal,
-            hidden_size=self.model_runner.model_config.hidden_size,
+            hidden_size=input_embeds_hidden_size,
             embed_dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
             enable_num_token_non_padded=enable_num_token_non_padded(),
@@ -530,6 +532,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
+
+    def _input_embeds_hidden_size(self) -> int:
+        """Return the configured prefill input-embedding buffer width."""
+        return getattr(
+            self.model_runner.model,
+            "input_embeds_hidden_size",
+            self.model_runner.model_config.hidden_size,
+        )
 
     def _next_token_logits_buffer(self, rows: int) -> Optional[torch.Tensor]:
         if not self.model_runner.pp_group.is_last_rank:
