@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -40,6 +41,12 @@ _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
 # Keyed by group: one region per group, kept for the process lifetime.
 _SYMM_GATHERERS: dict = {}
+
+
+def _symm_dp_adapter_entry_ns() -> Optional[int]:
+    if not envs.SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY.get():
+        return None
+    return time.perf_counter_ns()
 
 
 def _maybe_symm_gatherer(group, device, width: int):
@@ -161,6 +168,7 @@ class MLPSyncBatchInfo:
         device,
         group: torch.distributed.ProcessGroup,
         use_all_reduce: bool = False,
+        entry_timing: Optional[dict[str, int]] = None,
     ):
         # Build on host first: it is cheap, it gives info_width, and it lets the
         # transport be chosen before anything lands on a device. The symmetric
@@ -174,6 +182,8 @@ class MLPSyncBatchInfo:
         )
         if gatherer is not None:
             device = "cpu"
+            if entry_timing is not None:
+                gatherer.set_entry_timing(entry_timing)
 
         local_info_tensor = (
             local_info_cpu if device == "cpu" else local_info_cpu.to(device)
@@ -276,7 +286,14 @@ def prepare_mlp_sync_batch_raw(
     disable_overlap_schedule: bool,
     offload_tags: set[str],
     dwdp: bool = False,
+    telemetry_adapter_entry_ns: Optional[int] = None,
 ):
+    telemetry_entry_timing = None
+    if telemetry_adapter_entry_ns is not None:
+        telemetry_entry_timing = {
+            "adapter_entry_ns": telemetry_adapter_entry_ns,
+            "prepare_raw_entry_ns": time.perf_counter_ns(),
+        }
     # Check if other DP workers have running batches
     if (
         local_batch is None
@@ -382,10 +399,15 @@ def prepare_mlp_sync_batch_raw(
     )
 
     if not skip_all_gather:
+        if telemetry_entry_timing is not None:
+            telemetry_entry_timing["all_gather_call_entry_ns"] = (
+                time.perf_counter_ns()
+            )
         mlp_sync_info.all_gather(
             device=device,
             group=group,
             use_all_reduce=use_world_group,
+            entry_timing=telemetry_entry_timing,
         )
 
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
@@ -445,6 +467,7 @@ class SchedulerDPAttnAdapter:
     get_require_mlp_sync: Callable[[], bool]
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
+        telemetry_adapter_entry_ns = _symm_dp_adapter_entry_ns()
         return prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
@@ -458,6 +481,7 @@ class SchedulerDPAttnAdapter:
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
+            telemetry_adapter_entry_ns=telemetry_adapter_entry_ns,
         )
 
     def maybe_prepare_mlp_sync_batch(

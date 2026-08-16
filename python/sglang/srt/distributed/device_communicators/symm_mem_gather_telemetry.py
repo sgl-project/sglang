@@ -15,7 +15,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _REGISTERED_GATHERERS: weakref.WeakSet[Any] = weakref.WeakSet()
 
 
@@ -48,6 +48,7 @@ class SymmMemGatherTelemetry:
         self._dp_rank: Optional[int] = None
         self._generation_regressions = 0
         self._last_generation: Optional[int] = None
+        self._pending_entry_timing: Optional[dict[str, int]] = None
 
     @property
     def active(self) -> bool:
@@ -62,7 +63,12 @@ class SymmMemGatherTelemetry:
         self._dp_rank = dp_rank
         self._generation_regressions = 0
         self._last_generation = None
+        self._pending_entry_timing = None
         self._active = True
+
+    def set_pending_entry_timing(self, entry_timing: dict[str, int]) -> None:
+        """Save same-process phase markers for the next generation record."""
+        self._pending_entry_timing = dict(entry_timing)
 
     def begin(
         self,
@@ -80,7 +86,9 @@ class SymmMemGatherTelemetry:
             if generation != expected:
                 self._generation_regressions += 1
         self._last_generation = generation
-        return {
+        entry_timing = self._pending_entry_timing
+        self._pending_entry_timing = None
+        record = {
             "generation": generation,
             "slot": slot,
             "gather_start_ns": gather_start_ns,
@@ -95,6 +103,9 @@ class SymmMemGatherTelemetry:
             "host_retry_gap_max_ns": 0,
             "_last_sync_done_ns": None,
         }
+        if entry_timing is not None:
+            record["entry_timing"] = entry_timing
+        return record
 
     def note_poll(
         self,

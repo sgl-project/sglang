@@ -5,6 +5,7 @@ from sglang.srt.distributed.device_communicators.symm_mem_gather_telemetry impor
     common_generation_ids,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.scheduler_components import dp_attn
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -95,6 +96,31 @@ def test_ready_transitions_ties_and_host_timings(tmp_path):
     assert saved["peer_rows"] == [[peer] * 7 for peer in range(4)]
 
 
+def test_same_process_entry_timing_is_attached_to_next_generation(tmp_path):
+    recorder = SymmMemGatherTelemetry(world_size=2, group_rank=0, max_records=4)
+    recorder.start(output_dir=str(tmp_path), profile_id="entry", dp_rank=0)
+    entry_timing = {
+        "adapter_entry_ns": 1_000,
+        "prepare_raw_entry_ns": 1_020,
+        "all_gather_call_entry_ns": 1_080,
+    }
+    recorder.set_pending_entry_timing(entry_timing)
+    _finish_record(recorder, 1, start_ns=1_100)
+    _finish_record(recorder, 2, start_ns=2_000)
+    path = recorder.stop()
+    assert path is not None
+    payload = json.loads(path.read_text())
+    assert payload["schema_version"] == 2
+    assert payload["records"][0]["entry_timing"] == entry_timing
+    assert "entry_timing" not in payload["records"][1]
+    assert (
+        entry_timing["adapter_entry_ns"]
+        <= entry_timing["prepare_raw_entry_ns"]
+        <= entry_timing["all_gather_call_entry_ns"]
+        <= payload["records"][0]["gather_start_ns"]
+    )
+
+
 def test_generation_wrap_regression_and_bounded_records(tmp_path):
     recorder = SymmMemGatherTelemetry(world_size=2, group_rank=0, max_records=2)
     recorder.start(output_dir=str(tmp_path), profile_id="wrap", dp_rank=0)
@@ -151,3 +177,19 @@ def test_default_environment_does_not_enable_telemetry(monkeypatch):
     monkeypatch.delenv("SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY_MAX_RECORDS", raising=False)
     assert envs.SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY.get() is False
     assert envs.SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY_MAX_RECORDS.get() == 256
+
+
+def test_default_off_does_not_read_host_clock(monkeypatch):
+    monkeypatch.delenv("SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY", raising=False)
+
+    def fail_if_called():
+        raise AssertionError("default-off path sampled perf_counter_ns")
+
+    monkeypatch.setattr(dp_attn.time, "perf_counter_ns", fail_if_called)
+    assert dp_attn._symm_dp_adapter_entry_ns() is None
+
+
+def test_enabled_entry_reads_host_clock(monkeypatch):
+    monkeypatch.setenv("SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY", "true")
+    monkeypatch.setattr(dp_attn.time, "perf_counter_ns", lambda: 123_456)
+    assert dp_attn._symm_dp_adapter_entry_ns() == 123_456

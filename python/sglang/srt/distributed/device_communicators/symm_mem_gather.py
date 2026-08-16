@@ -204,6 +204,10 @@ class SymmMemGather:
             if time.monotonic() >= deadline:
                 raise TimeoutError("symmetric-memory completion marker timeout")
 
+    def set_entry_timing(self, entry_timing: dict[str, int]) -> None:
+        """Attach same-process scheduler-entry markers to the next gather."""
+        self._telemetry.set_pending_entry_timing(entry_timing)
+
     def _gather_with_telemetry(self, local_row_cpu: torch.Tensor) -> torch.Tensor:
         """Opt-in gather path with host-only observations after existing syncs."""
         gather_start_ns = time.perf_counter_ns()
