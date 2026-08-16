@@ -9,7 +9,6 @@ fires. See DecodeTransferQueue.resolve_deferred_releases.
 """
 
 import unittest
-from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -26,7 +25,7 @@ def _make_manager():
     """A bare CommonKVManager carrying only the deferred-ack state the helpers
     touch (avoids the heavy real __init__)."""
     mgr = CommonKVManager.__new__(CommonKVManager)
-    mgr._deferred_abort_ack_tracker = defaultdict(set)
+    mgr._deferred_abort_ack_tracker = {}
     return mgr
 
 
@@ -34,6 +33,7 @@ class TestAbortAckAggregation(CustomTestCase):
     def test_release_safe_only_after_all_required_ranks_ack(self):
         mgr = _make_manager()
         room = 100
+        mgr.register_deferred_abort_room(room)
         self.assertFalse(mgr.is_abort_release_safe(room, required_acks=2))
 
         mgr.note_abort_ack(room, 0)
@@ -45,6 +45,7 @@ class TestAbortAckAggregation(CustomTestCase):
     def test_duplicate_rank_ack_does_not_over_count(self):
         mgr = _make_manager()
         room = 101
+        mgr.register_deferred_abort_room(room)
         mgr.note_abort_ack(room, 0)
         mgr.note_abort_ack(room, 0)  # same rank twice
         # Two acks arrived but from one rank: not safe for a 2-rank prefill.
@@ -53,16 +54,63 @@ class TestAbortAckAggregation(CustomTestCase):
     def test_single_rank_fast_path(self):
         mgr = _make_manager()
         room = 102
+        mgr.register_deferred_abort_room(room)
         mgr.note_abort_ack(room, 0)
         self.assertTrue(mgr.is_abort_release_safe(room, required_acks=1))
 
     def test_clear_deferred_abort_state(self):
         mgr = _make_manager()
         room = 103
+        mgr.register_deferred_abort_room(room)
         mgr.note_abort_ack(room, 0)
         mgr.clear_deferred_abort_state(room)
         self.assertNotIn(room, mgr._deferred_abort_ack_tracker)
         self.assertFalse(mgr.is_abort_release_safe(room, required_acks=1))
+
+    def test_ack_before_register_is_dropped(self):
+        # An ack for a room that isn't actively held must not be recorded (it
+        # would otherwise pollute a later request reusing the same room).
+        mgr = _make_manager()
+        room = 104
+        mgr.note_abort_ack(room, 0)  # no register yet
+        self.assertNotIn(room, mgr._deferred_abort_ack_tracker)
+        self.assertFalse(mgr.is_abort_release_safe(room, required_acks=1))
+
+    def test_late_ack_after_release_does_not_pollute_reused_room(self):
+        # Regression for bootstrap_room reuse: req A (room R) releases, then a
+        # late ack from A arrives, then req B reuses room R. B must start from a
+        # clean slate and not inherit A's ack (which would release B early while
+        # its transfer is still in flight -> KV corruption).
+        mgr = _make_manager()
+        room = 105
+
+        # Req A: held, one of two ranks acks, then released (e.g. timed out).
+        mgr.register_deferred_abort_room(room)
+        mgr.note_abort_ack(room, 0)
+        mgr.clear_deferred_abort_state(room)
+
+        # Late ack from A's other rank arrives after release -> dropped.
+        mgr.note_abort_ack(room, 1)
+        self.assertNotIn(room, mgr._deferred_abort_ack_tracker)
+
+        # Req B reuses room R.
+        mgr.register_deferred_abort_room(room)
+        # Only B's rank-0 has acked so far; a 2-rank prefill is NOT safe yet.
+        mgr.note_abort_ack(room, 0)
+        self.assertFalse(mgr.is_abort_release_safe(room, required_acks=2))
+        mgr.note_abort_ack(room, 1)
+        self.assertTrue(mgr.is_abort_release_safe(room, required_acks=2))
+
+    def test_register_resets_stale_acks(self):
+        mgr = _make_manager()
+        room = 106
+        mgr.register_deferred_abort_room(room)
+        mgr.note_abort_ack(room, 0)
+        mgr.note_abort_ack(room, 1)
+        self.assertTrue(mgr.is_abort_release_safe(room, required_acks=2))
+        # Re-registering (a later reuse) wipes the prior acks.
+        mgr.register_deferred_abort_room(room)
+        self.assertFalse(mgr.is_abort_release_safe(room, required_acks=2))
 
 
 class _FakeIdxAllocator:
@@ -112,6 +160,9 @@ class TestResolveDeferredReleases(CustomTestCase):
         room, idx = 200, 7
         q = _make_queue()
         dreq = _make_decode_req(room, idx, mgr, n_prefill_ranks=2)
+        # In production the room is armed in abort_request when the ABORT is
+        # sent, before the scheduler defers here.
+        mgr.register_deferred_abort_room(room)
         q._defer_release(dreq)
 
         with patch.object(decode_mod, "release_kv_cache") as rel:
@@ -153,6 +204,32 @@ class TestResolveDeferredReleases(CustomTestCase):
         self.assertEqual(q._deferred_releases, [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
         self.assertIsNone(dreq.kv_receiver)
+
+    def test_failed_release_is_isolated_and_not_retried(self):
+        # A raising _do_release must drop the entry (no double-free on retry) and
+        # not brick resolve for the remaining entries or subsequent calls.
+        mgr = _make_manager()
+        q = _make_queue()
+        good = _make_decode_req(700, 1, mgr)
+        bad = _make_decode_req(701, 2, mgr)
+        # Both already past deadline -> both selected for release.
+        q._deferred_releases.append((bad, float("-inf"), 2, 1))
+        q._deferred_releases.append((good, float("-inf"), 1, 1))
+
+        calls = []
+
+        def fake_release(req, tree_cache, is_insert):
+            calls.append(req)
+            if req is bad.req:
+                raise RuntimeError("boom")
+
+        with patch.object(decode_mod, "release_kv_cache", side_effect=fake_release):
+            q.resolve_deferred_releases()  # must not raise
+            # The good one still released despite the bad one throwing.
+            self.assertIn(good.req, calls)
+            # Nothing left held, and a second call is a clean no-op (no retry).
+            self.assertEqual(q._deferred_releases, [])
+            q.resolve_deferred_releases()
 
     def test_defer_release_records_deadline_and_idx(self):
         mgr = _make_manager()

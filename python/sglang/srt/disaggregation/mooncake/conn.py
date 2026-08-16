@@ -2041,20 +2041,24 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     if self.enable_deferred_decode_kv_release:
                         # Deferred release: hold the ACK until the in-flight
-                        # transfer drains. Register the target BEFORE marking the
-                        # room Failed so the transfer worker -- which acks on the
-                        # Failed transition it observes -- always sees it. We do
-                        # NOT ack from this thread for an active room: only the
-                        # worker that owns the room knows when its write finished,
-                        # and acking here could race an in-flight write. If nothing
-                        # is in flight the worker never revisits the room and decode
+                        # transfer drains. Mark the room Failed FIRST (this stops
+                        # add_transfer_request from enqueuing any new chunk), THEN
+                        # register the ack target. Doing it in this order is
+                        # essential: if we registered first, the worker could
+                        # finish the in-flight chunk and ack (releasing the decode
+                        # pages) while the room is not yet Failed, letting a newly
+                        # enqueued chunk still write to those freed pages. We do
+                        # NOT ack from this thread for an active room -- only the
+                        # worker that owns the room knows when its write finished;
+                        # acking here would race an in-flight write. If nothing is
+                        # in flight the worker never revisits the room and decode
                         # falls back to its release timeout.
                         if room_active:
+                            self.update_status(room_to_be_aborted, KVPoll.Failed)
                             self._deferred_ack_targets[room_to_be_aborted] = (
                                 decode_ip,
                                 decode_port,
                             )
-                            self.update_status(room_to_be_aborted, KVPoll.Failed)
                             logger.debug(
                                 f"Received abort notification for room {room_to_be_aborted}, "
                                 f"marked as Failed; ACK deferred until transfer drains"

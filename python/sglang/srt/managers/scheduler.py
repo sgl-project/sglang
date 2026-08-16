@@ -4546,7 +4546,24 @@ class Scheduler(
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
+                    was_notified = decode_req.kv_receiver.abort_notified
                     decode_req.kv_receiver.abort()
+                    # Arm drain-ack accounting the first time the ABORT is sent,
+                    # so ABORT_ACKs that arrive before the scheduler defers this
+                    # req -- e.g. during the next forward step -- are captured
+                    # rather than dropped. Only on the notify transition, so a
+                    # repeated abort of the same req cannot wipe acks already
+                    # collected. A fresh set also drops any stale acks from a
+                    # prior request that reused this bootstrap_room.
+                    kv_mgr = decode_req.kv_receiver.kv_mgr
+                    if (
+                        kv_mgr.enable_deferred_decode_kv_release
+                        and not was_notified
+                        and decode_req.kv_receiver.abort_notified
+                    ):
+                        kv_mgr.register_deferred_abort_room(
+                            decode_req.req.bootstrap_room
+                        )
 
             # Abort requests already retracted to CPU cache
             if self.disagg_decode_prealloc_queue.retracted_queue:

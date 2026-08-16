@@ -258,7 +258,10 @@ class CommonKVManager(BaseKVManager):
             # ABORT_ACK) their in-flight transfer for an aborted room has
             # drained. A room is safe to release once every required prefill
             # rank has acked (mirrors prefill_response_tracker for Success).
-            self._deferred_abort_ack_tracker: Dict[int, Set[int]] = defaultdict(set)
+            # A room's entry exists only while it is actively being held; acks
+            # for an unregistered room are dropped so a stale/late ack can never
+            # pollute a later request that reuses the same bootstrap_room.
+            self._deferred_abort_ack_tracker: Dict[int, Set[int]] = {}
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
@@ -343,14 +346,21 @@ class CommonKVManager(BaseKVManager):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
 
+    def register_deferred_abort_room(self, bootstrap_room: int) -> None:
+        """Start (or reset) drain-ack accounting for a room the decode scheduler
+        is now holding. A fresh set wipes any stale acks from a prior request
+        that reused this bootstrap_room, and gates note_abort_ack so late acks
+        for an already-released room are ignored."""
+        self._deferred_abort_ack_tracker[bootstrap_room] = set()
+
     def note_abort_ack(self, bootstrap_room: int, prefill_rank: int) -> None:
         """Record that ``prefill_rank`` has drained its in-flight transfer for an
-        aborted room (called from the decode receiver thread on ABORT_ACK).
-
-        Kept independent of ``required_prefill_response_num_table``: the failing
-        request's receiver clears that table before the scheduler defers, so the
-        required count is snapshotted at defer time (see is_abort_release_safe)."""
-        self._deferred_abort_ack_tracker[bootstrap_room].add(prefill_rank)
+        aborted room (called from the decode receiver thread on ABORT_ACK). Only
+        counts while the room is actively held; grabs the set by reference so a
+        concurrent clear on the scheduler thread cannot raise."""
+        acks = self._deferred_abort_ack_tracker.get(bootstrap_room)
+        if acks is not None:
+            acks.add(prefill_rank)
 
     def is_abort_release_safe(self, bootstrap_room: int, required_acks: int) -> bool:
         """True once every prefill rank that could still be writing to this
@@ -1265,6 +1275,11 @@ class CommonKVSender(BaseKVSender):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "_deferred_ack_targets"):
+            # Drop a held drain-ack target if the room concluded without the
+            # transfer worker ever draining it (e.g. aborted before any chunk
+            # was enqueued); otherwise it would leak on the prefill.
+            self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
 
     def abort(self):
         self.kv_mgr.record_failure(

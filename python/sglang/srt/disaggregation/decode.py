@@ -2086,11 +2086,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                if self.enable_deferred_kv_release:
-                    # An in-flight prefill->decode write may still target this
+                if (
+                    self.enable_deferred_kv_release
+                    and decode_req.kv_receiver.abort_notified
+                ):
+                    # This decode initiated the abort (an ABORT was sent to
+                    # prefill and the drain-ack tracker was armed), so an
+                    # in-flight prefill->decode write may still target this
                     # request's KV pages. Hold the pages/req-slot + metadata
                     # buffer until the prefill confirms the transfer drained
                     # (ABORT_ACK) or the timeout fires (resolve_deferred_releases).
+                    # A prefill-initiated failure (abort_notified is False) has
+                    # already stopped writing, so it falls through to immediate
+                    # release below.
                     self._defer_release(decode_req)
                     deferred_indices.add(i)
                     indices_to_remove.add(i)
@@ -2192,21 +2200,32 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             return
         now = time.monotonic()
         still_held = []
+        to_release = []
         for decode_req, deadline, idx, required_acks in self._deferred_releases:
             room = decode_req.req.bootstrap_room
             kv_mgr = decode_req.kv_receiver.kv_mgr
             drained = kv_mgr.is_abort_release_safe(room, required_acks)
             if not drained and now < deadline:
                 still_held.append((decode_req, deadline, idx, required_acks))
-                continue
+            else:
+                to_release.append((decode_req, idx, room, drained))
+        # Commit the surviving set before releasing anything: an exception in
+        # _do_release must not leave an already-released entry in the list
+        # (a retry would double-free its metadata idx / hit a None receiver).
+        self._deferred_releases = still_held
+        for decode_req, idx, room, drained in to_release:
             if not drained:
                 logger.warning(
                     f"Deferred KV release for room {room} timed out after "
                     f"{self.deferred_kv_release_timeout}s without a full drain "
                     f"ack from prefill; releasing anyway."
                 )
-            self._do_release(decode_req, idx)
-        self._deferred_releases = still_held
+            try:
+                self._do_release(decode_req, idx)
+            except Exception:
+                # Isolate a single failed release so the rest still run and the
+                # decode loop is not bricked; the entry is already dropped.
+                logger.exception(f"Deferred KV release failed for room {room}")
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
@@ -2432,6 +2451,12 @@ class SchedulerDisaggregationDecodeMixin:
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
+        # Resolve held deferred releases first, every iteration and regardless of
+        # the polling gate / retraction early-return below: their timeouts must
+        # still fire under memory pressure, and freeing them here gives the
+        # retracted-request resumption more room to work with.
+        self.disagg_decode_transfer_queue.resolve_deferred_releases()
+
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
@@ -2451,7 +2476,6 @@ class SchedulerDisaggregationDecodeMixin:
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
-            self.disagg_decode_transfer_queue.resolve_deferred_releases()
             if self.enable_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
