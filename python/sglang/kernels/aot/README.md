@@ -44,6 +44,33 @@ make build MAX_JOBS=2
 make build MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
 ```
 
+### Windows ARM64
+
+Windows ARM64 builds require native ARM64 Python, CUDA-enabled ARM64 PyTorch,
+CUDA Toolkit 13+, and Visual Studio Build Tools with the ARM64 C++ toolchain.
+The Windows wheel intentionally contains the SM100+ `common_ops` module and
+omits optional Linux-oriented modules (FA3, FlashMLA, InfLLM-V2, spatial ops,
+and bundled Triton kernels).
+
+```powershell
+.\build_windows_arm64.ps1 `
+  -Python python `
+  -Wheelhouse C:\path\to\arm64\wheelhouse `
+  -CudaArchitectures 121a
+```
+
+Run the Windows ARM64 smoke test after installing the wheel:
+
+```powershell
+python -m pip install --force-reinstall --no-deps .\dist\sglang_kernel-*-win_arm64.whl
+python -m pytest --confcutdir .\tests\windows .\tests\windows\test_windows_arm64_smoke.py
+```
+
+GitHub-hosted Windows ARM64 runners currently do not include the Windows ARM64
+CUDA Toolkit, and PyTorch does not publish a Windows ARM64 wheel. The build must
+therefore run on a CUDA-enabled Windows ARM64 runner with a compatible PyTorch
+wheel preinstalled.
+
 ## Contribution
 
 ### Steps to add a new kernel:

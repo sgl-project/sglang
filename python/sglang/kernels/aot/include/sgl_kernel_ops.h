@@ -96,6 +96,7 @@ void register_graph_buffers(
  */
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
+#ifdef SGL_KERNEL_ENABLE_CUTLASS_MLA
 void cutlass_mla_decode(
     torch::Tensor const& out,
     torch::Tensor const& q_nope,
@@ -111,6 +112,7 @@ int64_t cutlass_mla_get_workspace_size(
     int64_t num_batches,
     int64_t sm_count = 0,
     int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
+#endif
 
 /*
  * From csrc/infllm_v2
@@ -220,6 +222,7 @@ void dsv4_fused_q_indexer_rope_hadamard_quant(
 /*
  * From csrc/gemm
  */
+#ifdef SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);
 torch::Tensor int8_scaled_mm(
     const torch::Tensor& mat_a,
@@ -235,6 +238,7 @@ torch::Tensor fp8_scaled_mm(
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype,
     const c10::optional<torch::Tensor>& bias);
+#endif
 void sgl_per_token_group_quant_8bit(
     at::Tensor input,
     at::Tensor output_q,
@@ -257,6 +261,7 @@ void sgl_per_token_group_quant_8bit_v2(
     const std::optional<torch::Tensor>& masked_m);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 
+#ifdef SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS
 torch::Tensor gptq_gemm(
     torch::Tensor a,
     torch::Tensor b_q_weight,
@@ -267,6 +272,7 @@ torch::Tensor gptq_gemm(
     int64_t bit);
 
 void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
+#endif
 
 /*
  * From csrc/moe
@@ -301,6 +307,7 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
 
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
 
+#ifdef SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS
 void fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
     torch::Tensor& a_ptrs,
@@ -320,6 +327,7 @@ void fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace);
+#endif
 
 void prepare_moe_input(
     const torch::Tensor& topk_ids,
@@ -391,6 +399,7 @@ void fused_qk_norm_rope(
 /*
  * From csrc/moe/cutlass_moe/w4a8
  */
+#ifdef SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS
 void get_cutlass_w4a8_moe_mm_data(
     const torch::Tensor& topk_ids,
     torch::Tensor& expert_offsets,
@@ -416,6 +425,7 @@ void cutlass_w4a8_moe_mm(
     torch::Tensor const& s_strides,
     int64_t chunk_size,
     int64_t topk);
+#endif
 /*
  * From csrc/speculative
  */
@@ -647,6 +657,7 @@ namespace flash {
 /*
  * From fa2 sparse
  */
+#ifdef SGL_KERNEL_ENABLE_SPARSE_FLASH_ATTN
 std::vector<at::Tensor> mha_fwd_sparse(
     at::Tensor& q,        // batch_size x seqlen_q x num_heads x head_size
     const at::Tensor& k,  // batch_size x seqlen_k x num_heads_k x head_size
@@ -687,6 +698,7 @@ std::vector<at::Tensor> mha_varlen_fwd_sparse(
     const double softcap,
     const bool return_softmax,
     c10::optional<at::Generator> gen_);
+#endif
 }  // namespace flash
 
 void convert_vertical_slash_indexes(
@@ -758,6 +770,7 @@ std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, i
 /*
  * From csrc/mamba
  */
+#ifdef SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS
 void causal_conv1d_update(
     const at::Tensor& x,
     const at::Tensor& conv_state,
@@ -778,10 +791,12 @@ void causal_conv1d_fwd(
     const std::optional<at::Tensor>& has_initial_state,
     bool silu_activation,
     int64_t pad_slot_id);
+#endif
 
 /*
  * From csrc/expert_specialization
  */
+#ifdef SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS
 void es_fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
     const torch::Tensor& a,
@@ -812,6 +827,7 @@ void es_sm100_mxfp8_blockscaled_grouped_quant(
     const torch::Tensor& blockscale_offsets,
     torch::Tensor& quant_output,
     torch::Tensor& scale_factor);
+#endif
 
 /*
  * From flashmla
