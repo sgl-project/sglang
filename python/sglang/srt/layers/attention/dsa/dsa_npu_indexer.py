@@ -647,7 +647,7 @@ class DSANPUIndexerMixin:
                 query_quant_mode=0,
                 key_quant_mode=0,
             )
-            return topk_indices_prev, topk_indices_next
+            return torch.cat([topk_indices_prev, topk_indices_next], dim=0).squeeze(1)
 
         else:
             topk_indices_prev = torch_npu.npu_lightning_indexer(
@@ -682,7 +682,7 @@ class DSANPUIndexerMixin:
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
-            return topk_indices_prev[0], topk_indices_next[0]
+            return torch.cat([topk_indices_prev[0], topk_indices_next[0]], dim=0).squeeze(1)
 
 
 def scattered_to_tp_attn_full(
