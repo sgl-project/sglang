@@ -26,7 +26,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def processor_cls_for(architecture, model_type):
-    """Through the production selection, as `resolve_native_spec` calls it."""
+    """Through the production selection, as `resolve_mm_spec` calls it."""
     hf_config = SimpleNamespace(architectures=[architecture], model_type=model_type)
     return get_mm_processor_cls(hf_config, SimpleNamespace(model_impl="sglang"))
 

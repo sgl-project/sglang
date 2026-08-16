@@ -44,7 +44,7 @@ pub struct Ingress {
     senders: Senders,
     ingress: IngressProducer,
     limits: Limits,
-    mm: Mm,
+    mm: MmDispatch,
     /// Requests parked in `Encoding` while an MM worker processes their media;
     /// resumed by `MmEncoded` / `MmFailed`. Only this thread touches it, so no
     /// lock.
@@ -52,19 +52,19 @@ pub struct Ingress {
     shutdown: flume::Receiver<()>,
 }
 
-/// The ingress side of the MM path.
+/// Dispatches multimodal requests onto the MM worker channel.
 #[derive(Clone)]
-pub struct Mm {
+pub struct MmDispatch {
     /// Whether the model is multimodal. When false, mm fields are silently
     /// ignored, as the Python `TokenizerManager` does with `mm_processor is
     /// None`.
     pub enabled: bool,
     /// → MM worker pool (spawned via `Server.start_mm_workers`).
     pub tx: flume::Sender<MmRequest>,
-    /// Results sidecar. Purged here when a late result arrives for a request
+    /// Parked results. Purged here when a late result arrives for a request
     /// that is no longer parked; otherwise it would leak, since only the
     /// scheduler drain pops entries.
-    pub sidecar: crate::mm::Sidecar,
+    pub results: crate::mm::MmResultStore,
 }
 
 /// Longest client-supplied rid accepted. It keys the detok table and travels on
@@ -127,7 +127,7 @@ impl Ingress {
         senders: Senders,
         ingress: IngressProducer,
         limits: Limits,
-        mm: Mm,
+        mm: MmDispatch,
         shutdown: flume::Receiver<()>,
     ) -> Self {
         Self {
@@ -202,7 +202,7 @@ impl Ingress {
         }
         // A rejected request never reaches the scheduler drain, so purge any
         // parked MM result (no-op for the common non-mm request).
-        self.mm.sidecar.purge(req.rid.as_str());
+        self.mm.results.purge(req.rid.as_str());
         let _ = req.state.apply(Event::Error(err.clone()));
         let _ = req.sink.try_send(EgressItem::Error(err)); // client may be gone
         if registered {
@@ -477,7 +477,7 @@ impl Ingress {
         let Some(mut req) = self.pending_mm.remove(&rid) else {
             tracing::debug!(rid = %rid, "mm result for unknown/finished request; dropped");
             // It will never reach the scheduler drain, so purge or leak.
-            self.mm.sidecar.purge(rid.as_str());
+            self.mm.results.purge(rid.as_str());
             return;
         };
         if let RequestKind::Generate(g) = &mut req.kind {
@@ -507,8 +507,8 @@ impl Ingress {
     /// ([`Rid::from_client`]), so no later request can ever answer to it.
     ///
     /// A request parked in `pending_mm` is cancelled here, so the worker's late
-    /// result lands in `on_mm_encoded`'s no-entry branch and purges the sidecar —
-    /// no generation runs for output nobody will read.
+    /// result lands in `on_mm_encoded`'s no-entry branch and purges the parked
+    /// result — no generation runs for output nobody will read.
     fn on_abort(&mut self, source: AbortSource) {
         let rid = source.rid().clone();
         if self.pending_mm.remove(&rid).is_some() {
@@ -803,12 +803,12 @@ mod tests {
         (ingress, detok_rx, consumer, tm_tx, mm_rx)
     }
 
-    /// An [`Mm`] over `tx` with a fresh sidecar.
-    fn test_mm(tx: flume::Sender<MmRequest>, enabled: bool) -> Mm {
-        Mm {
+    /// An [`MmDispatch`] over `tx` with a fresh result store.
+    fn test_mm(tx: flume::Sender<MmRequest>, enabled: bool) -> MmDispatch {
+        MmDispatch {
             enabled,
             tx,
-            sidecar: Default::default(),
+            results: Default::default(),
         }
     }
 
@@ -1478,7 +1478,7 @@ mod tests {
 
     /// An abort while the request is parked for MM cancels it: the pending
     /// entry is removed, the worker's late result is dropped, and its parked
-    /// sidecar entry is purged — no scheduler work runs for a dead client.
+    /// result-store entry is purged — no scheduler work runs for a dead client.
     #[test]
     fn abort_cancels_parked_mm_request() {
         let (mut ingress, _detok_rx, consumer, _tm_tx, mm_rx) = make_ingress();
@@ -1486,9 +1486,9 @@ mod tests {
         mm_rx.try_recv().expect("parked to mm pool");
 
         // The worker parks its result, as it always does before MmEncoded.
-        ingress.mm.sidecar.park(
+        ingress.mm.results.park(
             "mm-gone".into(),
-            crate::mm::MmSidecarEntry {
+            crate::mm::MmEncodedEntry {
                 features: crate::mm::FeatureStore::Inline(vec![]),
                 grids: vec![],
                 hashes: vec![],
@@ -1500,13 +1500,13 @@ mod tests {
         ingress.on_abort(AbortSource::Guard("mm-gone".to_string().into()));
         assert_eq!(consumer.drain(16).headers.len(), 1, "only the AbortReq");
 
-        // The late result must be dropped, not queued, and the sidecar purged.
+        // The late result must be dropped, not queued, and the parked result purged.
         ingress.on_mm_encoded("mm-gone".to_string().into(), vec![5, 6]);
         assert!(
             consumer.drain(16).headers.is_empty(),
             "cancelled, not queued"
         );
-        assert!(ingress.mm.sidecar.take("mm-gone").is_none(), "entry purged");
+        assert!(ingress.mm.results.take("mm-gone").is_none(), "entry purged");
     }
 
     /// A multimodal request parks in `Encoding` (submitted to the mm worker
