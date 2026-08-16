@@ -483,12 +483,17 @@ class LTX2TwoStageResidencyStrategy(ComponentResidencyStrategy):
     ) -> None:
         self.exit_phase(self._phase(use))
 
-    def prepare_after_request(
+    def finish_request(
         self,
         module: torch.nn.Module,
         use: ComponentUse,
         state: ResidencyState,
+        *,
+        preferred: bool,
     ) -> None:
+        if not preferred:
+            self.finish_use(module, use, state)
+            return
         phase = self._phase(use)
         if phase != self.manager._active_phase:
             self.enter_phase(phase)
@@ -539,7 +544,7 @@ class LTX2ResidentResidencyStrategy(LTX2TwoStageResidencyStrategy):
 class LTX2TwoStageResidencyController:
     """
     LTX-2.3 two-stage residency controller.
-    It builds the selected LTX2 ComponentResidencyStrategy and keeps the
+    It builds the selected LTX2 component residency strategy and keeps the
     thin stage adapter methods that are specific to two-stage LoRA flow.
 
     Modes:

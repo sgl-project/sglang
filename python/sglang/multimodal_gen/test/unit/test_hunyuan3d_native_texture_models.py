@@ -21,6 +21,9 @@ from sglang.multimodal_gen.runtime.models.dits.stable_diffusion import (
     StableDiffusionUNetConfig,
 )
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
+from sglang.multimodal_gen.runtime.pipelines.hunyuan3d_pipeline import (
+    Hunyuan3D2Pipeline,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan3d.paint import (
     Hunyuan3DPaintPostprocessStage,
     Hunyuan3DPaintTexGenStage,
@@ -186,6 +189,20 @@ class TestHunyuan3DWarmupOutput(unittest.TestCase):
         output = stage.forward(self._batch(), SimpleNamespace())
 
         self.assertEqual(output.output_file_paths, [])
+
+
+class TestHunyuan3DComponentResidency(unittest.TestCase):
+    def test_layerwise_texture_component_starts_on_cpu(self):
+        server_args = SimpleNamespace(
+            should_start_component_on_cpu=lambda component_name: (
+                component_name == "paint_transformer"
+            )
+        )
+
+        self.assertEqual(
+            Hunyuan3D2Pipeline._component_device(server_args, "paint_transformer"),
+            torch.device("cpu"),
+        )
 
 
 class TestHunyuan3DPaintTurboSchedule(unittest.TestCase):
