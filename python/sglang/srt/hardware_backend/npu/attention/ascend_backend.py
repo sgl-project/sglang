@@ -1523,10 +1523,15 @@ class AscendAttnBackend(AttentionBackend):
             and is_dsa_enable_prefill_cp()
             and forward_batch.attn_cp_metadata is not None
         ):
-            # if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
-            #     raise NotImplementedError(
-            #         "Ascend packed FP8 DSA attention does not support prefill CP."
-            #     )
+            cp_meta = forward_batch.attn_cp_metadata
+            actual_seq_qlen = (
+                cp_meta.actual_seq_q_prev_tensor,
+                cp_meta.actual_seq_q_next_tensor,
+            )
+            actual_seq_lengths_kv = (
+                cp_meta.kv_len_prev_tensor,
+                cp_meta.kv_len_next_tensor,
+            )
             attn_out = self.do_cp_balance_attn(
                 q_nope,
                 k_nope,
