@@ -277,6 +277,7 @@ class RuntimeHandle:
             from sglang.srt.managers.io_struct import GenerateReqInput
 
             obj = GenerateReqInput(**req_dict)
+            obj.normalize_batch_and_arguments()
             stream = req_dict.get("stream", False)
             self._submit_on_tm_loop(
                 self._run_generate(obj, chunk_callback, stream, mock_request)
@@ -285,6 +286,7 @@ class RuntimeHandle:
             from sglang.srt.managers.io_struct import EmbeddingReqInput
 
             obj = EmbeddingReqInput(**req_dict)
+            obj.normalize_batch_and_arguments()
             self._submit_on_tm_loop(self._run_embed(obj, chunk_callback, mock_request))
         else:
             raise ValueError(
