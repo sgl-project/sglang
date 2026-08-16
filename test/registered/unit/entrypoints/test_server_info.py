@@ -43,15 +43,13 @@ def _stub_tokenizer_manager(
     """A manager carrying the state `/server_info` and its writers read.
 
     `__new__` skips `__init__`, which would open the ZMQ sockets and start
-    the handle loop; `_config_updates` is the log `record_config_updates`
-    appends to.
+    the handle loop.
     """
     tokenizer_manager = TokenizerManager.__new__(TokenizerManager)
     tokenizer_manager.server_args = server_args
     tokenizer_manager.model_path = server_args.model_path
     tokenizer_manager.served_model_name = server_args.served_model_name
     tokenizer_manager.startup_time = None
-    tokenizer_manager._config_updates = []
     tokenizer_manager.get_internal_state = get_internal_state
     return tokenizer_manager
 

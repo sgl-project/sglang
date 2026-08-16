@@ -367,6 +367,8 @@ _EXPOSED_CUDA_ONLY: frozenset = frozenset()
 # some code overrides post-publish. Each needs an ordering judgment, not a blanket
 # conversion; the list exists so a new one is a decision made when it is written.
 _OVERRIDDEN_AND_READ = {
+    ("entrypoints/engine.py", "reasoning_parser"),
+    ("entrypoints/engine.py", "tool_call_parser"),
     ("configs/model_config.py", "dtype"),
     ("configs/model_config.py", "model_path"),
     ("disaggregation/decode_kvcache_offload_manager.py", "hicache_storage_backend"),
@@ -442,11 +444,53 @@ def _expanded_override_keys(rel, tree, call, kw) -> set:
         ):
             return set()
 
+    def loop_variable_values(name: str) -> set:
+        """The values a `for name, ... in (<literal tuples>)` loop binds.
+
+        A handler that records one field per loop iteration spells the field
+        names in the loop's own literal, so they are still static.
+        """
+        values = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.For):
+                continue
+            target = node.target
+            names = (
+                [target]
+                if isinstance(target, ast.Name)
+                else list(getattr(target, "elts", []))
+            )
+            if not names or not isinstance(names[0], ast.Name) or names[0].id != name:
+                continue
+            if not (node.lineno <= call.lineno <= (node.end_lineno or node.lineno)):
+                continue
+            for item in getattr(node.iter, "elts", []):
+                first = (
+                    item.elts[0] if isinstance(item, ast.Tuple) and item.elts else item
+                )
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    values.add(first.value)
+        return values
+
     def dict_keys(node) -> set:
-        assert isinstance(node, ast.Dict) and all(
-            isinstance(key, ast.Constant) for key in node.keys
+        assert isinstance(
+            node, ast.Dict
         ), f"non-literal dict in override expansion at {rel}:{call.lineno}"
-        return {key.value for key in node.keys}
+        keys = set()
+        for key in node.keys:
+            if isinstance(key, ast.Constant):
+                keys.add(key.value)
+                continue
+            assert isinstance(
+                key, ast.Name
+            ), f"non-literal dict key in override expansion at {rel}:{call.lineno}"
+            bound = loop_variable_values(key.id)
+            assert bound, (
+                f"dict key {key.id!r} at {rel}:{call.lineno} is not bound by a "
+                "literal loop; extend the resolver"
+            )
+            keys |= bound
+        return keys
 
     if isinstance(kw.value, ast.Dict):
         return dict_keys(kw.value)
@@ -941,25 +985,37 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                 raise AssertionError(f"unparsable module in the census: {rel}")
             for node in ast.walk(tree):
                 if not (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "override"
+                    isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 ):
                     continue
                 base = node.func.value
-                if (
+                is_override = node.func.attr == "override" and (
                     isinstance(base, ast.Call)
                     and isinstance(base.func, ast.Name)
                     and base.func.id == "get_context"
-                ):
-                    for kw in node.keywords:
-                        if kw.arg == "source":
-                            # Override metadata, not a config field.
-                            continue
-                        if kw.arg:
-                            written.add(kw.arg)
-                        else:
-                            written |= _expanded_override_keys(rel, tree, node, kw)
+                )
+                # `record_config_updates` is a named wrapper over override, so
+                # its call sites are override sites. Its body forwards **kwargs
+                # and names no field, so skip the forwarding call itself.
+                is_wrapper = node.func.attr == "record_config_updates"
+                if not (is_override or is_wrapper):
+                    continue
+                inside_wrapper = any(
+                    isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and fn.name == "record_config_updates"
+                    and fn.lineno <= node.lineno <= (fn.end_lineno or fn.lineno)
+                    for fn in ast.walk(tree)
+                )
+                if inside_wrapper:
+                    continue
+                for kw in node.keywords:
+                    if kw.arg == "source":
+                        # Override metadata, not a config field.
+                        continue
+                    if kw.arg:
+                        written.add(kw.arg)
+                    else:
+                        written |= _expanded_override_keys(rel, tree, node, kw)
         return written
 
     def test_the_post_publish_override_surface_matches_the_pinned_list(self):
