@@ -698,15 +698,14 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer.layer_id
 
         if self.is_mxfp4:
-            # Quantize bf16 K/V and store packed fp4 + E8M0 scales.
-            from sglang.srt.layers.jit_kernels.mxfp4_kv import quantize_and_store
+            # Quantize bf16 K/V and store packed fp4 + E8M0 scales (one launch).
+            from sglang.srt.layers.jit_kernels.mxfp4_kv import quantize_and_store_kv
 
             local_id = layer_id - self.start_layer
-            quantize_and_store(
-                cache_k, loc, self.k_data_buffer[local_id], self.k_scale_buffer[local_id]
-            )
-            quantize_and_store(
-                cache_v, loc, self.v_data_buffer[local_id], self.v_scale_buffer[local_id]
+            quantize_and_store_kv(
+                cache_k, cache_v, loc,
+                self.k_data_buffer[local_id], self.k_scale_buffer[local_id],
+                self.v_data_buffer[local_id], self.v_scale_buffer[local_id],
             )
             return
 

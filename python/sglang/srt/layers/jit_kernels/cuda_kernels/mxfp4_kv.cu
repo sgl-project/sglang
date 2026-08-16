@@ -136,6 +136,81 @@ __global__ void mxfp4_quantize_store_kernel(
   }
 }
 
+// K and V in one launch (halves per-layer launches in eager decode).
+__global__ void mxfp4_quantize_store_kv_kernel(
+    const __nv_bfloat16* __restrict__ cache_k, const __nv_bfloat16* __restrict__ cache_v,
+    int64_t* __restrict__ loc,
+    uint8_t* __restrict__ k_data, uint8_t* __restrict__ k_scale,
+    uint8_t* __restrict__ v_data, uint8_t* __restrict__ v_scale,
+    int T, int H) {
+  const int warp_id = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int row_in_warp = lane >> 4;
+  const int sub_lane = lane & 15;
+  const int blk = sub_lane / (MXFP4_BLOCK / 8);
+  const int sub_blk = sub_lane % (MXFP4_BLOCK / 8);
+
+  const int row = blockIdx.x * ROWS_PER_CTA + warp_id * 2 + row_in_warp;
+  if (row >= T * H) return;
+  const int token = row / H;
+  const int head = row % H;
+  const int slot = (int)loc[token];
+
+  const int elem0 = sub_lane * 8;
+  const long long row_off = (long long)row * MXFP4_HEAD_DIM + elem0;
+  // K
+  float vals[8];
+  {
+    const float4 v = *reinterpret_cast<const float4*>(cache_k + row_off);
+    const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&v);
+#pragma unroll
+    for (int i = 0; i < 8; i++) vals[i] = __bfloat162float(h[i]);
+  }
+  float m = block_absmax4(vals);
+  m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1, 16));
+  if (MXFP4_BLOCK == 32) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2, 16));
+  const int exp_ = exp_from_max(m);
+  const float inv_scale = exp2f(-(float)exp_);
+  uint32_t packed = 0;
+#pragma unroll
+  for (int i = 0; i < 8; i += 2) {
+    const uint8_t lo = float_to_e2m1(vals[i] * inv_scale);
+    const uint8_t hi = float_to_e2m1(vals[i + 1] * inv_scale);
+    packed |= (uint32_t)((hi << 4) | lo) << (i / 2 * 8);
+  }
+  uint8_t* dst = k_data + ((long long)(slot * H + head)) * (MXFP4_HEAD_DIM / 2) + sub_lane * 4;
+  *reinterpret_cast<uint32_t*>(dst) = packed;
+  if (sub_blk == 0) {
+    k_scale[(long long)(slot * H + head) * (MXFP4_HEAD_DIM / MXFP4_BLOCK) + blk] =
+        (uint8_t)(exp_ + 127);
+  }
+  // V
+  {
+    const float4 v = *reinterpret_cast<const float4*>(cache_v + row_off);
+    const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&v);
+#pragma unroll
+    for (int i = 0; i < 8; i++) vals[i] = __bfloat162float(h[i]);
+  }
+  m = block_absmax4(vals);
+  m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1, 16));
+  if (MXFP4_BLOCK == 32) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2, 16));
+  const int exp_v = exp_from_max(m);
+  const float inv_scale_v = exp2f(-(float)exp_v);
+  packed = 0;
+#pragma unroll
+  for (int i = 0; i < 8; i += 2) {
+    const uint8_t lo = float_to_e2m1(vals[i] * inv_scale_v);
+    const uint8_t hi = float_to_e2m1(vals[i + 1] * inv_scale_v);
+    packed |= (uint32_t)((hi << 4) | lo) << (i / 2 * 8);
+  }
+  uint8_t* vdst = v_data + ((long long)(slot * H + head)) * (MXFP4_HEAD_DIM / 2) + sub_lane * 4;
+  *reinterpret_cast<uint32_t*>(vdst) = packed;
+  if (sub_blk == 0) {
+    v_scale[(long long)(slot * H + head) * (MXFP4_HEAD_DIM / MXFP4_BLOCK) + blk] =
+        (uint8_t)(exp_v + 127);
+  }
+}
+
 // ============================================================================
 // dequantize: packed fp4 [T, H, 64] + scale [T, H, 4] -> bf16 [T, H, 128].
 // Same thread mapping as quantize (16 threads per row).

@@ -27,6 +27,9 @@ _CPP_SRC = r"""
 #include <torch/extension.h>
 void mxfp4_quantize_store(torch::Tensor, torch::Tensor, torch::Tensor,
                           torch::Tensor, int64_t, int64_t, int64_t);
+void mxfp4_quantize_store_kv(torch::Tensor, torch::Tensor, torch::Tensor,
+                             torch::Tensor, torch::Tensor, torch::Tensor,
+                             torch::Tensor, int64_t, int64_t, int64_t);
 void mxfp4_dequantize(torch::Tensor, torch::Tensor, torch::Tensor,
                       int64_t, int64_t, int64_t);
 void mxfp4_dequantize_indices(torch::Tensor, torch::Tensor, torch::Tensor,
@@ -56,6 +59,20 @@ void mxfp4_quantize_store(torch::Tensor cache_kv, torch::Tensor loc,
       (const __nv_bfloat16*)cache_kv.data_ptr(),
       (int64_t*)loc.data_ptr(), (uint8_t*)data.data_ptr(),
       (uint8_t*)scale.data_ptr(), (int)t, (int)h);
+}
+
+void mxfp4_quantize_store_kv(torch::Tensor cache_k, torch::Tensor cache_v,
+                             torch::Tensor loc, torch::Tensor k_data,
+                             torch::Tensor k_scale, torch::Tensor v_data,
+                             torch::Tensor v_scale, int64_t t, int64_t h,
+                             int64_t stream) {
+  const int rows = (int)(t * h);
+  const int grid = (rows + 15) / 16;
+  mxfp4_quantize_store_kv_kernel<<<grid, 256, 0, cur_stream(stream)>>>(
+      (const __nv_bfloat16*)cache_k.data_ptr(),
+      (const __nv_bfloat16*)cache_v.data_ptr(), (int64_t*)loc.data_ptr(),
+      (uint8_t*)k_data.data_ptr(), (uint8_t*)k_scale.data_ptr(),
+      (uint8_t*)v_data.data_ptr(), (uint8_t*)v_scale.data_ptr(), (int)t, (int)h);
 }
 
 void mxfp4_dequantize(torch::Tensor data, torch::Tensor scale,
@@ -102,16 +119,12 @@ void mxfp4_decode_fused(torch::Tensor q, torch::Tensor k_data, torch::Tensor k_s
   const int batch = (int)kv_indptr.numel() - 1;
   dim3 grid(batch, num_kv_heads);
   dim3 block(flashinfer::kBdx, flashinfer::kBdy, flashinfer::kBdz);
-  // raw fp4 tiles (K+V) + K/V fp16 tiles (2 stages) + float merge area.
-  const size_t kRowBytes = flashinfer::kHeadDim / 2 + 4;
-  const size_t kTileRows = flashinfer::kBdz * flashinfer::kBdy * flashinfer::kTile;
-  const size_t smem =
-      2 * flashinfer::kStages * kTileRows * kRowBytes +  // raw fp4 (K+V)
-      2 * flashinfer::kStages * flashinfer::kBdz * flashinfer::kBdy *
-          flashinfer::kTile * flashinfer::kHeadDim * sizeof(__half) +
-      2 * (flashinfer::kBdz * flashinfer::kBdy * flashinfer::kHeadDim *
-               sizeof(float) +
-           flashinfer::kBdz * flashinfer::kBdy * 2 * sizeof(float));
+  // K/V fp16 tiles (2 stages x K+V) + float merge area for sync_states.
+  const size_t smem = 2 * flashinfer::kStages * flashinfer::kBdz * flashinfer::kBdy *
+                      flashinfer::kTile * flashinfer::kHeadDim * sizeof(__half) +
+                      2 * (flashinfer::kBdz * flashinfer::kBdy * flashinfer::kHeadDim *
+                               sizeof(float) +
+                           flashinfer::kBdz * flashinfer::kBdy * 2 * sizeof(float));
   mxfp4_decode_fused_kernel<<<grid, block, smem, cur_stream(stream)>>>(
       *reinterpret_cast<flashinfer::Mxfp4DecodeParams*>(&params));
 }
@@ -132,6 +145,7 @@ def _load_ext():
         cuda_sources=[cuda_src, fused_src, _CUDA_WRAPPER_SRC],
         functions=[
             "mxfp4_quantize_store",
+            "mxfp4_quantize_store_kv",
             "mxfp4_dequantize",
             "mxfp4_dequantize_indices",
             "mxfp4_decode_fused",
@@ -226,6 +240,28 @@ def quantize_and_store(
     loc = _stage("loc", loc, _LOC_BUF_CAP, dtype=torch.int64)
     ext.mxfp4_quantize_store(
         cache_kv, loc, data, scale, t, h, torch.cuda.current_stream().cuda_stream
+    )
+
+
+def quantize_and_store_kv(
+    cache_k: torch.Tensor,  # [T, H, 128] bf16
+    cache_v: torch.Tensor,  # [T, H, 128] bf16
+    loc: torch.Tensor,      # [T] int64 slot per token
+    k_data: torch.Tensor,   # [S, H, 64] uint8 out
+    k_scale: torch.Tensor,  # [S, H, 4] uint8 out
+    v_data: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> None:
+    """Quantize and store K and V in a single kernel launch."""
+    ext = _load_ext()
+    t, h, d = cache_k.shape
+    assert d == 128, "MXFP4 KV kernel only supports head_dim=128"
+    cache_k = _stage("kv", cache_k.contiguous(), _KV_BUF_CAP)
+    cache_v = _stage("kv2", cache_v.contiguous(), _KV_BUF_CAP)
+    loc = _stage("loc", loc, _LOC_BUF_CAP, dtype=torch.int64)
+    ext.mxfp4_quantize_store_kv(
+        cache_k, cache_v, loc, k_data, k_scale, v_data, v_scale, t, h,
+        torch.cuda.current_stream().cuda_stream,
     )
 
 
