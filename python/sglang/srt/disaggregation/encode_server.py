@@ -911,7 +911,6 @@ class MMEncoder:
             raise InternalError(
                 f"Encoder artifact caching is not configured for {modality.name}"
             )
-        lookup_start = time.perf_counter()
         lookups: list[Optional[EncoderMediaLookup]] = [None] * len(mm_items)
         pending = {}
         for index, item in enumerate(mm_items):
@@ -969,31 +968,7 @@ class MMEncoder:
             )
         if any(lookup is None for lookup in lookups):
             raise InternalError("Encoder media identity lookup is incomplete")
-        resolved = list(lookups)
-        if encoder_metrics_collector is not None:
-            hit_count = sum(lookup.artifact is not None for lookup in resolved)
-            encoder_metrics_collector.record_preprocess_cache("hit", hit_count)
-            encoder_metrics_collector.record_preprocess_cache(
-                "miss", len(resolved) - hit_count
-            )
-            encoder_metrics_collector.record_content_identity(
-                "trusted", sum(lookup.snapshot is None for lookup in resolved)
-            )
-            encoder_metrics_collector.record_content_identity(
-                "server_computed",
-                sum(lookup.snapshot is not None for lookup in resolved),
-            )
-            stats = self.mm_preprocess_cache.stats()
-            encoder_metrics_collector.set_preprocess_cache_state(
-                stats["entries"],
-                stats["size_bytes"],
-                stats["evictions"],
-                stats["singleflight_joins"],
-            )
-            encoder_metrics_collector.observe_preprocess_phase(
-                "hash", time.perf_counter() - lookup_start
-            )
-        return resolved
+        return list(lookups)
 
     async def _materialize_encoder_media(
         self,
@@ -1751,19 +1726,6 @@ class MMEncoder:
         exist_mask = [m.item() == 1 for m in mask_tensor]
         missing_indices = [i for i, e in enumerate(exist_mask) if not e]
         hit_indices = [i for i, e in enumerate(exist_mask) if e]
-        if encoder_metrics_collector is not None and ctx.media_lookups is not None:
-            encoder_metrics_collector.record_skipped_stage("vit", len(hit_indices))
-            if ctx.mm_inputs is None:
-                prepared_indices = set(ctx.prepared_index_map or {})
-                metadata_hit_count = sum(
-                    index not in prepared_indices for index in hit_indices
-                )
-                encoder_metrics_collector.record_skipped_stage(
-                    "decode", metadata_hit_count
-                )
-                encoder_metrics_collector.record_skipped_stage(
-                    "processor", metadata_hit_count
-                )
         return missing_indices, hit_indices
 
     def _prefetch_global_cache_hits(
@@ -2341,16 +2303,10 @@ class MMEncoder:
     async def _process_image_items(self, mm_items, model_preprocessor):
         if not (self.image_processor or model_preprocessor):
             raise ValueError("No image processor available")
-        decode_start = time.perf_counter()
         images = await self._flatten_and_load_images(mm_items)
-        if encoder_metrics_collector is not None:
-            encoder_metrics_collector.observe_preprocess_phase(
-                "decode", time.perf_counter() - decode_start
-            )
         if self.model_type in ["kimi_k25", "kimi_k3", "kimi_vl"]:
             images = self._normalize_kimi_encoder_images(images)
         original_image_sizes = [_get_original_image_size(item) for item in images]
-        processor_start = time.perf_counter()
         if model_preprocessor:
             processor_output = invoke_encoder_preprocessor(
                 model_preprocessor,
@@ -2371,10 +2327,6 @@ class MMEncoder:
                     parallel.attn_tp_rank,
                     parallel.attn_tp_size,
                 )
-            if encoder_metrics_collector is not None:
-                encoder_metrics_collector.observe_preprocess_phase(
-                    "processor", time.perf_counter() - processor_start
-                )
             return processor_output
         image_config = self.vision_config.get("image", {})
         processor_input = await asyncio.get_running_loop().run_in_executor(
@@ -2386,10 +2338,6 @@ class MMEncoder:
         )
         if cache_config is not None and cache_config.capture_original_image_sizes:
             processor_input["original_image_sizes"] = original_image_sizes
-        if encoder_metrics_collector is not None:
-            encoder_metrics_collector.observe_preprocess_phase(
-                "processor", time.perf_counter() - processor_start
-            )
         return processor_input
 
     async def _process_video_items(self, mm_items, model_preprocessor):
@@ -2592,8 +2540,6 @@ class MMEncoder:
             encoder_metrics_collector.set_cache_state(
                 self.mm_cache.current_size, len(self.mm_cache)
             )
-            for stage in ("decode", "processor", "vit"):
-                encoder_metrics_collector.record_skipped_stage(stage, len(hit_indices))
         if self.profiler is not None:
             self.profiler.step()
         return grid_thw, output, aux_data
