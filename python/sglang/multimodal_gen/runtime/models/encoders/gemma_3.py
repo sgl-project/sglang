@@ -27,6 +27,9 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loa
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    EncoderTensorParallelMixin,
+)
 from sglang.multimodal_gen.runtime.utils.common import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -940,7 +943,9 @@ class Gemma3TextModel(nn.Module):
         return loaded_params
 
 
-class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin):
+class Gemma3ForConditionalGeneration(
+    EncoderTensorParallelMixin, nn.Module, LayerwiseOffloadableModuleMixin
+):
     # transformers 5.6.0 flattened SiglipVisionModel, dropping the
     # `vision_model` intermediate wrapper. Our reimpl keeps it, so remap
     # HF source keys back into our nested namespace when transferring weights.
