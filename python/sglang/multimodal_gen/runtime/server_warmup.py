@@ -101,6 +101,120 @@ def should_run_explicit_client_warmup(server_args: ServerArgs) -> bool:
     )
 
 
+def auto_residency_skip_reason(server_args: ServerArgs) -> str | None:
+    """Server-args-only gate for the warmup-calibrated residency promotion.
+
+    Only rules out paths the promotion was not designed for; the workers
+    re-check per component (explicit placement, FSDP modules, custom
+    strategies, missing sizes) and per measurement.
+    """
+    from sglang.multimodal_gen import envs
+    from sglang.multimodal_gen.configs.quantization.nunchaku import (
+        NunchakuSVDQuantArgs,
+    )
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    if envs.SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY:
+        return "disabled via SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY"
+    if server_args.performance_mode != "auto":
+        return f"performance_mode={server_args.performance_mode}"
+    if not should_run_synthetic_server_warmup(server_args):
+        return "no synthetic server warmup to calibrate from"
+    if server_args.backend == "diffusers":
+        return "diffusers backend"
+    if server_args.enable_breakable_cuda_graph:
+        return "breakable CUDA graph captures during warmup"
+    if envs.SGLANG_CACHE_DIT_ENABLED:
+        return "cache-dit enabled"
+    if server_args.batching_max_size > 1:
+        return "dynamic batching enabled"
+    if (server_args.dp_size or 1) > 1:
+        return "dp replicas warm up independently"
+    if server_args.use_fsdp_inference:
+        return "FSDP inference"
+    nunchaku = server_args.nunchaku_config
+    svdquant_enabled = nunchaku is not None and (
+        not isinstance(nunchaku, NunchakuSVDQuantArgs) or nunchaku.enable_svdquant
+    )
+    if (
+        server_args.quantization is not None
+        or server_args.transformer_weights_path
+        or svdquant_enabled
+    ):
+        # Residency changes shift the memory layout, which measurably moved
+        # fp8-quantized DiT outputs in the past (see PR #29649); keep
+        # quantized checkpoints on their configured strategy.
+        return "quantized checkpoint"
+    if not current_platform.is_cuda():
+        return "requires CUDA"
+    return None
+
+
+def _auto_residency_status(response: OutputBatch) -> str | None:
+    if isinstance(response.output, dict):
+        return response.output.get("status")
+    return None
+
+
+async def maybe_apply_auto_residency(
+    server_args: ServerArgs,
+    forward: Callable[[Req], Awaitable[OutputBatch]],
+) -> None:
+    """Promote implicitly offloaded components after warmup, then re-warm.
+
+    Runs between the synthetic warmup and the ready signal, so the residency
+    is frozen before ``/health`` turns 200. If a promotion (or the
+    post-promotion re-warmup) fails, the workers roll back and startup
+    continues on the original strategy; only a failed rollback raises, which
+    aborts startup.
+    """
+    from sglang.multimodal_gen.runtime.entrypoints.utils import AutoResidencyReq
+    from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+        PROMOTION_STATUS_PROMOTED,
+        PROMOTION_STATUS_ROLLBACK_FAILED,
+        PROMOTION_STATUS_ROLLED_BACK,
+    )
+
+    skip_reason = auto_residency_skip_reason(server_args)
+    if skip_reason is not None:
+        logger.debug("Auto residency: skipped (%s)", skip_reason)
+        return
+
+    response = await forward(AutoResidencyReq(action="apply"))
+    status = _auto_residency_status(response)
+    if status == PROMOTION_STATUS_ROLLBACK_FAILED:
+        raise RuntimeError(f"auto residency rollback failed: {response.error}")
+    if response.error is not None:
+        logger.warning(
+            "Auto residency promotion not applied; continuing on the original "
+            "strategy: %s",
+            response.error,
+        )
+        return
+    if status != PROMOTION_STATUS_PROMOTED:
+        return
+
+    # Re-run the synthetic warmup under the final residency: it physically
+    # moves promoted components, rebuilds compile caches invalidated by the
+    # placement change, and proves the promoted layout fits before ready.
+    try:
+        await run_async_client_warmup(server_args, forward, fail_open=False)
+    except Exception as e:
+        logger.warning(
+            "Post-promotion re-warmup failed (%s); rolling back auto residency", e
+        )
+        rollback = await forward(AutoResidencyReq(action="rollback"))
+        if (
+            rollback.error is not None
+            or _auto_residency_status(rollback) != PROMOTION_STATUS_ROLLED_BACK
+        ):
+            raise RuntimeError(
+                f"auto residency rollback failed: {rollback.error}"
+            ) from e
+        # restore warm caches for the original strategy before turning ready
+        await run_async_client_warmup(server_args, forward, fail_open=True)
+
+
 def format_warmup_req(req_or_group: Any) -> str:
     req = get_first_generation_req(req_or_group)
     prefix = (

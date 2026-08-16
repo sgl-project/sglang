@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Sequence, Union
 
 import imageio
+import msgspec
 import numpy as np
 import torch
 from PIL import Image
@@ -200,6 +201,16 @@ class GetDisaggStatsReq:
     """Request to get disagg pipeline metrics from the scheduler."""
 
     pass
+
+
+class AutoResidencyReq(msgspec.Struct, frozen=True):
+    """Apply or roll back the warmup-calibrated residency promotion.
+
+    Sent by the server warmup orchestrator after the synthetic warmup
+    requests finish and before the server reports ready.
+    """
+
+    action: str = "apply"  # "apply" | "rollback"
 
 
 def format_lora_message(
