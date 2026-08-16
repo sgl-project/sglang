@@ -247,42 +247,41 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
         self.assertFalse(interior_checkpoint)
         self.assertTrue(planned_interior_checkpoint)
 
-    def test_h32_unbounded_softplus_prefill_is_native_not_invalid_bound(self):
-        q = self._selector_tensor((1, 5, 32, 128))
-        k = self._selector_tensor((1, 5, 32, 128))
-        v = self._selector_tensor((1, 5, 32, 128))
-        g = self._selector_tensor((1, 5, 32, 128))
-        beta = self._selector_tensor((1, 5, 32))
+    def test_tp_head_shapes_unbounded_softplus_prefill_are_native(self):
         query_start_loc = Mock()
         query_start_loc.numel.return_value = 2
-        A_log = torch.empty(32, dtype=torch.float32)
-        dt_bias = torch.empty(32 * 128, dtype=torch.float32)
 
         with (
             patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
             patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
         ):
-            admission = CakeKDAKernel._cake_prefill_admission(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                query_start_loc=query_start_loc,
-                lower_bound=None,
-                is_spec_decode=False,
-                return_intermediate_states=False,
-                track_ssm_h_src=None,
-            )
+            for num_heads in (4, 8, 16, 32):
+                with self.subTest(num_heads=num_heads):
+                    shape = (1, 5, num_heads, 128)
+                    admission = CakeKDAKernel._cake_prefill_admission(
+                        self._selector_tensor(shape),
+                        self._selector_tensor(shape),
+                        self._selector_tensor(shape),
+                        self._selector_tensor(shape),
+                        self._selector_tensor(shape[:-1]),
+                        A_log=torch.empty(num_heads, dtype=torch.float32),
+                        dt_bias=torch.empty(num_heads * 128, dtype=torch.float32),
+                        query_start_loc=query_start_loc,
+                        lower_bound=None,
+                        is_spec_decode=False,
+                        return_intermediate_states=False,
+                        track_ssm_h_src=None,
+                    )
+                    self.assertTrue(admission.eligible, admission)
+                    self.assertEqual(admission.reason, CakePrefillReason.ELIGIBLE)
+
             wrong_shape = CakeKDAKernel._cake_prefill_admission(
                 self._selector_tensor((1, 5, 12, 128)),
                 self._selector_tensor((1, 5, 12, 128)),
                 self._selector_tensor((1, 5, 12, 128)),
                 self._selector_tensor((1, 5, 12, 128)),
                 self._selector_tensor((1, 5, 12)),
-                A_log=torch.empty(12),
+                A_log=torch.empty(11),
                 dt_bias=torch.empty(12 * 128),
                 query_start_loc=query_start_loc,
                 lower_bound=None,
@@ -291,8 +290,6 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
                 track_ssm_h_src=None,
             )
 
-        self.assertTrue(admission.eligible, admission)
-        self.assertEqual(admission.reason, CakePrefillReason.ELIGIBLE)
         self.assertFalse(wrong_shape.eligible)
         self.assertEqual(wrong_shape.reason, CakePrefillReason.UNSUPPORTED_CONTRACT)
         self.assertNotEqual(wrong_shape.reason, CakePrefillReason.INVALID_LOWER_BOUND)
@@ -629,74 +626,91 @@ class TestCakeKDAIndexedStateAdapter(CustomTestCase):
         for slot in (0, 2, 4):
             self.assertTrue(torch.equal(state_pool[slot], state_before[slot]))
 
-    def test_h32_unbounded_decode_forwards_raw_gate_params_and_direct_pool(self):
-        calls = []
-        kernel = self._kernel(calls)
-        kernel._gate_cache = {}
-        batch_size = 2
-        num_heads = 32
-        head_dim = 128
-        gate_storage = torch.randn(
-            batch_size, num_heads * head_dim + 17, dtype=torch.bfloat16
-        )
-        beta_storage = torch.randn(batch_size, num_heads + 13, dtype=torch.bfloat16)
-        state_pool = torch.randn(4, num_heads, head_dim, head_dim, dtype=torch.bfloat16)
-        state_indices = torch.tensor([3, -1], dtype=torch.int32)
-        A_log = torch.randn(num_heads, dtype=torch.float32)
-        dt_bias = torch.randn(num_heads * head_dim, dtype=torch.float32)
-        inputs = {
-            "q": torch.randn(1, batch_size, num_heads, head_dim, dtype=torch.bfloat16),
-            "k": torch.randn(1, batch_size, num_heads, head_dim, dtype=torch.bfloat16),
-            "v": torch.randn(1, batch_size, num_heads, head_dim, dtype=torch.bfloat16),
-            "a": gate_storage[:, : num_heads * head_dim],
-            "b": beta_storage[:, :num_heads],
-            "A_log": A_log,
-            "dt_bias": dt_bias,
-        }
+    def test_tp_head_shapes_unbounded_decode_forward_raw_inputs(self):
+        for num_heads in (4, 8, 16, 32):
+            with self.subTest(num_heads=num_heads):
+                calls = []
+                kernel = self._kernel(calls)
+                kernel._gate_cache = {}
+                batch_size = 2
+                head_dim = 128
+                gate_storage = torch.randn(
+                    batch_size, num_heads * head_dim + 17, dtype=torch.bfloat16
+                )
+                beta_storage = torch.randn(
+                    batch_size, num_heads + 13, dtype=torch.bfloat16
+                )
+                state_pool = torch.randn(
+                    4, num_heads, head_dim, head_dim, dtype=torch.bfloat16
+                )
+                state_indices = torch.tensor([3, -1], dtype=torch.int32)
+                A_log = torch.randn(num_heads, dtype=torch.float32)
+                dt_bias = torch.randn(num_heads * head_dim, dtype=torch.float32)
+                inputs = {
+                    "q": torch.randn(
+                        1, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+                    ),
+                    "k": torch.randn(
+                        1, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+                    ),
+                    "v": torch.randn(
+                        1, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+                    ),
+                    "a": gate_storage[:, : num_heads * head_dim],
+                    "b": beta_storage[:, :num_heads],
+                    "A_log": A_log,
+                    "dt_bias": dt_bias,
+                }
 
-        with (
-            patch.object(
-                kernel,
-                "_cake_direct_indexed_state_is_supported",
-                return_value=True,
-            ),
-            patch.object(
-                kernel,
-                "_cake_precompute_gate",
-                side_effect=AssertionError("native unbounded route precomputed gate"),
-            ),
-            patch.object(
-                torch.Tensor,
-                "index_select",
-                side_effect=AssertionError("native unbounded route gathered state"),
-            ),
-            patch.object(
-                torch.Tensor,
-                "index_copy_",
-                side_effect=AssertionError("native unbounded route scattered state"),
-            ),
-        ):
-            output = kernel._decode_cake(
-                **inputs,
-                ssm_states=state_pool,
-                cache_indices=state_indices,
-                lower_bound=None,
-            )
+                with (
+                    patch.object(
+                        kernel,
+                        "_cake_direct_indexed_state_is_supported",
+                        return_value=True,
+                    ),
+                    patch.object(
+                        kernel,
+                        "_cake_precompute_gate",
+                        side_effect=AssertionError(
+                            "native unbounded route precomputed gate"
+                        ),
+                    ),
+                    patch.object(
+                        torch.Tensor,
+                        "index_select",
+                        side_effect=AssertionError(
+                            "native unbounded route gathered state"
+                        ),
+                    ),
+                    patch.object(
+                        torch.Tensor,
+                        "index_copy_",
+                        side_effect=AssertionError(
+                            "native unbounded route scattered state"
+                        ),
+                    ),
+                ):
+                    output = kernel._decode_cake(
+                        **inputs,
+                        ssm_states=state_pool,
+                        cache_indices=state_indices,
+                        lower_bound=None,
+                    )
 
-        self.assertEqual(output.shape, (1, batch_size, num_heads, head_dim))
-        self.assertEqual(len(calls), 1)
-        call = calls[0]
-        self.assertTrue(call["use_gate_in_kernel"])
-        self.assertTrue(call["beta_is_logit"])
-        self.assertIsNone(call["lower_bound"])
-        self.assertEqual(call["g"].data_ptr(), inputs["a"].data_ptr())
-        self.assertEqual(call["g"].stride(0), inputs["a"].stride(0))
-        self.assertEqual(call["beta"].data_ptr(), inputs["b"].data_ptr())
-        self.assertEqual(call["beta"].stride(0), inputs["b"].stride(0))
-        self.assertEqual(call["A_log"].data_ptr(), A_log.data_ptr())
-        self.assertEqual(call["dt_bias"].data_ptr(), dt_bias.data_ptr())
-        self.assertIs(call["initial_state"], state_pool)
-        self.assertIs(call["ssm_state_indices"], state_indices)
+                self.assertEqual(output.shape, (1, batch_size, num_heads, head_dim))
+                self.assertEqual(len(calls), 1)
+                call = calls[0]
+                self.assertTrue(call["use_gate_in_kernel"])
+                self.assertTrue(call["beta_is_logit"])
+                self.assertIsNone(call["lower_bound"])
+                self.assertEqual(call["g"].data_ptr(), inputs["a"].data_ptr())
+                self.assertEqual(call["g"].stride(0), inputs["a"].stride(0))
+                self.assertEqual(call["beta"].data_ptr(), inputs["b"].data_ptr())
+                self.assertEqual(call["beta"].stride(0), inputs["b"].stride(0))
+                self.assertEqual(call["A_log"].data_ptr(), A_log.data_ptr())
+                self.assertEqual(call["dt_bias"].data_ptr(), dt_bias.data_ptr())
+                self.assertIs(call["initial_state"], state_pool)
+                self.assertIs(call["ssm_state_indices"], state_indices)
 
 
 class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
@@ -761,26 +775,30 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
         }
 
     @classmethod
-    def _unbounded_row_strided_inputs(cls, batch_size=2):
-        mixed_qkv = cls._strided_rows(batch_size, 3 * 32 * 128, 3 * 32 * 128 + 64)
-        raw_gate = cls._strided_rows(batch_size, 32 * 128, 32 * 128 + 64).unsqueeze(1)
-        raw_beta = cls._strided_rows(batch_size, 32, 64).unsqueeze(0)
+    def _unbounded_row_strided_inputs(cls, batch_size=2, num_heads=32):
+        gate_width = num_heads * 128
+        qkv_width = 3 * gate_width
+        mixed_qkv = cls._strided_rows(batch_size, qkv_width, qkv_width + 64)
+        raw_gate = cls._strided_rows(batch_size, gate_width, gate_width + 64).unsqueeze(
+            1
+        )
+        raw_beta = cls._strided_rows(batch_size, num_heads, num_heads + 32).unsqueeze(0)
         return {
             "mixed_qkv": mixed_qkv,
             "a": raw_gate,
             "b": raw_beta,
-            "A_log": torch.empty(1, 1, 32, 1, dtype=torch.float32),
-            "dt_bias": torch.empty(32 * 128, dtype=torch.float32),
+            "A_log": torch.empty(1, 1, num_heads, 1, dtype=torch.float32),
+            "dt_bias": torch.empty(gate_width, dtype=torch.float32),
             "scale": 128**-0.5,
             "ssm_states": torch.empty(
                 batch_size + 1,
-                32,
+                num_heads,
                 128,
                 128,
                 dtype=torch.bfloat16,
             ),
             "cache_indices": torch.arange(1, batch_size + 1, dtype=torch.int32),
-            "num_v_heads": 32,
+            "num_v_heads": num_heads,
             "head_v_dim": 128,
             "lower_bound": None,
         }
@@ -836,25 +854,28 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
         self.assertTrue(admission.eligible, admission)
         self.assertEqual(admission.reason, CakePackedDecodeReason.ELIGIBLE)
 
-    def test_selector_accepts_h32_unbounded_strided_gate_beta_and_state(self):
-        inputs = self._unbounded_row_strided_inputs(batch_size=2)
+    def test_selector_accepts_tp_unbounded_strided_gate_beta_and_state(self):
+        for num_heads in (4, 8, 16, 32):
+            with self.subTest(num_heads=num_heads):
+                inputs = self._unbounded_row_strided_inputs(
+                    batch_size=2, num_heads=num_heads
+                )
+                admission = self._unbounded_admission(inputs)
 
-        admission = self._unbounded_admission(inputs)
-
-        self.assertTrue(admission.eligible, admission)
-        self.assertEqual(admission.reason, CakePackedDecodeReason.ELIGIBLE)
-        self.assertEqual(
-            CakeKDAKernel._cake_packed_row_view(
-                inputs["a"], batch_size=2, row_width=32 * 128
-            ).stride(),
-            (32 * 128 + 64, 1),
-        )
-        self.assertEqual(
-            CakeKDAKernel._cake_packed_row_view(
-                inputs["b"], batch_size=2, row_width=32
-            ).stride(),
-            (64, 1),
-        )
+                self.assertTrue(admission.eligible, admission)
+                self.assertEqual(admission.reason, CakePackedDecodeReason.ELIGIBLE)
+                self.assertEqual(
+                    CakeKDAKernel._cake_packed_row_view(
+                        inputs["a"], batch_size=2, row_width=num_heads * 128
+                    ).stride(),
+                    (num_heads * 128 + 64, 1),
+                )
+                self.assertEqual(
+                    CakeKDAKernel._cake_packed_row_view(
+                        inputs["b"], batch_size=2, row_width=num_heads
+                    ).stride(),
+                    (num_heads + 32, 1),
+                )
 
     def test_h32_unbounded_packed_route_calls_raw_recurrent_and_never_triton(self):
         kernel = self._kernel(

@@ -542,7 +542,7 @@ class TestCakeLinearAttnBackend(unittest.TestCase):
         "sglang.srt.utils.is_sm100_supported",
         return_value=True,
     )
-    def test_kimi_linear_h32_d128_defaults_prefill_and_decode_to_cake(
+    def test_kimi_linear_equal_head_d128_defaults_prefill_and_decode_to_cake(
         self, _mock_sm100
     ):
         server_args = ServerArgs(
@@ -567,32 +567,35 @@ class TestCakeLinearAttnBackend(unittest.TestCase):
         "sglang.srt.utils.is_sm100_supported",
         return_value=True,
     )
-    def test_kimi_linear_h32_d128_defaults_ssm_state_to_bfloat16(self, _mock_sm100):
-        server_args = ServerArgs(model_path="dummy", tp_size=2)
+    def test_kimi_linear_tp_shapes_default_ssm_state_to_bfloat16(self, _mock_sm100):
         hf_config = SimpleNamespace(
-            linear_attn_config={"num_heads": 64, "head_dim": 128}
+            linear_attn_config={"num_heads": 32, "head_dim": 128}
         )
+        for tp_size, local_heads in ((1, 32), (2, 16), (4, 8), (8, 4)):
+            with self.subTest(tp_size=tp_size, local_heads=local_heads):
+                server_args = ServerArgs(model_path="dummy", tp_size=tp_size)
+                apply_kimi_k3_linear_attn_defaults(
+                    server_args,
+                    model_arch="KimiLinearForCausalLM",
+                    hf_config=hf_config,
+                )
 
-        apply_kimi_k3_linear_attn_defaults(
-            server_args,
-            model_arch="KimiLinearForCausalLM",
-            hf_config=hf_config,
-        )
-
-        self.assertEqual(server_args.mamba_ssm_dtype, "bfloat16")
-        self.assertEqual(server_args.linear_attn_decode_backend, "cake")
-        self.assertEqual(server_args.linear_attn_prefill_backend, "cake")
+                self.assertEqual(server_args.mamba_ssm_dtype, "bfloat16")
+                self.assertEqual(server_args.linear_attn_decode_backend, "cake")
+                self.assertEqual(server_args.linear_attn_prefill_backend, "cake")
 
     @patch(
         "sglang.srt.utils.is_sm100_supported",
         return_value=True,
     )
-    def test_kimi_linear_h32_d128_respects_explicit_fp32_ssm_state(self, _mock_sm100):
+    def test_kimi_linear_equal_head_d128_respects_explicit_fp32_ssm_state(
+        self, _mock_sm100
+    ):
         server_args = ServerArgs(
             model_path="dummy", mamba_ssm_dtype="float32", tp_size=2
         )
         hf_config = SimpleNamespace(
-            linear_attn_config={"num_heads": 64, "head_dim": 128}
+            linear_attn_config={"num_heads": 32, "head_dim": 128}
         )
 
         apply_kimi_k3_linear_attn_defaults(
@@ -609,12 +612,12 @@ class TestCakeLinearAttnBackend(unittest.TestCase):
         "sglang.srt.utils.is_sm100_supported",
         return_value=True,
     )
-    def test_kimi_linear_only_auto_routes_exact_per_rank_h32_contract(
+    def test_kimi_linear_rejects_nondivisible_empty_or_non_d128_contract(
         self, _mock_sm100
     ):
         for tp_size, num_heads, head_dim in (
-            (2, 32, 128),
-            (1, 16, 128),
+            (3, 32, 128),
+            (1, 0, 128),
             (1, 32, 64),
         ):
             with self.subTest(tp_size=tp_size, num_heads=num_heads, head_dim=head_dim):

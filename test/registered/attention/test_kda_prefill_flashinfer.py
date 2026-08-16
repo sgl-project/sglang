@@ -235,10 +235,11 @@ def test_kda_prefill_cake_returns_native_interior_state_tracking():
     assert data["beta"].stride(-2) == 32
 
 
-def test_kda_prefill_cake_native_unbounded_kimi_linear_h32_with_checkpoints():
+@pytest.mark.parametrize("num_heads", [4, 8, 16, 32])
+def test_kda_prefill_cake_native_unbounded_tp_shapes_with_checkpoints(num_heads):
     seq_lens = [65, 131]
-    data = _make_inputs(seq_lens, 32)
-    assert data["beta"].stride(1) == 48
+    data = _make_inputs(seq_lens, num_heads)
+    assert data["beta"].stride(1) == num_heads + 16
 
     interior_checkpoint_source = torch.tensor([0, 4], device="cuda", dtype=torch.int64)
     checkpoint_cu_starts = torch.tensor([0, 2, 5], device="cuda", dtype=torch.int64)
@@ -259,7 +260,9 @@ def test_kda_prefill_cake_native_unbounded_kimi_linear_h32_with_checkpoints():
     with patch.object(
         CakeKDAKernel,
         "_extend_triton",
-        side_effect=AssertionError("H32 unbounded prefill fell back to Triton"),
+        side_effect=AssertionError(
+            f"H{num_heads} unbounded prefill fell back to Triton"
+        ),
     ):
         output_cake = _extend(
             CakeKDAKernel(),

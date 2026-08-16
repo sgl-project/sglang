@@ -397,18 +397,21 @@ def test_kda_decode_cake_matches_triton_kimi_k3_h12(batch_size):
     not CAKE_ARCH_SUPPORTED,
     reason="CAKE KDA decode requires SM100 or SM103.",
 )
-@pytest.mark.parametrize("batch_size", [1, 8, 32])
-def test_kda_decode_cake_native_unbounded_kimi_linear_h32_matches_triton(
-    batch_size, monkeypatch
+@pytest.mark.parametrize(
+    "num_heads,batch_size",
+    [(4, 8), (8, 8), (16, 8), (32, 1), (32, 8), (32, 32)],
+)
+def test_kda_decode_cake_native_unbounded_tp_shapes_match_triton(
+    num_heads, batch_size, monkeypatch
 ):
     """Production packed decode must use the raw-gate Cake route with no fallback."""
-    torch.manual_seed(32000 + batch_size)
+    torch.manual_seed(32000 + 100 * num_heads + batch_size)
     d = _make_packed_decode_inputs(
         batch_size,
-        num_heads=32,
-        num_value_heads=32,
+        num_heads=num_heads,
+        num_value_heads=num_heads,
     )
-    gate_width = 32 * K
+    gate_width = num_heads * K
     gate_storage = torch.empty(
         batch_size,
         gate_width + 64,
@@ -418,9 +421,9 @@ def test_kda_decode_cake_native_unbounded_kimi_linear_h32_matches_triton(
     gate_storage[:, 8 : 8 + gate_width].copy_(d["a"])
     d["a"] = gate_storage[:, 8 : 8 + gate_width]
     assert d["a"].stride() == (gate_width + 64, 1)
-    assert d["b"].shape == (batch_size, 32)
-    assert d["b"].stride() == (160, 1)
-    assert d["ssm"].stride(0) > 32 * V * K
+    assert d["b"].shape == (batch_size, num_heads)
+    assert d["b"].stride() == (max(144, 128 + num_heads), 1)
+    assert d["ssm"].stride(0) > num_heads * V * K
 
     pool_size = d["ssm"].shape[0]
     d["cache_indices"] = d["allocated_cache_indices"][

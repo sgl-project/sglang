@@ -87,7 +87,7 @@ def disable_kimi_k3_symm_mem(server_args: ServerArgs) -> None:
 def _uses_native_kimi_linear_unbounded_kda(
     server_args: ServerArgs, *, model_arch=None, hf_config=None
 ) -> bool:
-    """Return whether every TP rank has the native H32/D128 Cake contract."""
+    """Return whether every TP rank has the native equal-head/D128 contract."""
     if model_arch != "KimiLinearForCausalLM" or hf_config is None:
         return False
     linear_attn_config = getattr(hf_config, "linear_attn_config", None)
@@ -101,8 +101,8 @@ def _uses_native_kimi_linear_unbounded_kda(
         and isinstance(head_dim, int)
         and isinstance(tp_size, int)
         and tp_size > 0
+        and num_heads > 0
         and num_heads % tp_size == 0
-        and num_heads // tp_size == 32
         and head_dim == 128
     )
 
@@ -120,8 +120,8 @@ def apply_kimi_k3_linear_attn_defaults(
         if server_args.mamba_ssm_dtype is None:
             server_args.mamba_ssm_dtype = "bfloat16"
             logger.info(
-                "Kimi-Linear H32/D128: defaulting --mamba-ssm-dtype to "
-                "bfloat16 for Cake's native KDA route."
+                "Kimi-Linear equal-head/D128: defaulting --mamba-ssm-dtype "
+                "to bfloat16 for Cake's native KDA route."
             )
         if server_args.mamba_ssm_dtype != "bfloat16":
             return
@@ -130,8 +130,8 @@ def apply_kimi_k3_linear_attn_defaults(
         if server_args.linear_attn_prefill_backend is None:
             server_args.linear_attn_prefill_backend = "cake"
         logger.info(
-            "Kimi-Linear H32/D128 with bf16 SSM state: defaulting KDA prefill "
-            "and decode to Cake's native unbounded-softplus route."
+            "Kimi-Linear equal-head/D128 with bf16 SSM state: defaulting KDA "
+            "prefill and decode to Cake's native unbounded-softplus route."
         )
         return
 
