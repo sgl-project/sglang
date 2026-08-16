@@ -122,7 +122,7 @@ def _activation_delta_masked_kernel(
         )
 
 
-def silu_mul_delta_masked(
+def act_delta_masked(
     gateup_output: torch.Tensor,  # [E_local, m_max, slices * inter] bf16
     gate_up_delta: torch.Tensor | None,  # [num_tokens, top_k, slices * inter]
     act_out: torch.Tensor,  # [E_local, m_max, inter] bf16

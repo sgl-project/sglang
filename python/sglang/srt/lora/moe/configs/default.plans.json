@@ -1,0 +1,50 @@
+{
+ "arch": "default",
+ "domain": {
+  "max_hidden": 0,
+  "max_local_experts": 0
+ },
+ "scenarios": [],
+ "fallback": [
+  {
+   "name": "fallback.serial",
+   "phase": "decode",
+   "provider": "deepgemm",
+   "plan": {
+    "gate_a_family": "grouped",
+    "down_a_family": "grouped",
+    "gate_b_family": "one_launch_sliced",
+    "down_b_family": "one_launch_sliced",
+    "middle_family": "materialized",
+    "finalize_family": "materialized"
+   }
+  },
+  {
+   "name": "fallback.serial_prefill",
+   "layout": "per_expert",
+   "phase": "prefill",
+   "provider": "deepgemm_contiguous",
+   "plan": {
+    "gate_a_family": "grouped",
+    "down_a_family": "grouped",
+    "down_b_family": "one_launch_sliced",
+    "middle_family": "b_activation",
+    "finalize_family": "materialized",
+    "down_b_scatter": true
+   }
+  },
+  {
+   "name": "fallback.serial_prefill",
+   "layout": "shared",
+   "phase": "prefill",
+   "provider": "deepgemm",
+   "plan": {
+    "gate_a_family": "grouped",
+    "down_a_family": "grouped",
+    "down_b_family": "one_launch_sliced",
+    "middle_family": "b_activation",
+    "finalize_family": "materialized"
+   }
+  }
+ ]
+}

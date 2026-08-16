@@ -28,9 +28,9 @@ import pytest
 import torch
 
 from sglang.srt.lora.moe.execution_plan import (
-    FactorSite,
     LoraBFamily,
     LoraBSpec,
+    Site,
 )
 from sglang.srt.lora.moe.lora_b import (
     indexed_pairs_lora_b,
@@ -213,7 +213,7 @@ def test_run_lora_b_dispatches_the_family_and_rejects_pdl() -> None:
     bridge, weight, offsets, num_slices, width = _site_tensors(
         "down", 16, 8, 0x1DB3, device
     )
-    spec = LoraBSpec(FactorSite.DOWN, LoraBFamily.INDEXED_PAIRS)
+    spec = LoraBSpec(Site.DOWN, LoraBFamily.INDEXED_PAIRS)
     with pytest.raises(ValueError, match="programmatic-dependent-launch"):
         run_lora_b(
             spec,

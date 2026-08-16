@@ -38,6 +38,13 @@ def _load_execution_plan():
 PLAN = _load_execution_plan()
 
 
+def _arch_pdl(enabled: bool):
+    """Pin build_routes' architecture probe: route PDL is arch-keyed now."""
+    arch = types.ModuleType("sglang.kernels.jit.utils")
+    arch.is_arch_support_pdl = lambda: enabled
+    return mock.patch.dict(sys.modules, {arch.__name__: arch})
+
+
 def _load_launch_config():
     package_names = (
         "sglang",
@@ -358,7 +365,7 @@ class TestDualGateARoute(unittest.TestCase):
             self.assertEqual(num_local_experts, 2)
             self.assertEqual(max_loras, 2)
             self.assertEqual(view, "aligned")
-            self.assertIsNone(use_pdl)
+            self.assertIs(use_pdl, False)
             calls.append(block_size)
             if fused_shapes:
                 self.assertIsNotNone(num_pairs_post_padded_out)
@@ -380,6 +387,7 @@ class TestDualGateARoute(unittest.TestCase):
             )
 
         with contextlib.ExitStack() as stack:
+            stack.enter_context(_arch_pdl(False))
             stack.enter_context(
                 mock.patch.object(
                     ROUTE_FACTORY, "_pair_route", side_effect=fake_pair_route
@@ -427,7 +435,7 @@ class TestDualGateARoute(unittest.TestCase):
             self.assertIs(token_slots, self.token_slots)
             self.assertEqual(lora_experts_per_adapter, 2)
             self.assertEqual(max_loras, 2)
-            self.assertIsNone(use_pdl)
+            self.assertIs(use_pdl, False)
             dual_calls.append({"block_sizes": block_sizes, "scratches": scratches})
             views = []
             for block_size, padded_count in zip(
@@ -450,6 +458,7 @@ class TestDualGateARoute(unittest.TestCase):
             )
 
         with (
+            _arch_pdl(False),
             mock.patch.object(
                 ROUTE_FACTORY,
                 "build_dual_granularity_aligned_routes",
@@ -540,14 +549,14 @@ class TestDualGateARoute(unittest.TestCase):
         token_dedup_plan = dataclasses.replace(
             reference,
             gate_a=PLAN.LoraASpec(
-                PLAN.FactorSite.GATE_UP,
+                PLAN.Site.GATE_UP,
                 PLAN.LoraAFamily.TOKEN_DEDUP_GROUPED,
                 True,
-                PLAN.FactorLayout.TOKEN_MAJOR,
+                PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
             gate_b=dataclasses.replace(
                 reference.gate_b,
-                input_layout=PLAN.FactorLayout.TOKEN_MAJOR,
+                input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
         )
         with self.assertRaisesRegex(
@@ -566,7 +575,7 @@ class TestDualGateARoute(unittest.TestCase):
 
 
 class TestRoutePdlWiring(unittest.TestCase):
-    def test_standard_plan_threads_explicit_pdl_to_every_aligned_route(self):
+    def test_standard_plan_threads_architecture_pdl_to_every_aligned_route(self):
         reference = PLAN.SERIAL_MATERIALIZED_REFERENCE
         shared_down = dataclasses.replace(
             reference,
@@ -578,14 +587,14 @@ class TestRoutePdlWiring(unittest.TestCase):
         shared_token = dataclasses.replace(
             reference,
             gate_a=PLAN.LoraASpec(
-                PLAN.FactorSite.GATE_UP,
+                PLAN.Site.GATE_UP,
                 PLAN.LoraAFamily.TOKEN_DEDUP_GROUPED,
                 True,
-                PLAN.FactorLayout.TOKEN_MAJOR,
+                PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
             gate_b=dataclasses.replace(
                 reference.gate_b,
-                input_layout=PLAN.FactorLayout.TOKEN_MAJOR,
+                input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
         )
 
@@ -639,6 +648,7 @@ class TestRoutePdlWiring(unittest.TestCase):
                 return views[0], views[1]
 
             with (
+                _arch_pdl(enabled),
                 mock.patch.object(
                     ROUTE_FACTORY,
                     "_aligned_pair_route",
@@ -652,7 +662,7 @@ class TestRoutePdlWiring(unittest.TestCase):
             ):
                 for plan in (reference, shared_down, shared_token):
                     ROUTE_FACTORY.build_routes(
-                        dataclasses.replace(plan, route_pdl=enabled),
+                        plan,
                         topk_ids=torch.tensor([[0, 1]], dtype=torch.int32),
                         token_slots=torch.tensor([0], dtype=torch.int32),
                         num_local_experts=2,
@@ -679,7 +689,7 @@ class TestRoutePdlWiring(unittest.TestCase):
             self.assertTrue(all(values == {enabled} for values in by_prefix.values()))
             self.assertEqual(dual_calls, [enabled, enabled])
 
-    def test_joint_plan_threads_explicit_pdl_control(self):
+    def test_joint_plan_threads_architecture_pdl_control(self):
         reference = PLAN.SERIAL_MATERIALIZED_REFERENCE
         shared_down_b = dataclasses.replace(
             reference.down_b,
@@ -734,9 +744,9 @@ class TestRoutePdlWiring(unittest.TestCase):
                 reference,
                 down_b=shared_down_b,
                 route_builder=PLAN.RouteBuilderFamily.JOINT_SHARED_OUTER,
-                route_pdl=enabled,
             )
             with (
+                _arch_pdl(enabled),
                 mock.patch.object(
                     ROUTE_FACTORY,
                     "build_joint_shared_routes",
@@ -1055,14 +1065,14 @@ class TestSharedTokenRoute(unittest.TestCase):
         shared_plan = dataclasses.replace(
             reference,
             gate_a=PLAN.LoraASpec(
-                PLAN.FactorSite.GATE_UP,
+                PLAN.Site.GATE_UP,
                 PLAN.LoraAFamily.TOKEN_DEDUP_GROUPED,
                 True,
-                PLAN.FactorLayout.TOKEN_MAJOR,
+                PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
             gate_b=dataclasses.replace(
                 reference.gate_b,
-                input_layout=PLAN.FactorLayout.TOKEN_MAJOR,
+                input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
         )
         topk_ids = torch.tensor([[-1, -1], [-1, 1], [0, -1]], dtype=torch.int32)
@@ -1083,7 +1093,7 @@ class TestSharedTokenRoute(unittest.TestCase):
             num_pairs_post_padded_out=None,
             fused_align_scratch=None,
         ):
-            self.assertIsNone(use_pdl)
+            self.assertIs(use_pdl, False)
             calls.append(
                 (
                     is_shared_outer,
@@ -1099,8 +1109,11 @@ class TestSharedTokenRoute(unittest.TestCase):
                 padded_count=num_pairs_post_padded_out,
             )
 
-        with mock.patch.object(
-            ROUTE_FACTORY, "_pair_route", side_effect=fake_pair_route
+        with (
+            _arch_pdl(False),
+            mock.patch.object(
+                ROUTE_FACTORY, "_pair_route", side_effect=fake_pair_route
+            ),
         ):
             routes = ROUTE_FACTORY.build_routes(
                 shared_plan,
@@ -1128,14 +1141,14 @@ class TestSharedTokenRoute(unittest.TestCase):
         shared_plan = dataclasses.replace(
             reference,
             gate_a=PLAN.LoraASpec(
-                PLAN.FactorSite.GATE_UP,
+                PLAN.Site.GATE_UP,
                 PLAN.LoraAFamily.TOKEN_DEDUP_GROUPED,
                 True,
-                PLAN.FactorLayout.TOKEN_MAJOR,
+                PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
             gate_b=dataclasses.replace(
                 reference.gate_b,
-                input_layout=PLAN.FactorLayout.TOKEN_MAJOR,
+                input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
             down_b=dataclasses.replace(
                 reference.down_b,
@@ -1166,7 +1179,7 @@ class TestSharedTokenRoute(unittest.TestCase):
                     fused_align_scratch=None,
                 ):
                     self.assertEqual(view, "aligned")
-                    self.assertIsNone(use_pdl)
+                    self.assertIs(use_pdl, False)
                     per_adapter = num_local_experts if is_shared_outer is False else 1
                     num_virtual = per_adapter * max_loras
                     cached_count = cached_counts.setdefault(
@@ -1192,8 +1205,11 @@ class TestSharedTokenRoute(unittest.TestCase):
                         ),
                     )
 
-                with mock.patch.object(
-                    ROUTE_FACTORY, "_pair_route", side_effect=fake_pair_route
+                with (
+                    _arch_pdl(False),
+                    mock.patch.object(
+                        ROUTE_FACTORY, "_pair_route", side_effect=fake_pair_route
+                    ),
                 ):
                     routes = ROUTE_FACTORY.build_routes(
                         shared_plan,
@@ -1283,7 +1299,7 @@ class TestRunnerRouteSelectionSource(unittest.TestCase):
         route_for_a = ast.unparse(self._method("_route_for_a"))
         route_for_b = ast.unparse(self._method("_route_for_b"))
         self.assertIn("routes.gate_a_aligned_per_expert", route_for_a)
-        self.assertIn("spec.site is FactorSite.GATE_UP", route_for_a)
+        self.assertIn("spec.site is Site.GATE_UP", route_for_a)
         self.assertIn("routes.aligned(spec.is_shared_outer)", route_for_a)
         self.assertNotIn("gate_a_aligned_per_expert", route_for_b)
         self.assertIn("routes.aligned(spec.is_shared_outer)", route_for_b)
@@ -1304,14 +1320,14 @@ class TestLaunchConfigRoutePreflight(unittest.TestCase):
         token_dedup = dataclasses.replace(
             reference,
             gate_a=PLAN.LoraASpec(
-                PLAN.FactorSite.GATE_UP,
+                PLAN.Site.GATE_UP,
                 PLAN.LoraAFamily.TOKEN_DEDUP_GROUPED,
                 True,
-                PLAN.FactorLayout.TOKEN_MAJOR,
+                PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
             gate_b=dataclasses.replace(
                 reference.gate_b,
-                input_layout=PLAN.FactorLayout.TOKEN_MAJOR,
+                input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
         )
         config = dataclasses.replace(

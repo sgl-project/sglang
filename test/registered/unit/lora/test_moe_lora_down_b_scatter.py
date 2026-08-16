@@ -43,15 +43,10 @@ from dataclasses import replace
 import pytest
 import torch
 
-from sglang.srt.lora.moe.config import (
-    DeviceArchitecture,
-    choices_for,
-)
 from sglang.srt.lora.moe.execution_plan import (
     ActivationFamily,
-    FactorContract,
-    FactorLayout,
-    FactorSite,
+    BridgeLayout,
+    DeviceArchitecture,
     FinalizeFamily,
     FinalizeSpec,
     LateOverlap,
@@ -62,7 +57,11 @@ from sglang.srt.lora.moe.execution_plan import (
     MiddleFamily,
     MiddleSpec,
     MoeLoraExecutionPlan,
+    Site,
+    StageContract,
+    iter_selected_plans,
 )
+from sglang.srt.lora.moe.launch_config import resolve_tiles
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-small")
@@ -72,27 +71,25 @@ _H200 = DeviceArchitecture.H200
 _SWIGLU = ActivationFamily.SWIGLU
 
 
-def _choices(architecture, layout, activation=_SWIGLU, hidden_size=2048):
+def _menu(architecture, layout, activation=_SWIGLU):
+    """The shipped rows for one layout, keyed by row name."""
     return {
-        choice.key: choice
-        for choice in choices_for(
-            architecture,
-            layout,
-            activation,
-            hidden_size=hidden_size,
-            num_local_experts=256,
+        sel.name: sel
+        for sel in iter_selected_plans(
+            architecture=architecture,
+            is_shared_outer=layout,
+            activation=activation,
         )
     }
 
 
-def _pick(menu, fragment: str):
-    matches = [choice for key, choice in menu.items() if fragment in key]
-    assert len(matches) == 1, (fragment, sorted(menu))
-    return matches[0]
-
-
-def _choice(architecture, layout, fragment: str, activation=_SWIGLU):
-    return _pick(_choices(architecture, layout, activation), fragment)
+def _shipped_launch(architecture, sel, *, physical_rank=16, num_tokens=4096):
+    """The shipped tile pick for one row, resolved the way serving does."""
+    return resolve_tiles(
+        architecture_value=architecture.value,
+        plan_key_name=sel.name,
+        physical_rank=physical_rank,
+    ).config_for(num_tokens)
 
 
 def _build_plan(
@@ -106,34 +103,30 @@ def _build_plan(
     ``_build_plan`` materializes a scenario (spec classes directly)."""
     pe = False
     consumes_down_b = finalize_family is not FinalizeFamily.MATERIALIZED
-    down_b_contract = FactorContract(
-        FactorSite.DOWN, is_shared_outer, FactorLayout.PAIR_MAJOR
-    )
+    down_b_contract = StageContract(Site.DOWN, is_shared_outer, BridgeLayout.PAIR_MAJOR)
     return MoeLoraExecutionPlan(
         gate_a=LoraASpec(
-            FactorSite.GATE_UP,
+            Site.GATE_UP,
             LoraAFamily.GROUPED,
             is_shared_outer,
-            FactorLayout.PAIR_MAJOR,
+            BridgeLayout.PAIR_MAJOR,
         ),
         gate_b=LoraBSpec(
-            FactorSite.GATE_UP,
+            Site.GATE_UP,
             LoraBFamily.ONE_LAUNCH_SLICED,
             pe,
-            FactorLayout.PAIR_MAJOR,
+            BridgeLayout.PAIR_MAJOR,
         ),
         middle=MiddleSpec(MiddleFamily.MATERIALIZED, activation),
-        down_a=LoraASpec(
-            FactorSite.DOWN, LoraAFamily.GROUPED, pe, FactorLayout.PAIR_MAJOR
-        ),
+        down_a=LoraASpec(Site.DOWN, LoraAFamily.GROUPED, pe, BridgeLayout.PAIR_MAJOR),
         down_b=(
             None
             if consumes_down_b
             else LoraBSpec(
-                FactorSite.DOWN,
+                Site.DOWN,
                 LoraBFamily.ONE_LAUNCH_SLICED,
                 is_shared_outer,
-                FactorLayout.PAIR_MAJOR,
+                BridgeLayout.PAIR_MAJOR,
             )
         ),
         finalize=FinalizeSpec(
@@ -174,10 +167,10 @@ class TestDownBScatterPlan:
         indexed = replace(
             _serial_plan(),
             down_b=LoraBSpec(
-                FactorSite.DOWN,
+                Site.DOWN,
                 LoraBFamily.INDEXED_PAIRS,
                 False,
-                FactorLayout.PAIR_MAJOR,
+                BridgeLayout.PAIR_MAJOR,
             ),
         )
         assert indexed.down_b is not None
@@ -203,52 +196,34 @@ class TestDownBScatterPlan:
         with pytest.raises(ValueError, match="down-B scatter"):
             replace(overlapped, down_b_scatter=True)
 
-    def test_flag_rejects_the_down_site_pdl_edge(self) -> None:
-        plan = _serial_plan()
-        with pytest.raises(ValueError, match="down-B scatter"):
-            replace(plan, down_b_scatter=True, down_a_to_b_pdl=True)
-
 
 # ---- CPU: shipped config structure -----------------------------------------------
 
 
-def _scatter_expected(key: str, layout) -> bool:
+def _scatter_expected(name: str, layout) -> bool:
     """The scatter ships on per-expert prefill serial shapes only."""
     if layout != False:
         return False
-    return ".prefill.serial." in key or ".fallback.serial_prefill." in key
+    return name in ("prefill.serial", "fallback.serial_prefill")
 
 
 class TestDownBScatterConfig:
     def test_config_never_touches_decode_shared_or_overlapped(self) -> None:
         cases = (
-            ("gb300_pe", _GB300, False, _SWIGLU, 2048),
-            ("h200_pe", _H200, False, _SWIGLU, 2048),
-            ("h200_sh", _H200, True, _SWIGLU, 2048),
-            ("gb300_sh", _GB300, True, _SWIGLU, 2048),
-            (
-                # The gb300 ReLU2 prefill winner keeps its overlap windows
-                # and is never scattered; its out-of-domain fallback twin is
-                # serial and is.
-                "gb300_relu2",
-                _GB300,
-                False,
-                ActivationFamily.RELU2,
-                2048,
-            ),
-            ("ood", _GB300, False, _SWIGLU, 8192),
-            ("ood_sh", _GB300, True, _SWIGLU, 8192),
+            ("gb300_pe", _GB300, False, _SWIGLU),
+            ("h200_pe", _H200, False, _SWIGLU),
+            ("h200_sh", _H200, True, _SWIGLU),
+            ("gb300_sh", _GB300, True, _SWIGLU),
+            # Rows are activation-agnostic: the ReLU2 build of the same menu
+            # (including the fallback rows every menu carries) makes the
+            # same per-row scatter decision.
+            ("gb300_relu2", _GB300, False, ActivationFamily.RELU2),
         )
-        for name, architecture, layout, activation, hidden_size in cases:
-            for key, choice in _choices(
-                architecture, layout, activation, hidden_size=hidden_size
-            ).items():
-                if name == "gb300_relu2" and ".prefill.relu2." in key:
-                    assert choice.plan.has_overlap, key
-                assert choice.plan.down_b_scatter is _scatter_expected(key, layout), (
-                    name,
-                    key,
-                )
+        for name, architecture, layout, activation in cases:
+            for row_name, choice in _menu(architecture, layout, activation).items():
+                assert choice.plan.down_b_scatter is _scatter_expected(
+                    row_name, layout
+                ), (name, row_name)
 
 
 class TestProviderScatterSurface:
@@ -675,9 +650,7 @@ def _token_slots(traffic: str, num_tokens: int) -> torch.Tensor:
 
 
 def _standalone_output_allocation(runner, *, num_tokens, dtype, device):
-    return torch.empty(
-        (num_tokens, runner.provider.hidden_size), dtype=dtype, device=device
-    )
+    return torch.empty((num_tokens, runner.hidden_size), dtype=dtype, device=device)
 
 
 def _scatter_pair():
@@ -690,13 +663,13 @@ def _scatter_pair():
     decode fallback choice — exactly the serial materialized shape with a
     complete tuned config — and the reordering is the same plan with the
     flag flipped."""
-    reference = _pick(_choices(_GB300, False), ".fallback.serial.")
+    reference = _menu(_GB300, False)["fallback.serial"]
     assert reference.plan.down_b_scatter is False
     assert reference.plan.middle.family is MiddleFamily.MATERIALIZED
     assert reference.plan == _serial_plan()
     reordered_plan = replace(reference.plan, down_b_scatter=True)
     assert reordered_plan.middle.family is MiddleFamily.MATERIALIZED
-    return reference.plan, reordered_plan, reference.launch_config
+    return reference.plan, reordered_plan, _shipped_launch(_GB300, reference)
 
 
 def _build_runner(plan, launch_config, provider_name: str, gpu, num_experts: int):
@@ -713,20 +686,15 @@ def _build_runner(plan, launch_config, provider_name: str, gpu, num_experts: int
         )
     )
     runner = MoeLoraRunner(
-        provider=provider,
+        providers={"test": provider},
         top_k=_TOP_K,
         routed_scaling_factor=_ROUTED_SCALING,
         activation=ActivationFamily.SWIGLU,
-        execution_plan=plan,
-        launch_config=launch_config,
     )
-    runner.validate_factors(
-        gate_up_lora_a=gpu["gate_up_lora_a"],
-        gate_up_lora_b=gpu["gate_up_lora_b"],
-        down_lora_a=gpu["down_lora_a"],
-        down_lora_b=gpu["down_lora_b"],
-        is_shared_outer=False,
+    runner._test_execution = dict(
+        plan=plan, launch_config=launch_config, provider_name="test"
     )
+    runner.prepare_plan(plan, provider_name="test", is_shared_outer=False)
     return runner
 
 
@@ -751,13 +719,13 @@ def _run_once(runner, gpu, token_slots, *, use_cuda_graph=False):
         down_lora_b=gpu["down_lora_b"],
         token_slots=token_slots,
         adapter_enabled=gpu["adapter_enabled"],
-        physical_rank=_RANK,
-        is_shared_outer=False,
         use_cuda_graph=use_cuda_graph,
         is_prefill=True,
         has_active_lora=True,
     )
-    return runner.run(dispatch, batch, output_dtype=torch.float32)
+    return runner.run(
+        dispatch, batch, output_dtype=torch.float32, **runner._test_execution
+    )
 
 
 def _workspace_buffer_names(runner) -> set[str]:

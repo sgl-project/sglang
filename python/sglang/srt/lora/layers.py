@@ -1061,19 +1061,14 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         provider construction, the shared-factor map, and launch configuration;
         this wrapper keeps no engine internals.
         """
-        from sglang.srt.lora.moe.config_backend import (
-            MoeLoraConfigBackend,
-        )
+        from sglang.srt.lora.moe.moe_lora_runner import MoeLoraLayerEngine
         from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
         workspace = self.lora_backend.moe_lora_workspace
         if workspace is None:
             workspace = MoeLoraWorkspace()
             self.lora_backend.moe_lora_workspace = workspace
-        self.moe_lora_config = MoeLoraConfigBackend.from_layer(
-            base_layer,
-            workspace=workspace,
-        )
+        self.moe_lora_engine = MoeLoraLayerEngine(base_layer, workspace=workspace)
         # This backend is fused-only: MoeRunner resolves its registered fused
         # func, so the forward below goes through the same runner path as any
         # other fused backend.
@@ -1102,14 +1097,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     ):
         """Set LoRA weight tensors from memory pool."""
         if self._lora_runner_backend.is_lora():
-            # Factor dtype and expert domain are immutable once bound, so they
-            # are validated here rather than on every forward.
-            self.moe_lora_config.bind_factors(
-                gate_up_lora_a=gate_up_lora_a_weights,
-                gate_up_lora_b=gate_up_lora_b_weights,
-                down_lora_a=down_lora_a_weights,
-                down_lora_b=down_lora_b_weights,
+            # The layout flag and pool-padded rank are server-lifetime
+            # constants; the engine binds its menu from them exactly once.
+            self.moe_lora_engine.ensure_bound(
                 is_shared_outer=bool(self.experts_shared_outer_loras),
+                physical_rank=int(down_lora_a_weights.shape[2]),
             )
 
         self.set_lora = True
@@ -1136,8 +1128,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             down_lora_b=self.down_lora_b_weights,
             token_slots=moe_lora_info.token_lora_mapping,
             adapter_enabled=moe_lora_info.adapter_enabled,
-            physical_rank=self.down_lora_a_weights.shape[2],
-            is_shared_outer=bool(self.experts_shared_outer_loras),
             use_cuda_graph=batch_info.use_cuda_graph,
             is_prefill=batch_info.is_prefill,
             has_active_lora=batch_info.has_active_lora,
@@ -1220,7 +1210,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         return self._lora_runner.run(
             dispatch_output,
             MoeLoraDispatchPayload(
-                config_backend=self.moe_lora_config,
+                engine=self.moe_lora_engine,
                 batch=self._get_moe_lora_batch(),
             ),
         )

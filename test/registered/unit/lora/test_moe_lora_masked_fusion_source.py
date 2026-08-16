@@ -49,6 +49,10 @@ def _function(source: str, name: str) -> str:
 
 class TestMaskedFusionSource(unittest.TestCase):
     def test_lora_a_to_b_pdl_has_a_complete_signal_wait_launch_chain(self):
+        # The kernel-level A->B PDL ABI stays complete (benchmarks drive it);
+        # the serving runner no longer threads it (plan-level PDL knobs were
+        # retired: route PDL is arch-keyed, A->B edges measured no better
+        # than launch-order overlap, 2026-08 twins).
         a = (LORA_MOE / "bf16.py").read_text()
         b = (LORA_MOE / "lora_b.py").read_text()
         runner = (LORA_MOE / "moe_lora_runner.py").read_text()
@@ -67,10 +71,8 @@ class TestMaskedFusionSource(unittest.TestCase):
             one_launch_b.index("gdc_wait"),
         )
         self.assertIn('"launch_pdl": True', b_launcher)
-        self.assertIn("produce_pdl=use_gate_pdl", runner)
-        self.assertIn("consume_pdl=use_gate_pdl", runner)
-        self.assertIn("produce_pdl=use_down_pdl", runner)
-        self.assertIn("consume_pdl=use_down_pdl", runner)
+        self.assertNotIn("produce_pdl", runner)
+        self.assertNotIn("consume_pdl", runner)
 
     def test_cutedsl_base_pdl_separates_producer_and_consumer_roles(self):
         api = _source("cutedsl_masked/api.py")
@@ -96,7 +98,7 @@ class TestMaskedFusionSource(unittest.TestCase):
             (
                 activation,
                 "_activation_delta_masked_kernel",
-                "silu_mul_delta_masked",
+                "act_delta_masked",
             ),
             (middle, "_b_act_kernel", "run_masked_fused_middle"),
         ):
@@ -283,7 +285,7 @@ class TestMaskedFusionSource(unittest.TestCase):
     def test_materialized_activation_supports_swiglu_and_relu2(self):
         source = _source("masked_activation.py")
         kernel = _function(source, "_activation_delta_masked_kernel")
-        wrapper = _function(source, "silu_mul_delta_masked")
+        wrapper = _function(source, "act_delta_masked")
         self.assertIn("NUM_SLICES", kernel)
         self.assertIn("ACTIVATION_TYPE", kernel)
         self.assertIn("tl.maximum", _function(source, "apply_activation"))
@@ -375,7 +377,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         activation = types.ModuleType(
             "sglang.srt.lora.moe.base_gemm_provider.masked_activation"
         )
-        activation.silu_mul_delta_masked = lambda *_args, **_kwargs: None
+        activation.act_delta_masked = lambda *_args, **_kwargs: None
         dispatch = types.ModuleType(
             "sglang.srt.lora.moe.base_gemm_provider.masked_dispatch"
         )

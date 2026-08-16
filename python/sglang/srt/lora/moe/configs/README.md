@@ -1,39 +1,69 @@
 # MoE LoRA config files
 
-One JSON file per device-architecture key space, consumed by
-`sglang/srt/lora/moe/config.py`:
+Two JSON files per device-architecture key space:
 
-- `gb300.json` — every SM100-family device (B200, GB200/GB300)
-- `h200.json` — SM90
-- `default.json` — served when no file covers the architecture; routes
+- `{arch}.plans.json` — execution-plan rows, loaded by
+  `sglang/srt/lora/moe/execution_plan.py` (`load_plans`/`resolve_plans`)
+- `{arch}.tiles.json` — per-row launch-tile rules, loaded by
+  `sglang/srt/lora/moe/launch_config.py` (`resolve_tiles`)
+
+Architectures:
+
+- `gb300.*` — every SM100-family device (B200, GB200/GB300)
+- `h200.*` — SM90
+- `default.*` — served when no file covers the architecture; routes
   everything through the conservative serial fallback
 - `base_gemm/` — M-bucketed base-GEMM launch tables (separate key space:
-  provider × geometry × device, not scenario rows; see its README)
+  provider × geometry × device, not plan rows; see its README)
 
-Each file:
+Plans file:
 
 ```json
 {
   "arch": "gb300",
   "domain": {"max_hidden": 4096, "max_local_experts": 512},
-  "scenarios": [ { "name", "when", "provider", "plan", "config" }, ... ],
+  "scenarios": [ { "name", "layout", "phase", "max_rank", "provider",
+                   "plan" }, ... ],
   "fallback":  [ ...same row shape, matched when the geometry is outside
                  "domain" or no scenario row matches... ]
 }
 ```
 
-Rows are matched FIRST-HIT IN ORDER, so put more specific predicates
-(token/rank tiers) above catch-alls. `when` supports: `layout`
-("per_expert"/"shared"), `activation`, `phase` ("decode"/"prefill"),
-`max_tokens`, `max_rank`, `min_local_experts`; absent keys are wildcards.
-`plan` carries kernel families, fusion shape, overlap windows, and route
-builder (see `_build_plan` in config.py for the field list); `config`
-carries the launch tiles. Every row is validated through the execution-plan
-contracts at load time — a malformed row fails startup, never serves.
+Plan selection happens ONCE, at weight bind: every selection input (layout,
+phase, pool-padded rank, geometry) is a server-lifetime constant, so
+nothing plan-shaped remains on the forward path. Rows are matched FIRST-HIT
+IN ORDER, so put more specific rows (rank bands) above catch-alls. `layout`
+("per_expert"/"shared") and `phase` ("decode"/"prefill") are exact keys
+(absent = wildcard); `max_rank` admits ranks up to its bound. Rows are
+activation-agnostic: the layer injects its own activation when the plan is
+built. `plan` carries kernel families, fusion shape, overlap windows, and
+route builder (see `build_plan` in execution_plan.py for the field list).
+Every served row is validated through the execution-plan contracts at bind
+time — a malformed row fails startup, never serves.
+
+Tiles file:
+
+```json
+{
+  "arch": "gb300",
+  "rules": {
+    "<plan row name>": [ { "max_rank", "max_tokens", "sites" }, ... ]
+  }
+}
+```
+
+The tile pick is the ONLY per-forward decision: at bind time the rank rules
+are filtered against the bound rank, and each forward takes the first rule
+whose `max_tokens` admits the batch (a rule without `max_tokens` terminates
+the ladder). `sites` holds `MoeLoraLaunchConfig` fields (per-site Triton
+tile dicts). A plan row with no rules serves the built-in heuristics.
+
+Both loaders are pydantic models with `extra="forbid"`: a field this build
+does not understand aborts startup instead of silently widening a match.
 
 Every value in the shipped files is a measured sweep winner from the
 2026-08 best-config campaign (bs 1–32, 4k/1k, mlpb=4, r16/32; Qwen3.5-35B,
-Qwen3.5-397B, Inkling-Small on GB300/B200/H200). gb300.json's claim over
+Qwen3.5-397B, Inkling-Small on GB300/B200/H200). gb300's claim over
 the whole SM100 family was re-validated on B200 (2026-08-14, 14-arm e2e
 sweep): every swept axis — decode B family, split-K, row domain, overlap
 windows, route builder, route PDL — confirmed the shipped winner.

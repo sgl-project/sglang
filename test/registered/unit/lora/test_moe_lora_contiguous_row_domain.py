@@ -56,15 +56,14 @@ from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
     ContiguousRowDomainProvider,
     contiguous_m_pad_ceiling,
 )
-from sglang.srt.lora.moe.config import (
-    ConfigChoice,
-    ConfigInput,
+from sglang.srt.lora.moe.execution_plan import (
+    ActivationFamily,
     DeviceArchitecture,
     Phase,
-    choices_for,
-    select_config,
+    iter_selected_plans,
+    resolve_plans,
 )
-from sglang.srt.lora.moe.execution_plan import ActivationFamily
+from sglang.srt.lora.moe.launch_config import resolve_tiles
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -75,24 +74,29 @@ _H200 = DeviceArchitecture.H200
 _SWIGLU = ActivationFamily.SWIGLU
 
 
-def _menu(architecture, layout, activation=_SWIGLU, hidden_size=2048):
+def _menu(architecture, layout, activation=_SWIGLU):
+    """The shipped rows for one layout, keyed by row name."""
     return {
-        choice.key: choice
-        for choice in choices_for(
-            architecture,
-            layout,
-            activation,
-            hidden_size=hidden_size,
-            num_local_experts=256,
+        sel.name: sel
+        for sel in iter_selected_plans(
+            architecture=architecture,
+            is_shared_outer=layout,
+            activation=activation,
         )
     }
 
 
-def _choice(architecture, layout, fragment: str, hidden_size: int = 2048):
-    menu = _menu(architecture, layout, hidden_size=hidden_size)
-    matches = [choice for key, choice in menu.items() if fragment in key]
-    assert len(matches) == 1, f"{fragment!r} not unique in {sorted(menu)}"
-    return matches[0]
+def _choice(architecture, layout, name: str):
+    return _menu(architecture, layout)[name]
+
+
+def _shipped_launch(architecture, sel, *, physical_rank=16, num_tokens=4096):
+    """The shipped tile pick for one row, resolved the way serving does."""
+    return resolve_tiles(
+        architecture_value=architecture.value,
+        plan_key_name=sel.name,
+        physical_rank=physical_rank,
+    ).config_for(num_tokens)
 
 
 def _host_aligned_prefix(counts: list[int], alignment: int) -> list[int]:
@@ -163,29 +167,25 @@ class TestRowDomainConfig:
         # backend.  The shared-outer fallback twin has no per-expert
         # is_shared_outer to re-target and stays on the masked DeepGEMM provider.
         gb300_pe = _menu(_GB300, False)
-        assert _pick(gb300_pe, ".prefill.serial.").provider == "cutedsl_contiguous"
-        assert (
-            _pick(gb300_pe, ".fallback.serial_prefill.").provider
-            == "deepgemm_contiguous"
-        )
+        assert gb300_pe["prefill.serial"].provider == "cutedsl_contiguous"
+        assert gb300_pe["fallback.serial_prefill"].provider == "deepgemm_contiguous"
         gb300_sh = _menu(_GB300, True)
-        assert _pick(gb300_sh, ".prefill.token_dedup.").provider == "cutedsl_contiguous"
-        assert _pick(gb300_sh, ".fallback.serial_prefill.").provider == "deepgemm"
+        assert gb300_sh["prefill.token_dedup"].provider == "cutedsl_contiguous"
+        assert gb300_sh["fallback.serial_prefill"].provider == "deepgemm"
         h200_pe = _menu(_H200, False)
-        assert _pick(h200_pe, ".prefill.serial.").provider == "deepgemm_contiguous"
-        assert (
-            _pick(h200_pe, ".fallback.serial_prefill.").provider
-            == "deepgemm_contiguous"
-        )
-        # Both H200 shared prefill twins converted: the b_activation
-        # materialized twin and the shared-rank twin (its reduce is
-        # pair-domain, its tail reads base rows only through src2dst).
+        assert h200_pe["prefill.serial"].provider == "deepgemm_contiguous"
+        assert h200_pe["fallback.serial_prefill"].provider == "deepgemm_contiguous"
+        # Every H200 shared prefill band converted: the small-rank and
+        # materialized b_activation twins and the shared-rank band (its
+        # reduce is pair-domain, its tail reads base rows only through
+        # src2dst).
         h200_sh = _menu(_H200, True)
-        assert _pick(h200_sh, ".prefill.shared_rank.").provider == "deepgemm_contiguous"
-        assert (
-            _pick(h200_sh, ".prefill.materialized.").provider == "deepgemm_contiguous"
+        assert h200_sh["prefill.materialized.small_rank"].provider == (
+            "deepgemm_contiguous"
         )
-        assert _pick(h200_sh, ".fallback.serial_prefill.").provider == "deepgemm"
+        assert h200_sh["prefill.shared_rank"].provider == "deepgemm_contiguous"
+        assert h200_sh["prefill.materialized"].provider == "deepgemm_contiguous"
+        assert h200_sh["fallback.serial_prefill"].provider == "deepgemm"
 
     def test_decode_choices_never_convert(self) -> None:
         # DECODE is categorically expert-major by measured config (the
@@ -195,13 +195,10 @@ class TestRowDomainConfig:
         for architecture in (_GB300, _H200):
             for layout in (False, True):
                 for activation in (_SWIGLU, ActivationFamily.RELU2):
-                    for hidden_size in (2048, 8192):
-                        for key, choice in _menu(
-                            architecture, layout, activation, hidden_size
-                        ).items():
-                            if ".decode." not in key and ".fallback.serial." not in key:
-                                continue
-                            assert choice.provider in ("cutedsl", "deepgemm"), key
+                    for name, choice in _menu(architecture, layout, activation).items():
+                        if not name.startswith("decode.") and name != "fallback.serial":
+                            continue
+                        assert choice.provider in ("cutedsl", "deepgemm"), name
 
     def test_h200_large_expert_prefill_selects_the_contiguous_serial(self) -> None:
         # The DeepGEMM contiguous backend is the only feasible prefill
@@ -209,39 +206,29 @@ class TestRowDomainConfig:
         # scratch does not fit).  The served plan carries the composed
         # b_act middle and down-B scatter, so it is no longer the bare
         # fully-serial shape.
-        routed = select_config(
-            ConfigInput(
-                capability_major=9,
-                capability_minor=0,
-                is_shared_outer=False,
-                activation=_SWIGLU,
-                mode=Phase.PREFILL,
-                num_tokens=8192,
-                active_rank=16,
-                hidden_size=4096,
-                num_local_experts=512,
-                has_active_lora=True,
-                use_cuda_graph=False,
-            )
-        )
-        assert ".prefill.serial." in routed.key
+        routed = resolve_plans(
+            architecture=_H200,
+            is_shared_outer=False,
+            physical_rank=16,
+            activation=_SWIGLU,
+            hidden_size=4096,
+            num_local_experts=512,
+        )[Phase.PREFILL]
+        assert routed.name == "prefill.serial"
         assert routed.provider == "deepgemm_contiguous"
         assert not routed.plan.is_fully_serial_materialized()
         assert routed.plan.down_b_scatter is True
 
-    def test_config_choice_accepts_the_contiguous_provider_keys(self) -> None:
-        base = _choice(_GB300, False, ".prefill.serial.")
-        for provider in ("deepgemm_contiguous", "cutedsl_contiguous"):
-            converted = ConfigChoice(base.key, provider, base.plan, base.launch_config)
-            assert converted.provider == provider
-        with pytest.raises(ValueError, match="cutedsl_contiguous"):
-            ConfigChoice(base.key, "row_major", base.plan, base.launch_config)
+    def test_runner_accepts_the_contiguous_provider_keys(self) -> None:
+        from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
-
-def _pick(menu, fragment: str):
-    matches = [choice for key, choice in menu.items() if fragment in key]
-    assert len(matches) == 1, (fragment, sorted(menu))
-    return matches[0]
+        assert MoeLoraRunner.select_provider_cls("deepgemm_contiguous") is not None
+        try:
+            assert MoeLoraRunner.select_provider_cls("cutedsl_contiguous") is not None
+        except NotImplementedError:
+            pass  # known name, device-gated (SM90 has no contiguous port)
+        with pytest.raises(ValueError, match="row_major"):
+            MoeLoraRunner.select_provider_cls("row_major")
 
 
 class TestCuteDslContiguousScheduleGeometry:
@@ -756,12 +743,10 @@ def _token_slots(traffic: str, num_tokens: int) -> torch.Tensor:
 
 def _standalone_output_allocation(runner, *, num_tokens, dtype, device):
     """Match eager output geometry without requiring a serving TP group."""
-    return torch.empty(
-        (num_tokens, runner.provider.hidden_size), dtype=dtype, device=device
-    )
+    return torch.empty((num_tokens, runner.hidden_size), dtype=dtype, device=device)
 
 
-def _build_runner(choice, provider_name: str, gpu, num_experts: int, layout):
+def _build_runner(architecture, choice, provider_name: str, gpu, num_experts, layout):
     from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
     quant_info = MoeLoraBf16QuantInfo(
@@ -773,20 +758,17 @@ def _build_runner(choice, provider_name: str, gpu, num_experts: int, layout):
     )
     provider = MoeLoraRunner.select_provider_cls(provider_name)(quant_info)
     runner = MoeLoraRunner(
-        provider=provider,
+        providers={"test": provider},
         top_k=_TOP_K,
         routed_scaling_factor=_ROUTED_SCALING,
         activation=ActivationFamily.SWIGLU,
-        execution_plan=choice.plan,
-        launch_config=choice.launch_config,
     )
-    runner.validate_factors(
-        gate_up_lora_a=gpu["gate_up_lora_a"],
-        gate_up_lora_b=gpu["gate_up_lora_b"],
-        down_lora_a=gpu["down_lora_a"],
-        down_lora_b=gpu["down_lora_b"],
-        is_shared_outer=layout,
+    runner._test_execution = dict(
+        plan=choice.plan,
+        launch_config=_shipped_launch(architecture, choice),
+        provider_name="test",
     )
+    runner.prepare_plan(choice.plan, provider_name="test", is_shared_outer=layout)
     return runner
 
 
@@ -813,13 +795,13 @@ def _run_once(
         down_lora_b=gpu["down_lora_b"],
         token_slots=token_slots,
         adapter_enabled=gpu["adapter_enabled"],
-        physical_rank=_PHYSICAL_RANK,
-        is_shared_outer=layout,
         use_cuda_graph=use_cuda_graph,
         is_prefill=is_prefill,
         has_active_lora=True,
     )
-    return runner.run(dispatch, batch, output_dtype=torch.float32)
+    return runner.run(
+        dispatch, batch, output_dtype=torch.float32, **runner._test_execution
+    )
 
 
 # The one intended divergence: the masked and contiguous S2/S4 kernel
@@ -838,18 +820,18 @@ _ORACLE_TOLERANCE = {"atol": 2e-2, "rtol": 0.05}
 # shipped per-expert prefill choice composes the b_act middle and down-B
 # scatter, which the dedicated b_act/scatter suites cover), the shared-outer
 # serial token-dedup b_activation winner (fused middle + mapped down-A +
-# joint route builder with its route_pdl chain), and the H200 shared-outer
+# joint route builder with its routing PDL chain), and the H200 shared-outer
 # serial shared-rank twin (fused middle + mapped down-A + the
 # SHARED_RANK_REDUCE finalize consuming shared down-B over the raw route).
 # The masked reference runner executes the SAME plan on the SAME DeepGEMM
 # masked provider either way — this oracle isolates the row-domain seam.
 _ELIGIBLE_PLAN_PARAMS = (
-    pytest.param(_GB300, False, ".fallback.serial.", id="per-expert-materialized"),
-    pytest.param(_GB300, True, ".prefill.token_dedup.", id="shared-outer-b-activation"),
+    pytest.param(_GB300, False, "fallback.serial", id="per-expert-materialized"),
+    pytest.param(_GB300, True, "prefill.token_dedup", id="shared-outer-b-activation"),
     pytest.param(
         _H200,
         True,
-        ".prefill.shared_rank.",
+        "prefill.shared_rank",
         id="shared-outer-shared-rank",
     ),
 )
@@ -882,8 +864,10 @@ def test_contiguous_prefill_matches_masked(
         architecture, layout, fragment, num_tokens, num_experts, device
     )
 
-    masked = _build_runner(choice, "deepgemm", gpu, num_experts, layout)
-    contiguous = _build_runner(choice, contiguous_provider, gpu, num_experts, layout)
+    masked = _build_runner(architecture, choice, "deepgemm", gpu, num_experts, layout)
+    contiguous = _build_runner(
+        architecture, choice, contiguous_provider, gpu, num_experts, layout
+    )
 
     for traffic in ("active", "mixed", "base_only"):
         token_slots = _token_slots(traffic, num_tokens).to(device)
@@ -936,8 +920,10 @@ def test_contiguous_prefill_replays_in_a_real_cuda_graph(
     choice, gpu = _oracle_setup(
         architecture, layout, fragment, num_tokens, num_experts, device
     )
-    masked = _build_runner(choice, "deepgemm", gpu, num_experts, layout)
-    contiguous = _build_runner(choice, contiguous_provider, gpu, num_experts, layout)
+    masked = _build_runner(architecture, choice, "deepgemm", gpu, num_experts, layout)
+    contiguous = _build_runner(
+        architecture, choice, contiguous_provider, gpu, num_experts, layout
+    )
     token_slots = _token_slots("active", num_tokens).to(device)
 
     for _ in range(2):  # JIT + workspace graph-buffer retention before capture

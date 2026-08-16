@@ -3,13 +3,14 @@
 Three steps, each usable alone:
 
 1. ``--check``: resolve the model's MoE geometry against the shipped (or
-   ``--config-dir``) files and report, per (layout, phase), which scenario
-   row would serve it — or that it falls to the serial fallback. Exit code 1
+   ``--config-dir``) plan tables and report, per (layout, phase), which row
+   would serve it — or that it falls to the serial fallback. Exit code 1
    when anything falls through, so CI can gate onboarding.
-2. ``--emit-seed``: write ``<out>/<arch>.json`` seeded for this geometry:
-   the shipped rows with the ``domain`` widened to include the model. This
-   serves correctly immediately (all rows still pass plan validation); it is
-   a starting point for step 3, not a certified optimum.
+2. ``--emit-seed``: write ``<out>/<arch>.plans.json`` seeded for this
+   geometry: the shipped rows with the ``domain`` widened to include the
+   model (the shipped ``<arch>.tiles.json`` is copied through unchanged).
+   This serves correctly immediately (all rows still pass plan validation);
+   it is a starting point for step 3, not a certified optimum.
 3. ``--sweep``: e2e-tune, one server relaunch per arm, the two axes the
    2026-08 campaign found can move with geometry:
    - LoRA config: shared-decode overlap windows (variant config dirs served
@@ -23,10 +24,10 @@ Three steps, each usable alone:
 
 TODO(quant): this harness currently tunes the bf16 serving path only. When
 fp8 / nvfp4 qlora support lands, the sweep must grow a quant dimension:
-quant-specific providers as sweep arms, a ``quant`` key in the config
-``when`` predicates (the resolver already fails closed on keys it does not
-understand, so old builds reject newer configs instead of mis-matching),
-and per-quant seed emission.
+quant-specific providers as sweep arms, a ``quant`` key on the plan rows
+(the pydantic loaders reject fields they do not understand, so old builds
+fail closed on newer tables instead of mis-matching), and per-quant seed
+emission.
 
 The sweep reuses the campaign protocol: bench_one_batch_server, input 4096 /
 output 1024, batch sizes 1/8/16/32, medians after first-pass discard.
@@ -36,7 +37,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import itertools
 import json
 import os
 import statistics
@@ -75,47 +75,35 @@ def resolve_report(args, geometry) -> int:
     sys.path.insert(0, os.path.join(REPO, "python"))
     if args.config_dir:
         os.environ["SGLANG_LORA_MOE_CONFIG_DIR"] = args.config_dir
-    from sglang.srt.lora.moe import config as cm
-    from sglang.srt.lora.moe.execution_plan import ActivationFamily
+    from sglang.srt.lora.moe.execution_plan import (
+        ActivationFamily,
+        architecture_for_capability,
+        resolve_plans,
+    )
 
     e_local = geometry["num_experts"] // args.ep_size
     fell_through = 0
-    for is_shared_outer, mode, tokens in itertools.product(
-        (False, True),
-        (cm.Phase.DECODE, cm.Phase.PREFILL),
-        (1, 32, 4096),
-    ):
-        if (mode is cm.Phase.DECODE) == (tokens == 4096):
-            continue
-        choice = cm.select_config(
-            cm.ConfigInput(
-                capability_major=args.capability_major,
-                capability_minor=0,
-                is_shared_outer=is_shared_outer,
-                activation=ActivationFamily(geometry["activation"]),
-                mode=mode,
-                num_tokens=tokens,
-                active_rank=args.max_rank,
-                hidden_size=geometry["hidden_size"],
-                num_local_experts=e_local,
-                has_active_lora=True,
-                use_cuda_graph=False,
-            )
+    for is_shared_outer in (False, True):
+        selected = resolve_plans(
+            architecture=architecture_for_capability(args.capability_major, 0),
+            is_shared_outer=is_shared_outer,
+            physical_rank=args.max_rank,
+            activation=ActivationFamily(geometry["activation"]),
+            hidden_size=geometry["hidden_size"],
+            num_local_experts=e_local,
         )
-        tag = "FALLBACK" if "fallback" in choice.key else "tuned"
-        if tag == "FALLBACK":
-            fell_through += 1
         layout_name = "shared" if is_shared_outer else "per_expert"
-        print(
-            f"  {layout_name:10s} {mode.value:7s} tokens={tokens:<5d} -> "
-            f"[{tag}] {choice.key}"
-        )
+        for phase, sel in selected.items():
+            tag = "FALLBACK" if "fallback" in sel.name else "tuned"
+            if tag == "FALLBACK":
+                fell_through += 1
+            print(f"  {layout_name:10s} {phase.value:7s} -> [{tag}] {sel.key}")
     return 1 if fell_through else 0
 
 
 def emit_seed(args, geometry) -> str:
     arch = "gb300" if args.capability_major >= 10 else "h200"
-    src = os.path.join(args.config_dir or PACKAGED, f"{arch}.json")
+    src = os.path.join(args.config_dir or PACKAGED, f"{arch}.plans.json")
     table = json.load(open(src))
     e_local = geometry["num_experts"] // args.ep_size
     table["domain"]["max_hidden"] = max(
@@ -135,8 +123,12 @@ def emit_seed(args, geometry) -> str:
         "seed:untuned until --sweep certifies them",
     }
     os.makedirs(args.out, exist_ok=True)
-    dst = os.path.join(args.out, f"{arch}.json")
+    dst = os.path.join(args.out, f"{arch}.plans.json")
     json.dump(table, open(dst, "w"), indent=1)
+    tiles_src = os.path.join(args.config_dir or PACKAGED, f"{arch}.tiles.json")
+    if os.path.isfile(tiles_src):
+        tiles_dst = os.path.join(args.out, f"{arch}.tiles.json")
+        json.dump(json.load(open(tiles_src)), open(tiles_dst, "w"), indent=1)
     print(f"seed config written: {dst}")
     return dst
 
@@ -220,9 +212,7 @@ def sweep(args, seed_path: str) -> None:
     for early, late in SHARED_WINDOW_CANDIDATES:
         candidate = copy.deepcopy(table)
         for row in candidate["scenarios"]:
-            if row["when"].get("layout") == "shared" and (
-                row["when"].get("phase") == "decode"
-            ):
+            if row.get("layout") == "shared" and row.get("phase") == "decode":
                 row["plan"]["early_overlap"] = early
                 row["plan"]["late_overlap"] = late
                 for k in ("early_overlap", "late_overlap"):
@@ -230,7 +220,13 @@ def sweep(args, seed_path: str) -> None:
                         del row["plan"][k]
                 row["provenance"] = "sweep-candidate"
         os.makedirs(variant_dir, exist_ok=True)
-        json.dump(candidate, open(os.path.join(variant_dir, f"{arch}.json"), "w"))
+        json.dump(candidate, open(os.path.join(variant_dir, f"{arch}.plans.json"), "w"))
+        tiles_src = os.path.join(args.out, f"{arch}.tiles.json")
+        if os.path.isfile(tiles_src):
+            json.dump(
+                json.load(open(tiles_src)),
+                open(os.path.join(variant_dir, f"{arch}.tiles.json"), "w"),
+            )
         tag = f"win_{early}_{late}"
         results[tag] = bench_once(
             args, {"SGLANG_LORA_MOE_CONFIG_DIR": variant_dir}, tag
@@ -240,9 +236,7 @@ def sweep(args, seed_path: str) -> None:
     early, late = best[len("win_") :].split("_", 1)
     print(f"window winner: early={early} late={late}")
     for row in table["scenarios"]:
-        if row["when"].get("layout") == "shared" and (
-            row["when"].get("phase") == "decode"
-        ):
+        if row.get("layout") == "shared" and row.get("phase") == "decode":
             for k in ("early_overlap", "late_overlap"):
                 row["plan"].pop(k, None)
             if early != "none":

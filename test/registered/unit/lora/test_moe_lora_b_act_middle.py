@@ -27,15 +27,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sglang.srt.lora.moe.config import (
-    DeviceArchitecture,
-    choices_for,
-)
 from sglang.srt.lora.moe.execution_plan import (
     ActivationFamily,
-    FactorContract,
-    FactorLayout,
-    FactorSite,
+    BridgeLayout,
+    DeviceArchitecture,
     FinalizeFamily,
     FinalizeSpec,
     LoraAFamily,
@@ -45,7 +40,13 @@ from sglang.srt.lora.moe.execution_plan import (
     MiddleFamily,
     MiddleSpec,
     MoeLoraExecutionPlan,
+    Phase,
+    Site,
+    StageContract,
+    iter_selected_plans,
+    resolve_plans,
 )
+from sglang.srt.lora.moe.launch_config import resolve_tiles
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=150, stage="base-b", runner_config="1-gpu-small")
@@ -55,27 +56,25 @@ _H200 = DeviceArchitecture.H200
 _SWIGLU = ActivationFamily.SWIGLU
 
 
-def _choices(architecture, layout, activation=_SWIGLU, hidden_size=2048):
+def _menu(architecture, layout, activation=_SWIGLU):
+    """The shipped rows for one layout, keyed by row name."""
     return {
-        choice.key: choice
-        for choice in choices_for(
-            architecture,
-            layout,
-            activation,
-            hidden_size=hidden_size,
-            num_local_experts=256,
+        sel.name: sel
+        for sel in iter_selected_plans(
+            architecture=architecture,
+            is_shared_outer=layout,
+            activation=activation,
         )
     }
 
 
-def _pick(menu, fragment: str):
-    matches = [choice for key, choice in menu.items() if fragment in key]
-    assert len(matches) == 1, (fragment, sorted(menu))
-    return matches[0]
-
-
-def _choice(architecture, layout, fragment: str, activation=_SWIGLU):
-    return _pick(_choices(architecture, layout, activation), fragment)
+def _shipped_launch(architecture, sel, *, physical_rank=16, num_tokens=4096):
+    """The shipped tile pick for one row, resolved the way serving does."""
+    return resolve_tiles(
+        architecture_value=architecture.value,
+        plan_key_name=sel.name,
+        physical_rank=physical_rank,
+    ).config_for(num_tokens)
 
 
 def _build_plan(
@@ -89,35 +88,33 @@ def _build_plan(
     ``_build_plan`` materializes a scenario (spec classes directly)."""
     pe = False
     consumes_gate_b = middle_family is MiddleFamily.B_ACTIVATION
-    gate_b_contract = FactorContract(FactorSite.GATE_UP, pe, FactorLayout.PAIR_MAJOR)
+    gate_b_contract = StageContract(Site.GATE_UP, pe, BridgeLayout.PAIR_MAJOR)
     return MoeLoraExecutionPlan(
         gate_a=LoraASpec(
-            FactorSite.GATE_UP,
+            Site.GATE_UP,
             LoraAFamily.GROUPED,
             is_shared_outer,
-            FactorLayout.PAIR_MAJOR,
+            BridgeLayout.PAIR_MAJOR,
         ),
         gate_b=(
             None
             if consumes_gate_b
             else LoraBSpec(
-                FactorSite.GATE_UP,
+                Site.GATE_UP,
                 LoraBFamily.ONE_LAUNCH_SLICED,
                 pe,
-                FactorLayout.PAIR_MAJOR,
+                BridgeLayout.PAIR_MAJOR,
             )
         ),
         middle=MiddleSpec(
             middle_family, activation, gate_b_contract if consumes_gate_b else None
         ),
-        down_a=LoraASpec(
-            FactorSite.DOWN, LoraAFamily.GROUPED, pe, FactorLayout.PAIR_MAJOR
-        ),
+        down_a=LoraASpec(Site.DOWN, LoraAFamily.GROUPED, pe, BridgeLayout.PAIR_MAJOR),
         down_b=LoraBSpec(
-            FactorSite.DOWN,
+            Site.DOWN,
             LoraBFamily.ONE_LAUNCH_SLICED,
             is_shared_outer,
-            FactorLayout.PAIR_MAJOR,
+            BridgeLayout.PAIR_MAJOR,
         ),
         finalize=FinalizeSpec(FinalizeFamily.MATERIALIZED),
         down_b_scatter=down_b_scatter,
@@ -131,7 +128,7 @@ class TestBActMiddleConfig:
     def test_h200_serial_prefill_ships_it_too(self) -> None:
         # The H200 serial prefill shape is the same eligible form, on the
         # SM90-capable DeepGEMM contiguous backend.
-        serial = _choice(_H200, False, ".prefill.serial.")
+        serial = _menu(_H200, False)["prefill.serial"]
         assert serial.plan.middle.family is MiddleFamily.B_ACTIVATION
         assert serial.plan.gate_b is None
         assert serial.plan.down_b_scatter is True
@@ -144,38 +141,34 @@ class TestBActMiddleConfig:
         for architecture in (_GB300, _H200):
             for layout in (False, True):
                 for activation in (_SWIGLU, ActivationFamily.RELU2):
-                    for key, choice in _choices(
-                        architecture, layout, activation
-                    ).items():
-                        if ".decode." not in key and ".fallback.serial." not in key:
+                    for name, choice in _menu(architecture, layout, activation).items():
+                        if not name.startswith("decode.") and name != "fallback.serial":
                             continue
                         assert (
                             choice.plan.middle.family is MiddleFamily.MATERIALIZED
-                        ), key
-                        assert choice.plan.gate_b is not None, key
+                        ), name
+                        assert choice.plan.gate_b is not None, name
 
     def test_out_of_domain_prefill_twins_get_the_swap(self) -> None:
-        per_expert = _pick(
-            _choices(_GB300, False, hidden_size=8192),
-            "fallback.serial_prefill",
-        )
-        shared = _pick(
-            _choices(_GB300, True, hidden_size=8192),
-            "fallback.serial_prefill",
-        )
-        relu2 = _pick(
-            _choices(
-                _GB300,
-                False,
-                ActivationFamily.RELU2,
-                hidden_size=8192,
-            ),
-            "fallback.serial_prefill",
-        )
+        def _prefill(is_shared_outer, activation=_SWIGLU):
+            return resolve_plans(
+                architecture=_GB300,
+                is_shared_outer=is_shared_outer,
+                physical_rank=16,
+                activation=activation,
+                hidden_size=8192,  # outside the gb300 tuned domain
+                num_local_experts=256,
+            )[Phase.PREFILL]
+
+        per_expert = _prefill(False)
+        shared = _prefill(True)
+        relu2 = _prefill(False, ActivationFamily.RELU2)
+        for sel in (per_expert, shared, relu2):
+            assert sel.name == "fallback.serial_prefill"
         # The per-expert twin composes the swap with the scatter; the shared
         # twin gets the swap only (its down-B is shared, never scattered);
-        # the ReLU2 twin keeps the materialized middle (the swap is
-        # SWIGLU-only) but still scatters.
+        # rows are activation-agnostic, so the ReLU2 twin ships the same
+        # fused middle with its own activation injected.
         assert per_expert.plan.middle.family is MiddleFamily.B_ACTIVATION
         assert per_expert.plan.gate_b is None
         assert per_expert.plan.down_b_scatter is True
@@ -184,7 +177,8 @@ class TestBActMiddleConfig:
         assert shared.plan.gate_b is None
         assert shared.plan.down_b_scatter is False
         assert shared.provider == "deepgemm"
-        assert relu2.plan.middle.family is MiddleFamily.MATERIALIZED
+        assert relu2.plan.middle.family is MiddleFamily.B_ACTIVATION
+        assert relu2.plan.middle.activation is ActivationFamily.RELU2
         assert relu2.plan.down_b_scatter is True
 
 
@@ -274,9 +268,7 @@ def _token_slots(traffic: str, num_tokens: int) -> torch.Tensor:
 
 
 def _standalone_output_allocation(runner, *, num_tokens, dtype, device):
-    return torch.empty(
-        (num_tokens, runner.provider.hidden_size), dtype=dtype, device=device
-    )
+    return torch.empty((num_tokens, runner.hidden_size), dtype=dtype, device=device)
 
 
 def _reference_choice():
@@ -285,7 +277,7 @@ def _reference_choice():
     The decode fallback is exactly that plan with a complete tuned launch
     config (one-launch B tilings, b_activation section, aligned-16 routes),
     so it doubles as the config donor for the swapped variants."""
-    choice = _pick(_choices(_GB300, False), ".fallback.serial.")
+    choice = _menu(_GB300, False)["fallback.serial"]
     assert choice.plan.middle.family is MiddleFamily.MATERIALIZED
     assert choice.plan.gate_b is not None
     assert choice.plan.down_b_scatter is False
@@ -307,20 +299,15 @@ def _build_runner(plan, launch_config, provider_name: str, gpu, num_experts: int
         )
     )
     runner = MoeLoraRunner(
-        provider=provider,
+        providers={"test": provider},
         top_k=_TOP_K,
         routed_scaling_factor=_ROUTED_SCALING,
         activation=ActivationFamily.SWIGLU,
-        execution_plan=plan,
-        launch_config=launch_config,
     )
-    runner.validate_factors(
-        gate_up_lora_a=gpu["gate_up_lora_a"],
-        gate_up_lora_b=gpu["gate_up_lora_b"],
-        down_lora_a=gpu["down_lora_a"],
-        down_lora_b=gpu["down_lora_b"],
-        is_shared_outer=False,
+    runner._test_execution = dict(
+        plan=plan, launch_config=launch_config, provider_name="test"
     )
+    runner.prepare_plan(plan, provider_name="test", is_shared_outer=False)
     return runner
 
 
@@ -345,13 +332,13 @@ def _run_once(runner, gpu, token_slots):
         down_lora_b=gpu["down_lora_b"],
         token_slots=token_slots,
         adapter_enabled=gpu["adapter_enabled"],
-        physical_rank=_RANK,
-        is_shared_outer=False,
         use_cuda_graph=False,
         is_prefill=True,
         has_active_lora=True,
     )
-    return runner.run(dispatch, batch, output_dtype=torch.float32)
+    return runner.run(
+        dispatch, batch, output_dtype=torch.float32, **runner._test_execution
+    )
 
 
 @deepgemm_cuda_only
@@ -379,16 +366,17 @@ def test_runner_b_act_matches_the_materialized_reference(
     assert swapped_plan.down_b_scatter is scatter
     num_tokens, num_experts = 64, 4
     gpu = _make_gpu_tensors(num_tokens, num_experts, device)
+    shared_launch = _shipped_launch(_GB300, reference_choice)
     reference_runner = _build_runner(
         reference_choice.plan,
-        reference_choice.launch_config,
+        shared_launch,
         "deepgemm",
         gpu,
         num_experts,
     )
     b_act_runner = _build_runner(
         swapped_plan,
-        reference_choice.launch_config,
+        shared_launch,
         provider_name,
         gpu,
         num_experts,

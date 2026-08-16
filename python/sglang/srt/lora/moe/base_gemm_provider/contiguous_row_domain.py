@@ -60,9 +60,9 @@ pair-to-row ABI grouped down-A consumes is the same ``src2dst``.  That is
 what admits the GB300 shared-outer SERIAL prefill winner (token-dedup shared
 gate A + fused B+activation middle + one-launch shared down B + materialized
 finalize): every LoRA factor kernel it uses is pair/token-domain, the JOINT
-shared-outer route builder is pure pair-domain metadata whose ``route_pdl``
-chain is internal to the three routing launches and independent of the row
-domain, and the finalize is the same ``post_reorder``.
+shared-outer route builder is pure pair-domain metadata whose PDL chain is
+internal to the three routing launches and independent of the row domain,
+and the finalize is the same ``post_reorder``.
 
 The shared-rank finalize family ports through the SAME lever: the rank
 reduction is pure pair-domain (it reads the canonical pair-major down-A
@@ -624,7 +624,7 @@ def contiguous_dispatch_fill(
         )
 
 
-def silu_mul_delta_contiguous(
+def act_delta_contiguous(
     gateup_output: torch.Tensor,  # [m_pad_ceiling, slices * inter] bf16
     gate_up_delta: torch.Tensor | None,  # [num_tokens, top_k, slices * inter]
     act_out: torch.Tensor,  # [m_pad_ceiling, inter] bf16
@@ -641,7 +641,7 @@ def silu_mul_delta_contiguous(
 
     Same launch, same grid, same per-pair arithmetic and the same
     exactly-once invalid-pair zero write on ``activation_lora_input`` as
-    :func:`masked_activation.silu_mul_delta_masked`; only the physical row
+    :func:`masked_activation.act_delta_masked`; only the physical row
     behind each ``src2dst`` entry differs.  The only wrapper-level change is
     that ``num_local_experts`` is explicit — the masked wrapper reads it from
     the slab's leading dimension, which the compact 2-D buffer no longer
@@ -1080,7 +1080,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
     ) -> None:
         if activation not in ("silu", "relu2"):
             raise ValueError(f"activation={activation!r} is not 'silu' or 'relu2'")
-        silu_mul_delta_contiguous(
+        act_delta_contiguous(
             gateup_out,
             gate_up_delta,
             act_out,

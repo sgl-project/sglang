@@ -288,6 +288,12 @@ def build_routes(
             "a separate gate-A route is qualified only for grouped, "
             "per-expert gate/up-A"
         )
+    # Route PDL is always on where the architecture supports it: measured
+    # +0.5..+2.0% decode on every model and GPU, prefill within +-1.3%
+    # (2026-08 twins); no per-plan knob.
+    from sglang.kernels.jit.utils import is_arch_support_pdl
+
+    use_pdl = is_arch_support_pdl()
     values: dict[str, object] = {}
     if RouteRequirement.RAW in requirements:
         values["raw_per_expert"] = _pair_route(
@@ -298,7 +304,7 @@ def build_routes(
             max_loras=max_loras,
             block_size=block_size,
             view=ROUTE_RAW,
-            use_pdl=plan.route_pdl,
+            use_pdl=use_pdl,
         )
         values["raw_shared_outer"] = _pair_route(
             topk_ids,
@@ -308,7 +314,7 @@ def build_routes(
             max_loras=max_loras,
             block_size=block_size,
             view=ROUTE_RAW,
-            use_pdl=plan.route_pdl,
+            use_pdl=use_pdl,
         )
 
     for requirement, fused_is_shared_outer, name in (
@@ -332,7 +338,7 @@ def build_routes(
                 max_loras=max_loras,
                 block_size=block_size,
                 view=ROUTE_FUSED_IDS,
-                use_pdl=plan.route_pdl,
+                use_pdl=use_pdl,
             )
 
     need_per_expert = RouteRequirement.ALIGNED_PER_EXPERT in requirements
@@ -357,7 +363,7 @@ def build_routes(
             max_loras=max_loras,
             block_size=block_size,
             workspace=workspace,
-            use_pdl=plan.route_pdl,
+            use_pdl=use_pdl,
         )
         values["aligned_per_expert"] = per_expert
         values["aligned_shared_outer"] = shared
@@ -387,7 +393,7 @@ def build_routes(
                 max_loras=max_loras,
                 block_size=block_size,
                 gate_a_block_size=gate_a_block_size,
-                use_pdl=plan.route_pdl,
+                use_pdl=use_pdl,
                 workspace=workspace,
             )
         elif need_per_expert and not gate_only_per_expert:
@@ -398,7 +404,7 @@ def build_routes(
                 num_local_experts=num_local_experts,
                 max_loras=max_loras,
                 block_size=block_size,
-                use_pdl=plan.route_pdl,
+                use_pdl=use_pdl,
                 workspace=workspace,
                 scratch_prefix="route:aligned_per_expert",
             )
@@ -410,7 +416,7 @@ def build_routes(
                 num_local_experts=num_local_experts,
                 max_loras=max_loras,
                 block_size=block_size,
-                use_pdl=plan.route_pdl,
+                use_pdl=use_pdl,
                 workspace=workspace,
                 scratch_prefix="route:aligned_shared_outer",
             )
@@ -424,9 +430,7 @@ def build_routes(
             max_loras=max_loras,
             block_size=gate_a_block_size,
             use_pdl=(
-                plan.route_pdl
-                if plan.route_builder is RouteBuilderFamily.STANDARD
-                else False
+                use_pdl if plan.route_builder is RouteBuilderFamily.STANDARD else False
             ),
             workspace=workspace,
             scratch_prefix="route:gate_a_aligned_per_expert",
@@ -469,9 +473,7 @@ def build_routes(
             max_loras=max_loras,
             block_size=block_size,
             use_pdl=(
-                plan.route_pdl
-                if plan.route_builder is RouteBuilderFamily.STANDARD
-                else False
+                use_pdl if plan.route_builder is RouteBuilderFamily.STANDARD else False
             ),
             workspace=workspace,
             scratch_prefix="route:shared_token",

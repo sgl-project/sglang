@@ -1,0 +1,513 @@
+{
+ "arch": "gb300",
+ "rules": {
+  "decode.per_expert": [
+   {
+    "max_rank": 16,
+    "sites": {
+     "b_activation": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_W": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "down_a": {
+      "BLOCK_SIZE_K": 128,
+      "BLOCK_SIZE_N": 16,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 4,
+      "num_warps": 4
+     },
+     "down_b": {
+      "BLOCK_SIZE_K": 16,
+      "BLOCK_SIZE_N": 256,
+      "GROUP_SIZE_M": 1,
+      "num_stages": 2,
+      "num_warps": 8
+     },
+     "gate_a": {
+      "BLOCK_SIZE_K": 128,
+      "BLOCK_SIZE_N": 16,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 3,
+      "num_warps": 4
+     },
+     "gate_a_routing_block_size": 16,
+     "gate_b": {
+      "BLOCK_SIZE_K": 16,
+      "BLOCK_SIZE_N": 128,
+      "GROUP_SIZE_M": 4,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "routing_block_size": 16,
+     "shared_finalize": {
+      "reduce": {
+       "BLOCK_SIZE_T": 32,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "tail": {
+       "BLOCK_SIZE_H": 128,
+       "BLOCK_SIZE_K": 32,
+       "num_stages": 3,
+       "num_warps": 4
+      }
+     }
+    }
+   },
+   {
+    "max_tokens": 4,
+    "sites": {
+     "b_activation": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_W": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "down_a": {
+      "BLOCK_SIZE_K": 128,
+      "BLOCK_SIZE_N": 16,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 4,
+      "num_warps": 4
+     },
+     "down_b": {
+      "BLOCK_SIZE_K": 16,
+      "BLOCK_SIZE_N": 256,
+      "GROUP_SIZE_M": 1,
+      "num_stages": 2,
+      "num_warps": 8
+     },
+     "gate_a": {
+      "BLOCK_SIZE_K": 128,
+      "BLOCK_SIZE_N": 16,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 3,
+      "num_warps": 4
+     },
+     "gate_a_routing_block_size": 16,
+     "gate_b": {
+      "BLOCK_SIZE_K": 16,
+      "BLOCK_SIZE_N": 128,
+      "GROUP_SIZE_M": 4,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "routing_block_size": 16,
+     "shared_finalize": {
+      "reduce": {
+       "BLOCK_SIZE_T": 32,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "tail": {
+       "BLOCK_SIZE_H": 128,
+       "BLOCK_SIZE_K": 32,
+       "num_stages": 3,
+       "num_warps": 4
+      }
+     }
+    }
+   },
+   {
+    "max_tokens": 16,
+    "sites": {
+     "b_activation": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_W": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "down_a": {
+      "BLOCK_SIZE_K": 128,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 3,
+      "num_warps": 8
+     },
+     "down_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_N": 128,
+      "GROUP_SIZE_M": 1,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_a": {
+      "BLOCK_SIZE_K": 128,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 4,
+      "num_warps": 4
+     },
+     "gate_a_routing_block_size": 16,
+     "gate_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_N": 512,
+      "GROUP_SIZE_M": 4,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "routing_block_size": 16,
+     "shared_finalize": {
+      "reduce": {
+       "BLOCK_SIZE_T": 32,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "tail": {
+       "BLOCK_SIZE_H": 128,
+       "BLOCK_SIZE_K": 32,
+       "num_stages": 3,
+       "num_warps": 4
+      }
+     }
+    }
+   },
+   {
+    "sites": {
+     "b_activation": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_W": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "down_a": {
+      "BLOCK_SIZE_K": 128,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 4,
+      "num_warps": 8
+     },
+     "down_b": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 256,
+      "GROUP_SIZE_M": 4,
+      "num_stages": 2,
+      "num_warps": 8
+     },
+     "gate_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 4,
+      "num_warps": 4
+     },
+     "gate_a_routing_block_size": 16,
+     "gate_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_N": 256,
+      "GROUP_SIZE_M": 16,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "routing_block_size": 16,
+     "shared_finalize": {
+      "reduce": {
+       "BLOCK_SIZE_T": 32,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "tail": {
+       "BLOCK_SIZE_H": 128,
+       "BLOCK_SIZE_K": 32,
+       "num_stages": 3,
+       "num_warps": 4
+      }
+     }
+    }
+   }
+  ],
+  "prefill.serial": [
+   {
+    "sites": {
+     "b_activation": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_W": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "down_a": {
+      "BLOCK_SIZE_K": 128,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "down_b": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 128,
+      "GROUP_SIZE_M": 16,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 3,
+      "num_warps": 4
+     },
+     "gate_a_routing_block_size": 64,
+     "gate_b": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 128,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "routing_block_size": 16,
+     "shared_finalize": {
+      "reduce": {
+       "BLOCK_SIZE_T": 32,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "tail": {
+       "BLOCK_SIZE_H": 128,
+       "BLOCK_SIZE_K": 32,
+       "num_stages": 3,
+       "num_warps": 4
+      }
+     }
+    }
+   }
+  ],
+  "decode.wide_windows": [
+   {
+    "sites": {
+     "b_activation": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_W": 64,
+      "GROUP_SIZE_M": 1,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "down_a": {
+      "BLOCK_SIZE_K": 128,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 4,
+      "num_warps": 4
+     },
+     "down_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_a": {
+      "BLOCK_SIZE_K": 128,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 4,
+      "num_warps": 4
+     },
+     "gate_a_routing_block_size": 16,
+     "gate_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "routing_block_size": 16,
+     "shared_finalize": {
+      "reduce": {
+       "BLOCK_SIZE_T": 8,
+       "num_stages": 3,
+       "num_warps": 2
+      },
+      "tail": {
+       "BLOCK_SIZE_H": 128,
+       "BLOCK_SIZE_K": 64,
+       "num_stages": 3,
+       "num_warps": 4
+      }
+     }
+    }
+   }
+  ],
+  "prefill.token_dedup": [
+   {
+    "sites": {
+     "b_activation": {
+      "BLOCK_SIZE_K": 16,
+      "BLOCK_SIZE_W": 128,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 4,
+      "num_warps": 4
+     },
+     "down_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 3,
+      "num_warps": 4
+     },
+     "down_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_N": 256,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_a": {
+      "BLOCK_SIZE_K": 128,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 4,
+      "num_warps": 4
+     },
+     "gate_a_routing_block_size": 16,
+     "gate_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "routing_block_size": 16,
+     "shared_finalize": {
+      "reduce": {
+       "BLOCK_SIZE_T": 32,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "tail": {
+       "BLOCK_SIZE_H": 128,
+       "BLOCK_SIZE_K": 32,
+       "num_stages": 3,
+       "num_warps": 4
+      }
+     }
+    }
+   }
+  ],
+  "fallback.serial": [
+   {
+    "sites": {
+     "b_activation": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_W": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 3,
+      "num_warps": 4
+     },
+     "down_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 32,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "down_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 32,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_a_routing_block_size": 16,
+     "gate_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "routing_block_size": 16,
+     "shared_finalize": {
+      "reduce": {
+       "BLOCK_SIZE_T": 32,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "tail": {
+       "BLOCK_SIZE_H": 128,
+       "BLOCK_SIZE_K": 32,
+       "num_stages": 3,
+       "num_warps": 4
+      }
+     }
+    }
+   }
+  ],
+  "fallback.serial_prefill": [
+   {
+    "sites": {
+     "b_activation": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_W": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 3,
+      "num_warps": 4
+     },
+     "down_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 32,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "down_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 32,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_a_routing_block_size": 16,
+     "gate_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "routing_block_size": 16,
+     "shared_finalize": {
+      "reduce": {
+       "BLOCK_SIZE_T": 32,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "tail": {
+       "BLOCK_SIZE_H": 128,
+       "BLOCK_SIZE_K": 32,
+       "num_stages": 3,
+       "num_warps": 4
+      }
+     }
+    }
+   }
+  ]
+ }
+}

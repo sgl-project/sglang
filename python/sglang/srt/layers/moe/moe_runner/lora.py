@@ -38,21 +38,20 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
-    from sglang.srt.lora.moe.config_backend import MoeLoraConfigBackend
-    from sglang.srt.lora.moe.moe_lora_runner import MoeLoraBatch
+    from sglang.srt.lora.moe.moe_lora_runner import MoeLoraBatch, MoeLoraLayerEngine
 
 
 @dataclass
 class MoeLoraDispatchPayload(MoeQuantInfo):
     """Per-forward payload for the ``lora`` runner backend.
 
-    ``config_backend`` is the layer's bound engine (providers, runners and
-    launch configuration are constructed once at attach); ``batch`` is this
-    forward's factor view. Both are borrowed references — constructing this
-    struct copies no tensors.
+    ``engine`` is the layer's bound engine (plans, tiles, providers, and the
+    runner all resolve once at weight bind); ``batch`` is this forward's
+    weight view. Both are borrowed references — constructing this struct
+    copies no tensors.
     """
 
-    config_backend: MoeLoraConfigBackend
+    engine: MoeLoraLayerEngine
     batch: MoeLoraBatch
 
 
@@ -63,11 +62,5 @@ def fused_experts_none_to_lora(
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
     """Run the MoE experts with LoRA fused into the pipeline."""
-    backend = quant_info.config_backend
-    batch = quant_info.batch
-    choice = backend.select(batch, num_tokens=dispatch_output.hidden_states.shape[0])
-    return backend.run_selected(
-        choice,
-        dispatch_output,
-        batch,
-    )
+    del runner_config
+    return quant_info.engine.run(dispatch_output, quant_info.batch)

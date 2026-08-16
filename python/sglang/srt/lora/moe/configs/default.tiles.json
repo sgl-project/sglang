@@ -1,0 +1,121 @@
+{
+ "arch": "default",
+ "rules": {
+  "fallback.serial": [
+   {
+    "sites": {
+     "b_activation": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_W": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 3,
+      "num_warps": 4
+     },
+     "down_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 32,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "down_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 32,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_a_routing_block_size": 16,
+     "gate_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "routing_block_size": 16,
+     "shared_finalize": {
+      "reduce": {
+       "BLOCK_SIZE_T": 32,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "tail": {
+       "BLOCK_SIZE_H": 128,
+       "BLOCK_SIZE_K": 32,
+       "num_stages": 3,
+       "num_warps": 4
+      }
+     }
+    }
+   }
+  ],
+  "fallback.serial_prefill": [
+   {
+    "sites": {
+     "b_activation": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_W": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 3,
+      "num_warps": 4
+     },
+     "down_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 32,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "down_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 32,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_a_routing_block_size": 16,
+     "gate_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "routing_block_size": 16,
+     "shared_finalize": {
+      "reduce": {
+       "BLOCK_SIZE_T": 32,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "tail": {
+       "BLOCK_SIZE_H": 128,
+       "BLOCK_SIZE_K": 32,
+       "num_stages": 3,
+       "num_warps": 4
+      }
+     }
+    }
+   }
+  ]
+ }
+}

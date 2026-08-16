@@ -23,67 +23,21 @@ class TestMoeLoraParallelWorkspace(CustomTestCase):
             raise unittest.SkipTest("CUDA required")
         cls.device = torch.device("cuda", torch.cuda.current_device())
 
-    def test_factor_binding_validates_plan_before_binding_state(self):
+    def test_prepare_plan_owns_the_menu_entry_checks(self):
         runner = object.__new__(MoeLoraRunner)
-        runner.provider = SimpleNamespace(
-            num_local_experts=2,
-            gate_up_slices=2,
-            hidden_size=8,
-            intermediate_size=16,
-            contract=SimpleNamespace(lora_delta_dtype=torch.bfloat16),
-        )
-        plan = mock.Mock()
-        runner.execution_plan = plan
-        runner.providers = {}
-        runner._plan_menu = None
+        provider = SimpleNamespace(name="test")
+        runner.providers = {"test": provider}
         runner._validate_plan_provider = mock.Mock()
-        runner._bound_is_shared_outer = None
-        runner._bound_physical_rank = None
-        runner._bound_slot_capacity = None
-        is_shared_outer = False
-        rank = 4
+        plan = mock.Mock()
 
-        runner.validate_factors(
-            gate_up_lora_a=torch.empty(
-                1,
-                2,
-                2 * rank,
-                8,
-                dtype=torch.bfloat16,
-                device=self.device,
-            ),
-            gate_up_lora_b=torch.empty(
-                1,
-                2,
-                2 * 16,
-                rank,
-                dtype=torch.bfloat16,
-                device=self.device,
-            ),
-            down_lora_a=torch.empty(
-                1,
-                2,
-                rank,
-                16,
-                dtype=torch.bfloat16,
-                device=self.device,
-            ),
-            down_lora_b=torch.empty(
-                1,
-                2,
-                8,
-                rank,
-                dtype=torch.bfloat16,
-                device=self.device,
-            ),
-            is_shared_outer=is_shared_outer,
+        runner.prepare_plan(
+            plan,
+            provider_name="test",
+            is_shared_outer=False,
         )
 
-        plan.validate_ownership.assert_called_once_with(is_shared_outer)
-        runner._validate_plan_provider.assert_called_once_with(plan)
-        self.assertEqual(runner._bound_is_shared_outer, is_shared_outer)
-        self.assertEqual(runner._bound_physical_rank, rank)
-        self.assertEqual(runner._bound_slot_capacity, 1)
+        plan.validate_ownership.assert_called_once_with(False)
+        runner._validate_plan_provider.assert_called_once_with(plan, provider)
 
     def test_side_stream_is_capture_safe_and_fully_joined(self):
         workspace = MoeLoraWorkspace()

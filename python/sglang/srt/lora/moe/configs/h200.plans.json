@@ -1,0 +1,140 @@
+{
+ "arch": "h200",
+ "domain": {
+  "max_hidden": 4096,
+  "max_local_experts": 512
+ },
+ "scenarios": [
+  {
+   "name": "decode.indexed_down_a",
+   "layout": "per_expert",
+   "phase": "decode",
+   "provider": "cutedsl",
+   "plan": {
+    "gate_a_family": "grouped",
+    "down_a_family": "indexed",
+    "gate_b_family": "one_launch_sliced",
+    "down_b_family": "one_launch_sliced",
+    "middle_family": "materialized",
+    "finalize_family": "materialized",
+    "early_overlap": "gate_a_b",
+    "late_overlap": "down_a_b"
+   }
+  },
+  {
+   "name": "prefill.serial",
+   "layout": "per_expert",
+   "phase": "prefill",
+   "provider": "deepgemm_contiguous",
+   "plan": {
+    "gate_a_family": "grouped",
+    "down_a_family": "grouped",
+    "down_b_family": "one_launch_sliced",
+    "middle_family": "b_activation",
+    "finalize_family": "materialized",
+    "down_b_scatter": true
+   }
+  },
+  {
+   "name": "decode.wide_windows",
+   "layout": "shared",
+   "phase": "decode",
+   "provider": "cutedsl",
+   "plan": {
+    "gate_a_family": "grouped",
+    "down_a_family": "grouped",
+    "gate_b_family": "one_launch_sliced",
+    "down_b_family": "one_launch_sliced",
+    "middle_family": "materialized",
+    "finalize_family": "materialized",
+    "early_overlap": "gate_a_b",
+    "late_overlap": "down_a_b",
+    "route_builder": "joint_shared_outer"
+   }
+  },
+  {
+   "name": "prefill.materialized.small_rank",
+   "layout": "shared",
+   "phase": "prefill",
+   "max_rank": 8,
+   "provider": "deepgemm_contiguous",
+   "plan": {
+    "gate_a_family": "token_dedup_grouped",
+    "down_a_family": "grouped",
+    "down_b_family": "one_launch_sliced",
+    "middle_family": "b_activation",
+    "finalize_family": "materialized",
+    "route_builder": "joint_shared_outer"
+   }
+  },
+  {
+   "name": "prefill.shared_rank",
+   "layout": "shared",
+   "phase": "prefill",
+   "max_rank": 64,
+   "provider": "deepgemm_contiguous",
+   "plan": {
+    "gate_a_family": "token_dedup_grouped",
+    "down_a_family": "grouped",
+    "middle_family": "b_activation",
+    "finalize_family": "shared_rank_reduce"
+   }
+  },
+  {
+   "name": "prefill.materialized",
+   "layout": "shared",
+   "phase": "prefill",
+   "provider": "deepgemm_contiguous",
+   "plan": {
+    "gate_a_family": "token_dedup_grouped",
+    "down_a_family": "grouped",
+    "down_b_family": "one_launch_sliced",
+    "middle_family": "b_activation",
+    "finalize_family": "materialized",
+    "route_builder": "joint_shared_outer"
+   }
+  }
+ ],
+ "fallback": [
+  {
+   "name": "fallback.serial",
+   "phase": "decode",
+   "provider": "deepgemm",
+   "plan": {
+    "gate_a_family": "grouped",
+    "down_a_family": "grouped",
+    "gate_b_family": "one_launch_sliced",
+    "down_b_family": "one_launch_sliced",
+    "middle_family": "materialized",
+    "finalize_family": "materialized"
+   }
+  },
+  {
+   "name": "fallback.serial_prefill",
+   "layout": "per_expert",
+   "phase": "prefill",
+   "provider": "deepgemm_contiguous",
+   "plan": {
+    "gate_a_family": "grouped",
+    "down_a_family": "grouped",
+    "down_b_family": "one_launch_sliced",
+    "middle_family": "b_activation",
+    "finalize_family": "materialized",
+    "down_b_scatter": true
+   }
+  },
+  {
+   "name": "fallback.serial_prefill",
+   "layout": "shared",
+   "phase": "prefill",
+   "provider": "deepgemm",
+   "plan": {
+    "gate_a_family": "grouped",
+    "down_a_family": "grouped",
+    "down_b_family": "one_launch_sliced",
+    "middle_family": "b_activation",
+    "finalize_family": "materialized"
+   }
+  }
+ ]
+}

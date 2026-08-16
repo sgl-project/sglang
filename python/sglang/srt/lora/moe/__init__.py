@@ -1,5 +1,7 @@
-"""Small LoRA execution primitives owned by SGLang; scenario resolution lives in config.py and stateful binding in config_backend.py.
+"""SGLang's MoE LoRA execution engine.
 
-Import concrete submodules explicitly so importing this package has no kernel
-initialization side effects.
+Plan tables load in ``execution_plan`` (what runs, per layout x phase, with
+the one measured rank band); tile tables load in ``launch_config`` (how each
+kernel launches, rank- and M-bucketed). ``MoeLoraLayerEngine`` resolves both
+once per layer at weight bind; the forward path is a phase lookup.
 """

@@ -1,7 +1,7 @@
 """The masked-row-domain half of a BF16 MoE provider, GEMM-engine-agnostic.
 
 S1 preprocess (the engine-local `fused_masked_preprocess`), the S3 activation
-join (`silu_mul_delta_masked`), and the S5 finalize (`post_reorder_deepgemm`)
+join (`act_delta_masked`), and the S5 finalize (`post_reorder_deepgemm`)
 are Triton kernels over one physical layout — rows in ``[E_local, m_max,·]``
 with ``masked_m`` counts and ``src2dst`` pair mapping — and carry nothing
 specific to any GEMM engine. Both shipped providers (DeepGEMM and CuTeDSL)
@@ -92,7 +92,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         # and lives for the layer's lifetime, so no per-forward imports.
         from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
         from sglang.srt.lora.moe.base_gemm_provider.masked_activation import (
-            silu_mul_delta_masked,
+            act_delta_masked,
         )
         from sglang.srt.lora.moe.base_gemm_provider.masked_dispatch import (
             fused_masked_preprocess,
@@ -100,7 +100,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
 
         self._preprocess = fused_masked_preprocess
         self._post_reorder = post_reorder_deepgemm
-        self._act_kernel = silu_mul_delta_masked
+        self._act_kernel = act_delta_masked
 
         from sglang.srt.lora.moe.base_gemm_provider.down_b_scatter import (
             invoke_down_b_scatter,

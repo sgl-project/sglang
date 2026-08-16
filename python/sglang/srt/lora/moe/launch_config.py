@@ -8,7 +8,10 @@ replace any site independently with a promoted Step-3/4/5/6 configuration.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import cache
 from typing import Any, Mapping
+
+import pydantic
 
 from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
     SHARED_RANK_DEFAULT_CONFIG,
@@ -17,11 +20,11 @@ from sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle import (
     FUSED_B_ACT_DEFAULT_CONFIG,
 )
 from sglang.srt.lora.moe.execution_plan import (
-    FactorSite,
     LoraAFamily,
     MiddleFamily,
     MoeLoraExecutionPlan,
     RouteRequirement,
+    Site,
 )
 
 
@@ -106,11 +109,11 @@ class MoeLoraLaunchConfig:
         for name, config in self.shared_finalize.items():
             _validate_flat_config(f"shared_finalize.{name}", config)
 
-    def for_a(self, site: FactorSite) -> Mapping[str, int]:
-        return self.gate_a if site is FactorSite.GATE_UP else self.down_a
+    def for_a(self, site: Site) -> Mapping[str, int]:
+        return self.gate_a if site is Site.GATE_UP else self.down_a
 
-    def for_b(self, site: FactorSite) -> Mapping[str, int]:
-        return self.gate_b if site is FactorSite.GATE_UP else self.down_b
+    def for_b(self, site: Site) -> Mapping[str, int]:
+        return self.gate_b if site is Site.GATE_UP else self.down_b
 
     def for_middle(self, family: MiddleFamily) -> Mapping[str, int]:
         """Return the explicit config for one fused-middle kernel family."""
@@ -172,3 +175,94 @@ class MoeLoraLaunchConfig:
 
 
 PROVISIONAL_LAUNCH_CONFIG = MoeLoraLaunchConfig()
+
+
+# ---------------------------------------------------------------------------
+# Tile tables: pydantic-validated JSON, separate from the plan tables.
+#
+# Plans say WHAT runs; these say HOW each kernel launches. Rules are matched
+# first hit in order per plan-row name: ``max_rank`` resolves at bind (the
+# pool-padded rank is a server constant), ``max_tokens`` per forward (the
+# M bucket). A missing table or row serves the built-in defaults.
+# ---------------------------------------------------------------------------
+
+
+class _TileRuleModel(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    max_rank: int | None = None
+    max_tokens: int | None = None
+    sites: dict[str, Any] = pydantic.Field(default_factory=dict)
+
+
+class _TilesFileModel(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    arch: str
+    rules: dict[str, list[_TileRuleModel]]
+
+
+@cache
+def _load_tiles(architecture_value: str) -> _TilesFileModel | None:
+    from sglang.srt.lora.moe.execution_plan import _read_table
+
+    raw = _read_table(f"{architecture_value}.tiles.json")
+    if raw is None:
+        return None
+    return _TilesFileModel.model_validate(raw)
+
+
+def _config_from_sites(sites: Mapping[str, Any]) -> MoeLoraLaunchConfig:
+    return MoeLoraLaunchConfig(**{name: value for name, value in sites.items()})
+
+
+class TileTable:
+    """One plan row's launch tiles, resolved to the bound rank at bind time.
+
+    ``config_for(num_tokens)`` picks the first rule whose ``max_tokens``
+    bound admits the batch — the M bucket — and returns a validated
+    MoeLoraLaunchConfig constructed once per rule.
+    """
+
+    def __init__(self, rules: list[tuple[int, MoeLoraLaunchConfig]]) -> None:
+        if not rules:
+            raise ValueError("a tile table needs at least one rule")
+        self._rules = rules
+
+    def config_for(self, num_tokens: int) -> MoeLoraLaunchConfig:
+        for bound, config in self._rules:
+            if num_tokens <= bound:
+                return config
+        return self._rules[-1][1]
+
+    def validate_for_plan(self, plan: MoeLoraExecutionPlan) -> None:
+        for _, config in self._rules:
+            config.validate_for_plan(plan)
+
+
+def resolve_tiles(
+    *,
+    architecture_value: str,
+    plan_key_name: str,
+    physical_rank: int,
+) -> TileTable:
+    """Resolve one plan row's tile rules against the bound rank, once.
+
+    Unknown rows or a missing table fall to the built-in default config —
+    byte-identical to serving without tile tables at all.
+    """
+    table = _load_tiles(architecture_value)
+    rules = table.rules.get(plan_key_name) if table is not None else None
+    if not rules:
+        return TileTable([(1 << 30, MoeLoraLaunchConfig())])
+    resolved: list[tuple[int, MoeLoraLaunchConfig]] = []
+    for rule in rules:
+        if rule.max_rank is not None and physical_rank > rule.max_rank:
+            continue
+        bound = rule.max_tokens if rule.max_tokens is not None else 1 << 30
+        resolved.append((bound, _config_from_sites(rule.sites)))
+        if rule.max_tokens is None:
+            break  # unconditional rule terminates the ladder
+    if not resolved:
+        resolved.append((1 << 30, MoeLoraLaunchConfig()))
+    return TileTable(resolved)

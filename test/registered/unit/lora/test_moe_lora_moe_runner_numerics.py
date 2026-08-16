@@ -20,13 +20,13 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.lora.moe.config import (
-    ConfigInput,
+from sglang.srt.lora.moe.execution_plan import (
+    ActivationFamily,
     Phase,
     architecture_for_capability,
-    select_config,
+    resolve_plans,
 )
-from sglang.srt.lora.moe.execution_plan import ActivationFamily
+from sglang.srt.lora.moe.launch_config import resolve_tiles
 from sglang.srt.lora.moe.moe_lora_runner import (
     MoeLoraBatch,
     MoeLoraRunner,
@@ -54,6 +54,24 @@ def _rand_bf16(
     shape: tuple[int, ...], *, generator: torch.Generator, scale: float
 ) -> torch.Tensor:
     return (torch.randn(shape, generator=generator) * scale).to(torch.bfloat16)
+
+
+def _resolve_execution(architecture, mode: Phase, num_tokens: int):
+    """The served plan and tile pick for this device, phase, and batch."""
+    selected = resolve_plans(
+        architecture=architecture,
+        is_shared_outer=False,
+        physical_rank=_PHYSICAL_RANK,
+        activation=ActivationFamily.SWIGLU,
+        hidden_size=_HIDDEN,
+        num_local_experts=_EXPERTS,
+    )[mode]
+    launch_config = resolve_tiles(
+        architecture_value=architecture.value,
+        plan_key_name=selected.name,
+        physical_rank=_PHYSICAL_RANK,
+    ).config_for(num_tokens)
+    return selected, launch_config
 
 
 def _make_cpu_tensors(num_tokens: int) -> dict[str, torch.Tensor]:
@@ -181,9 +199,7 @@ def _standalone_output_allocation(
 ) -> torch.Tensor:
     """Match eager output geometry without requiring a serving TP group."""
 
-    return torch.empty(
-        (num_tokens, runner.provider.hidden_size), dtype=dtype, device=device
-    )
+    return torch.empty((num_tokens, runner.hidden_size), dtype=dtype, device=device)
 
 
 @pytest.mark.parametrize(
@@ -213,24 +229,11 @@ def test_config_chosen_per_expert_swiglu_matches_fp32_reference(
     cpu = _make_cpu_tensors(num_tokens)
     gpu = {name: tensor.to(device) for name, tensor in cpu.items()}
 
-    choice = select_config(
-        ConfigInput(
-            capability_major=capability[0],
-            capability_minor=capability[1],
-            is_shared_outer=False,
-            activation=ActivationFamily.SWIGLU,
-            mode=mode,
-            num_tokens=num_tokens,
-            active_rank=_PHYSICAL_RANK,
-            hidden_size=_HIDDEN,
-            num_local_experts=_EXPERTS,
-            has_active_lora=True,
-            use_cuda_graph=False,
-        )
+    choice, launch_config = _resolve_execution(
+        architecture_for_capability(*capability), mode, num_tokens
     )
     assert choice.provider is not None
     assert choice.plan is not None
-    assert choice.launch_config is not None
 
     provider_cls = MoeLoraRunner.select_provider_cls(choice.provider)
     provider = provider_cls(
@@ -243,20 +246,15 @@ def test_config_chosen_per_expert_swiglu_matches_fp32_reference(
         )
     )
     runner = MoeLoraRunner(
-        provider=provider,
+        providers={"test": provider},
         top_k=_TOP_K,
         routed_scaling_factor=_ROUTED_SCALING,
         activation=ActivationFamily.SWIGLU,
-        execution_plan=choice.plan,
-        launch_config=choice.launch_config,
     )
-    runner.validate_factors(
-        gate_up_lora_a=gpu["gate_up_lora_a"],
-        gate_up_lora_b=gpu["gate_up_lora_b"],
-        down_lora_a=gpu["down_lora_a"],
-        down_lora_b=gpu["down_lora_b"],
-        is_shared_outer=False,
+    runner._test_execution = dict(
+        plan=choice.plan, launch_config=launch_config, provider_name="test"
     )
+    runner.prepare_plan(choice.plan, provider_name="test", is_shared_outer=False)
 
     dispatch = StandardDispatchOutput(
         hidden_states=gpu["hidden_states"],
@@ -278,13 +276,13 @@ def test_config_chosen_per_expert_swiglu_matches_fp32_reference(
             down_lora_b=gpu["down_lora_b"],
             token_slots=cpu_slots.to(device),
             adapter_enabled=gpu["adapter_enabled"],
-            physical_rank=_PHYSICAL_RANK,
-            is_shared_outer=False,
             use_cuda_graph=False,
             is_prefill=mode is Phase.PREFILL,
             has_active_lora=True,
         )
-        actual = runner.run(dispatch, batch, output_dtype=torch.float32)
+        actual = runner.run(
+            dispatch, batch, output_dtype=torch.float32, **runner._test_execution
+        )
         torch.testing.assert_close(
             actual.hidden_states.detach().cpu(),
             references[traffic],
@@ -330,20 +328,8 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
     gpu = {name: tensor.to(device) for name, tensor in cpu.items()}
     token_slots = _token_slots("active", num_tokens).to(device)
 
-    choice = select_config(
-        ConfigInput(
-            capability_major=capability[0],
-            capability_minor=capability[1],
-            is_shared_outer=False,
-            activation=ActivationFamily.SWIGLU,
-            mode=mode,
-            num_tokens=num_tokens,
-            active_rank=_PHYSICAL_RANK,
-            hidden_size=_HIDDEN,
-            num_local_experts=_EXPERTS,
-            has_active_lora=True,
-            use_cuda_graph=True,
-        )
+    choice, launch_config = _resolve_execution(
+        architecture_for_capability(*capability), mode, num_tokens
     )
     provider = MoeLoraRunner.select_provider_cls(choice.provider)(
         MoeLoraBf16QuantInfo(
@@ -355,20 +341,15 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
         )
     )
     runner = MoeLoraRunner(
-        provider=provider,
+        providers={"test": provider},
         top_k=_TOP_K,
         routed_scaling_factor=_ROUTED_SCALING,
         activation=ActivationFamily.SWIGLU,
-        execution_plan=choice.plan,
-        launch_config=choice.launch_config,
     )
-    runner.validate_factors(
-        gate_up_lora_a=gpu["gate_up_lora_a"],
-        gate_up_lora_b=gpu["gate_up_lora_b"],
-        down_lora_a=gpu["down_lora_a"],
-        down_lora_b=gpu["down_lora_b"],
-        is_shared_outer=False,
+    runner._test_execution = dict(
+        plan=choice.plan, launch_config=launch_config, provider_name="test"
     )
+    runner.prepare_plan(choice.plan, provider_name="test", is_shared_outer=False)
     dispatch = StandardDispatchOutput(
         hidden_states=gpu["hidden_states"],
         hidden_states_scale=None,
@@ -385,20 +366,22 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
         down_lora_b=gpu["down_lora_b"],
         token_slots=token_slots,
         adapter_enabled=gpu["adapter_enabled"],
-        physical_rank=_PHYSICAL_RANK,
-        is_shared_outer=False,
         use_cuda_graph=True,
         is_prefill=mode is Phase.PREFILL,
         has_active_lora=True,
     )
 
     for _ in range(2):  # JIT + workspace graph-buffer retention before capture
-        runner.run(dispatch, batch, output_dtype=torch.float32)
+        runner.run(
+            dispatch, batch, output_dtype=torch.float32, **runner._test_execution
+        )
     torch.cuda.synchronize(device)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = runner.run(dispatch, batch, output_dtype=torch.float32)
+        captured = runner.run(
+            dispatch, batch, output_dtype=torch.float32, **runner._test_execution
+        )
     output = captured.hidden_states
     output_ptr = output.data_ptr()
 

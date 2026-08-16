@@ -21,16 +21,24 @@ fusion fail before CUDA work.
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 from dataclasses import dataclass
 from enum import Enum
+from functools import cache
+
+import pydantic
+
+logger = logging.getLogger(__name__)
 
 
-class FactorSite(str, Enum):
+class Site(str, Enum):
     GATE_UP = "gate_up"
     DOWN = "down"
 
 
-class FactorLayout(str, Enum):
+class BridgeLayout(str, Enum):
     """Logical row layout of the rank bridge between A and B."""
 
     PAIR_MAJOR = "pair_major"
@@ -119,21 +127,21 @@ def _aligned_requirement(is_shared_outer: bool) -> RouteRequirement:
 
 
 @dataclass(frozen=True, slots=True)
-class FactorContract:
+class StageContract:
     """The factor and bridge contract of one logical A or B stage."""
 
-    site: FactorSite
+    site: Site
     is_shared_outer: bool
-    layout: FactorLayout
+    layout: BridgeLayout
 
     def __post_init__(self) -> None:
         self.validate()
 
-    def validate(self) -> FactorContract:
-        _require_enum(self.site, FactorSite, "site")
+    def validate(self) -> StageContract:
+        _require_enum(self.site, Site, "site")
         _require_bool(self.is_shared_outer, "is_shared_outer")
-        _require_enum(self.layout, FactorLayout, "layout")
-        if self.site is FactorSite.DOWN and self.layout is FactorLayout.TOKEN_MAJOR:
+        _require_enum(self.layout, BridgeLayout, "layout")
+        if self.site is Site.DOWN and self.layout is BridgeLayout.TOKEN_MAJOR:
             raise ValueError(
                 "the down bridge is inherently pair-major: each routed expert "
                 "produces a different activation"
@@ -145,49 +153,49 @@ class FactorContract:
 class LoraASpec:
     """One standalone LoRA-A execution stage."""
 
-    site: FactorSite
+    site: Site
     family: LoraAFamily
     is_shared_outer: bool = False
-    output_layout: FactorLayout = FactorLayout.PAIR_MAJOR
+    output_layout: BridgeLayout = BridgeLayout.PAIR_MAJOR
 
     def __post_init__(self) -> None:
         self.validate()
 
     @property
-    def contract(self) -> FactorContract:
-        return FactorContract(self.site, self.is_shared_outer, self.output_layout)
+    def contract(self) -> StageContract:
+        return StageContract(self.site, self.is_shared_outer, self.output_layout)
 
     def validate(self) -> LoraASpec:
-        _require_enum(self.site, FactorSite, "site")
+        _require_enum(self.site, Site, "site")
         _require_enum(self.family, LoraAFamily, "family")
         _require_bool(self.is_shared_outer, "is_shared_outer")
-        _require_enum(self.output_layout, FactorLayout, "output_layout")
+        _require_enum(self.output_layout, BridgeLayout, "output_layout")
         self.contract.validate()
 
-        if self.site is FactorSite.DOWN and self.is_shared_outer:
+        if self.site is Site.DOWN and self.is_shared_outer:
             raise ValueError(
                 "down A is always per-expert; only gate/up A may be shared-outer"
             )
         if self.family is LoraAFamily.GROUPED:
-            if self.output_layout is not FactorLayout.PAIR_MAJOR:
+            if self.output_layout is not BridgeLayout.PAIR_MAJOR:
                 raise ValueError("grouped A writes a pair-major bridge")
         elif self.family is LoraAFamily.INDEXED:
             # Step-3 qualified indexed A only as the down-site small-decode
             # frontier; every other site keeps its aligned general kernel.
-            if self.site is not FactorSite.DOWN:
+            if self.site is not Site.DOWN:
                 raise ValueError("indexed A is retained only at the down site")
             if self.is_shared_outer:
                 raise ValueError("indexed A is qualified only for per-expert factors")
-            if self.output_layout is not FactorLayout.PAIR_MAJOR:
+            if self.output_layout is not BridgeLayout.PAIR_MAJOR:
                 raise ValueError("indexed A writes a pair-major bridge")
         else:
-            if self.site is not FactorSite.GATE_UP:
+            if self.site is not Site.GATE_UP:
                 raise ValueError(f"{self.family.value} is a shared gate/up-A family")
             if not self.is_shared_outer:
                 raise ValueError(
                     f"{self.family.value} requires shared-outer A ownership"
                 )
-            if self.output_layout is not FactorLayout.TOKEN_MAJOR:
+            if self.output_layout is not BridgeLayout.TOKEN_MAJOR:
                 raise ValueError(f"{self.family.value} writes a token-major bridge")
         return self
 
@@ -203,32 +211,32 @@ class LoraASpec:
 class LoraBSpec:
     """One standalone LoRA-B execution stage."""
 
-    site: FactorSite
+    site: Site
     family: LoraBFamily
     is_shared_outer: bool = False
-    input_layout: FactorLayout = FactorLayout.PAIR_MAJOR
+    input_layout: BridgeLayout = BridgeLayout.PAIR_MAJOR
 
     def __post_init__(self) -> None:
         self.validate()
 
     @property
-    def contract(self) -> FactorContract:
-        return FactorContract(self.site, self.is_shared_outer, self.input_layout)
+    def contract(self) -> StageContract:
+        return StageContract(self.site, self.is_shared_outer, self.input_layout)
 
     def validate(self) -> LoraBSpec:
-        _require_enum(self.site, FactorSite, "site")
+        _require_enum(self.site, Site, "site")
         _require_enum(self.family, LoraBFamily, "family")
         _require_bool(self.is_shared_outer, "is_shared_outer")
-        _require_enum(self.input_layout, FactorLayout, "input_layout")
+        _require_enum(self.input_layout, BridgeLayout, "input_layout")
         self.contract.validate()
 
-        if self.site is FactorSite.GATE_UP and self.is_shared_outer:
+        if self.site is Site.GATE_UP and self.is_shared_outer:
             raise ValueError(
                 "gate/up B is always per-expert; only down B may be shared-outer"
             )
         if (
-            self.input_layout is FactorLayout.TOKEN_MAJOR
-            and self.site is not FactorSite.GATE_UP
+            self.input_layout is BridgeLayout.TOKEN_MAJOR
+            and self.site is not Site.GATE_UP
         ):
             raise ValueError("a token-major B input exists only at gate/up")
         if self.family is LoraBFamily.INDEXED_PAIRS:
@@ -239,7 +247,7 @@ class LoraBSpec:
                 raise ValueError(
                     "pair-indexed B is qualified only for per-expert factors"
                 )
-            if self.input_layout is not FactorLayout.PAIR_MAJOR:
+            if self.input_layout is not BridgeLayout.PAIR_MAJOR:
                 raise ValueError("pair-indexed B consumes a pair-major bridge")
         return self
 
@@ -262,7 +270,7 @@ class MiddleSpec:
 
     family: MiddleFamily
     activation: ActivationFamily
-    consumed_gate_b: FactorContract | None = None
+    consumed_gate_b: StageContract | None = None
 
     def __post_init__(self) -> None:
         self.validate()
@@ -272,7 +280,7 @@ class MiddleSpec:
         _require_enum(self.activation, ActivationFamily, "activation")
         if self.consumed_gate_b is not None:
             self.consumed_gate_b.validate()
-            if self.consumed_gate_b.site is not FactorSite.GATE_UP:
+            if self.consumed_gate_b.site is not Site.GATE_UP:
                 raise ValueError("consumed_gate_b must describe the gate/up site")
             if self.consumed_gate_b.is_shared_outer:
                 raise ValueError("consumed gate/up B must be per-expert")
@@ -296,7 +304,7 @@ class FinalizeSpec:
     """Final combine family and an optional down-B stage consumed by it."""
 
     family: FinalizeFamily
-    consumed_down_b: FactorContract | None = None
+    consumed_down_b: StageContract | None = None
 
     def __post_init__(self) -> None:
         self.validate()
@@ -311,7 +319,7 @@ class FinalizeSpec:
             )
         if self.consumed_down_b is not None:
             self.consumed_down_b.validate()
-            if self.consumed_down_b.site is not FactorSite.DOWN:
+            if self.consumed_down_b.site is not Site.DOWN:
                 raise ValueError("consumed_down_b must describe the down site")
         if self.family is FinalizeFamily.SHARED_RANK_REDUCE:
             consumed_down_b = self.consumed_down_b
@@ -344,21 +352,6 @@ class MoeLoraExecutionPlan:
     early_overlap: EarlyOverlap = EarlyOverlap.NONE
     late_overlap: LateOverlap = LateOverlap.NONE
     route_builder: RouteBuilderFamily = RouteBuilderFamily.STANDARD
-    # None means PDL-off for the standard fused-align builder. Explicit
-    # off/on controls remain separate composed candidates until end-to-end
-    # evidence is strong enough to select one by default.
-    route_pdl: bool | None = None
-    # Programmatic dependent launch is an execution edge, not a device-global
-    # kernel switch.  It is legal only when the named A producer and B consumer
-    # are consecutive launches on the same stream and both families implement
-    # the matching GDC signal/wait protocol.
-    gate_a_to_b_pdl: bool = False
-    down_a_to_b_pdl: bool = False
-    # Base-provider PDL is modeled as two concrete execution edges. The
-    # CuTeDSL base GEMM signals; the selected middle/finalize kernel is the
-    # dependent consumer. Overlap schedules insert an event join, so these
-    # controls admit only direct same-stream handoffs.
-    base_gateup_to_middle_pdl: bool = False
     # Down-tail reordering experiment: the standalone one-launch sliced
     # down-B runs AFTER the base down GEMM and read-modify-write adds its
     # unweighted delta into the provider's down output rows through the
@@ -380,7 +373,7 @@ class MoeLoraExecutionPlan:
             or self.late_overlap is not LateOverlap.NONE
         )
 
-    def _gate_b_contract(self) -> FactorContract:
+    def _gate_b_contract(self) -> StageContract:
         if self.gate_b is not None:
             return self.gate_b.contract
         consumed = self.middle.consumed_gate_b
@@ -388,12 +381,12 @@ class MoeLoraExecutionPlan:
             raise ValueError("the execution plan has no gate-B owner")
         return consumed
 
-    def _down_a_contract(self) -> FactorContract:
+    def _down_a_contract(self) -> StageContract:
         if self.down_a is None:
             raise ValueError("the execution plan has no down-A owner")
         return self.down_a.contract
 
-    def _down_b_contract(self) -> FactorContract:
+    def _down_b_contract(self) -> StageContract:
         if self.down_b is not None:
             return self.down_b.contract
         consumed = self.finalize.consumed_down_b
@@ -418,22 +411,6 @@ class MoeLoraExecutionPlan:
         _require_enum(self.early_overlap, EarlyOverlap, "early_overlap")
         _require_enum(self.late_overlap, LateOverlap, "late_overlap")
         _require_enum(self.route_builder, RouteBuilderFamily, "route_builder")
-        if self.route_pdl is not None and not isinstance(self.route_pdl, bool):
-            raise TypeError("route_pdl must be bool or None")
-        if (
-            self.route_builder is RouteBuilderFamily.JOINT_SHARED_OUTER
-            and self.route_pdl is None
-        ):
-            raise ValueError(
-                "joint shared-outer routing requires an explicit route_pdl "
-                "control until its PDL chain is promoted by composed evidence"
-            )
-        if not isinstance(self.gate_a_to_b_pdl, bool):
-            raise TypeError("gate_a_to_b_pdl must be bool")
-        if not isinstance(self.down_a_to_b_pdl, bool):
-            raise TypeError("down_a_to_b_pdl must be bool")
-        if not isinstance(self.base_gateup_to_middle_pdl, bool):
-            raise TypeError("base_gateup_to_middle_pdl must be bool")
         if not isinstance(self.down_b_scatter, bool):
             raise TypeError("down_b_scatter must be bool")
 
@@ -447,13 +424,13 @@ class MoeLoraExecutionPlan:
         if self.down_b is not None:
             self.down_b.validate()
 
-        if self.gate_a.site is not FactorSite.GATE_UP:
+        if self.gate_a.site is not Site.GATE_UP:
             raise ValueError("gate_a must describe the gate/up site")
-        if self.gate_b is not None and self.gate_b.site is not FactorSite.GATE_UP:
+        if self.gate_b is not None and self.gate_b.site is not Site.GATE_UP:
             raise ValueError("gate_b must describe the gate/up site")
-        if self.down_a is not None and self.down_a.site is not FactorSite.DOWN:
+        if self.down_a is not None and self.down_a.site is not Site.DOWN:
             raise ValueError("down_a must describe the down site")
-        if self.down_b is not None and self.down_b.site is not FactorSite.DOWN:
+        if self.down_b is not None and self.down_b.site is not Site.DOWN:
             raise ValueError("down_b must describe the down site")
 
         gate_b_consumed = self.middle.consumed_gate_b is not None
@@ -496,36 +473,12 @@ class MoeLoraExecutionPlan:
                 f"{self.late_overlap.value} overlap requires standalone down B"
             )
 
-        if self.gate_a_to_b_pdl and not self.gate_a_to_b_pdl_eligible():
-            raise ValueError(
-                "gate-A -> gate-B PDL requires a grouped A producer, a "
-                "one-launch sliced B consumer, and a same-stream consecutive "
-                "schedule (serial or gate-A+B overlap)"
-            )
-        if self.down_a_to_b_pdl and not self.down_a_to_b_pdl_eligible():
-            raise ValueError(
-                "down-A -> down-B PDL requires standalone grouped A and "
-                "one-launch sliced B stages on a same-stream consecutive "
-                "schedule (serial or down-A+B overlap)"
-            )
-        if (
-            self.base_gateup_to_middle_pdl
-            and not self.base_gateup_to_middle_pdl_eligible()
-        ):
-            raise ValueError(
-                "base gate/up -> middle PDL requires a direct serial handoff "
-                "to a PDL-aware Triton middle consumer"
-            )
-
         if self.down_b_scatter and not self.down_b_scatter_eligible():
             raise ValueError(
                 "down-B scatter requires a standalone one-launch sliced "
                 "down-B stage, the materialized finalize (run in "
                 "no-pair-delta mode), no late overlap window (the scatter "
-                "read-modify-writes the base down output), and no down-site "
-                "or base-down PDL edge (the base down GEMM sits between "
-                "down-A and down-B, and the scatter launch sits between the "
-                "base down GEMM and the finalize)"
+                "read-modify-writes the base down output)"
             )
 
         requirements = self._route_requirements_unchecked()
@@ -544,9 +497,9 @@ class MoeLoraExecutionPlan:
     def is_fully_serial(self) -> bool:
         """Whether the schedule is a plain ordered same-stream pipeline.
 
-        True iff the schedule has no early/late overlap windows, down-A is
-        GROUPED over the canonical pair activation, and no stage is stitched
-        to another through a PDL edge.  Such a plan drives the provider seam
+        True iff the schedule has no early/late overlap windows and down-A
+        is GROUPED over the canonical pair activation.  Such a plan drives
+        the provider seam
         (prepare / gateup / middle / down / finalize) as ordered same-stream
         calls with no cross-stage coupling, which is the schedule shape
         row-domain conversions key on; the finalize family is judged
@@ -557,9 +510,6 @@ class MoeLoraExecutionPlan:
             and self.late_overlap is LateOverlap.NONE
             and self.down_a is not None
             and self.down_a.family is LoraAFamily.GROUPED
-            and not self.gate_a_to_b_pdl
-            and not self.down_a_to_b_pdl
-            and not self.base_gateup_to_middle_pdl
             # The scatter reordering couples down-B to the base down output;
             # it is applied ON TOP of a fully serial materialized shape and
             # must not re-qualify for shape-keyed conversions.
@@ -586,35 +536,7 @@ class MoeLoraExecutionPlan:
             and self.down_b.family is LoraBFamily.ONE_LAUNCH_SLICED
             and self.finalize.family is FinalizeFamily.MATERIALIZED
             and self.late_overlap is LateOverlap.NONE
-            and not self.down_a_to_b_pdl
         )
-
-    def gate_a_to_b_pdl_eligible(self) -> bool:
-        """Whether the gate/up rank bridge has a real same-stream PDL edge."""
-
-        return (
-            self.gate_b is not None
-            and self.gate_a.family
-            in (LoraAFamily.GROUPED, LoraAFamily.TOKEN_DEDUP_GROUPED)
-            and self.gate_b.family is LoraBFamily.ONE_LAUNCH_SLICED
-            and self.early_overlap in (EarlyOverlap.NONE, EarlyOverlap.GATE_A_B)
-        )
-
-    def down_a_to_b_pdl_eligible(self) -> bool:
-        """Whether the down rank bridge has a real same-stream PDL edge."""
-
-        return (
-            self.down_a is not None
-            and self.down_b is not None
-            and self.down_a.family is LoraAFamily.GROUPED
-            and self.down_b.family is LoraBFamily.ONE_LAUNCH_SLICED
-            and self.late_overlap in (LateOverlap.NONE, LateOverlap.DOWN_A_B)
-        )
-
-    def base_gateup_to_middle_pdl_eligible(self) -> bool:
-        """Whether base GEMM1 directly precedes a PDL-aware middle kernel."""
-
-        return self.early_overlap is EarlyOverlap.NONE
 
     def _route_requirements_unchecked(self) -> frozenset[RouteRequirement]:
         requirements: set[RouteRequirement] = set()
@@ -655,32 +577,32 @@ class MoeLoraExecutionPlan:
 
 SERIAL_MATERIALIZED_REFERENCE = MoeLoraExecutionPlan(
     gate_a=LoraASpec(
-        FactorSite.GATE_UP,
+        Site.GATE_UP,
         LoraAFamily.GROUPED,
         False,
-        FactorLayout.PAIR_MAJOR,
+        BridgeLayout.PAIR_MAJOR,
     ),
     gate_b=LoraBSpec(
-        FactorSite.GATE_UP,
+        Site.GATE_UP,
         LoraBFamily.ONE_LAUNCH_SLICED,
         False,
-        FactorLayout.PAIR_MAJOR,
+        BridgeLayout.PAIR_MAJOR,
     ),
     middle=MiddleSpec(
         family=MiddleFamily.MATERIALIZED,
         activation=ActivationFamily.SWIGLU,
     ),
     down_a=LoraASpec(
-        FactorSite.DOWN,
+        Site.DOWN,
         LoraAFamily.GROUPED,
         False,
-        FactorLayout.PAIR_MAJOR,
+        BridgeLayout.PAIR_MAJOR,
     ),
     down_b=LoraBSpec(
-        FactorSite.DOWN,
+        Site.DOWN,
         LoraBFamily.ONE_LAUNCH_SLICED,
         False,
-        FactorLayout.PAIR_MAJOR,
+        BridgeLayout.PAIR_MAJOR,
     ),
     finalize=FinalizeSpec(family=FinalizeFamily.MATERIALIZED),
 )
@@ -695,32 +617,295 @@ def materialized_reference_plan(
     _require_bool(is_shared_outer, "is_shared_outer")
     return MoeLoraExecutionPlan(
         gate_a=LoraASpec(
-            FactorSite.GATE_UP,
+            Site.GATE_UP,
             LoraAFamily.GROUPED,
             is_shared_outer,
-            FactorLayout.PAIR_MAJOR,
+            BridgeLayout.PAIR_MAJOR,
         ),
         gate_b=LoraBSpec(
-            FactorSite.GATE_UP,
+            Site.GATE_UP,
             LoraBFamily.ONE_LAUNCH_SLICED,
             False,
-            FactorLayout.PAIR_MAJOR,
+            BridgeLayout.PAIR_MAJOR,
         ),
         middle=MiddleSpec(
             family=MiddleFamily.MATERIALIZED,
             activation=activation,
         ),
         down_a=LoraASpec(
-            FactorSite.DOWN,
+            Site.DOWN,
             LoraAFamily.GROUPED,
             False,
-            FactorLayout.PAIR_MAJOR,
+            BridgeLayout.PAIR_MAJOR,
         ),
         down_b=LoraBSpec(
-            FactorSite.DOWN,
+            Site.DOWN,
             LoraBFamily.ONE_LAUNCH_SLICED,
             is_shared_outer,
-            FactorLayout.PAIR_MAJOR,
+            BridgeLayout.PAIR_MAJOR,
         ),
         finalize=FinalizeSpec(family=FinalizeFamily.MATERIALIZED),
     )
+
+
+# ---------------------------------------------------------------------------
+# Plan tables: pydantic-validated JSON, loaded once per architecture.
+#
+# Per-forward selection is a phase lookup: layout and the pool-padded rank
+# are server-lifetime constants, so ``resolve_plans`` runs once per layer at
+# bind time and returns one selected plan per phase. Rows are matched first
+# hit in order; ``max_rank`` is the only predicate (the measured H200
+# shared-prefill kernel band). Launch tiles live in the separate tile tables
+# (see ``launch_config``): plans say WHAT runs, tiles say HOW it launches.
+# ---------------------------------------------------------------------------
+
+
+class Phase(str, Enum):
+    DECODE = "decode"
+    PREFILL = "prefill"
+
+
+class DeviceArchitecture(str, Enum):
+    H200 = "h200"
+    GB300 = "gb300"
+    DEFAULT = "default"
+
+
+def architecture_for_capability(major: int, minor: int) -> DeviceArchitecture:
+    if major == 9:
+        return DeviceArchitecture.H200
+    if major >= 10:
+        return DeviceArchitecture.GB300
+    return DeviceArchitecture.DEFAULT
+
+
+class _PlanSpecModel(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    gate_a_family: str = "grouped"
+    down_a_family: str = "grouped"
+    gate_b_family: str = "one_launch_sliced"
+    down_b_family: str = "one_launch_sliced"
+    middle_family: str = "materialized"
+    finalize_family: str = "materialized"
+    early_overlap: str = "none"
+    late_overlap: str = "none"
+    route_builder: str = "standard"
+    down_b_scatter: bool = False
+
+
+class _PlanRowModel(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    name: str
+    layout: str | None = None  # per_expert | shared; None matches both
+    phase: str | None = None  # decode | prefill; None matches both
+    max_rank: int | None = None
+    provider: str
+    plan: _PlanSpecModel
+
+
+class _PlansFileModel(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    arch: str
+    domain: dict[str, int] = pydantic.Field(default_factory=dict)
+    scenarios: list[_PlanRowModel] = pydantic.Field(default_factory=list)
+    fallback: list[_PlanRowModel]
+
+
+_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs")
+
+
+def _read_table(name: str) -> dict | None:
+    from sglang.srt.environ import envs
+
+    override_dir = envs.SGLANG_LORA_MOE_CONFIG_DIR.get()
+    for directory in filter(None, (override_dir, _CONFIG_DIR)):
+        path = os.path.join(directory, name)
+        if os.path.isfile(path):
+            if directory == override_dir:
+                logger.info(
+                    "MoE LoRA table %r loaded from override dir %s", name, directory
+                )
+            with open(path) as handle:
+                return json.load(handle)
+    return None
+
+
+@cache
+def load_plans(architecture: DeviceArchitecture) -> _PlansFileModel:
+    raw = _read_table(f"{architecture.value}.plans.json")
+    if raw is None:
+        logger.warning(
+            "no MoE LoRA plan table for architecture %s; serving the "
+            "conservative default plans",
+            architecture.value,
+        )
+        raw = _read_table("default.plans.json")
+    if raw is None:
+        raise RuntimeError("MoE LoRA plan tables are missing from the package")
+    return _PlansFileModel.model_validate(raw)
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedPlan:
+    """One phase's resolved menu entry: identity, provider, validated plan."""
+
+    key: str
+    name: str
+    provider: str
+    plan: MoeLoraExecutionPlan
+
+
+def build_plan(
+    spec: _PlanSpecModel,
+    *,
+    activation: ActivationFamily,
+    is_shared_outer: bool,
+) -> MoeLoraExecutionPlan:
+    """Materialize one row's plan spec into a validated execution plan.
+
+    The activation is a property of the layer, injected at construction —
+    rows are activation-agnostic by decision (2026-08-16).
+    """
+    gate_a_family = LoraAFamily(spec.gate_a_family)
+    gate_layout = (
+        BridgeLayout.TOKEN_MAJOR
+        if gate_a_family is LoraAFamily.TOKEN_DEDUP_GROUPED
+        else BridgeLayout.PAIR_MAJOR
+    )
+    middle_family = MiddleFamily(spec.middle_family)
+    finalize_family = FinalizeFamily(spec.finalize_family)
+    gate_b_contract = StageContract(Site.GATE_UP, False, gate_layout)
+    down_b_contract = StageContract(Site.DOWN, is_shared_outer, BridgeLayout.PAIR_MAJOR)
+    consumes_gate_b = middle_family is MiddleFamily.B_ACTIVATION
+    consumes_down_b = finalize_family is not FinalizeFamily.MATERIALIZED
+    plan = MoeLoraExecutionPlan(
+        gate_a=LoraASpec(Site.GATE_UP, gate_a_family, is_shared_outer, gate_layout),
+        gate_b=(
+            None
+            if consumes_gate_b
+            else LoraBSpec(
+                Site.GATE_UP, LoraBFamily(spec.gate_b_family), False, gate_layout
+            )
+        ),
+        middle=MiddleSpec(
+            middle_family, activation, gate_b_contract if consumes_gate_b else None
+        ),
+        down_a=LoraASpec(
+            Site.DOWN,
+            LoraAFamily(spec.down_a_family),
+            False,
+            BridgeLayout.PAIR_MAJOR,
+        ),
+        down_b=(
+            None
+            if consumes_down_b
+            else LoraBSpec(
+                Site.DOWN,
+                LoraBFamily(spec.down_b_family),
+                is_shared_outer,
+                BridgeLayout.PAIR_MAJOR,
+            )
+        ),
+        finalize=FinalizeSpec(
+            finalize_family, down_b_contract if consumes_down_b else None
+        ),
+        early_overlap=EarlyOverlap(spec.early_overlap),
+        late_overlap=LateOverlap(spec.late_overlap),
+        route_builder=RouteBuilderFamily(spec.route_builder),
+        down_b_scatter=spec.down_b_scatter,
+    )
+    return plan.validate_ownership(is_shared_outer)
+
+
+def resolve_plans(
+    *,
+    architecture: DeviceArchitecture,
+    is_shared_outer: bool,
+    physical_rank: int,
+    activation: ActivationFamily,
+    hidden_size: int,
+    num_local_experts: int,
+) -> dict[Phase, SelectedPlan]:
+    """Resolve the layer's one plan per phase, once, at bind time.
+
+    Every input is a server-lifetime constant, so nothing about plan
+    selection remains for the forward path. Out-of-domain geometry serves
+    the fallback rows.
+    """
+    table = load_plans(architecture)
+    layout_name = "shared" if is_shared_outer else "per_expert"
+    in_domain = hidden_size <= table.domain.get(
+        "max_hidden", 1 << 30
+    ) and num_local_experts <= table.domain.get("max_local_experts", 1 << 30)
+    rows = table.scenarios if in_domain else []
+    if not in_domain:
+        logger.warning(
+            "MoE LoRA geometry (hidden=%d, local_experts=%d) is outside the "
+            "tuned domain of table %r; serving the serial fallback",
+            hidden_size,
+            num_local_experts,
+            architecture.value,
+        )
+    selected: dict[Phase, SelectedPlan] = {}
+    for phase in Phase:
+        row = next(
+            (
+                candidate
+                for candidate in (*rows, *table.fallback)
+                if candidate.layout in (None, layout_name)
+                and candidate.phase in (None, phase.value)
+                and (candidate.max_rank is None or physical_rank <= candidate.max_rank)
+            ),
+            None,
+        )
+        if row is None:
+            raise RuntimeError(
+                f"no MoE LoRA plan row matches ({layout_name}, {phase.value}) "
+                f"on {architecture.value}"
+            )
+        selected[phase] = SelectedPlan(
+            key=f"{architecture.value}.{layout_name}.{row.name}",
+            name=row.name,
+            provider=row.provider,
+            plan=build_plan(
+                row.plan,
+                activation=activation,
+                is_shared_outer=is_shared_outer,
+            ),
+        )
+    return selected
+
+
+def iter_selected_plans(
+    *,
+    architecture: DeviceArchitecture,
+    is_shared_outer: bool,
+    activation: ActivationFamily,
+) -> list[SelectedPlan]:
+    """Every buildable row for one layout — the menu, rank-unfiltered.
+
+    Tests and the offline tuner enumerate this; serving uses
+    :func:`resolve_plans`, which picks one row per phase.
+    """
+    table = load_plans(architecture)
+    layout_name = "shared" if is_shared_outer else "per_expert"
+    out: list[SelectedPlan] = []
+    for row in (*table.scenarios, *table.fallback):
+        if row.layout not in (None, layout_name):
+            continue
+        out.append(
+            SelectedPlan(
+                key=f"{architecture.value}.{layout_name}.{row.name}",
+                name=row.name,
+                provider=row.provider,
+                plan=build_plan(
+                    row.plan,
+                    activation=activation,
+                    is_shared_outer=is_shared_outer,
+                ),
+            )
+        )
+    return out
