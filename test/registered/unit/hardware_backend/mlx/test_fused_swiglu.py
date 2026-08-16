@@ -19,6 +19,7 @@ only on Apple Silicon via stage-a-unit-test-mlx.
 import importlib.util
 import os
 import platform
+import sys
 
 import pytest
 
@@ -724,3 +725,7 @@ def test_aot_warm_skips_and_logs_on_compile_failure(monkeypatch, caplog):
     assert any(
         "skipping warm" in record.getMessage() for record in caplog.records
     ), f"expected skip-warm debug log not found: {[r.getMessage() for r in caplog.records]}"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
