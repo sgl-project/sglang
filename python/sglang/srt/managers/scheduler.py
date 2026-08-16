@@ -205,7 +205,10 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    SchedulerDPAttnAdapter,
+    symm_dp_scheduler_loop_entry_ns,
+)
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
@@ -1126,6 +1129,7 @@ class Scheduler(
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
+        self._symm_dp_scheduler_loop_entry_ns: Optional[int] = None
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -1695,6 +1699,10 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
+            self._symm_dp_scheduler_loop_entry_ns = (
+                symm_dp_scheduler_loop_entry_ns()
+            )
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1738,6 +1746,10 @@ class Scheduler(
         while True:
             if self.gracefully_exit:
                 break
+
+            self._symm_dp_scheduler_loop_entry_ns = (
+                symm_dp_scheduler_loop_entry_ns()
+            )
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -2026,6 +2038,9 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
+            get_telemetry_scheduler_loop_entry_ns=(
+                lambda: self._symm_dp_scheduler_loop_entry_ns
+            ),
         )
 
     def init_pool_stats_observer(self) -> None:

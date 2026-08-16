@@ -100,6 +100,7 @@ def test_same_process_entry_timing_is_attached_to_next_generation(tmp_path):
     recorder = SymmMemGatherTelemetry(world_size=2, group_rank=0, max_records=4)
     recorder.start(output_dir=str(tmp_path), profile_id="entry", dp_rank=0)
     entry_timing = {
+        "scheduler_loop_entry_ns": 900,
         "adapter_entry_ns": 1_000,
         "prepare_raw_entry_ns": 1_020,
         "all_gather_call_entry_ns": 1_080,
@@ -114,7 +115,8 @@ def test_same_process_entry_timing_is_attached_to_next_generation(tmp_path):
     assert payload["records"][0]["entry_timing"] == entry_timing
     assert "entry_timing" not in payload["records"][1]
     assert (
-        entry_timing["adapter_entry_ns"]
+        entry_timing["scheduler_loop_entry_ns"]
+        <= entry_timing["adapter_entry_ns"]
         <= entry_timing["prepare_raw_entry_ns"]
         <= entry_timing["all_gather_call_entry_ns"]
         <= payload["records"][0]["gather_start_ns"]
@@ -193,3 +195,19 @@ def test_enabled_entry_reads_host_clock(monkeypatch):
     monkeypatch.setenv("SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY", "true")
     monkeypatch.setattr(dp_attn.time, "perf_counter_ns", lambda: 123_456)
     assert dp_attn._symm_dp_adapter_entry_ns() == 123_456
+
+
+def test_scheduler_loop_entry_clock_is_default_off(monkeypatch):
+    monkeypatch.delenv("SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY", raising=False)
+
+    def fail_if_called():
+        raise AssertionError("default-off scheduler boundary sampled perf_counter_ns")
+
+    monkeypatch.setattr(dp_attn.time, "perf_counter_ns", fail_if_called)
+    assert dp_attn.symm_dp_scheduler_loop_entry_ns() is None
+
+
+def test_scheduler_loop_entry_clock_is_enabled(monkeypatch):
+    monkeypatch.setenv("SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY", "true")
+    monkeypatch.setattr(dp_attn.time, "perf_counter_ns", lambda: 654_321)
+    assert dp_attn.symm_dp_scheduler_loop_entry_ns() == 654_321

@@ -49,6 +49,13 @@ def _symm_dp_adapter_entry_ns() -> Optional[int]:
     return time.perf_counter_ns()
 
 
+def symm_dp_scheduler_loop_entry_ns() -> Optional[int]:
+    """Sample a scheduler-loop boundary only while SYMM_DP telemetry is enabled."""
+    if not envs.SGLANG_SYMM_MEM_DP_SYNC_TELEMETRY.get():
+        return None
+    return time.perf_counter_ns()
+
+
 def _maybe_symm_gatherer(group, device, width: int):
     """Symmetric-memory gatherer for this group, or None to use the collective."""
     if (
@@ -287,6 +294,7 @@ def prepare_mlp_sync_batch_raw(
     offload_tags: set[str],
     dwdp: bool = False,
     telemetry_adapter_entry_ns: Optional[int] = None,
+    telemetry_scheduler_loop_entry_ns: Optional[int] = None,
 ):
     telemetry_entry_timing = None
     if telemetry_adapter_entry_ns is not None:
@@ -294,6 +302,10 @@ def prepare_mlp_sync_batch_raw(
             "adapter_entry_ns": telemetry_adapter_entry_ns,
             "prepare_raw_entry_ns": time.perf_counter_ns(),
         }
+        if telemetry_scheduler_loop_entry_ns is not None:
+            telemetry_entry_timing["scheduler_loop_entry_ns"] = (
+                telemetry_scheduler_loop_entry_ns
+            )
     # Check if other DP workers have running batches
     if (
         local_batch is None
@@ -465,6 +477,7 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
+    get_telemetry_scheduler_loop_entry_ns: Callable[[], Optional[int]]
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         telemetry_adapter_entry_ns = _symm_dp_adapter_entry_ns()
@@ -482,6 +495,9 @@ class SchedulerDPAttnAdapter:
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
             telemetry_adapter_entry_ns=telemetry_adapter_entry_ns,
+            telemetry_scheduler_loop_entry_ns=(
+                self.get_telemetry_scheduler_loop_entry_ns()
+            ),
         )
 
     def maybe_prepare_mlp_sync_batch(
