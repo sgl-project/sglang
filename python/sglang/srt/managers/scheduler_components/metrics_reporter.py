@@ -7,13 +7,7 @@ import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    List,
-    Optional,
-    Tuple,
-    Union,
-)
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -64,6 +58,9 @@ class PrefillStats:
     num_new_seqs: int  # len(can_run_list)
     reprocessed_log_input_tokens: int = 0
     reprocessed_log_hit_tokens: int = 0
+    log_device_hit_tokens: int = 0
+    log_host_hit_tokens: int = 0
+    log_storage_hit_tokens: int = 0
     num_pending_tokens: int = 0
 
     @classmethod
@@ -79,6 +76,9 @@ class PrefillStats:
             log_hit_tokens=adder.log_hit_tokens,
             reprocessed_log_input_tokens=adder.reprocessed_log_input_tokens,
             reprocessed_log_hit_tokens=adder.reprocessed_log_hit_tokens,
+            log_device_hit_tokens=adder.log_device_hit_tokens,
+            log_host_hit_tokens=adder.log_host_hit_tokens,
+            log_storage_hit_tokens=adder.log_storage_hit_tokens,
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
@@ -338,15 +338,15 @@ class SchedulerMetricsReporter:
                 "num_draft_tokens": 0,
             }
 
-        # Fallback to server_args if draft_worker does not have the attributes.
-        server_args = self.scheduler.server_args
+        # Fallback to the published `spec` bag if draft_worker does not have
+        # the attributes.
         num_steps = getattr(
-            draft_worker, "speculative_num_steps", server_args.speculative_num_steps
+            draft_worker, "speculative_num_steps", get_spec().speculative_num_steps
         )
         num_draft_tokens = getattr(
             draft_worker,
             "speculative_num_draft_tokens",
-            server_args.speculative_num_draft_tokens,
+            get_spec().speculative_num_draft_tokens,
         )
 
         return {
@@ -636,6 +636,12 @@ class SchedulerMetricsReporter:
             total_tokens = effective_input_tokens + effective_hit_tokens
             cache_hit_rate = (
                 effective_hit_tokens / total_tokens if total_tokens > 0 else 0.0
+            )
+            self.metrics_collector.increment_effective_prefill_tokens(
+                input_tokens=effective_input_tokens,
+                device_hit_tokens=prefill_stats.log_device_hit_tokens,
+                host_hit_tokens=prefill_stats.log_host_hit_tokens,
+                storage_hit_tokens=prefill_stats.log_storage_hit_tokens,
             )
 
             # Basics
@@ -970,9 +976,7 @@ class SchedulerMetricsReporter:
         if not self.scheduler.enable_fpm:
             return
 
-        from sglang.srt.observability.forward_pass_metrics import (
-            ForwardPassMetrics,
-        )
+        from sglang.srt.observability.forward_pass_metrics import ForwardPassMetrics
 
         if self.scheduler._fpm_uses_device_timer:
             self.forward_pass_device_timer._report()

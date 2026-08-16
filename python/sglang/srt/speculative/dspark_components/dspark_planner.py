@@ -180,7 +180,7 @@ class DSparkVerifyPlanner:
                 and not get_schedule().disable_overlap_schedule
                 and not get_spec().speculative_skip_dp_mlp_sync
                 and get_disagg().disaggregation_mode == "null"
-                and self.server_args.pp_size == 1
+                and get_parallel().pp_size == 1
                 and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
             )
             if tp_rank == 0:
@@ -1139,6 +1139,6 @@ def build_sps_cost_table(
         return load_sps_table_from_path(sps_table_path)
     max_batch_tokens = max(
         1,
-        int(server_args.max_running_requests or 1) * verify_num_draft_tokens,
+        int(get_schedule().max_running_requests or 1) * verify_num_draft_tokens,
     )
     return build_uninitialized_sps_table(max_batch_tokens=max_batch_tokens)

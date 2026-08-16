@@ -224,7 +224,10 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
         from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 
         def backend(flag):
-            return SimpleNamespace(needs_cpu_seq_lens=flag)
+            return SimpleNamespace(
+                needs_cpu_seq_lens=flag,
+                extend_dummy_seqs_capped_by_req_pool=False,
+            )
 
         runner = SimpleNamespace(
             server_args=SimpleNamespace(speculative_attention_mode=spec_mode),

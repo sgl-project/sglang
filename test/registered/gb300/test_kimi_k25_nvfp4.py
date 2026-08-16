@@ -6,9 +6,7 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-register_cuda_ci(
-    est_time=7200, suite="nightly-4-gpu-gb300-kimi-k25-nvfp4", nightly=True
-)
+register_cuda_ci(est_time=7200, stage="nightly", runner_config="4-gpu-gb300")
 
 MODEL_PATH = "nvidia/Kimi-K2.5-NVFP4"
 DRAFT_MODEL_PATH = "lightseekorg/kimi-k2.5-eagle3-mla"
@@ -40,6 +38,11 @@ DP_EAGLE_ARGS = [
     "--speculative-num-draft-tokens=2",
 ]
 
+PERFORMANCE_BATCH_SIZES = {
+    "TP4+EAGLE3": [1, 8],
+    "TP4+DP4+DPA+EAGLE3": [16],
+}
+
 
 class TestKimiK25Nvfp4(unittest.TestCase):
     """Kimi-K2.5 NVFP4 + EAGLE3 on GB300 (4x GB300 NVL4, tp=4)."""
@@ -62,16 +65,35 @@ class TestKimiK25Nvfp4(unittest.TestCase):
             ),
         ]
 
-        run_combined_tests(
-            models=variants,
-            test_name="Kimi-K2.5-NVFP4",
-            accuracy_params=AccuracyTestParams(
-                dataset="mmmu-pro", baseline_accuracy=0.69, repeat=1, max_tokens=32768
-            ),
-            performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_gb300",
-            ),
+        failures = []
+        # Pinned to what `ns eval --benchmarks=mmmu-pro:1` sent implicitly --
+        # its `:1` suffix means temperature 0.7, not greedy -- so the baseline
+        # carries over unchanged. Do not "simplify" these away.
+        accuracy_params = AccuracyTestParams(
+            dataset="mmmu_pro_vision",
+            baseline_accuracy=0.69,
+            repeat=1,
+            max_tokens=32768,
+            temperature=0.7,
+            seed=0,
+            sgl_eval_thinking=False,
         )
+        for variant in variants:
+            try:
+                run_combined_tests(
+                    models=[variant],
+                    test_name=f"Kimi-K2.5-NVFP4 ({variant.variant})",
+                    accuracy_params=accuracy_params,
+                    performance_params=PerformanceTestParams(
+                        batch_sizes=PERFORMANCE_BATCH_SIZES[variant.variant],
+                        result_dir="performance_results_gb300",
+                    ),
+                )
+            except AssertionError as e:
+                failures.append(f"{variant.variant}: {e}")
+
+        if failures:
+            raise AssertionError("Kimi-K2.5-NVFP4 failures:\n" + "\n".join(failures))
 
 
 if __name__ == "__main__":

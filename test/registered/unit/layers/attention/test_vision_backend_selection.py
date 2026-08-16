@@ -11,7 +11,7 @@ from sglang.srt.layers.attention import vision
 from sglang.test.ci.ci_register import register_cpu_ci, register_npu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
-register_npu_ci(est_time=2, suite="stage-b-test-1-npu-a3")
+register_npu_ci(est_time=2, suite="base-b-test-1-npu-a3")
 register_npu_ci(est_time=2, suite="nightly-1-npu-a3", nightly=True)
 
 
@@ -50,6 +50,31 @@ def test_npu_backend_selection_priority(
     backend = vision.VisionAttention._determine_attention_backend(None, passed_backend)
 
     assert backend == expected
+
+
+def test_sdpa_preserves_flattened_batch_layout():
+    torch.manual_seed(0)
+    bsz, seq_len, num_heads, head_dim = 3, 5, 2, 8
+    q, k, v = [torch.randn(bsz * seq_len, num_heads, head_dim) for _ in range(3)]
+    backend = vision.VisionSdpaAttention(
+        head_dim=head_dim,
+        num_heads=num_heads,
+        num_kv_heads=num_heads,
+    )
+
+    output = backend(q=q, k=k, v=v, bsz=bsz)
+    q_ref, k_ref, v_ref = [
+        x.reshape(bsz, seq_len, num_heads, head_dim).transpose(1, 2) for x in (q, k, v)
+    ]
+    expected = F.scaled_dot_product_attention(
+        q_ref,
+        k_ref,
+        v_ref,
+        scale=backend.scale,
+    )
+    expected = expected.transpose(1, 2).reshape(bsz * seq_len, num_heads, head_dim)
+
+    torch.testing.assert_close(output, expected)
 
 
 @pytest.mark.parametrize("mask_kind", ["causal", "padding"])

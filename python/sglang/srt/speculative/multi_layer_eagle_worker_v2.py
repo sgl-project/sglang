@@ -26,7 +26,10 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
 )
-from sglang.srt.layers.moe.utils import speculative_moe_backend_context
+from sglang.srt.layers.moe.utils import (
+    draft_model_build_scope,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -40,6 +43,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
 )
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -150,7 +154,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
 
         # Load draft model weights only.
-        with empty_context(), speculative_moe_backend_context():
+        with empty_context(), speculative_moe_backend_context(), draft_model_build_scope():
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -159,6 +163,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 is_multi_layer_eagle=True,
+                # The draft runs at absolute target positions.
+                context_length=target_worker.model_runner.model_config.context_len,
             )
 
         # Alias for better readability
@@ -357,7 +363,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.draft_extend_attn_backend_list = []
         for step in range(self.speculative_num_steps):
             draft_backend_factory = DraftBackendFactory(
-                self.server_args,
                 self.draft_runner_list[step],
                 self.topk,
                 self.speculative_num_steps,
@@ -847,9 +852,12 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 forward_batch.token_to_kv_pool = self.draft_runner_list[
                     step
                 ].token_to_kv_pool
-                self.draft_runner_list[step].attn_backend.init_forward_metadata(
-                    forward_batch
-                )
+                if not forward_batch.forward_mode.is_idle():
+                    # An idle round (DP attention: this rank has no requests) has nothing
+                    # to plan pre-pad. Avoid raising when seq_lens is empty here.
+                    self.draft_runner_list[step].attn_backend.init_forward_metadata(
+                        forward_batch
+                    )
                 draft_logits_output = self.draft_runner_list[step].forward(
                     forward_batch
                 )
@@ -926,7 +934,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )

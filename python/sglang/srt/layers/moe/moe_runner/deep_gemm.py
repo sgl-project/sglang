@@ -73,6 +73,7 @@ else:
 
 
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
+_masked_standard_layout_memory_budget_bytes: Optional[int] = None
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -100,11 +101,91 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
     return tensor_gpu
 
 
-def _should_use_masked_standard_layout(runner_config: MoeRunnerConfig) -> bool:
-    """Use masked GEMM when expert parallelism keeps its buffer small."""
+def set_masked_standard_layout_memory_budget(
+    available_memory_bytes: int,
+) -> int:
+    """Cache the masked-layout share of free non-static device memory."""
+    global _masked_standard_layout_memory_budget_bytes
+    fraction = envs.SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION.get()
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError(
+            "SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION must be in (0, 1]"
+        )
+    _masked_standard_layout_memory_budget_bytes = int(available_memory_bytes * fraction)
+    return _masked_standard_layout_memory_budget_bytes
+
+
+def _estimate_masked_standard_layout_peak_bytes(
+    runner_config: MoeRunnerConfig,
+    quant_info: DeepGemmMoeQuantInfo,
+    hidden_states: torch.Tensor,
+) -> int:
+    padded_m = (hidden_states.shape[0] // 256 + 1) * 256
+    activation_dtype = (
+        torch.bfloat16
+        if quant_info.w13_weight.dtype == torch.bfloat16
+        else torch.float8_e4m3fn
+    )
+    hidden_size = hidden_states.shape[1]
+    gateup_size = quant_info.w13_weight.shape[1]
+    gateup_row_bytes = gateup_size * torch.bfloat16.itemsize
+    down_output_row_bytes = quant_info.w2_weight.shape[1] * torch.bfloat16.itemsize
+    input_row_bytes = hidden_size * activation_dtype.itemsize
+    down_input_row_bytes = gateup_size // 2 * activation_dtype.itemsize
+
+    if activation_dtype == torch.bfloat16:
+        input_scale_row_bytes = 0
+        down_scale_row_bytes = 0
+    else:
+        block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
+        packed_scales = quant_info.use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        scale_item_bytes = (
+            torch.uint8.itemsize if packed_scales else torch.float32.itemsize
+        )
+        input_scale_row_bytes = ceil_div(hidden_size, block_k) * scale_item_bytes
+        down_scale_row_bytes = ceil_div(gateup_size // 2, block_k) * scale_item_bytes
+
+    peak_row_bytes = max(
+        input_row_bytes + input_scale_row_bytes + gateup_row_bytes,
+        gateup_row_bytes + down_input_row_bytes + down_scale_row_bytes,
+        down_input_row_bytes + down_scale_row_bytes + down_output_row_bytes,
+    )
+    return runner_config.num_local_experts * padded_m * peak_row_bytes
+
+
+def _should_use_masked_standard_layout(
+    runner_config: MoeRunnerConfig,
+    quant_info: DeepGemmMoeQuantInfo,
+    hidden_states: torch.Tensor,
+) -> bool:
+    mode = envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.get().lower()
+    if mode not in ("auto", "masked", "compact"):
+        raise ValueError(
+            "SGLANG_DEEPGEMM_STANDARD_LAYOUT must be one of: auto, masked, compact"
+        )
+    if mode != "auto":
+        return mode == "masked"
+
+    global _masked_standard_layout_memory_budget_bytes
+    if _masked_standard_layout_memory_budget_bytes is None:
+        # Serving sets an all-rank budget before capture. Direct eager callers
+        # fall back to this rank's free memory without querying inside capture.
+        # Import lazily to avoid a module-initialization cycle through
+        # runner_utils -> DeepEP -> MoE -> this module.
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        if get_is_capture_mode():
+            return False
+        free_memory, _ = torch.cuda.mem_get_info(hidden_states.device)
+        set_masked_standard_layout_memory_budget(free_memory)
+
     return (
-        runner_config.num_experts > runner_config.num_local_experts
-        and runner_config.num_local_experts <= 32
+        _estimate_masked_standard_layout_peak_bytes(
+            runner_config, quant_info, hidden_states
+        )
+        <= _masked_standard_layout_memory_budget_bytes
     )
 
 
@@ -775,7 +856,7 @@ def pre_permute_standard_to_deep_gemm(
 
     topk_weights, topk_ids = topk_weights, topk_ids
 
-    if _should_use_masked_standard_layout(runner_config):
+    if _should_use_masked_standard_layout(runner_config, quant_info, hidden_states):
         output_dtype = (
             torch.bfloat16
             if quant_info.w13_weight.dtype == torch.bfloat16

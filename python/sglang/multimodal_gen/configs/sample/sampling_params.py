@@ -180,6 +180,16 @@ class SamplingParams:
     width: int | None = None
     fps: int = 24
 
+    # LTX-2.5 duration head. Ignored by other models, so the flags stay
+    # universally accepted.
+    # Decode with the diffusion decoder instead of the VAE one. Ignored by
+    # models that ship no such decoder.
+    use_diffusion_decoder: bool = False
+
+    auto_duration: bool = False
+    auto_duration_min_seconds: float = 1.0
+    auto_duration_max_seconds: float = 20.0
+
     # Resolution validation
     supported_resolutions: list[tuple[int, int]] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
@@ -201,11 +211,20 @@ class SamplingParams:
     progressive_levels: int = 1
     progressive_delta: float = 0.01
 
+    # LongCat-Image parameters
+    enable_cfg_renorm: bool = False
+    cfg_renorm_min: float = 0.0
+    enable_prompt_rewrite: bool = False
+
     # TeaCache parameters
     enable_teacache: bool = False
     teacache_params: Any = (
         None  # TeaCacheParams or WanTeaCacheParams, set by model-specific subclass
     )
+
+    # Spectrum parameters
+    enable_spectrum: bool = False
+    spectrum_params: Any = None  # SpectrumParams
 
     # Profiling
     profile: bool = field(default=False, metadata={"batch_sig_exclude": True})
@@ -329,6 +348,16 @@ class SamplingParams:
         env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
+
+        if self.enable_spectrum and isinstance(self.spectrum_params, dict):
+            from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
+
+            self.spectrum_params = SpectrumParams(**self.spectrum_params)
+
+        if self.enable_spectrum and self.spectrum_params is None:
+            from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
+
+            self.spectrum_params = SpectrumParams()
 
     def build_request_extra(self) -> dict[str, Any]:
         """Return optional request-scoped extras for downstream pipeline stages."""
@@ -546,6 +575,11 @@ class SamplingParams:
                 raise ValueError(
                     f"boundary_ratio must be within [0, 1], got {self.boundary_ratio!r}"
                 )
+
+        if self.enable_teacache and self.enable_spectrum:
+            raise ValueError(
+                "enable_teacache and enable_spectrum are mutually exclusive; enable only one."
+            )
 
         RLRolloutArgs.validate_sampling_params(self)
 
@@ -861,6 +895,11 @@ class SamplingParams:
             return parser.add_argument(*name_or_flags, **kwargs)
 
         add_argument("--data-type", type=str, nargs="+")
+        # Predict the shot length from the caption, overriding `--num-frames`.
+        add_argument("--use-diffusion-decoder", action="store_true")
+        add_argument("--auto-duration", action="store_true")
+        add_argument("--auto-duration-min-seconds", type=float)
+        add_argument("--auto-duration-max-seconds", type=float)
         add_argument(
             "--num-frames-round-down",
             action="store_true",
@@ -868,6 +907,86 @@ class SamplingParams:
         add_argument(
             "--enable-teacache",
             action="store_true",
+        )
+        add_argument(
+            "--enable-spectrum",
+            action="store_true",
+        )
+        add_argument("--w", type=float)
+        add_argument(
+            "--taylor-order",
+            "--taylor_order",
+            dest="taylor_order",
+            type=int,
+        )
+        add_argument(
+            "--history-size",
+            "--history_size",
+            dest="history_size",
+            type=int,
+        )
+        add_argument(
+            "--spectrum-window-size",
+            "--spectrum_window_size",
+            "--window-size",
+            "--window_size",
+            dest="spectrum_window_size",
+            type=float,
+            help="Spectrum initial skip window size.",
+        )
+        add_argument(
+            "--spectrum-flex-window",
+            "--spectrum_flex_window",
+            "--flex-window",
+            "--flex_window",
+            dest="spectrum_flex_window",
+            type=float,
+            help="Spectrum adaptive window growth slope.",
+        )
+        add_argument(
+            "--spectrum-warmup-steps",
+            "--spectrum_warmup_steps",
+            dest="spectrum_warmup_steps",
+            type=int,
+            help="Spectrum warmup denoising steps before caching.",
+        )
+        add_argument(
+            "--spectrum-m",
+            "--spectrum_m",
+            dest="spectrum_m",
+            type=int,
+            help="Spectrum Chebyshev polynomial degree (M).",
+        )
+        add_argument(
+            "--spectrum-lam",
+            "--spectrum_lam",
+            dest="spectrum_lam",
+            type=float,
+            help="Spectrum ridge regularization strength.",
+        )
+        add_argument(
+            "--spectrum-tau-num-steps",
+            "--spectrum_tau_num_steps",
+            dest="spectrum_tau_num_steps",
+            type=int,
+            help="Spectrum tau normalization horizon.",
+        )
+
+        # LongCat-Image parameters
+        add_argument(
+            "--enable-cfg-renorm",
+            action=StoreBoolean,
+            help="Enable CFG renormalization for LongCat-Image (default: false).",
+        )
+        add_argument(
+            "--cfg-renorm-min",
+            type=float,
+            help="Minimum CFG renorm scale for LongCat-Image (default: 0.0).",
+        )
+        add_argument(
+            "--enable-prompt-rewrite",
+            action=StoreBoolean,
+            help="Enable prompt rewriting via Qwen2.5-VL before encoding for LongCat-Image (default: false).",
         )
 
         # profiling
@@ -1299,6 +1418,34 @@ class SamplingParams:
         }
         if isinstance(cli_args.get("seed"), list) and len(cli_args["seed"]) == 1:
             cli_args["seed"] = cli_args["seed"][0]
+
+        spectrum_overrides = {}
+        spectrum_flag_map = {
+            "w": "w",
+            "taylor_order": "taylor_order",
+            "window_size": "spectrum_window_size",
+            "flex_window": "spectrum_flex_window",
+            "history_size": "history_size",
+            "warmup_steps": "spectrum_warmup_steps",
+            "m": "spectrum_m",
+            "lam": "spectrum_lam",
+            "tau_num_steps": "spectrum_tau_num_steps",
+        }
+        for field_name, arg_name in spectrum_flag_map.items():
+            if hasattr(args, arg_name) and getattr(args, arg_name) is not None:
+                spectrum_overrides[field_name] = getattr(args, arg_name)
+        if spectrum_overrides:
+            if not cli_args.get("enable_spectrum", False):
+                logger.info(
+                    "Spectrum override flags were provided without --enable-spectrum; "
+                    "auto-enabling Spectrum caching."
+                )
+                cli_args["enable_spectrum"] = True
+            existing_spectrum_params = cli_args.get("spectrum_params")
+            if isinstance(existing_spectrum_params, dict):
+                spectrum_overrides = {**existing_spectrum_params, **spectrum_overrides}
+            cli_args["spectrum_params"] = spectrum_overrides
+
         return cli_args
 
     def output_file_path(self):
