@@ -752,6 +752,7 @@ class PaliGemmaModelWithPiGemma(nn.Module):
             config.vision_config,
             act_layer=partial(get_act_fn, config.vision_config.hidden_act),
             qkv_backend="sdpa",
+            flatten_batch=False,
             use_data_parallel=True,
         )
         self.multi_modal_projector = PaliGemmaMultiModalProjector(config)

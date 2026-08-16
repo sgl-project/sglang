@@ -201,6 +201,7 @@ def test_pi05_siglip_reuses_srt_model_with_layerwise_groups():
             config,
             act_layer=lambda: nn.GELU(approximate="tanh"),
             qkv_backend="sdpa",
+            flatten_batch=False,
             use_data_parallel=True,
         )
 
@@ -214,6 +215,7 @@ def test_pi05_siglip_reuses_srt_model_with_layerwise_groups():
     assert f"{prefix}.proj.weight" in state_keys
     assert vision_model.embeddings.position_embedding.tp_size == 1
     assert layer.self_attn.tp_size == 1
+    assert layer.self_attn.qkv_backend.flatten_batch is False
     assert layer.mlp.fc1.tp_size == 1
     assert layer.mlp.fc2.tp_size == 1
     assert isinstance(layer.mlp.act, nn.GELU)

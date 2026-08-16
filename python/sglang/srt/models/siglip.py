@@ -111,6 +111,7 @@ class SiglipEncoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         qkv_backend: Optional[str] = None,
+        flatten_batch: bool = True,
         use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
@@ -123,7 +124,7 @@ class SiglipEncoderLayer(nn.Module):
             num_heads=config.num_attention_heads,
             projection_size=config.hidden_size,
             use_qkv_parallel=True,
-            flatten_batch=True,
+            flatten_batch=flatten_batch,
             qkv_backend=qkv_backend,
             use_data_parallel=use_data_parallel,
             quant_config=quant_config,
@@ -184,6 +185,7 @@ class SiglipEncoder(nn.Module):
         prefix: str = "",
         qkv_backend: Optional[str] = None,
         act_layer: Callable[[], nn.Module] = QuickGELU,
+        flatten_batch: bool = True,
         use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
@@ -199,6 +201,7 @@ class SiglipEncoder(nn.Module):
                     norm_layer=norm_layer,
                     qkv_backend=qkv_backend,
                     act_layer=act_layer,
+                    flatten_batch=flatten_batch,
                     use_data_parallel=use_data_parallel,
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_idx}", prefix),
@@ -238,6 +241,7 @@ class SiglipVisionTransformer(nn.Module):
         prefix: str = "",
         qkv_backend: Optional[str] = None,
         act_layer: Callable[[], nn.Module] = QuickGELU,
+        flatten_batch: bool = True,
         use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
@@ -253,6 +257,7 @@ class SiglipVisionTransformer(nn.Module):
             config=config,
             qkv_backend=qkv_backend,
             act_layer=act_layer,
+            flatten_batch=flatten_batch,
             use_data_parallel=use_data_parallel,
             quant_config=quant_config,
             prefix=add_prefix("encoder", prefix),
@@ -301,6 +306,7 @@ class SiglipVisionModel(nn.Module):
         prefix: str = "",
         qkv_backend: Optional[str] = None,
         act_layer: Callable[[], nn.Module] = QuickGELU,
+        flatten_batch: bool = True,
         use_data_parallel: bool = False,
     ):
         super().__init__()
@@ -308,6 +314,7 @@ class SiglipVisionModel(nn.Module):
             config,
             qkv_backend=qkv_backend,
             act_layer=act_layer,
+            flatten_batch=flatten_batch,
             use_data_parallel=use_data_parallel,
             quant_config=quant_config,
             prefix=add_prefix("vision_model", prefix),
