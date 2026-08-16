@@ -278,9 +278,12 @@ class ServingChatTestCase(unittest.TestCase):
                 None,
             )
 
+            self.basic_req.return_sampling_mask = True
+            self.basic_req.return_meta_info = True
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
+            self.assertTrue(adapted.return_sampling_mask)
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
@@ -294,6 +297,18 @@ class ServingChatTestCase(unittest.TestCase):
             )
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
                 self.chat._convert_to_internal_request(req, self.fastapi_request)
+
+    def test_validate_request_rejects_sampling_mask_without_meta_info(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            return_sampling_mask=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_sampling_mask requires return_meta_info=true.",
+        )
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
@@ -316,6 +331,8 @@ class ServingChatTestCase(unittest.TestCase):
             input_ids=[101, 102, 103],
             stop=["STOP"],
             return_prompt_token_ids=True,
+            cache_salt="tenant-a",
+            extra_key="classification",
         )
 
         with patch(
@@ -329,6 +346,8 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(adapted.input_ids, [101, 102, 103])
         self.assertTrue(adapted.return_prompt_token_ids)
         self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
+        self.assertEqual(adapted.cache_salt, "tenant-a")
+        self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
 
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):

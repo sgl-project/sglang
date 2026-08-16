@@ -1229,12 +1229,12 @@
         },
         "wan2_2_ti2v_5b": {
             "stages_ms": {
-                "InputValidationStage": 380.0,
+                "InputValidationStage": 706.07,
                 "TextEncodingStage": 328.44,
                 "LatentPreparationStage": 0.13,
                 "TimestepPreparationStage": 2.32,
                 "DenoisingStage": 15171.58,
-                "DecodingStage": 1527.14
+                "DecodingStage": 1100.28
             },
             "denoise_step_ms": {
                 "0": 183.83,
@@ -2808,7 +2808,7 @@
                 "MiniMaxH3LatentPreparationStage": 18.72,
                 "MiniMaxH3TimestepPreparationStage": 0.34,
                 "MiniMaxH3DenoisingStage": 16839.0,
-                "MiniMaxH3DecodingStage": 29741.66,
+                "MiniMaxH3DecodingStage": 2200.0,
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
@@ -2820,10 +2820,10 @@
                 "5": 2343.56,
                 "6": 2326.79
             },
-            "expected_e2e_ms": 47538.57,
+            "expected_e2e_ms": 19700.0,
             "expected_avg_denoise_ms": 2045.61,
             "expected_median_denoise_ms": 2332.99,
-            "estimated_full_test_time_s": 235.9
+            "estimated_full_test_time_s": 208.0
         },
         "mova_360p_tp2": {
             "stages_ms": {},

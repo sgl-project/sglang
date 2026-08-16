@@ -58,6 +58,10 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     set_context,
     uses_sliding_window_attention,
 )
+from sglang.srt.hardware_backend.mlx.remote_code_gate import (
+    ensure_remote_code_allowed,
+    resolve_model_directory,
+)
 from sglang.srt.hardware_backend.mlx.sampling import (
     GREEDY_PARAMS,
     MlxLazyLogprobs,
@@ -166,12 +170,14 @@ class MlxModelRunner:
         pool_size: int | None = None,
         mem_fraction_static: float = 0.8,
         quantization: str | None = None,
+        revision: str | None = None,
         enable_sampling: bool = False,
         sampling_rng_seed: int = 0,
         deterministic_seeding: bool = False,
     ):
         self.model_path = model_path
         self.trust_remote_code = trust_remote_code
+        self.revision = revision
         self.model = None
         self.disable_radix_cache = disable_radix_cache
         self._mem_fraction_static = mem_fraction_static
@@ -195,6 +201,19 @@ class MlxModelRunner:
         # mlx_lm.load() detects the config and instantiates QuantizedLinear
         # modules directly.
         self._quantization: str | None = quantization
+
+        # Optionally cap the buffer cache (recycled GPU buffers). MLX never
+        # returns freed buffers to the OS, so without a cap the process
+        # footprint ratchets up to the worst transient — which is model
+        # load/quantization itself, so the cap must be in place before it.
+        cache_limit_gb = envs.SGLANG_MLX_CACHE_LIMIT_GB.get()
+        if cache_limit_gb is not None:
+            if cache_limit_gb < 0:
+                raise ValueError(
+                    f"SGLANG_MLX_CACHE_LIMIT_GB must be >= 0, got {cache_limit_gb}"
+                )
+            mx.set_cache_limit(int(cache_limit_gb * (1024**3)))
+            logger.info(f"MLX buffer cache limit set to {cache_limit_gb:.1f} GB")
 
         self._load_model()
 
@@ -399,6 +418,7 @@ class MlxModelRunner:
                 return
             req.mamba_ping_pong_track_buffer = track_buffer
             req.mamba_next_track_idx = 0
+            req.mamba_last_track_idx = 0
 
         pool.store_cache(
             track_buffer[0],
@@ -480,10 +500,18 @@ class MlxModelRunner:
         logger.info(f"Loading MLX model: {self.model_path}")
         start_time = time.time()
 
+        # Resolve the checkpoint directory once and inspect that exact
+        # directory before mlx-lm can execute any checkpoint-shipped
+        # model_file; the same directory is then handed to mlx_lm_load
+        # (identity resolution for local dirs), so the inspected and
+        # executed snapshots cannot diverge.
+        model_dir = resolve_model_directory(self.model_path, revision=self.revision)
+        ensure_remote_code_allowed(model_dir, self.trust_remote_code)
+
         # We need the config dict to pass into quantize_model so it knows tied/embedding
         # layout. return_config=True is cheap and ignored when no quantization is requested.
         loaded = mlx_lm_load(
-            self.model_path,
+            str(model_dir),
             tokenizer_config={"trust_remote_code": self.trust_remote_code},
             return_config=True,
         )
