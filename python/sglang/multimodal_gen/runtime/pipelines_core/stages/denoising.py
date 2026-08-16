@@ -671,6 +671,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if self.server_args.enable_breakable_cuda_graph:
             # Cache-DiT wraps transformer.forward with step-skipping control
             # flow that must not be baked into a captured CUDA graph.
+            if self._cache_dit_requested():
+                logger.warning_once(
+                    "Cache-DiT was requested but is disabled because breakable "
+                    "CUDA graphs are enabled."
+                )
             return
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:

@@ -572,6 +572,11 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
                 "The surface level may be outside the volume data range."
             )
 
+        if batch.is_warmup:
+            if self.config.paint_enable:
+                return batch
+            return OutputBatch(output_file_paths=[], metrics=batch.metrics)
+
         obj_path, return_path = self._get_output_paths(batch)
         output_dir = os.path.dirname(obj_path)
         if output_dir:

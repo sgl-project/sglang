@@ -2,7 +2,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import torch
-from transformers import Qwen2_5_VLForConditionalGeneration
 
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
@@ -12,13 +11,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     ComponentOffloadStrategy,
     ResidentStrategy,
-)
-from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-    LayerwiseOffloadableModuleMixin,
-)
-from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_transformers import (
-    Qwen2_5VLGenerationEncoder,
-    load_qwen2_5vl_generation_model,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding import (
     RealtimeTextEncodingStage,
@@ -225,71 +217,39 @@ def test_realtime_text_encoder_use_starts_at_call_site():
     assert uses[0].start_at_stage_entry is False
 
 
-def test_transformers_qwen_generation_model_supports_layerwise_offload():
-    assert issubclass(
-        Qwen2_5VLGenerationEncoder,
-        LayerwiseOffloadableModuleMixin,
-    )
-    assert Qwen2_5VLGenerationEncoder.layer_names == [
-        "transformers_model.model.language_model.layers",
-        "transformers_model.model.visual.blocks",
-    ]
-
-
-def test_layerwise_qwen_loads_through_upstream_class(monkeypatch):
-    model = torch.nn.Linear(2, 2)
-    upstream_load = Mock(return_value=model)
-    monkeypatch.setattr(
-        Qwen2_5_VLForConditionalGeneration,
-        "from_pretrained",
-        upstream_load,
-    )
-
-    server_args = SimpleNamespace(
-        trust_remote_code=True,
-        revision="revision",
-        should_start_component_on_cpu=lambda _component_name: True,
-    )
-
-    loaded = load_qwen2_5vl_generation_model(
-        "model",
-        server_args=server_args,
-        dtype=torch.bfloat16,
-    )
-
-    upstream_load.assert_called_once_with(
-        "model",
-        subfolder="text_encoder",
-        trust_remote_code=True,
-        revision="revision",
-        torch_dtype=torch.bfloat16,
-    )
-    assert isinstance(loaded, Qwen2_5VLGenerationEncoder)
-    assert loaded.transformers_model is model
-    assert type(loaded.transformers_model) is torch.nn.Linear
-
-
-def test_qwen_layered_registers_stage_loaded_text_encoder(monkeypatch):
+def test_qwen_layered_uses_loaded_text_encoder(monkeypatch):
     from sglang.multimodal_gen.runtime.pipelines import qwen_image
 
     text_encoder = object()
-    stage = SimpleNamespace(text_encoder=text_encoder)
+    stage = SimpleNamespace()
+    stage_kwargs = {}
     pipeline = qwen_image.QwenImageLayeredPipeline.__new__(
         qwen_image.QwenImageLayeredPipeline
     )
     pipeline.model_path = "model"
     pipeline.modules = {
         name: object()
-        for name in ("vae", "tokenizer", "processor", "transformer", "scheduler")
+        for name in (
+            "text_encoder",
+            "vae",
+            "tokenizer",
+            "processor",
+            "transformer",
+            "scheduler",
+        )
     }
+    pipeline.modules["text_encoder"] = text_encoder
     pipeline.add_stage_factory = lambda _role, factory, _name: factory()
     pipeline.add_standard_timestep_preparation_stage = lambda **_kwargs: None
     pipeline.add_standard_denoising_stage = lambda: None
     pipeline.add_standard_decoding_stage = lambda: None
+
+    def create_stage(**kwargs):
+        stage_kwargs.update(kwargs)
+        return stage
+
     monkeypatch.setattr(
-        qwen_image,
-        "QwenImageLayeredBeforeDenoisingStage",
-        lambda **_kwargs: stage,
+        qwen_image, "QwenImageLayeredBeforeDenoisingStage", create_stage
     )
     server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(
@@ -300,7 +260,7 @@ def test_qwen_layered_registers_stage_loaded_text_encoder(monkeypatch):
 
     pipeline.create_pipeline_stages(server_args)
 
-    assert pipeline.modules["text_encoder"] is text_encoder
+    assert stage_kwargs["text_encoder"] is text_encoder
 
 
 def test_single_component_stage_is_finished_at_stage_exit():

@@ -1,7 +1,7 @@
 """Prompt-rewriting stage for LongCat-Image (T2I).
 
-`LongCatPromptRewriteStage` optionally rewrites the prompt via the HuggingFace
-`Qwen2_5_VLForConditionalGeneration.generate()` and sets the CPU generator for
+`LongCatPromptRewriteStage` optionally rewrites the prompt via the native
+Qwen2.5-VL encoder and sets the CPU generator for
 seed reproducibility. Text encoding, latent preparation, RoPE and denoising are
 all handled by the standard stages + `LongCatImagePipelineConfig` hooks, so this
 is the only model-specific stage.
@@ -16,9 +16,6 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
-)
-from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_transformers import (
-    load_qwen2_5vl_generation_model,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -184,15 +181,13 @@ def _get_prompt_language(prompt):
 class LongCatPromptRewriteStage(PipelineStage):
     """Optional prompt rewriting + request-level setup for LongCat-Image.
 
-    Loads the Qwen2.5-VL text encoder (HuggingFace) in-stage and, when
-    `enable_prompt_rewrite` is set, rewrites the prompt via `.generate()`
+    When `enable_prompt_rewrite` is set, rewrites the prompt via `.generate()`
     (using the checkpoint's generation_config.json sampling params). Always
     sets the CPU generator for seed reproducibility. CFG-renorm params are
     read directly from sampling_params in `postprocess_cfg_noise`, not set here.
 
-    The same encoder instance is shared with the standard `TextEncodingStage`
-    (the pipeline registers it via `add_module("text_encoder", ...)`), so
-    rewrite and encode run on one set of weights. Both stages declare a
+    The same encoder instance is shared with the standard `TextEncodingStage`,
+    so rewrite and encode run on one set of weights. Both stages declare a
     `text_encoder` ComponentUse; the residency manager keeps the encoder
     resident across the adjacent rewrite->encode uses and offloads it only
     after the last use (when `--text-encoder-cpu-offload` is enabled).
@@ -200,19 +195,13 @@ class LongCatPromptRewriteStage(PipelineStage):
 
     def __init__(
         self,
-        tokenizer,
+        text_encoder,
         text_processor,
-        model_path: str,
         text_encoder_dtype: torch.dtype,
     ):
         super().__init__()
         self.text_encoder_dtype = text_encoder_dtype
-        self.text_encoder = load_qwen2_5vl_generation_model(
-            model_path,
-            server_args=self.server_args,
-            dtype=self.text_encoder_dtype,
-        )
-        self.tokenizer = tokenizer
+        self.text_encoder = text_encoder
         self.text_processor = text_processor
 
     def component_uses(

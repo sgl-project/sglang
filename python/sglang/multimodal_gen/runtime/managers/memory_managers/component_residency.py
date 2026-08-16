@@ -116,7 +116,9 @@ def component_residency_selector_matches(component_name: str, selector: str) -> 
             "vae",
             "video_vae",
             "audio_vae",
+            "delight_vae",
             "hy3dshape_vae",
+            "paint_vae",
         )
     return component_name == selector
 

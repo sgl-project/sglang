@@ -26,7 +26,9 @@ DIT_COMPONENT_NAMES = frozenset(
         "transformer",
         "video_dit",
         "audio_dit",
+        "delight_transformer",
         "hy3dshape_model",
+        "paint_transformer",
         "unconditional_transformer",
     }
 )
@@ -45,7 +47,10 @@ VAE_COMPONENT_NAMES = frozenset(
         "vocoder",
         "spatial_upsampler",
         "condition_image_encoder",
+        "delight_vae",
+        "diffusion_decoder",
         "hy3dshape_vae",
+        "paint_vae",
         "sound_tokenizer",
     }
 )
@@ -54,6 +59,8 @@ DEFAULT_LAYERWISE_VAE_COMPONENT_NAMES = frozenset(
         "vae",
         "video_vae",
         "condition_image_encoder",
+        "delight_vae",
+        "paint_vae",
     }
 )
 CPU_OFFLOAD_ALL_COMPONENTS = "all"
