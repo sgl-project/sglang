@@ -1523,6 +1523,9 @@ class Envs:
     # Rust server
     # ===================================================================
     SGLANG_RUST_SERVER = EnvBool(False)
+    # Build a missing Rust extension from source (auto), require a bundled or
+    # cached extension (never), or rebuild the local cache entry (force).
+    SGLANG_RUST_BUILD_MODE = EnvStr("auto")
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
 

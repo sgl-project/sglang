@@ -2687,16 +2687,10 @@ def _start_native_grpc_server_for_runtime(
     template_manager,
     scheduler_info,
 ):
-    try:
-        from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
-        from sglang.srt.grpc import _core as grpc_native
-    except ImportError as e:
-        raise RuntimeError(
-            "Native gRPC extension (sglang.srt.grpc._core) not found in this wheel, "
-            "but --grpc-port was set. The extension is built from "
-            "rust/sglang-grpc/ via setuptools-rust during wheel build. Either "
-            "install a wheel that includes the extension or unset --grpc-port."
-        ) from e
+    from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+    from sglang.srt.rust_extension import load_rust_extension
+
+    grpc_native = load_rust_extension("sglang.srt.grpc._core")
 
     runtime_handle = RuntimeHandle(
         tokenizer_manager=tokenizer_manager,

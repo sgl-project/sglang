@@ -367,7 +367,9 @@ class RustServer:
         The caller gates this (``SGLANG_RUST_SERVER`` + rank 0); this always
         creates.
         """
-        from sglang.srt.server._core import Server
+        from sglang.srt.rust_extension import load_rust_extension
+
+        Server = load_rust_extension("sglang.srt.server._core").Server
 
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
