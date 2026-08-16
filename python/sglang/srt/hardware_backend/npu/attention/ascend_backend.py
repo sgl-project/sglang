@@ -1206,50 +1206,133 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
 
-        attn_out_prev, _, _ = torch_npu.npu_sparse_flash_attention(
-            query=q_nope_prev,
-            key=k_nope,
-            value=k_nope,
-            query_rope=q_rope_prev,
-            key_rope=k_pe,
-            sparse_indices=topk_indices_prev,
-            scale_value=layer.scaling,
-            actual_seq_lengths_query=actual_seq_qlen_prev.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_kv=actual_seq_lengths_kv_prev.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            block_table=self.forward_metadata.block_tables,
-            sparse_block_size=1,
-            layout_query="TND",
-            layout_kv="PA_BSND",
-            sparse_mode=3,
-            attention_mode=2,
-            return_softmax_lse=False,
-        )
-        attn_out_next, _, _ = torch_npu.npu_sparse_flash_attention(
-            query=q_nope_next,
-            key=k_nope,
-            value=k_nope,
-            query_rope=q_rope_next,
-            key_rope=k_pe,
-            sparse_indices=topk_indices_next,
-            scale_value=layer.scaling,
-            actual_seq_lengths_query=actual_seq_qlen_next.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_kv=actual_seq_lengths_kv_next.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            block_table=self.forward_metadata.block_tables,
-            sparse_block_size=1,
-            layout_query="TND",
-            layout_kv="PA_BSND",
-            sparse_mode=3,
-            attention_mode=2,
-            return_softmax_lse=False,
-        )
+        if getattr(
+                self.token_to_kv_pool, "dsa_kv_cache_store_fp8", False
+        ):
+            if q_nope.dtype != torch.bfloat16 or q_pe.dtype != torch.bfloat16:
+                raise RuntimeError(
+                    "DSA FP8 quant sparse attention requires BF16 query, "
+                    f"got q_nope={q_nope.dtype}, q_pe={q_pe.dtype}"
+                )
+            q_nope_prev = torch.cat([q_nope_prev, q_rope_prev], dim=-1).contiguous()
+            q_nope_next = torch.cat([q_nope_next, q_rope_next], dim=-1).contiguous()
+            tile_size = self.token_to_kv_pool.dsa_kv_quant_tile_size
+            packed_cache_dim = (
+                    self.kv_lora_rank
+                    + self.qk_rope_head_dim * 2
+                    + self.kv_lora_rank // tile_size * 4
+            )
+            if k_nope.shape[-1] != packed_cache_dim:
+                raise RuntimeError(
+                    f"Unexpected DSA FP8 cache dim {k_nope.shape[-1]}, "
+                    f"expected {packed_cache_dim}"
+                )
+            if k_nope.dtype == torch.uint8:
+                k_nope = k_nope.view(torch.float8_e4m3fn)
+            if k_nope.dtype != torch.float8_e4m3fn:
+                raise RuntimeError(
+                    f"Unexpected DSA FP8 cache dtype {k_nope.dtype}, "
+                    f"expected {torch.float8_e4m3fn}"
+                )
+            key = k_nope.view(-1, self.page_size, 1, packed_cache_dim)
+
+            attn_out_prev = torch_npu.npu_kv_quant_sparse_flash_attention(
+                query=q_nope_prev,
+                key=key,
+                value=key,
+                sparse_indices=topk_indices_prev,
+                scale_value=layer.scaling,
+                key_quant_mode=2,
+                value_quant_mode=2,
+                key_dequant_scale=None,
+                value_dequant_scale=None,
+                actual_seq_lengths_query=actual_seq_qlen_prev.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_kv=actual_seq_lengths_kv_prev.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                block_table=self.forward_metadata.block_tables,
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+                quant_scale_repo_mode=1,
+                tile_size=tile_size,
+                rope_head_dim=self.qk_rope_head_dim,
+            )
+            attn_out_next = torch_npu.npu_kv_quant_sparse_flash_attention(
+                query=q_nope_next,
+                key=key,
+                value=key,
+                sparse_indices=topk_indices_next,
+                scale_value=layer.scaling,
+                key_quant_mode=2,
+                value_quant_mode=2,
+                key_dequant_scale=None,
+                value_dequant_scale=None,
+                actual_seq_lengths_query=actual_seq_qlen_next.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_kv=actual_seq_lengths_kv_next.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                block_table=self.forward_metadata.block_tables,
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+                quant_scale_repo_mode=1,
+                tile_size=tile_size,
+                rope_head_dim=self.qk_rope_head_dim,
+            )
+        else:
+            attn_out_prev, _, _ = torch_npu.npu_sparse_flash_attention(
+                query=q_nope_prev,
+                key=k_nope,
+                value=k_nope,
+                query_rope=q_rope_prev,
+                key_rope=k_pe,
+                sparse_indices=topk_indices_prev,
+                scale_value=layer.scaling,
+                actual_seq_lengths_query=actual_seq_qlen_prev.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_kv=actual_seq_lengths_kv_prev.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                block_table=self.forward_metadata.block_tables,
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+                return_softmax_lse=False,
+            )
+            attn_out_next, _, _ = torch_npu.npu_sparse_flash_attention(
+                query=q_nope_next,
+                key=k_nope,
+                value=k_nope,
+                query_rope=q_rope_next,
+                key_rope=k_pe,
+                sparse_indices=topk_indices_next,
+                scale_value=layer.scaling,
+                actual_seq_lengths_query=actual_seq_qlen_next.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_kv=actual_seq_lengths_kv_next.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                block_table=self.forward_metadata.block_tables,
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+                return_softmax_lse=False,
+            )
         return torch.cat([attn_out_prev, attn_out_next], dim=0)
 
     def do_cp_attn_fia(
