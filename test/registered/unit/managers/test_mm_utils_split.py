@@ -18,6 +18,7 @@ import torch
 
 from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.multimodal.transport.cuda_ipc import PRECOMPUTED_FEATURE_HASHES_KEY
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -135,6 +136,105 @@ class TestGetNewExpandedMMItems(CustomTestCase):
             feature=torch.arange(18, dtype=torch.float32).reshape(6, 3),
             model_specific_data={"image_grid_hws": [[2, 3]]},
         )
+        out = get_new_expanded_mm_items([item])
+
+        self.assertEqual(len(out), 1)
+        self.assertIs(out[0], item)
+
+
+class TestPerItemFeatureListSplit(CustomTestCase):
+    """Streaming GPU processors emit ``feature`` as a per-image list of
+    already-wrapped entries, optionally with production-time hashes. Expansion
+    takes elements by index, assigns the hashes, and strips the carrier key."""
+
+    def _bundled_list_item(self, hashes=None, feature=None, num_images=2):
+        model_specific_data = {
+            # prod over rows -> [6, 4] patches; boundaries shape model data.
+            "image_grid_thw": torch.tensor([[1, 2, 3], [1, 4, 1]], dtype=torch.long)[
+                :num_images
+            ],
+        }
+        if hashes is not None:
+            model_specific_data[PRECOMPUTED_FEATURE_HASHES_KEY] = hashes
+        if feature is None:
+            feature = [object() for _ in range(num_images)]
+        return MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(0, 5), (5, 10)][:num_images],
+            feature=feature,
+            model_specific_data=model_specific_data,
+        )
+
+    def test_list_feature_splits_by_element(self):
+        sentinel_a, sentinel_b = object(), object()
+        item = self._bundled_list_item(feature=[sentinel_a, sentinel_b])
+        out = get_new_expanded_mm_items([item])
+
+        self.assertEqual(len(out), 2)
+        # Bare elements — not one-element lists, not slices.
+        self.assertIs(out[0].feature, sentinel_a)
+        self.assertIs(out[1].feature, sentinel_b)
+        self.assertEqual(out[0].offsets, [(0, 5)])
+        self.assertEqual(out[1].offsets, [(5, 10)])
+        self.assertTrue(all(o.hash is None for o in out))
+
+    def test_precomputed_hashes_assigned_and_stripped(self):
+        item = self._bundled_list_item(hashes=[111, 222])
+        out = get_new_expanded_mm_items([item])
+
+        self.assertEqual([o.hash for o in out], [111, 222])
+        # set_hash derives pad_value, so set_pad_value later no-ops.
+        self.assertTrue(all(o.pad_value is not None for o in out))
+        for o in out:
+            self.assertNotIn(PRECOMPUTED_FEATURE_HASHES_KEY, o.model_specific_data)
+
+    def test_wrong_length_hashes_ignored(self):
+        item = self._bundled_list_item(hashes=[111])
+        out = get_new_expanded_mm_items([item])
+
+        self.assertEqual(len(out), 2)
+        self.assertTrue(all(o.hash is None for o in out))
+        for o in out:
+            self.assertNotIn(PRECOMPUTED_FEATURE_HASHES_KEY, o.model_specific_data)
+
+    def test_single_image_list_feature_unwrapped(self):
+        # Single-image requests never reach the bundled split; the streamed
+        # per-image list (and its hash) must still be adopted.
+        sentinel = object()
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(0, 5)],
+            feature=[sentinel],
+            model_specific_data={
+                "image_grid_thw": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                PRECOMPUTED_FEATURE_HASHES_KEY: [42],
+            },
+        )
+        out = get_new_expanded_mm_items([item])
+
+        self.assertEqual(len(out), 1)
+        self.assertIs(out[0].feature, sentinel)
+        self.assertEqual(out[0].hash, 42)
+        self.assertIsNotNone(out[0].pad_value)
+        self.assertNotIn(PRECOMPUTED_FEATURE_HASHES_KEY, out[0].model_specific_data)
+
+    def test_single_image_skipped_hash_still_unwrapped(self):
+        sentinel = object()
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(0, 5)],
+            feature=[sentinel],
+            model_specific_data={PRECOMPUTED_FEATURE_HASHES_KEY: [None]},
+        )
+        out = get_new_expanded_mm_items([item])
+
+        self.assertIs(out[0].feature, sentinel)
+        self.assertIsNone(out[0].hash)
+        self.assertNotIn(PRECOMPUTED_FEATURE_HASHES_KEY, out[0].model_specific_data)
+
+    def test_list_length_mismatch_keeps_bundle(self):
+        # Unattributable list features must pass through unsplit.
+        item = self._bundled_list_item(feature=[object()])
         out = get_new_expanded_mm_items([item])
 
         self.assertEqual(len(out), 1)
