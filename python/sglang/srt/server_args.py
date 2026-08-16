@@ -7985,41 +7985,6 @@ class ServerArgs:
             "1" if requested_transport == "cuda_ipc" else "0"
         )
 
-    def _handle_custom_all_reduce_v2_multinode(self):
-        # Custom all-reduce v2's graph zero-copy path uses IPC handles and is
-        # intra-node only. On MNNVL-fabric devices (GB200/GB300) the eager pull
-        # path works across nodes via the symm-mem workspace. TP2-8 uses the
-        # explicit multinode mode, while TP16 uses the standard topology probe.
-        # Elsewhere force-disable v2 on multi-node so the dispatch falls back to
-        # the legacy CustomAllreduce path, unless the MNNVL opt-in is set.
-        if self.nnodes <= 1 or not envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
-            return
-        if (
-            not envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.is_set()
-            and is_mnnvl_fabric_device()
-        ):
-            # The explicit multinode mode supports TP2-8. TP16 uses the
-            # topology-probed path in can_use_custom_all_reduce_v2 instead.
-            if self.tp_size == 16:
-                return
-            if self.tp_size <= 8:
-                logger.info(
-                    "MNNVL fabric device detected with nnodes=%d: enabling "
-                    "custom all-reduce v2 multinode mode "
-                    "(SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE=1; set it "
-                    "to 0 to opt out).",
-                    self.nnodes,
-                )
-                envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.set("1")
-        if not envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get():
-            if envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.is_set():
-                logger.warning(
-                    "Disabling SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 because nnodes=%d "
-                    "(custom all-reduce v2 is intra-node only).",
-                    self.nnodes,
-                )
-            envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
-
     def _handle_environment_variables(self):
         self._handle_multimodal_feature_transport()
         envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
@@ -8031,7 +7996,6 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
-        self._handle_custom_all_reduce_v2_multinode()
         if self.enable_deterministic_inference:
             envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
         if self.debug_cuda_graph:

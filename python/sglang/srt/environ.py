@@ -1091,14 +1091,6 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
-    # Allow CustomAllReduceV2 on a process group that spans nodes (MNNVL
-    # fabric). Requires torch symmetric memory to rendezvous across nodes
-    # (fabric handles + IMEX). Graph zero-copy input registration is not
-    # supported in this mode and is disabled; all-reduce inside CUDA graphs
-    # falls back to eager pull from the symm workspace. Auto-enabled on
-    # MNNVL-fabric devices (GB200/GB300) when nnodes > 1; set 0/1 to
-    # override in either direction.
-    SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE = EnvBool(False)
 
     # ===================================================================
     # RoPE cache

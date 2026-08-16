@@ -724,14 +724,8 @@ class GroupCoordinator:
             self.pymscclpp_comm is not None
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         )
-        # With the MNNVL opt-in, let CustomAllReduceV2 take eligible (small)
-        # inputs ahead of the symm-mem pynccl fast path; otherwise pynccl
-        # would absorb every all-reduce whenever --enable-symm-mem is on and
-        # v2 never runs. Large inputs fail should_custom_ar and still go to
-        # the symm-mem path below.
-        _ca_takes_input = (
-            _CA_V2_MULTINODE
-            and self.ca_comm is not None
+        should_use_custom_allreduce = (
+            self.ca_comm is not None
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
         )
@@ -739,7 +733,7 @@ class GroupCoordinator:
             self.pynccl_comm is not None
             and self.is_symmetric_memory_enabled()
             and not should_use_pymscclpp_allreduce
-            and not _ca_takes_input
+            and not should_use_custom_allreduce
         ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with self.pynccl_comm.change_state(enable=True):
@@ -2054,9 +2048,6 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
-# Read once at import: whether CustomAllReduceV2 is opted in on a multi-node
-# (MNNVL) group. Used on the all_reduce hot path (see GroupCoordinator).
-_CA_V2_MULTINODE = envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get()
 _ENABLE_FLASHINFER_ALLREDUCE_ONLY = False
 
 
