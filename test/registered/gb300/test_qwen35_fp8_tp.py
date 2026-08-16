@@ -7,7 +7,7 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 
-register_cuda_ci(est_time=5400, stage="nightly", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=4800, stage="nightly", runner_config="4-gpu-gb300")
 
 MODEL_PATH = "Qwen/Qwen3.5-397B-A17B-FP8"
 

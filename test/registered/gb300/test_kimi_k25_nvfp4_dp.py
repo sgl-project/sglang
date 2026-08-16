@@ -7,7 +7,7 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 
-register_cuda_ci(est_time=5400, stage="nightly", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=7200, stage="nightly", runner_config="4-gpu-gb300")
 
 MODEL_PATH = "nvidia/Kimi-K2.5-NVFP4"
 DRAFT_MODEL_PATH = "lightseekorg/kimi-k2.5-eagle3-mla"
