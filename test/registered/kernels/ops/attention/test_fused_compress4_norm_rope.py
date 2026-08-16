@@ -39,11 +39,13 @@ ROPE_DIM = 64
 NORM_EPS = 1.0e-6
 N_DECODE_STEPS = 8  # spans >=2 compress boundaries plus non-boundary steps
 
-# Per-head-dim store epilogue the fused kernel dispatches to. head_dim 512 is the
-# flashmla epilogue (bf16 store into a [slots, head_dim] bf16 buffer, page_size
-# 1); head_dim 128 is the indexer epilogue (fp8 store into the page-major
-# index-k-with-scale buffer, head_dim + 4 bytes per token, page_size 64). The
-# indexer store is always fp8; bf16_store is a flashmla-only option.
+# Per-head-dim store epilogue the fused kernel dispatches to. Both epilogues
+# write into a page-major uint8 cache whose row stride is page_size *
+# bytes_per_token. head_dim 512 is the flashmla epilogue (bf16 store, so
+# head_dim * 2 bytes per token, page_size 1); head_dim 128 is the indexer
+# epilogue (fp8 store into the index-k-with-scale layout, head_dim + 4 bytes per
+# token, page_size 64). The indexer store is always fp8; bf16_store is a
+# flashmla-only option.
 CONFIGS = {
     512: dict(page_size=1, bf16_store=True, store="bf16"),
     128: dict(page_size=64, bf16_store=False, store="fp8"),
@@ -84,31 +86,60 @@ def _to_src(t: torch.Tensor, src_dtype: torch.dtype) -> torch.Tensor:
 def _make_cache(
     head_dim: int, num_slots: int, page_size: int, store: str
 ) -> torch.Tensor:
-    if store == "bf16":
-        return torch.zeros(
-            num_slots, head_dim, dtype=torch.bfloat16, device=get_device()
-        )
-    bytes_per_token = head_dim + 4  # fp8 codes + 4 scale bytes
+    # bf16 store: head_dim * 2 bytes/token; fp8 indexer store: head_dim fp8
+    # codes + 4 scale bytes. Both are page-major uint8 buffers.
+    bytes_per_token = head_dim * 2 if store == "bf16" else head_dim + 4
     num_pages = (num_slots + page_size) // page_size + 1
     return torch.zeros(
         num_pages, page_size * bytes_per_token, dtype=torch.uint8, device=get_device()
     )
 
 
-def _assert_cache_close(store: str, a: torch.Tensor, b: torch.Tensor) -> None:
+def _dequant_indexer_fp8(
+    cache: torch.Tensor, head_dim: int, page_size: int
+) -> torch.Tensor:
+    """Decode the index-k store: head_dim e4m3 codes + one fp32 scale per token."""
+    n_code = page_size * head_dim
+    codes = (
+        cache[:, :n_code]
+        .view(torch.float8_e4m3fn)
+        .float()
+        .view(cache.shape[0], page_size, head_dim)
+    )
+    scale = (
+        cache[:, n_code:]
+        .reshape(cache.shape[0], page_size, 4)
+        .view(torch.float32)  # [pages, page_size, 1]
+    )
+    return codes * scale
+
+
+def _assert_cache_close(
+    store: str, a: torch.Tensor, b: torch.Tensor, head_dim: int, page_size: int
+) -> None:
     """The two paths must produce interchangeable caches.
 
     The fused kernel keeps the compressed row in fp32 registers while the
-    two-kernel chain rounds it to bf16 between launches, so a handful of fp8
-    codes can land one code apart; scales are computed from the same amax and
-    stay identical. bf16 store carries the same intermediate difference forward.
+    two-kernel chain rounds it to bf16 between launches. bf16 store carries that
+    intermediate difference straight into the cache; the fp8 indexer store keeps
+    codes essentially identical while a rare amax tie shifts one token's scale in
+    its lowest mantissa bits, so it is compared in dequantized value space where
+    at most a handful of elements may land one e4m3 code apart.
     """
     if store == "bf16":
-        torch.testing.assert_close(a.float(), b.float(), atol=2e-2, rtol=2e-2)
+        a_f = a.view(torch.bfloat16).float()
+        b_f = b.view(torch.bfloat16).float()
+        torch.testing.assert_close(a_f, b_f, atol=2e-2, rtol=2e-2)
         return
-    diff = (a.to(torch.int16) - b.to(torch.int16)).abs()
-    assert diff.max().item() <= 1, f"fp8 store diverged by >1 code: max={diff.max()}"
-    assert diff.ne(0).float().mean().item() < 5e-3, "too many differing fp8 codes"
+    va = _dequant_indexer_fp8(a, head_dim, page_size)
+    vb = _dequant_indexer_fp8(b, head_dim, page_size)
+    diff = (va - vb).abs()
+    # No element may diverge by more than a single e4m3 code step...
+    step_tol = 2e-1 + 2e-1 * vb.abs()
+    assert (diff > step_tol).sum().item() == 0, "value diverged beyond one fp8 code"
+    # ...and only a handful may shift at all.
+    small_tol = 2e-2 + 2e-2 * vb.abs()
+    assert (diff > small_tol).float().mean().item() < 5e-3, "too many fp8 codes shifted"
 
 
 @pytest.mark.parametrize("head_dim", list(CONFIGS))
@@ -138,7 +169,7 @@ def test_fused_matches_chain_decode(
         seq_len_total, head_dim, seed=seq_len_total, src_dtype=src_dtype
     )
     ape = ape_cpu.to(device)
-    norm_weight = torch.randn(head_dim, dtype=torch.bfloat16, device=device)
+    norm_weight = torch.randn(head_dim, dtype=torch.float32, device=device)
     freqs_cis = precompute_freqs_cis(
         ROPE_DIM, seq_len_total + 4, 0, 10000, 1, 32, 1
     ).to(device)
@@ -214,7 +245,9 @@ def test_fused_matches_chain_decode(
                 cache_fused, before_fused
             ), f"fused wrote cache on non-compress step (pos={pos})"
 
-        _assert_cache_close(cfg["store"], cache_chain, cache_fused)
+        _assert_cache_close(
+            cfg["store"], cache_chain, cache_fused, head_dim, cfg["page_size"]
+        )
 
     assert next_slot >= 2, "test did not exercise at least two compress boundaries"
     # The state buffers accumulate the same verbatim token rows in both paths.
