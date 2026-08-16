@@ -401,7 +401,9 @@ class VisionSdpaAttention(nn.Module):
         else:
             attention_mask = attention_mask.to(device=q.device)
 
-        q, k, v = [rearrange(x, "(b s) h d -> b h s d", b=bsz) for x in [q, k, v]]
+        q = q.reshape(bsz, s, self.num_heads, self.head_size).transpose(1, 2)
+        k = k.reshape(bsz, s, self.num_kv_heads, self.head_size).transpose(1, 2)
+        v = v.reshape(bsz, s, self.num_kv_heads, self.head_size).transpose(1, 2)
 
         if self.softmax_in_single_precision:
             k = rearrange(k, "b h s d -> b h d s")
@@ -434,7 +436,7 @@ class VisionSdpaAttention(nn.Module):
             )
 
         # [b, h, s, head_size] --> [b * s, h, head_size]
-        output = rearrange(output, "b h s d -> (b s) h d")
+        output = output.transpose(1, 2).reshape(bsz * s, self.num_heads, self.head_size)
 
         return output
 
@@ -1477,7 +1479,7 @@ class VisionAttention(nn.Module):
 
         if self.use_qkv_parallel:
             # [b * s, h, head_size] --> [b, s, h * head_size]
-            output = rearrange(output, "(b s) ... h d -> b s ... (h d)", b=bsz)
+            output = output.reshape(bsz, s, -1)
 
             # [b, s, h * head_size] --> [b, s, h * head_size]
             output, _ = self.proj(output)
