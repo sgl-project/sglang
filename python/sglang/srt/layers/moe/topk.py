@@ -1840,7 +1840,9 @@ def remap_topk_for_per_rank_shared_slots(
 
     Routed IDs:  e -> e + e // num_local_routed
     Shared IDs:  ep_rank * num_local_experts + num_local_routed
-    Shared weight: 1.0 on the aiter path, else 1/routed_scaling_factor (see below).
+    Shared weight: 1.0 when routed_scaling_factor is pre-folded into the
+    topk weights (aiter / apply_routed_scaling_factor_on_output families),
+    else 1/routed_scaling_factor (see below).
     """
     if topk_ids.shape[0] == 0:
         return topk_ids, topk_weights
@@ -1880,15 +1882,17 @@ def remap_topk_for_per_rank_shared_slots(
     #     under-weight the always-on shared expert by routed_scaling_factor and
     #     corrupt every MoE layer.
     #
-    # NOTE: forward_deepep also skips the post-MoE multiply for the non-aiter
-    # families where routed_scaling_factor is pre-folded in topk
-    # (should_fuse_routed_scaling_factor_in_topk / apply_routed_scaling_factor_on_output:
-    # ModelOpt NVFP4, cutlass/trtllm-routed fp8), so those would likewise need a
-    # 1.0 shared weight. This fix is deliberately scoped to the aiter path (the
-    # one validated on AMD MI355X); those other backends are left at their
-    # existing behavior and can be addressed by their maintainers.
+    # The same 1.0 is required for the non-aiter pre-folding families selected
+    # by topk_config.apply_routed_scaling_factor_on_output (which mirrors
+    # should_fuse_routed_scaling_factor_in_topk, the flag forward_deepep
+    # checks, at TopK construction time: ModelOpt NVFP4 non-marlin,
+    # cutlass/trtllm-routed fp8, unquantized trtllm-routed): their routed
+    # topk weights already carry
+    # routed_scaling_factor and forward_deepep skips the post-MoE multiply,
+    # so applying 1/rsf here would under-weight the shared expert the same
+    # way as on the aiter path.
     routed_scaling_factor = topk_config.routed_scaling_factor
-    if _use_aiter:
+    if _use_aiter or topk_config.apply_routed_scaling_factor_on_output:
         topk_weights[:, -num_fused_shared_experts:] = 1.0
     elif routed_scaling_factor is not None and routed_scaling_factor != 0:
         topk_weights[:, -num_fused_shared_experts:] = 1.0 / routed_scaling_factor
