@@ -859,19 +859,9 @@ class Envs:
     # by the CK block-scale MoE kernel, which the full
     # SGLANG_FORCE_MXFP8_BLOCK_CONVERT would require.
     SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE = EnvBool(False)
-    # With the dense block-convert above: batches of at most this many tokens run
-    # the dense linear as cached-BF16 F.linear (fast skinny-M hipblaslt) instead of
-    # the aiter block-fp8 GEMM (fast at large M). 0 disables the hybrid. Costs one
-    # BF16 weight copy per dense linear.
-    SGLANG_OPT_MXFP8_DENSE_BF16_DECODE_M = EnvInt(0)
-    # Convert MXFP8 *dense linear* weights to per-channel (rowwise) fp8 at load and
-    # run them through aiter's per-token x per-channel bpreshuffle GEMM (flydsl,
-    # ~1.45 TB/s at M=1 vs ~0.5 for the block-scale CK path). Coarsens the 1x32
-    # weight scales to per-row — gate accuracy (GSM8K) before adopting.
-    SGLANG_FORCE_MXFP8_PTPC_DENSE = EnvBool(False)
     # With the dense block-convert: batches of at most this many tokens run the
-    # dense linear through the rowwise-fp8 aiter GEMM above instead of the
-    # block-fp8 GEMM (fast at large M). Takes precedence over the BF16 hybrid.
+    # dense linear through a rowwise-fp8 aiter GEMM (flydsl, ~1.45 TB/s at M=1)
+    # instead of the block-fp8 GEMM (fast at large M).
     # Costs one rowwise-fp8 copy of each dense linear weight; coarsens the
     # 1x32 weight scales to per-row for batches at or below the threshold.
     # Also gates fusing that per-token fp8 quant into the producing norm kernel:
@@ -1471,10 +1461,6 @@ class Envs:
     # changes which KV blocks the skip layers attend, so it is applied on ROCm
     # only (and never under two-batch overlap); elsewhere the backend pins 1.
     SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(6)
-    # Reuse the index-topk group source layer's decode top-k on its skip layers
-    # (device-side, CUDA-graph safe). Only has an effect when
-    # SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ > 1.
-    SGLANG_M3_DECODE_TOPK_REUSE = EnvBool(True)
     # Gluon sparse PREFILL. Replaces the Triton flash_prefill_with_gqa_share_sparse
     # main-attention step with AITER's pa_decode_gluon (every prefill query
     # token treated as a length-1 decode over a per-token sparse block table).
@@ -1483,24 +1469,11 @@ class Envs:
     # (fp8 KV, sinks, non-128 head/block dims, missing aiter) fall back to the
     # Triton kernel.
     SGLANG_OPT_USE_ATOM_PREFILL = EnvBool(True)
-    # Cap on the ATOM prefill gather scratch (per K/V buffer). The scratch is
-    # allocated lazily after the KV pool, so exceeding the cap -- or failing to
-    # allocate -- falls back to the Triton sparse kernel rather than OOM-ing.
-    SGLANG_OPT_ATOM_PREFILL_MAX_SCRATCH_MB = EnvInt(512)
-    # ATOM prefill: floor the paged-attention context-partition count at
-    # ceil(max_sparse_ctx / 256). Costs one device sync per sparse layer; the
-    # default sizes splits from get_recommended_splits alone (what ATOM does).
-    SGLANG_M3_PA_NEEDED_PARTS = EnvBool(False)
-    # Sub-tile the CDNA Triton sparse-prefill KV loop (SUB_K = block_size_k / 2 on
-    # gfx950, / 4 on gfx942) so each QK/PV MFMA is right-sized. 0 restores the
-    # single-tile dense loop.
-    SGLANG_SPARSE_ATTN_SUBK = EnvBool(True)
     # Index-topk skip layers drop the index
     # arms of the fused rope+cache kernel in prefill (main-only norm+rope+KV
     # write, no idx-K cache write). Only takes effect when the elision is safe:
-    # SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ > 1, decode top-k reuse active
-    # (SGLANG_M3_DECODE_TOPK_REUSE) and the dense-sparse decode path disabled;
-    # see MiniMaxSparseAttnBackend.prefill_skip_index_elision.
+    # SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ > 1 and the dense-sparse decode path
+    # disabled; see MiniMaxSparseAttnBackend.prefill_skip_index_elision.
     SGLANG_OPT_USE_PREFILL_SKIP_INDEX = EnvBool(False)
     # Use the aiter fused_qknorm_idxrqknorm C++/ASM
     # builtin for the sparse-layer norm+rope+cache in extend/prefill (decode

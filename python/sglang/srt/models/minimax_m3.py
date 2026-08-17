@@ -909,13 +909,9 @@ class MiniMaxM3Attention(nn.Module):
 
         is_unquant = isinstance(qm, UnquantizedLinearMethod)
         # Whether the loader pass would rewrite this layer's weights at load
-        # (block-fp8 or rowwise-fp8 conversion); the holder must run the same
-        # pass on the concatenated weights since the loader skips it.
-        needs_load_convert = getattr(qm, "convert_mxfp8_to_block", False) or (
-            not is_unquant
-            and getattr(qm, "use_mxfp8", False)
-            and envs.SGLANG_FORCE_MXFP8_PTPC_DENSE.get()
-        )
+        # (block-fp8 conversion); the holder must run the same pass on the
+        # concatenated weights since the loader skips it.
+        needs_load_convert = getattr(qm, "convert_mxfp8_to_block", False)
         use_mxfp8 = getattr(qm, "use_mxfp8", False) and hasattr(qp, "weight_scale_inv")
         if not (is_unquant or use_mxfp8):
             return

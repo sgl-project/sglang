@@ -7,8 +7,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
-
 from ..common.utils import (
     check_sparse_kv_fp8,
     get_cu_seqblocks,
@@ -21,8 +19,8 @@ from ..common.utils import (
 @functools.cache
 def _sparse_subk_divisor() -> int:
     """How many sub-tiles a CDNA KV tile is split into: 2 on gfx950, 4 on gfx942,
-    0 (no sub-tiling) elsewhere or under SGLANG_SPARSE_ATTN_SUBK=0."""
-    if not (torch.version.hip and envs.SGLANG_SPARSE_ATTN_SUBK.get()):
+    0 (no sub-tiling) elsewhere."""
+    if not torch.version.hip:
         return 0
     try:
         arch = torch.cuda.get_device_properties(0).gcnArchName

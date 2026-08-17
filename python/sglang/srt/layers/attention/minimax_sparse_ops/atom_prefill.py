@@ -37,7 +37,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_utils import (
     get_recommended_splits,
     pa_decode_gluon,
@@ -53,20 +52,11 @@ HEAD_DIM = 128
 _SCRATCH_GROW_PAGES = 1024
 _PAGE_ELEMS = HEAD_DIM * GLUON_PAGE_SIZE
 
-_max_scratch_pages_cached: Optional[int] = None
-
-
-def _max_scratch_pages() -> int:
-    # Hard cap on the gathered context span per forward (K and V buffers each).
-    # Default 512 MiB per buffer at bf16 = 32768 pages = ~2.1M context tokens
-    # across the batch; beyond that the entry point raises and the caller falls
-    # back to the Triton kernel (which reads the pool in place). Parsed once:
-    # this sits on the per-layer hot path and the env is fixed at launch.
-    global _max_scratch_pages_cached
-    if _max_scratch_pages_cached is None:
-        mb = envs.SGLANG_OPT_ATOM_PREFILL_MAX_SCRATCH_MB.get()
-        _max_scratch_pages_cached = max(1, (mb * 1024 * 1024) // (_PAGE_ELEMS * 2))
-    return _max_scratch_pages_cached
+# Hard cap on the gathered context span per forward (K and V buffers each):
+# 512 MiB per buffer at bf16 = 32768 pages = ~2.1M context tokens across the
+# batch; beyond that the entry point raises and the caller falls back to the
+# Triton kernel (which reads the pool in place).
+_MAX_SCRATCH_PAGES = (512 * 1024 * 1024) // (_PAGE_ELEMS * 2)
 
 
 # ---------------------------------------------------------------------------
@@ -166,8 +156,7 @@ def _get_scratch(
             raise ValueError(
                 f"atom prefill scratch of {cap_pages} pages "
                 f"({cap_pages * _PAGE_ELEMS * dtype.itemsize * 2 >> 20} MiB) "
-                "does not fit; lower SGLANG_OPT_ATOM_PREFILL_MAX_SCRATCH_MB or "
-                "--mem-fraction-static"
+                "does not fit; lower --mem-fraction-static"
             ) from exc
         _SCRATCH[key] = entry
     return entry
@@ -487,11 +476,10 @@ def atom_gluon_sparse_prefill(
             cu_seqlens, prefix_lens, seq_lens, seq_lens_cpu, total_q
         )
     )
-    max_pages = _max_scratch_pages()
-    if total_pages > max_pages:
+    if total_pages > _MAX_SCRATCH_PAGES:
         raise ValueError(
             f"atom prefill context span too large for scratch: {total_pages} pages "
-            f"> cap {max_pages} (raise SGLANG_OPT_ATOM_PREFILL_MAX_SCRATCH_MB)"
+            f"> cap {_MAX_SCRATCH_PAGES}"
         )
 
     # DEVIATION (NHD pool): rebind k_cache/v_cache to the gathered SHUFFLE 5D
@@ -524,17 +512,9 @@ def atom_gluon_sparse_prefill(
     # get_recommended_splits alone. An earlier needed_parts floor
     # (ceil(max_sparse_ctx/256), up to 8) over-split large-ctx chunked-prefill
     # batches, adding ~400us of empty-partition launch overhead per extra split
-    # (3433us vs 1013us/launch at num_seqs=16384). Match ATOM: rec_splits only.
-    # Escape hatch: SGLANG_M3_PA_NEEDED_PARTS=1 restores the old floor.
-    if envs.SGLANG_M3_PA_NEEDED_PARTS.get():
-        # Only the escape-hatch path needs the max sparse context, which requires
-        # a GPU->CPU sync (.item()). The default path uses get_recommended_splits
-        # alone, so skip the sync entirely there (it ran once per sparse layer).
-        max_ctx = int(sparse_ctx.max().item()) if sparse_ctx.numel() else 0
-        needed_parts = max(1, (max_ctx + ctx_part - 1) // ctx_part)
-        max_part_num = max(get_recommended_splits(num_seqs, 1), needed_parts)
-    else:
-        max_part_num = get_recommended_splits(num_seqs, 1)
+    # (3433us vs 1013us/launch at num_seqs=16384), and needed a GPU->CPU sync per
+    # sparse layer to compute. Match ATOM: rec_splits only.
+    max_part_num = get_recommended_splits(num_seqs, 1)
     intermediate_shape = (num_seqs, 1, max_part_num, num_q_heads)
     exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
     max_logits = torch.empty_like(exp_sums)

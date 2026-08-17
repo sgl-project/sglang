@@ -55,7 +55,6 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
-    apply_fp8_ptpc_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
@@ -469,7 +468,6 @@ class Fp8LinearMethod(LinearMethodBase):
             _mxfp8_to_block_fp8_required
             or envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.get()
         )
-        self.use_ptpc_from_mxfp8 = False
         self.weight_block_size = self.quant_config.weight_block_size
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
@@ -657,42 +655,16 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
-        if self.use_mxfp8 and envs.SGLANG_FORCE_MXFP8_PTPC_DENSE.get():
-            from sglang.srt.layers.quantization.mxfp8_block_convert import (
-                dequant_mxfp8_2d_to_bf16,
-            )
-
-            bf16_weight = dequant_mxfp8_2d_to_bf16(
-                layer.weight.data, layer.weight_scale_inv.data
-            ).float()
-            row_scale = bf16_weight.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
-            row_scale = row_scale / torch.finfo(torch.float8_e4m3fn).max
-            qweight = (
-                (bf16_weight / row_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-            )
-            layer.weight = Parameter(
-                shuffle_weight(qweight, (16, 16)), requires_grad=False
-            )
-            del layer.weight_scale_inv
-            layer.weight_scale = Parameter(
-                row_scale.to(torch.float32), requires_grad=False
-            )
-            self.use_mxfp8 = False
-            self.convert_mxfp8_to_block = False
-            self.block_quant = False
-            self.use_ptpc_from_mxfp8 = True
-            return
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
             )
 
-            bf16_decode_m = envs.SGLANG_OPT_MXFP8_DENSE_BF16_DECODE_M.get()
             use_ptpc = (
                 envs.SGLANG_OPT_MXFP8_DENSE_PTPC_DECODE_M.get() > 0
                 and _is_gfx95_supported
             )
-            if bf16_decode_m > 0 or use_ptpc:
+            if use_ptpc:
                 from sglang.srt.layers.quantization.mxfp8_block_convert import (
                     dequant_mxfp8_2d_to_bf16,
                 )
@@ -714,8 +686,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     (16, 16),
                 )
                 layer.weight._ptpc_scale = row_scale.to(torch.float32)
-            elif bf16_decode_m > 0:
-                layer.weight._bf16_dense_decode = bf16_weight
             layer.weight_scale_inv = Parameter(scale, requires_grad=False)
             self.use_mxfp8 = False
             self.convert_mxfp8_to_block = False
@@ -1022,14 +992,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 workspace=layer.workspace,
                 size_n=layer.output_size_per_partition,
                 size_k=layer.input_size_per_partition,
-                bias=bias,
-            )
-
-        if self.use_ptpc_from_mxfp8:
-            return apply_fp8_ptpc_linear(
-                input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
                 bias=bias,
             )
 

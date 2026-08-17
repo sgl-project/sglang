@@ -292,7 +292,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # Persistent per-bs device buffer for decode top-k reuse. CUDA-graph safe: alloc eager outside capture; the
         # captured graph only copy_()s into / reads from a fixed address.
         self._decode_topk_buf: dict = {}
-        self._decode_topk_reuse = envs.SGLANG_M3_DECODE_TOPK_REUSE.get()
         # Opt-in prefill skip-layer index elision (default off). Effective only when the elision is safe; see
         # prefill_skip_index_elision().
         self._prefill_skip_index = envs.SGLANG_OPT_USE_PREFILL_SKIP_INDEX.get()
@@ -368,11 +367,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._topk_cache_owner = None
         # Decode top-k reuse: pre-allocate the per-bs persistent buffer so graph
         # capture never allocates. num_kv_heads == 1 at TP>=4 for M3.
-        if (
-            self.index_cache_enabled
-            and self._decode_topk_reuse
-            and forward_batch.forward_mode.is_decode_or_idle()
-        ):
+        if self.index_cache_enabled and forward_batch.forward_mode.is_decode_or_idle():
             bs = forward_batch.seq_lens.shape[0]
             if bs > 0 and bs not in self._decode_topk_buf:
                 _nkv = self.kv_pool.main_pool.head_num
@@ -1317,16 +1312,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             per-forward cached top-k, so the indexer (which is the only idx-K
             reader) never runs on this layer; a cache miss raises instead of
             recomputing (see forward_extend);
-          * decode top-k reuse is on (SGLANG_M3_DECODE_TOPK_REUSE): decode skip
-            layers reuse the source layer's top-k buffer instead of recomputing
-            from their own idx-K history;
+          * decode skip layers reuse the source layer's top-k buffer instead of
+            recomputing from their own idx-K history;
           * the dense-sparse decode path is off: it bypasses decode top-k reuse
             (attn_fn is non-None in forward_decode), which would make decode
             skip layers read their own (elided) idx-K.
         """
         return (
             self._prefill_skip_index
-            and self._decode_topk_reuse
             and not self.use_dense_sparse_decode
             and self.index_topk_skipped(layer_id, disable_value)
         )
@@ -1740,12 +1733,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
 
             # Decode top-k reuse: group source layer computes+stores; skips reuse.
-            _use_reuse = (
-                self._decode_topk_reuse
-                and self.index_cache_enabled
-                and disable_value
-                and attn_fn is None
-            )
+            _use_reuse = self.index_cache_enabled and disable_value and attn_fn is None
             _topk_buf = self._decode_topk_buf.get(q.shape[0]) if _use_reuse else None
             _cached_topk = None
             _want_topk = False
