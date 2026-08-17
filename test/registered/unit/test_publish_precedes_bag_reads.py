@@ -104,10 +104,6 @@ _UNREAD_ENTRIES: dict = {
     ("multimodal_gen/test/unit/test_disagg_trace.py", "_srt_trace_server_args"): (
         "a trace fixture publishing its own context"
     ),
-    ("srt/entrypoints/engine.py", "_launch_subprocesses"): (
-        "its subprocess targets and its tokenizer-manager factory arrive as "
-        "parameters, so the walk resolves none of them"
-    ),
     ("srt/managers/detokenizer_manager.py", "run_detokenizer_process"): (
         "DetokenizerManager reads the handed instance at this revision"
     ),

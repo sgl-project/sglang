@@ -76,6 +76,21 @@ _CONFIGURED_SIZE_CALL_SITES = {
         "the one where initialize_model_parallel aliases _MOE_DP to _ATTN_CP, so "
         "the live sizes are equal there and a live comparison is always false"
     ),
+    ("srt/managers/scheduler.py", "configured_tp_size"): (
+        "configure_scheduler_process runs before the scheduler's own process "
+        "groups exist -- configuring the process is what it is for -- so there "
+        "is nothing live to ask yet"
+    ),
+    ("srt/managers/scheduler.py", "configured_moe_dp_size"): (
+        "same pre-distributed-init arithmetic in configure_scheduler_process"
+    ),
+    ("srt/managers/scheduler.py", "configured_attn_cp_size"): (
+        "same pre-distributed-init arithmetic in configure_scheduler_process"
+    ),
+    ("srt/utils/cuda_vmm_transport_utils.py", "configured_tp_size"): (
+        "the consumer count is configured fan-out arithmetic (tp_size // "
+        "dp_size), which is what the record answered before"
+    ),
     ("srt/model_loader/loader.py", "configured_moe_dp_size"): (
         "the same dict already carries the live moe_dp_size under 'dp'; this entry "
         "is the configured intent"
