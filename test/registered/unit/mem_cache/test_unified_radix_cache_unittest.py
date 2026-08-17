@@ -3844,6 +3844,12 @@ class UnifiedRadixCacheSuite:
             swa_available_before - len(leaf.key),
         )
 
+        rematch = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        )
+        self.assertEqual(len(rematch.device_indices), result.swa_branching_seqlen)
+        self.assertIsNone(rematch.swa_branching_seqlen)
+
     def test_swa_branching_seqlen_caps_insert_after_forward(self):
         if (
             not self.cfg.has_swa
@@ -3870,6 +3876,83 @@ class UnifiedRadixCacheSuite:
         self.assertIsNone(swa.prepare_for_caching_req(req, InsertParams(), 7, False))
         req.cache_protected_len = 8
         self.assertIsNone(swa.prepare_for_caching_req(req, InsertParams(), 12, False))
+
+        cache.tree_core.is_eagle = True
+        req.cache_protected_len = 4
+        params = InsertParams()
+        self.assertEqual(swa.prepare_for_caching_req(req, params, 12, False), 9)
+        params.key = RadixKey(array("q", range(9)), is_bigram=True)
+        result = mock.Mock(swa_branch_inserted=False)
+        swa.commit_insert_component_data(mock.Mock(), False, params, result, [])
+        self.assertTrue(result.swa_branch_inserted)
+
+    def test_swa_branch_insert_releases_forward_overshoot(self):
+        if (
+            not self.cfg.has_swa
+            or self.cfg.has_mamba
+            or self.cfg.page_size != 1
+            or self.cfg.sliding_window_size != 4
+        ):
+            self.skipTest("requires page_size=1 Full+SWA with window_size=4")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        swa = cache.components[ComponentType.SWA]
+
+        branching_seqlen = 8
+        forward_len = 20
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, forward_len)
+        req.origin_input_ids = tokens
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, forward_len)
+        req.cache_protected_len = branching_seqlen
+
+        kv_indices = self._alloc(allocator, forward_len)
+        req_to_token_pool.write(
+            (req.req_pool_idx, slice(0, forward_len)),
+            kv_indices,
+        )
+
+        params = InsertParams(
+            key=RadixKey(array("q", tokens[:branching_seqlen])),
+            swa_branching_seqlen=branching_seqlen,
+        )
+        result = mock.Mock(swa_branch_inserted=False)
+        swa.commit_insert_component_data(
+            mock.Mock(),
+            False,
+            params,
+            result,
+            [],
+        )
+        self.assertTrue(result.swa_branch_inserted)
+
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            swa.cleanup_after_caching_req(
+                req,
+                is_finished=False,
+                insert_result=result,
+            )
+
+        expected_evicted = forward_len - 1 - self.cfg.sliding_window_size
+        self.assertEqual(req.kv.swa_evicted_seqlen, expected_evicted)
+
+        mapping = allocator.full_to_swa_index_mapping
+        self.assertEqual(
+            torch.count_nonzero(mapping[kv_indices[:branching_seqlen]]).item(),
+            branching_seqlen,
+        )
+        self.assertEqual(
+            torch.count_nonzero(
+                mapping[kv_indices[branching_seqlen:expected_evicted]]
+            ).item(),
+            0,
+        )
+        self.assertEqual(
+            torch.count_nonzero(mapping[kv_indices[expected_evicted:]]).item(),
+            forward_len - expected_evicted,
+        )
 
     def test_mamba_branching_seqlen_disabled_under_hicache(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:

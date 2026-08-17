@@ -766,13 +766,19 @@ class SWAComponent(TreeComponent):
 
         branching_seqlen = req.swa_branching_seqlen
         if (
-            branching_seqlen is not None
-            and req.cache_protected_len < branching_seqlen <= token_ids_len
+            branching_seqlen is None
+            or branching_seqlen <= req.cache_protected_len
         ):
-            insert_params.swa_branching_seqlen = branching_seqlen
-            return branching_seqlen
+            return None
 
-        return None
+        # An EAGLE key with N bigrams spans N + 1 raw tokens.
+        effective_cache_len = branching_seqlen + int(self.tree_core.is_eagle)
+        if effective_cache_len > token_ids_len:
+            return None
+
+        # Record the logical SWA branch boundary for insertion.
+        insert_params.swa_branching_seqlen = branching_seqlen
+        return effective_cache_len
 
     def _free_out_of_window_slots(self, req: Req, pre_len: int) -> None:
         if self.sliding_window_size is None:
@@ -800,13 +806,15 @@ class SWAComponent(TreeComponent):
         insert_result: Optional[InsertResult] = None,
         insert_params: Optional[InsertParams] = None,
     ) -> None:
+        # Free unused SWA slots after inserting the branch.
         if (
             not is_finished
             and insert_result is not None
             and insert_result.swa_branch_inserted
             and envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
         ):
-            self._free_out_of_window_slots(req, len(req.get_fill_ids()) - 1)
+            forward_key_len = len(req.get_fill_ids()) - int(self.tree_core.is_eagle)
+            self._free_out_of_window_slots(req, forward_key_len - 1)
 
     # ---- HiCache Hooks ----
 
