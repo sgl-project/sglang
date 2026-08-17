@@ -191,7 +191,10 @@ class GenerationBatchResult:
 
 
 def validate_input_length(
-    req: Req, max_req_input_len: int, allow_auto_truncate: bool
+    req: Req,
+    max_req_input_len: int,
+    allow_auto_truncate: bool,
+    preserve_last_token_id: Optional[int] = None,
 ) -> Optional[str]:
     """Validate and potentially truncate input length.
 
@@ -199,6 +202,12 @@ def validate_input_length(
         req: The request containing input_ids to validate
         max_req_input_len: Maximum allowed input length
         allow_auto_truncate: Whether to truncate long inputs
+        preserve_last_token_id: If set and the input ends with this token id
+            (e.g. a BERT ``[SEP]``), keep it as the final token after
+            truncation. Encoder embedding models that pool over / rely on the
+            trailing special token need it preserved; a plain head-slice would
+            drop it and change the pooled embedding. Left as ``None`` for
+            generation models, whose trailing tokens carry no such role.
 
     Returns:
         Error message if validation fails, None if successful
@@ -210,7 +219,15 @@ def validate_input_length(
                 "the max context length. Truncated. "
                 f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
             )
-            req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+            truncated = req.origin_input_ids[:max_req_input_len]
+            if (
+                preserve_last_token_id is not None
+                and req.origin_input_ids[-1] == preserve_last_token_id
+                and truncated
+                and truncated[-1] != preserve_last_token_id
+            ):
+                truncated[-1] = preserve_last_token_id
+            req.origin_input_ids = truncated
             return None
         else:
             error_msg = (
