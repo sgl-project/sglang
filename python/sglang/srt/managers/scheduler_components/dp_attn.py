@@ -138,9 +138,11 @@ class MLPSyncBatchInfo:
         fallback_tensor = self._get_fallback_tensor(device=device)
         info_width = local_info_tensor.numel()
         # Inactive max_world_size slots must decode as IDLE.
+        # `.contiguous()` can alias `fallback_tensor` when every expanded
+        # dimension is size 1; this tensor is written by distributed collectives.
         global_info_tensor = fallback_tensor.expand(
             self.dp_size, self.tp_size * self.cp_size, info_width
-        ).contiguous()
+        ).clone()
 
         if use_all_reduce:
             # Admission can expose different WORLD sizes; use fixed global slots.
