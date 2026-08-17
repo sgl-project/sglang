@@ -261,8 +261,20 @@ def _write_backup(cache, node, write_back: bool = False) -> int:
     )
 
 
-def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
-    """Create (tree, allocator, req_to_token_pool) from a CacheConfig."""
+def build_fixture(
+    cfg: CacheConfig,
+    *,
+    enable_kv_cache_events: bool = False,
+    tree_page_size: Optional[int] = None,
+    mamba_cache_chunk_size: Optional[int] = None,
+):
+    """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
+
+    ``tree_page_size`` stands in for DCP, which widens the tree page past the
+    ``page_size`` the rest of the config still sees. It only reaches values
+    derived from the tree page: the allocator keeps ``cfg.page_size``, whereas
+    DCP sets the two equal, so do not read insert or match behaviour off it.
+    """
     server_args = ServerArgs(
         model_path="dummy",
         page_size=cfg.page_size,
@@ -271,7 +283,11 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
     # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
     # loads the HF config for self.model_path — impossible for the dummy model.
     # Mirror the property's default for a dummy HF config: FLA_CHUNK_SIZE.
-    server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, cfg.page_size)
+    server_args._mamba_cache_chunk_size = (
+        max(FLA_CHUNK_SIZE, cfg.page_size)
+        if mamba_cache_chunk_size is None
+        else mamba_cache_chunk_size
+    )
     set_global_server_args_for_scheduler(server_args)
     device = get_device()
 
@@ -372,7 +388,7 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
     cache_init_params = CacheInitParams(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=allocator,
-        page_size=cfg.page_size,
+        page_size=cfg.page_size if tree_page_size is None else tree_page_size,
         disable=False,
         sliding_window_size=cfg.sliding_window_size,
         tree_components=cfg.components,
@@ -5161,6 +5177,41 @@ class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
         self.assertGreater(order.index(a1), order.index(a2))
 
 
+class TestMambaCheckpointGrid(CustomTestCase):
+    """A donated mamba checkpoint is only reusable at a depth the tree can name.
+
+    ``tree_page_size`` simulates DCP: it widens the page the tree allocates on
+    while ``page_size`` and the mamba chunk grid stay where they are, which is
+    exactly the split that lets a checkpoint land between two node boundaries.
+    """
+
+    cfg = CacheConfig(
+        page_size=64,
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        kv_size=1024,
+        max_context_len=1024,
+    )
+
+    def _grid(self, cache):
+        component = next(
+            c
+            for c in cache._components_tuple
+            if c.component_type is ComponentType.MAMBA
+        )
+        return component.mamba_checkpoint_grid
+
+    def test_grid_follows_the_widened_tree_page(self):
+        cache, _, _ = build_fixture(
+            self.cfg, tree_page_size=256, mamba_cache_chunk_size=64
+        )
+        self.assertEqual(self._grid(cache), 256)
+
+    def test_grid_is_the_chunk_size_without_widening(self):
+        cache, _, _ = build_fixture(self.cfg, mamba_cache_chunk_size=64)
+        self.assertEqual(self._grid(cache), 64)
+
+
 class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.MAMBA),
@@ -6422,6 +6473,87 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         )
         child = self._attach_host_child(cache, parent_id, start_token=1000)
         self.assertIsNotNone(child)
+        cache.sanity_check()
+
+
+class TestSWAWindowUnderBigramKey(CustomTestCase):
+    """`cache_unfinished_req` has to leave the leaf it inserts holding a full
+    sliding window of live SWA. Otherwise the match that follows the insert
+    refuses that leaf, `cache_protected_len` never advances, and the next insert
+    frees KV the tree already owns as if it were the request's duplicate.
+
+    An EAGLE bigram key holds one entry less than the tokens it spans, so the
+    leaf stops at page_floor(len(key)) rather than page_floor(seq_len), a page
+    lower. The eviction frontier has to be measured against the key.
+    """
+
+    cfg = CacheConfig(
+        page_size=4,
+        components=(ComponentType.FULL, ComponentType.SWA),
+        sliding_window_size=7,
+        is_eagle=True,
+        kv_size=256,
+        max_context_len=64,
+    )
+
+    def _alloc_paged(self, allocator, need_size):
+        ps = self.cfg.page_size
+        aligned = ((need_size + ps - 1) // ps) * ps
+        full_indices = allocator.full_attn_allocator.alloc(aligned)
+        swa_indices = allocator.swa_attn_allocator.alloc(aligned)
+        self.assertIsNotNone(full_indices)
+        self.assertIsNotNone(swa_indices)
+        allocator.full_to_swa_index_mapping[full_indices] = swa_indices
+        return full_indices[:need_size]
+
+    def test_match_after_insert_reaches_the_new_leaf(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        page_size = self.cfg.page_size
+        # Page-aligned length is the shape that costs the bigram key a page.
+        seq_len = 4 * page_size
+
+        req = Req(
+            rid=0,
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req_to_token_pool.alloc([req])
+        tokens = list(range(1, seq_len + 1))
+        req.origin_input_ids = tokens
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        kv_indices = self._alloc_paged(allocator, seq_len)
+        req_to_token_pool.write((req.req_pool_idx, slice(0, seq_len)), kv_indices)
+        req.kv_committed_len = seq_len
+        req.last_node = cache.root_node.id
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
+
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            cache.cache_unfinished_req(req)
+
+        boundary = (seq_len - 1) // page_size * page_size
+        self.assertGreaterEqual(
+            boundary - req.kv.swa_evicted_seqlen,
+            self.cfg.sliding_window_size,
+            f"leaf ending at {boundary} keeps only "
+            f"{boundary - req.kv.swa_evicted_seqlen} live SWA tokens against a "
+            f"{self.cfg.sliding_window_size} window",
+        )
+        self.assertEqual(
+            req.cache_protected_len,
+            boundary,
+            "the match after the insert must reach the leaf the insert created",
+        )
+
+        cache.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        )
         cache.sanity_check()
 
 
