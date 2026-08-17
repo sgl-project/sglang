@@ -21,6 +21,21 @@ class ThinkingMode(str, Enum):
 import jinja2
 import orjson
 from fastapi import Request
+
+try:
+    from mistral_common.exceptions import MistralCommonException
+
+    _MISTRAL_COMMON_ERRORS: tuple[type[BaseException], ...] = (MistralCommonException,)
+except ImportError:  # mistral_common is optional in slimmed-down installs
+    _MISTRAL_COMMON_ERRORS = ()
+
+# Chat-template failures that describe a bad request rather than a server fault:
+# Jinja raise_exception, tojson on an Undefined, and mistral_common's conversation
+# validation (which rejects e.g. an assistant turn with empty content).
+_CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
+    jinja2.TemplateError,
+    TypeError,
+) + _MISTRAL_COMMON_ERRORS
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
@@ -546,14 +561,21 @@ class OpenAIServingChat(OpenAIServingBase):
                 if request.tools
                 else None
             )
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                tools=request_tools,
-                return_dict=False,
-                **template_kwargs,
-            )
+            try:
+                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    tools=request_tools,
+                    return_dict=False,
+                    **template_kwargs,
+                )
+            except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
+                # mistral_common validates conversation structure — it rejects an
+                # assistant turn with empty content, for instance. That is a bad
+                # request, not a server fault, so mirror the Jinja path and surface
+                # it as 400 rather than letting it escape as a 500.
+                raise ValueError(str(template_error)) from template_error
             if assistant_prefix:
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(
                     prompt_ids, assistant_prefix
@@ -1365,7 +1387,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids = self.tokenizer_manager.tokenizer.encode(
                         rendered_prompt, **encode_kwargs
                     )
-                except (jinja2.TemplateError, TypeError) as template_error:
+                except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)
                     # should be treated as client errors (400 BadRequest)
