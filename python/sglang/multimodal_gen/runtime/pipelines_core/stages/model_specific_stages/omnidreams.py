@@ -29,9 +29,9 @@ from __future__ import annotations
 
 import inspect
 import os
-from collections import OrderedDict
 from typing import Any
 
+import msgspec
 import PIL.Image
 import torch
 import torch.nn as nn
@@ -88,13 +88,6 @@ _SYSTEM_PROMPT = (
     "You are a helpful assistant who will provide prompts to an image generator."
 )
 _TEXT_MAX_LENGTH = 512
-# Upper bound on autoregressive chunks per request. Bounds the rollout loop
-# length (and thus GPU memory/compute) against an unbounded ``num_frames`` from
-# the HTTP API. ~256 chunks * len_t(2) * 4 = ~2048 pixel frames.
-_MAX_AR_CHUNKS = 320
-# LRU cache for text embeddings (key = prompt string, value = [1, L, 100352] on CPU).
-# Avoids re-running the 14 GB Cosmos-Reason1-7B for repeated prompts in serving.
-_TEXT_EMBED_CACHE_MAX_SIZE = 32
 # HD-map inputs ending in one of these are decoded as a per-frame raster video;
 # any other single string is treated as one image (degenerate broadcast).
 _HDMAP_VIDEO_EXTS = (".mp4", ".gif", ".webm", ".mov", ".mkv", ".avi")
@@ -239,8 +232,6 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         self.image_encoder = image_encoder  # one-shot first-frame I2V conditioning
         self.encoder = encoder  # per-AR-step HDMap conditioning
         self.config = config
-        # Per-instance LRU cache: prompt string -> text embedding on CPU.
-        self._text_embed_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -285,13 +276,6 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         producing washed-out / blurry rollouts. Message format and ``add_vision_id``
         mirror FlashDreams exactly so the token sequence is identical.
         """
-        # LRU cache: skip the 14 GB encoder for repeated prompts (serving).
-        cached = self._text_embed_cache.get(prompt)
-        if cached is not None:
-            # Move to front (LRU hit); return pinned tensor on device.
-            self._text_embed_cache.move_to_end(prompt)
-            return cached.to(device=device, non_blocking=True)
-
         messages = [
             {"role": "system", "content": [{"type": "text", "text": _SYSTEM_PROMPT}]},
             {"role": "user", "content": [{"type": "text", "text": prompt}]},
@@ -328,10 +312,6 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
             return_dict=True,
         )
         embeds = full_concat_embeddings(out.hidden_states)
-        # Store on CPU to avoid consuming GPU VRAM in the cache.
-        if len(self._text_embed_cache) >= _TEXT_EMBED_CACHE_MAX_SIZE:
-            self._text_embed_cache.popitem(last=False)
-        self._text_embed_cache[prompt] = embeds.detach().cpu()
         return embeds
 
     @staticmethod
@@ -502,30 +482,27 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         batch: Req,
         device: torch.device,
         vae_dtype: torch.dtype,
-        dit_dtype: torch.dtype,
         num_chunks: int,
         len_t: int,
         height: int,
         width: int,
-    ) -> tuple[list[torch.Tensor] | None, torch.Tensor | None]:
+    ) -> torch.Tensor | None:
         """Prepare HD-map conditioning for the AR loop.
 
-        Returns ``(hdmap_tokens, hdmap_pixel)``:
+        Returns a single preprocessed pixel clip ``hdmap_pixel``
+        ``[B, 3, total_pixel, H, W]`` on ``device``, or ``None`` when there is no
+        HD-map input (the AR stage falls back to zeros). The per-chunk VAE encode
+        + patchify is **deferred to the AR loop** (see
+        :class:`OmniDreamsDenoisingStage`), aligning with the FlashDreams replay
+        path (one-shot decode + per-step slice encode) and enabling per-step
+        closed-loop conditioning where each chunk's pixels arrive at runtime.
 
-        * No HD-map input -> ``(None, None)`` (AR stage falls back to zeros).
-        * Degenerate single-image fallback -> ``(tokens, None)``: the single
-          raster is VAE-encoded once here and broadcast across every latent
-          frame, then sliced into ``num_chunks`` precomputed patchified tokens
-          (no temporal motion -- back-compat / smoke only).
-        * Per-frame (video) path -> ``(None, hdmap_pixel)``: the full per-frame
-          raster sequence is decoded once (``load_video`` / A+B fast path) and
-          preprocessed into one causal clip ``hdmap_pixel``
-          ``[B, 3, total_pixel, H, W]`` on ``device``. The per-chunk VAE encode
-          + patchify is **deferred to the AR loop** (see
-          :class:`OmniDreamsDenoisingStage`), aligning with the FlashDreams
-          replay path (one-shot decode + per-step slice encode) and enabling
-          per-step closed-loop conditioning where each chunk's pixels arrive at
-          runtime.
+        Paths (both produce the same clip contract):
+        * per-frame (video): the full raster sequence decoded once (``load_video``
+          / A+B fast path) into one causal clip;
+        * degenerate single-image: the single raster preprocessed once and
+          broadcast into a static repeated-frame clip (no temporal motion --
+          back-compat / smoke only), routed through the same pixel path.
 
         HD-map is OmniDreams' central per-frame control signal (lane lines +
         actor boxes rendered at the ego pose); the generated viewpoint changes
@@ -533,9 +510,7 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         """
         hdmap = getattr(batch, "hdmap_path", None)
         if hdmap is None:
-            hdmap = getattr(batch, "hdmap_pixels", None)
-        if hdmap is None:
-            return None, None
+            return None
 
         # L latent frames total -> 1 + (L-1)*4 pixel frames (causal VAE, tc=4),
         # matching the output chunk math (chunk0=1+(len_t-1)*4, later=len_t*4).
@@ -562,41 +537,23 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
                 )
                 clip = None
             if clip is not None:
-                return None, clip
+                return clip
             # Fall through to the legacy path below on failure.
 
         frames = self._resolve_hdmap_frames(hdmap)
         if frames is None:
-            # Degenerate single-image fallback: one raster broadcast across all
-            # latent frames (no temporal motion -- back-compat / smoke only).
+            # Degenerate single-image fallback: preprocess the single raster
+            # once and broadcast it into a static repeated-frame clip (no
+            # temporal motion), routed through the same per-frame pixel path.
+            # No FlashDreams precedent for a precomputed-token broadcast path.
             x = self._preprocess_pixels(hdmap, height, width, device, vae_dtype)
             if x is None:
                 logger.warning(
                     "OmniDreams: HD-map preprocessed to None; disabling HDMap "
                     "(all chunks fall back to zeros). Check hdmap input."
                 )
-                return None, None
-            latent = _vae_encode_normalized(x, self.encoder).to(
-                dit_dtype
-            )  # [B,16,1,h,w]
-            if num_latent > 1 and latent.ndim == 5 and latent.shape[2] == 1:
-                latent = latent.repeat(1, 1, num_latent, 1, 1)
-            if latent.shape[2] != num_latent:
-                logger.warning(
-                    "OmniDreams: HD-map encoded to %d latent frames, expected %d "
-                    "(num_chunks=%d, len_t=%d). Check VAE temporal compression.",
-                    latent.shape[2],
-                    num_latent,
-                    num_chunks,
-                    len_t,
-                )
-            # Slice into per-chunk groups of len_t latent frames, patchify each:
-            # [B,16,len_t,h,w] -> [B, chunk_tokens, additional_concat_ch*pdim].
-            tokens: list[torch.Tensor] = []
-            for ci in range(num_chunks):
-                chunk_latent = latent[:, :, ci * len_t : (ci + 1) * len_t]
-                tokens.append(self.transformer.patchify(chunk_latent))
-            return tokens, None
+                return None
+            return x.repeat(1, 1, total_pixel, 1, 1)  # [B,3,total_pixel,H,W]
 
         # Per-frame (video) path: decode + preprocess the full causal clip once
         # here (one-shot decode, matching FlashDreams ``_load_video``); defer the
@@ -620,8 +577,8 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
                 "OmniDreams: HD-map clip preprocessed to None; disabling "
                 "HDMap (all chunks fall back to zeros). Check hdmap input."
             )
-            return None, None
-        return None, clip
+            return None
+        return clip
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -708,11 +665,13 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         # HD-map prep. The per-frame video path returns a preprocessed pixel clip
         # (``hdmap_pixel``) whose per-chunk VAE encode + patchify is deferred to
         # the AR loop (FlashDreams replay: one-shot decode + per-step encode);
-        # the degenerate single-image fallback returns precomputed per-chunk
-        # tokens. No HD-map input -> (None, None) (AR stage uses zeros).
+        # HD-map prep. Returns a preprocessed pixel clip (``hdmap_pixel``) whose
+        # per-chunk VAE encode + patchify is deferred to the AR loop (FlashDreams
+        # replay: one-shot decode + per-step encode); ``None`` when there is no
+        # HD-map input (the AR stage uses zeros).
         with self.use_declared_component(component_name="encoder", module=self.encoder):
-            hdmap_tokens, hdmap_pixel = self._encode_hdmap(
-                batch, device, vae_dtype, dit_dtype, num_chunks, len_t, height, width
+            hdmap_pixel = self._encode_hdmap(
+                batch, device, vae_dtype, num_chunks, len_t, height, width
             )
             # Keep the full hdmap pixel clip on CPU; the AR loop brings
             # each small per-chunk slice to GPU for encode (~13GB saved
@@ -732,14 +691,10 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
             "sink_size_t": int(getattr(batch, "sink_size_t", 0)),
             "context_noise": float(getattr(batch, "context_noise", 128)),
             "image_token": image_token,  # [B, hp*wp, in*pdim] or None
-            # HD-map, in two mutually-exclusive shapes (both None = disabled):
-            #  * ``hdmap_tokens``: None, or list[num_chunks] of precomputed
-            #    [B, chunk_tokens, additional_concat_ch*pdim] (single-image
-            #    broadcast fallback only);
-            #  * ``hdmap_pixel``: None, or a full preprocessed clip
-            #    [B, 3, total_pixel, H, W] -- per-chunk VAE-encoded in the AR
-            #    loop (the per-frame video path).
-            "hdmap_tokens": hdmap_tokens,
+            # ``hdmap_pixel``: None, or a full preprocessed clip
+            # [B, 3, total_pixel, H, W] -- per-chunk VAE-encoded in the AR
+            # loop (the per-frame video path; a single image becomes a static
+            # repeated-frame clip).
             "hdmap_pixel": hdmap_pixel,
         }
         # raw_latent_shape lets SDPA-path attn metadata stay a no-op.
@@ -760,17 +715,9 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
             self._realtime_stash_initial_state(
                 batch,
                 server_args,
-                rope=None,  # built lazily in the denoise stage (needs head_dim)
                 text_embeds=text_embeds,
-                image_full=None,  # assembled in the denoise stage (needs device)
-                inject_mask=None,
-                cond_mask_c0=None,
-                cond_mask_zero=None,
-                hdmap_zero=None,
-                cross_attn_kv=None,  # precomputed in the denoise stage
                 scheduler=scheduler,
                 generator=batch.generator,
-                hdmap_encode_cache=None,
                 arch_constants={
                     "hp": hp,
                     "wp": wp,
@@ -789,7 +736,6 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
                     "window_size_t": int(getattr(batch, "window_size_t", 6)),
                     "sink_size_t": int(getattr(batch, "sink_size_t", 0)),
                 },
-                hdmap_tokens=hdmap_tokens,
                 hdmap_pixel=hdmap_pixel,
                 image_token=image_token,
             )
@@ -803,53 +749,31 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
         *,
-        rope,
         text_embeds: torch.Tensor,
-        image_full,
-        inject_mask,
-        cond_mask_c0,
-        cond_mask_zero,
-        hdmap_zero,
-        cross_attn_kv,
         scheduler,
         generator,
-        hdmap_encode_cache,
         arch_constants: dict,
-        hdmap_tokens,
         hdmap_pixel,
         image_token,
     ) -> None:
         """Stash one-shot prep into ``RealtimeCausalDiTState.runtime_cache``.
 
-        The denoise stage reads these back on every realtime forward() call.
-        Tensors that need device/dit_dtype assembly (rope, masks, cross_attn_kv,
-        image_full) are built lazily in the denoise stage on the first chunk to
-        avoid duplicating the device-aware construction logic here; only the
-        device-independent inputs (text embeds, image_token, hdmap, scheduler,
-        generator, arch constants) are stashed here.
+        The denoise stage reads these back on the first (chunk-0) realtime
+        forward() to assemble the persistent ``_ARChunkCtx``. Device/dit_dtype-
+        aware tensors (rope, masks, cross-attn K/V, image_full, hdmap encode
+        cache) are built in the denoise stage's chunk-0 assembly, not here.
         """
         cache_state = batch.session.get_or_create_state(RealtimeCausalDiTState)
         rc = cache_state.runtime_cache
         rc.clear()
-        rc["rope"] = rope
         rc["text_embeds"] = text_embeds.detach()
         rc["image_token"] = image_token.detach() if image_token is not None else None
-        rc["image_full"] = image_full
-        rc["inject_mask"] = inject_mask
-        rc["cond_mask_c0"] = cond_mask_c0
-        rc["cond_mask_zero"] = cond_mask_zero
-        rc["hdmap_zero"] = hdmap_zero
-        rc["cross_attn_kv"] = cross_attn_kv
         rc["scheduler"] = scheduler
         rc["generator"] = generator
-        rc["hdmap_encode_cache"] = hdmap_encode_cache
         rc["arch_constants"] = dict(arch_constants)
-        # HD-map conditioning (one of these is non-None when HDMap is enabled):
-        #  * ``hdmap_tokens``: list[num_chunks] precomputed per-chunk tokens
-        #    (single-image broadcast fallback);
-        #  * ``hdmap_pixel``: full preprocessed clip on CPU, per-chunk slices
-        #    VAE-encoded in the denoise loop (per-frame video path).
-        rc["hdmap_tokens"] = hdmap_tokens
+        # HD-map conditioning: ``hdmap_pixel`` is the full preprocessed clip on
+        # CPU, per-chunk slices VAE-encoded in the denoise loop (per-frame video
+        # path; a single image becomes a static repeated-frame clip).
         rc["hdmap_pixel"] = hdmap_pixel
         cache_state.kv_cache = None  # initialized in the denoise stage
         cache_state.chunk_idx = 0
@@ -901,7 +825,6 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
             "sink_size_t": ac["sink_size_t"],
             "context_noise": ac["context_noise"],
             "image_token": rc["image_token"],
-            "hdmap_tokens": rc["hdmap_tokens"],
             "hdmap_pixel": rc["hdmap_pixel"],
             # Per-chunk closed-loop override (highest priority in the denoise
             # stage's HDMap resolution).
@@ -951,23 +874,11 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         num_frames = int(getattr(batch, "num_frames", None) or 0)
         tc = 4
         if num_frames <= 0:
-            n = max(1, int(getattr(batch, "num_chunks", 1)))
-        else:
-            first = 1 + (len_t - 1) * tc
-            if num_frames <= first:
-                n = 1
-            else:
-                n = 1 + -(-(num_frames - first) // (len_t * tc))  # ceil division
-        if n > _MAX_AR_CHUNKS:
-            logger.warning(
-                "OmniDreams: requested %d AR chunks exceeds the cap %d; clamping "
-                "(num_frames=%d). Raise _MAX_AR_CHUNKS if longer rollouts are needed.",
-                n,
-                _MAX_AR_CHUNKS,
-                num_frames,
-            )
-            n = _MAX_AR_CHUNKS
-        return n
+            return max(1, int(getattr(batch, "num_chunks", 1)))
+        first = 1 + (len_t - 1) * tc
+        if num_frames <= first:
+            return 1
+        return 1 + -(-(num_frames - first) // (len_t * tc))  # ceil division
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -978,6 +889,40 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
 # --------------------------------------------------------------------------- #
 # Autoregressive denoising stage                                              #
 # --------------------------------------------------------------------------- #
+class _ARChunkCtx(msgspec.Struct, frozen=True):
+    """Loop-invariant bundle for one AR chunk body (offline + realtime share it).
+
+    Both entry points build this via :meth:`_build_ar_chunk_ctx` (the single
+    source of truth for the field list + the context-noise tensor + the hdmap
+    extraction) and pass it to :meth:`OmniDreamsDenoisingStage._run_ar_chunk`
+    for every chunk index. The per-chunk-varying inputs (rope via
+    ``shift_t(chunk_idx)``, cond_mask select, hdmap resolution) are derived
+    inside ``_run_ar_chunk``.
+    """
+
+    text: torch.Tensor
+    caches: list
+    cross_attn_kv: Any
+    rope: RotaryPositionEmbedding3D
+    scheduler: Any
+    gen: Any
+    ctx_noise_t: torch.Tensor
+    cond_mask_c0: torch.Tensor | None
+    cond_mask_zero: torch.Tensor
+    image_full: torch.Tensor | None
+    inject_mask: torch.Tensor | None
+    hdmap_zero: torch.Tensor
+    hdmap_pixel: Any  # stashed full clip, sliced per chunk
+    hdmap_encode_cache: Any
+    hp: int
+    wp: int
+    len_t: int
+    chunk_tokens: int
+    in_d: int
+    dit_dtype: torch.dtype
+    device: torch.device
+
+
 class OmniDreamsDenoisingStage(DenoisingStage):
     """Autoregressive rollout (full ``forward()`` override).
 
@@ -1029,9 +974,37 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             )
         return uses
 
+    def _begin_ar_residency(self) -> tuple[Any, Any]:
+        """Hold the DiT (+ HD-map encoder) resident for the AR rollout.
+
+        No-op when the residency manager is absent (single-GPU / CPU test) or
+        the component is already resident. Returns the ``(transformer_use,
+        encoder_use)`` handles for :meth:`_end_ar_residency`.
+        """
+        residency_manager = self._component_residency_manager
+        transformer_use = None
+        encoder_use = None
+        if residency_manager is not None:
+            transformer_use = self._declared_component_use(component_name="transformer")
+            residency_manager.begin_use(transformer_use, self.transformer)
+            # The HD-map encoder VAE is per-chunk VAE-encoded in the AR loop
+            # (per-frame video path). Hold it resident alongside the DiT.
+            if self.encoder is not None:
+                encoder_use = self._declared_component_use(component_name="encoder")
+                residency_manager.begin_use(encoder_use, self.encoder)
+        return transformer_use, encoder_use
+
+    def _end_ar_residency(self, transformer_use, encoder_use) -> None:
+        """Release the DiT (+ HD-map encoder) held by :meth:`_begin_ar_residency`."""
+        residency_manager = self._component_residency_manager
+        if residency_manager is not None and transformer_use is not None:
+            residency_manager.end_use(transformer_use, self.transformer)
+        if residency_manager is not None and encoder_use is not None:
+            residency_manager.end_use(encoder_use, self.encoder)
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        # Phase 6 guard: TP is supported via column/row parallel layers in the
+        # Guard: TP is supported via column/row parallel layers in the
         # DiT, but SP (ulysses/ring) is not yet supported for the AR chunk loop.
         # Guarded with try/except since SP is not initialized in CPU tests.
         try:
@@ -1075,20 +1048,17 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         # single DiT resident afterwards; on the error path the request-level
         # finish_request still releases it, so an explicit try/finally is not
         # needed here.
-        residency_manager = self._component_residency_manager
-        transformer_use = None
-        encoder_use = None
-        if residency_manager is not None:
-            transformer_use = self._declared_component_use(component_name="transformer")
-            residency_manager.begin_use(transformer_use, self.transformer)
-            # The HD-map encoder VAE is per-chunk VAE-encoded in the AR loop
-            # (per-frame video path). Hold it resident alongside the DiT.
-            if self.encoder is not None:
-                encoder_use = self._declared_component_use(component_name="encoder")
-                residency_manager.begin_use(encoder_use, self.encoder)
+        transformer_use, encoder_use = self._begin_ar_residency()
 
         config = server_args.pipeline_config
         device = get_local_torch_device()
+        # The flat-checkpoint loader leaves plain nn.Linear weights (crossattn_proj,
+        # GPT2FeedForward, TimestepEmbedding) on CPU; the residency manager handles
+        # this for the server path, but the `sglang generate` CLI path has no
+        # manager, so move the DiT to the compute device here. No-op if already on
+        # the right device.
+        if next(self.transformer.parameters()).device != device:
+            self.transformer.to(device)
         dit_dtype = PRECISION_TO_TYPE[config.dit_precision]
         arch = config.dit_config.arch_config
         st = batch.extra["omnidreams"]
@@ -1166,7 +1136,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             B, chunk_tokens, hdmap_d, device=device, dtype=dit_dtype
         )
 
-        # Phase 6: precompute cross-attn K/V once per prompt (text context is
+        # Precompute cross-attn K/V once per prompt (text context is
         # static; avoids redundant k_proj/v_proj in every forward call).
         # Feed the projected context (crossattn_proj applied) so the cached K/V
         # match the per-block input dimensions.
@@ -1174,218 +1144,60 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             self.transformer.crossattn_proj(text)
         )
 
-        # Phase 5: compute view_indices for cross-view attention (optional).
-        # Default: single-view (V=1). Multi-view is gated by
-        # arch.enable_cross_view_attn and num_views on the request.
-        view_count = int(getattr(batch, "num_views", 1) or 1)
-        # Bound num_views to the camera-embedding table to prevent an
-        # out-of-range index (and reject nonsensical/abusive values).
-        n_cameras = int(getattr(arch, "n_cameras_emb", 1))
-        if view_count < 1 or view_count > n_cameras:
-            raise ValueError(
-                f"num_views={view_count} out of range [1, {n_cameras}] "
-                "(n_cameras_emb)."
-            )
-        view_indices: torch.Tensor | None = None
-        if view_count > 1 and self.transformer.adaln_view_embedder is not None:
-            view_indices = (
-                torch.arange(view_count, device=device, dtype=torch.long)
-                .unsqueeze(0)
-                .expand(B, -1)
-            )  # [B, V]
-
-        # Loop-invariant context-noise timestep tensor (same scalar every chunk).
-        ctx_noise_t = torch.tensor(context_noise, device=device, dtype=dit_dtype)
-
-        # Eager DiT call binding the loop-invariant args (text/caches/
-        # cross_attn_kv/view_indices); the per-call-varying tensors (noisy,
-        # timestep, cond_mask, rope, hdmap) are passed positionally.
-        def _dit_call(hidden_states, timestep, cond_mask_t, rope_t, hdmap_t):
-            return self.transformer(
-                hidden_states=hidden_states,
-                encoder_hidden_states=text,
-                timestep=timestep,
-                condition_video_input_mask=cond_mask_t,
-                rope_cos_sin=rope_t,
-                hdmap_condition=hdmap_t,
-                kv_caches=caches,
-                cross_attn_kv=cross_attn_kv,
-                view_indices=view_indices,
-            )
-
-        # FP8 modes (Phase 1): ``weight_only_fp8`` dequantizes pre-quantized FP8
-        # weights to bf16 and runs the standard eager PyTorch DiT; ``disabled``
-        # runs the raw bf16 checkpoint. The native FP8 DiT
-        # (optimized_dit_forward) was removed in Phase 1; a PyTorch-native
-        # ``fp8_compute`` mode may be added in Phase 2. ``auto``/``required`` are
-        # accepted as inert back-compat aliases (mapped in
-        # ``OmniDreamsPipelineConfig.__post_init__``).
+        # FP8 modes: ``weight_only_fp8`` dequantizes pre-quantized FP8 weights
+        # to bf16 and runs eager PyTorch; ``fp8_compute`` swaps linears to
+        # ``torch._scaled_mm``. Both are idempotent (guarded on the
+        # transformer); ``disabled`` runs the raw bf16 checkpoint.
         mode = getattr(config, "native_dit_acceleration", "disabled")
-
         if mode == "weight_only_fp8":
-            # ---- Weight-only FP8: dequantize FP8→bf16, use eager PyTorch path ----
-            # Resolve fp8_prepared_path
-            model_path = server_args.model_path
-            fp8_prepared_path = getattr(config, "native_dit_fp8_prepared_path", None)
-            if fp8_prepared_path is None:
-                if os.path.isfile(model_path):
-                    ckpt_dir = os.path.dirname(model_path)
-                else:
-                    ckpt_dir = model_path
-                fp8_prepared_path = os.path.join(ckpt_dir, "omnidreams_fp8_dit.pt")
-            # Cache: skip reload if weights already dequantized on a prior call.
-            already_loaded = getattr(
-                self.transformer, "_weight_only_fp8_applied", False
-            )
-            if already_loaded:
-                logger.debug(
-                    "OmniDreams: weight_only_fp8 weights already loaded, skipping."
-                )
-            elif fp8_prepared_path and os.path.exists(fp8_prepared_path):
-                from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
-                    dequantize_fp8_weights_to_bf16,
-                )
-
-                payload = torch.load(
-                    fp8_prepared_path, map_location="cpu", weights_only=True
-                )
-                bf16_weights = dequantize_fp8_weights_to_bf16(payload["weights"])
-                del payload  # free the 5.7GB FP8 dict immediately
-                # Filter to only keys the model actually has.
-                model_keys = set(self.transformer.state_dict().keys())
-                matched = {k: v for k, v in bf16_weights.items() if k in model_keys}
-                del bf16_weights
-                device = next(self.transformer.parameters()).device
-                self.transformer.load_state_dict(
-                    {k: v.to(device=device) for k, v in matched.items()},
-                    strict=False,
-                )
-                n = len(matched)
-                del matched
-                self.transformer._weight_only_fp8_applied = True
-                logger.info(
-                    "OmniDreams: loaded dequantized FP8 weights into DiT "
-                    "(weight_only_fp8 mode, %d keys). Caching for reuse.",
-                    n,
-                )
-            else:
-                logger.warning(
-                    "OmniDreams: weight_only_fp8 mode but FP8 prepared weights "
-                    "not found at %s; using raw bf16 checkpoint.",
-                    fp8_prepared_path,
-                )
-
+            self._maybe_load_weight_only_fp8(batch, server_args)
         elif mode == "fp8_compute":
-            # ---- Phase 2: FP8-compute linears (torch._scaled_mm) ----
-            # Swap the DiT linears to FP8-compute in place (post-load). On non-FP8
-            # HW (CPU) install_fp8_compute_on_dit is a no-op -> eager bf16. The AR
-            # loop below runs unchanged; the swapped quant_method/linears make the
-            # matmuls FP8-compute. Idempotent (guarded by _fp8_compute_applied).
-            from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
-                install_fp8_compute_on_dit,
-            )
+            self._maybe_install_fp8_compute(config, device)
+        elif mode == "fp8_compute_prepared":
+            self._maybe_install_prepared_fp8_compute(config, device)
 
-            installed = install_fp8_compute_on_dit(self.transformer)
-            if installed:
-                logger.info("OmniDreams: fp8_compute active.")
-            elif device.type == "cuda":
-                logger.info(
-                    "OmniDreams: fp8_compute requested but unavailable; eager bf16."
-                )
-
-        latent_chunks: list[torch.Tensor] = []
-        # Persistent streaming VAE-encode cache for the per-frame HD-map path.
-        # The LightVAE causal conv left-context must flow across AR chunks
-        # (chunk 0 seeds, chunk 1+ continues) rather than re-seeding every
-        # call — otherwise the short tail of a later chunk underflows
-        # ``time_conv`` (kernel=3) at the deepest downsample. Allocated once
-        # per rollout when the encoder supports the streaming contract.
+        # Persistent streaming VAE-encode cache for the per-frame HD-map path
+        # (chunk 0 seeds the causal left-context, later chunks continue).
         hdmap_encode_cache: Any = None
         if st["hdmap_pixel"] is not None and hasattr(
             self.encoder, "initialize_ar_encode_cache"
         ):
             hdmap_encode_cache = self.encoder.initialize_ar_encode_cache()
+
+        ctx = self._build_ar_chunk_ctx(
+            st=st,
+            text=text,
+            caches=caches,
+            rope=rope,
+            scheduler=scheduler,
+            gen=gen,
+            cond_mask_c0=cond_mask_c0,
+            cond_mask_zero=cond_mask_zero,
+            image_full=image_full,
+            inject_mask=inject_mask,
+            hdmap_zero=hdmap_zero,
+            cross_attn_kv=cross_attn_kv,
+            hdmap_encode_cache=hdmap_encode_cache,
+            hp=hp,
+            wp=wp,
+            len_t=len_t,
+            chunk_tokens=chunk_tokens,
+            in_d=in_d,
+            dit_dtype=dit_dtype,
+            device=device,
+            context_noise=context_noise,
+        )
+
+        latent_chunks: list[torch.Tensor] = []
         for chunk_idx in range(num_chunks):
-            # Eager/CUDA-graph paths consume the [L, D] cos|sin cache (shift_t).
-            rope_cos_sin = rope.shift_t(chunk_idx)
-            is_first = chunk_idx == 0
-            cond_mask = cond_mask_c0 if is_first else cond_mask_zero
-            # HD-map conditioning for this chunk, in three mutually-exclusive
-            # shapes (set in the before-stage's ``_encode_hdmap``):
-            #  * ``hdmap_pixel``: per-frame video path -> VAE-encode this chunk's
-            #    pixel slice here (FlashDreams replay: one-shot decode + per-step
-            #    slice encode). The causal VAE conv no longer crosses chunk
-            #    boundaries, so boundary latents differ from a one-shot encode --
-            #    by design, matching FlashDreams.
-            #  * ``hdmap_tokens``: single-image broadcast fallback -> precomputed.
-            #  * both None -> HDMap disabled (zeros).
-            if st["hdmap_pixel"] is not None:
-                s, e = _hdmap_chunk_pixel_bounds(chunk_idx, len_t)
-                chunk_clip = st["hdmap_pixel"][:, :, s:e].to(
-                    device=device
-                )  # [B,3,T_chunk,H,W]
-                chunk_latent = _vae_encode_normalized(
-                    chunk_clip,
-                    self.encoder,
-                    cache=hdmap_encode_cache,
-                    is_first_chunk=is_first,
-                ).to(
-                    dit_dtype
-                )  # [B,16,len_t,h,w]
-                hdmap_chunk = self.transformer.patchify(chunk_latent)
-            elif st["hdmap_tokens"] is not None:
-                hdmap_chunk = st["hdmap_tokens"][chunk_idx].to(
-                    device=device, dtype=dit_dtype
-                )
-            else:
-                hdmap_chunk = hdmap_zero
-            pin = is_first and image_full is not None
-
-            # Roll the per-block KV window before the forward.
-            for c in caches:
-                c.before_update(chunk_idx)
-
-            def predict_flow(noisy: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-                # The first-frame ``pin`` injection stays eager so ``image_full``
-                # is not baked in. pin is only true on chunk 0.
-                if pin:
-                    noisy = noisy * (1.0 - inject_mask) + image_full * inject_mask
-                return _dit_call(noisy, t, cond_mask, rope_cos_sin, hdmap_chunk)
-
-            noise = torch.empty(
-                B, chunk_tokens, in_d, device=device, dtype=dit_dtype
-            ).normal_(generator=gen)
-            clean = scheduler.sample(noise, predict_flow=predict_flow, rng=gen)
-            if pin:
-                clean = clean * (1.0 - inject_mask) + image_full * inject_mask
-
-            # Authoritative cache write: re-forward the CLEAN chunk at the
-            # context-noise timestep so the cache holds in-distribution K/V.
-            ctx_latent = scheduler.add_noise(
-                clean,
-                ctx_noise_t,
-                rng=gen,
-            )
-            if pin:
-                ctx_latent = ctx_latent * (1.0 - inject_mask) + image_full * inject_mask
-            # Return ignored: this forward exists for its in-cache K/V write
-            # side effect.
-            _dit_call(ctx_latent, ctx_noise_t, cond_mask, rope_cos_sin, hdmap_chunk)
-
-            for c in caches:
-                c.after_update(chunk_idx)
-
-            # [B, L, out*pdim] -> [B, out, len_t, h, w].
-            latent_chunks.append(self.transformer.unpatchify(clean, len_t, hp, wp))
+            latent_chunks.append(self._run_ar_chunk(ctx, chunk_idx))
 
         # Concatenate the AR chunks into the full latent sequence. The standard
         # DecodingStage decodes this in a single pass; the Wan VAE's causal
         # temporal feature cache flows across chunk boundaries, yielding correct
-        # continuity and FlashDreams frame counts.
+        # continuity and FlashDreams frame counts. SP is guarded off at entry,
+        # so no SP post-process is needed here.
         batch.latents = torch.cat(latent_chunks, dim=2)
-        # Phase 6: SP post-process — latents may need gathering when SP is
-        # eventually supported. Currently a no-op (SP is guarded at entry).
-        batch.latents = self._postprocess_sp_latents(batch, server_args)
 
         # Release the hdmap pixel clip now the rollout is done; the decode
         # stage only needs batch.latents. The clip lives on CPU (~13GB for
@@ -1395,12 +1207,178 @@ class OmniDreamsDenoisingStage(DenoisingStage):
 
         _log_omnidreams_stats("ar_concat_latents", batch.latents)
 
-        if residency_manager is not None and transformer_use is not None:
-            residency_manager.end_use(transformer_use, self.transformer)
-        if residency_manager is not None and encoder_use is not None:
-            residency_manager.end_use(encoder_use, self.encoder)
+        self._end_ar_residency(transformer_use, encoder_use)
 
         return batch
+
+    def _build_ar_chunk_ctx(
+        self,
+        *,
+        st: dict,
+        text: torch.Tensor,
+        caches: list,
+        rope: RotaryPositionEmbedding3D,
+        scheduler: Any,
+        gen: Any,
+        cond_mask_c0: torch.Tensor | None,
+        cond_mask_zero: torch.Tensor,
+        image_full: torch.Tensor | None,
+        inject_mask: torch.Tensor | None,
+        hdmap_zero: torch.Tensor,
+        cross_attn_kv: Any,
+        hdmap_encode_cache: Any,
+        hp: int,
+        wp: int,
+        len_t: int,
+        chunk_tokens: int,
+        in_d: int,
+        dit_dtype: torch.dtype,
+        device: torch.device,
+        context_noise: float,
+    ) -> _ARChunkCtx:
+        """Build the loop-invariant AR-chunk bundle (single source of truth).
+
+        Both the offline ``forward`` and the realtime ``_realtime_denoise_chunk``
+        call this so the field list, the context-noise tensor, and the hdmap
+        extraction from ``st`` live in one place — the offline/realtime parity
+        invariant depends on both building the same bundle.
+        """
+        ctx_noise_t = torch.tensor(context_noise, device=device, dtype=dit_dtype)
+        return _ARChunkCtx(
+            text=text,
+            caches=caches,
+            cross_attn_kv=cross_attn_kv,
+            rope=rope,
+            scheduler=scheduler,
+            gen=gen,
+            ctx_noise_t=ctx_noise_t,
+            cond_mask_c0=cond_mask_c0,
+            cond_mask_zero=cond_mask_zero,
+            image_full=image_full,
+            inject_mask=inject_mask,
+            hdmap_zero=hdmap_zero,
+            hdmap_pixel=st["hdmap_pixel"],
+            hdmap_encode_cache=hdmap_encode_cache,
+            hp=hp,
+            wp=wp,
+            len_t=len_t,
+            chunk_tokens=chunk_tokens,
+            in_d=in_d,
+            dit_dtype=dit_dtype,
+            device=device,
+        )
+
+    @torch.no_grad()
+    def _run_ar_chunk(
+        self,
+        ctx: _ARChunkCtx,
+        chunk_idx: int,
+        hdmap_pixel_chunk: Any = None,
+    ) -> torch.Tensor:
+        """One AR chunk body shared by the offline loop and the realtime path.
+
+        Numerical parity invariant: this is the single source of truth for the
+        per-chunk math — ``BlockKVCache`` before/after_update, ``shift_t`` RoPE,
+        2-step self-forcing denoise via ``scheduler.sample``, and the
+        context-noise re-forward at ``ctx_noise_t`` that writes in-distribution
+        K/V into the cache. Offline calls it ``num_chunks`` times; realtime
+        calls it once per ``forward()``. Returns the unpatchified chunk latent
+        ``[B, out, len_t, h, w]``; the caller owns loop/state lifecycle.
+        """
+        rope_cos_sin = ctx.rope.shift_t(chunk_idx)
+        is_first = chunk_idx == 0
+        cond_mask = ctx.cond_mask_c0 if is_first else ctx.cond_mask_zero
+
+        # HD-map conditioning for this chunk, in three mutually-exclusive shapes
+        # (resolution order mirrors the before-stage + closed-loop override):
+        #  1. ``hdmap_pixel_chunk`` (arg): closed-loop per-chunk pixels
+        #     (realtime only, None offline). VAE-encoded here.
+        #  2. ``hdmap_pixel``: stashed full clip -> slice this chunk's frames
+        #     and VAE-encode (per-frame video path, offline + realtime open-loop;
+        #     a single-image input is a static repeated-frame clip).
+        #  3. all None -> zeros (HDMap disabled).
+        if hdmap_pixel_chunk is not None:
+            # Closed-loop pixels arrive as fp32 from the realtime adapter; cast
+            # to the encoder's conv dtype (the offline path pre-casts in
+            # _preprocess_pixels).
+            chunk_clip = hdmap_pixel_chunk.to(
+                device=ctx.device, dtype=next(self.encoder.parameters()).dtype
+            )
+            chunk_latent = _vae_encode_normalized(
+                chunk_clip,
+                self.encoder,
+                cache=ctx.hdmap_encode_cache,
+                is_first_chunk=is_first,
+            ).to(ctx.dit_dtype)
+            hdmap_chunk = self.transformer.patchify(chunk_latent)
+        elif ctx.hdmap_pixel is not None:
+            s, e = _hdmap_chunk_pixel_bounds(chunk_idx, ctx.len_t)
+            chunk_clip = ctx.hdmap_pixel[:, :, s:e].to(device=ctx.device)
+            chunk_latent = _vae_encode_normalized(
+                chunk_clip,
+                self.encoder,
+                cache=ctx.hdmap_encode_cache,
+                is_first_chunk=is_first,
+            ).to(ctx.dit_dtype)
+            hdmap_chunk = self.transformer.patchify(chunk_latent)
+        else:
+            hdmap_chunk = ctx.hdmap_zero
+
+        pin = is_first and ctx.image_full is not None
+
+        # Roll the per-block KV window before the forward.
+        for c in ctx.caches:
+            c.before_update(chunk_idx)
+
+        def dit_call(hidden_states, timestep, cond_mask_t, rope_t, hdmap_t):
+            call_kwargs = dict(
+                hidden_states=hidden_states,
+                encoder_hidden_states=ctx.text,
+                timestep=timestep,
+                condition_video_input_mask=cond_mask_t,
+                rope_cos_sin=rope_t,
+                hdmap_condition=hdmap_t,
+                kv_caches=ctx.caches,
+                cross_attn_kv=ctx.cross_attn_kv,
+            )
+            return self.run_dit_with_bcg(self.transformer, call_kwargs)
+
+        def predict_flow(noisy: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            # The first-frame ``pin`` injection stays eager so ``image_full`` is
+            # not baked in. pin is only true on chunk 0.
+            if pin:
+                noisy = (
+                    noisy * (1.0 - ctx.inject_mask) + ctx.image_full * ctx.inject_mask
+                )
+            return dit_call(noisy, t, cond_mask, rope_cos_sin, hdmap_chunk)
+
+        noise = torch.empty(
+            ctx.text.shape[0],
+            ctx.chunk_tokens,
+            ctx.in_d,
+            device=ctx.device,
+            dtype=ctx.dit_dtype,
+        ).normal_(generator=ctx.gen)
+        clean = ctx.scheduler.sample(noise, predict_flow=predict_flow, rng=ctx.gen)
+        if pin:
+            clean = clean * (1.0 - ctx.inject_mask) + ctx.image_full * ctx.inject_mask
+
+        # Authoritative cache write: re-forward the CLEAN chunk at the
+        # context-noise timestep so the cache holds in-distribution K/V.
+        ctx_latent = ctx.scheduler.add_noise(clean, ctx.ctx_noise_t, rng=ctx.gen)
+        if pin:
+            ctx_latent = (
+                ctx_latent * (1.0 - ctx.inject_mask) + ctx.image_full * ctx.inject_mask
+            )
+        # Return ignored: this forward exists for its in-cache K/V write side
+        # effect.
+        dit_call(ctx_latent, ctx.ctx_noise_t, cond_mask, rope_cos_sin, hdmap_chunk)
+
+        for c in ctx.caches:
+            c.after_update(chunk_idx)
+
+        # [B, L, out*pdim] -> [B, out, len_t, h, w].
+        return self.transformer.unpatchify(clean, ctx.len_t, ctx.hp, ctx.wp)
 
     # ------------------------------------------------------------------ #
     # Realtime (streaming) path                                          #
@@ -1419,29 +1397,18 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         config = server_args.pipeline_config
         device = get_local_torch_device()
         dit_dtype = PRECISION_TO_TYPE[config.dit_precision]
-        arch = config.dit_config.arch_config
 
         # Hold the DiT (and HD-map encoder, when present) resident for this
         # chunk's forward. Same pattern as the offline path.
-        residency_manager = self._component_residency_manager
-        transformer_use = None
-        encoder_use = None
-        if residency_manager is not None:
-            transformer_use = self._declared_component_use(component_name="transformer")
-            residency_manager.begin_use(transformer_use, self.transformer)
-            if self.encoder is not None:
-                encoder_use = self._declared_component_use(component_name="encoder")
-                residency_manager.begin_use(encoder_use, self.encoder)
+        transformer_use, encoder_use = self._begin_ar_residency()
+        # Move the DiT to the compute device (see the offline path comment).
+        if next(self.transformer.parameters()).device != device:
+            self.transformer.to(device)
 
         try:
-            return self._realtime_denoise_chunk(
-                batch, server_args, device, dit_dtype, arch
-            )
+            return self._realtime_denoise_chunk(batch, server_args, device, dit_dtype)
         finally:
-            if residency_manager is not None and transformer_use is not None:
-                residency_manager.end_use(transformer_use, self.transformer)
-            if residency_manager is not None and encoder_use is not None:
-                residency_manager.end_use(encoder_use, self.encoder)
+            self._end_ar_residency(transformer_use, encoder_use)
 
     def _realtime_denoise_chunk(
         self,
@@ -1449,7 +1416,6 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         server_args: ServerArgs,
         device: torch.device,
         dit_dtype: torch.dtype,
-        arch,
     ) -> Req:
         """Run one AR chunk + streaming decode for realtime mode."""
         config = server_args.pipeline_config
@@ -1457,33 +1423,34 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         rc = cache_state.runtime_cache
         st = batch.extra["omnidreams"]
 
-        hp = st["hp"]
-        wp = st["wp"]
-        len_t = st["len_t"]
-        tokens_per_frame = st["tokens_per_frame"]
-        chunk_tokens = st["chunk_tokens"]
-        context_noise = st["context_noise"]
-        block_idx = batch.block_idx
-        # chunk_idx is the AR chunk index (cache_state.chunk_idx == block_idx
-        # by construction; the before-stage inits to 0 and we increment after
-        # each chunk).
+        # chunk_idx is the AR chunk index. cache_state.chunk_idx tracks it
+        # (the before-stage inits to 0; we increment after each chunk).
         chunk_idx = cache_state.chunk_idx
 
-        head_dim = rc["arch_constants"]["head_dim"]
-        in_d = rc["arch_constants"]["in_d"]
-        hdmap_d = rc["arch_constants"]["hdmap_d"]
-        mask_d = rc["arch_constants"]["mask_d"]
+        ctx = rc.get("ar_ctx")
+        if ctx is None:
+            # One-time chunk-0 assembly + ctx build. The ctx is loop-invariant
+            # across chunks (the per-chunk hdmap_pixel_chunk is passed to
+            # ``_run_ar_chunk`` directly), so it is built once and reused.
+            hp = st["hp"]
+            wp = st["wp"]
+            len_t = st["len_t"]
+            tokens_per_frame = st["tokens_per_frame"]
+            chunk_tokens = st["chunk_tokens"]
+            context_noise = st["context_noise"]
+            head_dim = rc["arch_constants"]["head_dim"]
+            in_d = rc["arch_constants"]["in_d"]
+            hdmap_d = rc["arch_constants"]["hdmap_d"]
+            mask_d = rc["arch_constants"]["mask_d"]
 
-        scheduler = rc["scheduler"].to(device)
-        text = rc["text_embeds"].to(device=device, dtype=dit_dtype)
-        B = text.shape[0]
-        gen = rc["generator"]
-        if gen is not None and gen.device != device:
-            gen = torch.Generator(device=device).manual_seed(gen.initial_seed())
-            rc["generator"] = gen
+            scheduler = rc["scheduler"].to(device)
+            text = rc["text_embeds"].to(device=device, dtype=dit_dtype)
+            B = text.shape[0]
+            gen = rc["generator"]
+            if gen is not None and gen.device != device:
+                gen = torch.Generator(device=device).manual_seed(gen.initial_seed())
+                rc["generator"] = gen
 
-        # ---- lazy one-shot assembly on chunk 0 (needs device/dit_dtype) ---- #
-        if cache_state.kv_cache is None or rc["rope"] is None:
             rope = RotaryPositionEmbedding3D(
                 head_dim=head_dim,
                 len_h=hp,
@@ -1494,7 +1461,6 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 t_extrapolation_ratio=1.0,
                 device=device,
             )
-            rc["rope"] = rope
             caches = self.transformer.init_kv_caches(
                 batch_size=B,
                 chunk_tokens=chunk_tokens,
@@ -1533,152 +1499,58 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             hdmap_zero = torch.zeros(
                 B, chunk_tokens, hdmap_d, device=device, dtype=dit_dtype
             )
-            rc["image_full"] = image_full
-            rc["inject_mask"] = inject_mask
-            rc["cond_mask_c0"] = cond_mask_c0
-            rc["cond_mask_zero"] = cond_mask_zero
-            rc["hdmap_zero"] = hdmap_zero
 
             # Precompute cross-attn K/V once (text context is static).
-            rc["cross_attn_kv"] = self.transformer.precompute_cross_attn_kv(
+            cross_attn_kv = self.transformer.precompute_cross_attn_kv(
                 self.transformer.crossattn_proj(text)
             )
 
-            # Initialize the persistent HD-map streaming encode cache (per-frame
-            # video path only) once per session.
+            # Persistent HD-map streaming encode cache (per-frame video path only).
+            hdmap_encode_cache = None
             if st.get("hdmap_pixel") is not None and hasattr(
                 self.encoder, "initialize_ar_encode_cache"
             ):
-                rc["hdmap_encode_cache"] = self.encoder.initialize_ar_encode_cache()
+                hdmap_encode_cache = self.encoder.initialize_ar_encode_cache()
 
-            # FP8 weight-only mode: dequantize once on the first chunk (same
-            # logic as the offline path; the result persists on self.transformer
-            # across calls via the _weight_only_fp8_applied flag).
+            # FP8 weight-only / fp8_compute: apply once on the first chunk.
             mode = getattr(config, "native_dit_acceleration", "disabled")
             if mode == "weight_only_fp8":
                 self._maybe_load_weight_only_fp8(batch, server_args)
             elif mode == "fp8_compute":
                 self._maybe_install_fp8_compute(config, device)
+            elif mode == "fp8_compute_prepared":
+                self._maybe_install_prepared_fp8_compute(config, device)
 
-        rope = rc["rope"]
-        caches = cache_state.kv_cache
-        image_full = rc["image_full"]
-        inject_mask = rc["inject_mask"]
-        cond_mask_c0 = rc["cond_mask_c0"]
-        cond_mask_zero = rc["cond_mask_zero"]
-        hdmap_zero = rc["hdmap_zero"]
-        cross_attn_kv = rc["cross_attn_kv"]
-        hdmap_encode_cache = rc["hdmap_encode_cache"]
-
-        # View indices (optional, multi-view cross-view attn).
-        view_count = int(getattr(batch, "num_views", 1) or 1)
-        n_cameras = int(getattr(arch, "n_cameras_emb", 1))
-        if view_count < 1 or view_count > n_cameras:
-            raise ValueError(
-                f"num_views={view_count} out of range [1, {n_cameras}] "
-                "(n_cameras_emb)."
-            )
-        view_indices: torch.Tensor | None = None
-        if view_count > 1 and self.transformer.adaln_view_embedder is not None:
-            view_indices = (
-                torch.arange(view_count, device=device, dtype=torch.long)
-                .unsqueeze(0)
-                .expand(B, -1)
-            )
-
-        ctx_noise_t = torch.tensor(context_noise, device=device, dtype=dit_dtype)
-
-        # Eager DiT call binding the session-persistent args.
-        def _dit_call(hidden_states, timestep, cond_mask_t, rope_t, hdmap_t):
-            return self.transformer(
-                hidden_states=hidden_states,
-                encoder_hidden_states=text,
-                timestep=timestep,
-                condition_video_input_mask=cond_mask_t,
-                rope_cos_sin=rope_t,
-                hdmap_condition=hdmap_t,
-                kv_caches=caches,
+            ctx = self._build_ar_chunk_ctx(
+                st=st,
+                text=text,
+                caches=caches,
+                rope=rope,
+                scheduler=scheduler,
+                gen=gen,
+                cond_mask_c0=cond_mask_c0,
+                cond_mask_zero=cond_mask_zero,
+                image_full=image_full,
+                inject_mask=inject_mask,
+                hdmap_zero=hdmap_zero,
                 cross_attn_kv=cross_attn_kv,
-                view_indices=view_indices,
+                hdmap_encode_cache=hdmap_encode_cache,
+                hp=hp,
+                wp=wp,
+                len_t=len_t,
+                chunk_tokens=chunk_tokens,
+                in_d=in_d,
+                dit_dtype=dit_dtype,
+                device=device,
+                context_noise=context_noise,
             )
+            rc["ar_ctx"] = ctx
 
-        # ---- per-chunk body (IDENTICAL math to the offline loop body) ---- #
-        rope_cos_sin = rope.shift_t(chunk_idx)
-        is_first = chunk_idx == 0
-        cond_mask = cond_mask_c0 if is_first else cond_mask_zero
-
-        # HD-map conditioning for this chunk. Resolution order (mirrors the
-        # offline loop + closed-loop override):
-        #  1. ``hdmap_pixel_chunk``: closed-loop per-chunk pixels from
-        #     ``condition_inputs["hdmap"]`` (set by the before-stage for
-        #     block_idx>0). VAE-encoded here (per-chunk slice).
-        #  2. ``hdmap_pixel``: stashed full clip -> slice this chunk's frames
-        #     and VAE-encode (open-loop per-frame video path, same as offline).
-        #  3. ``hdmap_tokens``: precomputed per-chunk tokens (single-image
-        #     broadcast fallback).
-        #  4. both None -> zeros (HDMap disabled).
-        hdmap_pixel_chunk = st.get("hdmap_pixel_chunk")
-        if hdmap_pixel_chunk is not None:
-            # Closed-loop pixels arrive as fp32 from the realtime adapter's
-            # _decode_hdmap_chunk; the offline path pre-casts to the VAE dtype in
-            # _preprocess_pixels, so cast here to match the encoder's conv dtype.
-            chunk_clip = hdmap_pixel_chunk.to(
-                device=device, dtype=next(self.encoder.parameters()).dtype
-            )
-            chunk_latent = _vae_encode_normalized(
-                chunk_clip,
-                self.encoder,
-                cache=hdmap_encode_cache,
-                is_first_chunk=is_first,
-            ).to(dit_dtype)
-            hdmap_chunk = self.transformer.patchify(chunk_latent)
-        elif st["hdmap_pixel"] is not None:
-            s, e = _hdmap_chunk_pixel_bounds(chunk_idx, len_t)
-            chunk_clip = st["hdmap_pixel"][:, :, s:e].to(device=device)
-            chunk_latent = _vae_encode_normalized(
-                chunk_clip,
-                self.encoder,
-                cache=hdmap_encode_cache,
-                is_first_chunk=is_first,
-            ).to(dit_dtype)
-            hdmap_chunk = self.transformer.patchify(chunk_latent)
-        elif st["hdmap_tokens"] is not None:
-            hdmap_chunk = st["hdmap_tokens"][chunk_idx].to(
-                device=device, dtype=dit_dtype
-            )
-        else:
-            hdmap_chunk = hdmap_zero
-
-        pin = is_first and image_full is not None
-
-        # Roll the per-block KV window before the forward.
-        for c in caches:
-            c.before_update(chunk_idx)
-
-        def predict_flow(noisy: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-            if pin:
-                noisy = noisy * (1.0 - inject_mask) + image_full * inject_mask
-            return _dit_call(noisy, t, cond_mask, rope_cos_sin, hdmap_chunk)
-
-        noise = torch.empty(
-            B, chunk_tokens, in_d, device=device, dtype=dit_dtype
-        ).normal_(generator=gen)
-        clean = scheduler.sample(noise, predict_flow=predict_flow, rng=gen)
-        if pin:
-            clean = clean * (1.0 - inject_mask) + image_full * inject_mask
-
-        # Authoritative cache write: re-forward the CLEAN chunk at the
-        # context-noise timestep (identical to the offline loop body).
-        ctx_latent = scheduler.add_noise(clean, ctx_noise_t, rng=gen)
-        if pin:
-            ctx_latent = ctx_latent * (1.0 - inject_mask) + image_full * inject_mask
-        _dit_call(ctx_latent, ctx_noise_t, cond_mask, rope_cos_sin, hdmap_chunk)
-
-        for c in caches:
-            c.after_update(chunk_idx)
-
-        # [B, L, out*pdim] -> [B, out, len_t, h, w].
-        chunk_latent_btchw = self.transformer.unpatchify(clean, len_t, hp, wp)
+        # Per-chunk body is IDENTICAL to the offline loop body (lives in
+        # ``_run_ar_chunk``); only the loop boundary + state persistence differ.
+        chunk_latent_btchw = self._run_ar_chunk(
+            ctx, chunk_idx, st.get("hdmap_pixel_chunk")
+        )
 
         # Advance the persistent chunk index for the next call.
         cache_state.chunk_idx += 1
@@ -1766,28 +1638,34 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 "OmniDreams: fp8_compute requested but unavailable; eager bf16."
             )
 
-    def _postprocess_sp_latents(
-        self, batch: Req, server_args: ServerArgs
-    ) -> torch.Tensor:
-        """Gather sharded latents when SP is active (future, currently no-op).
-
-        When SP is enabled, each rank outputs partial-sequence latents that
-        must be all-gathered along the time dimension. This is a placeholder
-        that returns the latents as-is when SP is not active.
-        """
-        try:
-            from sglang.multimodal_gen.runtime.distributed import (
-                get_sp_world_size,
-                sequence_model_parallel_all_gather,
+    def _maybe_install_prepared_fp8_compute(self, config, device) -> None:
+        """Install FP8 GEMMs from the explicit offline artifact, or fail loudly."""
+        if getattr(self.transformer, "_fp8_compute_applied", False):
+            return
+        fp8_prepared_path = getattr(config, "native_dit_fp8_prepared_path", None)
+        if not fp8_prepared_path:
+            raise ValueError(
+                "fp8_compute_prepared requires native_dit_fp8_prepared_path"
             )
+        if not os.path.isfile(fp8_prepared_path):
+            raise FileNotFoundError(
+                f"prepared FP8 DiT artifact not found: {fp8_prepared_path}"
+            )
+        payload = torch.load(fp8_prepared_path, map_location="cpu", weights_only=True)
+        weights = payload.get("weights")
+        if not isinstance(weights, dict):
+            raise ValueError("prepared FP8 DiT artifact has no 'weights' dictionary")
+        from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
+            install_fp8_compute_on_dit,
+        )
 
-            if get_sp_world_size() > 1 and getattr(
-                batch, "did_sp_shard_latents", False
-            ):
-                return sequence_model_parallel_all_gather(batch.latents, dim=2)
-        except (ImportError, AssertionError):
-            pass
-        return batch.latents
+        if not install_fp8_compute_on_dit(self.transformer, prepared_weights=weights):
+            raise RuntimeError(
+                f"fp8_compute_prepared is unavailable on device {device}; refusing BF16 fallback"
+            )
+        logger.info(
+            "OmniDreams: fp8_compute_prepared active from %s.", fp8_prepared_path
+        )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -1807,6 +1685,46 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         return result
 
 
+class _FullCgDecodeWrapper:
+    """Full CUDA-graph capture/replay for VAE decode (fixed-shape, no breaks).
+
+    The VAE decode forward is fixed-shape for a given (resolution, num_frames) —
+    no dynamic ops, no KV cache — so it is a perfect Full CG candidate (the
+    entire forward captured as one graph, no break-points needed). This wraps
+    the base decode function with a shape-keyed graph cache: the first call
+    for a given latent shape warms up + captures; subsequent calls copy in,
+    replay, clone out.
+
+    Gated on ``--enable-breakable-cuda-graph`` (reuses the BCG flag; for the
+    decode stage BCG = Full CG since there are no dynamic ops to break on).
+    """
+
+    def __init__(self, base_decode_fn) -> None:
+        self._base_decode_fn = base_decode_fn
+        # shape tuple -> (graph, static_in, static_out)
+        self._graphs: dict[tuple, tuple] = {}
+
+    def decode(self, latents: torch.Tensor, *args, **kwargs):
+        key = tuple(latents.shape)
+        cached = self._graphs.get(key)
+        if cached is None:
+            # Warmup (3 calls to stabilise cuDNN / cuBLAS plans).
+            static_in = latents.clone()
+            for _ in range(3):
+                _ = self._base_decode_fn(static_in, *args, **kwargs)
+            torch.cuda.synchronize()
+            # Capture.
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                static_out = self._base_decode_fn(static_in, *args, **kwargs)
+            self._graphs[key] = (g, static_in, static_out)
+            logger.info("OmniDreams decode Full CG captured for shape %s", key)
+        g, static_in, static_out = self._graphs[key]
+        static_in.copy_(latents)
+        g.replay()
+        return static_out.clone()
+
+
 class OmniDreamsCausalDecodingStage(CausalVaeDecodingStage):
     """Realtime-aware Wan VAE decode for OmniDreams.
 
@@ -1816,6 +1734,10 @@ class OmniDreamsCausalDecodingStage(CausalVaeDecodingStage):
     a conv ``_feat_map`` carried across AR chunks, so a steady chunk of ``len_t``
     latents emits the full ``len_t * temporal_compression`` pixel frames.
 
+    When ``--enable-breakable-cuda-graph`` is on, the offline single-pass
+    ``vae.decode`` is wrapped in Full CUDA Graph via :class:`_FullCgDecodeWrapper`
+    (the decode forward is fixed-shape → Full CG, no break-points needed).
+
     This subclass exists only to be the OmniDreams decoding stage identity; the
     behaviour lives in the base class. The correctness of steady-chunk frame
     counts depends on the decoder's persistent ``_feat_map`` surviving across
@@ -1824,6 +1746,24 @@ class OmniDreamsCausalDecodingStage(CausalVaeDecodingStage):
     NOT run a full ``clear_cache()`` (which would wipe the live decode cache and
     collapse each steady chunk to the causal-anchor 1-frame path).
     """
+
+    def _get_vae_decode_fn(
+        self, vae, server_args, *, decode_fn=None, compiled_callable=None
+    ):
+        base_fn = super()._get_vae_decode_fn(
+            vae,
+            server_args,
+            decode_fn=decode_fn,
+            compiled_callable=compiled_callable,
+        )
+        if getattr(server_args, "enable_breakable_cuda_graph", False):
+            if not hasattr(self, "_full_cg_wrapper"):
+                self._full_cg_wrapper = _FullCgDecodeWrapper(base_fn)
+            elif self._full_cg_wrapper._base_decode_fn is not base_fn:
+                # VAE changed (reload / dtype swap) — rebuild the wrapper.
+                self._full_cg_wrapper = _FullCgDecodeWrapper(base_fn)
+            return self._full_cg_wrapper.decode
+        return base_fn
 
 
 class OmniDreamsLightTAEDecodingStage(DecodingStage):

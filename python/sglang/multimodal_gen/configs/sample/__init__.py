@@ -8,7 +8,6 @@ from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParam
 from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
     LingBotVideoMoESamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.omnidreams import OmniDreamsSamplingParams
 from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
@@ -17,7 +16,6 @@ __all__ = [
     "ActionSamplingParams",
     "DiffusersGenericSamplingParams",
     "Ideogram4SamplingParams",
-    "OmniDreamsSamplingParams",
     "Pi05SamplingParams",
     "LingBotVideoMoESamplingParams",
 ]

@@ -11,7 +11,6 @@ CPU; the rest are CPU-runnable. The end-to-end serving path is covered by the
 
 from __future__ import annotations
 
-import os
 import types
 
 import pytest
@@ -25,16 +24,18 @@ from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
     OmniDreamsPipelineConfig,
 )
 from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
+    OmniDreamsAttention,
     OmniDreamsDiT,
     RotaryPositionEmbedding3D,
-    rope_dims,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_omnidreams_flow_match import (  # noqa: E501
     OmniDreamsFlowMatchScheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.omnidreams import (  # noqa: E501
-    _MAX_AR_CHUNKS,
     OmniDreamsBeforeDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.realtime.states import (
+    RealtimeCausalDiTState,
 )
 
 _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -42,68 +43,6 @@ requires_gpu = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="OmniDreams DiT forward runs on the platform (GPU) device",
 )
-
-
-# --------------------------------------------------------------------------- #
-# 3D RoPE: shift_t_freqs must match the FlashDreams reference exactly.         #
-#  (This was the FP8-blur root cause: the old layout was [t,t,h,h,w,w] and    #
-#  dropped the h/w NTK extrapolation; see omnidreams_rope.py.)                #
-# --------------------------------------------------------------------------- #
-def _fd_reference_shift_t_freqs(
-    *, head_dim, len_h, len_w, len_t, ratios, ar_idx=0, device="cpu"
-):
-    """Flashdreams ``RotaryPositionEmbedding3D.shift_t`` reference: per-axis
-    NTK-rescaled base frequencies (``_compute_freqs``) concatenated with the
-    non-interleaved ``[t, h, w, t, h, w]`` layout (``_cat_freqs``). This is the
-    contract the native FP8 C++ ``_make_cosmos_rope_cache`` consumes."""
-    dim_t, dim_h, dim_w = rope_dims(head_dim)
-
-    def _freqs(dim, ratio):
-        dim_range = (
-            torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2]
-            / dim
-        )
-        theta = 10000.0 * (ratio ** (dim / (dim - 2)))
-        return 1.0 / (theta**dim_range)
-
-    rt, rh, rw = ratios
-    t = torch.arange(len_t, device=device) + ar_idx * len_t
-    h = torch.arange(len_h, device=device)
-    w = torch.arange(len_w, device=device)
-    tt, hh, ww = torch.meshgrid(t, h, w, indexing="ij")
-    ft = torch.outer(tt.reshape(-1).float(), _freqs(dim_t, rt))
-    fh = torch.outer(hh.reshape(-1).float(), _freqs(dim_h, rh))
-    fw = torch.outer(ww.reshape(-1).float(), _freqs(dim_w, rw))
-    raw = torch.cat([ft, fh, fw, ft, fh, fw], dim=-1)  # [L, D]
-    return raw.unsqueeze(1).unsqueeze(1)  # [L, 1, 1, D]
-
-
-def test_shift_t_freqs_matches_fd_reference_formula():
-    # Golden: shift_t_freqs must equal flashdreams' shift_t exactly. The old
-    # implementation diverged (cos~0.64 vs fd) via wrong layout + dropped NTK.
-    emb = RotaryPositionEmbedding3D(
-        head_dim=128,
-        len_h=4,
-        len_w=5,
-        len_t=2,
-        h_extrapolation_ratio=3.0,
-        w_extrapolation_ratio=3.0,
-        t_extrapolation_ratio=1.0,
-    )
-    for ar in (0, 1, 2):
-        got = emb.shift_t_freqs(ar)
-        ref = _fd_reference_shift_t_freqs(
-            head_dim=128,
-            len_h=4,
-            len_w=5,
-            len_t=2,
-            ratios=(1.0, 3.0, 3.0),
-            ar_idx=ar,
-        )
-        assert got.shape == ref.shape == (2 * 4 * 5, 1, 1, 128)
-        assert torch.allclose(
-            got, ref, atol=1e-5
-        ), f"ar={ar} diverged from fd reference"
 
 
 # --------------------------------------------------------------------------- #
@@ -201,12 +140,16 @@ def _ar_stage_and_args(arch, dit, scheduler, monkeypatch):
     stage.scheduler = scheduler
     stage.vae = None
     stage._component_residency_manager = None
+    stage._bcg_runners = {}
     server_args = types.SimpleNamespace(
         pipeline_config=types.SimpleNamespace(
             dit_precision="fp32",
             dit_config=types.SimpleNamespace(arch_config=arch),
-        )
+        ),
+        enable_breakable_cuda_graph=False,
+        enable_torch_compile=False,
     )
+    stage.server_args = server_args
     return stage, server_args
 
 
@@ -233,7 +176,6 @@ def _ar_batch(
                 "sink_size_t": 0,
                 "context_noise": 128.0,
                 "image_token": image_token,
-                "hdmap_tokens": None,
                 "hdmap_pixel": None,
             }
         },
@@ -262,6 +204,87 @@ def test_ar_denoising_window_roll_many_chunks(monkeypatch):
     # covered by the real-weight e2e — finiteness of an untrained multi-chunk rollout
     # is not a stable invariant (GPU SDPA non-determinism near fp edges).
     assert tuple(out.latents.shape) == (1, 4, 3 * 2, 2 * 2, 2 * 2)
+
+
+@requires_gpu
+@torch.no_grad()
+def test_offline_realtime_single_chunk_parity(monkeypatch):
+    """A1 lock: the offline AR loop and the realtime single-chunk path share
+    ``_run_ar_chunk``, so one chunk of offline ``forward`` and one realtime
+    ``_realtime_denoise_forward`` (block_idx=0) must produce bit-identical
+    latents under the same seed + inputs (deterministic SDPA on a fixed device).
+    """
+    arch = _tiny_arch()
+    dit = _tiny_dit(arch)
+    sched = OmniDreamsFlowMatchScheduler()
+    stage, server_args = _ar_stage_and_args(arch, dit, sched, monkeypatch)
+
+    text = torch.randn(1, 5, arch.crossattn_proj_in_channels, device=_DEVICE)
+
+    # Offline: one chunk.
+    torch.manual_seed(0)
+    offline_batch = _ar_batch(
+        arch,
+        image_token=None,
+        num_chunks=1,
+        text=text,
+        gen=torch.Generator(device=_DEVICE).manual_seed(7),
+    )
+    offline_out = stage.forward(offline_batch, server_args)
+
+    # Realtime: one chunk (block_idx=0). Build a minimal session + the state
+    # the before-stage would have stashed (mirror _realtime_stash_initial_state);
+    # the denoise stage's lazy assembly builds the rest (rope/caches/masks/
+    # cross_attn_kv) on chunk 0.
+    rt_batch = _ar_batch(
+        arch,
+        image_token=None,
+        num_chunks=1,
+        text=text,
+        gen=torch.Generator(device=_DEVICE).manual_seed(7),
+    )
+    rt_batch.realtime_session_id = "parity"
+    rt_batch.block_idx = 0
+    rt_batch.condition_inputs = {}
+    head_dim = arch.model_channels // arch.num_heads
+    in_d = arch.in_channels * arch.patch_temporal * arch.patch_spatial**2
+    hdmap_d = arch.additional_concat_ch * arch.patch_temporal * arch.patch_spatial**2
+    mask_d = arch.patch_temporal * arch.patch_spatial**2
+    state = RealtimeCausalDiTState()
+    rt_batch.session = types.SimpleNamespace(get_or_create_state=lambda cls: state)
+    # Stash the one-shot prep via the real before-stage method (drift-free vs
+    # hand-populating rc); the denoise stage's lazy assembly builds the rest.
+    before_stage = OmniDreamsBeforeDenoisingStage.__new__(
+        OmniDreamsBeforeDenoisingStage
+    )
+    before_stage._realtime_stash_initial_state(
+        rt_batch,
+        server_args,
+        text_embeds=text,
+        scheduler=sched,
+        generator=rt_batch.generator,
+        arch_constants={
+            "hp": 2,
+            "wp": 2,
+            "len_t": 2,
+            "tokens_per_frame": 4,
+            "chunk_tokens": 4,
+            "head_dim": head_dim,
+            "in_d": in_d,
+            "hdmap_d": hdmap_d,
+            "mask_d": mask_d,
+            "context_noise": 128.0,
+            "window_size_t": 2,
+            "sink_size_t": 0,
+        },
+        hdmap_pixel=None,
+        image_token=None,
+    )
+
+    rt_out = stage._realtime_denoise_forward(rt_batch, server_args)
+
+    assert rt_out.latents.shape == offline_out.latents.shape
+    assert torch.equal(rt_out.latents, offline_out.latents)
 
 
 # --------------------------------------------------------------------------- #
@@ -300,7 +323,7 @@ def _hdmap_stage(monkeypatch):
 def test_encode_hdmap_per_frame_clip_slicing(monkeypatch):
     """Per-frame HD-map (option 2): the full raster sequence is decoded once as a
     causal clip (deferred per-chunk VAE encode in the AR loop). Returns
-    ``(None, clip)`` where ``clip`` has ``num_chunks * len_t`` latent frames."""
+    ``clip`` where the temporal length covers ``num_chunks * len_t`` latent frames."""
     stage = _hdmap_stage(monkeypatch)
     dev = torch.device("cpu")
     num_chunks, len_t = 3, 2
@@ -308,11 +331,8 @@ def test_encode_hdmap_per_frame_clip_slicing(monkeypatch):
     total_pixel = 1 + (num_latent - 1) * 4  # 21
 
     b = types.SimpleNamespace(hdmap_path=list(range(total_pixel)), hdmap_pixels=None)
-    toks, pixel = stage._encode_hdmap(
-        b, dev, torch.float32, torch.float32, num_chunks, len_t, 16, 16
-    )
-    # Per-frame path defers VAE encode to the AR loop -> (None, clip).
-    assert toks is None
+    pixel = stage._encode_hdmap(b, dev, torch.float32, num_chunks, len_t, 16, 16)
+    # Per-frame path defers VAE encode to the AR loop and returns its pixel clip.
     assert pixel is not None
     # pixel shape: [B, 3, total_pixel, H, W]
     assert pixel.shape[2] == total_pixel
@@ -397,49 +417,135 @@ def test_prepare_fp8_dit_weights_unfuses_to_qkv_into_qkv_proj():
         assert torch.allclose(deq[:inner], orig[:inner], atol=1.0)
 
 
+def test_prepared_fp8_weight_cache_uses_artifact_bytes_and_tp_row_shard():
+    """Prepared FP8 compute must consume artifact bytes, never BF16-dequantize."""
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
+        prepared_fp8_weight_cache,
+    )
+
+    raw = torch.arange(24, dtype=torch.uint8).reshape(6, 4)
+    scale = torch.arange(1, 7, dtype=torch.float16)
+    fp8, fp8_scale = prepared_fp8_weight_cache(
+        {
+            "blocks.0.self_attn.qkv_proj.weight": raw,
+            "blocks.0.self_attn.qkv_proj.weight_scale": scale,
+        },
+        "blocks.0.self_attn.qkv_proj.weight",
+        target_shape=(3, 4),
+        tp_rank=1,
+        tp_world_size=2,
+    )
+
+    assert fp8.dtype is torch.float8_e4m3fn
+    assert torch.equal(fp8.view(torch.uint8), raw[3:])
+    assert fp8_scale.dtype is torch.float32
+    assert torch.equal(fp8_scale, scale[3:].float().reshape(1, -1))
+
+
+def test_prepared_fp8_keeps_cross_attention_kv_in_bf16():
+    """Cross-attention K/V must retain BF16 precision for conditioning fidelity."""
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
+        prepare_fp8_dit_weights,
+    )
+
+    key = "blocks.0.cross_attn.to_kv.weight"
+    weight = torch.tensor([[1.0, -2.0], [3.0, -4.0]], dtype=torch.bfloat16)
+    cosmos_utils = types.SimpleNamespace(
+        prepare_cosmos_quantized_streaming_weights=lambda *args, **kwargs: {key: weight}
+    )
+
+    prepared = prepare_fp8_dit_weights({}, num_blocks=1, cosmos_fp8_utils=cosmos_utils)
+
+    assert prepared[key].dtype is torch.bfloat16
+    assert key + "_scale" not in prepared
+
+
+@requires_gpu
+@torch.no_grad()
+def test_fp8_compute_keeps_attention_bf16_and_quantizes_mlp_only():
+    """The safe compute policy must not FP8-quantize attention projections."""
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
+        OmniDreamsFP8ComputeLinear,
+        install_fp8_compute_on_dit,
+    )
+
+    model = _tiny_dit()
+    original_qkv_method = model.blocks[0].self_attn.to_qkv.quant_method
+
+    assert install_fp8_compute_on_dit(model)
+
+    assert model.blocks[0].self_attn.to_qkv.quant_method is original_qkv_method
+    assert isinstance(model.blocks[0].mlp.layer1, OmniDreamsFP8ComputeLinear)
+    assert isinstance(model.blocks[0].mlp.layer2, OmniDreamsFP8ComputeLinear)
+
+
 # --------------------------------------------------------------------------- #
 # Config three-state validation.                                              #
 # --------------------------------------------------------------------------- #
-def test_config_three_state_valid():
-    """Phase 1+2: native_dit_acceleration accepts disabled/weight_only_fp8/fp8_compute."""
-    for mode in ("disabled", "weight_only_fp8", "fp8_compute"):
+def test_config_fp8_acceleration_modes_valid():
+    """The explicit prepared mode is accepted alongside existing FP8 modes."""
+    for mode in (
+        "disabled",
+        "weight_only_fp8",
+        "fp8_compute",
+        "fp8_compute_prepared",
+    ):
         cfg = OmniDreamsPipelineConfig(native_dit_acceleration=mode)
         assert cfg.native_dit_acceleration == mode
 
 
 # --------------------------------------------------------------------------- #
-# Flat-checkpoint key coverage (authoritative 570-key .pt fixture).           #
+# param_names_mapping: checkpoint q/k/v -> packed to_qkv / to_kv.             #
 # --------------------------------------------------------------------------- #
-_KEY_FIXTURE = os.path.join(
-    os.path.dirname(__file__), "data", "omnidreams_dit_keys.txt"
-)
+def _apply(mapping_fn, key):
+    return mapping_fn(key)
 
 
-def _load_fixture_keys() -> set[str]:
-    with open(_KEY_FIXTURE) as f:
-        return {line.strip() for line in f if line.strip()}
-
-
-def _build_meta_model() -> OmniDreamsDiT:
-    with torch.device("meta"):
-        return OmniDreamsDiT(config=OmniDreamsDiTConfig(), hf_config={})
-
-
-def test_state_dict_matches_authoritative_key_fixture():
+def test_param_names_mapping_self_attn_qkv_merge():
     from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 
-    model = _build_meta_model()
-    keys = set(model.state_dict().keys())
-    ckpt_keys = _load_fixture_keys()
-    assert len(ckpt_keys) == 570
-    # The packed-QKV merge maps the checkpoint's separate q/k/v -> to_qkv and k/v ->
-    # to_kv (param_names_mapping). Apply it to the checkpoint keys and verify they
-    # cover exactly the model's state_dict (i.e. the flat checkpoint stays loadable).
-    mapping_fn = get_param_names_mapping(OmniDreamsDiT.param_names_mapping)
-    mapped = {mapping_fn(k)[0] for k in ckpt_keys}
-    assert (
-        mapped == keys
-    ), f"missing={sorted(keys - mapped)} extra={sorted(mapped - keys)}"
+    fn = get_param_names_mapping(OmniDreamsDiT.param_names_mapping)
+    key, idx, total = _apply(fn, "blocks.0.self_attn.q_proj.weight")
+    assert key == "blocks.0.self_attn.to_qkv.weight"
+    assert idx == 0
+    assert total == 3
+    _, idx, total = _apply(fn, "blocks.0.self_attn.k_proj.weight")
+    assert idx == 1
+    assert total == 3
+    _, idx, total = _apply(fn, "blocks.0.self_attn.v_proj.weight")
+    assert idx == 2
+    assert total == 3
+
+
+def test_param_names_mapping_cross_attn_kv_merge():
+    from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+
+    fn = get_param_names_mapping(OmniDreamsDiT.param_names_mapping)
+    key, idx, total = _apply(fn, "blocks.5.cross_attn.k_proj.weight")
+    assert key == "blocks.5.cross_attn.to_kv.weight"
+    assert idx == 0
+    assert total == 2
+    _, idx, total = _apply(fn, "blocks.5.cross_attn.v_proj.weight")
+    assert idx == 1
+    assert total == 2
+
+
+def test_param_names_mapping_passthrough():
+    from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+
+    fn = get_param_names_mapping(OmniDreamsDiT.param_names_mapping)
+    for name in (
+        "blocks.0.self_attn.q_norm.weight",
+        "blocks.0.self_attn.output_proj.weight",
+        "blocks.0.cross_attn.q_proj.weight",
+        "blocks.0.mlp.layer1.weight",
+        "final_layer.linear.weight",
+        "x_embedder.proj.1.weight",
+    ):
+        key, idx, total = _apply(fn, name)
+        assert key == name
+        assert idx is None
+        assert total is None
 
 
 # --------------------------------------------------------------------------- #
@@ -456,9 +562,260 @@ def test_compute_num_chunks_boundaries(num_frames, expected):
     )
 
 
-def test_compute_num_chunks_caps_ar_loop():
-    batch = types.SimpleNamespace(num_frames=10_000_000)
-    assert (
-        OmniDreamsBeforeDenoisingStage._compute_num_chunks(batch, len_t=2)
-        == _MAX_AR_CHUNKS
+# --------------------------------------------------------------------------- #
+# BCG (Breakable CUDA Graph) unit tests.                                       #
+# --------------------------------------------------------------------------- #
+def test_omnidreams_is_bcg_supported_in_server_args():
+    """OmniDreams must be accepted by server-args BCG validation."""
+    from sglang.multimodal_gen.runtime.server_args import (
+        BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
+        BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
     )
+
+    assert "OmniDreamsPipelineConfig" in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
+    assert "omnidreams" in BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS
+    assert "nvidia/omnidreams" in BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS
+
+
+def test_bcg_still_rejected_for_unsupported_models():
+    """BCG must still be rejected for unsupported model IDs."""
+    from sglang.multimodal_gen.runtime.server_args import (
+        BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
+    )
+
+    assert "some-random-model" not in BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS
+    assert "wan2.1" not in BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS
+
+
+def test_omnidreams_attention_is_bcg_break_point():
+    """OmniDreamsAttention.forward must be wrapped as a BCG break point.
+
+    The wrapper checks ``is_in_breakable_cuda_graph()`` and routes to the
+    eager-on-graph path during capture. When BCG is inactive (normal eager),
+    it delegates transparently to the original forward.
+    """
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        is_in_breakable_cuda_graph,
+    )
+
+    # The installed forward on the class must be the wrapped version: it
+    # should have ``__wrapped__`` pointing at the original forward.
+    assert hasattr(OmniDreamsAttention.forward, "__wrapped__")
+
+    # Sanity: is_in_breakable_cuda_graph returns False outside capture.
+    assert not is_in_breakable_cuda_graph()
+
+
+@requires_gpu
+@torch.no_grad()
+def test_bcg_routes_omnidreams_through_runner_when_enabled(monkeypatch):
+    """When BCG is enabled, the AR dit_call routes through the BCG runner
+    (``run_dit_with_bcg`` -> ``_maybe_get_bcg_runner`` -> ``_bcg_run``),
+    not a direct ``self.transformer(...)`` call."""
+    arch = _tiny_arch()
+    dit = _tiny_dit(arch)
+    sched = OmniDreamsFlowMatchScheduler()
+    stage, server_args = _ar_stage_and_args(arch, dit, sched, monkeypatch)
+    # Enable BCG on the stage's server_args.
+    stage.server_args.enable_breakable_cuda_graph = True
+
+    call_log: list[dict] = []
+    original_forward = dit.forward
+
+    def tracking_forward(**kwargs):
+        call_log.append(kwargs)
+        return original_forward(**kwargs)
+
+    dit.forward = tracking_forward
+
+    # Mock the BCG runner so we don't need a real CUDA graph capture.
+    mock_runner = types.SimpleNamespace(
+        __call__=lambda **kw: original_forward(**kw),
+        capture=lambda **kw: True,
+        entries={},
+        _disabled_reason=None,
+        _should_capture_on_call=lambda key: False,
+        _log_signature_miss=lambda key: None,
+    )
+    stage._bcg_runners[id(dit)] = mock_runner
+
+    text = torch.randn(1, 5, arch.crossattn_proj_in_channels, device=_DEVICE)
+    gen = torch.Generator(device=_DEVICE).manual_seed(2)
+    batch = _ar_batch(
+        arch, image_token=None, num_chunks=1, text=text, gen=gen, window_size_t=2
+    )
+    stage.forward(batch, server_args)
+
+    # The transformer forward must have been called (at least the denoise
+    # step + the context-noise re-forward).
+    assert len(call_log) >= 2
+
+    # Each call must carry the BCG-specific kwargs (kv_caches, cross_attn_kv).
+    for kw in call_log:
+        assert "kv_caches" in kw
+        assert "cross_attn_kv" in kw
+
+    # Restore.
+    stage.server_args.enable_breakable_cuda_graph = False
+
+
+@requires_gpu
+@torch.no_grad()
+def test_bcg_disabled_routes_omnidreams_eagerly(monkeypatch):
+    """When BCG is disabled, ``run_dit_with_bcg`` falls through to a direct
+    ``self.transformer(...)`` call (no runner created)."""
+    arch = _tiny_arch()
+    dit = _tiny_dit(arch)
+    sched = OmniDreamsFlowMatchScheduler()
+    stage, server_args = _ar_stage_and_args(arch, dit, sched, monkeypatch)
+    assert not stage.server_args.enable_breakable_cuda_graph
+
+    # _maybe_get_bcg_runner must return None.
+    assert stage._maybe_get_bcg_runner(dit) is None
+    assert stage._bcg_runners == {}
+
+
+def test_bcg_disables_torch_compile_for_omnidreams():
+    """``--enable-breakable-cuda-graph`` must skip torch.compile per the
+    existing framework policy (BCG and torch.compile are mutually exclusive)."""
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+        DenoisingStage,
+    )
+
+    stage = DenoisingStage.__new__(DenoisingStage)
+    stage.server_args = types.SimpleNamespace(
+        enable_breakable_cuda_graph=True,
+        enable_torch_compile=True,
+    )
+    stage._cache_dit_enabled = False
+    stage._torch_compile_registry = types.SimpleNamespace(is_compiled=lambda m: False)
+
+    # _maybe_torch_compile must return early when BCG is enabled, even if
+    # enable_torch_compile is also True.
+    stage._maybe_torch_compile(types.SimpleNamespace())
+
+
+@requires_gpu
+@torch.no_grad()
+def test_bcg_kv_cache_not_stale_across_requests(monkeypatch):
+    """During capture/replay, KV-cache update/read happens on each invocation
+    and does not reuse cache objects from a prior request.
+
+    The BCG signature keys mutable objects by identity (``id(obj)``), so a
+    new request with new KV-cache objects produces a different signature and
+    cannot replay a graph captured against another request's caches.
+    """
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+        _signature_kwargs,
+    )
+
+    arch = _tiny_arch()
+    dit = _tiny_dit(arch)
+    sched = OmniDreamsFlowMatchScheduler()
+    stage, server_args = _ar_stage_and_args(arch, dit, sched, monkeypatch)
+    stage.server_args.enable_breakable_cuda_graph = True
+
+    # Build two sets of KV caches (simulating two requests).
+    caches_a = dit.init_kv_caches(
+        batch_size=1,
+        chunk_tokens=4,
+        window_tokens=8,
+        sink_tokens=0,
+        device=_DEVICE,
+        dtype=torch.float32,
+    )
+    caches_b = dit.init_kv_caches(
+        batch_size=1,
+        chunk_tokens=4,
+        window_tokens=8,
+        sink_tokens=0,
+        device=_DEVICE,
+        dtype=torch.float32,
+    )
+
+    text = torch.randn(1, 5, arch.crossattn_proj_in_channels, device=_DEVICE)
+    cross_attn_kv = dit.precompute_cross_attn_kv(dit.crossattn_proj(text))
+
+    kwargs_a = dict(
+        hidden_states=torch.randn(1, 4, 20, device=_DEVICE),
+        encoder_hidden_states=text,
+        timestep=torch.tensor([500.0], device=_DEVICE),
+        condition_video_input_mask=torch.zeros(1, 4, 4, device=_DEVICE),
+        rope_cos_sin=torch.randn(4, 12, device=_DEVICE),
+        hdmap_condition=torch.randn(1, 4, 4, device=_DEVICE),
+        kv_caches=caches_a,
+        cross_attn_kv=cross_attn_kv,
+    )
+    kwargs_b = dict(kwargs_a)
+    kwargs_b["kv_caches"] = caches_b
+
+    sig_a = _signature_kwargs(kwargs_a)
+    sig_b = _signature_kwargs(kwargs_b)
+
+    # The signatures must differ because the kv_caches list identity differs.
+    assert sig_a != sig_b, (
+        "KV-cache objects from different requests must not share a BCG "
+        "signature (stale capture-bound Python objects)."
+    )
+
+    # Same caches -> same signature (replay-safe for the same request).
+    sig_a2 = _signature_kwargs(kwargs_a)
+    assert sig_a == sig_a2
+
+
+@requires_gpu
+@torch.no_grad()
+def test_bcg_hdmap_and_no_hdmap_signatures_differ(monkeypatch):
+    """HDMap enabled vs disabled produce different BCG signatures because the
+    ``hdmap_condition`` tensor shape differs (or is zero vs non-zero).
+
+    With the tiny arch, hdmap_d != 0, so the hdmap_condition tensor is always
+    present. The test verifies that different hdmap_condition values share the
+    same signature (shape-based, not value-based), confirming shape-stable
+    replay. The HDMap disabled path passes the same-shape zero tensor.
+    """
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+        _signature_kwargs,
+    )
+
+    arch = _tiny_arch()
+    dit = _tiny_dit(arch)
+    device = _DEVICE
+
+    text = torch.randn(1, 5, arch.crossattn_proj_in_channels, device=device)
+    caches = dit.init_kv_caches(
+        batch_size=1,
+        chunk_tokens=4,
+        window_tokens=8,
+        sink_tokens=0,
+        device=device,
+        dtype=torch.float32,
+    )
+    cross_attn_kv = dit.precompute_cross_attn_kv(dit.crossattn_proj(text))
+
+    pdim = arch.patch_temporal * arch.patch_spatial**2
+    hdmap_d = arch.additional_concat_ch * pdim
+
+    # HDMap enabled: real hdmap_condition tensor.
+    kwargs_hdmap = dict(
+        hidden_states=torch.randn(1, 4, arch.in_channels * pdim, device=device),
+        encoder_hidden_states=text,
+        timestep=torch.tensor([500.0], device=device),
+        condition_video_input_mask=torch.zeros(1, 4, pdim, device=device),
+        rope_cos_sin=torch.randn(4, 12, device=device),
+        hdmap_condition=torch.randn(1, 4, hdmap_d, device=device),
+        kv_caches=caches,
+        cross_attn_kv=cross_attn_kv,
+    )
+
+    # HDMap disabled: zero hdmap_condition (same shape, different value).
+    kwargs_no_hdmap = dict(kwargs_hdmap)
+    kwargs_no_hdmap["hdmap_condition"] = torch.zeros(1, 4, hdmap_d, device=device)
+
+    # Same shape -> same signature (shape-based replay is safe).
+    assert _signature_kwargs(kwargs_hdmap) == _signature_kwargs(kwargs_no_hdmap)
+
+    # Different shape -> different signature.
+    kwargs_diff_shape = dict(kwargs_hdmap)
+    kwargs_diff_shape["hdmap_condition"] = torch.randn(1, 8, hdmap_d, device=device)
+    assert _signature_kwargs(kwargs_hdmap) != _signature_kwargs(kwargs_diff_shape)

@@ -224,7 +224,7 @@ class OmniDreamsPipeline(ComposedPipelineBase):
             device=device,
         )
 
-        # Phase 6: populate memory budgets (GiB, approximate) for the
+        # Populate memory budgets (GiB, approximate) for the
         # ComponentResidencyManager offload scheduler. Exact values are
         # TODO(gpu): measure on the target GPU with torch.cuda.memory_stats().
         impl_image = (

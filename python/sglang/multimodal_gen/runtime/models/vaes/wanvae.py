@@ -1505,19 +1505,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
             self._enc_feat_map = [None] * self._enc_conv_num
 
     def clear_encode_cache(self) -> None:
-        """Reset ONLY the encoder feature cache, leaving the decoder's
-        ``_feat_map`` untouched.
-
-        ``encode()`` must not disturb the decoder cache: in OmniDreams realtime
-        the hdmap encoder and the latent decoder share one cached WanVAE
-        instance (memory optimization), and a full ``clear_cache()`` inside
-        ``encode()`` would wipe the decoder's persistent per-chunk
-        ``_feat_map`` mid-rollout, collapsing each steady chunk's temporal
-        upsample to the causal-anchor (1 frame) path. ``encode`` only ever
-        touches ``_enc_feat_map``, so scoping the reset to it is sufficient and
-        side-effect-free for the shared-instance case; standalone encoders are
-        unaffected (they have no live decoder cache to preserve).
-        """
+        """Reset only the encoder feature cache, leaving the decoder's untouched."""
         if self.config.load_encoder:
             self._enc_conv_num = self._count_conv3d(self.encoder)
             self._enc_conv_idx = 0
@@ -1566,11 +1554,6 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_feature_cache:
-            # Reset only the ENCODER cache: this WanVAE instance may be shared
-            # with an in-flight causal decode rollout (OmniDreams realtime reuses
-            # one cached instance for hdmap-encode + latent-decode), whose
-            # persistent ``_feat_map`` must survive across the interleaved
-            # per-chunk encode calls. A full ``clear_cache()`` here would wipe it.
             self.clear_encode_cache()
             if self.config.patch_size is not None:
                 x = patchify(x, patch_size=self.config.patch_size)
@@ -1645,9 +1628,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
                         feat_idx.set(0)
                         first_chunk.set(i == 0)
                         chunk = self.decoder(x[:, :, i : i + 1, :, :])
-                        # Non-SP path: stream chunks to CPU so out_chunks (grows
-                        # ~linearly with frames) doesn't OOM. SP keeps shards on
-                        # GPU for intra-layer halo/all-gather.
+                        # Stream to CPU on single-GPU to avoid OOM on long videos.
                         if not use_sp:
                             chunk = chunk.cpu()
                         out_chunks.append(chunk)

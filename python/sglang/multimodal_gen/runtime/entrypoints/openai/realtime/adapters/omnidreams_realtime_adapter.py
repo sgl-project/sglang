@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
 from typing import TYPE_CHECKING, Any
 
 import torch
-from fastapi import WebSocket
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeEvent,
@@ -16,15 +13,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
     BaseRealtimeModelAdapter,
     RealtimeChunkInputs,
-)
-from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
-    RawRGBRealtimeOutputAdapter,
-    RealtimeFrameSendStats,
+    save_realtime_first_frame,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size_or_raise,
     build_sampling_params,
-    save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
@@ -33,7 +26,6 @@ from sglang.multimodal_gen.runtime.realtime.control_signals import (
     ControlSignalQueue,
     ControlSignalSamplingParams,
 )
-from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.vision import (
     load_image,
     normalize,
@@ -48,7 +40,6 @@ if TYPE_CHECKING:
         RealtimeChunkContext,
     )
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-        OutputBatch,
         Req,
     )
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -87,38 +78,6 @@ def _len_t(server_args: ServerArgs) -> int:
         return OmniDreamsSamplingParams.len_t
     except AttributeError:
         return 2
-
-
-def _window_size_t(server_args: ServerArgs) -> int:
-    """Return the KV-cache rolling window size (latent frames) from pipeline config."""
-    try:
-        return int(server_args.pipeline_config.dit_config.arch_config.window_size_t)
-    except AttributeError:
-        pass
-    try:
-        from sglang.multimodal_gen.configs.sample.omnidreams import (
-            OmniDreamsSamplingParams,
-        )
-
-        return OmniDreamsSamplingParams.window_size_t
-    except AttributeError:
-        return 6
-
-
-def _sink_size_t(server_args: ServerArgs) -> int:
-    """Return the KV-cache permanent sink size (latent frames) from pipeline config."""
-    try:
-        return int(server_args.pipeline_config.dit_config.arch_config.sink_size_t)
-    except AttributeError:
-        pass
-    try:
-        from sglang.multimodal_gen.configs.sample.omnidreams import (
-            OmniDreamsSamplingParams,
-        )
-
-        return OmniDreamsSamplingParams.sink_size_t
-    except AttributeError:
-        return 0
 
 
 def _get_num_frames(block_idx: int, len_t: int) -> int:
@@ -264,19 +223,18 @@ class OmniDreamsRealtimeAdapter(BaseRealtimeModelAdapter):
         Per-chunk HD-map raster providing the spatial driving condition for the
         denoising stage.  See :meth:`ingest_event` for the assumed encoding.
 
-    KV window
-    ---------
-    ``realtime_causal_kv_cache_num_frames`` ← ``window_size_t`` (default 6)
-    ``realtime_causal_sink_size``           ← ``sink_size_t``    (default 0)
+    The KV-cache window/sink sizes are read by the denoise stage directly from
+    the pipeline config / ``OmniDreamsSamplingParams`` (not via the batch's
+    ``realtime_causal_kv_cache_*`` fields — those are a causal-DMD mechanism
+    OmniDreams does not use).
 
-    Both are read from the pipeline config at runtime via :func:`_window_size_t`
-    and :func:`_sink_size_t`; request-level overrides (if present) take priority.
+    Open-loop today: :meth:`wait_for_next_chunk` returns immediately; when the
+    hdmap queue is empty the denoise stage falls back to repeating the last
+    received frame or zeros. Closed-loop (await a fresh hdmap event per chunk)
+    is planned.
     """
 
     name = "omnidreams"
-
-    def __init__(self) -> None:
-        self.output_adapter = RawRGBRealtimeOutputAdapter()
 
     def create_state(self) -> OmniDreamsRealtimeState:
         return OmniDreamsRealtimeState()
@@ -293,35 +251,7 @@ class OmniDreamsRealtimeAdapter(BaseRealtimeModelAdapter):
         request: RealtimeVideoGenerationsRequest,
     ) -> None:
         """Save first_frame to a temp path and stash the path back on the request."""
-        if request.first_frame is None:
-            return
-
-        server_args = get_global_server_args()
-        if server_args.input_save_path is not None:
-            uploads_dir = server_args.input_save_path
-            os.makedirs(uploads_dir, exist_ok=True)
-        else:
-            if session.input_temp_dir is None:
-                session.input_temp_dir = tempfile.mkdtemp(prefix="sglang_input_")
-            uploads_dir = session.input_temp_dir
-
-        target_path = os.path.join(uploads_dir, f"{session.id}_first_frame")
-        image_path = await save_image_to_path(request.first_frame, target_path)
-        request.first_frame = image_path
-
-    async def wait_for_next_chunk(self, session: GenerateSession) -> None:
-        """Return immediately (open-loop).
-
-        OmniDreams generates continuously without waiting for the client to
-        deliver the next HDMap chunk.  When the hdmap queue is empty the
-        denoising stage falls back to repeating the last received frame or
-        zeros (handled by :meth:`OmniDreamsRealtimeState.sample_hdmap_chunk`).
-
-        # TODO(closed-loop): await hdmap event before returning so that each
-        # AR chunk is conditioned on a fresh client-supplied HDMap, turning
-        # this into a true closed-loop system (see plan Step 4 / P1).
-        """
-        del session
+        await save_realtime_first_frame(session, request)
 
     def ingest_event(
         self,
@@ -480,35 +410,10 @@ class OmniDreamsRealtimeAdapter(BaseRealtimeModelAdapter):
             batch.realtime_output_format = req.realtime_output_format
             batch.realtime_preview_max_width = req.realtime_preview_max_width
             batch.realtime_output_pacing = bool(req.realtime_output_pacing)
-            # KV window: prefer explicit request override, fall back to pipeline defaults.
-            batch.realtime_causal_kv_cache_num_frames = (
-                req.realtime_causal_kv_cache_num_frames
-                if req.realtime_causal_kv_cache_num_frames is not None
-                else _window_size_t(server_args)
-            )
-            batch.realtime_causal_sink_size = (
-                req.realtime_causal_sink_size
-                if req.realtime_causal_sink_size is not None
-                else _sink_size_t(server_args)
-            )
 
         return batch
 
-    async def send_output(
-        self,
-        ws: WebSocket,
-        session: GenerateSession,
-        result: OutputBatch,
-        batch: Req,
-    ) -> RealtimeFrameSendStats:
-        return await self.output_adapter.send(ws, session, result, batch)
-
-    def on_chunk_complete(self, session: GenerateSession, result: OutputBatch) -> None:
-        del result
-        session.generate_chunk_completed()
-
-    def dispose(self, session: GenerateSession) -> None:
+    def clear_state(self, session: GenerateSession) -> None:
         state = session.adapter_state
         if isinstance(state, OmniDreamsRealtimeState):
             state.clear()
-        self.output_adapter.reset()

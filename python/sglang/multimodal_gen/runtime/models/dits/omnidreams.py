@@ -13,8 +13,10 @@ The module is constructed with PRE-FUSION shapes to match the raw checkpoint:
 Both fusions run once in :meth:`post_load_weights` after ``load_state_dict``,
 matching FlashDreams ``update_parameters_after_loading_checkpoint``.
 
-The denoising forward pass (RoPE, SDPA, KV-cache) is implemented in a later
-phase; Phase-0 scaffolding only needs checkpoint-exact construction + fusion.
+The denoising forward (3D NeoX RoPE via ``shift_t``, SDPA self-attention, the
+rolling ``BlockKVCache`` autoregressive window, and precomputed cross-attention
+K/V) is fully implemented in :class:`OmniDreamsDiT` / :class:`OmniDreamsBlock` /
+:class:`OmniDreamsAttention`.
 """
 
 from __future__ import annotations
@@ -29,6 +31,9 @@ from torch import Tensor
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTConfig
 from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
+from sglang.multimodal_gen.runtime.layers.attention.layer import (
+    make_breakable_attention_forward,
+)
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNormScaleShift
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -36,6 +41,17 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+
+# SageAttention-3 FP4/FP8 kernel (the same kernel FlashDreams uses), built for
+# sm_120a. On non-Blackwell hosts / when sageattn3 is not built it stays None and
+# self-attention falls back to SDPA. (Same import-guard pattern as
+# runtime/platforms/cuda.py's SAGE_ATTN_3 resolver.)
+_sageattn3_blackwell = None
+if torch.cuda.is_available():
+    try:
+        from sageattn3 import sageattn3_blackwell as _sageattn3_blackwell
+    except Exception:  # pragma: no cover - sageattn3 is a from-source Blackwell ext
+        _sageattn3_blackwell = None
 
 
 def _sp_size() -> int:
@@ -274,7 +290,7 @@ class OmniDreamsAttention(nn.Module):
         rope_cos_sin: Tensor | None = None,
     ) -> Tensor:
         """Attention with an optional KV-cache window (autoregressive self-attn)
-        and optional precomputed cross-attention K/V (Phase 6 caching).
+        and optional precomputed cross-attention K/V (precomputed caching).
 
         Q/K are per-head RMSNorm'd, then (self-attn only) rotated by RoPE before
         a full bidirectional SDPA (scale 1/sqrt(head_dim)). Cross-attention passes
@@ -330,21 +346,35 @@ class OmniDreamsAttention(nn.Module):
         q_t = q.transpose(1, 2)
         k_t = k.transpose(1, 2)
         v_t = v.transpose(1, 2)
-        out = F.scaled_dot_product_attention(q_t, k_t, v_t)
+        if _sageattn3_blackwell is not None:
+            # SageAttention-3 FP4/FP8 kernel ([B,H,S,D]). OmniDreams self-attn is
+            # always MHA (Hq == Hkv), so the fast path applies. is_causal=False:
+            # cross-chunk causality comes from the KV window, not a mask.
+            out = _sageattn3_blackwell(q_t, k_t, v_t, is_causal=False)
+        else:
+            out = F.scaled_dot_product_attention(q_t, k_t, v_t)
         out = out.transpose(1, 2).reshape(B, L, n * d)
         out, _ = self.output_proj(out)
         return out
 
 
-class OmniDreamsBlock(nn.Module):
-    """Cosmos transformer block: self-attn -> (cross-view-attn) -> cross-attn -> MLP.
+# Install the BCG break point on OmniDreamsAttention so that its forward
+# (KV-cache update/read, SageAttention-3 / SDPA) executes eagerly between
+# captured graph segments. The projections / normalization / MLP / embedding /
+# residual regions in the surrounding OmniDreamsBlock remain eligible for
+# capture. This mirrors the universal wrapper applied to the generic attention
+# classes in runtime/layers/attention/layer.py.
+OmniDreamsAttention.forward = make_breakable_attention_forward(
+    OmniDreamsAttention.forward
+)
 
-    Cross-view attention is gated behind ``enable_cross_view_attn`` (Phase 5,
-    default off for the single-view checkpoint). When enabled each camera
-    view's tokens attend over all views at the same temporal position via a
-    dense bidirectional attention (no RoPE, no causal mask), and per-view
-    AdaLN modulation terms are added to the timestep-conditioned shift/scale/
-    gate biases.
+
+class OmniDreamsBlock(nn.Module):
+    """Cosmos transformer block: self-attn -> cross-attn -> MLP.
+
+    Single-view only: the single-view checkpoint ships no cross-view / multi-
+    camera attention, so that path was removed. AdaLN modulation (shift/scale/
+    gate) is conditioned on the timestep embedding only.
     """
 
     def __init__(
@@ -355,25 +385,14 @@ class OmniDreamsBlock(nn.Module):
         mlp_ratio: float = 4.0,
         use_adaln_lora: bool = False,
         adaln_lora_dim: int = 256,
-        enable_cross_view_attn: bool = False,
     ) -> None:
         super().__init__()
         self.x_dim = x_dim
         self.use_adaln_lora = use_adaln_lora
-        self.enable_cross_view_attn = enable_cross_view_attn
         head_dim = x_dim // num_heads
 
         self.layer_norm_self_attn = LayerNormScaleShift(x_dim, eps=1e-6)
         self.self_attn = OmniDreamsAttention(x_dim, None, num_heads, head_dim)
-
-        # Cross-view attention (Phase 5) — learnable LayerNorm (unlike AdaLN).
-        if enable_cross_view_attn:
-            self.layer_norm_cross_view_attn = nn.LayerNorm(
-                x_dim, elementwise_affine=True, eps=1e-6
-            )
-            self.cross_view_attn = OmniDreamsAttention(
-                x_dim, x_dim, num_heads, head_dim
-            )
 
         self.layer_norm_cross_attn = LayerNormScaleShift(x_dim, eps=1e-6)
         self.cross_attn = OmniDreamsAttention(x_dim, context_dim, num_heads, head_dim)
@@ -394,11 +413,6 @@ class OmniDreamsBlock(nn.Module):
         self.adaln_modulation_cross_attn = _make_adaln_mod()
         self.adaln_modulation_mlp = _make_adaln_mod()
 
-    @staticmethod
-    def _expand_view_mod(view_tensor: Tensor, B: int, V: int, D: int) -> Tensor:
-        """Expand per-view modulation ``[B, V, D]`` into ``[B, V, 1, D]``."""
-        return view_tensor.reshape(B, V, 1, D)
-
     def forward(
         self,
         x: Tensor,
@@ -407,20 +421,17 @@ class OmniDreamsBlock(nn.Module):
         context: Tensor,
         self_attn_kv_cache=None,
         cross_attn_kv: tuple[Tensor, Tensor] | None = None,
-        view_embedding_proj: Tensor | None = None,
         rope_cos_sin: Tensor | None = None,
     ) -> Tensor:
         """One transformer block on a single chunk.
 
         Args:
-            x: ``[B, L, D]`` tokens (flat across views & frames).
+            x: ``[B, L, D]`` tokens.
             emb: ``[B, D]`` timestep embedding.
             adaln_lora: ``[B, 3D]`` AdaLN-LoRA term.
             context: ``[B, Lctx, D]`` cross-attention key/value source.
             self_attn_kv_cache: optional :class:`BlockKVCache`.
             cross_attn_kv: optional precomputed ``(K,V)`` tuple for cross-attn.
-            view_embedding_proj: optional ``[B, V, 9D]`` view modulation tensor
-                (Phase 5 cross-view attention). ``None`` for single-view.
         """
         B, L, D = x.shape
         emb_ = emb.reshape(B, 1, D)
@@ -446,42 +457,12 @@ class OmniDreamsBlock(nn.Module):
             )
             shift_m, scale_m, gate_m = self.adaln_modulation_mlp(emb_).chunk(3, dim=-1)
 
-        # Cross-view modulation (Phase 5): additive per-view AdaLN bias.
-        if self.enable_cross_view_attn and view_embedding_proj is not None:
-            V = view_embedding_proj.shape[1]
-            (
-                view_shift_s,
-                view_scale_s,
-                view_gate_s,
-                view_shift_c,
-                view_scale_c,
-                view_gate_c,
-                view_shift_m,
-                view_scale_m,
-                view_gate_m,
-            ) = view_embedding_proj.chunk(9, dim=-1)
-            shift_s = shift_s + self._expand_view_mod(view_shift_s, B, V, D)
-            scale_s = scale_s + self._expand_view_mod(view_scale_s, B, V, D)
-            gate_s = gate_s + self._expand_view_mod(view_gate_s, B, V, D)
-            shift_c = shift_c + self._expand_view_mod(view_shift_c, B, V, D)
-            scale_c = scale_c + self._expand_view_mod(view_scale_c, B, V, D)
-            gate_c = gate_c + self._expand_view_mod(view_gate_c, B, V, D)
-            shift_m = shift_m + self._expand_view_mod(view_shift_m, B, V, D)
-            scale_m = scale_m + self._expand_view_mod(view_scale_m, B, V, D)
-            gate_m = gate_m + self._expand_view_mod(view_gate_m, B, V, D)
-
         normed = self.layer_norm_self_attn(x, shift_s, scale_s)
         x = x + gate_s * self.self_attn(
             normed,
             kv_cache=self_attn_kv_cache,
             rope_cos_sin=rope_cos_sin,
         )
-
-        # Cross-view attention (Phase 5): each view attends over all views at
-        # the same temporal position (dense bidirectional, no RoPE, no gate).
-        if self.enable_cross_view_attn and view_embedding_proj is not None:
-            x_cv = self._cross_view_attn_forward(x, L, B, D)
-            x = x + x_cv
 
         normed = self.layer_norm_cross_attn(x, shift_c, scale_c)
         x = x + gate_c * self.cross_attn(
@@ -492,22 +473,6 @@ class OmniDreamsBlock(nn.Module):
         x = x + gate_m * self.mlp(normed)
         return x
 
-    def _cross_view_attn_forward(self, x: Tensor, L: int, B: int, D: int) -> Tensor:
-        """Cross-view attention (Phase 5) — not yet implemented.
-
-        The intended behavior reshapes the flat ``[B, L, D]`` tokens into
-        ``[B, V, T*HW, D]`` and, for each temporal position ``t``, lets every
-        view's queries attend over the concatenated K/V of all views at that
-        same ``t`` (no RoPE, no causal mask). The view count ``V`` must be
-        threaded in from the caller, which is not wired up yet, so we fail
-        loudly instead of silently running global attention over all tokens.
-        """
-        raise NotImplementedError(
-            "Cross-view attention (enable_cross_view_attn=True) is not yet "
-            "supported: temporal-position-restricted attention is unimplemented. "
-            "Run with the default enable_cross_view_attn=False."
-        )
-
 
 # --------------------------------------------------------------------------- #
 # Top-level DiT                                                               #
@@ -516,10 +481,9 @@ class OmniDreamsDiT(BaseDiT):
     """OmniDreams Cosmos DiT (2.06B, DiT-only, autoregressive video world model).
 
     Supports TP (tensor parallelism via ``ColumnParallelLinear``/``RowParallelLinear``
-    head sharding), SP (sequence parallelism — guarded: SP init is detected and
+    head sharding). SP (sequence parallelism) is guarded: SP init is detected and
     rejected with a clear error since the autoregressive chunk loop is not yet
-    SP-aware), and optional cross-view attention (Phase 5, gated by config
-    ``enable_cross_view_attn``).
+    SP-aware. Single-view only (the checkpoint ships no cross-view attention).
     """
 
     _fsdp_shard_conditions = [lambda n, m: isinstance(m, OmniDreamsBlock)]
@@ -570,8 +534,6 @@ class OmniDreamsDiT(BaseDiT):
         )
         self.t_embedding_norm = nn.RMSNorm(arch.model_channels, eps=1e-6)
 
-        # Phase 5: cross-view attention (default off for single-view checkpoint).
-        _cv_enabled = getattr(arch, "enable_cross_view_attn", False)
         self.blocks = nn.ModuleList(
             [
                 OmniDreamsBlock(
@@ -581,7 +543,6 @@ class OmniDreamsDiT(BaseDiT):
                     mlp_ratio=arch.mlp_ratio,
                     use_adaln_lora=arch.use_adaln_lora,
                     adaln_lora_dim=arch.adaln_lora_dim,
-                    enable_cross_view_attn=_cv_enabled,
                 )
                 for _ in range(arch.num_blocks)
             ]
@@ -606,22 +567,10 @@ class OmniDreamsDiT(BaseDiT):
                 nn.GELU(),
             )
 
-        # Cross-view attention (Phase 5): embedder + projection network.
-        # Stays None for the single-view checkpoint (no params, no forward cost).
-        if _cv_enabled:
-            n_cameras = getattr(arch, "n_cameras_emb", 7)
-            self.adaln_view_embedder = nn.Embedding(n_cameras, arch.model_channels)
-            self.adaln_view_proj = nn.Linear(
-                arch.model_channels, arch.model_channels * 9
-            )
-        else:
-            self.adaln_view_embedder = None
-            self.adaln_view_proj = None
-
         self._is_shuffle_op_fused = False
         self._is_padding_mask_fused = False
 
-        # Phase 6 SP guard: store sp_size for forward-time detection.
+        # SP guard: store sp_size for forward-time detection.
         self._sp_size = _sp_size()
 
         # BaseDiT-required instance attributes.
@@ -736,7 +685,7 @@ class OmniDreamsDiT(BaseDiT):
         stage to avoid redundant ``k_proj(ctx)``/``v_proj(ctx)`` in every
         forward call (28 blocks × num_chunks × 3 calls/chunk of wasted matmul).
 
-        Phase 6. Invoke once before the chunk loop; pass to
+        Invoke once before the chunk loop; pass to
         :meth:`forward` as ``cross_attn_kv=result``.
         """
         result: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -794,7 +743,6 @@ class OmniDreamsDiT(BaseDiT):
         hdmap_condition: torch.Tensor | None = None,
         kv_caches: list | None = None,
         cross_attn_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
-        view_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Denoising forward (single-chunk, or one autoregressive chunk).
@@ -814,10 +762,8 @@ class OmniDreamsDiT(BaseDiT):
                 ``num_blocks``) enabling the autoregressive self-attention window.
                 ``None`` runs the plain single-chunk path.
             cross_attn_kv: optional per-block list of precomputed ``(K,V)`` tuples
-                (Phase 6 caching). When given, bypasses ``k_proj``/``v_proj``/
+                (precomputed caching). When given, bypasses ``k_proj``/``v_proj``/
                 ``k_norm`` in the cross-attention path.
-            view_indices: optional ``[B, V]`` long tensor of camera view indices
-                (Phase 5 cross-view attention). ``None`` for single-view mode.
 
         Returns:
             Patchified flow prediction ``[B, L, out_channels*kt*kh*kw]``.
@@ -829,8 +775,10 @@ class OmniDreamsDiT(BaseDiT):
         )
         # A single chunk's forward is compile-safe under fullgraph=False: the
         # only dynamic ops here are the per-block KV read/write, which graph-break
-        # cleanly. torch.compile must use max-autotune-no-cudagraphs so inductor
-        # does not install CUDA graphs that collide with OmniDreamsCUDAGraphRunner.
+        # cleanly. BCG (breakable CUDA graph) and torch.compile are mutually
+        # exclusive modes: when --enable-breakable-cuda-graph is set,
+        # DenoisingStage._maybe_torch_compile skips compilation (BCG captures
+        # the eager kernel stream itself). Do not combine the two.
         if self._sp_size > 1:
             raise RuntimeError(
                 "Sequence parallelism (SP) is not yet supported for OmniDreams. "
@@ -852,12 +800,6 @@ class OmniDreamsDiT(BaseDiT):
         if adaln_lora is not None:
             adaln_lora = adaln_lora.reshape(1, -1).expand(batch, -1)
 
-        # Phase 5: compute cross-view modulation once per forward.
-        view_embedding_proj: Tensor | None = None
-        if view_indices is not None and self.adaln_view_proj is not None:
-            view_emb = self.adaln_view_embedder(view_indices)  # [B, V, D]
-            view_embedding_proj = self.adaln_view_proj(view_emb)  # [B, V, 9D]
-
         context = self.crossattn_proj(encoder_hidden_states)
         for i, block in enumerate(self.blocks):
             x = block(
@@ -867,7 +809,6 @@ class OmniDreamsDiT(BaseDiT):
                 context,
                 self_attn_kv_cache=None if kv_caches is None else kv_caches[i],
                 cross_attn_kv=None if cross_attn_kv is None else cross_attn_kv[i],
-                view_embedding_proj=view_embedding_proj,
                 rope_cos_sin=rope_cos_sin,
             )
         return self.final_layer(x, t_emb, adaln_lora)
@@ -950,13 +891,6 @@ class RotaryPositionEmbedding3D:
                 w_extrapolation_ratio,
             ],
         )
-        # Per-axis NTK extrapolation ratios, reused by shift_t_freqs (the
-        # shared NDRotaryEmbedding.build_freqs drops theta_rescale_factor).
-        self._extrapolation_ratios = (
-            t_extrapolation_ratio,
-            h_extrapolation_ratio,
-            w_extrapolation_ratio,
-        )
 
     def _positions(self, autoregressive_index: int) -> Tensor:
         """``[L, 3]`` (t, h, w) integer coordinates in (t h w) flatten order."""
@@ -975,46 +909,6 @@ class RotaryPositionEmbedding3D:
         """
         cos, sin = self._rope.forward(self._positions(autoregressive_index))
         return torch.cat([cos, sin], dim=-1)
-
-    def shift_t_freqs(self, autoregressive_index: int = 0) -> Tensor:
-        """``[L, 1, 1, D]`` raw angle tensor for the native FP8 path.
-
-        The native FP8 DiT applies cos/sin internally (via
-        ``_make_cosmos_rope_cache``), so it needs the raw frequency×position
-        angles rather than the precomputed cos|sin cache returned by
-        :meth:`shift_t`.
-
-        Matches flashdreams ``RotaryPositionEmbedding3D.shift_t``: per-axis
-        NTK-rescaled base frequencies (``_compute_freqs``) concatenated with
-        the non-interleaved ``[t, h, w, t, h, w]`` layout (``_cat_freqs``).
-        The shared ``NDRotaryEmbedding.build_freqs`` deliberately drops
-        ``theta_rescale_factor`` (see mrope.py), so the rescale is applied
-        here; using ``build_freqs`` directly produced the wrong layout
-        (``[t, t, h, h, w, w]``) AND dropped the h/w NTK extrapolation,
-        which corrupted the native FP8 RoPE and caused blur.
-        """
-        pos = self._positions(autoregressive_index)  # [L, 3] (t, h, w)
-        dim_t, dim_h, dim_w = rope_dims(self.head_dim)
-        ratios = self._extrapolation_ratios  # (t, h, w)
-        halves: list[Tensor] = []
-        for axis_idx, axis_dim in enumerate((dim_t, dim_h, dim_w)):
-            ratio = ratios[axis_idx]
-            theta = 10000.0
-            if ratio != 1.0:
-                theta = theta * (ratio ** (axis_dim / (axis_dim - 2)))
-            dim_range = (
-                torch.arange(0, axis_dim, 2, dtype=torch.float32, device=pos.device)[
-                    : axis_dim // 2
-                ]
-                / axis_dim
-            )
-            base_freqs = 1.0 / (theta**dim_range)  # [dim//2]
-            angles = torch.outer(pos[:, axis_idx].float(), base_freqs)  # [L, dim//2]
-            halves.append(angles)
-        ft, fh, fw = halves
-        # Non-interleaved _cat_freqs: cat([t, h, w] * 2) -> [L, D].
-        raw = torch.cat([ft, fh, fw, ft, fh, fw], dim=-1)
-        return raw.unsqueeze(1).unsqueeze(1)  # [L, 1, 1, D]
 
 
 def apply_rope_freqs(x: Tensor, cos_sin: Tensor) -> Tensor:

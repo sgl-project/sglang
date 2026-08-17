@@ -35,10 +35,6 @@ class OmniDreamsDiTArchConfig(DiTArchConfig):
     # HDMap variant: 16 extra latent channels routed through additional_patch_embedding.
     # Overrides the FlashDreams CosmosDiTNetworkConfig default of 0 (HDMap disabled).
     additional_concat_ch: int = 16
-    # Cross-view attention is disabled for the single-view checkpoint.
-    enable_cross_view_attn: bool = False
-    view_condition_dim: int = 16
-    n_cameras_emb: int = 7
 
     # Checkpoint keys equal submodule names -> identity mappings.
     param_names_mapping: dict = field(default_factory=dict)

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """OmniDreams FP8 weight utilities (pure Python).
 
-Phase 1 dropped the vendored native CUDA FP8 DiT tree. What remains is the
+The vendored native CUDA FP8 DiT tree. What remains is the
 CPU-runnable FP8 weight surface used by the offline exporter and the
 ``weight_only_fp8`` runtime path:
 
@@ -15,7 +15,7 @@ CPU-runnable FP8 weight surface used by the offline exporter and the
 
 The native FP8 DiT dispatch (FP8 tensor-core GEMMs + Sage3/Sparge attention via
 the vendored C++ extension) was removed with the native tree. A PyTorch-native
-``fp8_compute`` mode may be added in Phase 2.
+``fp8_compute`` mode is available.
 """
 
 from __future__ import annotations
@@ -93,12 +93,13 @@ def prepare_fp8_dit_weights(
     # helpers expect the legacy split q/k/v keys. Unfuse first so they run
     # unchanged (see _unfuse_self_attn_qkv_for_cosmos).
     cpu_state = _unfuse_self_attn_qkv_for_cosmos(cpu_state)
-    return prepare_cosmos_quantized_streaming_weights(
+    prepared = prepare_cosmos_quantized_streaming_weights(
         cpu_state,
         num_blocks=num_blocks,
         device=None,
         linear_policy=linear_policy,
     )
+    return prepared
 
 
 # --------------------------------------------------------------------------- #
@@ -167,29 +168,75 @@ def dequantize_fp8_weights_to_bf16(
     return result
 
 
+def prepared_fp8_weight_cache(
+    prepared_weights: dict[str, torch.Tensor],
+    weight_key: str,
+    *,
+    target_shape: tuple[int, int],
+    tp_rank: int,
+    tp_world_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return one TP-local FP8 weight and its row scales from an artifact.
+
+    The artifact keeps E4M3 bytes in the normal ``[out, in]`` layout.  A TP
+    linear can shard either rows or columns, but not both; slice the full
+    artifact accordingly and retain its FP8 representation for ``_scaled_mm``.
+    """
+    raw_weight = prepared_weights.get(weight_key)
+    raw_scale = prepared_weights.get(f"{weight_key}_scale")
+    if raw_weight is None or raw_scale is None:
+        raise KeyError(f"prepared FP8 artifact is missing {weight_key!r} or its scale")
+    if raw_weight.dtype != torch.uint8 or raw_weight.ndim != 2:
+        raise ValueError(
+            f"prepared FP8 weight {weight_key!r} must be 2-D uint8, got "
+            f"shape={tuple(raw_weight.shape)}, dtype={raw_weight.dtype}"
+        )
+    if raw_scale.ndim != 1 or raw_scale.shape[0] != raw_weight.shape[0]:
+        raise ValueError(
+            f"prepared FP8 scale for {weight_key!r} must have one value per output row"
+        )
+    if tp_world_size < 1 or not 0 <= tp_rank < tp_world_size:
+        raise ValueError(f"invalid TP rank/world size: {tp_rank}/{tp_world_size}")
+
+    out, in_ = target_shape
+    full_out, full_in = raw_weight.shape
+    row_sharded = full_out == out * tp_world_size and full_in == in_
+    col_sharded = full_out == out and full_in == in_ * tp_world_size
+    unsharded = (full_out, full_in) == target_shape
+    if not (unsharded or row_sharded or col_sharded):
+        raise ValueError(
+            f"prepared FP8 shape {tuple(raw_weight.shape)} for {weight_key!r} "
+            f"cannot produce local TP shape {target_shape} at {tp_rank}/{tp_world_size}"
+        )
+    if row_sharded:
+        start = tp_rank * out
+        raw_weight = raw_weight[start : start + out]
+        raw_scale = raw_scale[start : start + out]
+    elif col_sharded:
+        start = tp_rank * in_
+        raw_weight = raw_weight[:, start : start + in_]
+
+    return (
+        raw_weight.contiguous().view(torch.float8_e4m3fn),
+        raw_scale.to(torch.float32).reshape(1, -1).contiguous(),
+    )
+
+
 # ============================================================================
 # FP8-compute linears (folded from omnidreams_fp8_compute.py)
 # ============================================================================
-"""Phase 2: PyTorch-native FP8-compute linears for the OmniDreams DiT.
+"""PyTorch-native FP8-compute linears for the OmniDreams DiT.
 
-Replaces the DiT's bf16 GEMMs (self/cross-attn projections + MLP) with
-FP8-compute matmuls via ``torch._scaled_mm`` on Blackwell (sm_120+), without any
-custom CUDA. Weights are quantized once (lazily, on first call) to FP8 e4m3 with
-a **per-output-channel (row-wise) scale** -- the same per-channel scheme as the
-offline FP8 artifact (``omnidreams_cosmos_fp8_utils.quantize_fp8_per_out_channel``)
--- and activations are quantized dynamically **per token (per row)** before each
-matmul. The rowwise ``torch._scaled_mm(a_fp8, w_fp8.t(), scale_a=[M,1],
-scale_b=[N], out_dtype=bf16)`` runs on FP8 tensor cores (~2x bf16 on sm_120).
+Replaces only the DiT MLP's bf16 GEMMs with FP8-compute matmuls via
+``torch._scaled_mm`` on Blackwell (sm_120+), without custom CUDA. Attention
+projections stay BF16 because W8A8 error accumulates through the autoregressive
+denoising loop. MLP weights are quantized once (lazily, on first call) to FP8
+e4m3 with a **per-output-channel (row-wise) scale**, and activations are
+quantized dynamically **per token (per row)** before each matmul.
 
-Design:
-* TP linears (``MergedColumnParallelLinear``/``ColumnParallelLinear``/
-  ``RowParallelLinear``) delegate the matmul to ``self.quant_method.apply``; the
-  TP gather/reduce lives in the linear's ``forward``. Swapping ``quant_method``
-  to :class:`OmniDreamsFP8ComputeLinearMethod` FP8s the matmul while preserving
-  all TP semantics -- no weight-loader / sharding reimplementation needed.
-* Plain ``nn.Linear`` (the GPT2FeedForward ``mlp.layer1``/``layer2`` are not
-  TP-sharded) is replaced with :class:`OmniDreamsFP8ComputeLinear`, a thin
-  wrapper holding the original bf16 weight and the same FP8 forward.
+Design: plain ``nn.Linear`` (the GPT2FeedForward ``mlp.layer1``/``layer2`` are
+not TP-sharded) is replaced with :class:`OmniDreamsFP8ComputeLinear`, a thin
+wrapper holding the original bf16 weight and the FP8 forward.
 
 The DiT is loaded normally (bf16 checkpoint, TP-sharded, ``post_load_weights``);
 :func:`install_fp8_compute_on_dit` then swaps the linears in place. Each rank
@@ -201,9 +248,6 @@ HW (CPU, no ``_scaled_mm``) the install is a no-op and the DiT runs eager bf16.
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
-    QuantizeMethodBase,
-)
 from sglang.multimodal_gen.runtime.models.dits.omnidreams_cosmos_fp8_utils import (
     FP8_MAX_E4M3,
     FP8_SCALE_EPS,
@@ -212,6 +256,18 @@ from sglang.multimodal_gen.runtime.models.dits.omnidreams_cosmos_fp8_utils impor
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+# sgl_kernel's CUTLASS rowwise fp8 GEMM. The prebuilt ``sglang-kernel`` wheel
+# (CUDA>=12.8, sm_120a gencode) ships it in the same .so as ``rmsnorm``, so it is
+# present on any mmgen-CUDA host. On CPU / non-sgl_kernel hosts it stays None and
+# ``_fp8_matmul`` falls back to ``torch._scaled_mm``.
+_sgl_fp8_scaled_mm = None
+if torch.cuda.is_available():
+    try:
+        from sgl_kernel import fp8_scaled_mm as _sgl_fp8_scaled_mm
+    except Exception:  # pragma: no cover - depends on the installed kernel wheel
+        _sgl_fp8_scaled_mm = None
 
 
 def _scaled_mm_available() -> bool:
@@ -247,29 +303,43 @@ def _fp8_matmul(
     w_scale: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    """FP8-compute matmul: ``x @ w_fp8.t()`` via rowwise ``torch._scaled_mm``.
+    """FP8-compute matmul: ``x @ w_fp8.t()``.
+
+    Uses sgl_kernel's CUTLASS rowwise fp8 GEMM when available — the same
+    per-token ``scale_a [M,1]`` + per-output-channel ``scale_b [1,N]`` scheme as
+    ``torch._scaled_mm``, with ``bias`` folded into the kernel. Falls back to
+    ``torch._scaled_mm`` + a separate bias add when sgl_kernel is unavailable.
 
     Args:
         x: activation ``[..., K]`` (bf16/fp32).
         w_fp8: weight ``[N, K]`` as ``float8_e4m3fn`` (per-row scale ``w_scale``).
-        w_scale: per-output-channel weight scale ``[N]``.
+        w_scale: per-output-channel weight scale ``[1, N]``.
         bias: optional ``[N]``.
 
     Returns: ``[..., N]`` bf16.
     """
     orig_shape = x.shape
     x_fp8, a_scale = _quantize_activation_per_token(x)  # [M,K], [M,1]
-    # rowwise scaled_mm: scale_a [M,1], scale_b [N]; weight passed as [K,N] (w.t()).
-    out = torch._scaled_mm(
-        x_fp8,
-        w_fp8.t(),
-        scale_a=a_scale,
-        scale_b=w_scale,
-        out_dtype=torch.bfloat16,
-    )  # [M, N]
+    if _sgl_fp8_scaled_mm is not None:
+        out = _sgl_fp8_scaled_mm(
+            x_fp8,
+            w_fp8.t(),  # [K, N]
+            a_scale,
+            w_scale,
+            torch.bfloat16,
+            bias,
+        )  # [M, N]
+    else:
+        out = torch._scaled_mm(
+            x_fp8,
+            w_fp8.t(),  # [K, N]
+            scale_a=a_scale,
+            scale_b=w_scale,
+            out_dtype=torch.bfloat16,
+        )  # [M, N]
+        if bias is not None:
+            out = out + bias
     out = out.reshape(*orig_shape[:-1], out.shape[-1])
-    if bias is not None:
-        out = out + bias
     return out
 
 
@@ -289,26 +359,6 @@ def _ensure_weight_cache(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor]
     w_scale = w_scale.to(torch.float32).reshape(1, -1).contiguous()  # [1, N]
     module._fp8_compute_cache = (weight, w_fp8, w_scale)
     return w_fp8, w_scale
-
-
-class OmniDreamsFP8ComputeLinearMethod(QuantizeMethodBase):
-    """Drop-in ``quant_method`` that FP8-computes an existing TP linear's matmul.
-
-    ``create_weights`` is a no-op: the linear already holds its bf16 weight
-    (loaded by the normal checkpoint path). ``apply`` lazily quantizes that
-    weight per-output-channel and runs ``torch._scaled_mm``. The linear's
-    ``forward`` (TP gather/reduce) is unchanged, so all TP semantics survive.
-    """
-
-    def create_weights(self, layer: nn.Module, *args, **kwargs) -> None:  # noqa: D401
-        # Weight already exists on the layer (post-load swap); nothing to create.
-        return None
-
-    def apply(
-        self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        w_fp8, w_scale = _ensure_weight_cache(layer)
-        return _fp8_matmul(x, w_fp8, w_scale, bias)
 
 
 class OmniDreamsFP8ComputeLinear(nn.Module):
@@ -341,7 +391,9 @@ class OmniDreamsFP8ComputeLinear(nn.Module):
         return _fp8_matmul(x, w_fp8, w_scale, self.bias)
 
 
-def install_fp8_compute_on_dit(dit: nn.Module) -> bool:
+def install_fp8_compute_on_dit(
+    dit: nn.Module, prepared_weights: dict[str, torch.Tensor] | None = None
+) -> bool:
     """Swap the DiT's linears to FP8-compute in place (post-load).
 
     Returns True if installed, False if skipped (non-CUDA DiT / no
@@ -366,21 +418,45 @@ def install_fp8_compute_on_dit(dit: nn.Module) -> bool:
         )
         return False
 
-    method = OmniDreamsFP8ComputeLinearMethod()
     n_swapped = 0
     for block in dit.blocks:
-        # Self-attn: fused QKV (MergedColumnParallel) + output (RowParallel).
-        block.self_attn.to_qkv.quant_method = method
-        block.self_attn.output_proj.quant_method = method
-        # Cross-attn: q (ColumnParallel) + fused KV (MergedColumnParallel) + output.
-        block.cross_attn.q_proj.quant_method = method
-        block.cross_attn.to_kv.quant_method = method
-        block.cross_attn.output_proj.quant_method = method
-        n_swapped += 5
-        # MLP: plain nn.Linear (not TP-sharded) -> replace with the FP8 wrapper.
+        # Attention stays BF16. DiT attention is precision-sensitive: applying
+        # dynamic W8A8 to Q/K/V or attention outputs causes AR denoising noise.
+        # Keep the established conservative policy and accelerate MLP only.
+        # MLP linears are plain nn.Linear (not TP-sharded).
         block.mlp.layer1 = OmniDreamsFP8ComputeLinear.from_linear(block.mlp.layer1)
         block.mlp.layer2 = OmniDreamsFP8ComputeLinear.from_linear(block.mlp.layer2)
         n_swapped += 2
+
+    if prepared_weights is not None:
+        from sglang.multimodal_gen.runtime.distributed import (
+            get_tp_rank,
+            get_tp_world_size,
+        )
+
+        tp_rank = get_tp_rank()
+        tp_world_size = get_tp_world_size()
+        for block_idx, block in enumerate(dit.blocks):
+            prefix = f"blocks.{block_idx}."
+            sites = (
+                (block.mlp.layer1, prefix + "mlp.layer1.weight", False),
+                (block.mlp.layer2, prefix + "mlp.layer2.weight", False),
+            )
+            for layer, key, is_tp in sites:
+                local_rank = tp_rank if is_tp else 0
+                local_world_size = tp_world_size if is_tp else 1
+                w_fp8, w_scale = prepared_fp8_weight_cache(
+                    prepared_weights,
+                    key,
+                    target_shape=tuple(layer.weight.shape),
+                    tp_rank=local_rank,
+                    tp_world_size=local_world_size,
+                )
+                layer._fp8_compute_cache = (
+                    layer.weight,
+                    w_fp8.to(device=layer.weight.device),
+                    w_scale.to(device=layer.weight.device),
+                )
 
     dit._fp8_compute_applied = True
     logger.info(

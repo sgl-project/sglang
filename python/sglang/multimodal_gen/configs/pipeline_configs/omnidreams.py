@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pipeline config for NVIDIA OmniDreams.
 
-Phase 0 wires the static structure (DiT config, VAE reuse, task type) and the
+The config wires the static structure (DiT config, VAE reuse, task type) and the
 2-step flow-match sigma schedule. The denoising/decoding callbacks used at GPU
 time are added in later phases.
 """
@@ -83,9 +83,9 @@ class OmniDreamsPipelineConfig(PipelineConfig):
     )
 
     # DiT FP8 acceleration mode (kept as flat fields, not a nested Config).
-    # Phase 1 honors ``disabled`` (eager bf16, default) and ``weight_only_fp8``
+    # Honors ``disabled`` (eager bf16, default) and ``weight_only_fp8``
     # (dequantize pre-quantized FP8 → bf16, eager PyTorch forward).
-    # Phase 2 adds ``fp8_compute``: swap the DiT linears to FP8-compute via
+    # Adds ``fp8_compute``: swap the DiT linears to FP8-compute via
     # ``torch._scaled_mm`` (per-channel weight + per-token activation). Falls
     # back to eager bf16 on non-FP8 HW (CPU).
     # ``auto``/``required`` are accepted as inert back-compat aliases mapped to

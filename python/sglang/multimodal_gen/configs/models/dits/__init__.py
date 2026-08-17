@@ -18,7 +18,6 @@ from sglang.multimodal_gen.configs.models.dits.longlive2 import LongLive2VideoCo
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTConfig
 from sglang.multimodal_gen.configs.models.dits.mova_audio import MOVAAudioConfig
 from sglang.multimodal_gen.configs.models.dits.mova_video import MOVAVideoConfig
-from sglang.multimodal_gen.configs.models.dits.omnidreams import OmniDreamsDiTConfig
 from sglang.multimodal_gen.configs.models.dits.sana_video import SanaVideoConfig
 from sglang.multimodal_gen.configs.models.dits.stablediffusion3 import (
     StableDiffusion3TransformerConfig,
@@ -39,7 +38,6 @@ __all__ = [
     "Hunyuan3DDiTConfig",
     "MOVAAudioConfig",
     "MOVAVideoConfig",
-    "OmniDreamsDiTConfig",
     "SanaVideoConfig",
     "StableDiffusion3TransformerConfig",
 ]
