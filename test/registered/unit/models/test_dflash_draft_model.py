@@ -18,6 +18,7 @@ from sglang.srt.speculative.dflash_utils import (
     get_dflash_attention_sliding_window_size,
 )
 from sglang.srt.speculative.dflash_worker_v2 import _get_dflash_embedding_module
+from sglang.test.test_utils import CustomTestCase
 
 
 class _FakeDraftLayer(nn.Module):
@@ -194,7 +195,7 @@ def _draft_config(*, has_embed_tokens):
     )
 
 
-class TestDFlashDraftModel(unittest.TestCase):
+class TestDFlashDraftModel(CustomTestCase):
     @patch.object(dflash, "VocabParallelEmbedding", _FakeEmbedding)
     @patch.object(dflash, "RMSNorm", _FakeNorm)
     @patch.object(dflash, "ReplicatedLinear", _FakeReplicatedLinear)
@@ -228,7 +229,7 @@ class TestDFlashDraftModel(unittest.TestCase):
         self.assertIsNone(model.get_input_embeddings())
 
 
-class TestDFlashDecoderLayer(unittest.TestCase):
+class TestDFlashDecoderLayer(CustomTestCase):
     def test_sliding_window_falls_back_to_published_dflash_config(self):
         config = SimpleNamespace(
             layer_types=["sliding_attention"],
@@ -411,7 +412,7 @@ class TestDFlashDecoderLayer(unittest.TestCase):
         torch.testing.assert_close(projected, target_hidden[:, :4])
 
 
-class TestDFlashWeightValidation(unittest.TestCase):
+class TestDFlashWeightValidation(CustomTestCase):
     @staticmethod
     def _weight(shape, *, pack_factor=None):
         weight = nn.Parameter(torch.empty(shape), requires_grad=False)
@@ -479,7 +480,7 @@ class TestDFlashWeightValidation(unittest.TestCase):
         )
 
 
-class TestDFlashEmbeddingSelection(unittest.TestCase):
+class TestDFlashEmbeddingSelection(CustomTestCase):
     def test_draft_embedding_is_preferred(self):
         draft_embedding = object()
         target_embedding = object()
@@ -513,7 +514,7 @@ class _FakeW4A16HeadMethod:
 _FakeW4A16HeadMethod.__name__ = "ModelOptNvFp4A16LinearMethod"
 
 
-class TestDFlashGreedyHead(unittest.TestCase):
+class TestDFlashGreedyHead(CustomTestCase):
     @staticmethod
     def _worker_stub():
         worker = object.__new__(dflash_worker_v2.DFlashWorkerV2)

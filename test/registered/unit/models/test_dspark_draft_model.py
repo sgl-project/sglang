@@ -13,6 +13,7 @@ from torch import nn
 
 from sglang.srt.models import dspark
 from sglang.srt.models.dspark import DSparkDraftMixin, build_markov_head
+from sglang.test.test_utils import CustomTestCase
 
 
 class _FakeReplicatedLinear(nn.Module):
@@ -67,7 +68,7 @@ class _LoadWeightsDraft(DSparkDraftMixin, _LoadWeightsBase):
         self.markov_head = nn.Module()
 
 
-class TestDSparkDraftModel(unittest.TestCase):
+class TestDSparkDraftModel(CustomTestCase):
     @patch.object(dspark, "ReplicatedLinear", _FakeReplicatedLinear)
     def test_markov_projection_receives_quant_config_and_full_prefix(self):
         _FakeReplicatedLinear.calls.clear()
