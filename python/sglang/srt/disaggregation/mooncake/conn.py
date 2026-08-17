@@ -800,13 +800,7 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 for (src_ptr, dst_ptr, item_len) in layers_params
             ]
-            for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for f in futures:
-                        f.cancel()
-                    return status
-            return 0
+            return self._await_transfer_futures(futures)
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
@@ -857,6 +851,29 @@ class MooncakeKVManager(CommonKVManager):
                 f"{dst_kv_item_len}. With --enable-unified-memory both sides "
                 "must enable it and use the same page size and model spec."
             )
+
+    def _await_transfer_futures(self, futures) -> int:
+        """Wait for a chunk's per-layer RDMA writes and return the first non-zero
+        status. ``future.cancel()`` is a no-op once a future is running, so on
+        failure we cancel the not-yet-started ones but, when deferred decode-side
+        KV release is enabled, still drain the already-running ones before
+        returning: the drain-ack relies on ``_staging_outstanding == 0`` meaning
+        no write is still touching the decode pages, so no sibling write may
+        outlive this call. With the feature off, keep the original
+        early-return-on-first-failure behavior (byte-identical)."""
+        ret = 0
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                status = future.result()
+            except concurrent.futures.CancelledError:
+                continue
+            if status != 0 and ret == 0:
+                ret = status
+                for f in futures:
+                    f.cancel()
+                if not self.enable_deferred_decode_kv_release:
+                    return ret
+        return ret
 
     def send_kvcache(
         self,
@@ -983,13 +1000,7 @@ class MooncakeKVManager(CommonKVManager):
                 executor.submit(process_layer, src_ptr, dst_ptr, token_item_len)
                 for src_ptr, dst_ptr, token_item_len in layers_params
             ]
-            for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for pending in futures:
-                        pending.cancel()
-                    return status
-            return 0
+            return self._await_transfer_futures(futures)
 
         transfer_blocks = []
         for src_ptr, dst_ptr, token_item_len in layers_params:
@@ -1117,14 +1128,7 @@ class MooncakeKVManager(CommonKVManager):
                 executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
             )
 
-        for future in concurrent.futures.as_completed(futures):
-            status = future.result()
-            if status != 0:
-                for f in futures:
-                    f.cancel()
-                return status
-
-        return 0
+        return self._await_transfer_futures(futures)
 
     def send_aux(
         self,
