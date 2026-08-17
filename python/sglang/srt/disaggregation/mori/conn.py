@@ -1487,6 +1487,8 @@ class MoriKVSender(CommonKVSender):
             self._finalize_failure()
 
     def _run_chunk(self, task: _TransferChunk) -> None:
+        if self.bootstrap_room not in self.kv_mgr.request_status:
+            return
         if self.conclude_state is not None:
             return
         if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed:

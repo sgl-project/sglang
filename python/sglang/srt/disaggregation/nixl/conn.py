@@ -1119,7 +1119,15 @@ class NixlKVManager(CommonKVManager):
             room = kv_chunk.room
             handles: List[Any] = []
             try:
-                if self.check_status(room) == KVPoll.Failed:
+                if (
+                    room not in self.request_status
+                    or self.check_status(room) == KVPoll.Failed
+                ):
+                    logger.debug(
+                        "Skipping chunk for room %s because it has already "
+                        "failed, been aborted, or been cleared",
+                        room,
+                    )
                     self._staging_outstanding.pop(room, None)
                     continue
 
