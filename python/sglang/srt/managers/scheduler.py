@@ -1926,7 +1926,7 @@ class Scheduler(
         # current (old-role) event loop so the supervisor can re-dispatch.
         if self._event_loop_should_restart:
             self._event_loop_should_restart = False
-            raise _PdRoleSwitchRestart()
+            raise role_switch.PdRoleSwitchRestart()
 
     def _materialize_cuda_vmm_inputs(self, recv_req):
         """Release VMM slices before request handling can reject the request."""
@@ -4846,9 +4846,6 @@ class Scheduler(
     def handle_pd_role_switch(self, recv_req: PdRoleSwitchReqInput):
         return role_switch.handle_pd_role_switch(self, recv_req)
 
-    def _teardown_disaggregation(self):
-        role_switch.teardown_disaggregation(self)
-
     def _sync_disaggregation_mode_to_subcomponents(self):
         # Push the (possibly flipped) mode into sub-components that cache it.
         # object.__setattr__ because some are frozen dataclasses.
@@ -4942,25 +4939,13 @@ class Scheduler(
         pass
 
 
-class _PdRoleSwitchRestart(Exception):
-    """Internal signal: break out of the current disaggregation event loop so the
-    supervisor can re-dispatch after a runtime P<->D role switch."""
-
-
 def dispatch_event_loop(scheduler: Scheduler):
-    if not scheduler.server_args.enable_pd_role_switch:
-        return _dispatch_event_loop_once(scheduler)
-
-    # Supervisor: a runtime PD role switch breaks out of the active event loop by
-    # raising _PdRoleSwitchRestart; we then re-dispatch to the new role's loop.
-    while True:
-        try:
-            return _dispatch_event_loop_once(scheduler)
-        except _PdRoleSwitchRestart:
-            logger.info(
-                "Re-dispatching event loop after PD role switch -> %s",
-                scheduler.disaggregation_mode.value,
-            )
+    if scheduler.server_args.enable_pd_role_switch:
+        return role_switch.run_event_loop_supervisor(
+            scheduler,
+            _dispatch_event_loop_once,
+        )
+    return _dispatch_event_loop_once(scheduler)
 
 
 def _dispatch_event_loop_once(scheduler: Scheduler):

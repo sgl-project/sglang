@@ -8,7 +8,7 @@ Kept out of scheduler.py to avoid growing it further.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
@@ -18,6 +18,24 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
+
+
+class PdRoleSwitchRestart(Exception):
+    """Break out of the current role's event loop after a successful switch."""
+
+
+def run_event_loop_supervisor(
+    scheduler: Scheduler, dispatch_once: Callable[[Scheduler], None]
+) -> None:
+    """Re-dispatch the scheduler event loop after each runtime role switch."""
+    while True:
+        try:
+            return dispatch_once(scheduler)
+        except PdRoleSwitchRestart:
+            logger.info(
+                "Re-dispatching event loop after PD role switch -> %s",
+                scheduler.disaggregation_mode.value,
+            )
 
 
 def handle_pd_role_switch(
@@ -56,7 +74,7 @@ def handle_pd_role_switch(
         # new role not up) and isn't safe to serve, so mark it unhealthy. There
         # is no in-place rollback.
         try:
-            scheduler._teardown_disaggregation()
+            teardown_disaggregation(scheduler)
             get_context().override("role_switch.flip", disaggregation_mode=new_role)
             scheduler.init_disaggregation()
         except Exception as e:

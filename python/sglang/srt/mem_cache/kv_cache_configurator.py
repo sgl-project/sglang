@@ -755,17 +755,18 @@ class KVCacheConfigurator:
             max_draft_tokens=max_speculative_num_draft_tokens(),
         )
 
-        if (
-            get_disagg().disaggregation_mode == "decode"
-            or get_disagg().enable_pd_role_switch
-        ):
+        disagg = get_disagg()
+        is_decode = disagg.disaggregation_mode == "decode"
+        if is_decode or disagg.enable_pd_role_switch:
             # Extra slots for pre-allocated requests. Role switching needs a
             # role-agnostic pool: the decode-flavored DecodeReqToTokenPool is a
             # superset of ReqToTokenPool, so a prefill instance can use it and
-            # later flip to decode without reallocation. extra_slots is only
-            # defaulted for the decode role; fall back to 0 so a role-switch
-            # prefill can build the same pool.
-            pre_alloc_size = get_disagg().disaggregation_decode_extra_slots or 0
+            # later flip to decode without reallocation. Preserve the original
+            # decode value exactly; only a role-switch prefill needs the fallback
+            # because extra_slots is defaulted for decode at startup.
+            pre_alloc_size = disagg.disaggregation_decode_extra_slots
+            if not is_decode:
+                pre_alloc_size = pre_alloc_size or 0
             if self.mambaish_config:
                 req_to_token_pool = self._build_hybrid_mamba_decode_req_pool(
                     max_num_reqs=max_num_reqs,

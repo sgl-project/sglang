@@ -2,9 +2,10 @@ import argparse
 import concurrent.futures
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.srt import runtime_context as rc  # noqa: E402
+from sglang.srt.disaggregation import role_switch  # noqa: E402
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqInput,
@@ -54,7 +55,9 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         rc.get_context().set_server_args(sa)
         s.server_args = sa
         s.is_fully_idle = MagicMock(return_value=idle)
-        s._teardown_disaggregation = MagicMock()
+        teardown_patcher = patch.object(role_switch, "teardown_disaggregation")
+        s.teardown_disaggregation = teardown_patcher.start()
+        self.addCleanup(teardown_patcher.stop)
         s.init_disaggregation = MagicMock()
         s._event_loop_should_restart = False
         s._pd_role_switch_in_progress = False
@@ -70,14 +73,14 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertIsInstance(out, PdRoleSwitchReqOutput)
         self.assertFalse(out.success)
         self.assertIn("enable-pd-role-switch", out.message)
-        s._teardown_disaggregation.assert_not_called()
+        s.teardown_disaggregation.assert_not_called()
 
     def test_rejected_on_invalid_role(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
         out = Scheduler.handle_pd_role_switch(s, PdRoleSwitchReqInput(new_role="both"))
         self.assertFalse(out.success)
         self.assertIn("invalid new_role", out.message)
-        s._teardown_disaggregation.assert_not_called()
+        s.teardown_disaggregation.assert_not_called()
 
     def test_rejected_when_not_in_pd_mode(self):
         s = self._scheduler(DisaggregationMode.NULL)
@@ -86,7 +89,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         )
         self.assertFalse(out.success)
         self.assertIn("not running in PD", out.message)
-        s._teardown_disaggregation.assert_not_called()
+        s.teardown_disaggregation.assert_not_called()
 
     def test_same_role_is_noop(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
@@ -95,7 +98,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         )
         self.assertTrue(out.success)
         self.assertEqual(out.message, "already in target role")
-        s._teardown_disaggregation.assert_not_called()
+        s.teardown_disaggregation.assert_not_called()
         s.init_disaggregation.assert_not_called()
         self.assertFalse(s._event_loop_should_restart)
 
@@ -106,7 +109,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         )
         self.assertFalse(out.success)
         self.assertIn("not idle", out.message)
-        s._teardown_disaggregation.assert_not_called()
+        s.teardown_disaggregation.assert_not_called()
 
     def test_successful_flip_orchestration(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
@@ -118,7 +121,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertEqual(out.old_role, "prefill")
         self.assertEqual(out.new_role, "decode")
         # Orchestration: drain -> teardown -> flip config bag -> rebuild -> signal.
-        s._teardown_disaggregation.assert_called_once()
+        s.teardown_disaggregation.assert_called_once_with(s)
         self.assertEqual(rc.get_disagg().disaggregation_mode, "decode")
         # The pristine startup record is never mutated.
         self.assertEqual(s.server_args.disaggregation_mode, "prefill")
@@ -149,7 +152,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         )
         self.assertFalse(out.success)
         self.assertIn("in progress", out.message)
-        s._teardown_disaggregation.assert_not_called()
+        s.teardown_disaggregation.assert_not_called()
 
     def test_rejected_when_unhealthy(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
@@ -159,7 +162,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         )
         self.assertFalse(out.success)
         self.assertIn("unhealthy", out.message)
-        s._teardown_disaggregation.assert_not_called()
+        s.teardown_disaggregation.assert_not_called()
 
     def test_rebuild_failure_marks_unhealthy_and_notifies(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
@@ -178,7 +181,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertFalse(s._event_loop_should_restart)
         self.assertFalse(s._pd_role_switch_in_progress)
         # Teardown + rebuild attempted exactly once (no rollback).
-        self.assertEqual(s._teardown_disaggregation.call_count, 1)
+        self.assertEqual(s.teardown_disaggregation.call_count, 1)
         self.assertEqual(s.init_disaggregation.call_count, 1)
         # A subsequent switch is rejected because the instance is unhealthy.
         out2 = Scheduler.handle_pd_role_switch(
@@ -192,7 +195,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         during teardown (not only rebuild) must also mark the instance unhealthy
         and must not proceed to rebuild."""
         s = self._scheduler(DisaggregationMode.PREFILL)
-        s._teardown_disaggregation = MagicMock(side_effect=RuntimeError("boom"))
+        s.teardown_disaggregation.side_effect = RuntimeError("boom")
 
         out = Scheduler.handle_pd_role_switch(
             s, PdRoleSwitchReqInput(new_role="decode")
@@ -205,7 +208,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertFalse(s._event_loop_should_restart)
         self.assertFalse(s._pd_role_switch_in_progress)
         # Teardown raised, so rebuild is never attempted.
-        self.assertEqual(s._teardown_disaggregation.call_count, 1)
+        self.assertEqual(s.teardown_disaggregation.call_count, 1)
         s.init_disaggregation.assert_not_called()
 
 
