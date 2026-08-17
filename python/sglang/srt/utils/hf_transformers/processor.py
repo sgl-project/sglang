@@ -13,6 +13,7 @@
 # ==============================================================================
 """Processor loading utilities."""
 
+import contextlib
 import json
 from pathlib import Path
 from typing import Optional
@@ -23,6 +24,7 @@ from transformers import (
     AutoTokenizer,
     PreTrainedTokenizerBase,
 )
+from transformers.processing_utils import ProcessorMixin
 
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import logger
@@ -116,6 +118,42 @@ def _apply_image_processor_backend(
         **image_processor_kwargs,
     )
     return processor
+
+
+# Molmo2's custom processing_molmo2.py (loaded via trust_remote_code) forwards
+# these five Molmo2-specific kwargs to ProcessorMixin.__init__. transformers 4.x
+# swallowed unknown kwargs silently; transformers 5.x rejects them with
+# TypeError, which crashes AutoProcessor.from_pretrained before the processor is
+# returned. Restore the 4.x-lenient behavior for these keys only, and only while
+# a molmo2 processor is being constructed.
+_MOLMO2_EXTRA_INIT_KWARGS = (
+    "image_use_col_tokens",
+    "use_single_crop_col_tokens",
+    "use_single_crop_start_token",
+    "video_use_col_tokens",
+    "use_frame_special_tokens",
+)
+
+
+@contextlib.contextmanager
+def _molmo2_processor_init_compat():
+    original_init = ProcessorMixin.__init__
+
+    def _tolerant_init(self, *init_args, **init_kwargs):
+        extras = {
+            key: init_kwargs.pop(key)
+            for key in _MOLMO2_EXTRA_INIT_KWARGS
+            if key in init_kwargs
+        }
+        original_init(self, *init_args, **init_kwargs)
+        for name, value in extras.items():
+            setattr(self, name, value)
+
+    ProcessorMixin.__init__ = _tolerant_init
+    try:
+        yield
+    finally:
+        ProcessorMixin.__init__ = original_init
 
 
 def _build_processor_manually(
@@ -270,6 +308,11 @@ def get_processor(
         if "size" not in kwargs:
             kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
 
+    if config.model_type == "molmo2":
+        processor_init_compat = _molmo2_processor_init_compat()
+    else:
+        processor_init_compat = contextlib.nullcontext()
+
     try:
         if "InternVL3_5" in tokenizer_name:
             processor = AutoTokenizer.from_pretrained(
@@ -289,13 +332,14 @@ def get_processor(
                     **kwargs,
                 )
             else:
-                processor = AutoProcessor.from_pretrained(
-                    tokenizer_name,
-                    *args,
-                    trust_remote_code=trust_remote_code,
-                    revision=revision,
-                    **kwargs,
-                )
+                with processor_init_compat:
+                    processor = AutoProcessor.from_pretrained(
+                        tokenizer_name,
+                        *args,
+                        trust_remote_code=trust_remote_code,
+                        revision=revision,
+                        **kwargs,
+                    )
 
     except ValueError as e:
         error_message = str(e)
