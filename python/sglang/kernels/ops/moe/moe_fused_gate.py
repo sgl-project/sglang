@@ -264,6 +264,8 @@ def moe_fused_gate(
     moe_softcapping: float = 0.0,
     num_expert_group: int = 1,
     topk_group: int = 1,
+    out_weights: torch.Tensor | None = None,
+    out_indices: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
@@ -271,7 +273,8 @@ def moe_fused_gate(
     With ``num_expert_group > 1`` it performs DeepSeek-V3 grouped routing
     (per-group top-2-sum group scores, keep ``topk_group`` groups, then top-k
     within). The first argument is named ``scores`` (raw GEMM logits) to match
-    the existing call sites.
+    the existing call sites. ``out_weights`` and ``out_indices`` provide an
+    allocation-free out variant; both must be supplied together.
     """
     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
     assert (
@@ -287,6 +290,9 @@ def moe_fused_gate(
     assert bias.ndim == 1, "bias must be 1D"
     assert scores.size(1) == bias.size(0), "scores and bias must have same num_experts"
     assert topk > num_fused_shared_experts, "topk must be > num_fused_shared_experts"
+    assert (out_weights is None) == (
+        out_indices is None
+    ), "out_weights and out_indices must be provided together"
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
 
@@ -302,6 +308,7 @@ def moe_fused_gate(
         and num_fused_shared_experts == 0
         and num_expert_group <= 1
         and moe_softcapping == 0.0
+        and out_weights is None
     ):
         radix_args = (
             scores,
@@ -323,8 +330,25 @@ def moe_fused_gate(
     experts_per_group = N // num_expert_group
     BLOCK_G = triton.next_power_of_2(num_expert_group)
 
-    weights = torch.empty((M, K), dtype=torch.float32, device=scores.device)
-    indices = torch.empty((M, K), dtype=torch.int32, device=scores.device)
+    if out_weights is None:
+        weights = torch.empty((M, K), dtype=torch.float32, device=scores.device)
+        indices = torch.empty((M, K), dtype=torch.int32, device=scores.device)
+    else:
+        assert out_indices is not None
+        assert out_weights.shape == (M, K) and out_indices.shape == (
+            M,
+            K,
+        ), "out tensors must have shape [num_tokens, topk]"
+        assert out_weights.dtype == torch.float32, "out_weights must be float32"
+        assert out_indices.dtype in (
+            torch.int32,
+            torch.int64,
+        ), "out_indices must be int32 or int64"
+        assert (
+            out_weights.device == scores.device == out_indices.device
+        ), "out tensors must be on the scores device"
+        weights = out_weights
+        indices = out_indices
 
     BLOCK_N = triton.next_power_of_2(N)  # 256 -> 256, 384 -> 512
     BLOCK_K = triton.next_power_of_2(K)  # 6 -> 8, 8 -> 8
