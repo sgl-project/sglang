@@ -6,7 +6,6 @@ from typing import Dict, List, Optional, Tuple, Union
 from urllib.parse import unquote, urlparse
 
 import pybase64
-import requests
 import torch
 
 from sglang.srt.managers.schedule_batch import (
@@ -21,6 +20,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.utils.common import download_remote_media
 
 
 class MossVLImageProcessor(SGLangBaseProcessor):
@@ -426,13 +426,10 @@ class MossVLImageProcessor(SGLangBaseProcessor):
 
         if value.startswith(("http://", "https://")):
             timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-            response = requests.get(value, stream=True, timeout=timeout)
-            response.raise_for_status()
+            content = download_remote_media(value, timeout=timeout)
             suffix = os.path.splitext(urlparse(value).path)[1] or ".mp4"
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
+                f.write(content)
                 return f.name, f.name
 
         if value.startswith("data:"):
