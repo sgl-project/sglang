@@ -8,6 +8,10 @@ import torch
 
 import sglang.srt.models.deepseek_v4 as deepseek_v4
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+    DeepseekV4HipRadixBackend,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -15,12 +19,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-_UNIFIED_UNPADDED_MODES = (
-    ForwardMode.EXTEND,
-    ForwardMode.MIXED,
-    ForwardMode.TARGET_VERIFY,
-    ForwardMode.SPLIT_PREFILL,
-)
+_UNIFIED_UNPADDED_MODES = tuple(mode for mode in ForwardMode if mode.is_extend())
 
 
 class _RecordingBackend:
@@ -167,6 +166,10 @@ class TestDeepseekV4UnifiedQLayout(unittest.TestCase):
                 query = backend.calls[0]["q"]
                 self.assertEqual(query.shape, (2, layer.n_local_heads, layer.head_dim))
                 self.assertTrue(query.is_contiguous())
+                self.assertEqual(
+                    query.untyped_storage().nbytes(),
+                    query.numel() * query.element_size(),
+                )
 
     def test_unified_decode_keeps_64_head_padding(self):
         layer, backend, (_, q_out) = self._run_forward(ForwardMode.DECODE, unified=True)
@@ -188,23 +191,70 @@ class TestDeepseekV4UnifiedQLayout(unittest.TestCase):
                 self.assertEqual(backend_query.shape, (2, 64, layer.head_dim))
                 self.assertTrue(backend_query.is_contiguous())
 
-    def test_multi_stream_and_prefill_cp_routes_reach_unpadded_layout(self):
-        for cp_active, expected_path in ((False, "multi_hip"), (True, "single")):
-            with self.subTest(cp_active=cp_active):
-                layer, backend, (path, q_out) = self._run_forward(
-                    ForwardMode.EXTEND,
-                    unified=True,
-                    multi_stream=True,
-                    prefill_cp=True,
-                    cp_active=cp_active,
-                    hip=True,
-                )
+    def test_prefill_cp_disables_multi_stream_and_uses_unpadded_layout(self):
+        layer, backend, (path, q_out) = self._run_forward(
+            ForwardMode.EXTEND,
+            unified=True,
+            multi_stream=True,
+            prefill_cp=True,
+            cp_active=True,
+            hip=True,
+        )
 
-                self.assertEqual(path, expected_path)
-                self.assertIsNone(q_out)
-                query = backend.calls[0]["q"]
-                self.assertEqual(query.shape, (2, layer.n_local_heads, layer.head_dim))
-                self.assertTrue(query.is_contiguous())
+        self.assertEqual(path, "single")
+        self.assertIsNone(q_out)
+        query = backend.calls[0]["q"]
+        self.assertEqual(query.shape, (2, layer.n_local_heads, layer.head_dim))
+        self.assertTrue(query.is_contiguous())
+        self.assertEqual(
+            query.untyped_storage().nbytes(),
+            query.numel() * query.element_size(),
+        )
+
+    def test_target_verify_routes_to_unified_decode_kernel(self):
+        backend = object.__new__(DeepseekV4HipRadixBackend)
+        unified_kv = torch.zeros(8, 4)
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_unified_kv=lambda _layer_id: unified_kv,
+            unified_swa_window=4,
+            unified_swa_ring_size=8,
+            unified_swa_pages=1,
+        )
+        backend.softmax_scale = 0.5
+        query = torch.zeros(2, 16, 4)
+        expected = torch.ones_like(query)
+        metadata = SimpleNamespace(
+            c128_page_indices=None,
+            c4_sparse_page_indices=None,
+            unified=SimpleNamespace(
+                verify_store_state_slot=torch.zeros(2, dtype=torch.int64),
+                swa_indices=torch.zeros(2, dtype=torch.int32),
+                swa_indptr=torch.arange(3, dtype=torch.int32),
+            ),
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            positions=torch.arange(2),
+        )
+
+        with (
+            patch.object(runtime, "decode", return_value=expected) as decode,
+            patch.object(runtime, "prefill") as prefill,
+        ):
+            actual = backend._forward_unified_kv(
+                q=query,
+                kv=torch.zeros(2, 4),
+                layer=SimpleNamespace(layer_id=0),
+                forward_batch=forward_batch,
+                compress_ratio=0,
+                attn_sink=torch.zeros(16),
+                core_attn_metadata=metadata,
+                save_kv_cache=False,
+            )
+
+        self.assertIs(actual, expected)
+        decode.assert_called_once()
+        prefill.assert_not_called()
 
 
 if __name__ == "__main__":
