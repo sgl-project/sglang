@@ -212,7 +212,7 @@ class BaseSpecWorker(ABC):
         return self.draft_worker.weight_load_time
 
     @property
-    def war_fastpath_runner(self):
+    def last_shared_read_runner(self):
         # The runner that runs the step's LAST shared-buffer-reading phase --
         # it owns the read-done event the scheduler's WAR barrier waits on.
         # Default is the target runner; override if the last phase runs
