@@ -493,10 +493,26 @@ jobs:
       - name: Accuracy Test ROCm 7.2 (8-GPU GPT-OSS)
         timeout-minutes: 180
         run: |
+          > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-gpt-oss --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      # Shares this job with the accuracy step above: it already serves the same
+      # two models, and an MI30x job spends ~49 min pulling the image and
+      # installing dependencies before it runs anything.
+      - name: Performance Test ROCm 7.2 (8-GPU GPT-OSS)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 120
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-gpt-oss --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -528,9 +544,23 @@ jobs:
       - name: Accuracy Test MI35x ROCm 7.2 (8-GPU GPT-OSS)
         timeout-minutes: 180
         run: |
+          > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      # Shares this job with the accuracy step above rather than taking its own,
+      # so the container setup and the GPT-OSS weight cache are paid for once.
+      - name: Performance Test MI35x ROCm 7.2 (8-GPU GPT-OSS)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 120
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-gpt-oss --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 

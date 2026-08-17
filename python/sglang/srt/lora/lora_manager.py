@@ -46,7 +46,7 @@ from sglang.srt.lora.utils import (
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_available_gpu_memory, replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
@@ -1030,7 +1030,7 @@ def init_lora_cuda_graph_moe_buffers(
     """
     from sglang.srt.lora.layers import FusedMoEWithLoRA
 
-    max_bs = server_args.cuda_graph_config.decode.max_bs
+    max_bs = get_exec().graph.cuda_graph_config.decode.max_bs
     max_loras = server_args.max_loras_per_batch
     for module in model.modules():
         if isinstance(module, FusedMoEWithLoRA):
