@@ -2017,6 +2017,332 @@ def _end_pair_chain(
     return sorted((a, b), key=lambda x: x.grow_direction != "up")
 
 
+class FloatMultiEndedAllocator(MultiEndedAllocator):
+    """Float MIDDLE cache pool: a span ``[low_wm_page, high_wm_page)`` between
+    two chain neighbors, with freed HOLES allowed inside the span.
+
+    Holes-first model (a middle CACHE pool is not a band):
+    - ``free`` marks interior holes (zero copies) and absorbs boundary holes;
+    - alloc reuses holes first (zero copies — steady-state churn recycles in
+      place), then extends the boundary on the side with the LARGER free gap;
+      from empty it positions the span at the MIDPOINT of the inter-frontier
+      region, so free gap exists on both sides and neighbor growth does not
+      immediately force a data move;
+    - data moves happen only ON DEMAND (the relocation surface —
+      ``make_room`` / ``compact_holes`` — lands in the next commit; nothing
+      in this class moves data yet).
+    - An EMPTY float (no live pages) resets its span and is
+      frontier-transparent: it occupies no bytes and must never wall off free
+      space (its parked position is irrelevant to neighbors).
+
+    Floats skip the lazy event pipeline (`lazy_compaction` must be False):
+    frees/allocs are zero-copy by design, so only the on-demand moves need
+    write-set safety, which their scheduler-phase call sites provide.
+    """
+
+    # The span IS this pool's capacity state (it has no watermark): moving it
+    # changes its own availability AND — via transparency + the chain frontier
+    # walks — both neighbors' gaps. Same `_CapacityField` contract as the end
+    # pools' `watermark_physical`, so a span move on the hole-free extension
+    # path (which rebinds no free-list) still invalidates every capacity memo.
+    low_wm_page: _CapacityField[int] = _CapacityField()
+    high_wm_page: _CapacityField[int] = _CapacityField()
+
+    # Host-side "a free may have put a hole ON a boundary since the last
+    # absorb". Only `free` can make a boundary page a hole (alloc DRAINS holes
+    # into live pages, and extension adds live pages), so a clean flag means
+    # the boundaries are provably still live and the deferred absorb can skip
+    # its D2H entirely. Span-moving relocation re-arms it.
+    _holes_dirty: bool = False
+
+    def __init__(self, **kwargs):
+        assert not kwargs.get("lazy_compaction", False), (
+            "FloatMultiEndedAllocator is holes-first; the lazy event pipeline "
+            "is end-pool machinery and must stay off for float middles"
+        )
+        # Base __init__ ends with self.clear(), which reads these via our
+        # _reset_watermarks override — pre-seed so the override can run.
+        self.low_wm_page = 0
+        self.high_wm_page = 0
+        super().__init__(**kwargs)
+        assert self.grow_direction == "float", (
+            f"FloatMultiEndedAllocator needs a 'float' sub-pool spec; got "
+            f"{self.grow_direction!r}"
+        )
+
+    # -- span / frontier state --
+
+    def _reset_watermarks(self) -> None:
+        # Park empty at the buffer top; empty-transparency makes the parked
+        # position irrelevant to neighbors.
+        self.low_wm_page = self.num_pages
+        self.high_wm_page = self.num_pages
+        self.watermark_physical = -1  # unused for float pools (logs only)
+
+    def _span_pages(self) -> int:
+        return self.high_wm_page - self.low_wm_page
+
+    def _hole_pages(self) -> int:
+        return int(self._free_phys_pages.numel())
+
+    def _live_pages(self) -> int:
+        return self._span_pages() - self._hole_pages()
+
+    def _is_frontier_transparent(self) -> bool:
+        return self._live_pages() == 0
+
+    def _allocated_pages(self) -> int:
+        return self._live_pages()
+
+    def _byte_low_frontier(self) -> int:
+        return self.low_wm_page * self.entry_bytes_per_page
+
+    def _byte_high_frontier(self) -> int:
+        return self.high_wm_page * self.entry_bytes_per_page
+
+    def _region_bounds_pages(self) -> Tuple[int, int]:
+        """Page bounds ``[lo, hi)`` of the inter-frontier region available to
+        this float (chain-transparent walk; clamped to the slot-0 sink
+        reservation). Rounded conservatively: ``lo`` up, ``hi`` down."""
+        epp = self.entry_bytes_per_page
+        lo = (self._chain_high_frontier_below_bytes() + epp - 1) // epp
+        lo = max(lo, self.min_page_index)
+        hi = self._chain_low_frontier_above_bytes() // epp
+        hi = min(hi, self.num_pages)
+        return lo, hi
+
+    def _gap_pages(self) -> Tuple[int, int]:
+        """(gap_low, gap_high) in own page units; both == the whole region
+        when the span is empty/parked."""
+        lo, hi = self._region_bounds_pages()
+        if self._is_frontier_transparent():
+            room = max(0, hi - lo)
+            return room, room
+        return max(0, self.low_wm_page - lo), max(0, hi - self.high_wm_page)
+
+    # -- availability --
+
+    def _available_tokens(self, extra_gap_bytes: int = 0) -> int:
+        gap_low, gap_high = self._gap_pages()
+        gap_pages = max(gap_low, gap_high)  # a single alloc extends ONE side
+        gap_pages += extra_gap_bytes // self.entry_bytes_per_page
+        pages_by_index_space = self.num_pages - self.min_page_index - self._live_pages()
+        pages_extend = min(gap_pages, pages_by_index_space)
+        return (pages_extend + self._hole_pages()) * self.page_size
+
+    # -- physical page primitives (holes-first) --
+
+    def take_physical_pages(self, num_pages: int) -> Optional[torch.Tensor]:
+        if num_pages <= 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        n_drain = min(num_pages, self._hole_pages())
+        need_more = num_pages - n_drain
+
+        fresh: Optional[torch.Tensor] = None
+        if need_more > 0:
+            lo, hi = self._region_bounds_pages()
+            if self._is_frontier_transparent():
+                # Reposition-on-alloc-from-empty: collapse to the midpoint so
+                # free gap remains on BOTH sides.
+                if need_more > hi - lo:
+                    return None
+                start = lo + (hi - lo - need_more) // 2
+                self.low_wm_page = start
+                self.high_wm_page = start + need_more
+                fresh = torch.arange(
+                    start, start + need_more, dtype=torch.int64, device=self.device
+                )
+            else:
+                gap_low = self.low_wm_page - lo
+                gap_high = hi - self.high_wm_page
+                # Extend toward the roomier gap; fall back to the other side.
+                sides = ("high", "low") if gap_high >= gap_low else ("low", "high")
+                for side in sides:
+                    if side == "high" and need_more <= gap_high:
+                        start = self.high_wm_page
+                        self.high_wm_page += need_more
+                        break
+                    if side == "low" and need_more <= gap_low:
+                        start = self.low_wm_page - need_more
+                        self.low_wm_page = start
+                        break
+                else:
+                    return None  # neither side fits; state untouched
+                fresh = torch.arange(
+                    start, start + need_more, dtype=torch.int64, device=self.device
+                )
+
+        if n_drain > 0:
+            drained = self._free_phys_pages[:n_drain].clone()
+            self._free_phys_pages = self._free_phys_pages[n_drain:]
+        else:
+            drained = None
+
+        if drained is None:
+            return fresh
+        if fresh is None:
+            return drained
+        return torch.cat([drained, fresh])
+
+    def take_physical(self, need_size: int) -> Optional[torch.Tensor]:
+        if need_size <= 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        assert need_size % self.page_size == 0, (
+            f"take_physical: need_size={need_size} must be a multiple of "
+            f"page_size={self.page_size}"
+        )
+        return self.take_physical_pages(need_size // self.page_size)
+
+    def _alloc_bind_fast_or_slow(
+        self, v_pages: torch.Tensor, N: int
+    ) -> Optional[torch.Tensor]:
+        # Holes-first always routes through take_physical_pages (no fused
+        # watermark fast path — float alloc cadence doesn't need it).
+        if N == 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        phys_pages = self.take_physical_pages(N)
+        if phys_pages is None:
+            return None
+        self.bind(v_pages, phys_pages)
+        return phys_pages
+
+    # -- free: hole-marking, boundary absorption, park-on-empty --
+
+    def free(
+        self, free_index: torch.Tensor, *, _pages: Optional[torch.Tensor] = None
+    ) -> None:
+        """Mark the freed pages as interior HOLES / absorb boundary ones.
+
+        `_pages` carries virtual PAGE ids the caller already derived (segment
+        frees from `start_pos` arithmetic; the SWA composite's page-rep
+        release) — same contract as the base allocator, and it must be
+        honoured here for the same reason: deriving them again via
+        `torch.unique` is a data-dependent-shape op, i.e. a HOST SYNC on the
+        per-step free path.
+        """
+        with record_function("FloatMultiEndedAlloc.free"):
+            if free_index is None or free_index.numel() == 0:
+                return
+            if not self.is_not_in_free_group:
+                self.free_group.append(free_index)
+                return
+            # Same page-derivation ladder as `_free_lazy`: caller-supplied
+            # ids, the ps==1 identity, then the dedup fallback for arbitrary
+            # (radix-shaped) input. No stale-slot `.item()` assert — same
+            # contract as the lazy path: callers must not double-free (a
+            # tombstoned page here would be appended to the hole list), and
+            # the composite's tombstone filters uphold it. The idle byte
+            # verifier's span == p2v-bound + holes conservation catches a
+            # violation after the fact without a per-free host sync.
+            free_v_pages_raw = free_index.detach().to(torch.int64)
+            if _pages is not None:
+                free_v_pages = _pages
+            elif self.page_size == 1:
+                free_v_pages = free_v_pages_raw
+            else:
+                free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
+            freed_p_pages = self.virtual_to_physical[free_v_pages]
+            self.virtual_to_physical[free_v_pages] = -1
+            self.physical_to_virtual[freed_p_pages] = -1
+            if self.is_id_owner:
+                self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
+            self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])
+            # Park is sync-free (span/hole COUNTS only); boundary absorption is
+            # DEFERRED — see `_absorb_span_boundary_holes`.
+            self._holes_dirty = True
+            self._park_if_empty()
+
+    def _park_if_empty(self) -> bool:
+        """Reset the span and go frontier-transparent once no live page
+        remains. Sync-free: `_live_pages()` is span minus hole COUNT, both
+        host-side (`numel()` is tensor metadata). Returns whether it parked."""
+        if self._live_pages() != 0:
+            return False
+        self._reset_watermarks()
+        self._free_phys_pages = torch.empty(0, dtype=torch.int64, device=self.device)
+        self._holes_dirty = False
+        return True
+
+    def _absorb_span_boundary_holes(self) -> int:
+        """Shrink the span past any holes touching its boundaries (zero-copy),
+        returning the number of pages handed back to the neighbours.
+
+        DEFERRED, not per-free: deciding how far to walk needs the hole set on
+        the HOST (the watermarks are host ints), so this is the float's one
+        D2H — exactly the base allocator's model, whose `_free_lazy` does "no
+        boundary absorb" and pays a single sync inside `_flush`. Doing it per
+        free put a host sync on the per-decode-step path.
+
+        Called where a sync is already free or already warranted: the per-step
+        opportunistic flush (the scheduler runs it at the sync boundary with
+        the forward stream drained) and the head of the tri's shortfall ladder
+        (a stale-wide span would otherwise inflate the rebalance deficit and
+        buy data movement that this zero-copy shrink makes unnecessary).
+
+        Skipping it is only ever CONSERVATIVE: the span reads wider than its
+        live content, so neighbours see less gap. `_live_pages()`, hence
+        transparency and the byte-conservation identity, stay exact either way.
+        """
+        if self._park_if_empty():
+            self._holes_dirty = False
+            return 0
+        if not self._holes_dirty or self._free_phys_pages.numel() == 0:
+            # Nothing freed since the last absorb => both boundaries are still
+            # live => the walk provably finds nothing. Skip the D2H; steady
+            # churn with only INTERIOR holes then costs no sync at all.
+            self._holes_dirty = False
+            return 0
+        self._holes_dirty = False
+        before = self._span_pages()
+        holes = set(int(x) for x in self._free_phys_pages.tolist())
+        changed = False
+        while self.low_wm_page in holes:
+            holes.remove(self.low_wm_page)
+            self.low_wm_page += 1
+            changed = True
+        while (self.high_wm_page - 1) in holes:
+            holes.remove(self.high_wm_page - 1)
+            self.high_wm_page -= 1
+            changed = True
+        if changed:
+            self._free_phys_pages = torch.tensor(
+                sorted(holes), dtype=torch.int64, device=self.device
+            )
+        return before - self._span_pages()
+
+    # -- on-demand data movement --
+
+    def _flush(self, *, urgent: bool) -> int:
+        """Boundary absorption only — never data movement. The base `_flush`
+        treats `_free_phys_pages` as a lazy compaction backlog to be drained,
+        but for a float those entries are INTERIOR HOLES, reusable assets by
+        design; relocation happens on demand via `make_room` /
+        `compact_holes`. What a float CAN do at a flush point is hand back
+        span it no longer needs, which is where its deferred D2H belongs — so
+        neighbours' urgent-flush ladders and the per-step opportunistic flush
+        both reclaim the boundary holes."""
+        return self._absorb_span_boundary_holes()
+
+    def flush_opportunistic(self) -> int:
+        """Public gated wrapper around `_flush(urgent=False)` — the base's
+        exact shape. The ONLY reason for the override is the gate: the base
+        keys its fast path on `lazy_compaction`, which a float never has; a
+        float's flushable work is its deferred boundary absorption, so the
+        fast path keys on `_holes_dirty` instead. The scheduler calls this at
+        the sync boundary with the forward stream drained, so the D2H the
+        flush costs is the cheapest one available; the clean fast path keeps
+        the common step sync-free."""
+        with record_function("FloatMultiEndedAlloc.flush_opportunistic"):
+            if not self._holes_dirty or self._free_phys_pages.numel() == 0:
+                return 0
+            return self._flush(urgent=False)
+
+    def bind_peer(self, peer: MultiEndedAllocator) -> None:  # pragma: no cover
+        raise AssertionError(
+            "float middles must be wired via bind_low_peer/bind_high_peer"
+        )
+
+
 class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Composite allocator for the MHA (full-attn) + Mamba hybrid pair.
 

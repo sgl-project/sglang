@@ -175,6 +175,43 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         self.assertEqual(after, allocator._compute_available_size())
         self.assertGreaterEqual(after, before)  # holes only ever add room
 
+    def test_float_only_span_move_invalidates_every_memo(self):
+        """A hole-free float alloc rebinds NO free-list and has no watermark —
+        the span fields are its ONLY capacity state. If they are not
+        `_CapacityField` descriptors, the float's own memo AND both
+        neighbours' (the span flips transparency, walling off their gaps)
+        keep serving pre-move values.
+
+        Driven on a hand-wired end+float+end chain (the composite arrives
+        with the tri phase); the float is exercised alone so no end-pool
+        descriptor write can mask a missing span bump."""
+        from test_multi_ended_allocator import TestFloatMultiEndedAllocator
+
+        inst = TestFloatMultiEndedAllocator(
+            [m for m in dir(TestFloatMultiEndedAllocator) if m.startswith("test_")][0]
+        )
+        _pool, sa, fla, da, _kv = inst._build_tri()
+        self.assertEqual(fla._hole_pages(), 0)  # hole-free extension path
+        self.assertTrue(fla._is_frontier_transparent())
+
+        # Prime every memo while the float is empty/transparent.
+        float_cached = fla.available_size()
+        low_end_cached = sa.available_size()
+        high_end_cached = da.available_size()
+
+        v = fla.alloc(4)  # float-only mutation: span move, no end-pool write
+        self.assertIsNotNone(v)
+        self.assertFalse(fla._is_frontier_transparent())  # span now opaque
+
+        self.assertEqual(fla.available_size(), fla._available_tokens())
+        self.assertEqual(sa.available_size(), sa._available_tokens())
+        self.assertEqual(da.available_size(), da._available_tokens())
+        # The opaque midpoint span must actually reduce what the neighbours
+        # see, i.e. the memos above were not merely re-serving primed values.
+        self.assertLess(sa.available_size(), low_end_cached)
+        self.assertLess(da.available_size(), high_end_cached)
+        self.assertLessEqual(fla.available_size(), float_cached)
+
     def test_bind_rewiring_bumps_the_epoch(self):
         """Rewiring changes what the chain walks see; a memo primed before a
         re-bind must not survive it."""
