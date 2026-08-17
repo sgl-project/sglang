@@ -153,6 +153,11 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
 
+    def get_hybrid_pool_buffer(self):
+        # Expose the K/V host tensors that Ascend MemCache requires for
+        # zero-copy I/O registration.
+        return [self.k_buffer, self.v_buffer]
+
     def get_ksize_per_token(self):
         return self.get_size_per_token() // 2
 
@@ -245,6 +250,18 @@ class MHATokenToKVPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
+        if layer_id == 0 and torch.distributed.get_rank() == 0:
+            logger.debug(
+                "[%s][L2-LOAD] slots=%d host_idx_dev=%s dev_idx_dev=%s "
+                "layout=%s io_backend=%s num_layers=%d",
+                self.__class__.__name__,
+                host_indices.numel(),
+                host_indices.device,
+                device_indices.device,
+                self.layout,
+                io_backend,
+                self.device_pool.layer_num,
+            )
         if self.device_pool is not None:
             if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
                 return
@@ -384,6 +401,18 @@ class MHATokenToKVPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if torch.distributed.get_rank() == 0:
+            logger.debug(
+                "[%s][L2-BACKUP] slots=%d host_idx_dev=%s dev_idx_dev=%s "
+                "layout=%s io_backend=%s num_layers=%d",
+                self.__class__.__name__,
+                device_indices.numel(),
+                host_indices.device,
+                device_indices.device,
+                self.layout,
+                io_backend,
+                self.device_pool.layer_num,
+            )
         if io_backend == "kernel_ascend":
             # NPU pools use contiguous multi-layer tensors and intentionally do
             # not build the CUDA-style k_data_ptrs/v_data_ptrs arrays.

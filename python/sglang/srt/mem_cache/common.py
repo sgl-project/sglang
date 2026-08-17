@@ -156,19 +156,27 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # internally, then sets req_pool_idx = None.
     assert (req.req_pool_idx is None) == (req.kv is None)
     if req.req_pool_idx is None and req.kv is None:
+        logger.debug(
+            f"[MambaRelease] EARLY_RETURN rid={req.rid} req_pool_idx set to None "
+            f"by cache_finished_req mamba_pool_idx={req.mamba_pool_idx}"
+        )
         return
 
     start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
     _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
-    if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
-        not tree_cache.supports_mamba()
-    ):
+    supports_mamba = tree_cache.supports_mamba()
+    is_hybrid = isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool)
+    if is_hybrid and (not supports_mamba):
         assert (
             req.mamba_pool_idx is not None
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
+        logger.debug(
+            f"[MambaRelease] FREE rid={req.rid} slot={req.mamba_pool_idx} "
+            f"avail={tree_cache.req_to_token_pool.mamba_allocator.available_size()}"
+        )
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     tree_cache.req_to_token_pool.free(req)

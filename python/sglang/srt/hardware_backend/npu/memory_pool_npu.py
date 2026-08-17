@@ -790,15 +790,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     # for disagg
     def get_contiguous_buf_infos(self):
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
-        kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)] + [
-            self.v_buffer[i].data_ptr() for i in range(self.layer_num)
-        ]
-        kv_data_lens = [self.k_buffer[i].nbytes for i in range(self.layer_num)] + [
-            self.v_buffer[i].nbytes for i in range(self.layer_num)
-        ]
-        kv_item_lens = [self.k_buffer[i][0].nbytes for i in range(self.layer_num)] + [
-            self.v_buffer[i][0].nbytes for i in range(self.layer_num)
-        ]
+        kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [self.k_buffer[i].nbytes for i in range(self.layer_num)]
+        kv_item_lens = [self.k_buffer[i][0].nbytes for i in range(self.layer_num)]
+        # When DSA KV cache is packed into the FP8 k_buffer, the v_buffer is
+        # intentionally empty (kr_cache_dim == 0). Its data_ptr() is null
+        if not self.dsa_kv_cache_store_fp8:
+            kv_data_ptrs += [
+                self.v_buffer[i].data_ptr() for i in range(self.layer_num)
+            ]
+            kv_data_lens += [self.v_buffer[i].nbytes for i in range(self.layer_num)]
+            kv_item_lens += [
+                self.v_buffer[i][0].nbytes for i in range(self.layer_num)
+            ]
         if self.index_head_dim is not None:
             kv_data_ptrs += [
                 self.index_k_buffer[i].data_ptr()
@@ -830,7 +834,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         local_layer_ids = list(
             range(self.start_layer, self.start_layer + self.layer_num)
         )
-        layer_ids = local_layer_ids * 2
+        layer_ids = (
+            local_layer_ids
+            if self.dsa_kv_cache_store_fp8
+            else local_layer_ids * 2
+        )
         if self.index_head_dim is not None:
             layer_ids += list(self.indexer_layer_ids)
             if self.index_k_scale_buffer is not None:

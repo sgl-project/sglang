@@ -260,6 +260,18 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         *,
         is_draft: bool = False,
     ):
+        if layer_id == 0 and torch.distributed.get_rank() == 0:
+            logger.debug(
+                "[%s][L2-LOAD] slots=%d host_idx_dev=%s dev_idx_dev=%s "
+                "layout=%s io_backend=%s num_layers=%d",
+                self.__class__.__name__,
+                host_indices.numel(),
+                host_indices.device,
+                device_indices.device,
+                self.layout,
+                io_backend,
+                self.device_pool.layer_num,
+            )
         if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
         host_indices = self.dcp_kernel_indices(host_indices)
@@ -426,6 +438,18 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if torch.distributed.get_rank() == 0:
+            logger.debug(
+                "[%s][L2-BACKUP] slots=%d host_idx_dev=%s dev_idx_dev=%s "
+                "layout=%s io_backend=%s num_layers=%d",
+                self.__class__.__name__,
+                device_indices.numel(),
+                host_indices.device,
+                device_indices.device,
+                self.layout,
+                io_backend,
+                self.device_pool.layer_num,
+            )
         host_indices = self.dcp_kernel_indices(host_indices)
         device_indices = self.dcp_kernel_indices(device_indices)
         if self._is_device_layer_sharded(device_pool):
@@ -446,9 +470,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             return
 
-        device_data_ptrs, device_kv_buffers = self._resolve_device_transfer_buffers(
-            device_pool
-        )
+        # data_ptrs/kv_buffers are only needed by the kernel/direct backends;
+        # kernel_ascend (NPU) uses k_buffer/v_buffer/index_k_buffer instead and
+        # NPU device pools do not expose data_ptrs.
+        if io_backend != "kernel_ascend":
+            device_data_ptrs, device_kv_buffers = self._resolve_device_transfer_buffers(
+                device_pool
+            )
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -598,6 +626,44 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
+        if self.layout == "page_first_kv_split":
+            # TODO (iforgetmyname): merge mla kv
+            k_buffer_data_ptr = self.k_buffer.data_ptr()
+            v_buffer_data_ptr = self.v_buffer.data_ptr()
+            for index in range(0, len(indices), self.page_size):
+                k_ptr = (
+                    k_buffer_data_ptr
+                    + indices[index]
+                    * self.layer_num
+                    * self.kv_lora_rank
+                    * self.dtype.itemsize
+                )
+                v_ptr = (
+                    v_buffer_data_ptr
+                    + indices[index]
+                    * self.layer_num
+                    * self.qk_rope_head_dim
+                    * self.dtype.itemsize
+                )
+                ptr_list.append(k_ptr)
+                ptr_list.append(v_ptr)
+            k_element_size = (
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
+                * self.kv_lora_rank
+            )
+            v_element_size = (
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
+                * self.qk_rope_head_dim
+            )
+            element_size_list = []
+            for _ in range(0, len(indices), self.page_size):
+                element_size_list.append(k_element_size)
+                element_size_list.append(v_element_size)
+            return ptr_list, element_size_list
         if self.layout == "layer_first":
             for index in range(0, len(indices), self.page_size):
                 for layer_id in range(self.layer_num):

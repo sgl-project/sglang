@@ -2659,9 +2659,26 @@ def create_custom_parallel_group(
     rank = torch.distributed.get_rank()
 
     local_config = sorted(list(set(group_ranks)))
-    gathered_configs = [None for _ in range(world_size)]
+    group_size = len(local_config)
 
-    torch.distributed.all_gather_object(gathered_configs, local_config)
+    # On NPU, all_gather_object on the default hccl PG triggers HCCL buffer
+    # allocation. For standard TP/DP partitioning (contiguous ranks),
+    # all unique groups can be derived locally without any collective op.
+    if (
+        _is_npu
+        and world_size % group_size == 0
+        and local_config == list(range(local_config[0], local_config[0] + group_size))
+        and local_config[0] % group_size == 0
+    ):
+        # Contiguous ranks: derive all unique groups locally
+        num_groups = world_size // group_size
+        gathered_configs = [
+            list(range(i * group_size, (i + 1) * group_size))
+            for i in range(num_groups)
+        ]
+    else:
+        gathered_configs = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(gathered_configs, local_config)
 
     unique_groups = []
     seen_signatures = set()

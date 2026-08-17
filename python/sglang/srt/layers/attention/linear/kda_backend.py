@@ -616,6 +616,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         else:
             q_bias, k_bias, v_bias = None, None, None
 
+        seqlens_cpu = forward_batch.extend_seq_lens_cpu
         q = causal_conv1d_fn(
             q,
             q_conv_weight,
@@ -625,7 +626,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
             has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            max_seq_len=max(seqlens_cpu),
+            has_any_initial=any(
+                p > 0 for p in (forward_batch.extend_prefix_lens_cpu or [])
+            ),
+            cu_seq_len=sum(seqlens_cpu),
+            seqlens_cpu=seqlens_cpu,
         ).transpose(0, 1)
         k = causal_conv1d_fn(
             k,
@@ -636,7 +642,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
             has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            max_seq_len=max(seqlens_cpu),
+            has_any_initial=any(
+                p > 0 for p in (forward_batch.extend_prefix_lens_cpu or [])
+            ),
+            cu_seq_len=sum(seqlens_cpu),
+            seqlens_cpu=seqlens_cpu,
         ).transpose(0, 1)
         v = causal_conv1d_fn(
             v,
@@ -647,7 +658,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
             has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            max_seq_len=max(seqlens_cpu),
+            has_any_initial=any(
+                p > 0 for p in (forward_batch.extend_prefix_lens_cpu or [])
+            ),
+            cu_seq_len=sum(seqlens_cpu),
+            seqlens_cpu=seqlens_cpu,
         ).transpose(0, 1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
