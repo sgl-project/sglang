@@ -203,13 +203,8 @@ def rocm_absorb_v_bmm(
     else:
         _bmm_buf = None
         if _use_aiter_gfx95 and attn.w_kc.dtype == torch.float8_e4m3fn:
-            # Write the absorbed v_up bmm output batch-major
-            # (tokens, heads, v_head_dim) via transpose_bm=True so the
-            # downstream flatten(1, 2) in the `_bmm_buf is not None` block is
-            # a free view. With the old transpose_bm=False the output was
-            # (heads, tokens, v) and needed a transpose(0,1).flatten copy =
-            # a per-layer direct_copy (elementwise_manual_unroll ~5us/layer),
-            # which ATOM / the MXFP4 path do not pay.
+            # As in the mxfp4 path above, write (batch, heads, dim) so the
+            # post-GEMM flatten is a free view instead of a copy.
             _bmm_buf = torch.empty(
                 attn_output.shape[0],
                 attn.num_local_heads,
@@ -227,7 +222,6 @@ def rocm_absorb_v_bmm(
                 transpose_bm_in=True,
                 dtype=torch.bfloat16,
             )
-            attn_bmm_output = _bmm_buf
         else:
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),

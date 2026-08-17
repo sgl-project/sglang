@@ -31,6 +31,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
+    input_to_float8,
     inverse_transform_scale_ue8m0,
     normalize_e4m3fn_to_e4m3fnuz,
     quant_weight_ue8m0,
@@ -500,6 +501,8 @@ class DeepseekV2WeightLoaderMixin:
                         if layer_id < self.config.num_hidden_layers:
                             layer_ids.add(layer_id)
 
+        arch = self.config.architectures[0] if self.config.architectures else None
+
         for layer_id in layer_ids:
             self_attn = (
                 self.model.layers[layer_id].self_attn
@@ -631,20 +634,13 @@ class DeepseekV2WeightLoaderMixin:
                         torch.bfloat16
                     )
 
-            # GLM (GlmMoeDsa) MLA absorbed weights (w_kc/w_vc) load as bf16, which
-            # forces the slow per-batched torch.bmm path in forward_mla on ROCm. Quantize
-            # to per-tensor fp8_e4m3fn (mirroring the DeepSeek fp8 flow) so the fused
-            # batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
-            # kernel is used instead. Must be e4m3fn (not fnuz) so forward_mla's dtype
-            # gate matches on gfx950.
+            # GLM ships kv_b_proj as bf16, which falls back to torch.bmm. Quantize to
+            # per-tensor e4m3fn (not fnuz) to match forward_mla_rocm's dtype gate.
             if (
                 _use_aiter_gfx95
-                and self.config.architectures
-                and self.config.architectures[0] == "GlmMoeDsaForCausalLM"
+                and arch == "GlmMoeDsaForCausalLM"
                 and w.dtype == torch.bfloat16
             ):
-                from sglang.srt.layers.quantization.fp8_utils import input_to_float8
-
                 w, self_attn.w_scale = input_to_float8(w, dtype=torch.float8_e4m3fn)
 
             w_kc, w_vc = w.unflatten(
@@ -655,9 +651,8 @@ class DeepseekV2WeightLoaderMixin:
                 _use_aiter_gfx95
                 and self.quant_config is not None
                 and self.quant_config.get_name() == "quark"
-                and self.config.architectures
-                and self.config.architectures[0]
-                == "DeepseekV3ForCausalLM"  # Avoid processing other models like GlmMoeDsaForCausalLM
+                # Avoid processing other models like GlmMoeDsaForCausalLM
+                and arch == "DeepseekV3ForCausalLM"
                 and w.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
             ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
