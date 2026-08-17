@@ -380,6 +380,25 @@ class HunYuanAttention(nn.Module):
             raise RuntimeError("Not support attnention type")
 
         attn_output = self.attn(q, k, v, forward_batch)
+
+        # In the piecewise CUDA graph path, RadixAttention may return
+        # flattened per-head output layout for Hunyuan:
+        #   [num_tokens * num_heads, head_dim]
+        # while Hunyuan o_proj expects merged hidden layout:
+        #   [num_tokens, num_heads * head_dim].
+        #
+        # Convert the per-head layout back to the merged hidden layout
+        # before feeding it into o_proj.
+        if (
+            attn_output.dim() == 2
+            and attn_output.shape[-1] == self.head_dim
+            and attn_output.shape[0] % self.num_heads == 0
+        ):
+            attn_output = attn_output.reshape(
+                attn_output.shape[0] // self.num_heads,
+                self.num_heads * self.head_dim,
+            )
+
         output, _ = self.o_proj(attn_output)
         return output, (ori_k, v)
 
@@ -599,6 +618,7 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config, logit_scale=logit_scale)
         self.sampler = create_sampler()
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
