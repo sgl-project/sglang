@@ -8,9 +8,6 @@
 //! pipeline cannot serve are rejected to the client — no Python fallback.
 
 pub mod payload;
+mod shm;
 pub mod sidecar;
 pub mod worker;
-
-// `ShmSegment` never leaves the module — callers see segments only through
-// `FeatureStore`.
-mod shm;

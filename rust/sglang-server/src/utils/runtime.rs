@@ -27,7 +27,7 @@ use crate::tokenizer_manager::channel::{
 use crate::tokenizer_manager::wiring::{Senders, TmEvent};
 use crate::utils::sock::bind_tcp_listener;
 use crate::{
-    api_server, tokenizer_manager, tokenizer_manager::detokenizer, tokenizer_manager::tokenizer,
+    http_server, tokenizer_manager, tokenizer_manager::detokenizer, tokenizer_manager::tokenizer,
 };
 
 /// A pipeline stage that owns its channel handles + config and runs a blocking
@@ -316,7 +316,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     });
                 }
                 let rt = builder.build().expect("build api runtime");
-                rt.block_on(api_server::app::serve(
+                rt.block_on(http_server::app::serve(
                     listener,
                     senders,
                     cfg.rust_server_args.channel_cap,

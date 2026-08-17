@@ -854,7 +854,7 @@ mod tests {
         SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
         merge_template_stops, unary_chat,
     };
-    use crate::api_server::guard::AbortGuard;
+    use crate::http_server::guard::AbortGuard;
     use crate::message::config::DefaultSamplingParams;
     use crate::message::egress::ChunkExtras;
     use axum::http::StatusCode;

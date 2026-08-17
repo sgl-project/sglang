@@ -740,7 +740,7 @@ mod tests {
         ChoiceExtensions, PromptSpec, completion_event_stream, completion_logprobs,
         completion_prompt_specs, completion_response_value, unary_completion,
     };
-    use crate::api_server::guard::AbortGuard;
+    use crate::http_server::guard::AbortGuard;
     use crate::message::egress::ChunkExtras;
     use axum::http::StatusCode;
     use dynamo_protocols::types::{

@@ -10,7 +10,7 @@
 //!
 //! All are non-blocking, so the GIL is never held across a wait.
 
-mod api_server;
+mod http_server;
 mod message;
 mod multi_modality;
 mod tokenizer_manager;
