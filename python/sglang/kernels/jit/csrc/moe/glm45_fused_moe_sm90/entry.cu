@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// TVM-FFI entry point for the GLM-4.5 FP8 fused MoE kernel. The CUDA body is
-// specialized for the TP=8 GLM-4.5-FP8 layout captured in production on H200.
+// TVM-FFI entry point for the GLM-4.5 FP8 fused MoE kernel. The CUDA body
+// targets H200 and specializes the TP=8 layout captured in production.
 
 #include "../tvm_ffi_utils.h"
 #include <algorithm>
