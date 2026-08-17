@@ -12,6 +12,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -72,9 +73,9 @@ def is_supported_jit_fused_add_rmsnorm_hidden_size(hidden_size: int) -> bool:
 
 @cache_once
 def _jit_fused_add_rmsnorm_module(
-    dtype: torch.dtype, cast_x_before_out_mul: bool
+    dtype: torch.dtype, cast_x_before_out_mul: bool, scale_input: bool
 ) -> Module:
-    args = make_cpp_args(cast_x_before_out_mul, dtype)
+    args = make_cpp_args(cast_x_before_out_mul, scale_input, dtype)
     return load_jit(
         "fused_add_rmsnorm",
         *args,
@@ -153,8 +154,27 @@ def fused_add_rmsnorm(
     *,
     cast_x_before_out_mul: bool = False,
 ) -> None:
-    module = _jit_fused_add_rmsnorm_module(input.dtype, cast_x_before_out_mul)
-    module.fused_add_rmsnorm(input, residual, weight, eps)
+    module = _jit_fused_add_rmsnorm_module(input.dtype, cast_x_before_out_mul, False)
+    module.fused_add_rmsnorm(input, residual, weight, eps, 1.0)
+
+
+@register_custom_op(mutates_args=["input", "residual"])
+def fused_scaled_add_rmsnorm(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    input_scale: float,
+) -> None:
+    """Compute RMSNorm(residual + input * input_scale) in place."""
+    if input.numel() == 0:
+        return
+    if torch._C._overlaps(input, residual):
+        raise ValueError(
+            "fused_scaled_add_rmsnorm requires non-overlapping input and residual"
+        )
+    module = _jit_fused_add_rmsnorm_module(input.dtype, False, True)
+    module.fused_add_rmsnorm(input, residual, weight, eps, input_scale)
 
 
 @debug_kernel_api

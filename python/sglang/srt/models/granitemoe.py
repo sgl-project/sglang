@@ -6,6 +6,7 @@ import torch
 from torch import nn
 from transformers import GraniteConfig
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -26,7 +27,71 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models import mixtral
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_cuda
+
+if is_cuda():
+    from sglang.kernels.ops.layernorm.norm import (
+        fused_scaled_add_rmsnorm,
+        is_supported_jit_fused_add_rmsnorm_hidden_size,
+    )
+else:
+    fused_scaled_add_rmsnorm = None
+
+    def is_supported_jit_fused_add_rmsnorm_hidden_size(
+        hidden_size: int,
+    ) -> bool:
+        return False
+
+
+def _scaled_residual_rmsnorm(
+    norm: RMSNorm,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    residual_multiplier: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if hidden_states.numel() == 0:
+        return hidden_states, residual
+
+    weight = norm.weight.data
+    if (
+        fused_scaled_add_rmsnorm is not None
+        and hidden_states.is_cuda
+        and hidden_states.dim() == 2
+        and residual.shape == hidden_states.shape
+        and weight.dim() == 1
+        and weight.shape[0] == hidden_states.shape[-1]
+        and hidden_states.is_contiguous()
+        and residual.is_contiguous()
+        and weight.is_contiguous()
+        and hidden_states.dtype in (torch.float16, torch.bfloat16)
+        and residual.dtype == hidden_states.dtype
+        and weight.dtype == hidden_states.dtype
+        and residual.device == hidden_states.device
+        and weight.device == hidden_states.device
+        and hidden_states is not residual
+        and (
+            torch.compiler.is_compiling()
+            or not torch._C._overlaps(hidden_states, residual)
+        )
+        and is_supported_jit_fused_add_rmsnorm_hidden_size(hidden_states.shape[-1])
+        and not norm.cast_x_before_out_mul
+        and not norm.fp32_residual
+        and norm.override_orig_dtype is None
+        and norm.variance_size_override is None
+        and not is_batch_invariant_mode_enabled()
+    ):
+        fused_scaled_add_rmsnorm(
+            hidden_states,
+            residual,
+            weight,
+            norm.variance_epsilon,
+            residual_multiplier,
+        )
+        return hidden_states, residual
+
+    hidden_states = hidden_states * residual_multiplier
+    residual = residual + hidden_states
+    return norm(residual), residual
 
 
 class GraniteMoeMoE(nn.Module):
@@ -90,7 +155,6 @@ class GraniteMoeMoE(nn.Module):
 
 
 class GraniteMoeAttention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -177,7 +241,6 @@ class GraniteMoeAttention(nn.Module):
 
 
 class GraniteMoeDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: GraniteConfig,
@@ -221,26 +284,36 @@ class GraniteMoeDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        residual: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = _scaled_residual_rmsnorm(
+                self.input_layernorm,
+                hidden_states,
+                residual,
+                self.residual_multiplier,
+            )
         # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states = residual + hidden_states * self.residual_multiplier
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = _scaled_residual_rmsnorm(
+            self.post_attention_layernorm,
+            hidden_states,
+            residual,
+            self.residual_multiplier,
+        )
         hidden_states = self.block_sparse_moe(hidden_states)
-        hidden_states = residual + hidden_states * self.residual_multiplier
 
-        return hidden_states
+        return hidden_states, residual
 
 
 class GraniteMoeModel(nn.Module):
-
     def __init__(
         self,
         config: GraniteConfig,
@@ -254,6 +327,7 @@ class GraniteMoeModel(nn.Module):
             org_num_embeddings=config.vocab_size,
         )
         self.embedding_multiplier = config.embedding_multiplier
+        self.residual_multiplier = config.residual_multiplier
 
         self.layers = nn.ModuleList(
             [
@@ -284,19 +358,28 @@ class GraniteMoeModel(nn.Module):
             hidden_states = self.get_input_embeddings(input_ids)
         hidden_states *= self.embedding_multiplier
 
+        residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states = layer(
+            hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
+                residual,
             )
-        hidden_states = self.norm(hidden_states)
+        if residual is not None:
+            hidden_states, _ = _scaled_residual_rmsnorm(
+                self.norm,
+                hidden_states,
+                residual,
+                self.residual_multiplier,
+            )
+        else:
+            hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
 class GraniteMoeForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: GraniteConfig,
