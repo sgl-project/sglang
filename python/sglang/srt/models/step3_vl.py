@@ -910,6 +910,14 @@ class Step3VLForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        if input_embeds is not None:
+            hidden_states = self.model(
+                input_ids, positions, forward_batch, input_embeds
+            )
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,

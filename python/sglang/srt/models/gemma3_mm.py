@@ -389,6 +389,11 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         # This really does cost me sometime
         positions += 1
 
+        if input_embeds is not None:
+            return self.language_model(
+                input_ids, positions, forward_batch, input_embeds, **kwargs
+            )
+
         # Replace image id with PAD if the image token if OOV, to avoid index-errors
         if input_ids is not None and self.config.image_token_index >= self.vocab_size:
             special_image_mask = input_ids == self.config.image_token_index
