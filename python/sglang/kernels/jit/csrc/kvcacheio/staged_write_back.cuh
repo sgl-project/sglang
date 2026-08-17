@@ -144,6 +144,14 @@ inline bool try_copy_page_first_pages_batch(
     return false;
   }
 
+  // CUDA 13 removed failIdx; the dlsym'd ABI follows the loaded libcudart,
+  // while the function pointer signature follows the compile-time headers.
+  static int runtime_version = 0;
+  static const cudaError_t runtime_version_err = cudaRuntimeGetVersion(&runtime_version);
+  if (runtime_version_err != cudaSuccess || runtime_version / 1000 != CUDA_VERSION / 1000) {
+    return false;
+  }
+
   auto copy_fn = get_cuda_memcpy_batch_async();
   if (copy_fn == nullptr) {
     return false;
