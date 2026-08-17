@@ -1747,8 +1747,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     if not user_set_prefill and not user_set_decode and is_hip():
         default = "triton" if kv_cache_dtype == "fp8_e4m3" else "tilelang"
-        declared["dsa_prefill_backend"] = "triton"
-        declared["dsa_decode_backend"] = "triton"
+        declared["dsa_prefill_backend"] = default
+        declared["dsa_decode_backend"] = default
     elif kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"
