@@ -1486,13 +1486,26 @@ class UnifiedRadixCache(BasePrefixCache):
             cache_salt=cache_salt,
         ).page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
-        if prefetch_length == 0 or (
-            not force
-            and (
-                prefetch_length < self.prefetch_threshold
-                or self.cache_controller.prefetch_rate_limited()
-            )
-        ):
+        if prefetch_length == 0:
+            return
+        if not force and prefetch_length < self.prefetch_threshold:
+            if getattr(self.cache_controller, "tp_rank", 0) == 0:
+                logger.info(
+                    "KV_STORAGE_PREFETCH event=skipped request_id=%s force=%s requested_tokens=%d reason=below_threshold threshold=%d",
+                    req_id,
+                    force,
+                    prefetch_length,
+                    self.prefetch_threshold,
+                )
+            return
+        if not force and self.cache_controller.prefetch_rate_limited():
+            if getattr(self.cache_controller, "tp_rank", 0) == 0:
+                logger.info(
+                    "KV_STORAGE_PREFETCH event=skipped request_id=%s force=%s requested_tokens=%d reason=rate_limited",
+                    req_id,
+                    force,
+                    prefetch_length,
+                )
             return
 
         anchor_lock_params = self.inc_host_lock_ref(last_host_node_id).to_dec_params()
