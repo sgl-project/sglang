@@ -8,7 +8,6 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-import msgspec
 import numpy as np
 import torch
 import torch.distributed
@@ -58,19 +57,6 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
-
-
-class _PPSpecTreeRow(msgspec.Struct):
-    """One request's relayed draft tree: the tokens plus the topology they
-    were arranged by. Held per rid between PP+spec rounds."""
-
-    tokens: torch.Tensor  # [num_draft_tokens], index 0 is the bonus token
-    # parent_list / top_scores_index rows. None until the request has been
-    # drafted for (its first decode after prefill carries zero drafts, which
-    # are rejected whatever tree shape they are hung on); the rebuild then
-    # substitutes chain constants at the width the drafted rows use.
-    parents: Optional[torch.Tensor]
-    top_scores: Optional[torch.Tensor]
 
 
 @dataclass
@@ -598,8 +584,6 @@ class SchedulerPPMixin:
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
-        # PP+spec: per-rid chain rows seeding the next verify round.
-        self._pp_spec_chain_by_rid: Dict[str, torch.Tensor] = {}
         self._pp_spec_relay = (
             envs.SGLANG_ENABLE_PP_SPEC.get()
             and self.ps.pp_size > 1
@@ -1233,25 +1217,7 @@ class SchedulerPPMixin:
                         merged, dtype=batch.seq_lens_cpu.dtype
                     )
                     batch.seq_lens_sum = int(sum(merged))
-            self._pp_spec_store_bonus(
-                fwd_batch,
-                pp_outputs["spec_bonus_tokens"],
-                chain_tokens=(
-                    pp_outputs["spec_next_chain"]
-                    if "spec_next_chain" in pp_outputs.tensors
-                    else None
-                ),
-                parent_list=(
-                    pp_outputs["spec_next_parents"]
-                    if "spec_next_parents" in pp_outputs.tensors
-                    else None
-                ),
-                top_scores_index=(
-                    pp_outputs["spec_next_top_scores"]
-                    if "spec_next_top_scores" in pp_outputs.tensors
-                    else None
-                ),
-            )
+            self._pp_spec_adopt_relayed_tree(batch, fwd_rids, pp_outputs)
             output_result = GenerationBatchResult(
                 logits_output=logits_output,
                 pp_hidden_states_proxy_tensors=None,
@@ -1273,12 +1239,23 @@ class SchedulerPPMixin:
             # and storing it would seed the next verify round with a token the
             # model never emitted.
             if batch.contains_last_prefill_chunk:
+                from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
+
+                # The request leaves prefill proposing nothing; the last stage
+                # drafts a real tree for it at the end of its first verify.
                 fwd_batch = (
                     mb_metadata.fwd_batch
                     if mb_metadata.fwd_batch is not None
                     else batch
                 )
-                self._pp_spec_store_bonus(fwd_batch, next_token_ids)
+                self._pp_spec_set_relay(
+                    batch,
+                    PPSpecRelayInput.degenerate(
+                        rids=[req.rid for req in fwd_batch.reqs],
+                        bonus_tokens=next_token_ids,
+                        num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                    ),
+                )
         else:
             # PP rank 0 also relays into output_tokens_buf so the next iter's
             # resolve_forward_inputs finds these tokens for the decode portion
@@ -1303,66 +1280,54 @@ class SchedulerPPMixin:
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
         self.process_batch_result(batch, output_result)
-        # Chains are stored before finish flags are set (at result prep), so
-        # finished requests must be dropped here or the dict grows per request.
-        if self._pp_spec_chain_by_rid:
-            for req in batch.reqs:
-                if req.finished():
-                    self._pp_spec_chain_by_rid.pop(req.rid, None)
 
-    def _pp_spec_store_bonus(
+    def _pp_spec_adopt_relayed_tree(
         self: Scheduler,
         batch: ScheduleBatch,
-        bonus_tokens: torch.Tensor,
-        chain_tokens: Optional[torch.Tensor] = None,
-        parent_list: Optional[torch.Tensor] = None,
-        top_scores_index: Optional[torch.Tensor] = None,
+        fwd_rids: List[str],
+        pp_outputs: PPProxyTensors,
     ) -> None:
-        """Stash the per-request tree row (root = bonus token) that seeds the
-        next verify round, together with the topology it was arranged by.
+        """Fold the tree the last stage drafted into the live batch.
 
-        chain_tokens is the last stage's tail-drafted tree (flat bs*dtn) and
-        parent_list / top_scores_index its shape; without them (prefill rounds)
-        a degenerate row [bonus, 0, ...] over a chain topology is stored — the
-        zero drafts just get rejected, costing acceptance not correctness.
-        Keyed by rid (not batch position): the microbatch composition can
-        change between rounds (finish / retract / merge)."""
+        The relayed rows are labelled with the composition that ran the
+        forward; the live microbatch may have been recomposed since, so they
+        are folded in by rid rather than by position."""
+        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
+
+        chain = pp_outputs.tensors.get("spec_next_chain")
+        if chain is None:
+            # The last stage skipped drafting this round (idle / zero steps);
+            # the requests keep the tree they already carry.
+            return
         num_draft_tokens = self.server_args.speculative_num_draft_tokens
-        bs = len(batch.reqs)
-        if chain_tokens is not None:
-            rows = chain_tokens.to(torch.int64).reshape(bs, num_draft_tokens)
-        else:
-            rows = torch.zeros(
-                (bs, num_draft_tokens),
-                dtype=torch.int64,
-                device=bonus_tokens.device,
-            )
-            rows[:, 0] = bonus_tokens.to(torch.int64)
-        for i, req in enumerate(batch.reqs):
-            if req.finished():
-                self._pp_spec_chain_by_rid.pop(req.rid, None)
-            else:
-                # clone(): a slice view would pin the whole rows storage for
-                # the entry's lifetime, and when chain_tokens is already
-                # int64 the .to() above is a no-op view of the relay buffer
-                # — a later relay reusing that buffer would corrupt stored
-                # rows (the row root is force-accepted by verify).
-                self._pp_spec_chain_by_rid[req.rid] = _PPSpecTreeRow(
-                    tokens=rows[i].clone(),
-                    parents=None if parent_list is None else parent_list[i].clone(),
-                    top_scores=(
-                        None
-                        if top_scores_index is None
-                        else top_scores_index[i].clone()
-                    ),
-                )
+        relayed = PPSpecRelayInput(
+            rids=fwd_rids,
+            tokens=chain.to(torch.int64).reshape(len(fwd_rids), num_draft_tokens),
+            parents=pp_outputs.tensors.get("spec_next_parents"),
+            top_scores=pp_outputs.tensors.get("spec_next_top_scores"),
+        )
+        self._pp_spec_set_relay(batch, relayed)
+
+    def _pp_spec_set_relay(self: Scheduler, batch: ScheduleBatch, relayed) -> None:
+        """Attach rows labelled with the forward-time composition to the live
+        batch: fold them into what the requests already carry, or relabel them
+        into the live order when the batch carries nothing yet."""
+        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
+
+        if isinstance(batch.spec_info, PPSpecRelayInput):
+            batch.spec_info.adopt(relayed)
+            return
+        live_rids = [req.rid for req in batch.reqs]
+        batch.spec_info = (
+            relayed if live_rids == relayed.rids else relayed.reindex(live_rids)
+        )
 
     def _pp_spec_chain_topology(
         self: Scheduler, bs: int, device: str
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """topk=1 chain constants, the shape a prefill round's degenerate row
-        implies. Mirrors _rebuild_topk1_chain_buffers: a single-step chain has
-        no parent entries, and both widths key off num_steps."""
+        """topk=1 chain constants, the shape a not-yet-drafted row implies.
+        Mirrors _rebuild_topk1_chain_buffers: a single-step chain has no parent
+        entries, and both widths key off num_steps."""
         num_steps = self.server_args.speculative_num_steps
         parent_width = num_steps if num_steps > 1 else 0
         parent_list = torch.arange(
@@ -1389,6 +1354,7 @@ class SchedulerPPMixin:
             build_tree_kernel_efficient,
             default_tree_mask_mode,
         )
+        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
 
         sa = self.server_args
         steps = sa.speculative_num_steps
@@ -1405,33 +1371,27 @@ class SchedulerPPMixin:
             )
             return
 
-        rows = [self._pp_spec_chain_by_rid[req.rid] for req in batch.reqs]
-        tree_rows = torch.stack([r.tokens for r in rows]).to(
-            device=device, dtype=torch.int64
-        )
+        relay: PPSpecRelayInput = batch.spec_info
+        # The rows track the batch through filter / merge, but a recomposition
+        # that bypasses those hooks would leave them labelled for a different
+        # order, and the rebuild reads them positionally. Relabel rather than
+        # hand the verify kernel another request's bonus token.
+        live_rids = [req.rid for req in batch.reqs]
+        if relay.rids != live_rids:
+            relay = relay.reindex(live_rids)
+            batch.spec_info = relay
+        tree_rows = relay.tokens.to(device=device, dtype=torch.int64)
         bonus_tokens = tree_rows[:, 0].contiguous()
         draft_tokens = tree_rows[:, 1:].contiguous()
         # Topology as drafted on the last stage. It is data-dependent once
-        # topk > 1, so it rides the relay rather than being re-derived here.
-        # Not-yet-drafted rows borrow the drafted rows' widths so the stack is
-        # rectangular; their drafts are zeros and get rejected regardless of
-        # the shape they hang on.
-        drafted = next((r for r in rows if r.parents is not None), None)
-        if drafted is None:
-            parent_list, top_scores_index = self._pp_spec_chain_topology(bs, device)
-        else:
-            chain_parents = torch.arange(
-                -1, drafted.parents.shape[0] - 1, dtype=torch.long, device=device
-            )
-            chain_scores = torch.arange(
-                drafted.top_scores.shape[0], dtype=torch.long, device=device
-            )
-            parent_list = torch.stack(
-                [chain_parents if r.parents is None else r.parents for r in rows]
-            ).to(device=device, dtype=torch.long)
-            top_scores_index = torch.stack(
-                [chain_scores if r.top_scores is None else r.top_scores for r in rows]
-            ).to(device=device, dtype=torch.long)
+        # topk > 1, so it rides the relay rather than being re-derived here;
+        # requests that have not been drafted for yet fall back to the chain
+        # constants, and their zero drafts get rejected either way.
+        parent_list, top_scores_index = relay.topology(
+            fallback=lambda: self._pp_spec_chain_topology(bs, device)
+        )
+        parent_list = parent_list.to(device=device, dtype=torch.long)
+        top_scores_index = top_scores_index.to(device=device, dtype=torch.long)
 
         # Mask selection mirrors the last stage's draft() tail
         # (build_eagle_verify_input) so every stage builds the same mask.

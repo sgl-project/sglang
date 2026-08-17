@@ -3777,6 +3777,10 @@ class Scheduler(
                 is_verify_round = self.server_args.pp_size > 1 and not (
                     batch.forward_mode.is_extend() or batch.is_extend_in_batch
                 )
+                # The relayed tree is what the requests carry between rounds;
+                # the rebuild below swaps it for this round's verify input, so
+                # hold on to it and put it back once the forward is done.
+                relay_input = batch.spec_info if is_verify_round else None
                 if is_verify_round:
                     # PP+spec decode: every stage rebuilds the same verify
                     # input from relayed per-req state (draft lives on the
@@ -3820,9 +3824,9 @@ class Scheduler(
                         )
                     batch.input_ids = None  # rebuilt next iter from draft_token
                     # The verify input is per-round; between iterations
-                    # spec_info must be merge/filter-safe (None on stages
-                    # without a draft worker).
-                    batch.spec_info = None
+                    # spec_info carries the relayed tree, which is
+                    # merge/filter-safe.
+                    batch.spec_info = relay_input
                 else:
                     # Non-overlap: drive the V2 worker synchronously (no
                     # future_map relay / on_publish). Only the PP+spec worker
@@ -3839,8 +3843,15 @@ class Scheduler(
                             batch, **kwargs
                         )
                     # The isolation restore reverted the worker's in-forward SB edits;
-                    # re-apply what must carry to the next iter.
-                    batch.spec_info = batch_result.next_draft_input
+                    # re-apply what must carry to the next iter. Under PP the
+                    # tail draft already consumed the draft input in-round, and
+                    # the next round's tree comes from the relay, so the last
+                    # stage carries the same relayed tree as the others.
+                    batch.spec_info = (
+                        relay_input
+                        if is_verify_round
+                        else batch_result.next_draft_input
+                    )
                     if batch_result.new_seq_lens is not None:
                         batch.seq_lens = batch_result.new_seq_lens
                         if batch.seq_lens_cpu is not None:
