@@ -70,6 +70,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.aiter_mla_gluon import (
+    log_mla_gluon_capability,
     mla_gluon_decode,
     prefer_mla_gluon_decode,
 )
@@ -354,6 +355,7 @@ class AiterAttnBackend(AttentionBackend):
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
+                log_mla_gluon_capability(logger)
 
             self.max_split_per_batch = 32 if _use_mla_ps_kernel else None
 

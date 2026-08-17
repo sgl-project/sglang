@@ -1,12 +1,19 @@
 """Gluon MLA decode wrapper for low head-count MLA (e.g. Kimi K3 TP8: 12 heads/GPU).
 
-Uses aiter ``mla_gluon`` when import/JIT succeeds. Falls back to the caller when
-Gluon is unavailable or fails to compile (known on some Triton 3.6.0 builds).
+Uses aiter ``mla_gluon`` when import succeeds and Triton Gluon exposes ``cga_layout``
+(needs Triton >= 3.7). Falls back to the caller (zero-pad + ``mla_decode_fwd``) when
+Gluon is unavailable or fails at runtime.
+
+Requires aiter ``main`` with ROCm/aiter #4480 (batch>1 ``bh16bn128``) and #4555
+(decode CUDA graph KV splits). SGLang probes import + Triton API only; aiter version
+is not pinned at build time.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -22,6 +29,101 @@ logger = logging.getLogger(__name__)
 _MLA_GLUON_ENABLED = get_bool_env_var("SGLANG_AITER_MLA_GLUON", "True")
 _mla_gluon_fn = None
 _mla_gluon_import_failed = False
+_capability_cache: Optional["MlaGluonCapability"] = None
+
+
+@dataclass(frozen=True)
+class MlaGluonCapability:
+    """Runtime probe of aiter/Triton Gluon prerequisites for h12 + FP8 decode."""
+
+    enabled_by_env: bool
+    import_ok: bool
+    triton_version: str
+    triton_cga_layout_ok: bool
+    ready: bool
+    summary: str
+
+    def missing_for_ready(self) -> list[str]:
+        missing = []
+        if not self.enabled_by_env:
+            missing.append("SGLANG_AITER_MLA_GLUON=0")
+        if not self.import_ok:
+            missing.append("aiter.ops.triton.gluon.mla_gluon import")
+        if not self.triton_cga_layout_ok:
+            missing.append(
+                f"Triton Gluon cga_layout (have {self.triton_version or 'unknown'}, need >= 3.7)"
+            )
+        return missing
+
+
+def _triton_version() -> str:
+    try:
+        import triton
+
+        return getattr(triton, "__version__", "unknown")
+    except Exception:
+        return "missing"
+
+
+def _triton_cga_layout_ok() -> bool:
+    try:
+        import triton.experimental.gluon.language as gl
+
+        return "cga_layout" in inspect.signature(gl.PaddedSharedLayout).parameters
+    except Exception:
+        return False
+
+
+def _gluon_runtime_ok() -> bool:
+    return mla_gluon_available() and _triton_cga_layout_ok()
+
+
+def probe_mla_gluon_capability(*, force_refresh: bool = False) -> MlaGluonCapability:
+    global _capability_cache
+    if _capability_cache is not None and not force_refresh:
+        return _capability_cache
+
+    enabled = _MLA_GLUON_ENABLED
+    triton_ver = _triton_version()
+    import_ok = mla_gluon_available() if enabled else False
+    cga_ok = _triton_cga_layout_ok()
+    ready = enabled and import_ok and cga_ok
+
+    if ready:
+        summary = f"Gluon MLA h12+fp8 ready (Triton={triton_ver})"
+    else:
+        cap = MlaGluonCapability(
+            enabled_by_env=enabled,
+            import_ok=import_ok,
+            triton_version=triton_ver,
+            triton_cga_layout_ok=cga_ok,
+            ready=False,
+            summary="",
+        )
+        missing = cap.missing_for_ready()
+        summary = (
+            "Gluon MLA h12+fp8 disabled; fallback to zero-pad mla_decode_fwd "
+            f"({'; '.join(missing)})"
+        )
+
+    _capability_cache = MlaGluonCapability(
+        enabled_by_env=enabled,
+        import_ok=import_ok,
+        triton_version=triton_ver,
+        triton_cga_layout_ok=cga_ok,
+        ready=ready,
+        summary=summary,
+    )
+    return _capability_cache
+
+
+def log_mla_gluon_capability(log: logging.Logger | None = None) -> MlaGluonCapability:
+    cap = probe_mla_gluon_capability()
+    (log or logger).info(cap.summary)
+    if not cap.ready:
+        for item in cap.missing_for_ready():
+            (log or logger).info("  missing: %s", item)
+    return cap
 
 
 def _in_cuda_graph_capture() -> bool:
@@ -111,7 +213,8 @@ def mla_gluon_decode(
         return o
     except Exception as exc:
         logger.warning(
-            "mla_gluon decode failed (num_head=%s, kv_dtype=%s, batch=%s): %s",
+            "mla_gluon decode failed (num_head=%s, kv_dtype=%s, batch=%s): %s; "
+            "falling back to zero-pad mla_decode_fwd",
             layer.tp_q_head_num,
             k_buffer.dtype,
             batch_size,
@@ -121,9 +224,25 @@ def mla_gluon_decode(
 
 
 def prefer_mla_gluon_decode(*, num_head: int, kv_cache_dtype: torch.dtype) -> bool:
-    """Route h12 decode through Gluon when FP8 KV (persist ASM lacks fp8 qh16)."""
-    if not mla_gluon_available():
+    """Route h12 decode through Gluon when FP8 KV and runtime prerequisites hold."""
+    if not _MLA_GLUON_ENABLED:
+        return False
+    if get_bool_env_var("SGLANG_AITER_MLA_GLUON_FORCE", "False"):
+        if mla_gluon_available():
+            return True
+        logger.warning(
+            "SGLANG_AITER_MLA_GLUON_FORCE=1 but mla_gluon import failed; "
+            "falling back"
+        )
         return False
     if num_head == 12 and kv_cache_dtype == fp8_dtype:
-        return True
-    return get_bool_env_var("SGLANG_AITER_MLA_GLUON_FORCE", "False")
+        return _gluon_runtime_ok()
+    return False
+
+
+def reset_mla_gluon_state_for_test() -> None:
+    """Test helper: clear import/probe caches."""
+    global _mla_gluon_fn, _mla_gluon_import_failed, _capability_cache
+    _mla_gluon_fn = None
+    _mla_gluon_import_failed = False
+    _capability_cache = None
