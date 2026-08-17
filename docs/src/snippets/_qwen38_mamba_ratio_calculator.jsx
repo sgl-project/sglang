@@ -115,15 +115,12 @@ export const Qwen38MambaRatioCalculator = () => {
         ? strategyFlag
         : "extra_buffer";
 
-    // S mirrors kv_cache_configurator._calculate_mamba_ratio (single GPU,
-    // overlap scheduler on): extra_buffer=5, extra_buffer_lazy=4,
-    // no_buffer=3, radix cache disabled=1.
-    // Mirrors kv_cache_configurator._calculate_mamba_ratio: base 3, minus 1
-    // under the decode-lock skip, plus the ping-pong track buffer (2 under the
-    // overlap scheduler, 1 for lazy or without overlap). no_buffer has no track
-    // buffer and adds the skip's drop back, so it stays 3; radix off is 1.
-    // Hardcoding 5/4/3 ignored both knobs and over-provisioned when either was
-    // set. Matches the sibling K3 calculator.
+    // S mirrors kv_cache_configurator._calculate_mamba_ratio: base 3, minus 1
+    // when SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1, plus the ping-pong track
+    // buffer (2 under the overlap scheduler, 1 for extra_buffer_lazy or with
+    // overlap off). no_buffer has no track buffer and no decode lock, so it
+    // stays 3; with the radix cache disabled S is 1. At the stock defaults:
+    // extra_buffer=5, extra_buffer_lazy=4, no_buffer=3, radix off=1.
     const skipLock = env.some((e) =>
       e.startsWith("SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"));
     const overlapOff =
@@ -137,19 +134,18 @@ export const Qwen38MambaRatioCalculator = () => {
           (skipLock ? 1 : 0) +
           (overlapOff || strategy === "extra_buffer_lazy" ? 1 : 2);
 
-    // Verify intermediates under speculative decoding: the draft-token count
-    // (4 at the recommended EAGLE/MTP 3/1/4), 0 when spec is off.
+    // D: verify intermediate states under speculative decoding, 0 with spec
+    // off.
     const specOn = hasFlag("--speculative-algorithm");
     const algo = (flagArg("--speculative-algorithm") || "").toUpperCase();
-    // ReplaySSM spec-verify moves the D intermediate SSM states off the
-    // per-request slot budget onto a fixed ring, so D is 0 even though spec is
-    // on (see the compute-mamba-ratio skill's ReplaySSM caveat). Counting them
-    // over-provisions the state pool ~2x and starves KV.
+    // ReplaySSM spec-verify keeps the verify intermediates on a fixed ring
+    // rather than per-request state slots, so D is 0 even with spec on.
     const replaySpec = hasFlag("--enable-linear-replayssm-spec");
-    // DSPARK never emits --speculative-num-draft-tokens: its verify window is
-    // --speculative-dspark-block-size (gamma) + 1, auto-inferred from the draft
-    // checkpoint when omitted. The old `|| 4` fallback silently under-counted.
-    const dsparkBlock = Number(flagArg("--speculative-dspark-block-size")) || 5;
+    // DSPARK takes no --speculative-num-draft-tokens: its verify window is
+    // --speculative-dspark-block-size (gamma) + 1, and gamma is read from the
+    // draft checkpoint when the flag is omitted — block_size 7 for
+    // RadixArk/Qwen3.8-27B-DSpark, so D = 8.
+    const dsparkBlock = Number(flagArg("--speculative-dspark-block-size")) || 7;
     const drafts = !specOn || replaySpec
       ? 0
       : algo === "DSPARK"
@@ -175,18 +171,19 @@ export const Qwen38MambaRatioCalculator = () => {
   const eff = derive(cfg.flags, cfg.env);
   const bs = derive(
     cfg.baseFlags.length ? cfg.baseFlags : cfg.flags,
-    cfg.baseEnv.length ? cfg.baseEnv : cfg.env,
+    // The env rides with the command it belongs to: a base command with an
+    // empty env must not inherit the Playground's overlay env.
+    cfg.baseFlags.length ? cfg.baseEnv : cfg.env,
   );
   const { ratio, tp, kvDtype, ssmDtype, radixOff, strategy, slots, specOn,
           drafts, stateBytesPerSlot, kvBytesPerToken } = eff;
 
   const valid = Number.isFinite(ratio) && ratio > 0 && L > 0 && tp === 1;
   const baseValid = Number.isFinite(bs.ratio) && bs.ratio > 0 && L > 0 && bs.tp === 1;
-  // C x S, NOT C x (S + D): the engine divides the main state pool by S alone
-  // (kv_cache_configurator.py, mamba_cap = max_mamba_cache_size // ratio where
-  // ratio = _calculate_mamba_ratio() = S) and sizes the spec intermediate
-  // buffer separately from D. Folding D in double-counts it and the surplus
-  // comes straight out of KV.
+  // The engine divides the state pool by S alone (kv_cache_configurator.py:
+  // mamba_cap = max_mamba_cache_size // _calculate_mamba_ratio()) and sizes
+  // the speculative verify buffer separately from D, so the pin is C x S,
+  // not C x (S + D).
   const pin = Math.ceil(C * slots);
   const pinValid = valid && Number.isFinite(pin) && pin > 0 && C > 0;
 
@@ -383,8 +380,9 @@ export const Qwen38MambaRatioCalculator = () => {
       )}
       <div style={{ color: colors.muted, fontSize: "11px" }}>
         state/slot {(stateBytesPerSlot / 1e6).toFixed(1)} MB · KV/token{" "}
-        {(kvBytesPerToken / 1e3).toFixed(1)} KB · {slots + drafts} state slots per
-        request, so {targetConcurrency || "N"} concurrent requests need{" "}
+        {(kvBytesPerToken / 1e3).toFixed(1)} KB · the ratio prices{" "}
+        {slots + drafts} state slots per request; the pin counts S = {slots},
+        so {targetConcurrency || "N"} concurrent requests pin{" "}
         {pinValid ? pin : "—"} slots.
       </div>
     </div>
