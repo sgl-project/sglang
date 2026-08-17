@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     collect_promotion_candidates,
     component_resident_size_bytes,
     estimate_default_workload_peak_bytes,
+    format_applied_changes,
     plan_auto_residency,
     rollback_promotions,
 )
@@ -452,6 +453,21 @@ class TestApplyAndRollback:
         # never disabled: re-enabling must not stack a second set of hooks
         module.enable_offload()
         assert manager.register_hooks_calls == 0
+
+
+class TestAppliedChangesLog:
+    def test_reports_equivalent_server_args_and_kill_switch(self):
+        plan = _plan_for(
+            [
+                _candidate("text_encoder", mode=LAYERWISE_OFFLOAD, weight_gib=7),
+                _candidate("vae", weight_gib=1),
+            ]
+        )
+        message = format_applied_changes(plan=plan)
+        assert "text_encoder: layerwise-offload -> resident" in message
+        assert "vae: component-offload -> resident" in message
+        assert "--component-residency text_encoder=resident vae=resident" in message
+        assert "SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY=1" in message
 
 
 class TestWarmupFrameAdjustment:

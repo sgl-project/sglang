@@ -495,6 +495,27 @@ def format_plan_summary(
     )
 
 
+def format_applied_changes(*, plan: AutoResidencyPlan) -> str:
+    """Describe the applied residency changes as equivalent server args.
+
+    Users can pin the printed ``--component-residency`` flags to freeze this
+    placement, or disable the adjustment entirely with the kill switch.
+    """
+    changes = "; ".join(
+        f"{candidate.component_name}: {candidate.residency_mode} -> resident"
+        for candidate in plan.promotions
+    )
+    equivalent = "--component-residency " + " ".join(
+        f"{candidate.component_name}=resident" for candidate in plan.promotions
+    )
+    return (
+        f"Auto residency: adjusted {changes}. "
+        f"Equivalent server args: {equivalent}. "
+        f"Pin these flags to make this placement explicit, or set "
+        f"SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY=1 to disable auto adjustment."
+    )
+
+
 def plan_summary_payload(
     *, plan: AutoResidencyPlan, workload: DefaultWorkload, status: str
 ) -> dict:

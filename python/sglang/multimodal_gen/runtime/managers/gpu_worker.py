@@ -64,6 +64,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     collect_promotion_candidates,
     component_resident_size_bytes,
     estimate_default_workload_peak_bytes,
+    format_applied_changes,
     format_plan_summary,
     plan_auto_residency,
     plan_summary_payload,
@@ -1106,6 +1107,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
         if self.is_output_rank:
             logger.info("%s", summary)
+            logger.info("%s", format_applied_changes(plan=plan))
         return OutputBatch(
             output=plan_summary_payload(
                 plan=plan, workload=workload, status=PROMOTION_STATUS_PROMOTED
@@ -1122,6 +1124,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return OutputBatch(
                 error=f"auto residency rollback failed: {rank_errors[0]}",
                 output={"status": PROMOTION_STATUS_ROLLBACK_FAILED},
+            )
+        if self.is_output_rank:
+            logger.info(
+                "Auto residency: rolled back; the residency configured at "
+                "startup is in effect again (no equivalent server-arg "
+                "changes remain)."
             )
         return OutputBatch(output={"status": PROMOTION_STATUS_ROLLED_BACK})
 
