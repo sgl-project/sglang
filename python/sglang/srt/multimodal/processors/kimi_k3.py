@@ -22,8 +22,17 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.mem_cache.multimodal_cache import (
+    MM_EMBEDDING_CACHE_HASH_KEY,
+    MM_EMBEDDING_CACHE_IDENTITY_KEY,
+    MM_EMBEDDING_CACHE_LEASE_ID_KEY,
+)
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
-from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
+from sglang.srt.multimodal.cache import (
+    build_feature_identity,
+    compact_feature_hash,
+    resolve_multimodal_item_hash,
+)
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     KimiK3DeferredPreprocessing,
@@ -506,15 +515,15 @@ class KimiK3ImageProcessor(
         deferred: Optional[KimiK3DeferredPreprocessing] = None,
     ) -> KimiK3ImagePreprocessArtifact:
         """Freeze one image's prompt-independent preprocessing result."""
-        # Use the same feature-hash contract as MultimodalDataItem.
-        feature_hash = resolve_multimodal_item_hash(
-            feature=feature, namespace=artifact_key
-        )
+        processor_output_hash = resolve_multimodal_item_hash(feature=feature)
+        feature_identity = build_feature_identity(artifact_key, processor_output_hash)
+        feature_hash = compact_feature_hash(feature_identity)
         if not self.keep_mm_features_on_device and feature.device.type != "cpu":
             feature = feature.cpu()
         return KimiK3ImagePreprocessArtifact(
             content_digest=content_digest,
             artifact_key=artifact_key,
+            feature_identity=feature_identity,
             feature_hash=feature_hash,
             original_size=original_size,
             resize_config=KimiK3ResizeConfig.from_dict(resize_config),
@@ -603,6 +612,9 @@ class KimiK3ImageProcessor(
         self,
         input_text,
         artifacts: list[KimiK3ImagePreprocessArtifact],
+        *,
+        featureless_hit_mask: Optional[list[bool]] = None,
+        embedding_lease_id: Optional[str] = None,
     ) -> MultimodalProcessorOutput:
         """Compose the current request from its prompt and ordered artifacts.
 
@@ -613,6 +625,13 @@ class KimiK3ImageProcessor(
         ``MultimodalDataItem`` with offsets, grid metadata, feature, and feature
         hash. It does not read raw media or access the preprocess cache.
         """
+        if featureless_hit_mask is None:
+            featureless_hit_mask = [False] * len(artifacts)
+        if len(featureless_hit_mask) != len(artifacts):
+            raise ValueError("featureless_hit_mask must align with artifacts")
+        if any(featureless_hit_mask) and embedding_lease_id is None:
+            raise ValueError("featureless cache hits require an embedding lease")
+
         # 1. rebuild prompt-specific tokens and offsets
         original_ids = (
             input_text
@@ -632,15 +651,25 @@ class KimiK3ImageProcessor(
 
         # 2. build request-owned items from prompt-independent artifacts
         items = []
-        for artifact, offset in zip(artifacts, offsets):
+        for artifact, offset, featureless in zip(
+            artifacts, offsets, featureless_hit_mask
+        ):
             model_specific_data = {
                 "image_grid_thw": torch.tensor([artifact.grid_thw], dtype=torch.int64)
             }
             if artifact.deferred is not None:
                 model_specific_data[DEFERRED_PREPROCESSING_KEY] = artifact.deferred
+            if featureless:
+                model_specific_data[MM_EMBEDDING_CACHE_LEASE_ID_KEY] = (
+                    embedding_lease_id
+                )
+            model_specific_data[MM_EMBEDDING_CACHE_IDENTITY_KEY] = (
+                artifact.feature_identity
+            )
+            model_specific_data[MM_EMBEDDING_CACHE_HASH_KEY] = artifact.feature_hash
             item = MultimodalDataItem(
                 modality=Modality.IMAGE,
-                feature=artifact.feature,
+                feature=None if featureless else artifact.feature,
                 offsets=[offset],
                 model_specific_data=model_specific_data,
             )
@@ -728,7 +757,7 @@ class KimiK3ImageProcessor(
                 )
         if (
             any(self._is_preprocessed_input(item) for item in image_data)
-            or not self.mm_preprocess_cache.enabled
+            or not self.media_artifact_cache_enabled
         ):
             # 1. keep preprocessed inputs and cache-off requests on the legacy path
             return await self._process_mm_data_uncached(
@@ -736,11 +765,19 @@ class KimiK3ImageProcessor(
             )
 
         # 2. resolve per-image artifacts before composing the current prompt
+        featureless_hit_mask = kwargs.get("featureless_hit_mask")
         artifacts = await self.prepare_media_artifacts(
             image_data,
             content_hashes=request_obj.mm_content_hashes,
+            featureless_hit_mask=featureless_hit_mask,
+            media_lookups=kwargs.get("preprocess_cache_lookups"),
         )
-        return self.compose_request(input_text, artifacts)
+        return self.compose_request(
+            input_text,
+            artifacts,
+            featureless_hit_mask=featureless_hit_mask,
+            embedding_lease_id=kwargs.get("embedding_lease_id"),
+        )
 
     def get_mm_data(self, prompt, embeddings, **kwargs):
         img_grid_thw = kwargs.get("img_grid_thw", None)
@@ -776,4 +813,16 @@ class KimiK3ImageProcessor(
             start = output.input_ids.index(self.mm_tokens.image_token_id, search_start)
             item.offsets = [(start, start + count - 1)]
             search_start = start + count
+
+        feature_identities = kwargs.get("mm_feature_identities")
+        if feature_identities is not None:
+            if len(feature_identities) != len(output.mm_items):
+                raise ValueError(
+                    "Expected one feature identity for each K3 encoder grid."
+                )
+            for item, identity in zip(output.mm_items, feature_identities):
+                item.model_specific_data[MM_EMBEDDING_CACHE_IDENTITY_KEY] = identity
+                item.model_specific_data[MM_EMBEDDING_CACHE_HASH_KEY] = (
+                    compact_feature_hash(identity)
+                )
         return output

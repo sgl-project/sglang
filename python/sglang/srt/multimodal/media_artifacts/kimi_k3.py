@@ -84,7 +84,7 @@ class KimiK3ResizeConfig:
 
 @dataclass(frozen=True)
 class KimiK3ImagePreprocessArtifact:
-    """K3's prompt-independent preprocess result for one image, containing the feature and everything
+    """K3's reusable preprocess-cache item for one image.
 
     ``original_size`` and ``resize_config`` rebuild the K3 image tokens for
     each prompt; ``grid_thw`` becomes encoder metadata; ``feature`` is either
@@ -94,6 +94,7 @@ class KimiK3ImagePreprocessArtifact:
 
     content_digest: str
     artifact_key: str
+    feature_identity: str
     feature_hash: int
     original_size: tuple[int, int]
     resize_config: KimiK3ResizeConfig
@@ -125,6 +126,7 @@ class KimiK3ImagePreprocessArtifact:
         return (
             self.content_digest,
             self.artifact_key,
+            self.feature_identity,
             self.feature_hash,
             self.original_size,
             (

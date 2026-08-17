@@ -12,8 +12,9 @@ import time
 import traceback
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http import HTTPStatus
+from types import MappingProxyType
 from typing import Annotated, Any, Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
@@ -58,12 +59,29 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_precompile_model_kernels_after_loading,
 )
 from sglang.srt.model_loader import get_model
-from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
+from sglang.srt.multimodal.cache import (
+    CacheLookup,
+    CacheMiss,
+    EncoderMediaLookup,
+    EncoderPreprocessArtifact,
+    MultimodalPreprocessCache,
+    build_artifact_key,
+    build_feature_hash,
+    build_feature_identity,
+    build_mm_global_cache_key,
+    build_processor_fingerprint,
+    media_preprocess_kwargs,
+    parse_content_hash,
+    snapshot_media,
+)
 from sglang.srt.multimodal.encoder_preprocessing import (
+    EncoderArtifactCacheConfig,
     EncoderPreprocessOutput,
     get_encoder_preprocessed_items,
     invoke_encoder_preprocessor,
+    resolve_encoder_feature_method,
     resolve_encoder_media_processor_config,
+    resolve_encoder_preprocessor,
 )
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
@@ -158,13 +176,21 @@ class InternalError(MMError):
 class GlobalCacheEncodeContext:
     req_id: str
     modality: Modality
-    mm_inputs: dict
+    mm_inputs: Optional[dict]
     get_feature_fn: Any
     grid_thw: List
     mm_feature: Any
     num_items: int
     aux_data: dict
     str_mm_hashes: Optional[List[str]]
+    source_mm_items: Optional[list] = None
+    media_lookups: Optional[List[EncoderMediaLookup]] = None
+    caller_hashes: Optional[List[str]] = None
+    prepared_mm_inputs: Optional[dict] = None
+    prepared_get_feature_fn: Any = None
+    prepared_grid_thw: Optional[List] = None
+    prepared_mm_feature: Any = None
+    prepared_index_map: Optional[dict[int, int]] = None
 
 
 class TensorWrapper:
@@ -269,16 +295,38 @@ def _normalize_aux_value(val):
     return val
 
 
+def _freeze_artifact_metadata(val):
+    """Copy per-item processor metadata into an immutable CPU-only value."""
+    if isinstance(val, torch.Tensor):
+        val = val.detach().cpu().tolist()
+    elif isinstance(val, np.ndarray):
+        val = val.tolist()
+    elif isinstance(val, np.generic):
+        return val.item()
+    if isinstance(val, (list, tuple)):
+        return tuple(_freeze_artifact_metadata(item) for item in val)
+    if isinstance(val, dict):
+        return MappingProxyType(
+            {key: _freeze_artifact_metadata(value) for key, value in val.items()}
+        )
+    return val
+
+
+def _artifact_metadata_to_aux(val):
+    if isinstance(val, tuple):
+        return [_artifact_metadata_to_aux(item) for item in val]
+    if isinstance(val, dict) or isinstance(val, MappingProxyType):
+        return {key: _artifact_metadata_to_aux(value) for key, value in val.items()}
+    return val
+
+
 def _build_mm_aux_data(mm_inputs, model_type=None):
     # Video aux metadata, scoped to model_type's video-meta attrs.
     aux = {
         attr: _normalize_aux_value(mm_inputs.get(attr))
         for attr in video_meta_attrs_for(model_type)
+        if mm_inputs.get(attr) is not None
     }
-    if model_type == "kimi_k3":
-        aux["original_image_sizes"] = _normalize_aux_value(
-            mm_inputs.get("original_image_sizes")
-        )
     return aux
 
 
@@ -334,9 +382,7 @@ class MMEncoder:
             remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
         )
-        self.model_type = getattr(
-            self.model_config.hf_config, "model_type", "unknown"
-        ).lower()
+        self.model_type = self.model_config.hf_config.model_type.lower()
 
         self.device = server_args.device
         self.gpu_id = server_args.base_gpu_id + rank if gpu_id is None else gpu_id
@@ -374,6 +420,51 @@ class MMEncoder:
         self.encoder_media_processor_config = resolve_encoder_media_processor_config(
             self.model
         )
+        self.encoder_artifact_cache_configs = (
+            self.encoder_media_processor_config.artifact_caches
+        )
+        requested_preprocess_cache_mb = server_args.mm_preprocess_cache_size_mb
+        preprocess_cache_mb = (
+            max(
+                (
+                    config.auto_cache_size_mb
+                    for config in self.encoder_artifact_cache_configs
+                ),
+                default=0,
+            )
+            if requested_preprocess_cache_mb is None
+            and self.encoder_artifact_cache_configs
+            else (requested_preprocess_cache_mb or 0)
+        )
+        preprocess_cache_bytes = (
+            preprocess_cache_mb * 1024 * 1024 // max(server_args.tp_size, 1)
+        )
+        self.mm_preprocess_cache = MultimodalPreprocessCache(
+            max_size_bytes=preprocess_cache_bytes,
+            max_entries=8192,
+        )
+        self.trust_mm_content_hashes = server_args.trust_mm_content_hashes
+        self.mm_processor_fingerprint = build_processor_fingerprint(
+            self.image_processor,
+            self.model_config.hf_config,
+            server_args,
+            extra={
+                "encoder_mode": True,
+                "preprocessing_backend": (
+                    "gpu" if self.use_image_processor_gpu else "cpu"
+                ),
+                "vision_config": self.vision_config,
+                "media_processor": self.encoder_media_processor_config,
+            },
+        )
+        if self.mm_preprocess_cache.enabled and rank == 0:
+            logger.info(
+                "Encoder preprocess cache enabled: %d MiB total "
+                "(%d MiB per TP rank), caller content hashes are %s",
+                preprocess_cache_mb,
+                preprocess_cache_bytes // (1024 * 1024),
+                "trusted" if self.trust_mm_content_hashes else "verified",
+            )
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
         self.context = zmq.asyncio.Context(2)
@@ -390,6 +481,12 @@ class MMEncoder:
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
         self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
         self.mm_cache_lock = asyncio.Lock()
+        # Metadata and embedding caches have different eviction policies. This
+        # short-lived map coalesces the work that fills both without retaining
+        # another copy of either result.
+        self.encoder_artifact_inflight: dict[str, asyncio.Future] = {}
+        self.encoder_artifact_inflight_lock = asyncio.Lock()
+        self.encoder_artifact_cache_generation = 0
 
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(os.environ.get("SGLANG_ENCODER_MM_LOAD_WORKERS", 4))
@@ -488,6 +585,17 @@ class MMEncoder:
                 self._encode_fn = self.encode
 
         logger.info(f"rank {rank} init finish ")
+
+    def clear_mm_caches(self) -> None:
+        self.encoder_artifact_cache_generation += 1
+        error = InternalError("Encoder media cache was flushed during preprocessing")
+        for future in self.encoder_artifact_inflight.values():
+            if not future.done():
+                future.set_exception(error)
+                future.exception()
+        self.encoder_artifact_inflight.clear()
+        self.mm_preprocess_cache.clear()
+        self.mm_cache.clear()
 
     def _infer_embedding_dims(self) -> dict:
         """Infer per-modality embedding dimensions from hf_config at init time."""
@@ -682,10 +790,13 @@ class MMEncoder:
                 return data
             media_metadata = {key: value for key, value in data.items() if key != "url"}
             content_hash = parse_content_hash(data.get("content_hash"))
+            content_verified = bool(data.get("_content_verified", False))
             data = data["url"]
+        else:
+            content_verified = False
         try:
             if modality == Modality.IMAGE:
-                if content_hash is not None:
+                if content_hash is not None and not content_verified:
                     snapshot = snapshot_media(data)
                     if snapshot.content_digest != content_hash:
                         raise BadRequestError(
@@ -728,6 +839,170 @@ class MMEncoder:
             raise BadRequestError(f"Error while loading data {data}: {e}") from e
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")
+
+    def _supports_encoder_artifact_cache(self, modality: Modality) -> bool:
+        return (
+            self.encoder_media_processor_config.artifact_cache_for(modality) is not None
+            and self.mm_preprocess_cache.enabled
+            and not envs.SGLANG_MM_SKIP_COMPUTE_HASH.get()
+        )
+
+    def _encoder_artifact_metadata(
+        self, mm_inputs: dict, index: int, modality: Modality
+    ) -> dict:
+        config = self.encoder_media_processor_config.artifact_cache_for(modality)
+        if config is None:
+            return {}
+        return MappingProxyType(
+            {
+                field: _freeze_artifact_metadata(mm_inputs[field][index])
+                for field in config.per_item_metadata_fields
+            }
+        )
+
+    @staticmethod
+    def _compatible_encoder_artifact(value, key: str, digest: str) -> bool:
+        return (
+            isinstance(value, EncoderPreprocessArtifact)
+            and value.artifact_key == key
+            and value.content_digest == digest
+        )
+
+    def _encoder_aux_data(
+        self,
+        modality: Modality,
+        mm_inputs: Optional[dict] = None,
+        artifacts: Optional[list[EncoderPreprocessArtifact]] = None,
+    ) -> dict:
+        aux = _build_mm_aux_data(mm_inputs or {}, self.model_type)
+        config = self.encoder_media_processor_config.artifact_cache_for(modality)
+        if config is not None:
+            for field in config.per_item_metadata_fields:
+                if artifacts is not None:
+                    aux[field] = [
+                        _artifact_metadata_to_aux(artifact.metadata[field])
+                        for artifact in artifacts
+                    ]
+                elif mm_inputs is not None:
+                    aux[field] = _normalize_aux_value(mm_inputs.get(field))
+        if artifacts is not None:
+            aux["mm_feature_identities"] = [
+                artifact.feature_identity for artifact in artifacts
+            ]
+        return aux
+
+    def _encoder_artifact_key(
+        self, content_digest: str, source, modality: Modality
+    ) -> str:
+        return build_artifact_key(
+            content_digest,
+            modality=modality.name.lower(),
+            processor_fingerprint=self.mm_processor_fingerprint,
+            preprocess_kwargs=media_preprocess_kwargs(
+                source, defaults={"detail": "auto"}
+            ),
+        )
+
+    async def _lookup_encoder_artifacts(
+        self, mm_items, modality: Modality
+    ) -> list[EncoderMediaLookup]:
+        """Resolve media identities without decoding metadata hits."""
+        if not self._supports_encoder_artifact_cache(modality):
+            raise InternalError(
+                f"Encoder artifact caching is not configured for {modality.name}"
+            )
+        lookups: list[Optional[EncoderMediaLookup]] = [None] * len(mm_items)
+        pending = {}
+        for index, item in enumerate(mm_items):
+            source = item.get("url", item) if isinstance(item, dict) else item
+            expected = (
+                parse_content_hash(item.get("content_hash"))
+                if isinstance(item, dict)
+                else None
+            )
+            if self.trust_mm_content_hashes and expected is not None:
+                key = self._encoder_artifact_key(expected, item, modality)
+                artifact = self.mm_preprocess_cache.get_if_present(
+                    key,
+                    lambda value: self._compatible_encoder_artifact(
+                        value, key, expected
+                    ),
+                )
+                if artifact is not None:
+                    lookups[index] = EncoderMediaLookup(
+                        source=source,
+                        expected_digest=expected,
+                        content_digest=expected,
+                        artifact_key=key,
+                        snapshot=None,
+                        artifact=artifact,
+                    )
+                    continue
+            pending[index] = (
+                item,
+                source,
+                expected,
+                self.io_executor.submit(snapshot_media, source),
+            )
+
+        for index, (item, source, expected, future) in pending.items():
+            snapshot = await asyncio.wrap_future(future)
+            if expected is not None and snapshot.content_digest != expected:
+                raise BadRequestError(
+                    "Encoder media content hash mismatch: "
+                    f"expected {expected}, got {snapshot.content_digest}"
+                )
+            key = self._encoder_artifact_key(snapshot.content_digest, item, modality)
+            lookups[index] = EncoderMediaLookup(
+                source=source,
+                expected_digest=expected,
+                content_digest=snapshot.content_digest,
+                artifact_key=key,
+                snapshot=snapshot,
+                artifact=self.mm_preprocess_cache.get_if_present(
+                    key,
+                    lambda value: self._compatible_encoder_artifact(
+                        value, key, snapshot.content_digest
+                    ),
+                ),
+            )
+        if any(lookup is None for lookup in lookups):
+            raise InternalError("Encoder media identity lookup is incomplete")
+        return list(lookups)
+
+    async def _materialize_encoder_media(
+        self,
+        lookups: list[EncoderMediaLookup],
+        indices: list[int],
+        modality: Modality,
+    ) -> list[dict]:
+        """Return verified snapshot-backed inputs for the processor miss path."""
+        pending = {}
+        for index in indices:
+            lookup = lookups[index]
+            if lookup.snapshot is None:
+                pending[index] = self.io_executor.submit(snapshot_media, lookup.source)
+
+        snapshots = {}
+        for index, future in pending.items():
+            snapshot = await asyncio.wrap_future(future)
+            lookup = lookups[index]
+            if snapshot.content_digest != lookup.content_digest:
+                raise BadRequestError(
+                    "Trusted encoder content hash did not match media bytes: "
+                    f"expected {lookup.content_digest}, got {snapshot.content_digest}"
+                )
+            snapshots[index] = snapshot
+
+        return [
+            {
+                "url": (lookups[index].snapshot or snapshots[index]).data,
+                "type": modality.name.lower(),
+                "content_hash": lookups[index].content_digest,
+                "_content_verified": True,
+            }
+            for index in indices
+        ]
 
     def submit_data_loading_tasks(self, items, modalities):
         futures = []
@@ -982,8 +1257,11 @@ class MMEncoder:
                 raise ValueError("Encoder preprocess output contains wrong modality")
             return selected
 
-        split_kimi_k3_images = (
-            self.model_type == "kimi_k3" and modality == Modality.IMAGE
+        cache_config = self.encoder_media_processor_config.artifact_cache_for(modality)
+        split_preprocessed_items = (
+            cache_config is not None
+            and cache_config.modality == modality
+            and cache_config.split_preprocessed_items
         )
 
         # Audio features are per-item (list of mels for mimo_v2, or batched
@@ -1004,10 +1282,10 @@ class MMEncoder:
                 offsets.append(curr)
             for index in indices:
                 sub_feature_list.append(mm_feature[offsets[index] : offsets[index + 1]])
-            if not split_kimi_k3_images:
+            if not split_preprocessed_items:
                 sub_feature = torch.cat(sub_feature_list, dim=0)
 
-        if split_kimi_k3_images:
+        if split_preprocessed_items:
             mm_items = [
                 MultimodalDataItem.from_dict(
                     {
@@ -1036,7 +1314,7 @@ class MMEncoder:
                 continue
             value = _convert(value)
             if key in _mm_grid_attrs.get(modality, []):
-                if split_kimi_k3_images:
+                if split_preprocessed_items:
                     for mm_item, index in zip(mm_items, indices):
                         mm_item.set(key, value[index : index + 1])
                 else:
@@ -1087,6 +1365,139 @@ class MMEncoder:
         req_id: str,
         hashes: Optional[List[str]] = None,
     ) -> GlobalCacheEncodeContext:
+        lookups = None
+        if self._supports_encoder_artifact_cache(modality):
+            lookups = await self._lookup_encoder_artifacts(mm_items, modality)
+            cached_artifacts = [lookup.artifact for lookup in lookups]
+            metadata_miss_indices = [
+                index
+                for index, artifact in enumerate(cached_artifacts)
+                if artifact is None
+            ]
+            prepared_mm_inputs = None
+            prepared_get_feature_fn = None
+            prepared_grid_thw = None
+            prepared_mm_feature = None
+            prepared_index_map = None
+            if metadata_miss_indices:
+                first_index_by_key = {}
+                for index in metadata_miss_indices:
+                    first_index_by_key.setdefault(lookups[index].artifact_key, index)
+                cache_results = dict(
+                    zip(
+                        first_index_by_key,
+                        self.mm_preprocess_cache.lookup_or_claim_many(
+                            list(first_index_by_key)
+                        ),
+                    )
+                )
+                owner_indices = [
+                    first_index_by_key[key]
+                    for key, result in cache_results.items()
+                    if isinstance(result, CacheMiss) and result.should_compute
+                ]
+                try:
+                    if owner_indices:
+                        processor_media = await self._materialize_encoder_media(
+                            lookups, owner_indices, modality
+                        )
+                        (
+                            prepared_mm_inputs,
+                            prepared_get_feature_fn,
+                        ) = await self._process_mm_items(processor_media, modality)
+                        prepared_grid_thw = _get_mm_grid_dim(
+                            prepared_mm_inputs, modality, self.model_type
+                        )
+                        prepared_mm_feature = _convert(
+                            _get_mm_feature(prepared_mm_inputs, modality)
+                        )
+                        prepared_artifacts = self._store_encoder_artifacts(
+                            [lookups[index] for index in owner_indices],
+                            prepared_mm_inputs,
+                            prepared_mm_feature,
+                            prepared_grid_thw,
+                            modality,
+                            store=False,
+                        )
+                        for index, artifact in zip(owner_indices, prepared_artifacts):
+                            miss = cache_results[artifact.artifact_key]
+                            self.mm_preprocess_cache.complete_miss(miss, artifact)
+                            cached_artifacts[index] = artifact
+                        prepared_index_map = {
+                            request_index: prepared_index
+                            for prepared_index, request_index in enumerate(
+                                owner_indices
+                            )
+                        }
+
+                    resolved_by_key = {}
+                    for key, result in cache_results.items():
+                        if isinstance(result, CacheLookup):
+                            resolved_by_key[key] = result.value
+                        elif result.should_compute:
+                            resolved_by_key[key] = cached_artifacts[
+                                first_index_by_key[key]
+                            ]
+                        else:
+                            resolved_by_key[key] = (
+                                await self.mm_preprocess_cache.wait_for_miss(result)
+                            )
+                    for index in metadata_miss_indices:
+                        artifact = resolved_by_key[lookups[index].artifact_key]
+                        cached_artifacts[index] = artifact
+                        lookups[index] = replace(lookups[index], artifact=artifact)
+                except BaseException as error:
+                    for result in cache_results.values():
+                        if (
+                            isinstance(result, CacheMiss)
+                            and result.should_compute
+                            and not result.future.done()
+                        ):
+                            self.mm_preprocess_cache.fail_miss(result, error)
+                    raise
+
+            if any(artifact is None for artifact in cached_artifacts):
+                raise InternalError(
+                    "Encoder global-cache metadata assembly is incomplete"
+                )
+            grid_thw = torch.tensor(
+                [artifact.grid_thw for artifact in cached_artifacts],
+                dtype=torch.int64,
+            )
+            if hashes is not None and len(hashes) != len(grid_thw):
+                raise BadRequestError(
+                    f"User-supplied hashes length {len(hashes)} != grid count "
+                    f"{len(grid_thw)} for {self.model_type}/{modality.name}"
+                )
+            str_mm_hashes = None
+            if self.rank == 0:
+                str_mm_hashes = [
+                    build_mm_global_cache_key(
+                        artifact.feature_identity,
+                        None if hashes is None else hashes[index],
+                    )
+                    for index, artifact in enumerate(cached_artifacts)
+                ]
+            return GlobalCacheEncodeContext(
+                req_id=req_id,
+                modality=modality,
+                mm_inputs=None,
+                get_feature_fn=None,
+                grid_thw=grid_thw,
+                mm_feature=None,
+                num_items=len(grid_thw),
+                aux_data=self._encoder_aux_data(modality, artifacts=cached_artifacts),
+                str_mm_hashes=str_mm_hashes,
+                source_mm_items=list(mm_items),
+                media_lookups=lookups,
+                caller_hashes=hashes,
+                prepared_mm_inputs=prepared_mm_inputs,
+                prepared_get_feature_fn=prepared_get_feature_fn,
+                prepared_grid_thw=prepared_grid_thw,
+                prepared_mm_feature=prepared_mm_feature,
+                prepared_index_map=prepared_index_map,
+            )
+
         mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
         grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
         mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
@@ -1112,6 +1523,11 @@ class MMEncoder:
             # L2 cache expects string keys for Mooncake.
             str_mm_hashes = [str(h) for h in mm_hashes]
 
+        if lookups is not None:
+            self._store_encoder_artifacts(
+                lookups, mm_inputs, mm_feature, grid_thw, modality
+            )
+
         return GlobalCacheEncodeContext(
             req_id=req_id,
             modality=modality,
@@ -1120,8 +1536,169 @@ class MMEncoder:
             grid_thw=grid_thw,
             mm_feature=mm_feature,
             num_items=num_items,
-            aux_data=_build_mm_aux_data(mm_inputs, self.model_type),
+            aux_data=self._encoder_aux_data(modality, mm_inputs),
             str_mm_hashes=str_mm_hashes,
+            source_mm_items=list(mm_items),
+            media_lookups=lookups,
+            caller_hashes=hashes,
+        )
+
+    def _store_encoder_artifacts(
+        self,
+        lookups,
+        mm_inputs,
+        mm_feature,
+        grid_thw,
+        modality: Modality,
+        *,
+        store: bool = True,
+    ) -> list[EncoderPreprocessArtifact]:
+        model_items = self._build_mm_data_items(
+            mm_feature,
+            mm_inputs,
+            list(range(len(grid_thw))),
+            modality,
+            grid_thw,
+        )
+        artifacts = []
+        for index, (lookup, item) in enumerate(zip(lookups, model_items)):
+            item.set_pad_value()
+            feature_identity = build_feature_identity(lookup.artifact_key, item.hash)
+            feature_hash = build_feature_hash(lookup.artifact_key, item.hash)
+            artifact = EncoderPreprocessArtifact(
+                content_digest=lookup.content_digest,
+                artifact_key=lookup.artifact_key,
+                feature_identity=feature_identity,
+                feature_hash=feature_hash,
+                grid_thw=tuple(int(value) for value in grid_thw[index]),
+                metadata=self._encoder_artifact_metadata(mm_inputs, index, modality),
+            )
+            if lookup.artifact is not None and lookup.artifact != artifact:
+                self.mm_preprocess_cache.pop(lookup.artifact_key)
+                raise InternalError(
+                    "Encoder artifact changed for identical content and options: "
+                    f"{lookup.artifact_key}"
+                )
+            if store:
+                self.mm_preprocess_cache.put(lookup.artifact_key, artifact)
+            artifacts.append(artifact)
+        return artifacts
+
+    async def _materialize_global_cache_context(
+        self, ctx: GlobalCacheEncodeContext
+    ) -> None:
+        """Build processor outputs lazily after an early global-cache miss."""
+        if ctx.mm_inputs is not None:
+            return
+        if ctx.media_lookups is None:
+            raise InternalError("Global cache context has no processor fallback")
+        processor_media = await self._materialize_encoder_media(
+            ctx.media_lookups, list(range(ctx.num_items)), ctx.modality
+        )
+        mm_inputs, get_feature_fn = await self._process_mm_items(
+            processor_media, ctx.modality
+        )
+        grid_thw = _get_mm_grid_dim(mm_inputs, ctx.modality, self.model_type)
+        mm_feature = _convert(_get_mm_feature(mm_inputs, ctx.modality))
+        artifacts = self._store_encoder_artifacts(
+            ctx.media_lookups, mm_inputs, mm_feature, grid_thw, ctx.modality
+        )
+        if [tuple(int(value) for value in grid) for grid in grid_thw] != [
+            tuple(int(value) for value in grid) for grid in ctx.grid_thw
+        ]:
+            raise InternalError("Cached encoder grid metadata changed during fallback")
+        if ctx.caller_hashes is None and self.rank == 0:
+            actual_hashes = [artifact.feature_identity for artifact in artifacts]
+            if actual_hashes != ctx.str_mm_hashes:
+                raise InternalError(
+                    "Cached encoder feature hashes changed during fallback"
+                )
+        ctx.mm_inputs = mm_inputs
+        ctx.get_feature_fn = get_feature_fn
+        ctx.mm_feature = mm_feature
+        ctx.aux_data = self._encoder_aux_data(ctx.modality, mm_inputs, artifacts)
+
+    async def _encode_global_cache_indices(
+        self, ctx: GlobalCacheEncodeContext, indices: List[int]
+    ) -> List[torch.Tensor]:
+        """Preprocess and encode only the requested global-cache misses."""
+        if not indices:
+            return []
+        if ctx.mm_inputs is None and ctx.media_lookups is not None:
+            slices_by_index = {}
+            prepared_index_map = ctx.prepared_index_map or {}
+            prepared_indices = [
+                index for index in indices if index in prepared_index_map
+            ]
+            if prepared_indices:
+                prepared_slices = self._encode_missing(
+                    ctx.prepared_mm_feature,
+                    ctx.prepared_mm_inputs,
+                    [prepared_index_map[index] for index in prepared_indices],
+                    ctx.modality,
+                    ctx.prepared_get_feature_fn,
+                    ctx.prepared_grid_thw,
+                    keep_on_gpu=True,
+                )
+                slices_by_index.update(zip(prepared_indices, prepared_slices))
+
+            materialize_indices = [
+                index for index in indices if index not in prepared_index_map
+            ]
+            if materialize_indices:
+                lookups = [ctx.media_lookups[index] for index in materialize_indices]
+                processor_media = await self._materialize_encoder_media(
+                    ctx.media_lookups, materialize_indices, ctx.modality
+                )
+                mm_inputs, get_feature_fn = await self._process_mm_items(
+                    processor_media, ctx.modality
+                )
+                grid_thw = _get_mm_grid_dim(mm_inputs, ctx.modality, self.model_type)
+                mm_feature = _convert(_get_mm_feature(mm_inputs, ctx.modality))
+                artifacts = self._store_encoder_artifacts(
+                    lookups, mm_inputs, mm_feature, grid_thw, ctx.modality
+                )
+                expected_grids = [
+                    tuple(int(value) for value in ctx.grid_thw[index])
+                    for index in materialize_indices
+                ]
+                actual_grids = [artifact.grid_thw for artifact in artifacts]
+                if actual_grids != expected_grids:
+                    raise InternalError(
+                        "Cached encoder grid metadata changed during fallback"
+                    )
+                if ctx.caller_hashes is None and self.rank == 0:
+                    expected_hashes = [
+                        ctx.str_mm_hashes[index] for index in materialize_indices
+                    ]
+                    actual_hashes = [
+                        artifact.feature_identity for artifact in artifacts
+                    ]
+                    if actual_hashes != expected_hashes:
+                        raise InternalError(
+                            "Cached encoder feature hashes changed during fallback"
+                        )
+                materialized_slices = self._encode_missing(
+                    mm_feature,
+                    mm_inputs,
+                    list(range(len(materialize_indices))),
+                    ctx.modality,
+                    get_feature_fn,
+                    grid_thw,
+                    keep_on_gpu=True,
+                )
+                slices_by_index.update(zip(materialize_indices, materialized_slices))
+            return [slices_by_index[index] for index in indices]
+
+        await self._materialize_global_cache_context(ctx)
+        return self._encode_missing(
+            ctx.mm_feature,
+            ctx.mm_inputs,
+            indices,
+            ctx.modality,
+            ctx.get_feature_fn,
+            ctx.grid_thw,
+            keep_on_gpu=True,
         )
 
     def _broadcast_global_cache_mask(self, mask_tensor: torch.Tensor):
@@ -1369,15 +1946,7 @@ class MMEncoder:
 
         new_slices = []
         if missing_indices:
-            new_slices = self._encode_missing(
-                ctx.mm_feature,
-                ctx.mm_inputs,
-                missing_indices,
-                ctx.modality,
-                ctx.get_feature_fn,
-                ctx.grid_thw,
-                keep_on_gpu=True,
-            )
+            new_slices = await self._encode_global_cache_indices(ctx, missing_indices)
 
         miss_d2h_handles = []
         if self.rank == 0 and new_slices:
@@ -1397,14 +1966,8 @@ class MMEncoder:
                 f"Req {ctx.req_id}: All ranks running ViT fallback "
                 f"for {len(fallback_indices)} items."
             )
-            fallback_slices = self._encode_missing(
-                ctx.mm_feature,
-                ctx.mm_inputs,
-                fallback_indices,
-                ctx.modality,
-                ctx.get_feature_fn,
-                ctx.grid_thw,
-                keep_on_gpu=True,
+            fallback_slices = await self._encode_global_cache_indices(
+                ctx, fallback_indices
             )
             if self.rank == 0:
                 fallback_hashes = [ctx.str_mm_hashes[i] for i in fallback_indices]
@@ -1492,14 +2055,8 @@ class MMEncoder:
 
                     new_slices = []
                     if missing_indices:
-                        new_slices = self._encode_missing(
-                            ctx.mm_feature,
-                            ctx.mm_inputs,
-                            missing_indices,
-                            ctx.modality,
-                            ctx.get_feature_fn,
-                            ctx.grid_thw,
-                            keep_on_gpu=True,
+                        new_slices = await self._encode_global_cache_indices(
+                            ctx, missing_indices
                         )
 
                     fallback_indices = await self._wait_global_cache_prefetch(
@@ -1512,14 +2069,8 @@ class MMEncoder:
                             f"Req {ctx.req_id}: All ranks running ViT fallback "
                             f"for {len(fallback_indices)} items."
                         )
-                        fallback_slices = self._encode_missing(
-                            ctx.mm_feature,
-                            ctx.mm_inputs,
-                            fallback_indices,
-                            ctx.modality,
-                            ctx.get_feature_fn,
-                            ctx.grid_thw,
-                            keep_on_gpu=True,
+                        fallback_slices = await self._encode_global_cache_indices(
+                            ctx, fallback_indices
                         )
 
                     if self.rank == 0:
@@ -1724,7 +2275,7 @@ class MMEncoder:
         return normalized
 
     async def _process_mm_items(self, mm_items, modality, log_metrics: bool = True):
-        model_preprocessor = getattr(self.model, "preprocess_mm_for_encoder", None)
+        model_preprocessor = resolve_encoder_preprocessor(self.model)
 
         preprocess_start = time.perf_counter()
         if modality == Modality.IMAGE:
@@ -1746,8 +2297,7 @@ class MMEncoder:
                 time.perf_counter() - preprocess_start, modality=modality.name.lower()
             )
 
-        target = self.model.thinker if hasattr(self.model, "thinker") else self.model
-        get_feature_method = getattr(target, f"get_{modality.name.lower()}_feature")
+        get_feature_method = resolve_encoder_feature_method(self.model, modality)
         return processor_input, get_feature_method
 
     async def _process_image_items(self, mm_items, model_preprocessor):
@@ -1783,7 +2333,10 @@ class MMEncoder:
             self.preproc_executor,
             functools.partial(self.image_processor, images=images, **image_config),
         )
-        if self.model_type == "kimi_k3":
+        cache_config = self.encoder_media_processor_config.artifact_cache_for(
+            Modality.IMAGE
+        )
+        if cache_config is not None and cache_config.capture_original_image_sizes:
             processor_input["original_image_sizes"] = original_image_sizes
         return processor_input
 
@@ -1879,10 +2432,226 @@ class MMEncoder:
         processor_input["audio_feature_lens"] = output_lengths
         return processor_input
 
+    async def _encode_with_preprocess_cache(
+        self, mm_items, modality: Modality, *, log_metrics: bool
+    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        """Reuse media metadata before decode and encode only cache misses."""
+        lookups = await self._lookup_encoder_artifacts(mm_items, modality)
+        embeddings: list[Optional[torch.Tensor]] = [None] * len(lookups)
+        artifacts: list[Optional[EncoderPreprocessArtifact]] = [
+            lookup.artifact for lookup in lookups
+        ]
+
+        async with self.mm_cache_lock:
+            for index, artifact in enumerate(artifacts):
+                if artifact is None:
+                    continue
+                cached = self.mm_cache.get_single(artifact.feature_hash)
+                if cached is not None and self.mm_cache.matches_identity(
+                    cached, artifact.feature_identity
+                ):
+                    embeddings[index] = cached.embedding
+
+        missing_indices = [
+            index for index, embedding in enumerate(embeddings) if embedding is None
+        ]
+        first_index_by_key = {}
+        for index in missing_indices:
+            key = lookups[index].artifact_key
+            if key not in first_index_by_key:
+                first_index_by_key[key] = index
+
+        futures_by_key = {}
+        owner_indices = []
+        loop = asyncio.get_running_loop()
+        async with self.encoder_artifact_inflight_lock:
+            cache_generation = self.encoder_artifact_cache_generation
+            for key, index in first_index_by_key.items():
+                future = self.encoder_artifact_inflight.get(key)
+                if future is None:
+                    future = loop.create_future()
+                    self.encoder_artifact_inflight[key] = future
+                    owner_indices.append(index)
+                else:
+                    self.mm_preprocess_cache.record_singleflight_joins(1)
+                futures_by_key[key] = future
+
+        try:
+            if owner_indices:
+                owner_results = await self._encode_preprocess_cache_owners(
+                    lookups,
+                    artifacts,
+                    embeddings,
+                    owner_indices,
+                    modality,
+                    cache_generation,
+                    log_metrics,
+                )
+                async with self.encoder_artifact_inflight_lock:
+                    for key, result in owner_results.items():
+                        future = futures_by_key[key]
+                        if not future.done():
+                            future.set_result(result)
+                        if self.encoder_artifact_inflight.get(key) is future:
+                            self.encoder_artifact_inflight.pop(key)
+
+            for request_index in missing_indices:
+                key = lookups[request_index].artifact_key
+                artifact, embedding = await asyncio.shield(futures_by_key[key])
+                artifacts[request_index] = artifact
+                embeddings[request_index] = embedding
+        except BaseException as error:
+            async with self.encoder_artifact_inflight_lock:
+                for request_index in owner_indices:
+                    key = lookups[request_index].artifact_key
+                    future = futures_by_key[key]
+                    if not future.done():
+                        future.set_exception(error)
+                        future.exception()
+                    if self.encoder_artifact_inflight.get(key) is future:
+                        self.encoder_artifact_inflight.pop(key)
+            raise
+
+        if any(artifact is None for artifact in artifacts) or any(
+            embedding is None for embedding in embeddings
+        ):
+            raise InternalError("Encoder cache assembly is incomplete")
+
+        resolved_artifacts = list(artifacts)
+        resolved_embeddings = list(embeddings)
+        output = torch.cat(resolved_embeddings, dim=0)
+        grid_thw = torch.tensor(
+            [artifact.grid_thw for artifact in resolved_artifacts],
+            dtype=torch.int64,
+        )
+        aux_data = self._encoder_aux_data(modality, artifacts=resolved_artifacts)
+
+        if encoder_metrics_collector is not None and log_metrics:
+            hit_indices = set(range(len(lookups))) - set(owner_indices)
+            hit_tokens = sum(
+                resolved_embeddings[index].shape[0] for index in hit_indices
+            )
+            encoder_metrics_collector.record_cache_tokens(
+                hit_tokens, output.shape[0], modality=modality.name.lower()
+            )
+            encoder_metrics_collector.record_cache_files(
+                len(hit_indices), len(lookups), modality=modality.name.lower()
+            )
+            encoder_metrics_collector.set_cache_state(
+                self.mm_cache.current_size, len(self.mm_cache)
+            )
+        if self.profiler is not None:
+            self.profiler.step()
+        return grid_thw, output, aux_data
+
+    async def _encode_preprocess_cache_owners(
+        self,
+        lookups: list[EncoderMediaLookup],
+        artifacts: list[Optional[EncoderPreprocessArtifact]],
+        embeddings: list[Optional[torch.Tensor]],
+        owner_indices: list[int],
+        modality: Modality,
+        cache_generation: int,
+        log_metrics: bool,
+    ) -> dict[str, tuple[EncoderPreprocessArtifact, torch.Tensor]]:
+        """Fill metadata and embedding caches before waking concurrent waiters."""
+        if owner_indices:
+            processor_media = await self._materialize_encoder_media(
+                lookups, owner_indices, modality
+            )
+            try:
+                mm_inputs, get_feature_fn = await self._process_mm_items(
+                    processor_media, modality, log_metrics=log_metrics
+                )
+            except NotImplementedError as error:
+                raise InternalError(f"Not implemented error: {error}") from error
+            except Exception as error:
+                raise BadRequestError(f"Failed to process mm items: {error}") from error
+
+            grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+            mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
+            model_items = self._build_mm_data_items(
+                mm_feature,
+                mm_inputs,
+                list(range(len(owner_indices))),
+                modality,
+                grid_thw,
+            )
+            for item in model_items:
+                item.set_pad_value()
+
+            forward_start = time.perf_counter()
+            with torch.inference_mode():
+                encoded = get_feature_fn(model_items).cpu()
+            if encoded.ndim != 2:
+                encoded = encoded.reshape(-1, encoded.shape[-1])
+            if encoder_metrics_collector is not None and log_metrics:
+                encoder_metrics_collector.observe_model_forward(
+                    time.perf_counter() - forward_start,
+                    modality=modality.name.lower(),
+                )
+            encoded_slices = self.slice_embedding(encoded, grid_thw, modality)
+
+            owner_results = {}
+            for position, request_index in enumerate(owner_indices):
+                item = model_items[position]
+                lookup = lookups[request_index]
+                prior = artifacts[request_index]
+                feature_identity = build_feature_identity(
+                    lookup.artifact_key, item.hash
+                )
+                feature_hash = build_feature_hash(lookup.artifact_key, item.hash)
+                artifact = EncoderPreprocessArtifact(
+                    content_digest=lookup.content_digest,
+                    artifact_key=lookup.artifact_key,
+                    feature_identity=feature_identity,
+                    feature_hash=feature_hash,
+                    grid_thw=tuple(int(value) for value in grid_thw[position]),
+                    metadata=self._encoder_artifact_metadata(
+                        mm_inputs, position, modality
+                    ),
+                )
+                if prior is not None and prior != artifact:
+                    self.mm_preprocess_cache.pop(lookup.artifact_key)
+                    raise InternalError(
+                        "Encoder artifact changed for identical content and options: "
+                        f"{lookup.artifact_key}"
+                    )
+                artifacts[request_index] = artifact
+                embeddings[request_index] = encoded_slices[position]
+                owner_results[lookup.artifact_key] = (
+                    artifact,
+                    encoded_slices[position],
+                )
+
+            async with self.mm_cache_lock:
+                if cache_generation != self.encoder_artifact_cache_generation:
+                    raise InternalError(
+                        "Encoder cache was flushed during preprocessing"
+                    )
+                for key, (artifact, embedding) in owner_results.items():
+                    self.mm_preprocess_cache.put(key, artifact)
+                    self.mm_cache.set(
+                        artifact.feature_hash,
+                        EmbeddingResult(
+                            embedding=embedding, identity=artifact.feature_identity
+                        ),
+                    )
+            return owner_results
+        return {}
+
     async def _encode(
         self, mm_items, modality: Modality, log_metrics: bool = True
     ) -> torch.Tensor:
         modality_str = modality.name.lower()
+        if (
+            self._supports_encoder_artifact_cache(modality)
+            and get_mm().enable_prefix_mm_cache
+            and log_metrics
+        ):
+            return await self._encode_with_preprocess_cache(
+                mm_items, modality, log_metrics=log_metrics
+            )
         try:
             # preprocess latency is observed inside _process_mm_items so all
             # callers (encode / batch_encode / global-cache) are covered.
@@ -1967,7 +2736,7 @@ class MMEncoder:
             if self.profiler is not None:
                 self.profiler.step()
 
-            aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
+            aux_data = self._encoder_aux_data(modality, mm_inputs)
 
             if modality == Modality.VIDEO and mm_inputs.get("video_audio_features"):
                 target = (
@@ -2339,7 +3108,7 @@ class MMEncoder:
         try:
             mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
             grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
-            aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
+            aux_data = self._encoder_aux_data(modality, mm_inputs)
 
             # Setup metadata and event management
             nbytes, total_tokens, embedding_dim, event = (
@@ -2435,7 +3204,7 @@ class MMEncoder:
     async def batch_encode(
         self, requests: List[dict], modality: Modality
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
-        """Cross-request encoder fusion (image/audio). No cache path."""
+        """Cross-request encoder fusion with K3 per-image cache reuse."""
         # items_per_req counts grid entries (post-expansion) so per-request
         # slicing of grid_dim/final_slices stays aligned for processors that
         # expand one leaf into multiple grids (e.g. Kimi-VL/K2.5/K3 dict-of-images).
@@ -2455,6 +3224,62 @@ class MMEncoder:
             encoder_metrics_collector.observe_mm_items_per_batch(
                 total, modality=modality_str
             )
+
+        if (
+            self._supports_encoder_artifact_cache(modality)
+            and get_mm().enable_prefix_mm_cache
+        ):
+            try:
+                (
+                    grid_dim,
+                    all_embeddings,
+                    aux_data,
+                ) = await self._encode_with_preprocess_cache(
+                    flat_items, modality, log_metrics=True
+                )
+                item_embeddings = self.slice_embedding(
+                    all_embeddings, grid_dim, modality
+                )
+                results = []
+                offset = 0
+                for req, count in zip(requests, items_per_req):
+                    slices = item_embeddings[offset : offset + count]
+                    embedding = slices[0] if count == 1 else torch.cat(slices, dim=0)
+                    request_aux = {
+                        key: value[offset : offset + count]
+                        for key, value in aux_data.items()
+                        if value is not None
+                    }
+                    if self.rank == 0:
+                        self.embedding_to_send[req["req_id"]] = EmbeddingData(
+                            req["req_id"],
+                            req["num_parts"],
+                            req["part_idx"],
+                            grid_dim[offset : offset + count],
+                            modality,
+                            embedding,
+                            **request_aux,
+                        )
+                    results.append(
+                        (
+                            embedding.nbytes,
+                            embedding.shape[0],
+                            embedding.shape[1],
+                            None,
+                            None,
+                        )
+                    )
+                    offset += count
+                for _ in range(max(0, len(requests) - 1)):
+                    if self.profiler is not None:
+                        self.profiler.step()
+                return results
+            except Exception as error:
+                return self._batch_set_error(
+                    requests,
+                    modality,
+                    InternalError(f"Internal cached encoding error: {error}"),
+                )
 
         try:
             mm_inputs, get_feat = await self._process_mm_items(flat_items, modality)
@@ -2495,17 +3320,17 @@ class MMEncoder:
             if self.profiler is not None:
                 for _ in requests:
                     self.profiler.step()
-            aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
+            aux_data = self._encoder_aux_data(modality, mm_inputs)
             results = []
             offset = 0
             for req, n in zip(requests, items_per_req):
                 slices = final_slices[offset : offset + n]
                 emb = slices[0] if n == 1 else torch.cat(slices, dim=0)
-                req_aux_data = {}
-                if aux_data.get("original_image_sizes") is not None:
-                    req_aux_data["original_image_sizes"] = aux_data[
-                        "original_image_sizes"
-                    ][offset : offset + n]
+                req_aux_data = {
+                    key: value[offset : offset + n]
+                    for key, value in aux_data.items()
+                    if value is not None
+                }
                 if self.rank == 0:
                     self.embedding_to_send[req["req_id"]] = EmbeddingData(
                         req["req_id"],
@@ -2726,19 +3551,25 @@ class PendingRequest:
 # VIDEO excluded: per-video preprocess kwargs (do_sample_frames, video_metadata)
 # vary per request and can't merge into one HF processor call.
 _BATCHABLE_MODALITIES = {Modality.IMAGE, Modality.AUDIO}
-_KIMI_K3_DEFAULT_ENCODER_MAX_BATCH_SIZE = 2
 
 
 def _resolve_encoder_batch_policy(
-    model_type: str,
+    artifact_cache_configs: tuple[EncoderArtifactCacheConfig, ...],
     configured_max_batch_size: int,
     max_batch_size_is_explicit: bool,
 ) -> Tuple[int, bool]:
     """Return effective batch size and same-turn coalescing policy."""
     max_batch_size = max(1, int(configured_max_batch_size))
-    coalesce_same_turn = model_type == "kimi_k3"
-    if coalesce_same_turn and not max_batch_size_is_explicit:
-        max_batch_size = min(max_batch_size, _KIMI_K3_DEFAULT_ENCODER_MAX_BATCH_SIZE)
+    coalesce_same_turn = any(
+        config.coalesce_same_turn for config in artifact_cache_configs
+    )
+    default_max_batch_sizes = [
+        config.default_max_batch_size
+        for config in artifact_cache_configs
+        if config.default_max_batch_size is not None
+    ]
+    if default_max_batch_sizes and not max_batch_size_is_explicit:
+        max_batch_size = min(max_batch_size, *default_max_batch_sizes)
     return max_batch_size, coalesce_same_turn
 
 
@@ -2868,7 +3699,10 @@ class EncoderScheduler:
         self, group: List[PendingRequest], modality: Modality
     ) -> None:
         # Video can't fuse (per-video preprocess kwargs vary).
-        if modality not in _BATCHABLE_MODALITIES:
+        if (
+            modality not in _BATCHABLE_MODALITIES
+            or self.encoder.mm_global_cache is not None
+        ):
             await self._dispatch_per_request(group, modality)
             return
 
@@ -3571,6 +4405,7 @@ async def _dp_worker_handle_request(
         "start_profile",
         "stop_profile",
         "health_encode",
+        "flush_cache",
         "send",
     )
     if is_encode and encoder_metrics_collector is not None:
@@ -3580,6 +4415,9 @@ async def _dp_worker_handle_request(
             content = await _dp_worker_handle_profile(enc, dp_rank, dp_type, request)
         elif dp_type == "health_encode":
             content = await _dp_worker_health_encode(enc)
+        elif dp_type == "flush_cache":
+            enc.clear_mm_caches()
+            content = {"ok": True}
         elif dp_type == "send":
             req_id = request["req_id"]
             await enc.send(
@@ -3676,7 +4514,7 @@ async def run_dp_worker(
         enc.dp_rank = dp_rank
 
     max_batch_size, coalesce_same_turn = _resolve_encoder_batch_policy(
-        enc.model_type,
+        enc.encoder_artifact_cache_configs,
         ENCODER_MAX_BATCH_SIZE,
         ENCODER_MAX_BATCH_SIZE_EXPLICIT,
     )
@@ -3780,7 +4618,7 @@ async def _lifespan(app: FastAPI):
         return
     if encoder is not None:
         max_batch_size, coalesce_same_turn = _resolve_encoder_batch_policy(
-            encoder.model_type,
+            encoder.encoder_artifact_cache_configs,
             ENCODER_MAX_BATCH_SIZE,
             ENCODER_MAX_BATCH_SIZE_EXPLICIT,
         )
@@ -3823,6 +4661,8 @@ async def _handle_encoder_worker_request(encoder: MMEncoder, request):
             request["requests"],
             Modality.from_str(request["modality"]),
         )
+    elif isinstance(request, dict) and request.get("type") == "flush_cache":
+        encoder.clear_mm_caches()
     elif (
         isinstance(request, dict)
         and isinstance(request.get("req_id"), str)
@@ -4236,9 +5076,13 @@ async def handle_encode_request(request: dict):
             encoder_metrics_collector.inc_requests_received(modality=modality_str)
         if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
             try:
-                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                    await encoder_scheduler.submit(request)
-                )
+                (
+                    nbytes,
+                    embedding_len,
+                    embedding_dim,
+                    error_msg,
+                    error_code,
+                ) = await encoder_scheduler.submit(request)
             except asyncio.TimeoutError:
                 time_stats.trace_ctx.abort(
                     abort_info={"reason": "encoder batch timed out"}
@@ -4259,9 +5103,13 @@ async def handle_encode_request(request: dict):
             async with encoder.encode_dispatch_lock:
                 for socket in send_sockets:
                     sock_send(socket, wrap_as_pickle(request))
-                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                    await encoder.encode_request(request, modality)
-                )
+                (
+                    nbytes,
+                    embedding_len,
+                    embedding_dim,
+                    error_msg,
+                    error_code,
+                ) = await encoder.encode_request(request, modality)
 
         if error_msg:
             time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
@@ -4443,6 +5291,25 @@ async def handle_scheduler_receive_url_request(request: dict):
     cond = await get_condition(rid)
     async with cond:
         cond.notify_all()
+
+
+@app.api_route("/flush_cache", methods=["GET", "POST"])
+async def flush_encoder_cache():
+    if dp_dispatcher is not None:
+        try:
+            await dp_dispatcher.broadcast({"_dp_type": "flush_cache"})
+        except MMError as error:
+            return Response(content=f"{error}\n", status_code=int(error.code))
+        return ORJSONResponse(content={"success": True})
+    if encoder is None:
+        return ORJSONResponse(
+            content={"success": False, "message": "encoder not ready"},
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+    for socket in send_sockets:
+        sock_send(socket, {"type": "flush_cache"})
+    encoder.clear_mm_caches()
+    return ORJSONResponse(content={"success": True})
 
 
 @app.get("/health")

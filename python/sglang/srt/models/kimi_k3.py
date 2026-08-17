@@ -106,7 +106,10 @@ from sglang.srt.models.kimi_k3_vl import (
 )
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
+from sglang.srt.multimodal.encoder_preprocessing import (
+    EncoderArtifactCacheConfig,
+    EncoderMediaProcessorConfig,
+)
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     fill_transparent_bg,
@@ -3075,10 +3078,22 @@ class KimiK3LinearForCausalLM(nn.Module):
 class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 
+    auto_mm_embedding_cache_size_mb = 4096
     supports_cuda_vmm_feature_transport = True
     encoder_media_processor_config = EncoderMediaProcessorConfig(
         image_decode_mode="nvjpeg_fancy",
         preserve_media_metadata=True,
+        artifact_caches=(
+            EncoderArtifactCacheConfig(
+                modality=Modality.IMAGE,
+                auto_cache_size_mb=256,
+                per_item_metadata_fields=("original_image_sizes",),
+                capture_original_image_sizes=True,
+                split_preprocessed_items=True,
+                coalesce_same_turn=True,
+                default_max_batch_size=2,
+            ),
+        ),
     )
 
     # Raw HF checkpoint prefixes, before hf_to_sglang_mapper is applied.
