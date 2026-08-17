@@ -93,7 +93,7 @@ export const config = {
     b200:   "lmsysorg/sglang:qwen38",
     b300:   "lmsysorg/sglang:qwen38",
     gb300:  "lmsysorg/sglang:qwen38",
-    mi300x: "lmsysorg/sglang-rocm:v0.5.17-rocm700-mi30x-20260812",
+    mi300x: "lmsysorg/sglang-rocm:v0.5.17-rocm700-mi30x-20260813",
     mi350x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260812",
     mi355x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260812",
   },
