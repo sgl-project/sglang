@@ -155,8 +155,13 @@ class LinearBase(torch.nn.Module):
         quant_config: Quantization configure.
     """
 
-    # Set by quant methods that attach a per-layer scheme (e.g. Quark) inside
-    # get_quant_method(), which runs before create_weights() picks the loader.
+    # Set by quant methods that attach a per-layer scheme, eagerly in
+    # get_quant_method(), which runs before create_weights() picks the loader,
+    # or lazily inside create_weights() itself (GPTQ). The default is what lets
+    # callers probe with `is None`; a hasattr() probe answers "yes" once it
+    # exists. Schemes must stay plain objects -- nn.Module.__setattr__ files a
+    # Module value under self._modules, which this default then shadows on read.
+    # VocabParallelEmbedding and FusedMoE carry the same default.
     scheme = None
 
     def __init__(

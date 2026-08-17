@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.server._core import Server
+    from sglang.srt.rust_extensions._server import Server
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -367,7 +367,9 @@ class RustServer:
         The caller gates this (``SGLANG_RUST_SERVER`` + rank 0); this always
         creates.
         """
-        from sglang.srt.server._core import Server
+        from sglang.srt.rust_extensions import load_rust_extension
+
+        Server = load_rust_extension("sglang.srt.rust_extensions._server").Server
 
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")

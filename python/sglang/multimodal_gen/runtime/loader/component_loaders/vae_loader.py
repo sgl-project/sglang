@@ -133,8 +133,10 @@ class VAELoader(ComponentLoader):
             # NOTE: some post init logics are only available after updated with config
             vae_config.post_init()
 
-        should_offload = server_args.should_cpu_offload_component(component_name)
-        target_device = self.target_device(should_offload)
+        component_starts_on_cpu = server_args.should_start_component_on_cpu(
+            component_name
+        )
+        target_device = self.target_device(component_starts_on_cpu)
 
         native_only = component_name in getattr(
             server_args.pipeline_config, "native_only_components", ()
