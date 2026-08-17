@@ -862,10 +862,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         runner = self.cuda_graph_runner_for_draft_extend
         if runner is None or batch.forward_mode.is_idle():
             return None
-        # Metadata that reads verify products by value cannot be built before
-        # the verify launch (e.g. flashinfer SWA derives prefix_lens from
-        # num_accept_tokens).
-        if self.draft_extend_attn_backend.draft_extend_metadata_reads_verify_products:
+        # SWA draft-extend metadata derives its prefix from num_accept_tokens
+        # (see flashinfer update_sliding_window), a verify product that does
+        # not exist yet at plan time; keep the legacy post-verify sequencing.
+        if self.draft_runner.sliding_window_size is not None:
             return None
         num_draft_tokens = self.speculative_num_draft_tokens
         # Shape-only placeholder: opted-in backends read verify products only
