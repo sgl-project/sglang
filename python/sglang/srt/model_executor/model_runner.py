@@ -627,6 +627,14 @@ class ModelRunner:
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
         self.sampler = create_sampler()
+        if not self.is_draft_worker:
+            # Must precede load_model: the model instantiates only its stage's
+            # layers per the (possibly auto-computed) partition.
+            from sglang.srt.distributed.pp_partition import (
+                maybe_set_auto_pp_partition,
+            )
+
+            maybe_set_auto_pp_partition(self.model_config, self.ps)
         self.load_model()
         prepare_moe_topk(
             model=self.model,

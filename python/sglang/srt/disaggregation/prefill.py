@@ -43,6 +43,8 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    build_kv_layer_ids,
+    build_staging_slot_metadata,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -68,6 +70,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -97,6 +100,24 @@ def should_force_retry(req: Req) -> bool:
 
     digest = hashlib.sha256(str(req.rid).encode()).digest()
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
+
+
+def _transfer_start_layer(*, pool, hf_text_config) -> int:
+    """Offset of this stage's first KV entry inside the peer's dense KV list.
+
+    A hybrid-linear pool stores KV only for its full-attention layers, but its
+    ``start_layer`` is a global layer index that also counts linear layers. The
+    decode peer's pointer list is dense over full-attention layers, so the global
+    index over-shoots it. Translate to a full-attention-relative offset.
+
+    The pool only knows this stage's own layer ids, so the count has to come from
+    the model-wide layer table.
+    """
+    if not isinstance(pool, HybridLinearKVPool):
+        return pool.start_layer
+    return sum(
+        1 for lid in hf_text_config.full_attention_layer_ids if lid < pool.start_layer
+    )
 
 
 def maybe_release_metadata_buffer(
@@ -212,7 +233,10 @@ class PrefillBootstrapQueue:
                 self.token_to_kv_pool.start_layer,
             )
             if layer_shard_enabled
-            else self.token_to_kv_pool.start_layer
+            else _transfer_start_layer(
+                pool=self.token_to_kv_pool,
+                hf_text_config=self.scheduler.model_config.hf_text_config,
+            )
         )
         kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
@@ -224,24 +248,27 @@ class PrefillBootstrapQueue:
             else getattr(self.token_to_kv_pool, "end_layer", None)
         )
 
-        if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
+        draft_kv_pool = self.draft_token_to_kv_pool if transfer_draft_cache else None
+        num_draft_entries = 0
+        if draft_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                draft_kv_pool.get_contiguous_buf_infos()
             )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+            num_draft_entries = len(draft_kv_data_ptrs)
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
-            self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
-            else []
+        kv_args.kv_layer_ids = build_kv_layer_ids(
+            token_to_kv_pool=self.token_to_kv_pool,
+            draft_token_to_kv_pool=draft_kv_pool,
+            num_draft_entries=num_draft_entries,
+            num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
@@ -288,11 +315,19 @@ class PrefillBootstrapQueue:
             kv_pool = self.token_to_kv_pool
             if hasattr(kv_pool, "full_kv_pool"):
                 kv_pool = kv_pool.full_kv_pool
-            if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
+            staging_slots = build_staging_slot_metadata(
+                kv_layer_ids=kv_args.kv_layer_ids,
+                num_draft_entries=num_draft_entries,
+                kv_pool=kv_pool,
+                draft_kv_pool=draft_kv_pool,
+            )
+            if staging_slots is not None:
+                k_buffers, v_buffers, slot_layer_ids = staging_slots
                 kv_manager.set_kv_buffer_tensors(
-                    kv_pool.k_buffer,
-                    kv_pool.v_buffer,
+                    k_buffers,
+                    v_buffers,
                     kv_pool.page_size,
+                    slot_layer_ids=slot_layer_ids,
                 )
         return kv_manager
 

@@ -623,6 +623,7 @@ class PrefillStagingStrategy:
                 target_info.dst_kv_item_len,
                 target_info.dst_kv_layer_ids,
                 staging_buffer=self.staging_buffer,
+                dst_slot_layer_ids=target_info.dst_slot_layer_ids or None,
             )
         except Exception as e:
             raise RuntimeError(

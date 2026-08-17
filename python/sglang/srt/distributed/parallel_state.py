@@ -2048,6 +2048,12 @@ def get_moe_tp_group() -> GroupCoordinator:
 get_tensor_model_parallel_group = get_tp_group
 
 _PP: Optional[GroupCoordinator] = None
+_SELF_PP: Optional[GroupCoordinator] = None
+
+
+def get_self_pp_group() -> GroupCoordinator:
+    assert _SELF_PP is not None, "self pipeline group is not initialized"
+    return _SELF_PP
 
 
 def get_pp_group() -> GroupCoordinator:
@@ -2700,6 +2706,19 @@ def initialize_model_parallel(
         max_world_size=max_world_size,
     )
 
+    # A single-member pipeline group per rank. The speculative draft never
+    # spans stages, so it is built and run against this group instead of the
+    # real one. new_group is collective, so every rank creates all of them.
+    global _SELF_PP
+    if _SELF_PP is None:
+        _SELF_PP = init_model_parallel_group(
+            [[r] for r in range(world_size)],
+            get_world_group().local_rank,
+            backend,
+            use_custom_allreduce=False,
+            group_name="self_pp",
+        )
+
 
 def create_custom_parallel_group(
     group_ranks: List[int], backend: str = "gloo"
@@ -2796,6 +2815,28 @@ def model_parallel_is_initialized():
 
 
 _TP_STATE_PATCHED = False
+_PP_STATE_PATCHED = False
+
+
+@contextmanager
+def patch_pipeline_parallel_group(pp_group: GroupCoordinator):
+    """Patch the pp group temporarily until this function ends.
+
+    This method is for draft workers of speculative decoding, whose model does not
+    span pipeline stages and must not read the target's pp topology.
+    """
+    global _PP_STATE_PATCHED
+    assert not _PP_STATE_PATCHED, "Should not call when it's already patched"
+
+    _PP_STATE_PATCHED = True
+    old_pp_group = get_pp_group()
+    global _PP
+    _PP = pp_group
+    try:
+        yield
+    finally:
+        _PP_STATE_PATCHED = False
+        _PP = old_pp_group
 
 
 @contextmanager

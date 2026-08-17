@@ -108,7 +108,16 @@ class Qwen3_5ForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        # Under PP the embedding lives on the first stage and the lm_head on the
+        # last, so a stage holds at most one of them; the draft keeps its own
+        # copy for the half it does not receive.
+        embed = (
+            None
+            if isinstance(self.model.embed_tokens, PPMissingLayer)
+            else self.model.embed_tokens.weight
+        )
+        head = None if isinstance(self.lm_head, PPMissingLayer) else self.lm_head.weight
+        return embed, head
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight

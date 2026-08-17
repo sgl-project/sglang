@@ -101,6 +101,13 @@ def get_pp_indices(
     """
     # partition_list_str can be set to None in sglang
     partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
+    if pp_size == 1:
+        # A single-stage pipeline owns every layer, so a partition list cannot
+        # apply to it. The env var is process-global, so a worker built with
+        # pp_size=1 inside a pipelined process -- the speculative draft, which
+        # never spans stages -- would otherwise read the target's list and
+        # reject it for having the wrong length.
+        partition_list_str = None
     if partition_list_str is not None:
         try:
             partitions = [int(layer) for layer in partition_list_str.split(",")]
@@ -114,6 +121,19 @@ def get_pp_indices(
             raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
         start_layer = sum(partitions[:pp_rank])
         end_layer = start_layer + partitions[pp_rank]
+        return (start_layer, end_layer)
+
+    from sglang.srt.distributed.pp_partition import get_auto_pp_partition
+
+    auto_partition = get_auto_pp_partition()
+    # Same pp_size==1 trap as the env var: the draft worker must not read the
+    # target's partition.
+    if auto_partition is not None and pp_size > 1:
+        assert len(auto_partition) == pp_size and sum(auto_partition) == (
+            num_hidden_layers
+        ), f"auto PP partition {auto_partition} does not cover {num_hidden_layers} layers at pp_size={pp_size}"
+        start_layer = sum(auto_partition[:pp_rank])
+        end_layer = start_layer + auto_partition[pp_rank]
     else:
         base_layers = num_hidden_layers // pp_size
         remainder = num_hidden_layers % pp_size

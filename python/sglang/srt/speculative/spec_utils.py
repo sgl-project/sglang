@@ -35,6 +35,8 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
+    get_self_pp_group,
+    patch_pipeline_parallel_group,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
@@ -671,6 +673,15 @@ def load_token_map(token_map_path: str) -> List[int]:
         token_map_path = os.path.join(cache_dir, file_name)
     hot_token_id = torch.load(token_map_path, weights_only=True)
     return torch.tensor(hot_token_id, dtype=torch.int64)
+
+
+@contextmanager
+def draft_pp_context():
+    # The draft model never spans pipeline stages (multi-layer drafts stay
+    # whole on the last stage); give it a single-member pp group so it
+    # initializes as if pp were off.
+    with patch_pipeline_parallel_group(get_self_pp_group()):
+        yield
 
 
 @contextmanager
