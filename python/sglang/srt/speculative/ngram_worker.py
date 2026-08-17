@@ -419,6 +419,8 @@ class NGRAMWorker(BaseSpecWorker):
             batch_result = self.target_worker.forward_batch_generation(
                 batch, is_verify=True
             )
+            # Keep this as corase
+            self.target_worker.model_runner.shared_read_done_event = None
 
             logits_output, can_run_cuda_graph = (
                 batch_result.logits_output,
