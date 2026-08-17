@@ -122,6 +122,7 @@ from sglang.srt.observability.request_metrics_exporter import (
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
 from sglang.srt.runtime_context import (
+    get_context,
     get_device,
     get_disagg,
     get_exec,
@@ -379,8 +380,6 @@ class InputFormat(Enum):
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
 
 
-_SERVER_ARGS_FIELDS = frozenset(f.name for f in dataclasses.fields(ServerArgs))
-
 _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 
 
@@ -410,7 +409,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # the in-process path re-projects the object the launcher published.
         set_global_server_args_for_tokenizer(server_args)
         self.startup_time: Optional[Dict[str, Any]] = None
-        self._config_updates: List[Tuple[str, Dict[str, Any]]] = []
         self.elastic_worker_count = get_parallel().dp_size
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
@@ -2065,31 +2063,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return success, message, num_paused_requests
 
     def record_config_updates(self, source: str, **fields) -> None:
-        """Record a control-plane config change for this engine.
+        """Record a control-plane config change: a weight update, a parser
+        resolved from the chat template, a HiCache mirror attach.
 
-        These are post-startup facts the config bags do not model (weight
-        version, model path, the tokenizer's HiCache mirror); the readback
-        endpoints overlay them onto the startup config. The process-global
-        sibling is ``RuntimeContext.override`` / ``resolved_server_args_dict``,
-        which writes the config bags.
+        These land in the config bags like every other post-publish change, so
+        one log carries the provenance for the whole process.
         """
-        unknown = sorted(f for f in fields if f not in _SERVER_ARGS_FIELDS)
-        if unknown:
-            raise ValueError(
-                f"{unknown} are not ServerArgs fields; the readback endpoints "
-                "overlay these onto a serialized ServerArgs, so an unknown key "
-                "would surface as a phantom config entry."
-            )
-        self._config_updates.append((source, dict(fields)))
+        get_context().override(source, **fields)
 
     def config_value(self, name: str):
-        """The value in effect for one config field, control-plane updates first."""
+        """The value in effect for one config field."""
         if name in _MANAGER_OWNED_FIELDS:
             return getattr(self, name)
-        for _source, fields in reversed(self._config_updates):
-            if name in fields:
-                return fields[name]
-        return getattr(self.server_args, name)
+        return get_context().config_leaf(name)
 
     def _dump_config_snapshot(self) -> Optional[Dict[str, Any]]:
         """The config in effect, or None when it cannot be serialized.
@@ -2104,18 +2090,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return None
 
     def resolved_config_dict(self, base: Dict[str, Any]) -> Dict[str, Any]:
-        """``base`` (a serialized ``ServerArgs``) with the control-plane updates on top."""
-        resolved = dict(base)
-        for _source, fields in self._config_updates:
-            resolved.update(fields)
+        """``base`` (a serialized ``ServerArgs``) with the control-plane changes on top."""
+        resolved = get_context().resolved_server_args_dict(base)
         for name in _MANAGER_OWNED_FIELDS:
             resolved[name] = getattr(self, name)
         return resolved
 
     def _update_model_path_info(self, model_path: str, load_format: str):
+        # These two stay on the manager: the readback reads them from here,
+        # and a bag write would not reach the other processes anyway.
         self.served_model_name = model_path
-        self.record_config_updates("tokenizer.update_weights", load_format=load_format)
         self.model_path = model_path
+        self.record_config_updates("tokenizer.update_weights", load_format=load_format)
 
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
@@ -2986,7 +2972,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         logger.info(log_message)
         to_dump_with_server_args = {
             "server_args": self.server_args,
-            "config_updates": list(self._config_updates),
+            "config_updates": get_context().overrides_log(),
             "resolved_config": self._dump_config_snapshot(),
             "requests": data_list.copy(),
         }
@@ -3071,7 +3057,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Write the data to the file
                 data_to_dump_with_server_args = {
                     "server_args": self.server_args,
-                    "config_updates": list(self._config_updates),
+                    "config_updates": get_context().overrides_log(),
                     "resolved_config": self._dump_config_snapshot(),
                     "requests": data_to_dump,
                     "launch_command": " ".join(sys.argv),

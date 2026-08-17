@@ -903,6 +903,29 @@ class RuntimeContext:
             bag._set(name, value)
         self._overrides_log.append((source, dict(fields)))
 
+    def config_leaf(self, name: str):
+        """One resolved config leaf by field name — the read side of ``override``.
+
+        Callers that hold a field name rather than a namespace (a readback
+        endpoint, a control-plane handler) would otherwise have to know which
+        bag it lives in.
+        """
+        bags = self._config_bags
+        if bags is None:
+            raise ValueError("config not published; cannot read a config leaf")
+        from sglang.srt.arg_groups.arg_utils import namespace_of
+
+        path = namespace_of(type(self._server_args)).get(name)
+        if path is None:
+            raise ValueError(f"{name!r} is not a config leaf (no NS namespace)")
+        parts = path.split(".")
+        bag = self.config_bag(parts[0])
+        for seg in parts[1:]:
+            bag = object.__getattribute__(bag, "_subs").get(seg)
+            if bag is None:
+                raise ValueError(f"subgroup {seg!r} missing under {path!r}")
+        return getattr(bag, name)
+
     def overrides_log(self) -> list:
         """Provenance of post-publish ``override`` calls: ``[(source, {field: value})]``.
 
@@ -925,12 +948,14 @@ class RuntimeContext:
         ``ServerArgs`` field names, so overlaying them onto the top level of
         either base is exact.
 
-        This covers the process-global bags only. Control-plane facts the bags
-        do not model (weight version, model path, the tokenizer's HiCache
-        mirror) live on the tokenizer manager, and
-        ``TokenizerManager.resolved_config_dict`` overlays those for the
-        top-level ``/server_info`` body. The two are separate logs, not one
-        merged dict.
+        The log is per process: it carries what *this* process overrode. A
+        weight reload records ``model_path`` and ``load_format`` from the
+        scheduler process (``ModelRunner.update_model_fields``); the tokenizer
+        process records only ``load_format`` and keeps ``model_path`` /
+        ``served_model_name`` as ``TokenizerManager`` attributes, which
+        ``TokenizerManager.resolved_config_dict`` overlays on top of this dump.
+        The top-level ``/server_info`` fields are the startup record, not this
+        dump.
         """
         d = dict(vars(self.server_args)) if base is None else dict(base)
         for _source, fields in self._overrides_log:
