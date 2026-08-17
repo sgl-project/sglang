@@ -94,6 +94,13 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                # NPU: Barrier to prevent TP rank desync. NPU's isend is
+                # effectively blocking, so different TP ranks spend different
+                # time in P2P ops. Without this barrier, fast ranks advance to
+                # the next mb_id's collective ops while slow ranks are still in
+                # the current mb_id's P2P, causing collective op mismatch.
+                if is_npu():
+                    torch.distributed.barrier(self.tp_cpu_group)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -106,7 +113,7 @@ class SchedulerPPMixin:
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
                             recv_reqs,
-                            async_send=True,
+                            async_send=not is_npu(),
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
@@ -164,7 +171,7 @@ class SchedulerPPMixin:
                         ):
                             self.send_proxy_work = self._pp_send_dict_to_next_stage(
                                 result.pp_hidden_states_proxy_tensors.tensors,
-                                async_send=True,
+                                async_send=not is_npu(),
                                 msg_type="proxy",
                             )
 
@@ -228,6 +235,8 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                if is_npu():
+                    torch.distributed.barrier(self.tp_cpu_group)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -332,13 +341,13 @@ class SchedulerPPMixin:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
+                        recv_reqs, async_send=not is_npu()
                     )
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                        bootstrapped_rids, async_send=True
+                        bootstrapped_rids, async_send=not is_npu()
                     )
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
+                        transferred_rids, async_send=not is_npu()
                     )
                     if cur_batch:
                         self.device_module.current_stream().wait_event(
@@ -346,7 +355,7 @@ class SchedulerPPMixin:
                         )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=True,
+                            async_send=not is_npu(),
                             msg_type="proxy",
                         )
 
@@ -381,6 +390,8 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                if is_npu():
+                    torch.distributed.barrier(self.tp_cpu_group)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -518,16 +529,16 @@ class SchedulerPPMixin:
 
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
+                        recv_reqs, async_send=not is_npu()
                     )
                     send_retract_work = self._pp_send_pyobj_to_next_stage(
-                        retract_rids, async_send=True
+                        retract_rids, async_send=not is_npu()
                     )
                     send_prealloc_work = self._pp_send_pyobj_to_next_stage(
-                        prealloc_rids, async_send=True
+                        prealloc_rids, async_send=not is_npu()
                     )
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
+                        transferred_rids, async_send=not is_npu()
                     )
                     if cur_batch and not cur_batch.forward_mode.is_prebuilt():
                         self.device_module.current_stream().wait_event(
@@ -535,7 +546,7 @@ class SchedulerPPMixin:
                         )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=True,
+                            async_send=not is_npu(),
                             msg_type="proxy",
                         )
 
@@ -1194,7 +1205,7 @@ class SchedulerPPMixin:
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
                             pp_outputs_to_send.tensors,
-                            async_send=True,
+                            async_send=not is_npu(),
                             msg_type="output",
                         )
         # send the outputs from the last round to let the next stage worker run post processing
@@ -1203,7 +1214,7 @@ class SchedulerPPMixin:
                 with torch.profiler.record_function("send_res_dict_to_next_stage"):
                     send_output_work = self._pp_send_dict_to_next_stage(
                         pp_outputs.tensors,
-                        async_send=True,
+                        async_send=not is_npu(),
                         msg_type="output",
                     )
         return send_output_work
