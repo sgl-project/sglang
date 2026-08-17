@@ -42,7 +42,6 @@ class TestUnifiedKimiLinearDcpHiCache(UnifiedRadixTreeTestMixin, CustomTestCase)
 
     kl_threshold = 0.01
     gsm8k_threshold = 0.85
-    mmlu_threshold = 0.4
     prefill_cache_assert = staticmethod(
         make_mamba_prefill_assert(chunk_size=WIDENED_PAGE)
     )

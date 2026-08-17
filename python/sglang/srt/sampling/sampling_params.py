@@ -46,7 +46,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     """
     The sampling parameters.
 
-    See docs_new/docs/basic_usage/sampling_params.mdx
+    See docs/docs/basic_usage/sampling_params.mdx
     for the documentation.
     """
 
@@ -133,6 +133,12 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         self.no_stop_trim = (
             self.no_stop_trim if self.no_stop_trim is not None else False
         )
+
+        # An empty grammar constraint means "unset", not "constrain to nothing".
+        self.json_schema = self.json_schema or None
+        self.regex = self.regex or None
+        self.ebnf = self.ebnf or None
+        self.structural_tag = self.structural_tag or None
 
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:

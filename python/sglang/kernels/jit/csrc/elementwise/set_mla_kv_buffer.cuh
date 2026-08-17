@@ -35,7 +35,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 struct SetMlaKVBufferParams {
   const void* __restrict__ k_nope;
@@ -213,4 +213,4 @@ struct SetMlaKVBufferKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

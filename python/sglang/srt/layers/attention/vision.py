@@ -17,7 +17,7 @@ from sglang.kernels.ops.layernorm.norm import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
+from sglang.srt.runtime_context import get_context, get_exec, get_mm, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -148,6 +148,7 @@ def prepare_vision_attention_metadata(
     cu_seqlens: torch.Tensor,
     device: torch.device,
     *,
+    max_seqlen: Optional[int] = None,
     packed_indptrs: Optional[torch.Tensor] = None,
     sequence_lengths: Optional[torch.Tensor] = None,
     flashinfer_max_seqlen: Optional[int] = None,
@@ -156,7 +157,8 @@ def prepare_vision_attention_metadata(
 
     cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32, non_blocking=True)
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    max_seqlen = int(seq_lens.max().item())
+    if max_seqlen is None:
+        max_seqlen = int(seq_lens.max().item())
     return VisionAttentionMetadata(
         cu_seqlens=cu_seqlens,
         seq_lens=seq_lens,
@@ -164,6 +166,43 @@ def prepare_vision_attention_metadata(
         packed_indptrs=packed_indptrs,
         sequence_lengths=sequence_lengths,
         flashinfer_max_seqlen=flashinfer_max_seqlen,
+    )
+
+
+def prepare_flashinfer_cudnn_vision_attention_metadata(
+    cu_seqlens: torch.Tensor,
+    device: torch.device,
+    *,
+    elem_per_token: int,
+) -> VisionAttentionMetadata:
+    cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32, non_blocking=True)
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    batch_size = int(seq_lens.numel())
+    padded_batch_size = next(
+        (size for size in BATCH_BUCKETS if size >= batch_size),
+        math.ceil(batch_size / BATCH_BUCKETS[0]) * BATCH_BUCKETS[0],
+    )
+    if padded_batch_size != batch_size:
+        pad_size = padded_batch_size - batch_size
+        padded_indptrs = torch.cat([cu_seqlens, cu_seqlens[-1].expand(pad_size)])
+        padded_seq_lens = torch.cat([seq_lens, seq_lens.new_zeros(pad_size)])
+    else:
+        padded_indptrs = cu_seqlens
+        padded_seq_lens = seq_lens
+
+    elem_indptrs = padded_indptrs * elem_per_token
+    real_max_seqlen = int(seq_lens.max().item())
+    max_seqlen = next(
+        (size for size in FLASHINFER_MAX_SEQLEN_BUCKETS if size >= real_max_seqlen),
+        math.ceil(real_max_seqlen / FLASHINFER_MAX_SEQLEN_BUCKETS[-1])
+        * FLASHINFER_MAX_SEQLEN_BUCKETS[-1],
+    )
+    return prepare_vision_attention_metadata(
+        cu_seqlens,
+        device=device,
+        packed_indptrs=torch.cat([elem_indptrs] * 3),
+        sequence_lengths=padded_seq_lens.view(-1, 1, 1, 1),
+        flashinfer_max_seqlen=max_seqlen,
     )
 
 
@@ -362,7 +401,9 @@ class VisionSdpaAttention(nn.Module):
         else:
             attention_mask = attention_mask.to(device=q.device)
 
-        q, k, v = [rearrange(x, "(b s) h d -> b h s d", b=bsz) for x in [q, k, v]]
+        q = q.reshape(bsz, s, self.num_heads, self.head_size).transpose(1, 2)
+        k = k.reshape(bsz, s, self.num_kv_heads, self.head_size).transpose(1, 2)
+        v = v.reshape(bsz, s, self.num_kv_heads, self.head_size).transpose(1, 2)
 
         if self.softmax_in_single_precision:
             k = rearrange(k, "b h s d -> b h d s")
@@ -395,7 +436,7 @@ class VisionSdpaAttention(nn.Module):
             )
 
         # [b, h, s, head_size] --> [b * s, h, head_size]
-        output = rearrange(output, "b h s d -> (b s) h d")
+        output = output.transpose(1, 2).reshape(bsz * s, self.num_heads, self.head_size)
 
         return output
 
@@ -1063,7 +1104,7 @@ class VisionAttention(nn.Module):
         # Select attention backend via a unified method
         _passed_backend = qkv_backend
         qkv_backend = self._determine_attention_backend(_passed_backend)
-        if get_mm().mm_attention_backend is None and _passed_backend is None:
+        if _passed_backend is None and get_mm().mm_attention_backend is None:
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
@@ -1173,7 +1214,14 @@ class VisionAttention(nn.Module):
         - Ascend NPU: "ascend_attn"
         - Other platforms: device-specific optimized backend or "sdpa"
         """
-        override_backend = get_mm().mm_attention_backend
+        try:
+            override_backend = get_mm().mm_attention_backend
+        except ValueError:
+            if passed_backend is None or get_context().is_config_namespace_published(
+                "mm"
+            ):
+                raise
+            override_backend = None
         if override_backend is not None:
             backend = override_backend
         elif passed_backend is not None:
@@ -1438,7 +1486,7 @@ class VisionAttention(nn.Module):
 
         if self.use_qkv_parallel:
             # [b * s, h, head_size] --> [b, s, h * head_size]
-            output = rearrange(output, "(b s) ... h d -> b s ... (h d)", b=bsz)
+            output = output.reshape(bsz, s, -1)
 
             # [b, s, h * head_size] --> [b, s, h * head_size]
             output, _ = self.proj(output)

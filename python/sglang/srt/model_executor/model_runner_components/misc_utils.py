@@ -3,8 +3,16 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Optional
 
-from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
-from sglang.srt.runtime_context import get_context, get_exec, get_schedule
+from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
+    is_deepseek_dsa,
+    is_kimi_k3,
+)
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_context,
+    get_schedule,
+)
 from sglang.srt.server_args import CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
 
 if TYPE_CHECKING:
@@ -25,10 +33,11 @@ def maybe_disable_chunked_prefix_cache(
     # model's (often non-MLA) config must not flip the shared setting.
     if is_draft_worker:
         return
+    # Chunked prefix cache is a prefill feature: the prefill half decides.
+    prefill_backend, _ = attention_backends()
     if (
         not use_mla_backend
-        or get_exec().kernel.attention_backend
-        not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+        or prefill_backend not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
     ):
         if not get_schedule().disable_chunked_prefix_cache:
             get_context().override(
@@ -68,3 +77,16 @@ def resolve_pp_proxy_topk_size(
     ):
         return None
     return getattr(hf_config, "index_topk", None)
+
+
+def resolve_pp_proxy_residual_num_blocks(
+    *, model_config: ModelConfig, pp_size: int, pp_rank: int, start_layer: int
+) -> Optional[int]:
+    """Return the inherited Kimi K3 attention-residual bank width."""
+    if pp_size <= 1 or pp_rank == 0 or not is_kimi_k3(model_config.hf_config):
+        return None
+
+    block_size = getattr(model_config.hf_text_config, "attn_res_block_size", None)
+    if block_size is None:
+        return None
+    return (start_layer + block_size - 1) // block_size
