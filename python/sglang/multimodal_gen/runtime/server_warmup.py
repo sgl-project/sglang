@@ -180,6 +180,10 @@ async def maybe_apply_auto_residency(
         logger.debug("Auto residency: skipped (%s)", skip_reason)
         return
 
+    logger.info(
+        "Server warmup complete; adjusting component residency for the "
+        "default workload (--performance-mode auto)."
+    )
     response = await forward(AutoResidencyReq(action="apply"))
     status = _auto_residency_status(response)
     if status == PROMOTION_STATUS_ROLLBACK_FAILED:
