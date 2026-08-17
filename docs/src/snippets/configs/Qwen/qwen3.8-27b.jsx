@@ -338,8 +338,9 @@ export const config = {
   // Verification: RTX 5090 / RTX PRO 6000 cells were measured across their
   // whole overlay envelope; the h200/gb300 badges carry the source page's
   // validation, which covers the overlay defaults (plus plain MTP on gb300) —
-  // non-default overlay picks there are valid but unmeasured. DGX Spark stays
-  // unverified (SM121 / aarch64 unvalidated).
+  // non-default overlay picks there are valid but unmeasured. DGX Spark was
+  // measured across its whole overlay envelope too, but to a weaker standard
+  // (boot-and-serve only — see the cell block comment below).
   //
   // Cells carry NO --mamba-full-memory-ratio: the ratio depends on workload,
   // S, D and kv_bytes_per_token, so the page's calculator computes it live
