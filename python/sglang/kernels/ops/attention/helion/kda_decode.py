@@ -28,18 +28,46 @@ _KDA_BF16_CONFIG = helion.Config(
     block_sizes=[16],
     indexing="pointer",
     l2_groupings=[16],
-    # Policies are positional in the traced load order. Retune them if the
-    # decode body gains, loses, or reorders loads.
+    # Policies are positional in the traced load order. Keep the labels in
+    # sync if the power-of-two path changes.
     load_eviction_policies=[
-        "",
-        "last",
-        "first",
-        "last",
-        "first",
-        "first",
-        "last",
-        "",
-        "last",
+        "",  # ssm_state_indices
+        "last",  # a
+        "first",  # dt_bias
+        "last",  # A_log
+        "first",  # b
+        "first",  # state
+        "last",  # mixed_qkv (k)
+        "",  # mixed_qkv (v)
+        "last",  # mixed_qkv (q)
+    ],
+    loop_orders=[[1, 2, 0]],
+    num_stages=1,
+    num_warps=1,
+    pid_type="flat",
+    range_flattens=[None],
+    range_multi_buffers=[None],
+    range_num_stages=[],
+    range_unroll_factors=[0],
+)
+
+_KDA_BF16_MASKED_CONFIG = helion.Config(
+    atomic_indexing=[],
+    block_sizes=[16],
+    indexing="pointer",
+    l2_groupings=[16],
+    # Flattened state storage registers an extra load slot before state.
+    load_eviction_policies=[
+        "",  # ssm_state_indices
+        "last",  # a
+        "first",  # dt_bias
+        "last",  # A_log
+        "first",  # b
+        "",  # state_storage
+        "first",  # state
+        "last",  # mixed_qkv (k)
+        "",  # mixed_qkv (v)
+        "last",  # mixed_qkv (q)
     ],
     loop_orders=[[1, 2, 0]],
     num_stages=1,
@@ -78,6 +106,7 @@ def _helion_fused_recurrent_kda_packed_decode_body(
     use_qk_l2norm_in_kernel: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     use_fast_rsqrt: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     use_lower_bound: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    use_masked_indexing: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
 ) -> torch.Tensor:
     """Fused packed KDA decode body; mutates ``initial_state`` and ``out``."""
     B = mixed_qkv.size(0)
@@ -108,11 +137,30 @@ def _helion_fused_recurrent_kda_packed_decode_body(
             ssm_state_indices.stride(0),
         )
     )
+    if use_masked_indexing:
+        state_strides = (
+            initial_state.stride(0),
+            initial_state.stride(1),
+            initial_state.stride(2),
+            initial_state.stride(3),
+        )
+        state_storage_size = (
+            (initial_state.size(0) - 1) * state_strides[0]
+            + (HV - 1) * state_strides[1]
+            + (V - 1) * state_strides[2]
+            + (K - 1) * state_strides[3]
+            + 1
+        )
+        # Preserve envelope/page-major strides while masking padded lanes.
+        state_storage = initial_state.as_strided([state_storage_size], [1])
 
     block_v = hl.register_block_size(1, V)
 
     for tile_b, tile_hv, tile_v in hl.tile([B, HV, V], block_size=[1, 1, block_v]):
         k_offsets = hl.arange(K)
+        if use_masked_indexing:
+            k_valid = k_offsets < K
+            v_valid = tile_v.index < V
         i_b = tile_b.id
         i_hv = tile_hv.id
         i_h = i_hv // heads_per_q
@@ -125,8 +173,23 @@ def _helion_fused_recurrent_kda_packed_decode_body(
             k_input_offsets = H * K + i_h * K + k_offsets
             v_offsets = 2 * H * K + i_hv * V + tile_v.index
 
-            raw_gate = a[i_b, i_hv * K + k_offsets].float()
-            raw_gate = raw_gate + dt_bias[i_hv * K + k_offsets].float()
+            if use_masked_indexing:
+                raw_gate = hl.load(
+                    a,
+                    [i_b, i_hv * K + k_offsets],
+                    extra_mask=k_valid,
+                ).float()
+                raw_gate = (
+                    raw_gate
+                    + hl.load(
+                        dt_bias,
+                        [i_hv * K + k_offsets],
+                        extra_mask=k_valid,
+                    ).float()
+                )
+            else:
+                raw_gate = a[i_b, i_hv * K + k_offsets].float()
+                raw_gate = raw_gate + dt_bias[i_hv * K + k_offsets].float()
             A_log_value = A_log[i_hv].float()
             A = torch.exp2(A_log_value * _LOG2_E)
             if use_lower_bound:
@@ -141,11 +204,34 @@ def _helion_fused_recurrent_kda_packed_decode_body(
                 log_decay = -A * softplus
             beta = torch.sigmoid(b[i_b, i_hv].float())
 
-            state = initial_state[state_index, i_hv, tile_v.index, k_offsets].float()
+            if use_masked_indexing:
+                state_offsets = (
+                    state_index * state_strides[0]
+                    + i_hv * state_strides[1]
+                    + tile_v.index[:, None] * state_strides[2]
+                    + k_offsets[None, :] * state_strides[3]
+                )
+                state_mask = v_valid[:, None] & k_valid[None, :]
+                state = hl.load(
+                    state_storage,
+                    [state_offsets],
+                    extra_mask=state_mask,
+                ).float()
+            else:
+                state = initial_state[
+                    state_index, i_hv, tile_v.index, k_offsets
+                ].float()
             decay = torch.exp2(log_decay * _LOG2_E)
             state = state * decay[None, :]
 
-            k = mixed_qkv[i_b, k_input_offsets].float()
+            if use_masked_indexing:
+                k = hl.load(
+                    mixed_qkv,
+                    [i_b, k_input_offsets],
+                    extra_mask=k_valid,
+                ).float()
+            else:
+                k = mixed_qkv[i_b, k_input_offsets].float()
             if use_qk_l2norm_in_kernel:
                 k_norm = (k * k).sum() + 1e-6
                 if use_fast_rsqrt:
@@ -157,7 +243,14 @@ def _helion_fused_recurrent_kda_packed_decode_body(
             value_residual = value_residual * beta
             state = state + value_residual[:, None] * k[None, :]
 
-            q = mixed_qkv[i_b, q_offsets].float()
+            if use_masked_indexing:
+                q = hl.load(
+                    mixed_qkv,
+                    [i_b, q_offsets],
+                    extra_mask=k_valid,
+                ).float()
+            else:
+                q = mixed_qkv[i_b, q_offsets].float()
             if use_qk_l2norm_in_kernel:
                 q_norm = (q * q).sum() + 1e-6
                 if use_fast_rsqrt:
@@ -168,7 +261,15 @@ def _helion_fused_recurrent_kda_packed_decode_body(
             output = (state * q[None, :]).sum(-1)
 
             out[i_b, 0, i_hv, tile_v] = output.to(out.dtype)
-            initial_state[state_index, i_hv, tile_v.index, k_offsets] = state
+            if use_masked_indexing:
+                hl.store(
+                    state_storage,
+                    [state_offsets],
+                    state,
+                    extra_mask=state_mask,
+                )
+            else:
+                initial_state[state_index, i_hv, tile_v.index, k_offsets] = state
 
     return out
 
@@ -185,6 +286,12 @@ _helion_fused_recurrent_kda_packed_decode_bf16 = helion.kernel(
     config=_KDA_BF16_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
+_helion_fused_recurrent_kda_packed_decode_bf16_masked = helion.kernel(
+    _helion_fused_recurrent_kda_packed_decode_body,
+    static_shapes=False,
+    config=_KDA_BF16_MASKED_CONFIG,
+    ignore_warnings=_IGNORED_WARNINGS,
+)
 _helion_fused_recurrent_kda_packed_decode_bf16_small_head = helion.kernel(
     _helion_fused_recurrent_kda_packed_decode_body,
     static_shapes=False,
@@ -198,6 +305,7 @@ def _select_decode_kernel(
     is_bf16_state: bool,
     num_v_heads: int,
     use_lower_bound: bool,
+    use_masked_indexing: bool,
 ) -> helion.Kernel:
     if (
         is_bf16_state
@@ -206,8 +314,14 @@ def _select_decode_kernel(
     ):
         return _helion_fused_recurrent_kda_packed_decode_bf16_small_head
     if is_bf16_state:
+        if use_masked_indexing:
+            return _helion_fused_recurrent_kda_packed_decode_bf16_masked
         return _helion_fused_recurrent_kda_packed_decode_bf16
     return _helion_fused_recurrent_kda_packed_decode
+
+
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and value & (value - 1) == 0
 
 
 def validate_packed_decode_inputs(
@@ -348,7 +462,7 @@ def helion_fused_recurrent_kda_packed_decode(
     * The return is the same ``(out, initial_state)`` object pair supplied by the
       caller.
     """
-    _, _, num_v_heads, _, _ = validate_packed_decode_inputs(
+    _, _, num_v_heads, key_dim, value_dim = validate_packed_decode_inputs(
         mixed_qkv,
         a,
         b,
@@ -360,10 +474,14 @@ def helion_fused_recurrent_kda_packed_decode(
     )
     use_lower_bound = lower_bound is not None
     is_bf16_state = initial_state.dtype is torch.bfloat16
+    use_masked_indexing = not (
+        _is_power_of_two(key_dim) and _is_power_of_two(value_dim)
+    )
     kernel = _select_decode_kernel(
         is_bf16_state=is_bf16_state,
         num_v_heads=num_v_heads,
         use_lower_bound=use_lower_bound,
+        use_masked_indexing=use_masked_indexing,
     )
     lower_bound_value = 0.0 if lower_bound is None else lower_bound
     result = kernel(
@@ -380,5 +498,6 @@ def helion_fused_recurrent_kda_packed_decode(
         use_qk_l2norm_in_kernel,
         is_bf16_state,
         use_lower_bound,
+        use_masked_indexing,
     )
     return result, initial_state
