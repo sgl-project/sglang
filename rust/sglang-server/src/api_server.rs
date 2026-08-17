@@ -20,7 +20,7 @@ use axum::Router;
 use crate::runtime::ServerArgs;
 use crate::tokenizer_manager::ActivityCounter;
 use crate::tokenizer_manager::Senders;
-use disaggregation::bootstrap as pd_bootstrap;
+use disaggregation::{bootstrap as pd_bootstrap, load_balancer as pd_lb};
 
 /// Shared handler state: submission handles, immutable server configuration,
 /// and the API-owned chat formatter.
@@ -32,6 +32,11 @@ struct AppState {
     chat_formatter: Option<openai::ChatFormatter>,
     /// Egress heartbeat (bumped per drained ring frame).
     egress_activity: ActivityCounter,
+    /// Embedded PD load balancer (decode front door): `Some` only on a decode
+    /// node launched with `SGLANG_ENABLE_EMBEDDED_PD_LB=1`. Prefill workers are
+    /// registered at runtime via `/prefill_workers`; an empty pool routes
+    /// nothing.
+    prefill_worker_pool: Option<Arc<pd_lb::PrefillWorkerPool>>,
 }
 
 pub async fn serve(
@@ -46,18 +51,32 @@ pub async fn serve(
     shutdown: flume::Receiver<()>,
 ) {
     let chat_formatter = openai::load_chat_support(&server_args);
+    let prefill_worker_pool = pd_lb::PrefillWorkerPool::try_from(server_args.as_ref())
+        .ok()
+        .map(Arc::new);
     let state = AppState {
         senders,
         egress_buf,
         server_args: server_args.clone(),
         chat_formatter,
         egress_activity,
+        prefill_worker_pool,
     };
     // Each endpoint module registers its own routes and merges here.
-    let router = Router::new()
+    let mut router = Router::new()
         .merge(common::routes())
         .merge(native_api::routes())
         .merge(openai::routes());
+
+    // Embedded PD LB (decode front door): the /prefill_workers admin API
+    // plus the auto-recovery sweeper probing down workers back into
+    // rotation (cancelled with the runtime on shutdown).
+    if let Some(pool) = &state.prefill_worker_pool {
+        let (routes, sweeper) = pd_lb::router_and_sweeper(pool.clone());
+        tokio::spawn(sweeper);
+        router = router.merge(routes);
+        tracing::info!("PD load balancer mounted on the api listener");
+    }
 
     // TODO(auth): no API-key boundary yet. Python gates every route (except
     // /health*, /metrics*, OPTIONS) via `add_api_key_middleware`; until ported,

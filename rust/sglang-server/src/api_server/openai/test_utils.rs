@@ -112,6 +112,7 @@ pub(super) fn app_state(senders: Senders) -> super::AppState {
         server_args: server_args(),
         chat_formatter: None,
         egress_activity: Default::default(),
+        prefill_worker_pool: None,
     }
 }
 
