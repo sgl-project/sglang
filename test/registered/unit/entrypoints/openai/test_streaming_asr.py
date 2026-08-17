@@ -22,11 +22,15 @@ from sglang.srt.entrypoints.openai.realtime.protocol import SessionUpdateEvent
 from sglang.srt.entrypoints.openai.realtime.session import RealtimeConnection
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
+    generate_asr_transcript,
     hash_audio_content,
     process_asr_chunk,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     RealtimeEncoderWindowPolicy,
+)
+from sglang.srt.entrypoints.openai.transcription_adapters.qwen3_asr import (
+    Qwen3ASRAdapter,
 )
 from sglang.srt.multimodal.audio_encoder_windowing import AudioEncoderWindowConfig
 from sglang.srt.utils import get_or_create_event_loop
@@ -75,7 +79,9 @@ def _adapter(
     return SimpleNamespace(
         prompt_template="PROMPT:",
         model_sample_rate=1,
+        supports_chunked_streaming=True,
         postprocess_text=lambda text: text,
+        postprocess_streaming_text=lambda text: text,
         build_sampling_params=lambda request: {"language": request.language},
         realtime_encoder_window_policy=window_config,
         chunked_streaming_config={
@@ -134,6 +140,34 @@ class _MockTokenizerManager:
                     "text": transcript,
                     "meta_info": {
                         "finish_reason": {"type": self._finish_reasons.pop(0)}
+                    },
+                }
+
+        return gen()
+
+
+class _StreamingTokenizerManager(_MockTokenizerManager):
+    def __init__(self, chunks, *, incremental=True, supports_encoder_windows=False):
+        super().__init__("unused", supports_encoder_windows=supports_encoder_windows)
+        self._chunks = chunks
+        self.server_args = SimpleNamespace(incremental_streaming_output=incremental)
+
+    def generate_request(self, adapted_request, raw_request=None, **kwargs):
+        self.requests.append(adapted_request)
+        config = kwargs.get("audio_encoder_window_config")
+        self.processor_kwargs.append(
+            {"audio_encoder_window_config": config} if config is not None else None
+        )
+
+        async def gen():
+            for index, text in enumerate(self._chunks):
+                finish_reason = "stop" if index == len(self._chunks) - 1 else None
+                yield {
+                    "text": text,
+                    "meta_info": {
+                        "finish_reason": (
+                            {"type": finish_reason} if finish_reason else None
+                        )
                     },
                 }
 
@@ -292,6 +326,102 @@ def _append_seconds(connection, seconds):
 
 
 class TestStreamingASR(CustomTestCase):
+    def test_decoder_stream_hides_qwen_prefix_and_reconstructs_text(self):
+        tokenizer_manager = _StreamingTokenizerManager(
+            ["language en<asr", "_text>Hello", " world"]
+        )
+        updates = []
+
+        async def collect(text):
+            updates.append(text)
+
+        result = _run(
+            generate_asr_transcript(
+                tokenizer_manager=tokenizer_manager,
+                adapter=Qwen3ASRAdapter(),
+                audio_data=_AUDIO,
+                sampling_params={},
+                prompt="PROMPT:",
+                on_update=collect,
+            )
+        )
+
+        self.assertTrue(tokenizer_manager.requests[0].stream)
+        self.assertEqual(updates, ["Hello", "Hello world"])
+        self.assertEqual(result.text, "Hello world")
+        self.assertEqual(result.finish_reason, "stop")
+
+    def test_decoder_stream_appends_deltas_without_duplicates(self):
+        tokenizer_manager = _StreamingTokenizerManager(["hello", " world", " again"])
+        connection = RealtimeConnection(
+            Mock(send_text=AsyncMock(), close=AsyncMock()),
+            tokenizer_manager,
+            _adapter(),
+            _server_args(long_audio_strategy="cumulative"),
+        )
+        connection.config.configured = True
+        connection.config.language = "en"
+        connection.config.sampling_params = {"max_new_tokens": 256}
+        connection._send = AsyncMock()
+        connection.asr_state.audio.append_pcm(b"\x01\x00\x02\x00")
+
+        self.assertTrue(_run(connection._run_inference(is_last=False)))
+
+        deltas = [
+            call.args[0]
+            for call in connection._send.call_args_list
+            if call.args[0].type == "conversation.item.input_audio_transcription.delta"
+        ]
+        self.assertEqual([event.delta for event in deltas], ["hello", " world"])
+
+        _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
+        completed = [
+            call.args[0]
+            for call in connection._send.call_args_list
+            if call.args[0].type
+            == "conversation.item.input_audio_transcription.completed"
+        ]
+        self.assertEqual(completed[-1].transcript, "hello world again")
+
+    def test_encoder_window_stream_holds_prefix_replay_before_appending(self):
+        tokenizer_manager = _StreamingTokenizerManager(
+            ["one", " two", " three", " four", " five"],
+            supports_encoder_windows=True,
+        )
+        processor = RealtimeASRProcessor(
+            tokenizer_manager,
+            _adapter(encoder_window_config=_ENCODER_WINDOW_POLICY),
+            _server_args(120),
+        )
+        state = processor.create_state()
+        state.decoder_suffix = DecoderSuffixState(
+            emitted_text="one two", pending_suffix="three four"
+        )
+        state.audio.append_pcm(b"\x01\x00\x02\x00")
+        deltas = []
+
+        async def collect(text):
+            deltas.append(text)
+
+        remaining = _run(
+            processor.process(
+                state,
+                is_last=False,
+                language="en",
+                sampling_params={},
+                on_transcript_delta=collect,
+            )
+        )
+
+        self.assertTrue(tokenizer_manager.requests[0].stream)
+        self.assertEqual(deltas, ["three"])
+        self.assertEqual(remaining, "")
+        self.assertEqual(state.decoder_suffix.latest_text, "one two three four five")
+        self.assertEqual(
+            tokenizer_manager.processor_kwargs[0]["audio_encoder_window_config"],
+            _ENCODER_WINDOW_GEOMETRY,
+        )
+
     def test_cumulative_prompt_and_word_reconciliation(self):
         state = _state(emitted_text="hello", chunk_index=5)
         tokenizer_manager, _ = _chunk(state, "hello world foo")

@@ -209,6 +209,26 @@ def has_no_word_boundaries(text: str) -> bool:
     )
 
 
+def could_be_decoder_prefix_replay(text: str, decoder_prefix: str) -> bool:
+    """Whether partial decoder text can still become a full prefix replay.
+
+    Append-only streaming waits while the completed leading words still match
+    the supplied prefix. Once they diverge, or the whole prefix is available,
+    normal reconciliation can decide what is new transcript text.
+    """
+    text_words = text.split()
+    prefix_words = decoder_prefix.split()
+    if not text_words or not prefix_words:
+        return False
+    completed_word_count = len(text_words) - int(not text[-1].isspace())
+    if completed_word_count >= len(prefix_words):
+        return False
+    return (
+        _normalized_word_prefix_len(prefix_words, text_words[:completed_word_count])
+        == completed_word_count
+    )
+
+
 def _is_no_boundary_char(char: str) -> bool:
     return (
         is_cjk_char(char) or _THAI_CODEPOINT_START <= ord(char) <= _THAI_CODEPOINT_END

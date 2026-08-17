@@ -5,7 +5,7 @@ import io
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Union
 
 import msgspec
 import numpy as np
@@ -196,18 +196,28 @@ async def generate_asr_transcript(
     routing_key: Optional[str] = None,
     audio_encoder_window_config: Optional["AudioEncoderWindowConfig"] = None,
     mm_hashes: Optional[List[str]] = None,
+    on_update: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> Optional[GeneratedTranscript]:
-    """Run one stateless backend request and return text with its stop reason."""
+    """Run one backend request and optionally publish decoder snapshots."""
+    stream = on_update is not None
     chunk_request = GenerateReqInput(
         text=prompt,
         audio_data=audio_data,
         sampling_params=sampling_params,
-        stream=False,
+        stream=stream,
         modalities=["audio"],
         routing_key=routing_key,
         mm_hashes=mm_hashes,
     )
 
+    cumulative_text = ""
+    incremental = bool(
+        getattr(
+            getattr(tokenizer_manager, "server_args", None),
+            "incremental_streaming_output",
+            False,
+        )
+    )
     try:
         ret = None
         async for ret in tokenizer_manager.generate_request(
@@ -215,7 +225,16 @@ async def generate_asr_transcript(
             raw_request,
             audio_encoder_window_config=audio_encoder_window_config,
         ):
-            break
+            if not stream:
+                break
+            chunk_text = ret.get("text", "")
+            if incremental:
+                cumulative_text += chunk_text
+            else:
+                cumulative_text = chunk_text
+            visible_text = adapter.postprocess_streaming_text(cumulative_text)
+            if visible_text is not None:
+                await on_update(normalize_whitespace(visible_text))
     except asyncio.CancelledError:
         raise
     except ValueError:
@@ -226,13 +245,18 @@ async def generate_asr_transcript(
         logger.warning("[streaming_asr] ASR request returned no response")
         return None
 
-    finish_reason = ret.get("meta_info", {}).get("finish_reason")
+    raw_text = cumulative_text if stream else ret.get("text", "")
+    return GeneratedTranscript(
+        text=normalize_whitespace(adapter.postprocess_text(raw_text)),
+        finish_reason=_finish_reason_type(ret),
+    )
+
+
+def _finish_reason_type(response: Dict[str, Any]) -> Optional[str]:
+    finish_reason = response.get("meta_info", {}).get("finish_reason")
     if isinstance(finish_reason, dict):
         finish_reason = finish_reason.get("type")
-    return GeneratedTranscript(
-        text=normalize_whitespace(adapter.postprocess_text(ret.get("text", ""))),
-        finish_reason=finish_reason,
-    )
+    return finish_reason
 
 
 async def generate_cumulative_transcript(
@@ -243,6 +267,7 @@ async def generate_cumulative_transcript(
     sampling_params: Dict[str, Any],
     raw_request: Optional[Request] = None,
     routing_key: Optional[str] = None,
+    on_update: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> Optional[GeneratedTranscript]:
     """Generate one cumulative hypothesis with stable raw-audio identity."""
     return await generate_asr_transcript(
@@ -254,6 +279,7 @@ async def generate_cumulative_transcript(
         raw_request=raw_request,
         routing_key=routing_key,
         mm_hashes=[hash_audio_content(audio_data)],
+        on_update=on_update,
     )
 
 
