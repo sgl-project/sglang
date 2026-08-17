@@ -248,12 +248,10 @@ class NGRAMWorker(BaseSpecWorker):
         # complete and splicing would duplicate the tail.
         use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
 
-        # Host prep that does not need the accept results goes before the
-        # blocking .cpu() below, overlapping with the in-flight forward.
-        # Only the last max_trie_depth tokens can enter check_token, so slice
-        # the tails instead of copying whole prompts (the ids are array.array;
-        # list() converts just the short tails).
+        # Accept-independent prep, hoisted above the blocking .cpu() below.
         req_ids = [req.rid for req in batch.reqs]
+        # Only the last max_trie_depth tokens can match; the ids are
+        # array.array, so list() the tails for list concat below.
         input_tails = [
             list(req.origin_input_ids[-self.max_trie_depth :]) for req in batch.reqs
         ]
@@ -278,8 +276,7 @@ class NGRAMWorker(BaseSpecWorker):
             self.prev_accept_lens = prev_accept_lens.tolist()
             assert bs == len(self.prev_accept_lens)
         else:
-            # Nothing to splice; keep the staging consistent for the corpus
-            # update without paying the D2H sync.
+            # _update_ngram_corpus still reads the staging; fill it empty.
             self.prev_token_ids = []
             self.prev_accept_lens = [0] * bs
 
