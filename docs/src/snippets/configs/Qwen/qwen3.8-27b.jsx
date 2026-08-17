@@ -103,18 +103,14 @@ export const config = {
         { id: "none", label: "None" },
         {
           id: "eagle", label: "EAGLE",
-          // MTP availability and the ReplaySSM flag are SEPARATE questions.
-          // Availability: gb300 shipped verified MTP cells before this rework,
-          // and SM120 (RTX PRO 6000 / RTX 5090) + SM121 (DGX Spark) are
-          // validated here. h200 (SM90) never shipped an MTP recipe and is not
-          // added speculatively. The ReplaySSM flag is scoped separately below.
-          // On the 32GB 5090 MTP additionally needs the NVFP4 weights.
-          disabled: (sel) =>
-            !["rtx5090", "rtx6000", "dgx-spark", "gb300"].includes(sel.hw) ||
-            (sel.hw === "rtx5090" && sel.quant !== "nvfp4"),
+          // EAGLE / MTP is the in-checkpoint head and is offered on every
+          // platform. The only availability constraint is the 32GB RTX 5090,
+          // where the head needs the NVFP4 weights to leave room. The
+          // ReplaySSM flag is scoped separately in `flags` below -- that is a
+          // per-platform validation question, not an availability one.
+          disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
           disableReason:
-            "EAGLE / MTP is offered on SM120 (RTX PRO 6000, RTX 5090), SM121 " +
-            "(DGX Spark) and GB300; on the 32GB RTX 5090 it also requires NVFP4 weights",
+            "On the 32GB RTX 5090 the MTP head only fits on top of the NVFP4 weights",
           // ReplaySSM spec-verify rides with EAGLE on EVERY platform at the
           // maintainers' direction. It replaces the per-draft full-state
           // snapshots with a fold-every-commit ring, which takes the D
@@ -139,12 +135,11 @@ export const config = {
             "--speculative-num-steps 3",
             "--speculative-eagle-topk 1",
             "--speculative-num-draft-tokens 4",
-            // ReplaySSM spec-verify ONLY where it has been exercised: SM120
-            // (RTX PRO 6000, RTX 5090) and SM121 (DGX Spark). It moves the D
-            // intermediate SSM states onto a fixed ring and is what makes MTP
-            // fit a 32GB card at all. gb300 (SM103) keeps its original,
-            // already-verified MTP recipe without it rather than inheriting an
-            // untested flag.
+            // ReplaySSM spec-verify ONLY on SM120 (RTX PRO 6000, RTX 5090)
+            // and SM121 (DGX Spark), where it has been exercised. It moves the
+            // D intermediate SSM states onto a fixed ring and is what makes MTP
+            // fit a 32GB card at all. h200 (SM90) and gb300 (SM103) keep the
+            // plain MTP recipe rather than inheriting an untested flag.
             ...(["rtx5090", "rtx6000", "dgx-spark"].includes(sel.hw)
               ? ["--enable-linear-replayssm-spec"]
               : []),
