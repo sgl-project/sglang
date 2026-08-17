@@ -52,6 +52,11 @@ class KimiK2Detector(BaseFormatDetector):
     <|tool_call_begin|>{counter}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
     ```
 
+    Format Structure (stripped functions — client sanitized "." and ":" in history):
+    ```
+    <|tool_call_begin|>functions{name}{index}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
+    ```
+
     Reference: https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/docs/tool_call_guidance.md
     """
 
@@ -86,14 +91,25 @@ class KimiK2Detector(BaseFormatDetector):
         )
         # Bare call counter: "0", "3" (model uses auto-incrementing counter)
         self.tool_call_id_counter_regex = re.compile(r"^\d+$")
+        # Client-stripped functions ID: "functionsread3" when a client
+        # sanitized "." and ":" from the canonical "functions.read:3" form
+        # and round-tripped that ID through chat history, training the model
+        # to emit the stripped variant in subsequent turns. Lazy name match
+        # so trailing digits route to index.
+        self.tool_call_id_stripped_regex = re.compile(
+            r"^functions(?P<name>.+?)(?P<index>\d+)$"
+        )
 
     def _parse_tool_call_id(
         self, function_id: str, tools: List[Tool], function_args: str = None
     ):
         """Parse a tool call ID into (function_name, call_index).
 
-        Standard format: "functions.ReadFile:0" → ("ReadFile", 0)
-        Bare counter:    "3" → call_index=3, infer name from arguments.
+        Standard format:    "functions.ReadFile:0" → ("ReadFile", 0)
+        Bare counter:       "3" → call_index=3, infer name from arguments.
+        Stripped functions: "functionsread3" → ("read", 3); occurs when a
+            client sanitized "." and ":" from canonical IDs and the format
+            round-tripped through chat history.
 
         The bare counter is a conversation-level auto-increment, NOT an index
         into the tools list. The function name is inferred by matching argument
@@ -109,6 +125,10 @@ class KimiK2Detector(BaseFormatDetector):
             if name:
                 return name, call_index
             return None, call_index
+
+        m = self.tool_call_id_stripped_regex.match(function_id)
+        if m:
+            return m.group("name"), int(m.group("index"))
 
         logger.warning("Unexpected tool_call_id format: %s", function_id)
         return None, 0
