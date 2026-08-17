@@ -74,7 +74,8 @@ else
 
     rm -f "${REPO_ROOT}/python/pyproject.toml" && mv "${REPO_ROOT}/python/pyproject_other.toml" "${REPO_ROOT}/python/pyproject.toml"
 
-    # setuptools-rust builds the sglang-mm extension (sglang.srt.multimodal._core)
+    # setuptools-rust builds the sglang-mm extension
+    # (sglang.srt.rust_extensions._multimodal)
     # declared in pyproject_other.toml, so a Rust toolchain must be present like
     # on the CUDA/AMD CI paths. Idempotent; installs per-user under $HOME/.cargo.
     # Export PATH here because the pip install below runs in this same shell
