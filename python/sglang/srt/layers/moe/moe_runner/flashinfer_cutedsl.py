@@ -24,8 +24,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
-        DeepEPNormalCombineInput,
-        DeepEPNormalDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -367,15 +365,6 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         # FlashInfer's gated W4A16 epilogue currently uses two-stage finalize.
         use_fused_finalize = False
 
-    local_expert_offset = layer.moe_ep_rank * layer.num_local_experts
-    if quant_mode == "w4a16":
-        from sglang.srt.layers.moe import get_moe_a2a_backend
-
-        if get_moe_a2a_backend().is_deepep():
-            # DeepEP normal dispatch rebases received routes to the rank-local
-            # expert namespace and uses -1 for routes owned by another rank.
-            local_expert_offset = 0
-
     with torch.inference_mode(False):
         layer._cutedsl_wrapper = CuteDslMoEWrapper(
             num_experts=layer.num_experts,
@@ -385,7 +374,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             use_cuda_graph=use_cuda_graph,
             max_num_tokens=max_num_tokens,
             num_local_experts=layer.num_local_experts,
-            local_expert_offset=local_expert_offset,
+            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             output_dtype=layer.moe_runner_config.params_dtype,
             device=str(layer.w13_weight.device),
             use_fused_finalize=use_fused_finalize,
@@ -413,8 +402,8 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
 
     Shared by the two CuteDSL runner entries:
 
-    * "v2" route-based path (a2a=none/flashinfer, plus W4A16 DeepEP
-      normal mode): drives CuteDslMoEWrapper.run. Weights are [Up, Gate]
+    * "v2" route-based path (a2a=none/flashinfer): drives
+      CuteDslMoEWrapper.run. Weights are [Up, Gate]
       interleaved with MMA-layout blockscales. wrapper is set;
       w*_scale are scalarized.
 
@@ -466,7 +455,7 @@ def _run_cutedsl_v2_fp4(
     topk_weights: torch.Tensor,
     quant_info: CuteDslFp4MoeQuantInfo,
 ) -> torch.Tensor:
-    """Run the route-based CuTe DSL FP4 wrapper for any BF16/FP4 dispatcher."""
+    """Run the route-based CuTe DSL FP4 wrapper."""
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
@@ -624,53 +613,22 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
 
 @register_fused_func("deepep", "flashinfer_cutedsl")
 def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
-    dispatch_output: DeepEPNormalDispatchOutput | DeepEPLLDispatchOutput,
+    dispatch_output: DeepEPLLDispatchOutput,
     quant_info: CuteDslFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> DeepEPNormalCombineInput | DeepEPLLCombineInput:
-    from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
-    from sglang.srt.layers.moe.token_dispatcher.deepep import (
-        DeepEPLLCombineInput,
-        DeepEPNormalCombineInput,
+) -> DeepEPLLCombineInput:
+    from sglang.srt.layers.moe.flashinfer_cutedsl_moe import (
+        flashinfer_cutedsl_moe_masked,
     )
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
 
     assert runner_config.activation in (
         "silu",
         "relu2",
-    ), (
-        f"CuteDSL MoE supports 'silu' or 'relu2', got {runner_config.activation!r}."
-    )
-    assert not runner_config.apply_router_weight_on_input, (
-        "apply_router_weight_on_input is not supported for Flashinfer"
-    )
-
-    if quant_info.quant_mode == "w4a16":
-        if not DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
-            raise ValueError(
-                "FlashInfer CuTe DSL NVFP4 W4A16 supports DeepEP normal "
-                "dispatch only; low-latency masked dispatch requires W4A4."
-            )
-        output = _run_cutedsl_v2_fp4(
-            hidden_states=dispatch_output.hidden_states,
-            hidden_states_scale=dispatch_output.hidden_states_scale,
-            topk_ids=dispatch_output.topk_ids,
-            topk_weights=dispatch_output.topk_weights,
-            quant_info=quant_info,
-        )
-        return DeepEPNormalCombineInput(
-            hidden_states=output,
-            topk_ids=dispatch_output.topk_ids,
-            topk_weights=dispatch_output.topk_weights,
-        )
-
-    if not DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
-        raise ValueError(
-            "FlashInfer CuTe DSL W4A4 supports DeepEP low-latency dispatch only."
-        )
-
-    from sglang.srt.layers.moe.flashinfer_cutedsl_moe import (
-        flashinfer_cutedsl_moe_masked,
-    )
+    ), f"CuteDSL masked MoE supports 'silu' or 'relu2', got {runner_config.activation!r}."
+    assert (
+        not runner_config.apply_router_weight_on_input
+    ), "apply_router_weight_on_input is not supported for Flashinfer"
 
     hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
 

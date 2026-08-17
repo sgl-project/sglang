@@ -75,15 +75,9 @@ def should_run_flashinfer_autotune(
 
     # Autotune can run before the MoE backend globals are initialized, so read
     # the configured backends -- the draft leaves (`get_spec()`) or the target
-    # leaves (`get_exec().moe`) above. CuteDSL W4A4 + DeepEP uses the v1 masked
-    # path, which bypasses MoeRunner, and its dummy dispatch can exceed DeepEP
-    # low-latency's token limit. W4A16 + DeepEP normal uses the v2 wrapper and
-    # should be tuned like the other route-based CuteDSL paths.
-    if (
-        backend_str == "flashinfer_cutedsl"
-        and a2a_backend_str == "deepep"
-        and not envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
-    ):
+    # leaves (`get_exec().moe`) above. CuteDSL v1 bypasses MoeRunner, and its
+    # dummy dispatch can exceed DeepEP low-latency's token limit.
+    if backend_str == "flashinfer_cutedsl" and a2a_backend_str == "deepep":
         return False
 
     # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
