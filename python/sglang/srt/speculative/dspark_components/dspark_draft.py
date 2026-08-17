@@ -396,6 +396,10 @@ class DraftBlockProposer:
         forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
+        # Graph bucket selection uses the raw per-rank request counts.  Keep
+        # them separate from global_num_tokens_cpu below, which is scaled into
+        # draft-token units for DP/MoE synchronization.
+        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         gnt, gnt_logprob = spec_scale_global_num_tokens(
             self._draft_block_spec_info,
             batch.global_num_tokens,
