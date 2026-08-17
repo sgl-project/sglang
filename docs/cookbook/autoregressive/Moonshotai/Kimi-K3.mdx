@@ -399,3 +399,7 @@ Decisions the preset already makes:
 <Note>
 No preset has a full serving round on final weights; the constants derive from measured single- and dual-node rounds plus a 64-GPU sweep. Validate throughput and accuracy on your workload before committing a fleet.
 </Note>
+
+#### SM120 (RTX PRO 6000 / RTX 6000D / RTX 5090)
+
+The MegaMoE presets above require **SM100/SM103 datacenter Blackwell** — DeepGEMM ships no SM120 MegaMoE kernels, and `--moe-a2a-backend megamoe` is rejected at startup on SM120/SM121 with a clear error. On SM120 GPUs, K3 MXFP4 runs on the Marlin (W4A16) runner by default (`--moe-a2a-backend none`), or opt into the DeepGEMM grouped-GEMM path (same `--moe-runner-backend deep_gemm` flag, without `--moe-a2a-backend megamoe`) once the image ships `sgl-deep-gemm>=0.1.5`, the first release with arch-12 JIT kernels and scale-factor layout transforms.
