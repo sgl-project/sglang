@@ -88,18 +88,23 @@ Qwen3.5-397B, Inkling-Small on GB300/B200/H200).
 - Plans, confirmed on B200 (2026-08-14, 14-arm e2e sweep, three models):
   decode B family, split-K, row domain, overlap windows, route builder and
   route PDL all picked the same winner as on GB300.
-- Tiles, confirmed on B200 (2026-08-17, 4-candidate forcing sweep on the
+- Tiles, confirmed on B200 (2026-08-17, 52-arm 4-candidate forcing sweep: the
   per-expert decode row at r16/32/64, the per-expert prefill row and both
-  shared rows): B200 picks the same winner as GB300 in every cell. Forcing
-  the wrong tile costs up to 4.9% on the rank rule and 5–16% for the built-in
-  heuristics, so the ladder earns its place on both dies.
+  shared rows, on all three models, plus r32 at tp2 and tp8): B200 picks the
+  same winner as GB300 in every cell. Forcing the wrong tile costs up to 4.9%
+  on the rank rule and 5–26% for the built-in heuristics — the more local
+  experts, the more the table is worth — so the ladder earns its place on both
+  dies, at every TP measured.
 - The one place both dies wanted something the table did not have: at rank 32
   the M≤16 tiles keep winning up to 32 tokens, where the ladder used to fall
   to the wildcard row. `{"max_rank": 32, "max_tokens": 32}` encodes exactly
   that measured window — above 32 tokens at that rank nothing was measured,
-  so it still serves the wildcard row.
-- NOT measured on B200: tile values for the ≤4-token bucket and the optional
-  tp{2,4,8} tile-forcing confirmation. Those inherit GB300's numbers.
+  so it still serves the wildcard row. Confirmed on two geometries: +4.4% at
+  bs32 on 35B (committed table vs old, GB300) and +2.0% on Inkling per-expert,
+  each with the cells the rule must not touch reading inside ±0.7%.
+- NOT measured on B200: tile values for the ≤4-token bucket, whose sites are
+  byte-identical to the rank rule's, so forcing them re-runs the incumbent
+  rather than testing it. Those inherit GB300's numbers.
 
 Provenance and the full axis inventory: the campaign's best-config tables
 document, plus `B200_POLICY_ADJUDICATION_20260814.md`.
