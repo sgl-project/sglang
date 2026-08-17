@@ -35,8 +35,9 @@ if(${CUDA_VERSION} VERSION_GREATER 12.4)
     )
 endif()
 if(${CUDA_VERSION} VERSION_GREATER 12.8)
+    # sm_100f is compatible with all sm_10x
     list(APPEND FLASHMLA_CUDA_FLAGS
-        "-gencode=arch=compute_100a,code=sm_100a"
+        "-gencode=arch=compute_100f,code=sm_100f"
     )
     set(FLASHMLA_ENABLE_SM100 ON)
 endif()
@@ -89,10 +90,6 @@ if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
     else()
         message(STATUS "cutlass/arch/config.h already patched for SM103a")
     endif()
-
-    list(APPEND FLASHMLA_CUDA_FLAGS
-        "-gencode=arch=compute_103a,code=sm_103a"
-    )
 endif()
 
 

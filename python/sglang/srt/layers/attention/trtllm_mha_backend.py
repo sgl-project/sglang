@@ -21,6 +21,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
@@ -102,6 +103,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     supports_ragged_verify_graph: bool = True
 
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
+        if fm == ForwardMode.EXTEND:
+            return SharedReadEnds.PRE_REPLAY
+        return super().shared_read_ends(fm)
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -164,7 +171,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Speculative decoding
         # Only support topk <= 1 for now.
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_step_id = speculative_step_id
         self.target_verify_metadata = {}
 
@@ -340,9 +347,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self._swa_kv_pool is not None:
             _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
             if is_swa:
-                return self._swa_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
+                swa_loc = self.forward_metadata.swa_out_cache_loc
+                assert (
+                    swa_loc is not None
+                    and swa_loc.shape[0] >= forward_batch.out_cache_loc.shape[0]
+                ), (
+                    "SWA write locs missing or too short: init_forward_metadata "
+                    "must translate out_cache_loc once; a per-layer gather of "
+                    "the live mapping would race the scheduler after the WAR "
+                    "fence releases"
                 )
+                # Piecewise prefill narrows out_cache_loc per attention call;
+                # the snapshot keeps the padded batch length.
+                return swa_loc[: forward_batch.out_cache_loc.shape[0]]
         return forward_batch.out_cache_loc
 
     def _bind_swa_page_table(

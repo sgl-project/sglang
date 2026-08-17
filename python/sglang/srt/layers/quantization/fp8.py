@@ -60,11 +60,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
-    get_fp8_gemm_runner_backend,
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
+    resolve_mxfp8_dense_gemm_backend,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -84,8 +84,10 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    is_blackwell_supported,
     is_cpu,
     is_cuda,
+    is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
     is_musa,
@@ -139,10 +141,7 @@ def _require_fp4_dtype():
 
 
 if _use_aiter or _use_hip_int4:
-    from aiter.ops.shuffle import (
-        shuffle_scale,
-        shuffle_weight,
-    )
+    from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -235,6 +234,7 @@ class Fp8Config(QuantizationConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
         is_fp4_experts: bool = False,
+        kv_cache_quant_algo: Optional[str] = None,
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
@@ -258,10 +258,11 @@ class Fp8Config(QuantizationConfig):
             )
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
+        self.kv_cache_quant_algo = kv_cache_quant_algo
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
-                    f"The block-wise quantization only supports fp8-serialized checkpoint for now."
+                    "The block-wise quantization only supports fp8-serialized checkpoint for now."
                 )
             if len(weight_block_size) != 2:
                 raise ValueError(
@@ -322,6 +323,9 @@ class Fp8Config(QuantizationConfig):
                 normalized.append(f"model.{base}")
             ignored_layers = normalized
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
+        kv_cache_quant_algo = cls.get_from_keys_or(
+            config, ["kv_cache_quant_algo"], None
+        )
         if use_mxfp8:
             # MXFP8 (OCP) spec fixes block size to [1, 32]; ckpt field is metadata only.
             if weight_block_size is not None and weight_block_size != [1, 32]:
@@ -337,6 +341,7 @@ class Fp8Config(QuantizationConfig):
             weight_block_size=weight_block_size,
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
+            kv_cache_quant_algo=kv_cache_quant_algo,
         )
 
     def get_quant_method(
@@ -464,7 +469,9 @@ class Fp8LinearMethod(LinearMethodBase):
         self.weight_block_size = self.quant_config.weight_block_size
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
+        self.mxfp8_dense_backend = None
         if self.use_mxfp8 and not self.convert_mxfp8_to_block:
+            self.mxfp8_dense_backend = resolve_mxfp8_dense_gemm_backend()
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
@@ -724,7 +731,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if not self.use_mxfp8:
             return
 
-        backend = get_fp8_gemm_runner_backend()
+        backend = self.mxfp8_dense_backend
         if backend.is_flashinfer_trtllm():
             from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 
@@ -766,7 +773,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 .reshape_as(scale_u8)
                 .contiguous(),
             )
-        elif backend.is_flashinfer_cutlass():
+        elif backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
             from flashinfer import block_scale_interleave
 
             scale_u8 = layer.weight_scale_inv.data
@@ -777,13 +784,28 @@ class Fp8LinearMethod(LinearMethodBase):
                 "weight_scale_inv_swizzled",
                 block_scale_interleave(scale_u8.contiguous()).contiguous(),
             )
-        elif get_fp8_gemm_runner_backend().is_deep_gemm():
+        elif backend.is_deep_gemm():
             from sglang.srt.layers.deep_gemm_wrapper.configurer import (
                 DEEPGEMM_SCALE_UE8M0,
             )
 
             n, k = layer.weight.shape
             scale_u8 = layer.weight_scale_inv.data
+            layer.weight_scale_inv_swizzled = None
+            if n % 64 != 0 or k % 128 != 0:
+                if not (is_blackwell_supported() and is_flashinfer_available()):
+                    raise RuntimeError(
+                        f"--fp8-gemm-backend=deep_gemm cannot serve MXFP8 weight shape "
+                        f"({n}, {k}) (needs N % 64 == 0 and K % 128 == 0), and this "
+                        "device has no FlashInfer MXFP8 fallback kernel."
+                    )
+                from flashinfer import block_scale_interleave
+
+                copy_or_rebind_param(
+                    layer,
+                    "weight_scale_inv_swizzled",
+                    block_scale_interleave(scale_u8.contiguous()).contiguous(),
+                )
             scale_fp32 = (
                 (scale_u8.contiguous().view(-1).to(torch.int32) << 23)
                 .view(torch.float32)
@@ -801,9 +823,6 @@ class Fp8LinearMethod(LinearMethodBase):
             else:
                 scale_packed = scale_fp32
             copy_or_rebind_param(layer, "weight_scale_inv_deepgemm", scale_packed)
-        else:
-            # Triton path consumes canonical 2D UE8M0 uint8 scales directly.
-            return
 
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
@@ -953,32 +972,15 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
-            backend = get_fp8_gemm_runner_backend()
-            if backend.is_flashinfer_cutlass():
+            backend = self.mxfp8_dense_backend
+            extra_kwargs = {}
+            if backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
                 weight_scale = layer.weight_scale_inv_swizzled
             elif backend.is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled
-            elif get_fp8_gemm_runner_backend().is_deep_gemm():
-                weight_scale = getattr(
-                    layer, "weight_scale_inv_deepgemm", layer.weight_scale_inv
-                )
-                if isinstance(x, tuple):
-                    return self.w8a8_mxfp8_linear(
-                        input=x[0],
-                        weight=layer.weight,
-                        weight_scale=weight_scale,
-                        input_scale=x[1],
-                        bias=bias,
-                        weight_scale_fallback=layer.weight_scale_inv,
-                    )
-                return self.w8a8_mxfp8_linear(
-                    input=x,
-                    weight=layer.weight,
-                    weight_scale=weight_scale,
-                    input_scale=None,
-                    bias=bias,
-                    weight_scale_fallback=layer.weight_scale_inv,
-                )
+            elif backend.is_deep_gemm():
+                weight_scale = layer.weight_scale_inv_deepgemm
+                extra_kwargs["weight_scale_swizzled"] = layer.weight_scale_inv_swizzled
             else:
                 weight_scale = layer.weight_scale_inv
             if isinstance(x, tuple):
@@ -988,6 +990,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale=weight_scale,
                     input_scale=x[1],
                     bias=bias,
+                    **extra_kwargs,
                 )
             return self.w8a8_mxfp8_linear(
                 input=x,
@@ -995,6 +998,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=weight_scale,
                 input_scale=None,
                 bias=bias,
+                **extra_kwargs,
             )
 
         if self.block_quant:
@@ -1026,6 +1030,24 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale_inv,
                 input_scale=None,
                 bias=bias,
+            )
+
+        if isinstance(x, tuple):
+            # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
+            # x = (fp8_input, per_tensor_input_scale[, orig_dtype]).
+            # apply_fp8_linear detects the fp8 dtype and skips re-quantizing;
+            # orig_dtype (when present) sets the GEMM output dtype.
+            qx, x_scale = x[0], x[1]
+            out_dtype = x[2] if len(x) > 2 else None
+            return apply_fp8_linear(
+                input=qx,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=x_scale,
+                bias=bias,
+                cutlass_fp8_supported=self.cutlass_fp8_supported,
+                use_per_token_if_dynamic=self.use_per_token_if_dynamic,
+                pre_quant_output_dtype=out_dtype,
             )
 
         return apply_fp8_linear(
@@ -1073,20 +1095,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
 
     @staticmethod
-    def is_deepgemm_moe_runner_backend_enabled() -> bool:
+    def is_deepgemm_moe_runner_backend_enabled(
+        moe_runner_backend=None, moe_a2a_backend=None
+    ) -> bool:
         """Check if MoE will actually use DeepGEMM runner for FP8."""
-        from sglang.srt.layers import deep_gemm_wrapper
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend is None:
+            moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_deep_gemm():
             return True
         if moe_runner_backend.is_auto():
-            return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
-                get_moe_a2a_backend().is_deepep()
-                or get_moe_a2a_backend().is_mooncake()
-                or get_moe_a2a_backend().is_nixl()
-            )
+            if moe_a2a_backend is None:
+                moe_a2a_backend = get_moe_a2a_backend()
+            if not (
+                moe_a2a_backend.is_deepep()
+                or moe_a2a_backend.is_mooncake()
+                or moe_a2a_backend.is_nixl()
+            ):
+                return False
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         return False
 
     @staticmethod
@@ -1774,11 +1804,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from triton_kernels.tensor import convert_layout, wrap_torch_tensor
             from triton_kernels.tensor_details import layout
 
-            scale_layout, scale_layout_opts = (
-                layout.make_default_matmul_mxfp4_w_scale_layout(
-                    mx_axis=1, num_warps=num_warps
-                )
+            scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+                mx_axis=-2, num_warps=num_warps
             )
+            scale_layout_opts = {}
             scale = scale.transpose(-2, -1)
             scale = convert_layout(
                 wrap_torch_tensor(scale), scale_layout, **scale_layout_opts
@@ -1824,9 +1853,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return qweight.view_as(weight), scale_u8
 
-        from sglang.srt.layers.quantization.mxfp8_block_convert import (
-            _ue8m0_to_fp32,
-        )
+        from sglang.srt.layers.quantization.mxfp8_block_convert import _ue8m0_to_fp32
 
         def _quantize_for_deepgemm(weight: torch.Tensor):
             weight = weight.contiguous()
@@ -2112,11 +2139,38 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
+        if (
+            get_moe_runner_backend().is_flashinfer_trtllm()
+            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        ):
+            self._prepare_flashinfer_trtllm_activation_params(layer)
+
         if get_moe_runner_backend().is_hpc_ops():
             self._prepare_hpc_ops_weights(layer)
 
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
+
+    def _prepare_flashinfer_trtllm_activation_params(self, layer: Module) -> None:
+        """Materialize optional TRT-LLM SwiGLU parameters once per expert."""
+        num_experts = int(layer.num_local_experts)
+        device = layer.w13_weight.device
+        for name, value in (
+            ("gemm1_alpha", self.moe_runner_config.gemm1_alpha),
+            ("gemm1_beta", self.moe_runner_config.gemm1_beta),
+            ("gemm1_clamp_limit", self.moe_runner_config.gemm1_clamp_limit),
+        ):
+            tensor = (
+                None
+                if value is None
+                else torch.full(
+                    (num_experts,),
+                    float(value),
+                    dtype=torch.float32,
+                    device=device,
+                )
+            )
+            setattr(layer, f"_flashinfer_trtllm_{name}", tensor)
 
     def _prepare_hpc_ops_weights(self, layer: Module) -> None:
         """Precompute the scale layouts consumed by the HPC-Ops fused MoE kernels.
@@ -2352,6 +2406,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 None,  # alpha
                 None,  # limit
                 True,  # is_vnni
+                moe_runner_config.activation,  # activation
             )
             return StandardCombineInput(hidden_states=output)
 
@@ -2526,6 +2581,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale_inv=(
                     layer.w2_weight_scale_inv if self.block_quant else None
                 ),
+                gemm1_alpha=layer._flashinfer_trtllm_gemm1_alpha,
+                gemm1_beta=layer._flashinfer_trtllm_gemm1_beta,
+                gemm1_clamp_limit=layer._flashinfer_trtllm_gemm1_clamp_limit,
                 w13_input_scale=layer.w13_input_scale if not self.block_quant else None,
                 output1_scales_scalar=(
                     getattr(layer, "output1_scales_scalar", None)
