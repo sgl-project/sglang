@@ -665,6 +665,17 @@ class TransformersBase(nn.Module):
         self.config = config
         self.text_config = get_hf_text_config(config)
         self.weight_mapper = self.hf_to_sglang_mapper
+        # Molmo2's checkpoint keys are relative to `Molmo2ForConditionalGeneration`
+        # (e.g. `model.transformer.blocks.N.weight`). SGLang's fallback wraps that
+        # class under `self.model`, so the real tree path is
+        # `model.model.transformer.blocks.N.weight` — every key needs a single
+        # `model.` prefix added, not a `.transformer.` layer stripped. The base
+        # mapper's `"model.transformer.": "model."` rule (longest-prefix-match
+        # wins) instead collapses the path and mismatches the tree, producing
+        # `ValueError: No module or parameter named 'model.blocks' ...`. Replace
+        # the mapper with a uniform-prefix-add rule for Molmo2 only.
+        if getattr(config, "model_type", None) == _MOLMO2_MODEL_TYPE:
+            self.weight_mapper = WeightsMapper(orig_to_new_prefix={"": "model."})
         self.pp_group = get_pp_group()
 
         # Weight loading attrs
