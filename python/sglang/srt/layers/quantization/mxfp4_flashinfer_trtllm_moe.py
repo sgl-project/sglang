@@ -103,6 +103,11 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             if swiglu_limit is not None
             else None
         )
+        layer.register_buffer(
+            "_gemm1_clamp_limit_tensor",
+            self._gemm1_clamp_limit_tensor,
+            persistent=False,
+        )
 
     def create_weights(
         self,
