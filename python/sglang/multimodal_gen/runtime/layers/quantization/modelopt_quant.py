@@ -7,7 +7,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 import torch
-
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
@@ -22,7 +22,6 @@ from sglang.multimodal_gen.runtime.models.parameter import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
-from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
