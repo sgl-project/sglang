@@ -177,12 +177,16 @@ class CompressorBackendMixin:
 
         # The compressed row is a temporary that only the norm/rope store reads,
         # so for the one shape that has a fused kernel it never reaches memory.
+        # The fused compress+norm+rope kernel now has both a decode entry
+        # (plan.is_decode, one row per sequence) and an extend entry (the
+        # CompressorPrefillPlan, one row per compress plan) used by chunked
+        # prefill AND MTP target_verify. Both are numerically identical to the
+        # unfused chain; `plan.is_decode` is therefore no longer required.
         if (
             _is_hip
             and envs.SGLANG_OPT_FUSE_COMPRESS_NORM_ROPE.get()
             and compress_ratio == 4
             and head_dim in (128, 512)
-            and plan.is_decode
             and not is_online
             and not use_fp4_indexer
         ):

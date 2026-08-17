@@ -119,7 +119,10 @@ def _jit_fused_compress4_norm_rope_module(
         make_name(f"fused_compress4_norm_rope_{head_dim}"),
         *args,
         cuda_files=["deepseek_v4/fused_compress4_norm_rope.cuh"],
-        cuda_wrappers=[("decode", f"{kernel_class}::run_decode")],
+        cuda_wrappers=[
+            ("decode", f"{kernel_class}::run_decode"),
+            ("prefill", f"{kernel_class}::run_prefill"),
+        ],
         extra_cuda_cflags=["-use_fast_math"],
     )
 
@@ -509,7 +512,7 @@ def compress_forward_norm_rope_store(
     bit-identical to the two-kernel chain, which rounds that row to bf16 on the
     way out: measured at up to ~1e-4 of fp8 codes differing, by one code.
     """
-    assert plan.is_decode and plan.compress_ratio == 4 and head_dim in (128, 512)
+    assert plan.compress_ratio == 4 and head_dim in (128, 512)
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_fused_compress4_norm_rope_module(
         head_dim,
@@ -520,18 +523,35 @@ def compress_forward_norm_rope_store(
         page_size,
         bf16_store,
     )
-    module.decode(
-        kv_score_buffer,
-        kv_score_input,
-        ape,
-        plan[1],
-        norm_weight,
-        norm_eps,
-        freq_cis,
-        out_loc,
-        kvcache,
-        plan.compress_ratio,
-    )
+    if plan.is_decode:
+        module.decode(
+            kv_score_buffer,
+            kv_score_input,
+            ape,
+            plan[1],  # plan_d
+            norm_weight,
+            norm_eps,
+            freq_cis,
+            out_loc,
+            kvcache,
+            plan.compress_ratio,
+        )
+    else:
+        # Extend / target-verify: the compress kernel iterates plan_c and the
+        # ring-buffer staging iterates plan_w (both carried by CompressorPrefillPlan).
+        module.prefill(
+            kv_score_buffer,
+            kv_score_input,
+            ape,
+            plan[1],  # plan_c
+            plan[2],  # plan_w
+            norm_weight,
+            norm_eps,
+            freq_cis,
+            out_loc,
+            kvcache,
+            plan.compress_ratio,
+        )
 
 
 def compress_norm_rope_store(

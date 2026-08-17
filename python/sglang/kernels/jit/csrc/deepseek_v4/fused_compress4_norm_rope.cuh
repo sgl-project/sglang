@@ -44,6 +44,8 @@
 namespace sglang {
 
 using PlanD = device::compress::DecodePlan;
+using PlanC = device::compress::CompressPlan;
+using PlanW = device::compress::WritePlan;
 using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::inv_scale_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
@@ -79,6 +81,7 @@ SGL_DEVICE float wave_reduce_max(float value) {
 #endif
 
 #define FUSED_C4_KERNEL __global__ __launch_bounds__(kFusedBlockSize, 4)
+#define FUSED_C4_WRITE_KERNEL __global__ __launch_bounds__(128, 16)
 
 struct FusedCompress4NormRopeParams {
   void* __restrict__ kv_buffer;
@@ -92,6 +95,30 @@ struct FusedCompress4NormRopeParams {
   float eps;
   uint32_t compress_ratio;
   uint32_t batch_size;
+};
+
+/// \brief Extend/target-verify counterpart of FusedCompress4NormRopeParams.
+///
+/// Unlike decode, the current step carries multiple query tokens per sequence
+/// (mini-extend), so the compress domain (one entry per `plan_c`) and the
+/// ring-buffer write domain (one entry per `plan_w`) are separate and unequal.
+/// The fused compress+norm+rope kernel iterates over `plan_c`; the ring-buffer
+/// staging for future steps' overlap reads runs as a small companion launch
+/// over `plan_w` (mirrors c4_v2.cuh flash_c4_prefill + write_c4_prefill).
+struct FusedCompress4NormRopePrefillParams {
+  void* __restrict__ kv_buffer;
+  const void* __restrict__ kv_input;
+  const void* __restrict__ score_bias;
+  const void* __restrict__ norm_weight;
+  const float* __restrict__ freqs_cis;
+  const int64_t* __restrict__ out_loc;
+  uint8_t* __restrict__ kvcache;
+  const PlanC* __restrict__ plan_c;
+  const PlanW* __restrict__ plan_w;
+  float eps;
+  uint32_t compress_ratio;
+  uint32_t num_compress;
+  uint32_t num_write;
 };
 
 /// \brief `kTileElements_` is elements per lane, and it is what reconciles the
@@ -170,6 +197,70 @@ SGL_DEVICE void fused_c4_write_decode(BufferFloat* kv_buf, const InputFloat* kv_
         data_cast[i][j] = cast<BufferFloat>(data[i][j]);
       }
       gmem_buffer.store(kv_buf + Trait::kHeadDim * i, data_cast[i]);
+    }
+  }
+}
+
+/// \brief Extend-mode ring-buffer staging: copy each query token's raw
+/// kv/score row (kElementSize = head_dim * 4) into the ring buffer at its
+/// WritePlan slot, so a future step's compress can read it as overlap. This is
+/// a verbatim port of c4_v2.cuh::write_c4_prefill onto the fused prefill params;
+/// it is a separate launch because the write domain (one entry per `plan_w`)
+/// differs from the compress domain (one entry per `plan_c`). Uses the compress
+/// kernel's 4-elem/lane contiguous split (block=128), not the fused epilogue's
+/// 2-elem/256 mapping -- this only moves bytes, it does no math.
+template <int64_t kHeadDim, typename BufferFloat, typename SrcFloat, bool kUsePDL>
+FUSED_C4_WRITE_KERNEL void fused_c4_write_prefill(const __grid_constant__ FusedCompress4NormRopePrefillParams params) {
+  using namespace device;
+  using WTrait = FusedC4Trait<kHeadDim, 4>;
+  using StorageInput = AlignedVector<SrcFloat, 4>;
+
+  const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint32_t global_wid = global_tid / kWarpThreads;      // warp id
+  const uint32_t global_pid = global_wid / WTrait::kNumSplit;  // write-plan id
+  const uint32_t global_sid = global_wid % WTrait::kNumSplit;  // split id
+  // Each warp handles one contiguous tile of the kElementSize row.
+  const int64_t split_offset = global_sid * (WTrait::kTileDim * 4);
+  if (global_pid >= params.num_write) return;
+
+  const auto plan = params.plan_w[global_pid];
+  const auto kv_input = static_cast<const SrcFloat*>(params.kv_input) + split_offset;
+  const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
+  if (plan.is_invalid()) return;
+
+  const auto kv_src = kv_input + plan.ragged_id * WTrait::kElementSize;
+  const auto kv_buf = kv_buffer + plan.write_loc * WTrait::kElementSize;
+  const auto gmem_input = tile::Memory<StorageInput>::warp();
+
+  PDLWaitPrimary<kUsePDL>();
+  StorageInput data[4];
+#pragma unroll
+  for (int32_t i = 0; i < 4; ++i) {
+    data[i] = gmem_input.load(kv_src, i);
+  }
+
+  if constexpr (std::is_same_v<BufferFloat, SrcFloat>) {
+    PDLTriggerSecondary<kUsePDL>();
+#pragma unroll
+    for (int32_t i = 0; i < 4; ++i) {
+      gmem_input.store(kv_buf, data[i], i);
+    }
+  } else {
+    using StorageBuffer = AlignedVector<BufferFloat, 4>;
+    const auto gmem_buffer = tile::Memory<StorageBuffer>::warp();
+
+    StorageBuffer data_cast[4];
+#pragma unroll
+    for (int32_t i = 0; i < 4; ++i) {
+#pragma unroll
+      for (int32_t j = 0; j < 4; ++j) {
+        data_cast[i][j] = cast<BufferFloat>(data[i][j]);
+      }
+    }
+    PDLTriggerSecondary<kUsePDL>();
+#pragma unroll
+    for (int32_t i = 0; i < 4; ++i) {
+      gmem_buffer.store(kv_buf, data_cast[i], i);
     }
   }
 }
@@ -403,6 +494,144 @@ FUSED_C4_KERNEL void flash_c4_decode_norm_rope(const __grid_constant__ FusedComp
   }
 }
 
+/// \brief Extend/target-verify twin of flash_c4_decode_norm_rope. One block per
+/// compress plan (`plan_c`). The current query tokens are read from the ragged
+/// `kv_input` (staged into the ring buffer by fused_c4_write_prefill in a
+/// companion launch), so there is no in-kernel write here; everything else --
+/// the compress reduction, norm, rope and fp8/bf16 store -- is identical to the
+/// decode kernel.
+template <
+    int64_t kHeadDim,
+    typename BufferFloat,
+    typename InputFloat,
+    typename SrcFloat,
+    typename DType,
+    int32_t kPageBits,
+    bool kUsePDL,
+    bool kBf16Store>
+FUSED_C4_KERNEL void flash_c4_prefill_norm_rope(const __grid_constant__ FusedCompress4NormRopePrefillParams params) {
+  using namespace device;
+  using Trait = FusedC4Trait<kHeadDim, 2>;
+
+  constexpr int64_t kRopeDim = 64;
+  constexpr int64_t kVecSize = Trait::kTileElements;
+  constexpr uint32_t kRopeWarp = kFusedNumWarps - 1;
+  constexpr int64_t kPageBytes =
+      kBf16Store ? (kHeadDim * 2ll << kPageBits) : host::div_ceil(584ll << kPageBits, 576) * 576;
+  static_assert(kHeadDim == kFusedBlockSize * kVecSize);
+  static_assert(kRopeDim == kWarpThreads * kVecSize);
+  static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
+  using Float2 = AlignedVector<float, kVecSize>;
+  using Storage = AlignedVector<DType, kVecSize>;
+
+  const auto tx = threadIdx.x;
+  const auto warp_id = tx / kWarpThreads;
+  const auto lane_id = tx % kWarpThreads;
+  const auto pid = blockIdx.x;
+  if (pid >= params.num_compress) return;
+
+  // Block-uniform early-out: one block owns one compress plan, so this cannot
+  // split a warp/block before the __syncthreads() in the norm below.
+  const auto plan = params.plan_c[pid];
+  if (plan.is_invalid()) return;
+
+  // One warp per head_dim split, one block per compress plan.
+  const int64_t split_offset = static_cast<int64_t>(warp_id) * Trait::kTileDim;
+
+  const auto kv_input = static_cast<const SrcFloat*>(params.kv_input) + split_offset;
+  const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
+  const auto score_bias = static_cast<const InputFloat*>(params.score_bias) + split_offset;
+
+  const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
+  const auto kv_buf_0 = kv_buffer + plan.read_page_0 * Trait::kPageElementSize;
+  const auto kv_buf_1 = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
+
+  PDLWaitPrimary<kUsePDL>();
+  // Current tokens come from the ragged input; overlap from the ring buffer.
+  // `plan.buffer_len` says how many of the 8 window rows are already buffered.
+  const auto need_overlap = plan.seq_len > 4;
+  Float2 data = fused_c4_forward<Trait, BufferFloat, InputFloat, SrcFloat>(
+      kv_buf_0, kv_buf_1, kv_src, score_bias, need_overlap, plan.buffer_len);
+
+  const auto position = static_cast<int32_t>(plan.seq_len - params.compress_ratio);
+  const auto out_loc = params.out_loc[plan.ragged_id];
+  const auto freqs_cis = params.freqs_cis + position * kRopeDim;
+
+  Float2 freq;
+  if (warp_id == kRopeWarp) freq.load(freqs_cis, lane_id);
+
+  // part 1: RMSNorm. Sum of squares reduced across the block, which holds the
+  // whole head_dim row.
+  {
+    __shared__ float partial_sums[kFusedNumWarps];
+
+    Storage weight_vec;
+    weight_vec.load(params.norm_weight, tx);
+
+    float sum_of_squares = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      sum_of_squares += data[i] * data[i];
+    }
+
+    const auto warp_sum = warp::reduce_sum(sum_of_squares);
+    if (lane_id == 0) partial_sums[warp_id] = warp_sum;
+    __syncthreads();
+    sum_of_squares = warp::reduce_sum<kFusedNumWarps>(partial_sums[lane_id % kFusedNumWarps]);
+    const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
+
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      const auto fp32_weight = cast<float>(weight_vec[i]);
+      data[i] = data[i] * norm_factor * fp32_weight;
+    }
+  }
+
+  const int64_t page = out_loc >> kPageBits;
+  const int64_t offset = out_loc & ((1 << kPageBits) - 1);
+  const auto page_ptr = params.kvcache + page * kPageBytes;
+  const auto value_ptr = page_ptr + offset * (kBf16Store ? (kHeadDim * 2) : 576);
+
+  PDLTriggerSecondary<kUsePDL>();
+
+  // part 2: rope on the last warp, then either a plain bf16 store or a
+  // per-warp fp8 group quant on the non-rope warps.
+  if constexpr (kBf16Store) {
+    Float2 d = data;
+    if (warp_id == kRopeWarp) {
+      const auto x_real = data[0];
+      const auto x_imag = data[1];
+      const auto freq_real = freq[0];
+      const auto freq_imag = freq[1];
+      d[0] = x_real * freq_real - x_imag * freq_imag;
+      d[1] = x_real * freq_imag + x_imag * freq_real;
+    }
+    reinterpret_cast<bf16x2_t*>(value_ptr)[tx] = cast<bf16x2_t>(fp32x2_t{d[0], d[1]});
+  } else if (warp_id == kRopeWarp) {
+    const auto x_real = data[0];
+    const auto x_imag = data[1];
+    const auto freq_real = freq[0];
+    const auto freq_imag = freq[1];
+    data[0] = x_real * freq_real - x_imag * freq_imag;
+    data[1] = x_real * freq_imag + x_imag * freq_real;
+    const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
+    const auto rope_ptr = value_ptr + 448;
+    reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result;
+  } else {
+    // BF16 round-trip to match the precision of the non-fused path.
+    const auto x = cast<float>(cast<bf16_t>(data[0]));
+    const auto y = cast<float>(cast<bf16_t>(data[1]));
+    const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
+    const auto scale_raw = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
+    const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
+    const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
+    const auto result = pack_fp8(x * inv_scale, y * inv_scale);
+    const auto scale_ptr = page_ptr + (576 << kPageBits) + offset * 8;
+    reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = result;
+    if (lane_id == 0) static_cast<uint8_t*>(scale_ptr)[warp_id] = scale_ue8m0;
+  }
+}
+
 template <
     int64_t kHeadDim,
     typename BufferFloat,
@@ -418,7 +647,14 @@ struct FusedCompress4NormRopeKernel {
       kBf16Store ? (kHeadDim * 2 * kPageSize) : host::div_ceil(584 * kPageSize, 576) * 576;
   static constexpr auto kernel =
       flash_c4_decode_norm_rope<kHeadDim, BufferFloat, InputFloat, SrcFloat, DType, kLogPageSize, kUsePDL, kBf16Store>;
+  static constexpr auto prefill_kernel =
+      flash_c4_prefill_norm_rope<kHeadDim, BufferFloat, InputFloat, SrcFloat, DType, kLogPageSize, kUsePDL, kBf16Store>;
+  static constexpr auto write_kernel = fused_c4_write_prefill<kHeadDim, BufferFloat, SrcFloat, kUsePDL>;
   using Trait = FusedC4Trait<kHeadDim, 2>;
+  // The ring-buffer write reuses the compressor's 4-elem/lane contiguous split
+  // (block=128), so its grid is sized from a 128-wide tile, not the epilogue's.
+  static constexpr uint32_t kWriteNumSplit = kHeadDim / (4 * device::kWarpThreads);
+  static constexpr uint32_t kWriteWarpsPerBlock = 128 / device::kWarpThreads;
 
   static_assert(kHeadDim == 512, "fused c4 epilogue is defined for flashmla head_dim=512");
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
@@ -492,6 +728,94 @@ struct FusedCompress4NormRopeKernel {
     LaunchKernel(batch_size, kFusedBlockSize, device_.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
   }
+
+  static void run_prefill(
+      const tvm::ffi::TensorView kv_buffer,
+      const tvm::ffi::TensorView kv_input,
+      const tvm::ffi::TensorView ape,
+      const tvm::ffi::TensorView plan_c_,
+      const tvm::ffi::TensorView plan_w_,
+      const tvm::ffi::TensorView norm_weight,
+      const double eps,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView kvcache,
+      const int64_t compress_ratio) {
+    using namespace host;
+
+    auto N = SymbolicSize{"num_q_tokens"};
+    auto C = SymbolicSize{"num_c_plans"};
+    auto W = SymbolicSize{"num_w_plans"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+
+    TensorMatcher({-1, 4, Trait::kElementSize})  // kv score ring buffer
+        .with_dtype<BufferFloat>()
+        .with_device(device_)
+        .verify(kv_buffer);
+    TensorMatcher({N, Trait::kElementSize})  // kv score input (ragged)
+        .with_dtype<SrcFloat>()
+        .with_device(device_)
+        .verify(kv_input);
+    TensorMatcher({8, kHeadDim})  // ape
+        .with_dtype<InputFloat>()
+        .with_device(device_)
+        .verify(ape);
+    TensorMatcher({kHeadDim})  // norm weight
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(norm_weight);
+    TensorMatcher({-1, 64})  // freqs_cis
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(freqs_cis);
+    TensorMatcher({-1})  // out_loc (indexed by plan.ragged_id)
+        .with_dtype<int64_t>()
+        .with_device(device_)
+        .verify(out_loc);
+    TensorMatcher({-1, -1})  // cache
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(kvcache);
+
+    const auto plan_c = compress::verify_plan_c(plan_c_, C, device_);
+    const auto plan_w = compress::verify_plan_w(plan_w_, W, device_);
+    const auto num_q_tokens = static_cast<uint32_t>(N.unwrap());
+    const auto num_c = static_cast<uint32_t>(C.unwrap());
+    const auto num_w = static_cast<uint32_t>(W.unwrap());
+    RuntimeCheck(out_loc.size(0) >= N.unwrap());
+    RuntimeCheck(num_q_tokens >= num_w, "invalid prefill plan: num_q < num_w");
+
+    const auto params = FusedCompress4NormRopePrefillParams{
+        .kv_buffer = kv_buffer.data_ptr(),
+        .kv_input = kv_input.data_ptr(),
+        .score_bias = ape.data_ptr(),
+        .norm_weight = norm_weight.data_ptr(),
+        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+        .out_loc = static_cast<const int64_t*>(out_loc.data_ptr()),
+        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
+        .plan_c = plan_c,
+        .plan_w = plan_w,
+        .eps = static_cast<float>(eps),
+        .compress_ratio = static_cast<uint32_t>(compress_ratio),
+        .num_compress = num_c,
+        .num_write = num_w,
+    };
+    const auto device = device_.unwrap();
+    // Compress + norm + rope + store, one block per compress plan. The current
+    // tokens are read from the ragged input, so this does not depend on the
+    // ring-buffer write below (mirrors c4_v2.cuh run_prefill's launch order).
+    if (num_c) {
+      LaunchKernel(num_c, kFusedBlockSize, device)  //
+          .enable_pdl(kUsePDL)(prefill_kernel, params);
+    }
+    // Stage this step's tokens into the ring buffer for future overlap reads.
+    if (const auto num_w_blocks = div_ceil(num_w * kWriteNumSplit, kWriteWarpsPerBlock)) {
+      LaunchKernel(num_w_blocks, 128, device)  //
+          .enable_pdl(kUsePDL)(write_kernel, params);
+    }
+  }
 };
 
 /// \brief compress -> RMSNorm -> RoPE -> hadamard -> fp8 quant -> paged store,
@@ -551,6 +875,171 @@ FUSED_C4_KERNEL void flash_c4_decode_norm_rope_indexer(const __grid_constant__ F
 
   const auto position = static_cast<int32_t>(plan.seq_len - params.compress_ratio);
   const auto out_loc = params.out_loc[token_id];
+  const auto freqs_cis = params.freqs_cis + position * kRopeDim;
+
+  Float4 freq;
+
+  // part 1: norm
+  {
+    Storage weight_vec;
+    weight_vec.load(params.norm_weight, lane_id);
+    if (is_rope_lane) freq.load(freqs_cis, lane_id - (kWarpThreads - kRopeSize));
+
+    float sum_of_squares = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      sum_of_squares += data[i] * data[i];
+    }
+
+    sum_of_squares = warp::reduce_sum(sum_of_squares);
+    const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
+
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      const auto fp32_weight = cast<float>(weight_vec[i]);
+      data[i] = data[i] * norm_factor * fp32_weight;
+    }
+  }
+
+  // part 2: rope (rope-lane only, 4 elems per lane = 2 (real, imag) pairs)
+  if (is_rope_lane) {
+    const auto x_real = data[0];
+    const auto x_imag = data[1];
+    const auto y_real = data[2];
+    const auto y_imag = data[3];
+    const auto freq_x_real = freq[0];
+    const auto freq_x_imag = freq[1];
+    const auto freq_y_real = freq[2];
+    const auto freq_y_imag = freq[3];
+    data[0] = x_real * freq_x_real - x_imag * freq_x_imag;
+    data[1] = x_real * freq_x_imag + x_imag * freq_x_real;
+    data[2] = y_real * freq_y_real - y_imag * freq_y_imag;
+    data[3] = y_real * freq_y_imag + y_imag * freq_y_real;
+  }
+
+  // part 3: hadamard transform
+  {
+    {
+      const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
+      data[0] = a0 + a1;
+      data[1] = a0 - a1;
+      data[2] = a2 + a3;
+      data[3] = a2 - a3;
+    }
+    {
+      const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
+      data[0] = a0 + a2;
+      data[1] = a1 + a3;
+      data[2] = a0 - a2;
+      data[3] = a1 - a3;
+    }
+#pragma unroll
+    for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
+#pragma unroll
+      for (int i = 0; i < kVecSize; ++i) {
+#ifndef USE_ROCM
+        const float other = __shfl_xor_sync(kFullMask, data[i], mask, kWarpThreads);
+#else
+        const float other = __shfl_xor(data[i], mask, kWarpThreads);
+#endif
+        data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
+      }
+    }
+    const float kHadamardScale = math::rsqrt(static_cast<float>(kHeadDim));
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i)
+      data[i] *= kHadamardScale;
+  }
+
+  // part 4: per-warp UE8M0 quant + store (128 elements -> one fp8 group).
+  {
+    using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;
+    float local_max = math::abs(data[0]);
+#pragma unroll
+    for (int i = 1; i < kVecSize; ++i) {
+      local_max = math::max(local_max, math::abs(data[i]));
+    }
+    const auto abs_max = warp::reduce_max(local_max);
+    const auto scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
+    const auto inv_scale = 1.0f / scale;
+    const int64_t page = out_loc >> kPageBits;
+    const int64_t offset = out_loc & ((1 << kPageBits) - 1);
+    const auto page_ptr = params.kvcache + page * kPageBytes;
+    const auto value_ptr = page_ptr + offset * 128;
+    const auto scale_ptr = page_ptr + (128 << kPageBits) + offset * 4;
+    OutStorage result;
+    result[0] = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
+    result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
+    PDLTriggerSecondary<kUsePDL>();
+    if constexpr (kPreshuffleSize != 0) {
+      constexpr int32_t kTile = kPreshuffleSize;
+      const int32_t dim_base = lane_id * kVecSize;
+      const int32_t token_tile_id = offset / kTile;
+      const int32_t token_in_tile = offset % kTile;
+      const int32_t col_tile_id = dim_base / kTile;
+      const int32_t col_in_tile = dim_base % kTile;
+      const int32_t value_offset = token_tile_id * (kTile * static_cast<int32_t>(kHeadDim)) +
+                                   col_tile_id * (kTile * kTile) + token_in_tile * kTile + col_in_tile;
+      result.store(page_ptr + value_offset, 0);
+    } else {
+      result.store(value_ptr, lane_id);
+    }
+    if (lane_id == 0) reinterpret_cast<float*>(scale_ptr)[0] = scale;
+  }
+}
+
+/// \brief Extend/target-verify twin of flash_c4_decode_norm_rope_indexer.
+/// One token per 32-lane warp, iterating over compress plans (`plan_c`) with no
+/// in-kernel write (staged separately by fused_c4_write_prefill). The is_invalid
+/// early-out is warp-uniform (work_id is warp-uniform), so the cross-lane
+/// hadamard butterflies below still see a full warp.
+template <
+    typename BufferFloat,
+    typename InputFloat,
+    typename SrcFloat,
+    typename DType,
+    int32_t kPageBits,
+    bool kUsePDL,
+    int32_t kPreshuffleSize>
+FUSED_C4_KERNEL void flash_c4_prefill_norm_rope_indexer(const __grid_constant__ FusedCompress4NormRopePrefillParams params) {
+  using namespace device;
+
+  constexpr int64_t kHeadDim = 128;
+  using Trait = FusedC4Trait<kHeadDim, 4>;
+  constexpr int64_t kRopeDim = 64;
+  constexpr int64_t kVecSize = Trait::kTileElements;
+  constexpr uint32_t kRopeSize = kRopeDim / kVecSize;
+  constexpr int64_t kPageBytes = 132ll << kPageBits;
+  static_assert(kHeadDim == kWarpThreads * kVecSize);
+  static_assert(kRopeDim == kWarpThreads * 2);
+  static_assert(Trait::kNumSplit == 1, "indexer fusion runs one warp per token");
+  using Float4 = AlignedVector<float, kVecSize>;
+  using Storage = AlignedVector<DType, kVecSize>;
+
+  const auto warp_id = threadIdx.x / kWarpThreads;
+  const auto lane_id = threadIdx.x % kWarpThreads;
+  const auto pid = blockIdx.x * kFusedNumWarps + warp_id;
+  const bool is_rope_lane = lane_id >= kWarpThreads - kRopeSize;
+
+  if (pid >= params.num_compress) return;
+
+  const auto plan = params.plan_c[pid];
+  if (plan.is_invalid()) return;
+
+  const auto kv_input = static_cast<const SrcFloat*>(params.kv_input);
+  const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer);
+  const auto score_bias = static_cast<const InputFloat*>(params.score_bias);
+
+  const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
+  const auto kv_buf_0 = kv_buffer + plan.read_page_0 * Trait::kPageElementSize;
+  const auto kv_buf_1 = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
+
+  PDLWaitPrimary<kUsePDL>();
+  Float4 data = fused_c4_forward<Trait, BufferFloat, InputFloat, SrcFloat>(
+      kv_buf_0, kv_buf_1, kv_src, score_bias, plan.seq_len > 4, plan.buffer_len);
+
+  const auto position = static_cast<int32_t>(plan.seq_len - params.compress_ratio);
+  const auto out_loc = params.out_loc[plan.ragged_id];
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
   Float4 freq;
@@ -841,6 +1330,157 @@ flash_c4_decode_norm_rope_indexer_w64(const __grid_constant__ FusedCompress4Norm
     if (wave_lane == 0) reinterpret_cast<float*>(scale_ptr)[0] = scale;
   }
 }
+
+/// \brief Extend/target-verify twin of flash_c4_decode_norm_rope_indexer_w64.
+/// One token per wavefront, iterating over compress plans (`plan_c`) with no
+/// in-kernel write. The is_invalid early-out is wave-uniform (all 64 lanes of a
+/// token share token_id), so the wavefront butterflies stay intact.
+template <
+    typename BufferFloat,
+    typename InputFloat,
+    typename SrcFloat,
+    typename DType,
+    int32_t kPageBits,
+    bool kUsePDL,
+    int32_t kPreshuffleSize>
+FUSED_C4_KERNEL void
+flash_c4_prefill_norm_rope_indexer_w64(const __grid_constant__ FusedCompress4NormRopePrefillParams params) {
+  using namespace device;
+
+  constexpr int64_t kHeadDim = 128;
+  using Trait = FusedC4Trait<kHeadDim, 2>;
+  constexpr int64_t kRopeDim = 64;
+  constexpr int64_t kVecSize = Trait::kTileElements;
+  constexpr uint32_t kWarpsPerToken = Trait::kNumSplit;
+  constexpr uint32_t kThreadsPerToken = kWarpsPerToken * kWarpThreads;
+  constexpr uint32_t kTokensPerBlock = kFusedBlockSize / kThreadsPerToken;
+  constexpr int64_t kPageBytes = 132ll << kPageBits;
+  static_assert(kThreadsPerToken == kWaveThreads, "one token must own one wavefront");
+  static_assert(kHeadDim == kThreadsPerToken * kVecSize);
+  static_assert(kRopeDim == kWarpThreads * kVecSize, "rope tail is the token's last warp");
+  using Float2 = AlignedVector<float, kVecSize>;
+  using Storage = AlignedVector<DType, kVecSize>;
+
+  const auto tx = threadIdx.x;
+  const auto warp_id = tx / kWarpThreads;
+  const auto lane_id = tx % kWarpThreads;
+  const auto local_token = warp_id / kWarpsPerToken;
+  const auto split_id = warp_id % kWarpsPerToken;
+  const auto wave_lane = split_id * kWarpThreads + lane_id;
+  const auto pid = blockIdx.x * kTokensPerBlock + local_token;
+
+  if (pid >= params.num_compress) return;
+
+  const auto plan = params.plan_c[pid];
+  if (plan.is_invalid()) return;
+
+  const int64_t split_offset = static_cast<int64_t>(split_id) * Trait::kTileDim;
+
+  const auto kv_input = static_cast<const SrcFloat*>(params.kv_input) + split_offset;
+  const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
+  const auto score_bias = static_cast<const InputFloat*>(params.score_bias) + split_offset;
+
+  const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
+  const auto kv_buf_0 = kv_buffer + plan.read_page_0 * Trait::kPageElementSize;
+  const auto kv_buf_1 = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
+
+  PDLWaitPrimary<kUsePDL>();
+  Float2 data = fused_c4_forward<Trait, BufferFloat, InputFloat, SrcFloat>(
+      kv_buf_0, kv_buf_1, kv_src, score_bias, plan.seq_len > 4, plan.buffer_len);
+
+  const auto position = static_cast<int32_t>(plan.seq_len - params.compress_ratio);
+  const auto out_loc = params.out_loc[plan.ragged_id];
+  const auto freqs_cis = params.freqs_cis + position * kRopeDim;
+  const bool is_rope_warp = split_id == kWarpsPerToken - 1;
+
+  Float2 freq;
+
+  // part 1: norm
+  {
+    Storage weight_vec;
+    weight_vec.load(params.norm_weight, wave_lane);
+    if (is_rope_warp) freq.load(freqs_cis, lane_id);
+
+    float sum_of_squares = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      sum_of_squares += data[i] * data[i];
+    }
+
+    sum_of_squares = wave_reduce_sum(sum_of_squares);
+    const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
+
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      const auto fp32_weight = cast<float>(weight_vec[i]);
+      data[i] = data[i] * norm_factor * fp32_weight;
+    }
+  }
+
+  // part 2: rope on the token's last warp, 1 (real, imag) pair per lane
+  if (is_rope_warp) {
+    const auto x_real = data[0];
+    const auto x_imag = data[1];
+    const auto freq_real = freq[0];
+    const auto freq_imag = freq[1];
+    data[0] = x_real * freq_real - x_imag * freq_imag;
+    data[1] = x_real * freq_imag + x_imag * freq_real;
+  }
+
+  // part 3: hadamard (128-point, indexed by wave_lane * kVecSize + i)
+  {
+    {
+      const float a0 = data[0], a1 = data[1];
+      data[0] = a0 + a1;
+      data[1] = a0 - a1;
+    }
+#pragma unroll
+    for (uint32_t mask = 1; mask < kWaveThreads; mask <<= 1) {
+#pragma unroll
+      for (int i = 0; i < kVecSize; ++i) {
+        const float other = __shfl_xor(data[i], mask, kWaveThreads);
+        data[i] = (wave_lane & mask) ? (other - data[i]) : (data[i] + other);
+      }
+    }
+    const float kHadamardScale = math::rsqrt(static_cast<float>(kHeadDim));
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i)
+      data[i] *= kHadamardScale;
+  }
+
+  // part 4: one fp8 group per 128-element row (scale reduces over the wavefront).
+  {
+    float local_max = math::abs(data[0]);
+#pragma unroll
+    for (int i = 1; i < kVecSize; ++i) {
+      local_max = math::max(local_max, math::abs(data[i]));
+    }
+    const auto abs_max = wave_reduce_max(local_max);
+    const auto scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
+    const auto inv_scale = 1.0f / scale;
+    const int64_t page = out_loc >> kPageBits;
+    const int64_t offset = out_loc & ((1 << kPageBits) - 1);
+    const auto page_ptr = params.kvcache + page * kPageBytes;
+    const auto value_ptr = page_ptr + offset * 128;
+    const auto scale_ptr = page_ptr + (128 << kPageBits) + offset * 4;
+    const auto result = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
+    PDLTriggerSecondary<kUsePDL>();
+    if constexpr (kPreshuffleSize != 0) {
+      constexpr int32_t kTile = kPreshuffleSize;
+      const int32_t dim_base = wave_lane * kVecSize;
+      const int32_t token_tile_id = offset / kTile;
+      const int32_t token_in_tile = offset % kTile;
+      const int32_t col_tile_id = dim_base / kTile;
+      const int32_t col_in_tile = dim_base % kTile;
+      const int32_t value_offset = token_tile_id * (kTile * static_cast<int32_t>(kHeadDim)) +
+                                   col_tile_id * (kTile * kTile) + token_in_tile * kTile + col_in_tile;
+      *reinterpret_cast<fp8x2_e4m3_t*>(page_ptr + value_offset) = result;
+    } else {
+      reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[wave_lane] = result;
+    }
+    if (wave_lane == 0) reinterpret_cast<float*>(scale_ptr)[0] = scale;
+  }
+}
 #endif  // USE_ROCM
 
 template <
@@ -864,6 +1504,14 @@ struct FusedCompress4NormRopeIndexerKernel {
       kLogPageSize,
       kUsePDL,
       kPreshuffleSize>;
+  static constexpr auto prefill_kernel = flash_c4_prefill_norm_rope_indexer_w64<
+      BufferFloat,
+      InputFloat,
+      SrcFloat,
+      DType,
+      kLogPageSize,
+      kUsePDL,
+      kPreshuffleSize>;
   static constexpr uint32_t kTokensPerBlock = kFusedBlockSize / kWaveThreads;
   using Trait = FusedC4Trait<kHeadDim, 2>;
 #else
@@ -875,9 +1523,21 @@ struct FusedCompress4NormRopeIndexerKernel {
       kLogPageSize,
       kUsePDL,
       kPreshuffleSize>;
+  static constexpr auto prefill_kernel = flash_c4_prefill_norm_rope_indexer<
+      BufferFloat,
+      InputFloat,
+      SrcFloat,
+      DType,
+      kLogPageSize,
+      kUsePDL,
+      kPreshuffleSize>;
   static constexpr uint32_t kTokensPerBlock = kFusedNumWarps;
   using Trait = FusedC4Trait<kHeadDim, 4>;
 #endif
+  static constexpr auto write_kernel = fused_c4_write_prefill<kHeadDim, BufferFloat, SrcFloat, kUsePDL>;
+  // head_dim 128 => one 128-wide tile, so the write is one warp per plan.
+  static constexpr uint32_t kWriteNumSplit = kHeadDim / (4 * device::kWarpThreads);
+  static constexpr uint32_t kWriteWarpsPerBlock = 128 / device::kWarpThreads;
 
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
 
@@ -954,6 +1614,90 @@ struct FusedCompress4NormRopeIndexerKernel {
     const uint32_t num_blocks = div_ceil(batch_size, kTokensPerBlock);
     LaunchKernel(num_blocks, kFusedBlockSize, device_.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
+  }
+
+  static void run_prefill(
+      const tvm::ffi::TensorView kv_buffer,
+      const tvm::ffi::TensorView kv_input,
+      const tvm::ffi::TensorView ape,
+      const tvm::ffi::TensorView plan_c_,
+      const tvm::ffi::TensorView plan_w_,
+      const tvm::ffi::TensorView norm_weight,
+      const double eps,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView kvcache,
+      const int64_t compress_ratio) {
+    using namespace host;
+
+    auto N = SymbolicSize{"num_q_tokens"};
+    auto C = SymbolicSize{"num_c_plans"};
+    auto W = SymbolicSize{"num_w_plans"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+
+    TensorMatcher({-1, 4, Trait::kElementSize})  // kv score ring buffer
+        .with_dtype<BufferFloat>()
+        .with_device(device_)
+        .verify(kv_buffer);
+    TensorMatcher({N, Trait::kElementSize})  // kv score input (ragged)
+        .with_dtype<SrcFloat>()
+        .with_device(device_)
+        .verify(kv_input);
+    TensorMatcher({8, kHeadDim})  // ape
+        .with_dtype<InputFloat>()
+        .with_device(device_)
+        .verify(ape);
+    TensorMatcher({kHeadDim})  // norm weight
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(norm_weight);
+    TensorMatcher({-1, 64})  // freqs_cis
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(freqs_cis);
+    TensorMatcher({-1})  // out_loc (indexed by plan.ragged_id)
+        .with_dtype<int64_t>()
+        .with_device(device_)
+        .verify(out_loc);
+    TensorMatcher({-1, -1})  // cache
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(kvcache);
+
+    const auto plan_c = compress::verify_plan_c(plan_c_, C, device_);
+    const auto plan_w = compress::verify_plan_w(plan_w_, W, device_);
+    const auto num_q_tokens = static_cast<uint32_t>(N.unwrap());
+    const auto num_c = static_cast<uint32_t>(C.unwrap());
+    const auto num_w = static_cast<uint32_t>(W.unwrap());
+    RuntimeCheck(out_loc.size(0) >= N.unwrap());
+    RuntimeCheck(num_q_tokens >= num_w, "invalid prefill plan: num_q < num_w");
+
+    const auto params = FusedCompress4NormRopePrefillParams{
+        .kv_buffer = kv_buffer.data_ptr(),
+        .kv_input = kv_input.data_ptr(),
+        .score_bias = ape.data_ptr(),
+        .norm_weight = norm_weight.data_ptr(),
+        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+        .out_loc = static_cast<const int64_t*>(out_loc.data_ptr()),
+        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
+        .plan_c = plan_c,
+        .plan_w = plan_w,
+        .eps = static_cast<float>(eps),
+        .compress_ratio = static_cast<uint32_t>(compress_ratio),
+        .num_compress = num_c,
+        .num_write = num_w,
+    };
+    const auto device = device_.unwrap();
+    if (const auto num_c_blocks = div_ceil(num_c, kTokensPerBlock)) {
+      LaunchKernel(num_c_blocks, kFusedBlockSize, device)  //
+          .enable_pdl(kUsePDL)(prefill_kernel, params);
+    }
+    if (const auto num_w_blocks = div_ceil(num_w * kWriteNumSplit, kWriteWarpsPerBlock)) {
+      LaunchKernel(num_w_blocks, 128, device)  //
+          .enable_pdl(kUsePDL)(write_kernel, params);
+    }
   }
 };
 
