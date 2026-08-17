@@ -81,7 +81,6 @@ class StartupWeightLoadOptions:
     offload_group_size: int
     enable_memory_saver: bool
     enable_weights_cpu_backup: bool
-    torchao_config: str
     enable_lora: bool
     has_lora_paths: bool
     weight_loader_disable_mmap: bool
@@ -119,7 +118,6 @@ class StartupWeightLoadOptions:
             offload_group_size=server_args.offload_group_size,
             enable_memory_saver=server_args.enable_memory_saver,
             enable_weights_cpu_backup=server_args.enable_weights_cpu_backup,
-            torchao_config=server_args.torchao_config,
             enable_lora=server_args.enable_lora,
             has_lora_paths=bool(server_args.lora_paths),
             weight_loader_disable_mmap=server_args.weight_loader_disable_mmap,
@@ -374,7 +372,6 @@ class StartupWeightLoadManager:
                 options.enable_weights_cpu_backup,
                 "CPU weight backup is not supported",
             ),
-            (bool(options.torchao_config), "TorchAO is not supported"),
             (
                 options.enable_lora or options.has_lora_paths,
                 "LoRA is not supported",

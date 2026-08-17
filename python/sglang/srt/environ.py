@@ -534,6 +534,7 @@ class Envs:
     # "legacy" (rectangular grid, max_extend_len-shaped).
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
+    SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
@@ -761,6 +762,13 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
+    # permuted in place at load so gate/up land in adjacent columns of the same
+    # output tile, which removes intermediate_cache1 and the standalone
+    # activation launch per MoE layer. Opt-in because the in-place permute is
+    # not compatible with runtime weight updates or EPLB expert rearrangement,
+    # both of which assume the checkpoint's halves layout.
+    SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED = EnvBool(False)
     # Fuse the `residual_add + RMSNorm + zero-pad` triplet that appears
     # before the MoE block for models whose MoE input hidden_size must be
     # padded up to a stride (e.g. GPT-OSS MXFP4 needs pad to multiple of
@@ -931,7 +939,6 @@ class Envs:
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
     SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
-    SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
     # Chunk size for the rebalance expert-weight P2P exchange; set
     # >= num_physical_experts to submit a single batch_isend_irecv.
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvIntWithAlias(
@@ -1515,6 +1522,9 @@ class Envs:
     # Rust server
     # ===================================================================
     SGLANG_RUST_SERVER = EnvBool(False)
+    # Build a missing Rust extension from source (auto), require a bundled or
+    # cached extension (never), or rebuild the local cache entry (force).
+    SGLANG_RUST_BUILD_MODE = EnvStr("auto")
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
 

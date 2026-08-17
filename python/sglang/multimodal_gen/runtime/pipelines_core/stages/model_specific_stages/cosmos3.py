@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -684,8 +687,9 @@ class Cosmos3LatentPreparationStage(PipelineStage):
                 )
                 cond_indexes = [0]
 
-            with torch.no_grad():
-                cond_latent = self._vae_encode(pixel_input).to(dtype)
+            with self.use_declared_component(component_name="vae", module=self.vae):
+                with torch.no_grad():
+                    cond_latent = self._vae_encode(pixel_input).to(dtype)
 
             max_idx = max(cond_indexes)
             if max_idx >= num_latent_frames:
@@ -780,6 +784,11 @@ class Cosmos3LatentPreparationStage(PipelineStage):
                 )
             self._prepare_action_latents(batch, generator, device, dtype)
         return batch
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        return [ComponentUse(self._component_stage_name(stage_name), "vae")]
 
     @staticmethod
     def _resolve_domain_id(batch: Req) -> int:
@@ -1084,6 +1093,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 len(gen_layers),
                 compile_kwargs,
             )
+            transformer._gen_layers_torch_compiled = True
             for i, layer in enumerate(gen_layers):
                 gen_layers[i] = torch.compile(layer, **compile_kwargs)
         else:
@@ -1157,21 +1167,6 @@ class Cosmos3DenoisingStage(PipelineStage):
                     self, "_share_vision_temporal_positions", True
                 ),
             )
-
-    def _manage_device_placement(self, server_args: ServerArgs):
-        """Move transformer to GPU if CPU offload is enabled."""
-        if not server_args.dit_cpu_offload:
-            return
-
-        # FSDP manages offloading internally
-        if server_args.use_fsdp_inference:
-            return
-
-        device = get_local_torch_device()
-        # Load the model to GPU if it's on CPU
-        if next(self.transformer.parameters()).device.type == "cpu":
-            self.log_info("Moving transformer to GPU for inference")
-            self.transformer.to(device)
 
     @staticmethod
     def _cfg_active_at(t: torch.Tensor, interval: tuple[float, float] | None) -> bool:
@@ -1329,11 +1324,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         if self.vae is None:
             raise RuntimeError("Cosmos3 Transfer denoising requires the pipeline VAE")
 
-        self._manage_device_placement(server_args)
         device = batch.latents.device
-        if next(self.vae.parameters()).device != device:
-            self.vae.to(device)
-
         generator = batch.generator
         if generator is None and batch.seed is not None:
             generator = torch.Generator(device=device).manual_seed(batch.seed)
@@ -1342,20 +1333,32 @@ class Cosmos3DenoisingStage(PipelineStage):
         output_chunks = []
         previous_output = None
         for chunk_id in range(int(plan["num_chunks"])):
-            current_conditional_frames = self._prepare_transfer_chunk(
-                batch, chunk_id, previous_output, generator
-            )
+            with self.use_declared_component(
+                component_name="vae",
+                module=self.vae,
+                phase="transfer_encode",
+            ):
+                current_conditional_frames = self._prepare_transfer_chunk(
+                    batch, chunk_id, previous_output, generator
+                )
             self.scheduler.set_timesteps(
                 batch.num_inference_steps, device=batch.latents.device
             )
             batch.timesteps = self.scheduler.timesteps
-            self._denoise_once(
-                batch,
-                server_args,
-                generator=generator,
-                manage_device=False,
-            )
-            previous_output = self._decode_transfer_latents(batch.latents).clamp(-1, 1)
+            with self.use_declared_component(
+                component_name="transformer",
+                module=self.transformer,
+                phase="denoise",
+            ):
+                self._denoise_once(batch, server_args, generator=generator)
+            with self.use_declared_component(
+                component_name="vae",
+                module=self.vae,
+                phase="transfer_decode",
+            ):
+                previous_output = self._decode_transfer_latents(batch.latents).clamp(
+                    -1, 1
+                )
             if chunk_id == 0:
                 output_chunks.append(previous_output)
             else:
@@ -1364,8 +1367,6 @@ class Cosmos3DenoisingStage(PipelineStage):
         batch.extra["transfer_decoded_output"] = torch.cat(output_chunks, dim=2)[
             :, :, : int(plan["total_frames"])
         ]
-        if server_args.vae_cpu_offload and not getattr(batch, "is_warmup", False):
-            self.vae.to("cpu", non_blocking=True)
         return batch
 
     def _denoise_once(
@@ -1373,12 +1374,8 @@ class Cosmos3DenoisingStage(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
         generator: torch.Generator | None = None,
-        manage_device: bool = True,
     ) -> Req:
         """Run one denoising loop with CFG and optional conditioning."""
-        if manage_device:
-            self._manage_device_placement(server_args)
-
         self._share_vision_temporal_positions = bool(
             getattr(
                 batch.sampling_params,
@@ -1711,7 +1708,12 @@ class Cosmos3DenoisingStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         if batch.extra.get("transfer_plan") is not None:
             return self._forward_transfer(batch, server_args)
-        return self._denoise_once(batch, server_args)
+        with self.use_declared_component(
+            component_name="transformer",
+            module=self.transformer,
+            phase="denoise",
+        ):
+            return self._denoise_once(batch, server_args)
 
     def _predict_noise_cfg(
         self,
@@ -2002,6 +2004,42 @@ class Cosmos3DenoisingStage(PipelineStage):
         }
         return [cond_full, cond_nc, uncond]
 
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        uses = [
+            ComponentUse(
+                stage_name,
+                "transformer",
+                phase="denoise",
+                preferred_ready_after_request=True,
+                memory_intensive=True,
+                start_at_stage_entry=False,
+            )
+        ]
+        if self.vae is not None:
+            uses = [
+                ComponentUse(
+                    stage_name,
+                    "vae",
+                    phase="transfer_encode",
+                    allow_prefetch=False,
+                    keep_ready_after_warmup=True,
+                    start_at_stage_entry=False,
+                ),
+                *uses,
+                ComponentUse(
+                    stage_name,
+                    "vae",
+                    phase="transfer_decode",
+                    allow_prefetch=False,
+                    keep_ready_after_warmup=True,
+                    start_at_stage_entry=False,
+                ),
+            ]
+        return uses
+
 
 class Cosmos3DecodingStage(PipelineStage):
     """
@@ -2171,14 +2209,11 @@ class Cosmos3DecodingStage(PipelineStage):
         device = batch.latents.device
         decoded = batch.extra.get("transfer_decoded_output")
         if decoded is None:
-            if server_args.vae_cpu_offload:
-                self.vae.to(device)
-            with torch.no_grad():
-                decoded = self._decode_latents(batch.latents)
-            if server_args.vae_cpu_offload and not getattr(batch, "is_warmup", False):
-                self.vae.to("cpu", non_blocking=True)
+            with self.use_declared_component(component_name="vae", module=self.vae):
+                with torch.no_grad():
+                    decoded = self._decode_latents(batch.latents)
 
-        self.log_info(f"Decoded tensor shape: {decoded.shape}")
+        self.log_debug("Decoded tensor shape: %s", decoded.shape)
         output = self._postprocess_tensor(decoded)
         output = self._compose_transfer_display(output, batch)
 
@@ -2194,23 +2229,25 @@ class Cosmos3DecodingStage(PipelineStage):
             else:
                 output = check_video_safety(output)
         elif not is_image_gen:
-            self.log_info(f"Postprocessed video tensor shape: {output.shape}")
+            self.log_debug("Postprocessed video tensor shape: %s", output.shape)
 
         audio = None
         audio_sample_rate = None
         if self.sound_tokenizer is not None and batch.audio_latents is not None:
-            if server_args.vae_cpu_offload:
-                self.sound_tokenizer.to(device)
-            with torch.no_grad():
-                decoded_audio = self.sound_tokenizer.decode(
-                    batch.audio_latents.to(device)
-                )
+            with self.use_declared_component(
+                component_name="sound_tokenizer", module=self.sound_tokenizer
+            ) as sound_tokenizer:
+                assert sound_tokenizer is not None
+                with torch.no_grad():
+                    decoded_audio = sound_tokenizer.decode(
+                        batch.audio_latents.to(device)
+                    )
             audio = decoded_audio.float().cpu()
-            audio_sample_rate = self.sound_tokenizer.sample_rate
-            if server_args.vae_cpu_offload and not getattr(batch, "is_warmup", False):
-                self.sound_tokenizer.to("cpu", non_blocking=True)
-            self.log_info(
-                f"Decoded audio tensor shape: {tuple(audio.shape)} @ {audio_sample_rate} Hz"
+            audio_sample_rate = sound_tokenizer.sample_rate
+            self.log_debug(
+                "Decoded audio tensor shape: %s @ %s Hz",
+                tuple(audio.shape),
+                audio_sample_rate,
             )
 
         return OutputBatch(
@@ -2221,3 +2258,12 @@ class Cosmos3DecodingStage(PipelineStage):
             metrics=batch.metrics if hasattr(batch, "metrics") else None,
             **action_metadata,
         )
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        uses = [ComponentUse(stage_name, "vae", keep_ready_after_warmup=True)]
+        if self.sound_tokenizer is not None:
+            uses.append(ComponentUse(stage_name, "sound_tokenizer"))
+        return uses

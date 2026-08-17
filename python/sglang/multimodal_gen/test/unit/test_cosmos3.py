@@ -1041,8 +1041,8 @@ class TestCosmos3Transfer(unittest.TestCase):
 
         stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
         stage.vae = torch.nn.Linear(1, 1, bias=False)
+        stage.transformer = torch.nn.Linear(1, 1, bias=False)
         stage.scheduler = Scheduler()
-        stage._manage_device_placement = mock.Mock()
         stage._prepare_transfer_chunk = mock.Mock(side_effect=[0, 1])
         stage._denoise_once = mock.Mock(side_effect=lambda batch, *_a, **_k: batch)
         stage._decode_transfer_latents = mock.Mock(
@@ -1066,6 +1066,7 @@ class TestCosmos3Transfer(unittest.TestCase):
             },
         )
         server_args = types.SimpleNamespace(vae_cpu_offload=False)
+        stage.server_args = server_args
 
         stage._forward_transfer(batch, server_args)
 
