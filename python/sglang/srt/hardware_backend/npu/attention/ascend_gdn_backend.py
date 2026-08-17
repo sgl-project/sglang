@@ -10,10 +10,6 @@ from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend
     AscendMambaAttnBackendBase,
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNKernelDispatcher
-from sglang.srt.layers.attention.linear.utils import (
-    get_linear_attn_decode_backend,
-    get_linear_attn_prefill_backend,
-)
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -36,8 +32,9 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape[-2],
             )
         )
-        decode_backend = get_linear_attn_decode_backend()
-        prefill_backend = get_linear_attn_prefill_backend()
+        backends = model_runner.linear_attn_backends
+        decode_backend = backends.decode
+        prefill_backend = backends.prefill
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
 
     def _prepare_mamba_track_metadata(self, forward_batch: ForwardBatch):
