@@ -37,7 +37,7 @@ class AttentionBackendEnum(enum.Enum):
     SPARSE_VIDEO_GEN_2_ATTN = enum.auto()
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
-    AITER_SAGE = enum.auto()
+    AITER_QUANT = enum.auto()
     SLA_ATTN = enum.auto()
     SAGE_SLA_ATTN = enum.auto()
     LASER_ATTN = enum.auto()
