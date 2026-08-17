@@ -373,10 +373,7 @@ def _apply_rope_qk(
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if (
-        not (current_platform.is_cuda() or current_platform.is_rocm())
-        or not q.is_cuda
-    ):
+    if not (current_platform.is_cuda() or current_platform.is_rocm()) or not q.is_cuda:
         half = cos_sin_cache.shape[-1] // 2
         cos_half, sin_half = cos_sin_cache.split(half, dim=-1)
         cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1)

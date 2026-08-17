@@ -92,9 +92,7 @@ class FeedForward(nn.Module):
                 if current_platform.is_npu():
                     hidden_states = silu_and_mul(hidden_states)
                 else:
-                    hidden_states = silu_and_mul_with_activation_rounding(
-                        hidden_states
-                    )
+                    hidden_states = silu_and_mul_with_activation_rounding(hidden_states)
             else:
                 gate, hidden_states = hidden_states.chunk(2, dim=-1)
                 hidden_states = self.act_fn(gate).mul_(hidden_states)
