@@ -47,10 +47,11 @@ from sglang.srt.multimodal.internvl_vit_cuda_graph_runner import (
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_xpu
 from sglang.utils import logger
 
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 
 
 class InternAttention(nn.Module):
@@ -372,15 +373,17 @@ class InternVisionEncoder(nn.Module):
         encoder_states = () if output_hidden_states else None
         hidden_states = inputs_embeds
 
+        vision_max_seqlen = None
         if cu_seqlens is None:
             bsz, seq_len, _ = inputs_embeds.shape
             cu_seqlens = _get_cu_seqlens_for_shape(
                 bsz, seq_len, device=inputs_embeds.device
             )
+            vision_max_seqlen = seq_len
         forward_metadata = None
         if isinstance(cu_seqlens, torch.Tensor):
             forward_metadata = prepare_vision_attention_metadata(
-                cu_seqlens, device=inputs_embeds.device
+                cu_seqlens, device=inputs_embeds.device, max_seqlen=vision_max_seqlen
             )
         elif cu_seqlens is None:
             cu_seqlens = SingletonCache()
@@ -642,7 +645,19 @@ class InternVLChatModel(nn.Module):
         # Normal pixel_values are 4D [N, C, H, W]; precomputed embeddings are 2D or 3D.
         if pixel_values.dim() != 4:
             return pixel_values
-        image_features = self.extract_feature(pixel_values)
+        # XPU: too many tiles in one ViT forward crashes Level Zero at tp>1;
+        # chunk (tiles are independent, so concat is bit-exact).
+        max_tiles = envs.SGLANG_VIT_MAX_TILES.get()
+        if _is_xpu and max_tiles > 0 and pixel_values.shape[0] > max_tiles:
+            image_features = torch.cat(
+                [
+                    self.extract_feature(pixel_values[i : i + max_tiles])
+                    for i in range(0, pixel_values.shape[0], max_tiles)
+                ],
+                dim=0,
+            )
+        else:
+            image_features = self.extract_feature(pixel_values)
         return image_features
 
     def get_video_feature(self, items: List[MultimodalDataItem]):
@@ -716,7 +731,7 @@ class InternVLChatModel(nn.Module):
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
-                num_experts=self.config.num_experts,
+                num_experts=self.config.llm_config.num_experts,
             )
         elif "Qwen3ForCausalLM" in self.config.llm_config.architectures:
             stacked_params_mapping = [

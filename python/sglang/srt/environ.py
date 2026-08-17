@@ -1135,6 +1135,9 @@ class Envs:
     # Multimodal processing
     # ===================================================================
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
+    # XPU: cap tiles per InternVL ViT forward; batching many at tp>1 crashes
+    # Level Zero. 0 = off.
+    SGLANG_VIT_MAX_TILES = EnvInt(12)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
