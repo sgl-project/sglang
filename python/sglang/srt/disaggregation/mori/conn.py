@@ -743,8 +743,18 @@ class MoriKVManager(CommonKVManager):
                 "Destination KV descriptors do not match prefill pp configuration"
             )
         dst_k_descs = dst_mem_descs[start_layer:end_layer]
+        if (
+            num_local_layers < dst_total_layers
+            and dst_total_layers % num_local_layers != 0
+        ):
+            # Decode has draft-model KV while Prefill has target-model KV only:
+            # [K_main..., V_main..., draft_K..., draft_V...].
+            multiplier_ratio = dst_total_layers // num_local_layers
+            dst_v_offset = num_local_layers * multiplier_ratio
+        else:
+            dst_v_offset = dst_total_layers
         dst_v_descs = dst_mem_descs[
-            dst_total_layers + start_layer : dst_total_layers + end_layer
+            dst_v_offset + start_layer : dst_v_offset + end_layer
         ]
         return src_k_descs, src_v_descs, dst_k_descs, dst_v_descs, num_local_layers
 
