@@ -113,6 +113,7 @@ class RequestFuncOutput:
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
     spec_cap_lens_histogram: List[int] = field(default_factory=list)
+    speculative_decoding_stats: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -254,6 +255,34 @@ def _extract_cache_from_sglext(data, output):
         output.cached_tokens_details = details
 
 
+def _extract_speculative_decoding_stats_from_sglext(
+    data: Dict[str, Any], output: RequestFuncOutput, *, choice_index: int = 0
+) -> None:
+    """Capture SGLang's final per-choice speculative decoding extension."""
+
+    records = (data.get("sglext") or {}).get("speculative_decoding_stats")
+    if not isinstance(records, list):
+        return
+    for record in records:
+        if isinstance(record, dict) and record.get("index") == choice_index:
+            # The benchmark output is already aligned by request index, so keep
+            # the native and OpenAI response schemas identical here.
+            output.speculative_decoding_stats = {
+                key: value for key, value in record.items() if key != "index"
+            }
+            return
+
+
+def _extract_speculative_decoding_stats_from_meta(
+    data: Dict[str, Any], output: RequestFuncOutput
+) -> None:
+    """Capture the equivalent field from SGLang's native ``/generate`` API."""
+
+    stats = (data.get("meta_info") or {}).get("speculative_decoding_stats")
+    if isinstance(stats, dict):
+        output.speculative_decoding_stats = stats
+
+
 # set ignore_eos True by default
 async def async_request_openai_completions(
     request_func_input: RequestFuncInput,
@@ -326,6 +355,10 @@ async def async_request_openai_completions(
                             pass
                         else:
                             data = json.loads(chunk)
+
+                            _extract_speculative_decoding_stats_from_sglext(
+                                data, output
+                            )
 
                             if getattr(args, "cache_report", False):
                                 _extract_cache_from_sglext(data, output)
@@ -496,6 +529,9 @@ async def async_request_openai_chat_completions(
                         output.spec_cap_lens_histogram = (
                             _meta_info.get("spec_cap_lens_histogram", []) or []
                         )
+                        _extract_speculative_decoding_stats_from_sglext(
+                            response_json, output
+                        )
                         if getattr(args, "cache_report", False):
                             _extract_cache_from_sglext(response_json, output)
                     else:
@@ -511,6 +547,9 @@ async def async_request_openai_chat_completions(
                                 pass
                             else:
                                 data = json.loads(chunk)
+                                _extract_speculative_decoding_stats_from_sglext(
+                                    data, output
+                                )
                                 # Check for usage info in final chunks. OpenAI-compatible
                                 # servers may emit usage-only chunks with choices=[].
                                 output_len = (data.get("usage") or {}).get(
@@ -723,6 +762,8 @@ async def async_request_sglang_generate(
                             pass
                         else:
                             data = orjson.loads(sse_data)
+
+                            _extract_speculative_decoding_stats_from_meta(data, output)
 
                             _meta_info = data.get("meta_info") or {}
                             if _meta_info.get("spec_accept_length") is not None:
@@ -993,6 +1034,36 @@ def flush_server_cache(
     else:
         response = requests.post(base_url + "/flush_cache", headers=get_auth_headers())
     response.raise_for_status()
+
+
+def collect_speculative_decoding_stats(
+    outputs: List[RequestFuncOutput],
+) -> Optional[Dict[str, Any]]:
+    """Build an index-aligned record without sampling successful requests.
+
+    The container is omitted when the service returned no statistics at all.
+    Once present, every measured request has an entry, including failures or
+    responses missing the extension, so coverage is explicit.
+    """
+
+    num_with_stats = sum(
+        output.speculative_decoding_stats is not None for output in outputs
+    )
+    if num_with_stats == 0:
+        return None
+    return {
+        "schema_version": 1,
+        "num_requests": len(outputs),
+        "num_requests_with_stats": num_with_stats,
+        "requests": [
+            {
+                "request_index": index,
+                "success": output.success,
+                "stats": output.speculative_decoding_stats,
+            }
+            for index, output in enumerate(outputs)
+        ],
+    }
 
 
 @dataclass
@@ -1778,6 +1849,7 @@ async def benchmark(
 
     resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
     server_info = resp.json() if resp.status_code == 200 else None
+    speculative_decoding_stats = collect_speculative_decoding_stats(outputs)
 
     if (
         metrics.median_ttft_ms is not None
@@ -1838,6 +1910,9 @@ async def benchmark(
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
+
+        if speculative_decoding_stats is not None:
+            result["speculative_decoding_stats"] = speculative_decoding_stats
 
         if args.cache_report:
             result["cache_report"] = {

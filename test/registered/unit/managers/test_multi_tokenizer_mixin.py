@@ -43,6 +43,9 @@ def _make_batch_str_output() -> BatchStrOutput:
         rids=["rid-0", "rid-1"],
         spec_verify_ct=[0, 0],
         spec_num_correct_drafts=[0, 0],
+        spec_num_proposed_drafts=[0, 5],
+        spec_verify_lens=[None, [6]],
+        spec_accept_lens=[None, [4]],
         spec_correct_drafts_histogram=[[], []],
         finished_reasons=[None, {"type": "length"}],
         output_strs=["first", "second"],
@@ -91,6 +94,9 @@ class TestMultiTokenizerMixin(unittest.TestCase):
             single_output.cached_tokens_details,
             [{"device": 1, "host": 3}],
         )
+        self.assertEqual(single_output.spec_num_proposed_drafts, [5])
+        self.assertEqual(single_output.spec_verify_lens, [[6]])
+        self.assertEqual(single_output.spec_accept_lens, [[4]])
 
     def test_get_tokenizer_worker_class_uses_default(self):
         self.assertIs(get_tokenizer_worker_class(DefaultServerArgs()), TokenizerWorker)

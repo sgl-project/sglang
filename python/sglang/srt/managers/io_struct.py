@@ -1485,6 +1485,11 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     spec_verify_ct: Optional[List[int]] = None
     # Accepted drafts
     spec_num_correct_drafts: Optional[List[int]] = None
+    # Verified drafts, exact for adaptive/ragged verification widths.
+    spec_num_proposed_drafts: Optional[List[int]] = None
+    # Raw per-step lengths (inclusive of root/bonus), final output only.
+    spec_verify_lens: Optional[List[Optional[List[int]]]] = None
+    spec_accept_lens: Optional[List[Optional[List[int]]]] = None
     spec_num_block_accept_tokens: Optional[List[int]] = None
     spec_num_cap_tokens: Optional[List[int]] = None
     # Acceptance histogram
@@ -1576,6 +1581,11 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     spec_verify_ct: Optional[List[int]] = None
     # Accepted drafts
     spec_num_correct_drafts: Optional[List[int]] = None
+    # Verified drafts, exact for adaptive/ragged verification widths.
+    spec_num_proposed_drafts: Optional[List[int]] = None
+    # Raw per-step lengths (inclusive of root/bonus), final output only.
+    spec_verify_lens: Optional[List[Optional[List[int]]]] = None
+    spec_accept_lens: Optional[List[Optional[List[int]]]] = None
     spec_num_block_accept_tokens: Optional[List[int]] = None
     spec_num_cap_tokens: Optional[List[int]] = None
     # Acceptance histogram

@@ -19,6 +19,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
 - [Ngram Speculative Decoding](#ngram-speculative-decoding)
+- [Per-request decoding statistics](#per-request-decoding-statistics)
 - [Full Parameter Reference](#full-parameter-reference)
 - [OOM Troubleshooting](#oom-troubleshooting)
 - [References](#references)
@@ -33,6 +34,73 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - **You have a DFlash draft checkpoint**: Use **DFLASH** with `--speculative-algorithm DFLASH` and `--speculative-draft-model-path ...`.
 - **You have a smaller draft LLM**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
 - **No extra model available**: Use **NGRAM** (`--speculative-algorithm NGRAM`, CUDA-only).
+
+### Per-request decoding statistics
+
+Use `--speculative-decoding-stats` to return request-local verification
+statistics from any built-in speculative decoding algorithm. The default is
+`none`.
+
+| Mode | Response | Scheduler memory |
+| --- | --- | --- |
+| `none` | No response extension | No per-step arrays |
+| `summary` | Counts, acceptance rate, mean acceptance length, and histogram | Constant per request |
+| `detailed` | Summary plus ordered `verify_lengths` and `accept_lengths` arrays | One integer pair per verification step |
+
+For example, add the following flag to an existing speculative decoding server
+command:
+
+```bash Command
+--speculative-decoding-stats detailed
+```
+
+OpenAI-compatible Chat Completions and Completions responses expose the result
+under `sglext.speculative_decoding_stats`. A non-streaming response contains
+all choices in one list. A streaming response includes one choice record only
+in that choice's final chunk, where `finish_reason` is non-null.
+
+```json Response
+{
+  "choices": [{"index": 0, "finish_reason": "stop"}],
+  "sglext": {
+    "speculative_decoding_stats": [{
+      "index": 0,
+      "schema_version": 1,
+      "mode": "detailed",
+      "num_verification_steps": 2,
+      "num_verified_draft_tokens": 9,
+      "num_accepted_draft_tokens": 5,
+      "draft_acceptance_rate": 0.5555555556,
+      "mean_accept_length": 3.5,
+      "accepted_draft_tokens_histogram": [0, 1, 0, 1],
+      "verify_lengths": [6, 5],
+      "accept_lengths": [4, 3]
+    }]
+  }
+}
+```
+
+The native `/generate` API returns the same statistics object in the final
+`meta_info.speculative_decoding_stats` field. It does not add `index`, because
+native output metadata already belongs to one generated item.
+
+The length fields use the verifier's raw token accounting:
+
+- `verify_lengths[i]` is the number of tokens presented to verification step
+  `i`, including the root token. It records the actual width for adaptive or
+  ragged verification.
+- `accept_lengths[i]` is the verifier's accepted length, including the target
+  or bonus token. It is captured before stop or grammar handling can shorten
+  the client-visible output.
+- `num_verified_draft_tokens` equals `sum(verify_length - 1)` and
+  `num_accepted_draft_tokens` equals `sum(accept_length - 1)`.
+
+<Note>
+`detailed` mode increases response size and holds two arrays until each request
+finishes. Use `summary` when you only need aggregate acceptance metrics. The
+embedded Rust HTTP server does not currently expose this extension and rejects
+non-`none` modes instead of silently dropping the fields.
+</Note>
 
 ### Method comparison (mini table)
 

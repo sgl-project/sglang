@@ -153,6 +153,9 @@ class SchedulerOutputStreamer:
             return_indexer_topk=return_indexer_topk,
             return_sampling_mask=return_sampling_mask,
             spec_algorithm=self.spec_algorithm,
+            spec_stats_mode=getattr(
+                self.server_args, "speculative_decoding_stats", "none"
+            ),
             disaggregation_mode=self.disaggregation_mode,
             default_stream_interval=get_serving().stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
@@ -270,6 +273,7 @@ class _GenerationStreamAccumulator:
     return_indexer_topk: bool
     return_sampling_mask: bool = False
     spec_algorithm: Any
+    spec_stats_mode: str
     disaggregation_mode: DisaggregationMode
     default_stream_interval: int
     default_force_stream_interval: int
@@ -296,6 +300,9 @@ class _GenerationStreamAccumulator:
     video_tokens: list = field(default_factory=list)
     spec_verify_ct: list = field(default_factory=list)
     spec_num_correct_drafts: list = field(default_factory=list)
+    spec_num_proposed_drafts: list = field(default_factory=list)
+    spec_verify_lens: list = field(default_factory=list)
+    spec_accept_lens: list = field(default_factory=list)
     spec_num_block_accept_tokens: list = field(default_factory=list)
     spec_num_cap_tokens: list = field(default_factory=list)
     spec_correct_drafts_histogram: list = field(default_factory=list)
@@ -451,6 +458,17 @@ class _GenerationStreamAccumulator:
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
             self.spec_num_correct_drafts.append(req.spec_num_correct_drafts)
+            if self.spec_stats_mode != "none":
+                self.spec_num_proposed_drafts.append(req.spec_num_proposed_drafts)
+                if self.spec_stats_mode == "detailed":
+                    # Detailed arrays can grow to the output length. Transfer
+                    # them only once, on the final output.
+                    self.spec_verify_lens.append(
+                        req.spec_verify_lens if req.finished() else None
+                    )
+                    self.spec_accept_lens.append(
+                        req.spec_accept_lens if req.finished() else None
+                    )
             self.spec_num_block_accept_tokens.append(req.spec_num_block_accept_tokens)
             self.spec_num_cap_tokens.append(req.spec_num_cap_tokens)
             self.spec_correct_drafts_histogram.append(req.spec_correct_drafts_histogram)
@@ -617,6 +635,17 @@ class _GenerationStreamAccumulator:
             http_worker_ipcs=self.http_worker_ipcs,
             spec_verify_ct=self.spec_verify_ct,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
+            spec_num_proposed_drafts=(
+                self.spec_num_proposed_drafts
+                if self.spec_stats_mode != "none"
+                else None
+            ),
+            spec_verify_lens=(
+                self.spec_verify_lens if self.spec_stats_mode == "detailed" else None
+            ),
+            spec_accept_lens=(
+                self.spec_accept_lens if self.spec_stats_mode == "detailed" else None
+            ),
             spec_num_block_accept_tokens=self.spec_num_block_accept_tokens,
             spec_num_cap_tokens=self.spec_num_cap_tokens,
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,

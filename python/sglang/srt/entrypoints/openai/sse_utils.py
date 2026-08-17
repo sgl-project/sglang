@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import msgspec
 
@@ -44,6 +44,7 @@ class StreamChunk(msgspec.Struct, omit_defaults=True):
     model: str
     choices: List[StreamChoice]
     usage: Optional[dict] = None
+    sglext: Optional[Dict[str, Any]] = None
 
 
 _stream_encoder = msgspec.json.Encoder()
@@ -61,6 +62,7 @@ def build_sse_content(
     logprobs: Optional[dict] = None,
     matched_stop: Union[None, int, str] = None,
     usage: Optional[dict] = None,
+    sglext: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Build an SSE chunk string for content/reasoning updates.
 
@@ -76,6 +78,7 @@ def build_sse_content(
         logprobs: Log probabilities if requested
         matched_stop: Stop token/string that was matched
         usage: Token usage statistics
+        sglext: Optional SGLang response extensions
 
     Returns:
         SSE-formatted string "data: {...}\\n\\n"
@@ -95,5 +98,6 @@ def build_sse_content(
         model=model,
         choices=[choice],
         usage=usage,
+        sglext=sglext,
     )
     return (_SSE_DATA_B + _stream_encoder.encode(chunk) + _SSE_NL_B).decode()

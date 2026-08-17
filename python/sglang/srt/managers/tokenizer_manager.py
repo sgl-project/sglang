@@ -2784,8 +2784,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and len(recv_obj.spec_num_correct_drafts) > i
         ):
             # Total number of proposed draft tokens per request.
-            num_proposed_drafts = recv_obj.spec_verify_ct[i] * (
-                self.server_args.speculative_num_draft_tokens - 1
+            exact_proposed_drafts = getattr(recv_obj, "spec_num_proposed_drafts", None)
+            num_proposed_drafts = (
+                exact_proposed_drafts[i]
+                if exact_proposed_drafts is not None and len(exact_proposed_drafts) > i
+                else recv_obj.spec_verify_ct[i]
+                * (self.server_args.speculative_num_draft_tokens - 1)
             )
             num_correct_drafts = recv_obj.spec_num_correct_drafts[i]
 
@@ -2846,6 +2850,45 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["spec_cap_lens_histogram"] = recv_obj.spec_cap_lens_histogram[
                     i
                 ]
+
+            stats_mode = getattr(self.server_args, "speculative_decoding_stats", "none")
+            if stats_mode != "none":
+                verify_ct = recv_obj.spec_verify_ct[i]
+                stats = {
+                    "schema_version": 1,
+                    "mode": stats_mode,
+                    "num_verification_steps": verify_ct,
+                    "num_verified_draft_tokens": num_proposed_drafts,
+                    "num_accepted_draft_tokens": num_correct_drafts,
+                    "draft_acceptance_rate": (
+                        num_correct_drafts / num_proposed_drafts
+                        if num_proposed_drafts > 0
+                        else 0.0
+                    ),
+                    # Raw verifier acceptance includes one guaranteed target /
+                    # bonus token per verification step.
+                    "mean_accept_length": 1.0 + num_correct_drafts / verify_ct,
+                    "accepted_draft_tokens_histogram": (
+                        recv_obj.spec_correct_drafts_histogram[i]
+                        if recv_obj.spec_correct_drafts_histogram
+                        and len(recv_obj.spec_correct_drafts_histogram) > i
+                        else []
+                    ),
+                }
+                if stats_mode == "detailed":
+                    verify_lens = getattr(recv_obj, "spec_verify_lens", None)
+                    accept_lens = getattr(recv_obj, "spec_accept_lens", None)
+                    stats["verify_lengths"] = (
+                        verify_lens[i]
+                        if verify_lens is not None and len(verify_lens) > i
+                        else []
+                    )
+                    stats["accept_lengths"] = (
+                        accept_lens[i]
+                        if accept_lens is not None and len(accept_lens) > i
+                        else []
+                    )
+                meta_info["speculative_decoding_stats"] = stats
 
     def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
         return (

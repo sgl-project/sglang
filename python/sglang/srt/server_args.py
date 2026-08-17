@@ -2060,6 +2060,19 @@ class ServerArgs:
         "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
         NS("spec"),
     ] = None
+    speculative_decoding_stats: A[
+        Literal["none", "summary", "detailed"],
+        Arg(
+            help=(
+                "Return per-request speculative decoding statistics in SGLang "
+                "response extensions. 'summary' returns aggregate counters; "
+                "'detailed' additionally returns the raw verify/accept length "
+                "for every verification step."
+            ),
+            choices=["none", "summary", "detailed"],
+        ),
+        NS("spec"),
+    ] = "none"
     speculative_draft_model_path: A[
         Optional[str],
         Arg(

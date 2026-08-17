@@ -26,6 +26,7 @@ from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
     should_include_usage,
+    speculative_decoding_stats_from_meta,
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -372,12 +373,22 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     token_ids=chunk_token_ids,
                     prompt_token_ids=chunk_prompt_token_ids,
                 )
+                spec_stats = (
+                    speculative_decoding_stats_from_meta(content["meta_info"], index)
+                    if finish_reason_type is not None
+                    else None
+                )
                 chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=created,
                     object="text_completion",
                     choices=[choice_data],
                     model=request.model,
+                    sglext=(
+                        SglExt(speculative_decoding_stats=[spec_stats])
+                        if spec_stats is not None
+                        else None
+                    ),
                 )
 
                 # Add usage stats if continuous_usage_stats is enabled
@@ -517,11 +528,22 @@ class OpenAIServingCompletion(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        spec_stats = [
+            stats
+            for idx, ret_item in enumerate(ret)
+            if (
+                stats := speculative_decoding_stats_from_meta(
+                    ret_item["meta_info"], idx
+                )
+            )
+            is not None
+        ]
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or spec_stats:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                speculative_decoding_stats=spec_stats or None,
             )
 
         for idx, ret_item in enumerate(ret):

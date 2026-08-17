@@ -222,6 +222,103 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(response.choices[0].token_ids, [3, 4])
         self.assertEqual(response.choices[0].prompt_token_ids, [1, 2])
 
+    def test_non_streaming_response_returns_speculative_decoding_sglext(self):
+        req = CompletionRequest(model="x", prompt="Hello", max_tokens=10)
+        mock_ret = [
+            {
+                "text": " world",
+                "output_ids": [3, 4],
+                "meta_info": {
+                    "id": "test-id",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "finish_reason": {"type": "stop"},
+                    "weight_version": "v1",
+                    "speculative_decoding_stats": {
+                        "schema_version": 1,
+                        "mode": "detailed",
+                        "num_verification_steps": 2,
+                        "num_verified_draft_tokens": 9,
+                        "num_accepted_draft_tokens": 5,
+                        "draft_acceptance_rate": 5 / 9,
+                        "mean_accept_length": 3.5,
+                        "accepted_draft_tokens_histogram": [0, 1, 0, 1],
+                        "verify_lengths": [6, 5],
+                        "accept_lengths": [4, 3],
+                    },
+                },
+            }
+        ]
+
+        response = self.sc._build_completion_response(req, mock_ret, 1234567890)
+
+        self.assertIsNotNone(response.sglext)
+        stats = response.sglext.speculative_decoding_stats[0]
+        self.assertEqual(stats.index, 0)
+        self.assertEqual(stats.verify_lengths, [6, 5])
+        self.assertEqual(stats.accept_lengths, [4, 3])
+
+    def test_streaming_stats_are_only_returned_on_finish_chunk(self):
+        stats = {
+            "schema_version": 1,
+            "mode": "detailed",
+            "num_verification_steps": 2,
+            "num_verified_draft_tokens": 9,
+            "num_accepted_draft_tokens": 5,
+            "draft_acceptance_rate": 5 / 9,
+            "mean_accept_length": 3.5,
+            "accepted_draft_tokens_histogram": [0, 1, 0, 1],
+            "verify_lengths": [6, 5],
+            "accept_lengths": [4, 3],
+        }
+
+        async def _mock_generate(*args, **kwargs):
+            for text, finish_reason in (("A", None), ("", {"type": "stop"})):
+                yield {
+                    "text": text,
+                    "meta_info": {
+                        "id": "cmpl-spec-stream",
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                        "finish_reason": finish_reason,
+                        "speculative_decoding_stats": stats,
+                    },
+                    "index": 0,
+                }
+
+        self.sc.tokenizer_manager.generate_request = _mock_generate
+        self.sc.tokenizer_manager.server_args.incremental_streaming_output = True
+        self.sc.tokenizer_manager.server_args.stream_response_default_include_usage = (
+            False
+        )
+        req = CompletionRequest(model="x", prompt="Hello", max_tokens=10, stream=True)
+
+        async def run_stream():
+            return [
+                chunk
+                async for chunk in self.sc._generate_completion_stream(
+                    Mock(), req, self.fastapi_request
+                )
+            ]
+
+        chunks = get_or_create_event_loop().run_until_complete(run_stream())
+        payloads = [
+            json.loads(chunk.removeprefix("data: "))
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        chunks_with_stats = [payload for payload in payloads if "sglext" in payload]
+
+        self.assertEqual(len(chunks_with_stats), 1)
+        self.assertEqual(chunks_with_stats[0]["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(
+            chunks_with_stats[0]["sglext"]["speculative_decoding_stats"][0][
+                "accept_lengths"
+            ],
+            [4, 3],
+        )
+
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
         err_msg = "Aborted by scheduler"

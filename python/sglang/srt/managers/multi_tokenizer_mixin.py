@@ -158,6 +158,11 @@ def _handle_output_by_index(output, i):
             spec_num_correct_drafts=_extract_field_by_index(
                 output, "spec_num_correct_drafts", i
             ),
+            spec_num_proposed_drafts=_extract_field_by_index(
+                output, "spec_num_proposed_drafts", i
+            ),
+            spec_verify_lens=_extract_field_by_index(output, "spec_verify_lens", i),
+            spec_accept_lens=_extract_field_by_index(output, "spec_accept_lens", i),
             spec_correct_drafts_histogram=_extract_field_by_index(
                 output, "spec_correct_drafts_histogram", i
             ),
@@ -284,6 +289,11 @@ def _handle_output_by_index(output, i):
             spec_num_correct_drafts=_extract_field_by_index(
                 output, "spec_num_correct_drafts", i
             ),
+            spec_num_proposed_drafts=_extract_field_by_index(
+                output, "spec_num_proposed_drafts", i
+            ),
+            spec_verify_lens=_extract_field_by_index(output, "spec_verify_lens", i),
+            spec_accept_lens=_extract_field_by_index(output, "spec_accept_lens", i),
             spec_correct_drafts_histogram=_extract_field_by_index(
                 output, "spec_correct_drafts_histogram", i
             ),

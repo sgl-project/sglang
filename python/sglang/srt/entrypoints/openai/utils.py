@@ -8,10 +8,22 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     CompletionRequest,
     LogProbs,
+    SpeculativeDecodingStats,
     StreamOptions,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def speculative_decoding_stats_from_meta(
+    meta_info: Dict[str, Any], index: int
+) -> Optional[SpeculativeDecodingStats]:
+    """Convert final internal metadata to the public SGLang extension type."""
+
+    stats = meta_info.get("speculative_decoding_stats")
+    if not isinstance(stats, dict):
+        return None
+    return SpeculativeDecodingStats(index=index, **stats)
 
 
 def to_openai_style_logprobs(

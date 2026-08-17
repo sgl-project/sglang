@@ -133,6 +133,45 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
         self.assertEqual(predict_tokens, [[201, 202, 203]])
         self.assertEqual(req.kv_committed_len, 3)
 
+    def test_detailed_stats_keep_raw_lengths_before_grammar_truncation(self):
+        req = _make_req(terminate_after=2)
+        proc = _make_processor()
+        proc.server_args.speculative_decoding_stats = "detailed"
+        result = _make_result(6, [4], [101, 102, 103, 104, 0, 0])
+
+        predict_tokens = proc._resolve_spec_v2_tokens(result, _FakeBatch([req]))
+
+        self.assertEqual(predict_tokens, [[101, 102]])
+        self.assertEqual(req.spec_num_proposed_drafts, 5)
+        self.assertEqual(req.spec_num_correct_drafts, 3)
+        self.assertEqual(req.spec_verify_lens, [6])
+        self.assertEqual(req.spec_accept_lens, [4])
+
+    def test_detailed_stats_use_ragged_cap_as_actual_verify_width(self):
+        req = _make_req(terminate_after=99)
+        proc = _make_processor()
+        proc.server_args.speculative_decoding_stats = "detailed"
+        result = _make_result(6, [3], [201, 202, 203, 0, 0, 0])
+        result.cap_lens = torch.tensor([5], dtype=torch.long)
+
+        proc._resolve_spec_v2_tokens(result, _FakeBatch([req]))
+
+        self.assertEqual(req.spec_num_proposed_drafts, 4)
+        self.assertEqual(req.spec_verify_lens, [5])
+        self.assertEqual(req.spec_accept_lens, [3])
+
+    def test_summary_stats_count_without_allocating_step_arrays(self):
+        req = _make_req(terminate_after=99)
+        proc = _make_processor()
+        proc.server_args.speculative_decoding_stats = "summary"
+        result = _make_result(6, [3], [201, 202, 203, 0, 0, 0])
+
+        proc._resolve_spec_v2_tokens(result, _FakeBatch([req]))
+
+        self.assertEqual(req.spec_num_proposed_drafts, 5)
+        self.assertIsNone(req.spec_verify_lens)
+        self.assertIsNone(req.spec_accept_lens)
+
 
 class TestReasoningTokenAccounting(CustomTestCase):
     def test_multi_token_end_can_span_decode_steps(self):

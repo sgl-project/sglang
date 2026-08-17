@@ -413,6 +413,29 @@ class CompletionRequest(BaseModel):
         return v
 
 
+class SpeculativeDecodingStats(BaseModel):
+    """Per-choice speculative decoding statistics returned by SGLang."""
+
+    index: int
+    schema_version: Literal[1] = 1
+    mode: Literal["summary", "detailed"]
+    num_verification_steps: int
+    num_verified_draft_tokens: int
+    num_accepted_draft_tokens: int
+    draft_acceptance_rate: float
+    mean_accept_length: float
+    accepted_draft_tokens_histogram: List[int]
+    # Raw verifier lengths. Both include the root / bonus token and are only
+    # present in ``detailed`` mode.
+    verify_lengths: Optional[List[int]] = None
+    accept_lengths: Optional[List[int]] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        return {k: v for k, v in data.items() if v is not None}
+
+
 class SglExt(BaseModel):
     """SGLang extension fields for OpenAI-compatible responses.
 
@@ -422,6 +445,7 @@ class SglExt(BaseModel):
 
     routed_experts: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
+    speculative_decoding_stats: Optional[List[SpeculativeDecodingStats]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
