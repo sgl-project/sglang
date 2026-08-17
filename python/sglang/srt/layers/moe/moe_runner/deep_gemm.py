@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang._torch_compile import sglang_compile
 from sglang.kernels.ops.attention.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.quantization import per_token_group_quant
 
@@ -77,7 +78,7 @@ _masked_standard_layout_memory_budget_bytes: Optional[int] = None
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
-@torch.compile(disable=_is_hip or _is_npu)
+@sglang_compile(disable=_is_hip or _is_npu)
 def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
     temp = x.to(torch.float32).view(torch.int32)
     exp = torch.bitwise_right_shift(temp, 23)

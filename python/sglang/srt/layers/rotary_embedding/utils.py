@@ -7,6 +7,7 @@ from typing import Tuple
 
 import torch
 
+from sglang._torch_compile import sglang_compile
 from sglang.srt.utils import cpu_has_amx_support, get_compiler_backend, is_cpu, is_npu
 
 _is_npu = is_npu()
@@ -93,7 +94,7 @@ def apply_rotary_pos_emb_native_eager(
     return q_embed, k_embed
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@sglang_compile(dynamic=True, backend=get_compiler_backend())
 def apply_rotary_pos_emb_native(
     q: torch.Tensor,
     k: torch.Tensor,

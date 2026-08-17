@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang._torch_compile import sglang_compile
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
@@ -684,7 +685,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     return batch_next_token_ids.view(-1)
 
 
-@torch.compile(dynamic=True, disable=is_npu())
+@sglang_compile(dynamic=True, disable=is_npu())
 def multinomial_with_seed(
     logprobs: torch.Tensor, seed: torch.Tensor, positions: torch.Tensor
 ) -> torch.Tensor:

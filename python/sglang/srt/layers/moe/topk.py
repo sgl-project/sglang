@@ -32,6 +32,8 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
+from sglang._torch_compile import sglang_compile
+
 if TYPE_CHECKING:
     from triton_kernels.tensor_details.ragged_tensor import RaggedTensorMetadata
 
@@ -968,7 +970,7 @@ def fused_topk(
 
 
 # This is used by the Deepseek V2/V3/R1 series models
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@sglang_compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1126,7 +1128,7 @@ def grouped_topk_xpu(
     )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@sglang_compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def kimi_k2_biased_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1167,7 +1169,7 @@ def kimi_k2_biased_topk_impl(
     return topk_weights, topk_ids
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@sglang_compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def biased_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1287,7 +1289,7 @@ def biased_topk_jit_kernel_impl(
         return topk_weights, topk_ids
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@sglang_compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1426,7 +1428,7 @@ def _zero_topk_weights_padded_region(
     topk_weights[indices >= num_token_non_padded, :] = 0.0
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@sglang_compile(dynamic=True, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
 ):

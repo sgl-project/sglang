@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang._torch_compile import sglang_compile
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_compiler_backend
@@ -95,7 +96,7 @@ def create_kt_config_from_server_args(
     )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@sglang_compile(dynamic=True, backend=get_compiler_backend())
 def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.Tensor:
     """Mask CPU expert IDs by setting them to -1.
 

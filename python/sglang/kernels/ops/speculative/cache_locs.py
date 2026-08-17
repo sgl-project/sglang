@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang._torch_compile import sglang_compile
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -158,7 +159,7 @@ def align_evict_mask_to_page_size(
         tl.store(evict_mask + bid * num_draft_tokens + i, False)
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@sglang_compile(dynamic=True, disable=_is_npu)
 def get_src_tgt_cache_loc(
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,

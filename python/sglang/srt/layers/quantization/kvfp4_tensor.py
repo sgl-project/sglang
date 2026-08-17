@@ -17,6 +17,8 @@ from enum import Enum
 
 import torch
 
+from sglang._torch_compile import sglang_compile
+
 
 class FP4KVCacheRecipe(Enum):
     MXFP4 = 1  # KVFP4: block-wise scaling
@@ -61,7 +63,7 @@ class FP4MXBlock16KVQuantizeUtil:
     """
 
     @staticmethod
-    @torch.compile
+    @sglang_compile
     def batched_quantize(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
 
@@ -104,7 +106,7 @@ class FP4MXBlock16KVQuantizeUtil:
         return packed, scale_factors
 
     @staticmethod
-    @torch.compile
+    @sglang_compile
     def batched_dequantize(
         quant_tensor: torch.Tensor,
         scale_factors: torch.Tensor,

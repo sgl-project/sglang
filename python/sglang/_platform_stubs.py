@@ -395,6 +395,7 @@ def install_platform_stubs() -> None:
         sys.meta_path.insert(0, _TritonFinder())
 
         triton = _make_mock("triton")
+        triton.__sglang_stub__ = True
         triton.__version__ = "3.0.0"
         triton.cdiv = _cdiv
         triton.next_power_of_2 = _next_power_of_2
