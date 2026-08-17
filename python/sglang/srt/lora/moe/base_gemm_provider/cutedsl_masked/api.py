@@ -348,8 +348,8 @@ def prepare_contiguous(
     expects, so descriptor construction, partitioning, and the epilogue are
     reused verbatim.  ``seg_offsets`` rides the masked_m argument slot — the
     direct scheduler this mode requires never reads that slot, and the kernel
-    reads it only for the segment-base tile fold.  SM100-only: the SM90
-    sibling kernel has no contiguous port.
+    reads it only for the segment-base tile fold.  Both device kernels carry
+    the fold, so this dispatches by capability exactly like ``prepare``.
     """
     if not config.contiguous_segments:
         raise ValueError("prepare_contiguous requires config.contiguous_segments")
@@ -362,12 +362,6 @@ def prepare_contiguous(
     experts, m_ceil, n, k = _validate_contiguous(
         a, b, c, seg_offsets, m_alignment=m_alignment
     )
-    major, _minor = torch.cuda.get_device_capability(a.device)
-    if major < 10:
-        raise NotImplementedError(
-            "the contiguous CuTeDSL grouped GEMM is implemented for SM100+ "
-            f"only (the SM90 kernel has no contiguous port); device is sm{major}x"
-        )
 
     # The unit L mode makes the flat tensors structurally identical to a
     # single-expert masked slab; strides stay the natural contiguous ones.
@@ -396,7 +390,7 @@ def prepare_contiguous(
     direct_schedule_arg = _as_dynamic_cute_tensor(direct_schedule, leading_dim=0)
     schedule_tiles_arg = _as_dynamic_cute_tensor(schedule_tiles, leading_dim=0)
 
-    gemm = MaskedGroupedGemmKernel(
+    gemm = _kernel_class_for(a.device)(
         acc_dtype=cutlass.Float32,
         use_2cta_instrs=config.use_2cta_instrs,
         mma_tiler_mn=config.mma_tiler_mn,

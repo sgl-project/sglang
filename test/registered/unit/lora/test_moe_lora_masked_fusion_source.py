@@ -117,11 +117,28 @@ class TestMaskedFusionSource(unittest.TestCase):
     def test_contiguous_cutedsl_launch_passes_no_pdl_argument(self):
         # The contiguous provider's _launch has no produce_pdl parameter
         # (contiguous compiles no producer twins); passing one crashes at
-        # GB300 prefill-graph capture. SM90 CI cannot reach this class, so
-        # pin it at the source level: no call-site kwarg inside the class.
+        # prefill-graph capture. Pin it at the source level — no call-site
+        # kwarg inside the class — so a CPU runner catches it on both archs.
         src = _source("cutedsl_bf16.py")
         contiguous = src[src.index("class CuteDslBf16ContiguousProvider") :]
         self.assertNotIn("produce_pdl=", contiguous)
+
+    def test_both_device_kernels_carry_the_contiguous_admission_and_fold(self):
+        # prepare_contiguous dispatches by capability, so the SM90 kernel
+        # must enforce the same admission (swap_ab + direct schedule at a
+        # (1, 1) cluster) and fold the segment base in BOTH device loops —
+        # a kernel missing one loop's fold reads the wrong expert's rows.
+        for name in ("cutedsl_masked/kernel.py", "cutedsl_masked/kernel_sm90.py"):
+            source = _source(name)
+            self.assertIn(
+                "contiguous_segments requires swap_ab and use_direct_schedule",
+                source,
+            )
+            self.assertIn("contiguous_segments requires a (1, 1) cluster", source)
+            self.assertEqual(source.count("seg_base_tile + "), 2, name)
+        api = _source("cutedsl_masked/api.py")
+        contiguous_fn = _function(api, "prepare_contiguous")
+        self.assertIn("_kernel_class_for(a.device)", contiguous_fn)
 
     def test_deepgemm_sm90_geometry_guard_checks_both_contractions(self):
         class StubProvider:

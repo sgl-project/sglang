@@ -333,11 +333,11 @@ class MoeLoraRunner:
 
             return CuteDslBf16Provider
         if provider_name == "cutedsl_contiguous":
-            if torch.cuda.get_device_capability() < (10, 0):
+            if torch.cuda.get_device_capability() < (9, 0):
                 raise NotImplementedError(
                     "the contiguous CuTeDSL MoE LoRA MoE provider requires "
-                    "SM100+ (the SM90 kernel has no contiguous port); this "
-                    f"device is sm{torch.cuda.get_device_capability()}"
+                    "SM90+ (tcgen05 on SM100+, WGMMA on SM90); this device "
+                    f"is sm{torch.cuda.get_device_capability()}"
                 )
             from sglang.srt.lora.moe.base_gemm_provider.cutedsl_bf16 import (
                 CuteDslBf16ContiguousProvider,

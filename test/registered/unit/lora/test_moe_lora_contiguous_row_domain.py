@@ -35,8 +35,8 @@ CUDA cases split by dependency:
   ``src2dst`` entry differs), but the S2/S4 DeepGEMM masked and contiguous
   kernel families may select different tile configurations, so their BF16
   outputs can differ by rounding.  The ``cutedsl_contiguous`` oracle leg
-  (SM100 + CuTeDSL only) shares the same tolerance discipline for the same
-  reason: both GEMM engines accumulate in FP32 and round to BF16 per tile,
+  (SM90+ with the CuTeDSL stack) shares the same tolerance discipline for the
+  same reason: both GEMM engines accumulate in FP32 and round to BF16 per tile,
   so an engine swap is the same rounding-class divergence as a
   tile-configuration swap.
 * CUDA-graph cases (per plan/layout) capture the contiguous prefill pipeline
@@ -237,7 +237,7 @@ class TestRowDomainConfig:
         try:
             assert MoeLoraRunner.select_provider_cls("cutedsl_contiguous") is not None
         except NotImplementedError:
-            pass  # known name, device-gated (SM90 has no contiguous port)
+            pass  # known name, device-gated (needs SM90+)
         with pytest.raises(ValueError, match="row_major"):
             MoeLoraRunner.select_provider_cls("row_major")
 
@@ -431,11 +431,11 @@ deepgemm_cuda_only = pytest.mark.skipif(
 
 def _cutedsl_contiguous_ready() -> bool:
     # The oracle's masked reference is the DeepGEMM runner, so the CuTeDSL
-    # leg needs everything the DeepGEMM leg does PLUS SM100 and the CuTeDSL
-    # stack (the SM90 kernel has no contiguous port).
+    # leg needs everything the DeepGEMM leg does PLUS SM90+ and the CuTeDSL
+    # stack (both device kernels carry the contiguous fold).
     if not _deep_gemm_ready():
         return False
-    if torch.cuda.get_device_capability() < (10, 0):
+    if torch.cuda.get_device_capability() < (9, 0):
         return False
     try:
         import cuda.bindings.driver  # noqa: F401
@@ -453,7 +453,7 @@ _CONTIGUOUS_PROVIDER_PARAMS = (
         marks=pytest.mark.skipif(
             not _cutedsl_contiguous_ready(),
             reason=(
-                "the CuTeDSL contiguous leg needs SM100+, the CuTeDSL stack, "
+                "the CuTeDSL contiguous leg needs SM90+, the CuTeDSL stack, "
                 "and the DeepGEMM masked reference"
             ),
         ),

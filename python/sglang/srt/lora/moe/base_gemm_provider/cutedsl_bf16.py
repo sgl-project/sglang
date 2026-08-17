@@ -23,8 +23,9 @@ Selected explicitly by the evidence-backed serving config on SM90/SM100; the
 device kernel is architecture-dispatched in ``cutedsl_masked.api``.
 
 :class:`CuteDslBf16ContiguousProvider` (bottom of this module) is the
-route-major twin over the contiguous row domain, SM100-only, reachable via
-``the config files=contiguous_cutedsl``.
+route-major twin over the contiguous row domain, selected by plan rows that
+name the ``cutedsl_contiguous`` provider; it dispatches to the same two
+device kernels.
 """
 
 from __future__ import annotations
@@ -486,7 +487,7 @@ class CuteDslContiguousWorkspace(ContiguousRowWorkspace, kw_only=True):
 
 
 class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
-    """Route-major twin of :class:`CuteDslBf16Provider` (SM100-only).
+    """Route-major twin of :class:`CuteDslBf16Provider`.
 
     Same resident ``[E, N, K]`` BF16 weights, same swap_ab + direct-schedule
     winner family, same compile-once/warm-at-attach discipline; only the row
@@ -501,11 +502,12 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
     own aligned segment (the contiguous twin of masked slab padding);
     ``_compile_stage`` validates that per width at attach.
 
-    SM100-only: the SM90 WGMMA sibling kernel has no contiguous port.  The
-    selector converts tuned-domain GB300 prefill choices here by default;
-    the 'contiguous_cutedsl' env value additionally forces gb300
-    out-of-domain prefill keys here (untuned-geometry A/B), guarded by the
-    1024-expert packing cap below so every menu choice stays attachable.
+    Architecture dispatch matches the masked twin: tcgen05 on SM100+, the
+    WGMMA sibling on SM90 — both kernels carry the segment-base fold — with
+    Hopper dropping the unvalidated narrow-8 decode tile exactly as the
+    masked provider does.  Plan rows reach this class by naming the
+    ``cutedsl_contiguous`` provider, guarded by the 1024-expert packing cap
+    below so every menu choice stays attachable.
     The base GEMMs are factor-layout-agnostic — resident
     weights are identical either way — so the shared-outer plan differs from
     the per-expert one only in the domain-level glue and LoRA kernels, all
@@ -552,12 +554,6 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
 
     def __init__(self, quant_info: MoeLoraBf16QuantInfo):
         device = quant_info.w13_weight.device
-        if torch.cuda.get_device_capability(device) < (10, 0):
-            raise NotImplementedError(
-                "cutedsl_contiguous requires SM100+ (the SM90 kernel has no "
-                "contiguous port); use 'cutedsl' or 'deepgemm_contiguous' on "
-                f"sm{torch.cuda.get_device_capability(device)}"
-            )
         super().__init__(quant_info, m_alignment=self.M_ALIGNMENT)
 
         from sglang.srt.lora.moe.base_gemm_provider.cutedsl_masked.api import (
@@ -592,14 +588,23 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
         # Same physical-machine rule as the masked provider: the all-SM xwide
         # schedule is qualified only on the campaign's 152-SM GB300.
         device_properties = torch.cuda.get_device_properties(device)
+        device_capability = torch.cuda.get_device_capability(device)
         xwide_clusters = self.XWIDE_PERSISTENT_CLUSTERS
-        if device_properties.multi_processor_count == 152:
+        if (
+            device_capability >= (10, 0)
+            and device_properties.multi_processor_count == 152
+        ):
             xwide_clusters = 152
         tile_set = (
             (self.NARROW_TOKEN_WIDTH, self.NARROW_PERSISTENT_CLUSTERS),
             (self.WIDE_TOKEN_WIDTH, self.WIDE_PERSISTENT_CLUSTERS),
             (self.XWIDE_TOKEN_WIDTH, xwide_clusters),
         )
+        # Same compiled-width rule as the masked provider: the SM90 port
+        # validates tile N in {64, 128, 256}, so Hopper drops the narrow-8
+        # decode tile and `_token_width_for` floors selection at wide.
+        if device_capability < (10, 0):
+            tile_set = tile_set[1:]
 
         from sglang.srt.lora.moe.base_gemm_provider.gemm_config_store import (
             cutedsl_version,

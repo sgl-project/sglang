@@ -64,6 +64,13 @@ SM90-specific facts a reader coming from `kernel.py` needs:
   only out-of-bounds predication past ``m_max``, which the masked contract
   relies on. `use_2cta_instrs` is rejected (no SM90 support); producer-side
   PDL signaling is supported independently from dependent-launch admission.
+* ``contiguous_segments`` is ported with the semantics documented in
+  `kernel.py` (plan section 69): the masked_m slot carries ``seg_offsets``,
+  the segment base folds into the token-tile coordinate in both device
+  loops, the flat token/output tensors pin their unit L mode, and the
+  resident weight keeps its true expert L index. The mode inherits the same
+  swap_ab + direct-schedule + (1, 1)-cluster admission; nothing about it is
+  tcgen05-specific.
 """
 
 import math
@@ -113,6 +120,7 @@ class MaskedGroupedGemmKernelSm90:
         produce_pdl: bool = False,
         swap_ab: bool = False,
         use_direct_schedule: bool = False,
+        contiguous_segments: bool = False,
     ):
         if use_2cta_instrs:
             raise ValueError("2-CTA MMA is a tcgen05 feature; SM90 has none")
@@ -131,6 +139,20 @@ class MaskedGroupedGemmKernelSm90:
         self.produce_pdl = produce_pdl
         self.swap_ab = swap_ab
         self.use_direct_schedule = use_direct_schedule
+        self.contiguous_segments = contiguous_segments
+        if contiguous_segments and not (swap_ab and use_direct_schedule):
+            # Same admission as the SM100 kernel: the segment-base fold
+            # assumes the token axis is the scheduler's dynamic-M viewed
+            # through swap_ab, and only the direct scheduler leaves the
+            # masked_m argument slot free to carry seg_offsets.
+            raise ValueError(
+                "contiguous_segments requires swap_ab and use_direct_schedule"
+            )
+        if contiguous_segments and cluster_shape_mn != (1, 1):
+            # Matches the packed schedule's own (1, 1) representability guard
+            # (schedule_builder.dual_stage_schedule_capacities); a real
+            # cluster would also break the local->global tile-index fold.
+            raise ValueError("contiguous_segments requires a (1, 1) cluster")
 
         # K extent of the tile is deferred to _setup_attributes.
         self.tile_shape_mnk = (*mma_tiler_mn, 1)
@@ -278,6 +300,11 @@ class MaskedGroupedGemmKernelSm90:
         # extent on ITS M axis, so under swap the tile and cluster are handed
         # over transposed and the device swaps the returned coords back.
         m_max, n, expert_cnt = c.shape
+        if cutlass.const_expr(self.contiguous_segments):
+            # The flat route-major output carries a unit L mode, so the true
+            # expert count lives on the resident weight (logical A under the
+            # swap_ab this mode requires).
+            expert_cnt = cute.size(a.shape[2])
         k = cute.size(a.shape[1])
         scheduler_cta_tile = self.tile_shape_mnk
         scheduler_cluster = self.cluster_shape_mn
@@ -562,9 +589,24 @@ class MaskedGroupedGemmKernelSm90:
                         work_tile.tile_m_idx,
                         work_tile.expert_idx,
                     )
-                tAgA_mkl = tAgA[
-                    (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
-                ]
+                a_rest_l_coord = mma_tile_coord_mnl[2]
+                if cutlass.const_expr(self.contiguous_segments):
+                    # ``masked_m`` carries seg_offsets in this mode.  Fold the
+                    # expert's aligned segment base into the flat token-tile
+                    # index (exact: segment bases are alignment multiples and
+                    # the token tile divides the alignment — host-guarded),
+                    # pin the flat token/output tensors to their unit L mode,
+                    # and keep the resident weight on its true expert index.
+                    seg_base_tile = (
+                        masked_m[work_tile.expert_idx] // self.tile_shape_mnk[1]
+                    )
+                    mma_tile_coord_mnl = (
+                        mma_tile_coord_mnl[0],
+                        seg_base_tile + mma_tile_coord_mnl[1],
+                        cutlass.Int32(0),
+                    )
+                    a_rest_l_coord = work_tile.expert_idx
+                tAgA_mkl = tAgA[(None, mma_tile_coord_mnl[0], None, a_rest_l_coord)]
                 tBgB_nkl = tBgB[
                     (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
                 ]
@@ -654,6 +696,17 @@ class MaskedGroupedGemmKernelSm90:
                         work_tile.tile_n_idx,
                         work_tile.tile_m_idx,
                         work_tile.expert_idx,
+                    )
+                if cutlass.const_expr(self.contiguous_segments):
+                    # Same segment-base fold as the DMA warp: the store lands
+                    # at the flat global token tile, L pinned to the unit mode.
+                    seg_base_tile = (
+                        masked_m[work_tile.expert_idx] // self.tile_shape_mnk[1]
+                    )
+                    mma_tile_coord_mnl = (
+                        mma_tile_coord_mnl[0],
+                        seg_base_tile + mma_tile_coord_mnl[1],
+                        cutlass.Int32(0),
                     )
                 gC_mnl_slice = gC_mnl[(None, None, *mma_tile_coord_mnl)]
 
