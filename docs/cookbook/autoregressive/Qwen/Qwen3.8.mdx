@@ -1,0 +1,326 @@
+---
+title: Qwen3.8
+description: "Deploy Qwen3.8 with SGLang — day-0 recipes for Qwen's 2.4T-parameter (95B active) hybrid GDN/GQA Mixture-of-Experts model on NVIDIA and AMD."
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install sglang
+```
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+**NVIDIA GPUs** (H200 / B200 / B300 / GB300) — the launch image, since this is a day-0 model with no release cut yet:
+
+```bash Command
+docker pull lmsysorg/sglang:qwen38
+```
+
+**AMD GPUs** — pinned `v0.5.17` builds. The two are **not** interchangeable: they target different GPU architectures *and* different ROCm versions, so pick the one matching your hardware or AITER's kernels won't load.
+
+MI350X / MI355X (CDNA4, gfx950 — ROCm 7.20):
+
+```bash Command
+docker pull lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260812
+```
+
+MI300X (CDNA3, gfx942 — ROCm 7.00):
+
+```bash Command
+docker pull lmsysorg/sglang-rocm:v0.5.17-rocm700-mi30x-20260813
+```
+
+For how to launch either image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with whatever the command generator below produces.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick your hardware + quantization to generate the launch command. Three of the strategies are operating points on the throughput/latency curve; the fourth swaps the speculative decoder:
+
+- **Low Latency** — fastest reply for a single user. Pick for chat.
+- **Balanced** — good speed with several users at once. Use for typical multi-user serving.
+- **High Throughput** — most tokens per second across many users. Best for batch jobs.
+- **DSpark** — the trained [DSpark draft model](#3-3-dspark-and-replayssm-speculative-decoding) instead of the checkpoint's built-in MTP head. Only offered where DSpark's constraints allow it (see [3.3](#3-3-dspark-and-replayssm-speculative-decoding)).
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/Qwen/qwen3.8.jsx";
+import { benchmarks } from "/src/snippets/configs/Qwen/qwen3.8-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+The knobs come in two flavors:
+
+- **Built-in SGLang features** — TP / DP-Attention, MoE backend + EP (including WideEP), reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, and HiCache tiers.
+- **Qwen3.8 specific features** — the **DSpark** speculative-decoding preset and its **ReplaySSM** opt-out, plus the GDN radix-cache-strategy and KV-cache-precision knobs (see [Configuration Tips](#2-configuration-tips) and [3.3 DSpark and ReplaySSM](#3-3-dspark-and-replayssm-speculative-decoding) below).
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+**Qwen3.8** (`Qwen3.8-2.4T-A95B`) is Qwen's largest open-weight model to date: **2.4T total parameters, 95B active per token**. It continues the hybrid-attention design of the Qwen3.5 / Qwen3.6 series, scaled up to 92 layers.
+
+- **Hybrid Attention** — 23 repeats of `3 × (Gated DeltaNet → MoE) → 1 × (Gated Attention → MoE)`, so 69 linear-attention layers to 23 full-attention ones. Gated Attention runs 64 query heads over 4 KV heads at head dimension 256. This balances linear computational complexity against long-context modeling quality.
+- **GDN (Gated Delta Network)** — the linear-attention layers pair a State Space Model with causal convolution (CausalConv1d), 128 V heads and 16 QK heads at head dimension 128. A fixed-size recurrent state replaces the growing KV cache, so memory is `O(1)` per layer while compute stays `O(N)`.
+- **Sparse Mixture-of-Experts** — 512 experts, 10 routed plus 1 shared active per token, expert intermediate dimension 2048. Hidden dimension 8192, vocabulary 248,320.
+- **MTP** — the checkpoint ships multi-token-prediction weights trained with multiple steps. That is what the NEXTN speculative recipes on this page decode against.
+
+**License:** [Qwen3.8-2.4T-A95B](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B/blob/main/LICENSE). **Context length:** 262,144 native, extensible to 1,010,000 tokens.
+
+**Recommended generation:** `temperature=1.0`, `top_p=0.95`, `top_k=20`, `min_p=0.0`, `presence_penalty=0.0`, `repetition_penalty=1.0`. Raising `presence_penalty` toward 2 curbs runaway repetition at some risk of language mixing. For agentic work Qwen suggests allowing 262,144 tokens of reasoning and 131,072 for the final response.
+
+**Resources:** Each precision is its own repo — [BF16](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B) · [FP8](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8) · [NVFP4, NVIDIA Blackwell (RadixArk)](https://huggingface.co/RadixArk/Qwen3.8-2.4T-A95B-NVFP4) · [MXFP4, AMD CDNA4 (Qwen)](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4). Speculative-decoding draft model: [`RadixArk/Qwen3.8-2.4T-A95B-DSpark`](https://huggingface.co/RadixArk/Qwen3.8-2.4T-A95B-DSpark) (see [3.3](#3-3-dspark-and-replayssm-speculative-decoding)).
+
+## 2. Configuration Tips
+
+Four cells are marked **Not Verified** — **GB300 BF16** and the three GB300 **DSpark** strategies. They have launch recipes but no completed validation run; every other cell on the page has been run, including B300 NVFP4 DSpark.
+
+**Weight size decides the topology.** At 2.4T parameters BF16 is ≈4.8TB, FP8 ≈2.4TB, NVFP4 ≈1.2TB. FP8 fits no single node here — not even B300, whose 8 × 288GB = 2.30TB misses by a hair — so every FP8 recipe is multi-node. Single-node means FP4: NVFP4 on B300, MXFP4 on MI355X/MI350X. B200 NVFP4 would fit one node but pipelines two, because ~25GB per GPU after weights is too little to serve against. BF16 does not fit 16 GPUs either, so its one recipe is TP32 across 8 GB300 nodes — the only platform where a flat TP32 stays on rack-scale NVLink.
+
+**Two distinct FP4 checkpoints.** [NVFP4](https://huggingface.co/RadixArk/Qwen3.8-2.4T-A95B-NVFP4) is Blackwell-only; [MXFP4](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4) is MI350X/MI355X-only and hybrid (MXFP4 experts, FP8 attention/dense). MI300X is CDNA3 with no hardware MX matmul, so it serves FP8. Leave `--moe-runner-backend` unset on both and the runner resolves from the checkpoint's own `quant_method` — except the NVFP4 wide-EP tier, which pairs `flashinfer_trtllm_routed` with `--moe-a2a-backend flashinfer` by hand because auto cannot resolve that combination.
+
+### GDN state is the scarce resource, not KV
+
+Two thirds of the layers are Gated DeltaNet, and their recurrent state lives in its own pool. That pool, not KV, is usually what caps concurrency — and a request's cost depends on the caching strategy:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Strategy</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>State slots per request</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}><code>--disable-radix-cache</code></td>
+      <td style={{padding: "9px 12px"}}>1</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>no_buffer</code></td>
+      <td style={{padding: "9px 12px"}}>3</td>
+    </tr>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}><code>extra_buffer</code> (this model's <code>auto</code>)</td>
+      <td style={{padding: "9px 12px"}}>5, or 4 where PP disables the overlap scheduler</td>
+    </tr>
+  </tbody>
+</table>
+
+So `--max-mamba-cache-size` has to match the ratio in force, or it silently clamps `max_running_requests` to a fraction of the target — every cell leaves the pool to `--mamba-full-memory-ratio` except GB300 FP8 Balanced and Low Latency, whose pins are part of tuned capacity sets — Low Latency's `--max-mamba-cache-size 80` is exactly its 16 concurrent requests × 5 slots. And `extra_buffer` needs radix caching on: `mamba_extra_buffer_of()` requires `disable_radix_cache` false, so adding `--disable-radix-cache` makes the strategy inert and drops the budget to one slot.
+
+### NEXTN caps concurrency at 48
+
+MTP weights ship inside the checkpoint, so NEXTN needs no draft model and the 3/1/4 preset fills in automatically. But a speculative cell with no `--max-running-requests` gets **48** from the speculative hook rather than a memory-derived ceiling — pin it explicitly to serve more. `pp_size > 1` rules speculative decoding out entirely in aggregated serving, which is why the H200, B200/B300 FP8, B200 NVFP4 and MI300X recipes carry no MTP.
+
+### Linear-attention backends differ by GPU generation
+
+`--mamba-ssm-dtype bfloat16` is load-bearing on SM100: the flashinfer GDN decode default is gated on it, and without it decode silently falls back to Triton. On SM90 the GDN default is Triton for *both* halves, which is why H200 is the one cell pinning `--linear-attn-decode-backend flashinfer` too. The flashinfer GDN prefill default only covers chunk sizes up to 8192, so any cell with a larger `--chunked-prefill-size` must state `--linear-attn-prefill-backend flashinfer` itself.
+
+`--attention-backend trtllm_mha` is SM100-only. On Blackwell cells that leave it unset, the model hook picks it together with `--page-size 64` — and returns early when the backend *is* named, so an explicit backend also drops that paired page size and nothing then depends on `--speculative-eagle-topk` to keep the backend off Triton.
+
+### GB300 tiers
+
+The FP8 ladder spans the whole curve on 4 nodes × 4 GPUs:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Tier</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Shape</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Spec</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}>Low Latency</td>
+      <td style={{padding: "9px 12px"}}>TP16 narrow EP</td>
+      <td style={{padding: "9px 12px"}}>NEXTN 3+1</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}>Balanced</td>
+      <td style={{padding: "9px 12px"}}>DP4×TP4 + EP16</td>
+      <td style={{padding: "9px 12px"}}>NEXTN 3+1</td>
+    </tr>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}>High Throughput</td>
+      <td style={{padding: "9px 12px"}}>DP4×TP4 + EP16</td>
+      <td style={{padding: "9px 12px"}}>off</td>
+    </tr>
+  </tbody>
+</table>
+
+Balanced and High Throughput share one shape and differ only in capacity. Low Latency is the odd one out: narrow EP wins at low concurrency, where spending ranks on expert parallelism costs more than it returns. MTP is off at saturation because draft-plus-verify overhead outweighs the speedup. NVFP4 has only two tiers — its recipes span different GPU counts (8 vs 16) and the wide-EP one holds capacity fixed across its whole concurrency list, so no third operating point exists.
+
+Extra build requirements: FP8 Balanced and High Throughput need the **DeepEP v2 wheel** (`2.1.0+01dc3aa`), since their `--moe-a2a-backend deepep_v2` flags do not exist upstream. NVFP4 High Throughput needs `nvfp4_agg_wideep_dep16_flashinfer_setup.sh` run first, and its `SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8192` is not optional — unset it falls back to 1024 and startup raises once `1024 × ep_size` no longer covers the largest CuteDSL MoE forward.
+
+### GB300 PD disaggregation layouts
+
+The PD role selector adds the role and transfer flags to the selected base recipe. It does not resize the prefill and decode workers. Use separate workers with the layouts below for the measured GB300 operating points:
+
+| Checkpoint and operating point | Prefill workers | Decode worker | Capacity setting |
+|---|---|---|---|
+| FP8, high throughput | 2 × TP1 / PP16 | DP4-attention / TP4 / EP16, DeepEP v2 + EPLB | Keep frontend concurrency above the decode MRR so prefill remains queued |
+| NVFP4, high throughput | 2 × TP1 / PP6 | DP2-attention / TP4 / EP8, FlashInfer one-sided A2A | Prefill MRR 128 per worker; decode MRR 512; frontend concurrency 1536 |
+| NVFP4, low latency | TP4 / PP2 | TP16 | Decode MRR 1 and frontend concurrency 1 at the latency endpoint |
+
+For NVFP4 with NEXTN, use the 3/1/4 settings on both roles so the prefill worker transfers the draft state. Enable ReplaySSM on the decode role. The generated router command sets the main policy to `round_robin`, which applies to prefill, and keeps the decode policy explicit; the server-side `--load-balance-method` does not configure router worker selection. Round robin is the measured choice for the fixed-shape throughput runs above. For agentic workloads with substantial repeated-prefix reuse, consider cache-aware routing, especially on the prefill side, and validate the cache-locality versus load-balance tradeoff on the target workload.
+
+### AllReduce fusion
+
+The four cells running one flat TP group — GB300 FP8 Low Latency, GB300 NVFP4 Low Latency, GB300 BF16, B300 NVFP4 — set `SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION`, the Qwen3.5 CuteDSL path whose single workspace fuses AllReduce + Residual + RMSNorm with the MoE finalize. Worth 6–13% over the legacy path. Don't pass `--flashinfer-allreduce-fusion-backend` alongside it — the env suppresses the flag with a warning.
+
+Nothing else can use it: the fusion needs DP-attention off and the built-in TP MoE, so the wide-EP tiers are out, and the pipelined cells put their cross-node traffic on IB rather than NVLink. The three GB300 cells also carry `NCCL_NVLS_ENABLE=1`, because SGLang forces NVLS collectives off when that variable is unset.
+
+### AMD
+
+Recommended: **MI355X + MXFP4, single node, TP8**. MI350X emits the identical command (same gfx950, same 288GB, same `mi35x` image); MI300X is CDNA3, takes the `mi30x` image, and needs two nodes for the FP8 weights.
+
+- **`--mem-fraction-static` looks aggressive on purpose.** With the aiter backend above 8192 context SGLang multiplies it by **0.85** before allocating, so MI355X's `0.9` lands at ≈0.765 and MI300X's `1.0` at ≈0.85. Don't "fix" these downward. MI300X must stay at 1.0 or the weights stop fitting.
+- **`--disable-custom-all-reduce` belongs on every MI300X rank** — SGLang resolves it per process, so setting it on one node would leave the two pipeline stages reducing through different code paths.
+- MI300X runs `--kv-cache-dtype fp8_e4m3` with `--page-size 16`: at 8 × 192GB per node the shape is memory-bound.
+
+### ReplaySSM
+
+A GDN layer's recurrent state overwrites itself every token, so speculative verify has to be rewindable. Snapshotting the whole K×V state per draft step costs 64 KiB per request, layer and head at K=V=128, times γ+1 steps — scratch taken out of the same budget as the persistent state pool.
+
+[ReplaySSM](https://tridao.me/blog/2026/replayssm/) stores each draft step's raw inputs `Sᵢ = (vᵢ, kᵢ, gᵢ, βᵢ)` instead, a few hundred bytes written by the verify kernel on its way through. Once the sampler fixes the accepted length, one fold kernel replays the accepted prefix from the committed checkpoint and advances it in place. The fold is a verbatim clone of the verify recurrence, so the rebuilt state is bit-identical to the recurrent baseline; draft-step scratch shrinks by roughly two orders of magnitude and is never allocated.
+
+Folding on every commit is what lets it compose with radix prefix caching over the mutable GDN state: every `--mamba-track-interval` tokens the state is handed to the radix tree, and under `extra_buffer` it goes to a second slot so the running request keeps mutating its own. It is off by default — see [3.3](#3-3-dspark-and-replayssm-speculative-decoding).
+
+## 3. Advanced Usage
+
+<Note>
+The `model` argument in the examples below is the BF16 repo id. Every precision is a **separate repo**, so `model` has to be the checkpoint the server was actually launched with — `…-A95B-FP8`, `…-A95B-NVFP4`, or `…-A95B-FP8-MXFP4`. The Deploy panel's cURL snippet always shows the right id for the cell you have selected.
+</Note>
+
+### 3.1 Reasoning
+
+Qwen3.8 **always** reasons — thinking cannot be turned off, and every response opens with a `<think>…</think>` block. The `qwen3` reasoning parser (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) splits that block into `reasoning_content`, leaving `content` as the answer alone.
+
+Depth is tunable per request with `reasoning_effort` — `xhigh` (the default), `medium`, or `low`. `preserve_thinking` carries reasoning from earlier turns into context and is on by default.
+
+<Accordion title="Reasoning Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+resp = client.chat.completions.create(
+    model="Qwen/Qwen3.8-2.4T-A95B",
+    messages=[{"role": "user", "content": "What is 15% of 240?"}],
+    reasoning_effort="xhigh",  # xhigh (default) | medium | low
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Answer:", msg.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update — a sample transcript will be added here.
+```
+
+</Accordion>
+
+### 3.2 Tool Calling
+
+Enable the `qwen3_coder` tool-call parser (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`.
+
+<Accordion title="Tool Calling Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "The city name"},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                },
+                "required": ["location"],
+            },
+        },
+    }
+]
+
+resp = client.chat.completions.create(
+    model="Qwen/Qwen3.8-2.4T-A95B",
+    messages=[{"role": "user", "content": "What's the weather in Beijing?"}],
+    tools=tools,
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Content:", msg.content)
+print("Tool calls:", msg.tool_calls)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update — a sample transcript will be added here.
+```
+
+</Accordion>
+
+### 3.3 DSpark and ReplaySSM (Speculative Decoding)
+
+We trained a **DSpark** draft model for Qwen3.8 with SpecForge. Turn it on with the **DSpark** chip in the **Speculative Decoding** card of the [Playground above](#playground) — it emits:
+
+```bash Command
+--speculative-algorithm DSPARK \
+--speculative-draft-model-path RadixArk/Qwen3.8-2.4T-A95B-DSpark
+```
+
+**ReplaySSM is a separate opt-in.** `--enable-linear-replayssm-spec` defaults off and DSpark does not turn it on, so add it with the **ReplaySSM (spec)** row in the flag-select list. With it on (see [Configuration Tips](#2-configuration-tips) above for how it works), the verify kernel stores each draft step's raw inputs instead of snapshotting the full K×V GDN state, and a single fold kernel replays the accepted prefix from the last committed checkpoint. It's a pure side channel behind a ring buffer — the verify output is bitwise unchanged — so there's no accuracy tradeoff, only a memory one.
+
+**DSpark does not compose with every cell.** `_handle_dspark` rejects the run outright rather than degrading, so check these before turning the chip on:
+
+- **`--pp-size` must be 1.** The H200, B200, B300 (FP8) and MI300X cells are all pipelined, so DSpark is unavailable on them.
+- **With DP-Attention it additionally requires `--enable-dp-lm-head`**, the built-in TP MoE (`--moe-a2a-backend none`), and no context parallel. That rules out the GB300 wide-EP tiers, which run DP attention over DeepEP v2 or FlashInfer A2A.
+- `--speculative-num-steps` is forced to 1, and an omitted `--speculative-draft-model-path` only works if the target checkpoint bundles the draft weights.
+
+The Playground greys the DSpark chip out on the combinations above.
+
+The **DSpark** strategy chip in the Deploy panel emits this substitution on the four hw × quantization combinations that clear those constraints: GB300 FP8 (on the low-latency shape — the balanced tier's DeepEP v2 a2a rules DSpark out), GB300 NVFP4, GB300 BF16 and B300 NVFP4. Everything else on the page is either pipelined or wide-EP.
+
+Because the draft model needs its own weights and KV, those cells run tighter than their NEXTN counterparts — the validated B300 recipe drops `--mem-fraction-static` to 0.80 and trims `--context-length` to 200000 to buy the room back.
+
+ReplaySSM composes with radix prefix caching, overlap scheduling, and PD decode, so DSpark speculative decoding runs alongside the rest of the stack (WideEP, PD disaggregation, HiCache) rather than requiring any of them to be turned off.
