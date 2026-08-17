@@ -401,7 +401,7 @@ class DeepseekV2MLP(nn.Module):
             )
             return down_output
 
-        if self.swiglu_limit is not None:
+        if self.use_fused_clamp_act_mul and self.swiglu_limit is not None:
             from aiter.ops.triton.fusions.fused_clamp_act_mul import (
                 fused_clamp_act_mul,
             )

@@ -252,7 +252,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         assert self.config.activation in ("silu", "situ")
         assert self.config.is_gated
         self.swiglu_limit = self.config.swiglu_limit
-        self.use_swizzle = True
+        self.use_swizzle = self.swiglu_limit is not None
 
     def run(
         self,
