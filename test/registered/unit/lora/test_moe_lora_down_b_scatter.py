@@ -86,7 +86,7 @@ def _menu(architecture, layout, activation=_SWIGLU):
         row.name: SelectedPlan(
             key=f"{architecture.value}.{layout_name}.{row.name}",
             name=row.name,
-            provider=row.provider,
+            base_gemm_rows=row.base_gemm_rows,
             plan=build_plan(row.plan, activation=activation, is_shared_outer=layout),
         )
         for row in (*table.scenarios, *table.fallback)
@@ -683,11 +683,11 @@ def _scatter_pair():
     return reference.plan, reordered_plan, _shipped_launch(_GB300, reference)
 
 
-def _build_runner(plan, launch_config, provider_name: str, gpu, num_experts: int):
+def _build_runner(plan, launch_config, base_gemm_rows: str, gpu, num_experts: int):
     from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
     from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 
-    provider = MoeLoraRunner.select_provider_cls(provider_name)(
+    provider = MoeLoraRunner.select_provider_cls(base_gemm_rows, "deepgemm")(
         MoeLoraBf16QuantInfo(
             w13_weight=gpu["w13_weight"],
             w2_weight=gpu["w2_weight"],
@@ -703,9 +703,9 @@ def _build_runner(plan, launch_config, provider_name: str, gpu, num_experts: int
         activation=ActivationFamily.SWIGLU,
     )
     runner._test_execution = dict(
-        plan=plan, launch_config=launch_config, provider_name="test"
+        plan=plan, launch_config=launch_config, base_gemm_rows="test"
     )
-    runner.prepare_plan(plan, provider_name="test")
+    runner.prepare_plan(plan, base_gemm_rows="test")
     return runner
 
 
@@ -747,9 +747,9 @@ def _workspace_buffer_names(runner) -> set[str]:
 
 
 @deepgemm_cuda_only
-@pytest.mark.parametrize("provider_name", ("deepgemm", "deepgemm_contiguous"))
+@pytest.mark.parametrize("base_gemm_rows", ("expert_major", "route_major"))
 def test_runner_scatter_matches_the_materialized_reference(
-    provider_name: str, monkeypatch: pytest.MonkeyPatch
+    base_gemm_rows: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """One serial prefill batch, shipped tail vs the scatter reordering — on
     the masked provider and on the contiguous provider (row-domain
@@ -764,10 +764,10 @@ def test_runner_scatter_matches_the_materialized_reference(
     num_tokens, num_experts = 64, 4
     gpu = _make_gpu_tensors(num_tokens, num_experts, device)
     reference_runner = _build_runner(
-        serial_plan, launch_config, "deepgemm", gpu, num_experts
+        serial_plan, launch_config, "expert_major", gpu, num_experts
     )
     scatter_runner = _build_runner(
-        reordered_plan, launch_config, provider_name, gpu, num_experts
+        reordered_plan, launch_config, base_gemm_rows, gpu, num_experts
     )
 
     for traffic in ("active", "mixed", "base_only"):
@@ -775,7 +775,7 @@ def test_runner_scatter_matches_the_materialized_reference(
         reference = _run_once(reference_runner, gpu, token_slots).hidden_states
         scatter = _run_once(scatter_runner, gpu, token_slots).hidden_states
         torch.testing.assert_close(
-            scatter, reference, **_SCATTER_TOLERANCE, msg=f"{provider_name}: {traffic}"
+            scatter, reference, **_SCATTER_TOLERANCE, msg=f"{base_gemm_rows}: {traffic}"
         )
 
     # The disappearing allocation: the scatter path never materializes the
@@ -800,10 +800,10 @@ def test_scatter_pipeline_replays_correctly_in_a_real_cuda_graph(
     num_tokens, num_experts = 64, 4
     gpu = _make_gpu_tensors(num_tokens, num_experts, device)
     reference_runner = _build_runner(
-        serial_plan, launch_config, "deepgemm", gpu, num_experts
+        serial_plan, launch_config, "expert_major", gpu, num_experts
     )
     scatter_runner = _build_runner(
-        reordered_plan, launch_config, "deepgemm", gpu, num_experts
+        reordered_plan, launch_config, "expert_major", gpu, num_experts
     )
     token_slots = _token_slots("active", num_tokens).to(device)
 

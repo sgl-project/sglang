@@ -9,7 +9,7 @@
   {
    "name": "fallback.serial",
    "phase": "decode",
-   "provider": "deepgemm",
+   "base_gemm_rows": "expert_major",
    "plan": {
     "gate_up_a_family": "grouped",
     "down_a_family": "grouped",
@@ -23,7 +23,7 @@
    "name": "fallback.serial_prefill",
    "layout": "per_expert",
    "phase": "prefill",
-   "provider": "deepgemm_contiguous",
+   "base_gemm_rows": "route_major",
    "plan": {
     "gate_up_a_family": "grouped",
     "down_a_family": "grouped",
@@ -37,7 +37,7 @@
    "name": "fallback.serial_prefill",
    "layout": "shared",
    "phase": "prefill",
-   "provider": "deepgemm",
+   "base_gemm_rows": "expert_major",
    "plan": {
     "gate_up_a_family": "grouped",
     "down_a_family": "grouped",

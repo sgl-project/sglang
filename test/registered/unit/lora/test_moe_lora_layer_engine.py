@@ -20,14 +20,15 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 class _FakeRunner:
-    def __init__(self, provider_names, workspace: object) -> None:
-        self.providers = dict.fromkeys(provider_names)
+    def __init__(self, row_orders, workspace: object) -> None:
+        self.providers = dict.fromkeys(row_orders)
+        self.base_gemm_vendor = "cutedsl"
         self.workspace = workspace
         self.prepared: list[str] = []
         self.runs = 0
 
-    def prepare_plan(self, _plan, *, provider_name):
-        self.prepared.append(provider_name)
+    def prepare_plan(self, _plan, *, base_gemm_rows):
+        self.prepared.append(base_gemm_rows)
 
     def run(
         self,
@@ -36,12 +37,12 @@ class _FakeRunner:
         *,
         plan,
         launch_config,
-        provider_name,
+        base_gemm_rows,
         output_dtype=None,
     ):
         del plan
         self.runs += 1
-        return provider_name, launch_config, output_dtype
+        return base_gemm_rows, launch_config, output_dtype
 
 
 def _base_layer(*, hidden_size=2048, num_local_experts=256):
@@ -59,8 +60,8 @@ def _engine(monkeypatch, *, capability=(9, 0), created=None, runner_cls=_FakeRun
         torch.cuda, "get_device_capability", lambda device=None: capability
     )
 
-    def fake_from_layer(_base_layer, *, provider_names, workspace):
-        runner = runner_cls(provider_names, workspace)
+    def fake_from_layer(_base_layer, *, row_orders, vendor, workspace):
+        runner = runner_cls(row_orders, workspace)
         if created is not None:
             created.append(runner)
         return runner
@@ -92,8 +93,10 @@ def test_binding_resolves_and_prepares_every_phase_once(monkeypatch) -> None:
     assert len(created) == 1
     runner = created[0]
     # one plan per phase, each prepared against its provider on ONE runner
-    assert runner.prepared == [sel.provider for sel in engine._selected.values()]
-    assert set(runner.providers) == {sel.provider for sel in engine._selected.values()}
+    assert runner.prepared == [sel.base_gemm_rows for sel in engine._selected.values()]
+    assert set(runner.providers) == {
+        sel.base_gemm_rows for sel in engine._selected.values()
+    }
 
     # a repeated identical bind is a no-op; a changed constant is an error
     engine.ensure_bound(is_shared_outer=False, physical_rank=64)
@@ -110,13 +113,13 @@ def test_run_routes_by_phase_and_buckets_by_batch_size(monkeypatch) -> None:
     engine = _engine(monkeypatch, capability=(10, 0))
     engine.ensure_bound(is_shared_outer=False, physical_rank=64)
 
-    decode_provider, tiny_launch, dtype = engine.run(
+    decode_rows, tiny_launch, dtype = engine.run(
         _dispatch(4), _batch(), output_dtype=torch.bfloat16
     )
-    assert decode_provider == "cutedsl"
+    assert decode_rows == "expert_major"
     assert dtype == torch.bfloat16
-    prefill_provider, _, _ = engine.run(_dispatch(4096), _batch(is_prefill=True))
-    assert prefill_provider == "cutedsl_contiguous"
+    prefill_rows, _, _ = engine.run(_dispatch(4096), _batch(is_prefill=True))
+    assert prefill_rows == "route_major"
 
     # the M-bucket pick is per forward: the gb300 decode ladder at rank 64
     # serves different tiles at 4 and 17 tokens
@@ -135,8 +138,8 @@ def test_run_before_binding_is_an_error(monkeypatch) -> None:
 
 def test_failed_initial_binding_is_transactional(monkeypatch) -> None:
     class _FailingRunner(_FakeRunner):
-        def prepare_plan(self, _plan, *, provider_name):
-            self.prepared.append(provider_name)
+        def prepare_plan(self, _plan, *, base_gemm_rows):
+            self.prepared.append(base_gemm_rows)
             if len(self.prepared) == 2:
                 raise NotImplementedError("unsupported plan")
 

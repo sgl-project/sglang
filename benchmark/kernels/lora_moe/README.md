@@ -18,9 +18,11 @@ Four things pick what a layer executes, and they run at two different times.
    FIRST row whose `layout`, `phase` and `max_rank` all admit this layer. An
    absent key is a wildcard. If the model's geometry is outside `domain`, or no
    row matches, the `fallback` rows are walked the same way instead.
-2. **Provider.** Comes from the matched row's `provider` field. It is checked
-   against the device — `cutedsl_contiguous` is SM100+ only, so a table that
-   names it on SM90 fails at startup, loudly.
+2. **Provider.** Joined from two places: the matched row's `base_gemm_rows`
+   (`expert_major` / `route_major`) says which row order the plan needs, and
+   `--moe-lora-base-gemm` says which vendor implements it. A geometry CuteDSL
+   cannot admit falls back to DeepGEMM with a warning, which is what keeps the
+   out-of-domain fallback rows always attachable.
 3. **Tile rules.** `resolve_tiles` takes that row's rule list and drops every
    rule whose `max_rank` is below the bound rank. What survives is a ladder.
 
@@ -97,12 +99,13 @@ size instead of arguing about the fourth digit.
 - **Some rules are duplicated on purpose, and nothing enforces it.** See the
   note in `configs/README.md`. If you retune one of a duplicated pair, retune
   the other in the same edit.
-- **Changing a provider is not the same as changing a layout.** Each vendor has
-  a masked (expert-major) and a contiguous (route-major) implementation, and the
-  row's plan expects a specific one. Swapping `cutedsl` for `deepgemm` keeps the
-  layout; swapping `cutedsl` for `deepgemm_contiguous` changes it, which changes
-  the memory footprint and can make a server fail to start. Measure vendor and
-  layout separately or you will not know which one moved the number.
+- **Vendor and row order are different axes, and the config only holds one.**
+  `base_gemm_rows` in the table is the row order; the vendor is the server flag.
+  Changing the row order changes the memory footprint and can make a server
+  fail to start; changing the vendor does not. Measure them separately or you
+  will not know which one moved the number — an earlier sweep forced whole
+  providers and conflated the two, which is how a 30% decode result got
+  attributed to the wrong axis.
 
 ## Scripts here
 

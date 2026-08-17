@@ -9,7 +9,7 @@
    "name": "decode.indexed_down_a",
    "layout": "per_expert",
    "phase": "decode",
-   "provider": "cutedsl",
+   "base_gemm_rows": "expert_major",
    "plan": {
     "gate_up_a_family": "grouped",
     "down_a_family": "indexed",
@@ -25,7 +25,7 @@
    "name": "prefill.serial",
    "layout": "per_expert",
    "phase": "prefill",
-   "provider": "deepgemm_contiguous",
+   "base_gemm_rows": "route_major",
    "plan": {
     "gate_up_a_family": "grouped",
     "down_a_family": "grouped",
@@ -39,7 +39,7 @@
    "name": "decode.wide_windows",
    "layout": "shared",
    "phase": "decode",
-   "provider": "cutedsl",
+   "base_gemm_rows": "expert_major",
    "plan": {
     "gate_up_a_family": "grouped",
     "down_a_family": "grouped",
@@ -57,7 +57,7 @@
    "layout": "shared",
    "phase": "prefill",
    "max_rank": 8,
-   "provider": "deepgemm_contiguous",
+   "base_gemm_rows": "route_major",
    "plan": {
     "gate_up_a_family": "token_dedup_grouped",
     "down_a_family": "grouped",
@@ -72,7 +72,7 @@
    "layout": "shared",
    "phase": "prefill",
    "max_rank": 64,
-   "provider": "deepgemm_contiguous",
+   "base_gemm_rows": "route_major",
    "plan": {
     "gate_up_a_family": "token_dedup_grouped",
     "down_a_family": "grouped",
@@ -84,7 +84,7 @@
    "name": "prefill.materialized",
    "layout": "shared",
    "phase": "prefill",
-   "provider": "deepgemm_contiguous",
+   "base_gemm_rows": "route_major",
    "plan": {
     "gate_up_a_family": "token_dedup_grouped",
     "down_a_family": "grouped",
@@ -99,7 +99,7 @@
   {
    "name": "fallback.serial",
    "phase": "decode",
-   "provider": "deepgemm",
+   "base_gemm_rows": "expert_major",
    "plan": {
     "gate_up_a_family": "grouped",
     "down_a_family": "grouped",
@@ -113,7 +113,7 @@
    "name": "fallback.serial_prefill",
    "layout": "per_expert",
    "phase": "prefill",
-   "provider": "deepgemm_contiguous",
+   "base_gemm_rows": "route_major",
    "plan": {
     "gate_up_a_family": "grouped",
     "down_a_family": "grouped",
@@ -127,7 +127,7 @@
    "name": "fallback.serial_prefill",
    "layout": "shared",
    "phase": "prefill",
-   "provider": "deepgemm",
+   "base_gemm_rows": "expert_major",
    "plan": {
     "gate_up_a_family": "grouped",
     "down_a_family": "grouped",

@@ -28,7 +28,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum
 from functools import cache
-from typing import Any
+from typing import Any, Literal
 
 import pydantic
 from pydantic.dataclasses import dataclass as pydantic_dataclass
@@ -503,7 +503,14 @@ class _PlanRowModel(pydantic.BaseModel):
     layout: str | None = None  # per_expert | shared; None matches both
     phase: str | None = None  # decode | prefill; None matches both
     max_rank: int | None = None
-    provider: str
+    # How the routed activation rows reach the base GEMM. NOT the adapter
+    # ``layout`` above: this is the row order of the activation buffer, and it
+    # is a plan property because the surrounding stages depend on it.
+    # expert_major = padded [E, m_max, K] per-expert slabs (masked providers);
+    # route_major = one flat buffer of aligned per-expert segments (contiguous
+    # providers). WHICH VENDOR implements it is a serving choice, not a table
+    # one -- see --moe-lora-base-gemm.
+    base_gemm_rows: Literal["expert_major", "route_major"]
     plan: _PlanSpecModel
     # Free-form annotation the offline tuner stamps on rows it emits or
     # sweeps.  Declared so extra="forbid" still rejects genuine typos while
@@ -558,11 +565,15 @@ def load_plans(architecture: DeviceArchitecture) -> _PlansFileModel:
 
 @dataclass(frozen=True, slots=True)
 class SelectedPlan:
-    """One phase's resolved menu entry: identity, provider, validated plan."""
+    """One phase's resolved menu entry: identity, row order, validated plan.
+
+    Carries the row order the plan requires, not a provider name: the vendor
+    that implements it comes from serving config, so a table cannot pin it.
+    """
 
     key: str
     name: str
-    provider: str
+    base_gemm_rows: str
     plan: MoeLoraExecutionPlan
 
 
@@ -687,7 +698,7 @@ def resolve_plans(
         selected[phase] = SelectedPlan(
             key=f"{architecture.value}.{layout_name}.{row.name}",
             name=row.name,
-            provider=row.provider,
+            base_gemm_rows=row.base_gemm_rows,
             plan=build_plan(
                 row.plan,
                 activation=activation,

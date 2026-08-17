@@ -15,10 +15,10 @@ Three variant kinds, one per invocation:
   python make_config_variant.py tiles --arch gb300 --out /tmp/v \
       --row decode.per_expert --drop
 
-  # Swap one plan row's provider (same-layout vendor swap or otherwise —
-  # the device gate and plan contracts still validate at startup):
+  # Swap one plan row's base-GEMM row order (the vendor is a server flag,
+  # --moe-lora-base-gemm, not a table value):
   python make_config_variant.py plans --arch gb300 --out /tmp/v \
-      --row prefill.serial --provider deepgemm_contiguous
+      --row prefill.serial --base-gemm-rows expert_major
 """
 
 from __future__ import annotations
@@ -70,7 +70,11 @@ def main() -> None:
     parser.add_argument("--row", required=True, help="plan row name, exact")
     parser.add_argument("--from-rule", help="tiles: predicate of the rule to force")
     parser.add_argument("--drop", action="store_true", help="tiles: delete the row")
-    parser.add_argument("--provider", help="plans: new provider for the row")
+    parser.add_argument(
+        "--base-gemm-rows",
+        choices=("expert_major", "route_major"),
+        help="plans: new base-GEMM row order for the row",
+    )
     args = parser.parse_args()
 
     table = copy.deepcopy(_load(args.arch, args.kind))
@@ -87,8 +91,8 @@ def main() -> None:
             table["rules"][args.row] = [{"sites": copy.deepcopy(rule["sites"])}]
             tag = args.from_rule.replace("=", "").replace(",", "_")
     else:
-        if not args.provider:
-            raise SystemExit("plans: --provider is required")
+        if not args.base_gemm_rows:
+            raise SystemExit("plans: --base-gemm-rows is required")
         rows = [
             row
             for row in table["scenarios"] + table.get("fallback", [])
@@ -96,11 +100,11 @@ def main() -> None:
         ]
         if not rows:
             raise SystemExit(f"no plan row named {args.row!r}")
-        before = {row["provider"] for row in rows}
+        before = {row["base_gemm_rows"] for row in rows}
         for row in rows:
-            row["provider"] = args.provider
-        tag = args.provider
-        print(f"{args.row}: {'/'.join(sorted(before))} -> {args.provider}")
+            row["base_gemm_rows"] = args.base_gemm_rows
+        tag = args.base_gemm_rows
+        print(f"{args.row}: {'/'.join(sorted(before))} -> {args.base_gemm_rows}")
 
     out = os.path.join(args.out, f"{args.row}__{tag}")
     os.makedirs(out, exist_ok=True)

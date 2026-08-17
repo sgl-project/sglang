@@ -89,7 +89,7 @@ def _menu(architecture, layout, activation=_SWIGLU):
         row.name: SelectedPlan(
             key=f"{architecture.value}.{layout_name}.{row.name}",
             name=row.name,
-            provider=row.provider,
+            base_gemm_rows=row.base_gemm_rows,
             plan=build_plan(row.plan, activation=activation, is_shared_outer=layout),
         )
         for row in (*table.scenarios, *table.fallback)
@@ -178,25 +178,25 @@ class TestRowDomainConfig:
         # backend.  The shared-outer fallback twin has no per-expert
         # is_shared_outer to re-target and stays on the masked DeepGEMM provider.
         gb300_pe = _menu(_GB300, False)
-        assert gb300_pe["prefill.serial"].provider == "cutedsl_contiguous"
-        assert gb300_pe["fallback.serial_prefill"].provider == "deepgemm_contiguous"
+        assert gb300_pe["prefill.serial"].base_gemm_rows == "route_major"
+        assert gb300_pe["fallback.serial_prefill"].base_gemm_rows == "route_major"
         gb300_sh = _menu(_GB300, True)
-        assert gb300_sh["prefill.token_dedup"].provider == "cutedsl_contiguous"
-        assert gb300_sh["fallback.serial_prefill"].provider == "deepgemm"
+        assert gb300_sh["prefill.token_dedup"].base_gemm_rows == "route_major"
+        assert gb300_sh["fallback.serial_prefill"].base_gemm_rows == "expert_major"
         h200_pe = _menu(_H200, False)
-        assert h200_pe["prefill.serial"].provider == "deepgemm_contiguous"
-        assert h200_pe["fallback.serial_prefill"].provider == "deepgemm_contiguous"
+        assert h200_pe["prefill.serial"].base_gemm_rows == "route_major"
+        assert h200_pe["fallback.serial_prefill"].base_gemm_rows == "route_major"
         # Every H200 shared prefill band converted: the small-rank and
         # materialized b_activation twins and the shared-rank band (its
         # reduce is pair-domain, its tail reads base rows only through
         # src2dst).
         h200_sh = _menu(_H200, True)
-        assert h200_sh["prefill.materialized.small_rank"].provider == (
-            "deepgemm_contiguous"
+        assert (
+            h200_sh["prefill.materialized.small_rank"].base_gemm_rows == "route_major"
         )
-        assert h200_sh["prefill.shared_rank"].provider == "deepgemm_contiguous"
-        assert h200_sh["prefill.materialized"].provider == "deepgemm_contiguous"
-        assert h200_sh["fallback.serial_prefill"].provider == "deepgemm"
+        assert h200_sh["prefill.shared_rank"].base_gemm_rows == "route_major"
+        assert h200_sh["prefill.materialized"].base_gemm_rows == "route_major"
+        assert h200_sh["fallback.serial_prefill"].base_gemm_rows == "expert_major"
 
     def test_decode_choices_never_convert(self) -> None:
         # DECODE is categorically expert-major by measured config (the
@@ -209,7 +209,7 @@ class TestRowDomainConfig:
                     for name, choice in _menu(architecture, layout, activation).items():
                         if not name.startswith("decode.") and name != "fallback.serial":
                             continue
-                        assert choice.provider in ("cutedsl", "deepgemm"), name
+                        assert choice.base_gemm_rows == "expert_major", name
 
     def test_h200_large_expert_prefill_selects_the_contiguous_serial(self) -> None:
         # The DeepGEMM contiguous backend is the only feasible prefill
@@ -226,20 +226,25 @@ class TestRowDomainConfig:
             num_local_experts=512,
         )[Phase.PREFILL]
         assert routed.name == "prefill.serial"
-        assert routed.provider == "deepgemm_contiguous"
+        assert routed.base_gemm_rows == "route_major"
         assert not routed.plan.is_fully_serial_materialized()
         assert routed.plan.down_b_scatter is True
 
     def test_runner_accepts_the_contiguous_provider_keys(self) -> None:
         from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
-        assert MoeLoraRunner.select_provider_cls("deepgemm_contiguous") is not None
+        assert MoeLoraRunner.select_provider_cls("route_major", "deepgemm") is not None
         try:
-            assert MoeLoraRunner.select_provider_cls("cutedsl_contiguous") is not None
+            assert (
+                MoeLoraRunner.select_provider_cls("route_major", "cutedsl") is not None
+            )
         except NotImplementedError:
-            pass  # known name, device-gated (needs SM90+)
-        with pytest.raises(ValueError, match="row_major"):
-            MoeLoraRunner.select_provider_cls("row_major")
+            pass  # known pair, device-gated (needs SM90+)
+        # a vendor in the row-order slot must not silently resolve
+        with pytest.raises(ValueError, match="row order"):
+            MoeLoraRunner.select_provider_cls("cutedsl_contiguous", "cutedsl")
+        with pytest.raises(ValueError, match="vendor"):
+            MoeLoraRunner.select_provider_cls("route_major", "nosuchvendor")
 
 
 class TestCuteDslContiguousScheduleGeometry:
@@ -447,9 +452,9 @@ def _cutedsl_contiguous_ready() -> bool:
 
 # Both contiguous engines run the SAME oracle and CUDA-graph cases below.
 _CONTIGUOUS_PROVIDER_PARAMS = (
-    pytest.param("deepgemm_contiguous", marks=deepgemm_cuda_only),
+    pytest.param("deepgemm", marks=deepgemm_cuda_only),
     pytest.param(
-        "cutedsl_contiguous",
+        "cutedsl",
         marks=pytest.mark.skipif(
             not _cutedsl_contiguous_ready(),
             reason=(
@@ -757,7 +762,7 @@ def _standalone_output_allocation(runner, *, num_tokens, dtype, device):
     return torch.empty((num_tokens, runner.hidden_size), dtype=dtype, device=device)
 
 
-def _build_runner(architecture, choice, provider_name: str, gpu, num_experts, layout):
+def _build_runner(architecture, choice, vendor: str, gpu, num_experts, layout):
     from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
     quant_info = MoeLoraBf16QuantInfo(
@@ -767,7 +772,9 @@ def _build_runner(architecture, choice, provider_name: str, gpu, num_experts, la
         intermediate_size=_INTERMEDIATE,
         hidden_size=_HIDDEN,
     )
-    provider = MoeLoraRunner.select_provider_cls(provider_name)(quant_info)
+    provider = MoeLoraRunner.select_provider_cls(choice.base_gemm_rows, vendor)(
+        quant_info
+    )
     runner = MoeLoraRunner(
         providers={"test": provider},
         top_k=_TOP_K,
@@ -777,9 +784,9 @@ def _build_runner(architecture, choice, provider_name: str, gpu, num_experts, la
     runner._test_execution = dict(
         plan=choice.plan,
         launch_config=_shipped_launch(architecture, choice),
-        provider_name="test",
+        base_gemm_rows="test",
     )
-    runner.prepare_plan(choice.plan, provider_name="test")
+    runner.prepare_plan(choice.plan, base_gemm_rows="test")
     return runner
 
 

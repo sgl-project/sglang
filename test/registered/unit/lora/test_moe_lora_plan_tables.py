@@ -76,7 +76,7 @@ def _resolve(
 class TestSm100PerExpert:
     def test_decode_ships_indexed_pairs_b_grouped_a_wide_windows(self):
         c = _resolve(rank=32, experts=512)[Phase.DECODE]
-        assert c.provider == "cutedsl"
+        assert c.base_gemm_rows == "expert_major"
         assert c.plan.gate_up_a.family is LoraAFamily.GROUPED
         assert c.plan.gate_up_b.family is LoraBFamily.INDEXED_PAIRS
         assert c.plan.down_a.family is LoraAFamily.GROUPED
@@ -89,7 +89,7 @@ class TestSm100PerExpert:
 
     def test_prefill_ships_serial_route_major_b_activation(self):
         c = _resolve()[Phase.PREFILL]
-        assert c.provider == "cutedsl_contiguous"
+        assert c.base_gemm_rows == "route_major"
         assert c.plan.middle.family is MiddleFamily.B_ACTIVATION
         assert c.plan.gate_up_b is None  # consumed by the b_activation middle
         assert c.plan.down_b_scatter
@@ -132,7 +132,7 @@ class TestSm100PerExpert:
 class TestSm100Shared:
     def test_decode_ships_wide_window_materialized_joint(self):
         c = _resolve(layout=True, rank=32)[Phase.DECODE]
-        assert c.provider == "cutedsl"
+        assert c.base_gemm_rows == "expert_major"
         assert c.plan.early_overlap is EarlyOverlap.GATE_UP_A_B
         assert c.plan.late_overlap is LateOverlap.DOWN_A_B
         assert c.plan.middle.family is MiddleFamily.MATERIALIZED
@@ -143,7 +143,7 @@ class TestSm100Shared:
 
     def test_prefill_ships_token_dedup_serial(self):
         c = _resolve(layout=True, rank=32)[Phase.PREFILL]
-        assert c.provider == "cutedsl_contiguous"
+        assert c.base_gemm_rows == "route_major"
         assert c.plan.gate_up_a.family is LoraAFamily.TOKEN_DEDUP_GROUPED
         assert c.plan.middle.family is MiddleFamily.B_ACTIVATION
         assert c.plan.route_builder is RouteBuilderFamily.JOINT_SHARED_OUTER
@@ -158,7 +158,7 @@ class TestH200:
         for rank in (8, 32, 320):
             c = _resolve(architecture=_H200, rank=rank)[Phase.DECODE]
             assert c.plan.down_a.family is LoraAFamily.INDEXED
-            assert c.provider == "cutedsl"
+            assert c.base_gemm_rows == "expert_major"
 
     def test_shared_prefill_rank_band(self):
         # The one plan-level rank band, bound once at bind time: <=8 the
@@ -200,7 +200,7 @@ class TestResolution:
         selected = _resolve(hidden=8192, experts=1024)
         decode = selected[Phase.DECODE]
         assert decode.name == "fallback.serial"
-        assert decode.provider == "deepgemm"
+        assert decode.base_gemm_rows == "expert_major"
         assert decode.plan.early_overlap is EarlyOverlap.NONE
         assert decode.plan.late_overlap is LateOverlap.NONE
         assert selected[Phase.PREFILL].name == "fallback.serial_prefill"

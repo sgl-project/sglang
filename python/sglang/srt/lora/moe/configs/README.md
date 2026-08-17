@@ -22,12 +22,21 @@ Plans file:
 {
   "arch": "gb300",
   "domain": {"max_hidden": 4096, "max_local_experts": 512},
-  "scenarios": [ { "name", "layout", "phase", "max_rank", "provider",
+  "scenarios": [ { "name", "layout", "phase", "max_rank", "base_gemm_rows",
                    "plan" }, ... ],
   "fallback":  [ ...same row shape, matched when the geometry is outside
                  "domain" or no scenario row matches... ]
 }
 ```
+
+`base_gemm_rows` is how the routed activation rows reach the base GEMM —
+`expert_major` for the padded `[E, m_max, K]` per-expert slabs, `route_major`
+for one flat buffer of aligned per-expert segments. It is a table value
+because the surrounding stages are built for it. WHICH VENDOR implements that
+row order is not: `--moe-lora-base-gemm` picks CuteDSL or DeepGEMM at serving
+time, defaulting to CuteDSL, and a geometry CuteDSL cannot admit falls back to
+DeepGEMM automatically. Do not confuse `base_gemm_rows` with `layout` above:
+that one is the ADAPTER weight layout (per-expert or shared-outer).
 
 Plan selection happens ONCE, at weight bind: every selection input (layout,
 phase, pool-padded rank, geometry) is a server-lifetime constant, so
@@ -45,9 +54,10 @@ measured rows, so a ReLU2 MoE is now served by the SwiGLU winners:
   set and now inherits the SwiGLU ladder (which is banded by token count,
   where the ReLU2 row was not);
 - per-expert prefill on SM100: materially different — the retired
-  `prefill.relu2` ran the masked `cutedsl` provider with an early gate/up-A
+  `prefill.relu2` ran the expert-major (masked) rows with an early gate/up-A
   window and a late down-A+B window and no scatter, where `prefill.serial`
-  runs `cutedsl_contiguous` strictly serially with the scatter epilogue.
+  runs the route-major (contiguous) rows strictly serially with the scatter
+  epilogue.
 
 Both are numerically correct (every provider registers relu2 for the fused
 middle); the ReLU2-tuned schedules are simply no longer served. Re-adding

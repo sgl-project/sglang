@@ -158,10 +158,15 @@ class MoeLoraRunner:
         routed_scaling_factor: float | None,
         activation: ActivationFamily = ActivationFamily.SWIGLU,
         workspace: MoeLoraWorkspace | None = None,
+        base_gemm_vendor: str = "cutedsl",
     ) -> None:
         if not providers:
             raise ValueError("a MoE LoRA runner needs at least one provider")
         self.providers = dict(providers)
+        # The vendor actually bound, which is not always the one asked for:
+        # a geometry CuteDSL cannot admit falls back to DeepGEMM. Recorded so
+        # the bind log reports what ran rather than what was requested.
+        self.base_gemm_vendor = base_gemm_vendor
         # Every provider of a layer reads the same resident tensors, so the
         # geometry is a layer fact and lives here rather than per call.
         geometries = {
@@ -193,17 +198,38 @@ class MoeLoraRunner:
         cls,
         base_layer: FusedMoE,
         *,
-        provider_names: Sequence[str],
+        row_orders: Sequence[str],
+        vendor: str,
         workspace: MoeLoraWorkspace | None = None,
     ) -> MoeLoraRunner:
-        """Admit the layer's resident state and bind its unique providers."""
+        """Admit the layer's resident state and bind one provider per row order.
+
+        A layer needs at most two: the decode phase's and the prefill phase's.
+        Both come from the same vendor, so the flag is read once per layer.
+        """
         cls._admit(base_layer)
         config = base_layer.moe_runner_config
+        num_local_experts = int(base_layer.num_local_experts)
+        if vendor == "cutedsl" and not cls.cutedsl_admits(num_local_experts):
+            # DeepGEMM admits every geometry, which is why the out-of-domain
+            # fallback rows used to name it outright. Now that the vendor is a
+            # serving choice, that guarantee lives here instead, or a geometry
+            # past CuTeDSL's limits would fail to start.
+            logger.warning(
+                "MoE LoRA base GEMM falling back to DeepGEMM: CuTeDSL cannot "
+                "admit this device/geometry (%d local experts). Decode "
+                "throughput is materially lower on DeepGEMM.",
+                num_local_experts,
+            )
+            vendor = "deepgemm"
         return cls(
             providers={
-                name: cls._build_provider(base_layer, provider_name=name)
-                for name in dict.fromkeys(provider_names)
+                rows: cls._build_provider(
+                    base_layer, base_gemm_rows=rows, vendor=vendor
+                )
+                for rows in dict.fromkeys(row_orders)
             },
+            base_gemm_vendor=vendor,
             # Layer-static routing scalars, read once rather than per forward.
             top_k=int(config.top_k),
             routed_scaling_factor=config.routed_scaling_factor,
@@ -304,50 +330,70 @@ class MoeLoraRunner:
             )
 
     @staticmethod
-    def select_provider_cls(
-        provider_name: str,
-    ) -> type[MoeBaseProvider]:
-        """Resolve the provider explicitly selected by the serving config."""
-        from sglang.srt.lora.moe.base_gemm_provider.deep_gemm_bf16 import (
-            DeepGemmBf16Provider,
+    def cutedsl_admits(num_local_experts: int) -> bool:
+        """Whether CuTeDSL can serve this device and geometry at all.
+
+        Two gates, both ours rather than the kernel's: SM90 is the oldest
+        architecture with a masked grouped GEMM here, and the packed direct
+        schedule holds expert indices in a fixed-width field.  The remaining
+        admission input -- rows per expert against the widest compiled tile --
+        is per-forward today and cannot be answered here yet.
+        """
+        from sglang.srt.lora.moe.base_gemm_provider.cutedsl_masked.schedule_abi import (
+            MAX_EXPERTS,
         )
 
-        if provider_name == "deepgemm":
-            return DeepGemmBf16Provider
-        if provider_name == "deepgemm_contiguous":
-            from sglang.srt.lora.moe.base_gemm_provider.deep_gemm_bf16 import (
-                DeepGemmBf16ContiguousProvider,
-            )
+        if torch.cuda.get_device_capability() < (9, 0):
+            return False
+        return num_local_experts <= MAX_EXPERTS
 
-            return DeepGemmBf16ContiguousProvider
-        if provider_name == "cutedsl":
+    @staticmethod
+    def select_provider_cls(
+        base_gemm_rows: str,
+        vendor: str,
+    ) -> type[MoeBaseProvider]:
+        """Resolve (row order from the plan) x (vendor from serving config).
+
+        The plan table owns the row order because the surrounding stages are
+        built for it; the vendor is a serving choice, so the pair is only
+        joined here.
+        """
+        if base_gemm_rows not in ("expert_major", "route_major"):
+            raise ValueError(
+                f"unknown MoE LoRA base-GEMM row order {base_gemm_rows!r}; "
+                "expected 'expert_major' or 'route_major'"
+            )
+        if vendor == "cutedsl":
             if torch.cuda.get_device_capability() < (9, 0):
                 raise NotImplementedError(
-                    "the CuTeDSL MoE LoRA MoE provider requires SM90+ "
-                    "(tcgen05 on SM100+, WGMMA on SM90); this device is "
+                    "the CuTeDSL MoE LoRA providers require SM90+ (tcgen05 on "
+                    "SM100+, WGMMA on SM90); this device is "
                     f"sm{torch.cuda.get_device_capability()}"
                 )
             from sglang.srt.lora.moe.base_gemm_provider.cutedsl_bf16 import (
+                CuteDslBf16ContiguousProvider,
                 CuteDslBf16Provider,
             )
 
-            return CuteDslBf16Provider
-        if provider_name == "cutedsl_contiguous":
-            if torch.cuda.get_device_capability() < (9, 0):
-                raise NotImplementedError(
-                    "the contiguous CuTeDSL MoE LoRA MoE provider requires "
-                    "SM90+ (tcgen05 on SM100+, WGMMA on SM90); this device "
-                    f"is sm{torch.cuda.get_device_capability()}"
-                )
-            from sglang.srt.lora.moe.base_gemm_provider.cutedsl_bf16 import (
-                CuteDslBf16ContiguousProvider,
+            return (
+                CuteDslBf16Provider
+                if base_gemm_rows == "expert_major"
+                else CuteDslBf16ContiguousProvider
+            )
+        if vendor == "deepgemm":
+            from sglang.srt.lora.moe.base_gemm_provider.deep_gemm_bf16 import (
+                DeepGemmBf16ContiguousProvider,
+                DeepGemmBf16Provider,
             )
 
-            return CuteDslBf16ContiguousProvider
+            return (
+                DeepGemmBf16Provider
+                if base_gemm_rows == "expert_major"
+                else DeepGemmBf16ContiguousProvider
+            )
         raise ValueError(
-            f"unknown MoE LoRA MoE provider {provider_name!r}; expected "
-            "'deepgemm', 'deepgemm_contiguous', 'cutedsl', or "
-            "'cutedsl_contiguous'"
+            f"unknown MoE LoRA base-GEMM vendor {vendor!r}; expected "
+            "'cutedsl' or 'deepgemm'"
         )
 
     @classmethod
@@ -355,9 +401,10 @@ class MoeLoraRunner:
         cls,
         base_layer: FusedMoE,
         *,
-        provider_name: str,
+        base_gemm_rows: str,
+        vendor: str,
     ) -> MoeBaseProvider:
-        return cls.select_provider_cls(provider_name)(
+        return cls.select_provider_cls(base_gemm_rows, vendor)(
             MoeLoraBf16QuantInfo(
                 w13_weight=base_layer.w13_weight,
                 w2_weight=base_layer.w2_weight,
@@ -367,9 +414,9 @@ class MoeLoraRunner:
             )
         )
 
-    def prepare_plan(self, plan: MoeLoraExecutionPlan, *, provider_name: str) -> None:
+    def prepare_plan(self, plan: MoeLoraExecutionPlan, *, base_gemm_rows: str) -> None:
         """Validate one menu entry against its provider, once, at bind time."""
-        self._validate_plan_provider(plan, self.providers[provider_name])
+        self._validate_plan_provider(plan, self.providers[base_gemm_rows])
 
     def _validate_plan_provider(
         self, plan: MoeLoraExecutionPlan, provider: MoeBaseProvider
@@ -442,13 +489,13 @@ class MoeLoraRunner:
         *,
         plan: MoeLoraExecutionPlan,
         launch_config: MoeLoraLaunchConfig,
-        provider_name: str,
+        base_gemm_rows: str,
         output_dtype: torch.dtype | None = None,
     ) -> StandardCombineInput:
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-        provider = self.providers[provider_name]
+        provider = self.providers[base_gemm_rows]
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         assert TopKOutputChecker.format_is_standard(topk_output)
@@ -1202,6 +1249,21 @@ class MoeLoraRunner:
         return output
 
 
+def _base_gemm_vendor() -> str:
+    """The ``--moe-lora-base-gemm`` choice, defaulting when no server is up.
+
+    Kernel tests and offline tools construct engines without a published
+    server context; they get the shipped default rather than an error, which
+    is also what a bare library import should see.
+    """
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        return get_global_server_args().moe_lora_base_gemm
+    except Exception:  # no published context (tests, offline tooling)
+        return "cutedsl"
+
+
 class MoeLoraLayerEngine:
     """Everything one MoE layer needs to run LoRA behind ``run_moe_core``.
 
@@ -1231,6 +1293,10 @@ class MoeLoraLayerEngine:
         )
         self.hidden_size = int(base_layer.w2_weight.shape[1])
         self.num_local_experts = int(base_layer.num_local_experts)
+        # Vendor for both base GEMMs, read once per layer at construction: it
+        # is a server-lifetime constant, so nothing vendor-shaped reaches the
+        # forward path or the plan tables.
+        self.base_gemm_vendor = _base_gemm_vendor()
         self.workspace = workspace
         self._selected: dict[Phase, SelectedPlan] | None = None
         self._tiles: dict[Phase, TileTable] = {}
@@ -1272,12 +1338,13 @@ class MoeLoraLayerEngine:
         )
         runner = MoeLoraRunner.from_layer(
             self._base_layer,
-            provider_names=tuple(sel.provider for sel in selected.values()),
+            row_orders=tuple(sel.base_gemm_rows for sel in selected.values()),
+            vendor=self.base_gemm_vendor,
             workspace=self.workspace,
         )
         tiles: dict[Phase, TileTable] = {}
         for phase, sel in selected.items():
-            runner.prepare_plan(sel.plan, provider_name=sel.provider)
+            runner.prepare_plan(sel.plan, base_gemm_rows=sel.base_gemm_rows)
             table = resolve_tiles(
                 architecture_value=self.architecture.value,
                 plan_key_name=sel.name,
@@ -1294,15 +1361,17 @@ class MoeLoraLayerEngine:
         if not MoeLoraLayerEngine._config_logged:
             MoeLoraLayerEngine._config_logged = True
             logger.info(
-                "MoE LoRA plans bound (%s, hidden=%d, local_experts=%d, rank=%d): %s",
+                "MoE LoRA plans bound (%s, hidden=%d, local_experts=%d, "
+                "rank=%d): %s [base GEMM: %s]",
                 self.architecture.value,
                 self.hidden_size,
                 self.num_local_experts,
                 physical_rank,
                 ", ".join(
-                    f"{phase.value}={sel.key}@{sel.provider}"
+                    f"{phase.value}={sel.key}@{sel.base_gemm_rows}"
                     for phase, sel in selected.items()
                 ),
+                runner.base_gemm_vendor,
             )
 
     def run(
@@ -1325,6 +1394,6 @@ class MoeLoraLayerEngine:
             batch,
             plan=sel.plan,
             launch_config=launch_config,
-            provider_name=sel.provider,
+            base_gemm_rows=sel.base_gemm_rows,
             output_dtype=output_dtype,
         )

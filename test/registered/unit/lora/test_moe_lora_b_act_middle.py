@@ -71,7 +71,7 @@ def _menu(architecture, layout, activation=_SWIGLU):
         row.name: SelectedPlan(
             key=f"{architecture.value}.{layout_name}.{row.name}",
             name=row.name,
-            provider=row.provider,
+            base_gemm_rows=row.base_gemm_rows,
             plan=build_plan(row.plan, activation=activation, is_shared_outer=layout),
         )
         for row in (*table.scenarios, *table.fallback)
@@ -146,7 +146,7 @@ class TestBActMiddleConfig:
         assert serial.plan.middle.family is MiddleFamily.B_ACTIVATION
         assert serial.plan.gate_up_b is None
         assert serial.plan.down_b_scatter is True
-        assert serial.provider == "deepgemm_contiguous"
+        assert serial.base_gemm_rows == "route_major"
 
     def test_decode_choices_keep_the_materialized_middle(self) -> None:
         # The swap is a prefill-only config: every decode-phase choice on
@@ -186,11 +186,11 @@ class TestBActMiddleConfig:
         assert per_expert.plan.middle.family is MiddleFamily.B_ACTIVATION
         assert per_expert.plan.gate_up_b is None
         assert per_expert.plan.down_b_scatter is True
-        assert per_expert.provider == "deepgemm_contiguous"
+        assert per_expert.base_gemm_rows == "route_major"
         assert shared.plan.middle.family is MiddleFamily.B_ACTIVATION
         assert shared.plan.gate_up_b is None
         assert shared.plan.down_b_scatter is False
-        assert shared.provider == "deepgemm"
+        assert shared.base_gemm_rows == "expert_major"
         assert relu2.plan.middle.family is MiddleFamily.B_ACTIVATION
         assert relu2.plan.middle.activation is ActivationFamily.RELU2
         assert relu2.plan.down_b_scatter is True
@@ -299,11 +299,11 @@ def _reference_choice():
     return choice
 
 
-def _build_runner(plan, launch_config, provider_name: str, gpu, num_experts: int):
+def _build_runner(plan, launch_config, base_gemm_rows: str, gpu, num_experts: int):
     from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
     from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 
-    provider = MoeLoraRunner.select_provider_cls(provider_name)(
+    provider = MoeLoraRunner.select_provider_cls(base_gemm_rows, "deepgemm")(
         MoeLoraBf16QuantInfo(
             w13_weight=gpu["w13_weight"],
             w2_weight=gpu["w2_weight"],
@@ -319,9 +319,9 @@ def _build_runner(plan, launch_config, provider_name: str, gpu, num_experts: int
         activation=ActivationFamily.SWIGLU,
     )
     runner._test_execution = dict(
-        plan=plan, launch_config=launch_config, provider_name="test"
+        plan=plan, launch_config=launch_config, base_gemm_rows="test"
     )
-    runner.prepare_plan(plan, provider_name="test")
+    runner.prepare_plan(plan, base_gemm_rows="test")
     return runner
 
 
@@ -356,10 +356,10 @@ def _run_once(runner, gpu, token_slots):
 
 
 @deepgemm_cuda_only
-@pytest.mark.parametrize("provider_name", ("deepgemm", "deepgemm_contiguous"))
+@pytest.mark.parametrize("base_gemm_rows", ("expert_major", "route_major"))
 @pytest.mark.parametrize("scatter", (False, True))
 def test_runner_b_act_matches_the_materialized_reference(
-    provider_name: str, scatter: bool, monkeypatch: pytest.MonkeyPatch
+    base_gemm_rows: str, scatter: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """One serial prefill batch, serial materialized middle vs the b_act swap
     (and vs b_act + scatter, the full shipped composition) — on the masked
@@ -384,14 +384,14 @@ def test_runner_b_act_matches_the_materialized_reference(
     reference_runner = _build_runner(
         reference_choice.plan,
         shared_launch,
-        "deepgemm",
+        "expert_major",
         gpu,
         num_experts,
     )
     b_act_runner = _build_runner(
         swapped_plan,
         shared_launch,
-        provider_name,
+        base_gemm_rows,
         gpu,
         num_experts,
     )
@@ -404,5 +404,5 @@ def test_runner_b_act_matches_the_materialized_reference(
             b_act,
             reference,
             **_B_ACT_TOLERANCE,
-            msg=f"{provider_name}: scatter={scatter} {traffic}",
+            msg=f"{base_gemm_rows}: scatter={scatter} {traffic}",
         )

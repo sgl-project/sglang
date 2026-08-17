@@ -232,10 +232,10 @@ def test_config_chosen_per_expert_swiglu_matches_fp32_reference(
     choice, launch_config = _resolve_execution(
         architecture_for_capability(*capability), mode, num_tokens
     )
-    assert choice.provider is not None
+    assert choice.base_gemm_rows is not None
     assert choice.plan is not None
 
-    provider_cls = MoeLoraRunner.select_provider_cls(choice.provider)
+    provider_cls = MoeLoraRunner.select_provider_cls(choice.base_gemm_rows, "deepgemm")
     provider = provider_cls(
         MoeLoraBf16QuantInfo(
             w13_weight=gpu["w13_weight"],
@@ -252,9 +252,9 @@ def test_config_chosen_per_expert_swiglu_matches_fp32_reference(
         activation=ActivationFamily.SWIGLU,
     )
     runner._test_execution = dict(
-        plan=choice.plan, launch_config=launch_config, provider_name="test"
+        plan=choice.plan, launch_config=launch_config, base_gemm_rows="test"
     )
-    runner.prepare_plan(choice.plan, provider_name="test")
+    runner.prepare_plan(choice.plan, base_gemm_rows="test")
 
     dispatch = StandardDispatchOutput(
         hidden_states=gpu["hidden_states"],
@@ -331,7 +331,7 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
     choice, launch_config = _resolve_execution(
         architecture_for_capability(*capability), mode, num_tokens
     )
-    provider = MoeLoraRunner.select_provider_cls(choice.provider)(
+    provider = MoeLoraRunner.select_provider_cls(choice.base_gemm_rows, "deepgemm")(
         MoeLoraBf16QuantInfo(
             w13_weight=gpu["w13_weight"],
             w2_weight=gpu["w2_weight"],
@@ -347,9 +347,9 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
         activation=ActivationFamily.SWIGLU,
     )
     runner._test_execution = dict(
-        plan=choice.plan, launch_config=launch_config, provider_name="test"
+        plan=choice.plan, launch_config=launch_config, base_gemm_rows="test"
     )
-    runner.prepare_plan(choice.plan, provider_name="test")
+    runner.prepare_plan(choice.plan, base_gemm_rows="test")
     dispatch = StandardDispatchOutput(
         hidden_states=gpu["hidden_states"],
         hidden_states_scale=None,

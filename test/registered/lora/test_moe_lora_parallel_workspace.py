@@ -30,7 +30,7 @@ class TestMoeLoraParallelWorkspace(CustomTestCase):
         runner._validate_plan_provider = mock.Mock()
         plan = mock.Mock()
 
-        runner.prepare_plan(plan, provider_name="test")
+        runner.prepare_plan(plan, base_gemm_rows="test")
 
         runner._validate_plan_provider.assert_called_once_with(plan, provider)
 
