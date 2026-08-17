@@ -492,10 +492,7 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-stepper button:disabled, .sgd-builder-request-stepper button:disabled { opacity: 0.32; cursor: not-allowed; }
 .sgd-builder-resource-summary { margin: 8px 0 0; color: var(--sgdb-muted); font-size: 11px; line-height: 1.4; }
 
-.sgd-builder-topology-summary { display: grid; gap: 10px; }
-.sgd-builder-topology-summary > div { display: grid; gap: 4px; }
-.sgd-builder-topology-summary > div > span { color: var(--sgdb-muted); font-size: 11px; }
-.sgd-builder-topology-summary strong { font-size: 13px; font-weight: 590; line-height: 1.4; }
+.sgd-builder-topology-toggle { margin-top: 10px; }
 .sgd-builder-text-action {
   justify-self: start;
   min-height: 32px;
@@ -729,8 +726,9 @@ html.dark table tbody tr:nth-child(even) td,
 
 @container builder-controls (min-width: 560px) {
   .sgd-builder-scope-panel[data-scope="base"] { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 28px; }
-  .sgd-builder-scope-panel[data-scope="base"] > .sgd-builder-recipe,
-  .sgd-builder-scope-panel[data-scope="base"] > .sgd-builder-topology { grid-column: 1 / -1; }
+  .sgd-builder-scope-panel[data-scope="base"] > .sgd-builder-recipe { grid-column: 1 / -1; }
+  /* Half a column cannot host two steppers side by side — stack them. */
+  .sgd-builder-scope-panel[data-scope="base"] .sgd-builder-resource-grid { grid-template-columns: minmax(0, 1fr); }
   .sgd-builder-setting-layout { display: grid; grid-template-columns: minmax(240px, 0.9fr) minmax(0, 1.1fr); }
   .sgd-builder-setting-list { padding-right: 16px; border-right: 1px solid var(--sgdb-line); }
   .sgd-builder-context--inline { display: none; }
@@ -761,7 +759,6 @@ html.dark table tbody tr:nth-child(even) td,
   .sgd-builder-scope-tabs button { font-size: 13px; }
   .sgd-builder-hardware-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .sgd-builder-resource-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .sgd-builder-topology-summary { grid-template-columns: minmax(0, 1fr) auto; align-items: end; }
   .sgd-builder-topology-inputs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 

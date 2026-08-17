@@ -1811,7 +1811,10 @@ export const Deployment = ({ config, benchmarks }) => {
         {recommendedRecipe && (
           <section className="sgd-builder-recipe">
             <div>
-              <span>Recommended for {sel.hw.toUpperCase()}</span>
+              {/* This is the verified operating point, not sizing advice — a
+                  hardware whose validation ran on 8 GPUs is not "recommending"
+                  8 over a smaller deployment. */}
+              <span>Verified recipe · {sel.hw.toUpperCase()}</span>
               <strong>
                 {[
                   `${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node} GPUs`,
@@ -1826,7 +1829,7 @@ export const Deployment = ({ config, benchmarks }) => {
               {renderStatus("verified")}
               {recommendedInUse
                 ? <small>In use</small>
-                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>Use recommended</button>}
+                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>Use verified recipe</button>}
             </div>
           </section>
         )}
@@ -1853,8 +1856,14 @@ export const Deployment = ({ config, benchmarks }) => {
           </div>
         </section>
 
+        {/* Topology lives with Resources: its summary is the heading's detail
+            line, so the two rows that used to repeat each other are one
+            section. The advanced editor and its messages stay here too. */}
         <section className="sgd-builder-section">
-          <div className="sgd-builder-section-heading"><span>Resources</span></div>
+          <div className="sgd-builder-section-heading">
+            <span>Resources</span>
+            <small>{builderMeta.topologySummary || "No valid topology"}</small>
+          </div>
           <div className="sgd-builder-resource-grid">
             {renderStepper("nodes", "Nodes")}
             {renderStepper("gpus_per_node", "GPUs / node")}
@@ -1864,23 +1873,14 @@ export const Deployment = ({ config, benchmarks }) => {
               {sel.nodes} nodes × {sel.gpus_per_node} {sel.hw.toUpperCase()} = {totalGpus} GPUs
             </p>
           )}
-        </section>
-
-        <section className="sgd-builder-section sgd-builder-topology">
-          <div className="sgd-builder-topology-summary">
-            <div>
-              <span>Topology</span>
-              <strong>{builderMeta.topologySummary || "No valid topology"}</strong>
-            </div>
-            <button
-              type="button"
-              className="sgd-builder-text-action"
-              aria-expanded={builderAdvanced}
-              onClick={() => setBuilderAdvanced((open) => !open)}
-            >
-              Advanced topology <span aria-hidden="true">{builderAdvanced ? "↗" : "↘"}</span>
-            </button>
-          </div>
+          <button
+            type="button"
+            className="sgd-builder-text-action sgd-builder-topology-toggle"
+            aria-expanded={builderAdvanced}
+            onClick={() => setBuilderAdvanced((open) => !open)}
+          >
+            Advanced topology <span aria-hidden="true">{builderAdvanced ? "↗" : "↘"}</span>
+          </button>
           {builderAdvanced && (
             <div className="sgd-builder-advanced">
               <p>Auto uses an exact verified recipe when one exists; manual values are allowed when the model constraints remain valid.</p>
