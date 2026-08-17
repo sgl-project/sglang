@@ -893,6 +893,11 @@ class ServerArgs:
         Arg(help="The number of tokens in a page.", resolvable=True),
         NS("schedule"),
     ] = None
+    c128_page_size: A[
+        int,
+        "The physical page size of the NPU DSV4 C128 KV cache. Must be a positive multiple of 16.",
+        NS("schedule"),
+    ] = 16
     swa_full_tokens_ratio: A[
         float,
         Arg(

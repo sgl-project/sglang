@@ -9,12 +9,13 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.runtime_context import get_parallel, get_schedule
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_hip, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang.utils import logger
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 
 embedding_cache: Optional[MultiModalStaticCache] = None
 
@@ -510,9 +511,9 @@ def _get_chunked_prefill_embedding(
 
         is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
         if is_per_image:
-            if _is_hip or _is_npu:
+            if _is_hip or _is_npu or _is_xpu:
                 # ROCm CI regressed with one large cross-request ViT batch; keep
-                # the previous per-request path on HIP while CUDA uses batching.
+                # the previous per-request path on HIP/NPU/XPU while CUDA uses batching.
                 chunk = _get_chunked_embedding_by_item(
                     data_embedding_func,
                     embedding_items_per_req,

@@ -18,6 +18,9 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
     unpack_list_of_buffers,
 )
+from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
+    ScheduleBatchDisaggregationDecodeMixin,
+)
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
@@ -94,6 +97,40 @@ class TestDisaggregationWire(unittest.TestCase):
     def test_empty_inner_list(self):
         packed = pack_int_lists([[]], "I")
         self.assertEqual(unpack_int_lists(packed, "I"), [[]])
+
+    def test_prebuilt_skips_unused_prompt_tensor(self):
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            prefix_indices=[0, 1],
+            extend_range=SimpleNamespace(length=3),
+            origin_input_ids=[0, 1, 2, 3, 4],
+            output_ids=[],
+            retracted_stain=True,
+            is_retracted=True,
+            multimodal_inputs=None,
+            get_fill_ids=Mock(side_effect=AssertionError("prompt should not be read")),
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            device="cpu",
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.arange(5, dtype=torch.int64).reshape(1, 5)
+            ),
+            return_logprob=False,
+            model_config=SimpleNamespace(vocab_size=32),
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.decode_schedule_batch_mixin."
+            "SamplingBatchInfo.from_schedule_batch",
+            return_value=Mock(),
+        ):
+            ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt(batch)
+
+        self.assertIsNone(batch.input_ids)
+        self.assertEqual(batch.extend_num_tokens, 3)
+        self.assertTrue(torch.equal(batch.out_cache_loc, torch.tensor([2, 3, 4])))
+        req.get_fill_ids.assert_not_called()
 
     def test_list_of_buffers_roundtrip(self):
         bufs = [b"abc", b"", b"de", b"x" * 17]

@@ -10,9 +10,6 @@ from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-    maybe_evict_dsv4_state_on_swa,
-)
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -96,9 +93,6 @@ def free_swa_out_of_window_slots(
             req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
         token_to_kv_pool_allocator.free_swa(free_slots)
-        maybe_evict_dsv4_state_on_swa(
-            token_to_kv_pool_allocator, req_to_token_pool, req, new_swa_evicted_seqlen
-        )
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
