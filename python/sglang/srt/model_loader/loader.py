@@ -4278,6 +4278,9 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
 
+    if isinstance(load_config.load_format, type):
+        return load_config.load_format(load_config)
+
     if model_config and model_config.quantization in ["auto-round-int8"]:
         logger.info("Using IncModelLoader due to AutoRound quantization config.")
         return IncModelLoader(load_config)
@@ -4331,9 +4334,6 @@ def get_model_loader(
                 f"Using ModelOptModelLoader for quantization: {model_config.quantization}"
             )
         return ModelOptModelLoader(load_config)
-
-    if isinstance(load_config.load_format, type):
-        return load_config.load_format(load_config)
 
     if load_config.load_format == LoadFormat.SHARDED_STATE:
         return ShardedStateLoader(load_config)
