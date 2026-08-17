@@ -466,8 +466,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
 
-    is_w4a16 = quant_info.quant_mode == "w4a16"
-    if is_w4a16:
+    if quant_info.quant_mode == "w4a16":
         x_fp4 = hidden_states
         x_sf = None
         per_token_scale = None
@@ -490,7 +489,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         )
         per_token_scale = None
 
-    if not is_w4a16:
+    if quant_info.quant_mode != "w4a16":
         seq_len, hidden_size = hidden_states.shape
         x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
         x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
@@ -505,7 +504,9 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         w1_weight=quant_info.w13_weight,
         w1_weight_sf=quant_info.w13_weight_sf,
         w1_alpha=quant_info.w1_alpha,
-        fc2_input_scale=None if is_w4a16 else quant_info.a2_scale,
+        fc2_input_scale=(
+            None if quant_info.quant_mode == "w4a16" else quant_info.a2_scale
+        ),
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
@@ -549,8 +550,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
 
-    is_w4a16 = quant_info.quant_mode == "w4a16"
-    if is_w4a16:
+    if quant_info.quant_mode == "w4a16":
         x_fp4 = hidden_states
         per_token_scale = None
     elif x_sf is not None:
@@ -596,7 +596,9 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         w1_weight=quant_info.w13_weight,
         w1_weight_sf=quant_info.w13_weight_sf,
         w1_alpha=quant_info.w1_alpha,
-        fc2_input_scale=None if is_w4a16 else quant_info.a2_scale,
+        fc2_input_scale=(
+            None if quant_info.quant_mode == "w4a16" else quant_info.a2_scale
+        ),
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
