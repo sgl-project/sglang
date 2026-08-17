@@ -30,7 +30,7 @@ class _CountingFactory:
 
 class TestWarMailboxRingWiring(unittest.TestCase):
     """All WAR read-done publishers must draw from the single ring that sits
-    next to the mailbox they write (model_runner.war_fastpath_read_done_event),
+    next to the mailbox they write (model_runner.shared_read_done_event),
     so a publisher added later cannot silently reintroduce per-step allocation.
 
     Reads the sources from disk rather than importing (these modules pull in
@@ -46,17 +46,19 @@ class TestWarMailboxRingWiring(unittest.TestCase):
         for rel in (
             "model_executor/runner/decode_cuda_graph_runner.py",
             "speculative/eagle_draft_extend_cuda_graph_runner.py",
-            "model_executor/runner_utils/war_event.py",
+            "model_executor/runner_utils/shared_read_event.py",
         ):
             src = (root / rel).read_text()
             publishes = [
                 line
                 for line in src.splitlines()
-                if "war_fastpath_read_done_event = " in line and "None" not in line
+                if "shared_read_done_event = " in line and "None" not in line
             ]
-            self.assertTrue(publishes, f"no WAR publish found in {rel}")
+            self.assertTrue(publishes, f"no shared-read publish found in {rel}")
             self.assertIn(
-                "war_read_done_events.next()", src, f"{rel} publishes without the ring"
+                "shared_read_done_events.next()",
+                src,
+                f"{rel} publishes without the ring",
             )
             for pattern in (
                 "read_done = device_module.Event()",

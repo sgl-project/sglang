@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import logging
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Optional
 
+import msgspec
+
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.common import rank0_log
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
-
-logger = logging.getLogger(__name__)
 
 
 class LinearAttnKernelBackend(Enum):
@@ -20,6 +20,7 @@ class LinearAttnKernelBackend(Enum):
     FLASHKDA = "flashkda"
     NVIDIA_KDA = "nvidia_kda"
     PTX_KDA = "ptx_kda"
+    HELION = "helion"
     CUSTOM = "custom"
 
     @classmethod
@@ -47,60 +48,55 @@ class LinearAttnKernelBackend(Enum):
     def is_ptx_kda(self):
         return self == LinearAttnKernelBackend.PTX_KDA
 
+    def is_helion(self):
+        return self == LinearAttnKernelBackend.HELION
+
     def is_custom(self):
         return self == LinearAttnKernelBackend.CUSTOM
 
 
-_BACKENDS: Dict[str, Optional[LinearAttnKernelBackend]] = {
-    "decode": None,
-    "prefill": None,
-    "verify": None,
-}
+class LinearAttnBackends(msgspec.Struct, frozen=True):
+    """One runner's linear-attn kernel choice, per phase.
+
+    Per runner, not per process: a target and its draft coexist and can want
+    different kernels (only the runner whose model is GDN gets the SM100
+    FlashInfer prefill default, and an explicit flag applies to whichever runner
+    was launched with it).
+    """
+
+    decode: LinearAttnKernelBackend
+    prefill: LinearAttnKernelBackend
+    verify: LinearAttnKernelBackend
 
 
-def initialize_linear_attn_config(
-    server_args: ServerArgs, prefill_default: Optional[str] = None
-):
-    base = server_args.linear_attn_backend
-    decode = server_args.linear_attn_decode_backend or base
-    prefill = server_args.linear_attn_prefill_backend or prefill_default or base
+def resolve_linear_attn_backends(
+    prefill_default: Optional[str] = None,
+) -> LinearAttnBackends:
+    """This runner's kernel choice from the published leaves.
 
-    _BACKENDS["decode"] = LinearAttnKernelBackend(decode)
-    _BACKENDS["prefill"] = LinearAttnKernelBackend(prefill)
-
-    # Verify backend. Unset -> follow decode (flashinfer -> its recurrent kernel,
-    # else triton), preserving historical behavior.
-    verify = server_args.linear_attn_verify_backend
-    if verify is None:
-        verify = decode if _BACKENDS["decode"].is_flashinfer() else "triton"
-    _BACKENDS["verify"] = LinearAttnKernelBackend(verify)
-
-    rank0_log(
-        f"Linear attention kernel backend: decode={decode}, prefill={prefill}, "
-        f"verify={verify}"
+    ``prefill_default`` is the caller's own auto-default (the SM100 GDN
+    domain); an explicitly configured ``--linear-attn-prefill-backend`` wins.
+    """
+    mamba = get_exec().mamba
+    base = mamba.linear_attn_backend
+    decode = LinearAttnKernelBackend(mamba.linear_attn_decode_backend or base)
+    prefill = LinearAttnKernelBackend(
+        mamba.linear_attn_prefill_backend or prefill_default or base
     )
 
+    # Unset verify follows decode (flashinfer -> its recurrent kernel, else triton).
+    verify = mamba.linear_attn_verify_backend
+    if verify is None:
+        verify = decode.value if decode.is_flashinfer() else "triton"
 
-def _get_backend(phase: str) -> LinearAttnKernelBackend:
-    backend = _BACKENDS[phase]
-    if backend is None:
-        logger.warning(
-            "linear-attn %s backend is not initialized, using triton backend", phase
-        )
-        backend = _BACKENDS[phase] = LinearAttnKernelBackend.TRITON
-    return backend
-
-
-def get_linear_attn_decode_backend() -> LinearAttnKernelBackend:
-    return _get_backend("decode")
-
-
-def get_linear_attn_prefill_backend() -> LinearAttnKernelBackend:
-    return _get_backend("prefill")
-
-
-def get_linear_attn_verify_backend() -> LinearAttnKernelBackend:
-    return _get_backend("verify")
+    backends = LinearAttnBackends(
+        decode=decode, prefill=prefill, verify=LinearAttnKernelBackend(verify)
+    )
+    rank0_log(
+        f"Linear attention kernel backend: decode={backends.decode.value}, "
+        f"prefill={backends.prefill.value}, verify={backends.verify.value}"
+    )
+    return backends
 
 
 def build_verify_intermediate_state_indices(
