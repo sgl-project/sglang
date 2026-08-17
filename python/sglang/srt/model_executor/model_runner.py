@@ -80,7 +80,6 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
-from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
@@ -167,7 +166,6 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.model_executor.runner_utils import make_war_read_done_event
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
@@ -180,6 +178,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     is_ep_joiner,
     is_ep_scale_joiner,
+    remote_instance_transfer_engine_enabled,
     set_global_dwdp_manager,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -313,6 +312,13 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        # Set the global server_args in the scheduler process (target worker
+        # only, so a draft init cannot clobber target-derived global state).
+        # Before the constructor's bag reads (page_size below): a standalone
+        # construction (benchmark/one_batch, the manual runner tests) has no
+        # earlier publish.
+        if not is_draft_worker:
+            set_global_server_args_for_scheduler(server_args)
         self.draft_attention_backend = resolve_draft_attention_backend(
             draft_attention_backend=draft_attention_backend,
             server_args=server_args,
@@ -332,7 +338,7 @@ class ModelRunner:
             server_args.speculative_algorithm
         )
         self.capture_tail_hooks = []
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.mtp_draft_device_pools = ()
@@ -359,11 +365,6 @@ class ModelRunner:
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
             enable_show_time_cost()
-
-        # Set the global server_args in the scheduler process (target worker
-        # only, so a draft init cannot clobber target-derived global state).
-        if not self.is_draft_worker:
-            set_global_server_args_for_scheduler(server_args)
 
         misc_utils.maybe_disable_chunked_prefix_cache(
             use_mla_backend=self.use_mla_backend,
@@ -402,14 +403,10 @@ class ModelRunner:
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
-        # WAR fast-path: a decode-graph forward publishes a fresh event here after
-        # load_batch; the scheduler's WAR barrier waits on it (then clears it)
-        # instead of the whole-forward wait_stream. None -> whole-forward fallback.
-        self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
-        # Graph runners record this persistent event after shared-state reads.
-        self.war_read_done_event = make_war_read_done_event(
-            torch.get_device_module(self.device)
-        )
+        # Published by the step's last shared-buffer-reading phase (decode graph,
+        # eagle draft extend, or prefill); the scheduler's WAR barrier waits on it
+        # then clears it. None -> coarse whole-forward wait_stream.
+        self.shared_read_done_event: Optional[torch.cuda.Event] = None
 
         # CPU offload
         set_offloader(
@@ -561,7 +558,6 @@ class ModelRunner:
 
     def init_remote_instance_weight_transporter(self):
         self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
-            server_args=self.server_args,
             get_model=lambda: self.model,
             tp_rank=self.ps.tp_rank,
             gpu_id=self.gpu_id,
@@ -672,9 +668,7 @@ class ModelRunner:
         )
 
     def maybe_init_remote_instance_transfer_engine(self):
-        if self.server_args.remote_instance_weight_loader_use_transfer_engine(
-            load_format=self.draft_load_format
-        ):
+        if remote_instance_transfer_engine_enabled(load_format=self.draft_load_format):
             self.remote_instance_weight_transporter.init_engine()
 
     def maybe_init_expert_location_metadata(self):
@@ -754,10 +748,6 @@ class ModelRunner:
         )
 
     def maybe_apply_post_load_model_transforms(self):
-        # In layered loading, torchao may have been applied
-        torchao_applied = getattr(self.model, "torchao_applied", False)
-        if not torchao_applied:
-            apply_torchao_config_to_model(self.model, get_exec().graph.torchao_config)
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.ps.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
