@@ -34,12 +34,6 @@ from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 logger = logging.getLogger(__name__)
 
-# The spec classes are pydantic dataclasses: field types (enums, bools,
-# nested specs) are enforced at construction, so the validate() methods
-# carry only cross-field semantics.  Strict mode keeps the fail-closed
-# posture — no silent coercion of strings or ints into enums and bools —
-# and extra="forbid" keeps unknown constructor kwargs a hard error the
-# way stdlib dataclasses were (pydantic's default silently drops them).
 _STRICT = pydantic.ConfigDict(strict=True, extra="forbid")
 
 
