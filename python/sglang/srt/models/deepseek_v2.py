@@ -210,6 +210,7 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    get_current_device_stream_fast,
     is_non_idle_and_non_empty,
     make_layers,
     use_intel_amx_backend,
@@ -2252,7 +2253,7 @@ class DeepseekV2AttentionMLA(
             latent_cache.contiguous(),
             self.cp_size,
             forward_batch,
-            torch.cuda.current_stream(),
+            get_current_device_stream_fast(),
         )
         k_nope = latent_cache_output[..., : self.kv_lora_rank].unsqueeze(1)
         k_pe = latent_cache_output[..., self.kv_lora_rank :].unsqueeze(1)
