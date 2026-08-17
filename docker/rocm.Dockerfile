@@ -151,6 +151,15 @@ RUN mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.
 # rest of this Dockerfile refers to /opt/rocm throughout.
 RUN ln -s ${ROCM_HOME} /opt/rocm
 
+# BUILD_TRITON=0 keeps the Triton that ships with the ROCm 10 torch stack (3.8).
+# The rocm720 stages set it to 1, which runs AITER's install_triton.sh; that
+# script resolves its index from `dpkg -l rocm-core`, which does not exist for a
+# pip-installed SDK, so it would fall back to the ROCm 7.2 index and drop a
+# 7.2-built Triton 3.7.0 into a ROCm 10 image. There is no 3.7 to fall back to
+# either: AMD's ROCm 10 channel publishes only 3.8 (the 7.15 channel has 3.5-3.8,
+# which is why the gfx1250 stage can pin 3.7.1). AITER does not require 3.7 --
+# its requirements.txt leaves torch and triton to the base image on purpose.
+#
 # ===============================
 # Base image 942 with rocm10 and args
 FROM rocm10-base AS gfx942-rocm10
