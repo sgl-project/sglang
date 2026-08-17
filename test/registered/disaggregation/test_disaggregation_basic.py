@@ -225,13 +225,15 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
 class TestDisaggregationMooncakeSpec(
     JSONConstrainedMixin, SpecGrammarKit, PDDisaggregationServerBase
 ):
+    min_retraction_accept_length = 1.3
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_TARGET_MODEL_EAGLE3
         spec_args = [
             "--speculative-algorithm",
-            "EAGLE",
+            "EAGLE3",
             "--speculative-draft-model-path",
             DEFAULT_DRAFT_MODEL_EAGLE3,
             "--speculative-num-steps",
@@ -245,8 +247,50 @@ class TestDisaggregationMooncakeSpec(
             "--dtype=float16",
         ]
         cls.extra_prefill_args = spec_args
-        cls.extra_decode_args = spec_args
+        cls.extra_decode_args = [
+            *spec_args,
+            "--disaggregation-decode-retraction-backup",
+            "host_pool",
+        ]
+        cls.extra_decode_env = {"SGLANG_TEST_RETRACT": "true"}
         cls.launch_all()
+
+    def test_host_pool_retraction_preserves_spec_acceptance(self):
+        prompts = [
+            f"Request {i}: explain how speculative decoding works. " * 4
+            for i in range(4)
+        ]
+        response = requests.post(
+            self.lb_url + "/generate",
+            json={
+                "text": prompts,
+                "sampling_params": {
+                    "temperature": 0,
+                    "ignore_eos": True,
+                    "max_new_tokens": 64,
+                },
+            },
+        )
+        response.raise_for_status()
+        results = response.json()
+        retracted_results = [
+            result for result in results if result["meta_info"]["num_retractions"] > 0
+        ]
+        retraction_count = sum(
+            result["meta_info"]["num_retractions"] for result in retracted_results
+        )
+        self.assertGreater(retraction_count, 0)
+
+        completion_tokens = sum(
+            result["meta_info"]["completion_tokens"] for result in retracted_results
+        )
+        verify_count = sum(
+            result["meta_info"]["spec_verify_ct"] for result in retracted_results
+        )
+        self.assertGreater(verify_count, 0)
+        accept_length = completion_tokens / verify_count
+        print(f"Retraction speculative {accept_length=:.4f}")
+        self.assertGreater(accept_length, self.min_retraction_accept_length)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
