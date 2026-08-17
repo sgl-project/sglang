@@ -465,6 +465,40 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                 )
 
+    def _init_out_graph_metadata(
+        self,
+        *,
+        bs: int,
+        raw_bs: int,
+        num_tokens: int,
+        input_ids: Optional[torch.Tensor],
+        seq_lens_sum: Optional[int],
+        has_seq_lens_cpu: bool,
+        spec_info,
+        out_cache_loc_dsv4,
+    ):
+        """Run the out-graph metadata init over the padded static buffers."""
+        buffers = self.buffers
+        from types import SimpleNamespace
+
+        if seq_lens_sum is not None:
+            seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+        fb_view = SimpleNamespace(
+            batch_size=bs,
+            forward_mode=self.forward_mode,
+            input_ids=input_ids,
+            req_pool_indices=buffers.req_pool_indices,
+            seq_lens=buffers.seq_lens,
+            seq_lens_sum=seq_lens_sum,
+            # Mirror absence must survive replay (stale buffer defeats None-guards).
+            seq_lens_cpu=(buffers.seq_lens_cpu if has_seq_lens_cpu else None),
+            encoder_lens=None,
+            out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            out_cache_loc_dsv4=out_cache_loc_dsv4,
+            spec_info=spec_info,
+        )
+        self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
+
     def stage_shared_reads(
         self,
         *,
@@ -496,9 +530,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             if bs != raw_bs:
                 buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
             buffers.seq_lens_cpu[:raw_bs].copy_(seq_lens_cpu)
-            seq_lens_sum = (
-                int(seq_lens_cpu.sum()) + (bs - raw_bs) * self.seq_len_fill_value
-            )
+            seq_lens_sum = int(seq_lens_cpu.sum())
 
         # The init reads verify products only by shape; a view over the static
         # buffers (steady-state extend widths, stale accept counts) stands in
@@ -513,23 +545,16 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         spec_view.extend_seq_lens_cpu = [self.captured_req_width] * bs
         spec_view.extend_seq_lens_tensor = buffers.extend_seq_lens[:bs]
 
-        from types import SimpleNamespace
-
-        fb_view = SimpleNamespace(
-            batch_size=bs,
-            forward_mode=self.forward_mode,
+        self._init_out_graph_metadata(
+            bs=bs,
+            raw_bs=raw_bs,
+            num_tokens=num_tokens,
             input_ids=buffers.input_ids[:num_tokens],
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
             seq_lens_sum=seq_lens_sum,
-            # Mirror absence must survive replay (stale buffer defeats None-guards).
-            seq_lens_cpu=(None if seq_lens_cpu is None else buffers.seq_lens_cpu),
-            encoder_lens=None,
-            out_cache_loc=buffers.out_cache_loc[:num_tokens],
-            out_cache_loc_dsv4=out_cache_loc_dsv4,
+            has_seq_lens_cpu=seq_lens_cpu is not None,
             spec_info=spec_view,
+            out_cache_loc_dsv4=out_cache_loc_dsv4,
         )
-        self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
     def execute(self, forward_batch: ForwardBatch, staged: bool = False):
         assert forward_batch.out_cache_loc is not None
@@ -634,28 +659,16 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         if not staged:
             # A staged replay ran this init at plan time (stage_shared_reads).
-            from types import SimpleNamespace
-
-            seq_lens_sum = forward_batch.seq_lens_sum
-            if seq_lens_sum is not None:
-                seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
-            fb_view = SimpleNamespace(
-                batch_size=bs,
-                forward_mode=self.forward_mode,
+            self._init_out_graph_metadata(
+                bs=bs,
+                raw_bs=raw_bs,
+                num_tokens=num_tokens,
                 input_ids=getattr(forward_batch, "input_ids", None),
-                req_pool_indices=buffers.req_pool_indices,
-                seq_lens=buffers.seq_lens,
-                seq_lens_sum=seq_lens_sum,
-                # Mirror absence must survive replay (stale buffer defeats None-guards).
-                seq_lens_cpu=(
-                    None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu
-                ),
-                encoder_lens=None,
-                out_cache_loc=buffers.out_cache_loc[:num_tokens],
-                out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+                seq_lens_sum=forward_batch.seq_lens_sum,
+                has_seq_lens_cpu=forward_batch.seq_lens_cpu is not None,
                 spec_info=forward_batch.spec_info,
+                out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             )
-            self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
         # Snapshot built -- the forward is done reading the shared pool. Publish
         # a read-done event the scheduler's WAR barrier waits on (draft extend
