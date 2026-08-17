@@ -48,9 +48,11 @@ class MambaAttnBackendBase(AttentionBackend):
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_unified_memory = model_runner.server_args.enable_unified_memory
-        self.mamba_chunk_size = getattr(
-            model_runner.model_config.hf_text_config, "mamba_chunk_size", 64
-        )
+        # model_config must not be touched here: backend selection reads the
+        # linear_attn_backends stamp first, and that guard test constructs
+        # backends on runners without a real model_config.
+        self._model_runner = model_runner
+        self._mamba_chunk_size: Optional[int] = None
         # Fused replay-prep state-indices fast path (fused_replay_state_indices):
         # requires the static hybrid pool whose v2p translate is the identity —
         # the unified pool overrides translate_mamba_indices with an allocator
@@ -77,6 +79,14 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
+
+    @property
+    def mamba_chunk_size(self) -> int:
+        if self._mamba_chunk_size is None:
+            self._mamba_chunk_size = getattr(
+                self._model_runner.model_config.hf_text_config, "mamba_chunk_size", 64
+            )
+        return self._mamba_chunk_size
 
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba slot-id translate (identity for the non-unified
