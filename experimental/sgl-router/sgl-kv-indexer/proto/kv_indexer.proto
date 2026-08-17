@@ -41,7 +41,7 @@ message WorkerCacheSpec {
 message MatchExternalKvRequest {
   // Block-level hashes matched against placement metadata. This RPC returns
   // placement matches only; it does not compute the longest reusable prefix.
-  repeated string hashes = 1;
+  repeated sfixed64 hashes = 1 [packed = true];
 
   // When true, only hashes that are actually matched should increase hit
   // counters. Diagnostic callers should leave this false.
@@ -61,7 +61,7 @@ message ExternalKvAction {
   ExternalKvActionType type = 1;
   TierType tier = 2;
   // Non-empty for REPORT/REVOKE; ignored for CLEAR_ALL_AT_TIER.
-  repeated string hashes = 3;
+  repeated sfixed64 hashes = 3 [packed = true];
 
   // REPORT only. Per-hash resident component bitmask at this tier, a REPLACE
   // snapshot index-aligned with `hashes`. Empty means every hash is a legacy
@@ -100,7 +100,7 @@ message ApplyExternalKvBatchResponse {
 
 message TierHashes {
   TierType tier = 1;
-  repeated string hashes = 2;
+  repeated sfixed64 hashes = 2 [packed = true];
   // Diagnostic snapshots aligned with `hashes`. Empty only for backends that
   // cannot expose component detail.
   repeated uint32 component_masks = 3;
@@ -121,7 +121,7 @@ message MatchExternalKvPrefixRequest {
   // Block hashes in prompt order. hashes[0] MUST be the request's first block:
   // prefix matching starts there and stops at the first block a worker is
   // missing, so a misordered list silently truncates every match.
-  repeated string hashes = 1;
+  repeated sfixed64 hashes = 1 [packed = true];
 
   // Caller-supplied ceiling on how many leading blocks to consider. 0 means no
   // caller ceiling: the server considers every block sent. Unlike the mutating
@@ -158,12 +158,12 @@ message MatchExternalKvPrefixResponse {
 }
 
 message HitCountEntry {
-  string hash = 1;
+  sfixed64 hash = 1;
   uint64 hit_count_total = 2;
 }
 
 message GetExternalKvHitCountsRequest {
-  repeated string hashes = 1;
+  repeated sfixed64 hashes = 1 [packed = true];
 }
 
 message GetExternalKvHitCountsResponse {

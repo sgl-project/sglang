@@ -4,10 +4,11 @@
 use std::collections::HashMap;
 
 use tokio::sync::Semaphore;
+use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 use crate::admission::{reject_if_deadline_passed, RejectionLog};
-use crate::pb::kv_indexer_server::KvIndexer;
+use crate::pb::kv_indexer_server::{KvIndexer, KvIndexerServer};
 use crate::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvAction,
     ExternalKvActionType, ExternalKvPrefixMatch, GetExternalKvHitCountsRequest,
@@ -21,6 +22,17 @@ use crate::pb::{
 pub(crate) const MAX_HASHES_PER_REQUEST: usize = 16_384;
 pub(crate) const MAX_ACTIONS_PER_BATCH: usize = 256;
 pub const DEFAULT_PREFIX_QUERY_MAX_INFLIGHT: usize = 32;
+/// Maximum encoded gRPC request size accepted by the Indexer server. With
+/// packed `sfixed64` hashes this holds roughly one million blocks.
+pub const MAX_GRPC_DECODING_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+/// Per-connection bound on concurrently served HTTP/2 streams. Decoding happens
+/// in tonic's codec before a method body runs, so `prefix_query_max_inflight`
+/// bounds only the scan, not the bytes a peer makes the server buffer — left
+/// unset, one connection can hold an unbounded number of
+/// [`MAX_GRPC_DECODING_MESSAGE_SIZE`] messages at once. Sized well above the
+/// router's own default of 32 in-flight queries so it never throttles a healthy
+/// caller.
+pub const MAX_CONCURRENT_STREAMS: u32 = 64;
 
 static OVERLOAD_LOG: RejectionLog = RejectionLog::new();
 
@@ -52,7 +64,7 @@ pub trait KvIndexerBackend: Send + Sync + 'static {
     /// attach each worker's `WorkerCacheSpec` and the resident component set.
     async fn collect_worker_prefix_inputs(
         &self,
-        hashes: &[String],
+        hashes: &[i64],
     ) -> Result<Vec<WorkerPrefixInput>, Status> {
         let matched = self
             .match_external_kv(MatchExternalKvRequest {
@@ -77,7 +89,7 @@ pub trait KvIndexerBackend: Send + Sync + 'static {
         request: MatchExternalKvPrefixRequest,
     ) -> Result<MatchExternalKvPrefixResponse, Status> {
         let limit = prefix_limit(request.hashes.len(), request.max_blocks);
-        let hashes: Vec<String> = request.hashes.into_iter().take(limit).collect();
+        let hashes: Vec<i64> = request.hashes.into_iter().take(limit).collect();
         if hashes.is_empty() {
             return Ok(MatchExternalKvPrefixResponse::default());
         }
@@ -112,7 +124,7 @@ impl KvIndexerBackend for std::sync::Arc<dyn KvIndexerBackend> {
 
     async fn collect_worker_prefix_inputs(
         &self,
-        hashes: &[String],
+        hashes: &[i64],
     ) -> Result<Vec<WorkerPrefixInput>, Status> {
         (**self).collect_worker_prefix_inputs(hashes).await
     }
@@ -156,6 +168,21 @@ where
             prefix_query_semaphore: Semaphore::new(max_inflight),
         }
     }
+
+    /// Wraps the service in its generated server with the decoding limit a
+    /// full-length prefix query needs. Constructing the server any other way
+    /// silently reinstates tonic's 4 MiB default, so production and tests that
+    /// exercise large requests go through here.
+    pub fn into_server(self) -> KvIndexerServer<Self> {
+        KvIndexerServer::new(self).max_decoding_message_size(MAX_GRPC_DECODING_MESSAGE_SIZE)
+    }
+}
+
+/// A transport builder carrying the Indexer's stream bound. Pairs with
+/// [`KvIndexerService::into_server`]: that sets the per-message ceiling, this
+/// bounds how many messages can be in flight against it at once.
+pub fn server_builder() -> Server {
+    Server::builder().max_concurrent_streams(MAX_CONCURRENT_STREAMS)
 }
 
 #[tonic::async_trait]
@@ -227,7 +254,7 @@ fn validate_worker_id(worker_id: &str) -> Result<(), Status> {
 
 /// Well-formedness plus the per-request hash ceiling, for the RPCs that mutate
 /// state or build a per-hash response.
-fn validate_hashes_bounded(hashes: &[String]) -> Result<(), Status> {
+fn validate_hashes_bounded(hashes: &[i64]) -> Result<(), Status> {
     validate_hashes(hashes)?;
     if hashes.len() > MAX_HASHES_PER_REQUEST {
         return Err(Status::resource_exhausted(format!(
@@ -242,14 +269,9 @@ fn validate_hashes_bounded(hashes: &[String]) -> Result<(), Status> {
 /// candidate worker, and truncating it would silently understate a worker's
 /// reusable prefix. Length is bounded by `max_blocks` and the transport limit,
 /// not by the caller's deadline, which cannot cancel a scan already under way.
-fn validate_hashes(hashes: &[String]) -> Result<(), Status> {
+fn validate_hashes(hashes: &[i64]) -> Result<(), Status> {
     if hashes.is_empty() {
         return Err(Status::invalid_argument("hashes must not be empty"));
-    }
-    if hashes.iter().any(|hash| hash.is_empty()) {
-        return Err(Status::invalid_argument(
-            "hashes must not contain empty values",
-        ));
     }
     Ok(())
 }
@@ -373,31 +395,26 @@ pub struct WorkerPrefixInput {
 /// Builds component-blind (legacy) prefix inputs from a `MatchExternalKv` result:
 /// each held block becomes a whole-block placement (mask `0`, no size, no spec).
 pub(crate) fn legacy_inputs_from_match(
-    hashes: &[String],
+    hashes: &[i64],
     matched: &MatchExternalKvResponse,
 ) -> Vec<WorkerPrefixInput> {
     matched
         .matches
         .iter()
         .map(|node| {
-            let mut tiers_by_hash: HashMap<&str, Vec<i32>> = HashMap::new();
+            let mut tiers_by_hash: HashMap<i64, Vec<i32>> = HashMap::new();
             for tier in &node.hashes_by_tier {
                 for hash in &tier.hashes {
-                    tiers_by_hash
-                        .entry(hash.as_str())
-                        .or_default()
-                        .push(tier.tier);
+                    tiers_by_hash.entry(*hash).or_default().push(tier.tier);
                 }
             }
             let blocks = hashes
                 .iter()
                 .map(|hash| {
-                    tiers_by_hash
-                        .get(hash.as_str())
-                        .map(|tiers| BlockComponents {
-                            token_count: 0,
-                            tier_masks: tiers.iter().map(|tier| (*tier, 0u32)).collect(),
-                        })
+                    tiers_by_hash.get(hash).map(|tiers| BlockComponents {
+                        token_count: 0,
+                        tier_masks: tiers.iter().map(|tier| (*tier, 0u32)).collect(),
+                    })
                 })
                 .collect();
             WorkerPrefixInput {
@@ -687,7 +704,7 @@ mod tests {
 
     fn prefix_request() -> Request<MatchExternalKvPrefixRequest> {
         Request::new(MatchExternalKvPrefixRequest {
-            hashes: vec!["a".to_string()],
+            hashes: vec![-1],
             max_blocks: 0,
         })
     }
@@ -753,7 +770,7 @@ mod tests {
             metadata,
             extensions,
             MatchExternalKvPrefixRequest {
-                hashes: vec!["a".to_string()],
+                hashes: vec![-1],
                 max_blocks: 0,
             },
         );
@@ -804,7 +821,7 @@ mod tests {
         ExternalKvAction {
             r#type: r#type as i32,
             tier,
-            hashes: hashes.iter().map(|h| h.to_string()).collect(),
+            hashes: hashes.iter().map(|h| h.parse().unwrap()).collect(),
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
         }
@@ -830,7 +847,7 @@ mod tests {
 
     #[test]
     fn validate_actions_rejects_misaligned_side_arrays() {
-        let base = action(ExternalKvActionType::ActionReport, hbm(), &["a", "b"]);
+        let base = action(ExternalKvActionType::ActionReport, hbm(), &["1", "2"]);
         assert!(validate_actions(std::slice::from_ref(&base)).is_ok());
         let mut aligned = base.clone();
         aligned.component_masks = vec![COMPONENT_FULL, COMPONENT_FULL];
@@ -874,7 +891,7 @@ mod tests {
 
     #[test]
     fn validate_hashes_rejects_oversized_query() {
-        let hashes = vec!["1".to_string(); MAX_HASHES_PER_REQUEST + 1];
+        let hashes = vec![1; MAX_HASHES_PER_REQUEST + 1];
         let error = validate_hashes_bounded(&hashes).unwrap_err();
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     }
@@ -882,7 +899,7 @@ mod tests {
     /// Only the bounded variant rejects on length.
     #[test]
     fn validate_hashes_accepts_oversized_prefix_query() {
-        let hashes = vec!["1".to_string(); MAX_HASHES_PER_REQUEST + 1];
+        let hashes = vec![1; MAX_HASHES_PER_REQUEST + 1];
         assert!(validate_hashes(&hashes).is_ok());
     }
 

@@ -13,33 +13,29 @@ pub fn dram() -> i32 {
     TierType::TierDram as i32
 }
 
-pub fn hashes(values: &[&str]) -> Vec<String> {
-    values.iter().map(|value| (*value).to_string()).collect()
-}
-
-pub fn action(kind: ExternalKvActionType, tier: i32, values: &[&str]) -> ExternalKvAction {
+pub fn action(kind: ExternalKvActionType, tier: i32, hashes: &[i64]) -> ExternalKvAction {
     ExternalKvAction {
         r#type: kind as i32,
         tier,
-        hashes: hashes(values),
+        hashes: hashes.to_vec(),
         component_masks: Vec::new(),
         block_sizes: Vec::new(),
     }
 }
 
 /// A component-aware REPORT action: each hash carries its component bitmask and
-/// token count, index-aligned with `values`.
+/// token count, index-aligned with `hashes`.
 #[allow(dead_code)] // used by memory_integration, not grpc_contract
 pub fn component_report(
     tier: i32,
-    values: &[&str],
+    hashes: &[i64],
     masks: &[u32],
     block_sizes: &[u32],
 ) -> ExternalKvAction {
     ExternalKvAction {
         r#type: ExternalKvActionType::ActionReport as i32,
         tier,
-        hashes: hashes(values),
+        hashes: hashes.to_vec(),
         component_masks: masks.to_vec(),
         block_sizes: block_sizes.to_vec(),
     }

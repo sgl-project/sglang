@@ -150,13 +150,13 @@ fn classify_rpc(status: Status) -> BridgeError {
 enum Action {
     Report {
         tier: i32,
-        hashes: Vec<String>,
+        hashes: Vec<i64>,
         masks: Vec<Option<u32>>,
         block_sizes: Vec<Option<u32>>,
     },
     Revoke {
         tier: i32,
-        hashes: Vec<String>,
+        hashes: Vec<i64>,
     },
     ClearAll,
 }
@@ -171,13 +171,7 @@ impl EventActions {
     /// with an immediately-preceding store to the same tier and never across a
     /// revoke/clear, so the final per-hash state is preserved. All hashes here
     /// share the event's component mask and block size.
-    fn report(
-        &mut self,
-        tier: i32,
-        hashes: Vec<String>,
-        mask: Option<u32>,
-        block_size: Option<u32>,
-    ) {
+    fn report(&mut self, tier: i32, hashes: Vec<i64>, mask: Option<u32>, block_size: Option<u32>) {
         if hashes.is_empty() {
             return;
         }
@@ -204,7 +198,7 @@ impl EventActions {
         });
     }
 
-    fn revoke(&mut self, tier: i32, hashes: Vec<String>) {
+    fn revoke(&mut self, tier: i32, hashes: Vec<i64>) {
         if hashes.is_empty() {
             return;
         }
@@ -626,15 +620,21 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
     Ok(())
 }
 
-fn decode_hashes(value: &Value) -> Result<Vec<String>, BridgeError> {
+fn decode_hashes(value: &Value) -> Result<Vec<i64>, BridgeError> {
     expect_array(value, "block_hashes")?
         .iter()
         .map(|value| {
             if let Some(value) = value.as_i64() {
-                return Ok(value.to_string());
+                return Ok(value);
             }
+            // SGLang folds the unsigned top 64 bits of the SHA-256 into the
+            // signed range by subtracting 2^64 (`hash_str_to_int64`), which is
+            // two's complement, so a producer that serialises the unsigned half
+            // instead is carrying identical bits. Reinterpreting recovers the
+            // hash the router queries for; refusing the value would instead skip
+            // the whole event and lose every placement it carried.
             if let Some(value) = value.as_u64() {
-                return Ok(value.to_string());
+                return Ok(value as i64);
             }
             Err(BridgeError::Decode(
                 "block hash must be an integer".to_string(),
@@ -870,7 +870,7 @@ mod tests {
     fn rep(tier: i32, hashes: &[&str]) -> Action {
         Action::Report {
             tier,
-            hashes: hashes.iter().map(|h| h.to_string()).collect(),
+            hashes: hashes.iter().map(|h| h.parse().unwrap()).collect(),
             masks: vec![None; hashes.len()],
             block_sizes: vec![None; hashes.len()],
         }
@@ -879,7 +879,7 @@ mod tests {
     fn rev(tier: i32, hashes: &[&str]) -> Action {
         Action::Revoke {
             tier,
-            hashes: hashes.iter().map(|h| h.to_string()).collect(),
+            hashes: hashes.iter().map(|h| h.parse().unwrap()).collect(),
         }
     }
 
@@ -945,7 +945,7 @@ mod tests {
         ExternalKvAction {
             r#type: ExternalKvActionType::ActionReport as i32,
             tier,
-            hashes: hashes.iter().map(|h| h.to_string()).collect(),
+            hashes: hashes.iter().map(|h| h.parse().unwrap()).collect(),
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
         }
@@ -955,7 +955,7 @@ mod tests {
         ExternalKvAction {
             r#type: ExternalKvActionType::ActionRevoke as i32,
             tier,
-            hashes: hashes.iter().map(|h| h.to_string()).collect(),
+            hashes: hashes.iter().map(|h| h.parse().unwrap()).collect(),
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
         }
@@ -995,7 +995,7 @@ mod tests {
             actions: vec![ExternalKvAction {
                 r#type: ExternalKvActionType::ActionReport as i32,
                 tier: hbm(),
-                hashes: (0..count).map(|index| format!("hash-{index}")).collect(),
+                hashes: (0..count).map(|index| index as i64).collect(),
                 component_masks: (0..count as u32).collect(),
                 block_sizes: (0..count as u32).map(|index| index + 1).collect(),
             }],
@@ -1009,7 +1009,7 @@ mod tests {
         assert_eq!(batches[0].actions[0].hashes.len(), MAX_HASHES_PER_REQUEST);
         assert_eq!(
             batches[1].actions[0].hashes,
-            vec![format!("hash-{MAX_HASHES_PER_REQUEST}")]
+            vec![MAX_HASHES_PER_REQUEST as i64]
         );
         assert_eq!(
             batches[1].actions[0].component_masks,
@@ -1252,7 +1252,7 @@ mod tests {
     }
 
     #[test]
-    fn negative_hashes_are_stringified() {
+    fn negative_hashes_remain_signed_integers() {
         assert_eq!(
             actions_of(vec![stored(&[-1905904552702706914], "GPU")]),
             vec![rep(hbm(), &["-1905904552702706914"])]
@@ -1299,16 +1299,21 @@ mod tests {
         assert!(parse_clear_tiers("HBM,NVME").is_err());
     }
 
+    /// An event that serialises a hash as unsigned must decode to the value the
+    /// router queries for. Anything else would file the block under a hash no
+    /// query can reach, which reads as a silent cache miss rather than an error.
     #[test]
-    fn decode_hashes_accepts_signed_and_unsigned() {
+    fn decode_hashes_reinterprets_unsigned_as_the_same_bits() {
         let value = Value::Array(vec![
             Value::from(1_i64),
             Value::from(-2_i64),
+            Value::from(i64::MAX as u64),
             Value::from(u64::MAX),
+            Value::from(1_u64 << 63),
         ]);
         assert_eq!(
             decode_hashes(&value).unwrap(),
-            vec!["1".to_string(), "-2".to_string(), u64::MAX.to_string()]
+            vec![1, -2, i64::MAX, -1, i64::MIN]
         );
         assert!(decode_hashes(&Value::Array(vec![Value::String("x".into())])).is_err());
     }
@@ -1347,7 +1352,7 @@ mod tests {
             actions_of(vec![stored_c(&[1], "GPU", 64, strv(&["full", "swa"]))]),
             vec![Action::Report {
                 tier: hbm(),
-                hashes: vec!["1".to_string()],
+                hashes: vec![1],
                 masks: vec![Some(
                     crate::service::COMPONENT_FULL | crate::service::COMPONENT_SWA
                 )],
@@ -1379,7 +1384,7 @@ mod tests {
         );
         assert_eq!(request.actions.len(), 1);
         let action = &request.actions[0];
-        assert_eq!(action.hashes, vec!["1".to_string(), "2".to_string()]);
+        assert_eq!(action.hashes, vec![1, 2]);
         assert_eq!(
             action.component_masks,
             vec![

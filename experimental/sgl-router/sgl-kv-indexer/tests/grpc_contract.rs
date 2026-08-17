@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use prost::Message;
 use tokio::sync::Semaphore;
 use tonic::transport::Server;
 use tonic::{Code, Status};
@@ -29,8 +30,8 @@ use sgl_kv_indexer::pb::{
     MatchExternalKvResponse,
 };
 use sgl_kv_indexer::{
-    GrpcPrefixIndex, InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService, PrefixIndex,
-    PrefixIndexConfig,
+    server_builder, GrpcPrefixIndex, InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService,
+    PrefixIndex, PrefixIndexConfig, MAX_GRPC_DECODING_MESSAGE_SIZE,
 };
 use test_id::nanos;
 use test_kv::{action, apply_request, hbm};
@@ -39,10 +40,10 @@ use test_net::free_addr;
 async fn start_backend(
     backend: InMemoryKvIndexerBackend,
 ) -> KvIndexerClient<tonic::transport::Channel> {
-    let svc = KvIndexerServer::new(KvIndexerService::new(backend));
+    let svc = KvIndexerService::new(backend).into_server();
     let addr = free_addr();
     tokio::spawn(async move {
-        Server::builder()
+        server_builder()
             .add_service(svc)
             .serve(addr)
             .await
@@ -101,10 +102,10 @@ impl KvIndexerBackend for BlockingPrefixBackend {
 async fn start_blocking_backend(
     backend: BlockingPrefixBackend,
 ) -> KvIndexerClient<tonic::transport::Channel> {
-    let svc = KvIndexerServer::new(KvIndexerService::with_prefix_query_max_inflight(backend, 2));
+    let svc = KvIndexerService::with_prefix_query_max_inflight(backend, 2).into_server();
     let addr = free_addr();
     tokio::spawn(async move {
-        Server::builder()
+        server_builder()
             .add_service(svc)
             .serve(addr)
             .await
@@ -136,7 +137,7 @@ async fn prefix_limit_rejects_over_real_grpc_without_blocking_writes() {
     };
     let client = start_blocking_backend(backend).await;
     let request = || MatchExternalKvPrefixRequest {
-        hashes: vec!["hash".into()],
+        hashes: vec![-1],
         max_blocks: 0,
     };
 
@@ -188,7 +189,7 @@ fn apply(
     seq: u64,
     action_type: ExternalKvActionType,
     tier: i32,
-    hashes: &[&str],
+    hashes: &[i64],
 ) -> ApplyExternalKvBatchRequest {
     apply_request(worker, addr, seq, vec![action(action_type, tier, hashes)])
 }
@@ -198,7 +199,7 @@ fn apply_report(
     addr: &str,
     seq: u64,
     tier: i32,
-    hashes: &[&str],
+    hashes: &[i64],
 ) -> ApplyExternalKvBatchRequest {
     apply(
         worker,
@@ -216,9 +217,7 @@ async fn multiple_workers_share_one_indexer_server() {
     let suffix = nanos();
     let worker_0 = format!("worker-0-{suffix}");
     let worker_1 = format!("worker-1-{suffix}");
-    let hash_0 = format!("horizontal-h0-{suffix}");
-    let hash_1 = format!("horizontal-h1-{suffix}");
-    let shared_hash = format!("horizontal-shared-{suffix}");
+    let (hash_0, hash_1, shared_hash) = (1, 2, 3);
 
     indexer
         .apply_external_kv_batch(apply_report(
@@ -226,7 +225,7 @@ async fn multiple_workers_share_one_indexer_server() {
             "10.0.0.1:9000",
             1,
             hbm(),
-            &[&hash_0, &shared_hash],
+            &[hash_0, shared_hash],
         ))
         .await
         .expect("apply worker-0");
@@ -236,14 +235,14 @@ async fn multiple_workers_share_one_indexer_server() {
             "10.0.0.2:9000",
             1,
             hbm(),
-            &[&hash_1, &shared_hash],
+            &[hash_1, shared_hash],
         ))
         .await
         .expect("apply worker-1");
 
     let response = indexer
         .match_external_kv(MatchExternalKvRequest {
-            hashes: vec![hash_0.clone(), hash_1.clone(), shared_hash.clone()],
+            hashes: vec![hash_0, hash_1, shared_hash],
             count_as_hit: false,
         })
         .await
@@ -262,20 +261,20 @@ async fn multiple_workers_share_one_indexer_server() {
     // semantics live in memory_integration.rs.
     indexer
         .match_external_kv(MatchExternalKvRequest {
-            hashes: vec![hash_0.clone()],
+            hashes: vec![hash_0],
             count_as_hit: true,
         })
         .await
         .expect("counting match over gRPC");
-    let miss = format!("horizontal-miss-{suffix}");
+    let miss = 4;
     let counts = indexer
         .get_external_kv_hit_counts(GetExternalKvHitCountsRequest {
-            hashes: vec![hash_0.clone(), miss.clone()],
+            hashes: vec![hash_0, miss],
         })
         .await
         .expect("hit counts over gRPC")
         .into_inner();
-    let count = |hash: &str| {
+    let count = |hash: i64| {
         counts
             .entries
             .iter()
@@ -283,8 +282,8 @@ async fn multiple_workers_share_one_indexer_server() {
             .map(|entry| entry.hit_count_total)
             .unwrap_or(0)
     };
-    assert!(count(&hash_0) >= 1, "matched hash should have a hit");
-    assert_eq!(count(&miss), 0, "unmatched hash must not be counted");
+    assert!(count(hash_0) >= 1, "matched hash should have a hit");
+    assert_eq!(count(miss), 0, "unmatched hash must not be counted");
 }
 
 #[tokio::test]
@@ -293,7 +292,7 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
 
     // empty worker_id
     let err = c
-        .apply_external_kv_batch(apply_report("", "addr", 1, hbm(), &["h"]))
+        .apply_external_kv_batch(apply_report("", "addr", 1, hbm(), &[1]))
         .await
         .expect_err("empty worker_id must be rejected");
     assert_eq!(
@@ -329,7 +328,7 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
         actions: vec![ExternalKvAction {
             r#type: 999,
             tier: hbm(),
-            hashes: vec!["h".into()],
+            hashes: vec![1],
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
         }],
@@ -352,7 +351,7 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
             1,
             ExternalKvActionType::ActionReport,
             999,
-            &["h"],
+            &[1],
         ))
         .await
         .expect_err("bad tier rejected");
@@ -367,7 +366,7 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
 async fn match_prefix_over_grpc() {
     let mut c = start().await;
     let (w_long, w_short) = (format!("long-{}", nanos()), format!("short-{}", nanos()));
-    let (a, b, d) = ("mp-a", "mp-b", "mp-c");
+    let (a, b, d) = (1, 2, 3);
 
     c.apply_external_kv_batch(apply_report(&w_long, "10.0.0.1:9000", 1, hbm(), &[a, b, d]))
         .await
@@ -378,7 +377,7 @@ async fn match_prefix_over_grpc() {
 
     let resp = c
         .match_external_kv_prefix(MatchExternalKvPrefixRequest {
-            hashes: vec![a.into(), b.into(), d.into()],
+            hashes: vec![a, b, d],
             max_blocks: 0,
         })
         .await
@@ -401,18 +400,15 @@ async fn prefix_query_scans_more_than_one_apply_chunk_over_grpc() {
     const APPLY_CHUNK_SIZE: usize = 16_384;
 
     let mut indexer = start().await;
-    let hashes: Vec<String> = (0..=APPLY_CHUNK_SIZE)
-        .map(|index| format!("large-prefix-{index}"))
-        .collect();
+    let hashes: Vec<i64> = (0..=APPLY_CHUNK_SIZE as i64).collect();
     for (seq, chunk) in hashes.chunks(APPLY_CHUNK_SIZE).enumerate() {
-        let chunk: Vec<&str> = chunk.iter().map(String::as_str).collect();
         indexer
             .apply_external_kv_batch(apply_report(
                 "large-prefix-worker",
                 "10.0.0.1:9000",
                 seq as u64,
                 hbm(),
-                &chunk,
+                chunk,
             ))
             .await
             .expect("bounded apply chunk");
@@ -429,6 +425,61 @@ async fn prefix_query_scans_more_than_one_apply_chunk_over_grpc() {
 
     assert_eq!(response.best_prefix_blocks as usize, APPLY_CHUNK_SIZE + 1);
     assert_eq!(response.blocks_read as usize, APPLY_CHUNK_SIZE + 1);
+}
+
+#[tokio::test]
+async fn packed_signed_hash_query_can_exceed_tonics_default_receive_limit() {
+    const TONIC_DEFAULT_RECEIVE_LIMIT: usize = 4 * 1024 * 1024;
+    const HASH_COUNT: usize = 600_000;
+
+    let mut indexer = start().await;
+    indexer
+        .apply_external_kv_batch(apply_report(
+            "large-wire-worker",
+            "10.0.0.1:9000",
+            1,
+            hbm(),
+            &[-1],
+        ))
+        .await
+        .expect("store the signed first hash");
+
+    let mut hashes = Vec::with_capacity(HASH_COUNT);
+    hashes.push(-1);
+    hashes.extend((1..HASH_COUNT).map(|value| value as i64));
+    let request = MatchExternalKvPrefixRequest {
+        hashes,
+        max_blocks: 0,
+    };
+    assert!(request.encoded_len() > TONIC_DEFAULT_RECEIVE_LIMIT);
+    assert!(request.encoded_len() < MAX_GRPC_DECODING_MESSAGE_SIZE);
+
+    let response = indexer
+        .match_external_kv_prefix(request)
+        .await
+        .expect("configured server accepts a packed request larger than 4 MiB")
+        .into_inner();
+    assert_eq!(response.best_prefix_blocks, 1);
+}
+
+/// Past the configured ceiling the server must answer OUT_OF_RANGE, because that
+/// is the code the router maps to a degraded (cache-affinity-free) route rather
+/// than to a failed request. A different code there would fail the request.
+#[tokio::test]
+async fn query_past_the_configured_limit_is_refused_as_out_of_range() {
+    let hash_count = MAX_GRPC_DECODING_MESSAGE_SIZE / std::mem::size_of::<i64>() + 1_024;
+    let request = MatchExternalKvPrefixRequest {
+        hashes: (0..hash_count).map(|value| value as i64).collect(),
+        max_blocks: 0,
+    };
+    assert!(request.encoded_len() > MAX_GRPC_DECODING_MESSAGE_SIZE);
+
+    let status = start()
+        .await
+        .match_external_kv_prefix(request)
+        .await
+        .expect_err("a request past the ceiling must be refused");
+    assert_eq!(status.code(), Code::OutOfRange);
 }
 
 /// Serves an empty backend behind an interceptor that records the `grpc-timeout`

@@ -668,6 +668,14 @@ fn resolve_prefix_query(
             tracing::warn!(%model, error = %error, "KV Indexer unavailable; falling back to min-load routing");
             Ok(sgl_kv_indexer::PrefixOutcome::Empty)
         }
+        // A prompt too long to fit one gRPC message is still a prompt a worker
+        // can serve, so it costs cache affinity like the cases above. Logged
+        // separately because the remedy is operational — raise the indexer's
+        // message limit — rather than waiting for the indexer to recover.
+        Err(error @ PrefixIndexError::QueryTooLarge) => {
+            tracing::warn!(%model, error = %error, "prompt exceeds the KV Indexer query size limit; falling back to min-load routing");
+            Ok(sgl_kv_indexer::PrefixOutcome::Empty)
+        }
         // A rejection means the router and the indexer disagree on the request
         // contract; degrading would hide that from every request.
         Err(error) => {
@@ -971,13 +979,15 @@ mod tests {
     use super::*;
 
     /// An unavailable indexer must never fail a request that min-load routing
-    /// can still serve.
+    /// can still serve. `QueryTooLarge` belongs here too: a prompt that outgrows
+    /// the query's message limit loses cache affinity, not availability.
     #[test]
     fn unavailable_indexer_degrades_to_empty_prefix_signal() {
         for error in [
             sgl_kv_indexer::PrefixIndexError::Overloaded,
             sgl_kv_indexer::PrefixIndexError::Timeout,
             sgl_kv_indexer::PrefixIndexError::Unreachable,
+            sgl_kv_indexer::PrefixIndexError::QueryTooLarge,
         ] {
             assert_eq!(
                 resolve_prefix_query(Err(error.clone()), "tiny").unwrap(),

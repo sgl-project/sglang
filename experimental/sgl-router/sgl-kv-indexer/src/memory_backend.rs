@@ -34,21 +34,21 @@ struct WorkerRecord {
     address: String,
     spec: Option<WorkerCacheSpec>,
     /// Reverse index used by CLEAR_ALL_AT_TIER.
-    holdings: HashMap<i32, HashSet<String>>,
+    holdings: HashMap<i32, HashSet<i64>>,
 }
 
 #[derive(Debug, Default)]
 struct State {
-    blocks: HashMap<String, BlockRecord>,
+    blocks: HashMap<i64, BlockRecord>,
     workers: HashMap<String, WorkerRecord>,
-    hit_counts: HashMap<String, u64>,
+    hit_counts: HashMap<i64, u64>,
 }
 
 struct WorkerView {
     worker_id: String,
     address: String,
     spec: Option<WorkerCacheSpec>,
-    hashes_by_tier: BTreeMap<i32, Vec<(String, u32, u32)>>,
+    hashes_by_tier: BTreeMap<i32, Vec<(i64, u32, u32)>>,
     blocks: Vec<Option<BlockComponents>>,
 }
 
@@ -105,7 +105,7 @@ impl InMemoryKvIndexerBackend {
 
                     // REPORT is a REPLACE snapshot. Keep the final occurrence
                     // when a coalesced action repeats one hash.
-                    let mut last_by_hash: HashMap<String, (u32, u32)> = HashMap::new();
+                    let mut last_by_hash: HashMap<i64, (u32, u32)> = HashMap::new();
                     for (index, hash) in action.hashes.into_iter().enumerate() {
                         let mask = if has_masks {
                             action.component_masks[index]
@@ -121,7 +121,7 @@ impl InMemoryKvIndexerBackend {
                     }
 
                     for (hash, (mask, token_count)) in last_by_hash {
-                        let block = state.blocks.entry(hash.clone()).or_default();
+                        let block = state.blocks.entry(hash).or_default();
                         block
                             .placements
                             .insert((worker_id.clone(), action.tier), mask);
@@ -189,7 +189,7 @@ impl InMemoryKvIndexerBackend {
                     .into_iter()
                     .map(|(tier, placements)| TierHashes {
                         tier,
-                        hashes: placements.iter().map(|(hash, _, _)| hash.clone()).collect(),
+                        hashes: placements.iter().map(|(hash, _, _)| *hash).collect(),
                         component_masks: placements.iter().map(|(_, mask, _)| *mask).collect(),
                         block_sizes: placements
                             .into_iter()
@@ -205,9 +205,9 @@ impl InMemoryKvIndexerBackend {
 
     fn collect_worker_views(
         state: &State,
-        hashes: &[String],
+        hashes: &[i64],
         with_blocks: bool,
-    ) -> (Vec<WorkerView>, Vec<String>) {
+    ) -> (Vec<WorkerView>, Vec<i64>) {
         // Keyed by a borrow of the stored worker id, so it is copied once per
         // worker in the result rather than once per scanned placement.
         let mut worker_order: Vec<&str> = Vec::new();
@@ -221,7 +221,7 @@ impl InMemoryKvIndexerBackend {
             if block.placements.is_empty() {
                 continue;
             }
-            matched_hashes.push(hash.clone());
+            matched_hashes.push(*hash);
             for ((worker, tier), mask) in &block.placements {
                 let view = by_worker.entry(worker.as_str()).or_insert_with(|| {
                     worker_order.push(worker.as_str());
@@ -248,7 +248,7 @@ impl InMemoryKvIndexerBackend {
                     components.tier_masks.push((*tier, *mask));
                 } else {
                     view.hashes_by_tier.entry(*tier).or_default().push((
-                        hash.clone(),
+                        *hash,
                         *mask,
                         block.token_count,
                     ));
@@ -263,7 +263,7 @@ impl InMemoryKvIndexerBackend {
         (workers, matched_hashes)
     }
 
-    fn collect_prefix_inputs_locked(state: &State, hashes: &[String]) -> Vec<WorkerPrefixInput> {
+    fn collect_prefix_inputs_locked(state: &State, hashes: &[i64]) -> Vec<WorkerPrefixInput> {
         Self::collect_worker_views(state, hashes, true)
             .0
             .into_iter()
@@ -392,7 +392,7 @@ impl InMemoryKvIndexerBackend {
     }
 }
 
-fn revoke_one(state: &mut State, worker_id: &str, hash: &str, tier: i32) {
+fn revoke_one(state: &mut State, worker_id: &str, hash: &i64, tier: i32) {
     let mut remove_block = false;
     if let Some(block) = state.blocks.get_mut(hash) {
         block.placements.remove(&(worker_id.to_string(), tier));
@@ -414,12 +414,12 @@ fn revoke_one(state: &mut State, worker_id: &str, hash: &str, tier: i32) {
     }
 }
 
-fn dedup_preserve_order(hashes: &[String]) -> Vec<String> {
+fn dedup_preserve_order(hashes: &[i64]) -> Vec<i64> {
     let mut seen = HashSet::new();
     hashes
         .iter()
-        .filter(|hash| seen.insert(hash.as_str().to_string()))
-        .cloned()
+        .filter(|hash| seen.insert(**hash))
+        .copied()
         .collect()
 }
 
@@ -441,7 +441,7 @@ impl KvIndexerBackend for InMemoryKvIndexerBackend {
 
     async fn collect_worker_prefix_inputs(
         &self,
-        hashes: &[String],
+        hashes: &[i64],
     ) -> Result<Vec<WorkerPrefixInput>, Status> {
         let state = self.read_state()?;
         Ok(Self::collect_prefix_inputs_locked(&state, hashes))
@@ -470,8 +470,8 @@ mod tests {
 
     #[test]
     fn dedup_keeps_first_seen_order() {
-        let hashes = vec!["a".into(), "b".into(), "a".into(), "c".into()];
-        assert_eq!(dedup_preserve_order(&hashes), vec!["a", "b", "c"]);
+        let hashes = vec![1, -2, 1, 3];
+        assert_eq!(dedup_preserve_order(&hashes), vec![1, -2, 3]);
     }
 
     #[test]
@@ -484,7 +484,7 @@ mod tests {
         let query = std::thread::spawn(move || {
             result_tx
                 .send(query_backend.do_match(MatchExternalKvRequest {
-                    hashes: vec!["a".into()],
+                    hashes: vec![-1],
                     count_as_hit: false,
                 }))
                 .unwrap();

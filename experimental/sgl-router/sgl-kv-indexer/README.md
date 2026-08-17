@@ -175,10 +175,11 @@ The Indexer returns every candidate sorted by prefix length; it does not choose
 a worker. When configured, it replaces the Router's local radix tree as the
 cache signal: the Router intersects Indexer results with its healthy candidates,
 and a successful query with no usable match selects by minimum active load.
-Indexer connection failures, timeouts, and overload fall back to that same
-minimum-active-load selection, so an unreachable Indexer costs cache affinity
-rather than availability; a rejected RPC still fails the Router request with
-`503`, because it means the two sides disagree on the request contract. An
+Indexer connection failures, timeouts, overload, and a prompt too long to fit one
+gRPC message fall back to that same minimum-active-load selection, so an
+unreachable Indexer costs cache affinity rather than availability; a rejected RPC
+still fails the Router request with `503`, because it means the two sides
+disagree on the request contract. An
 endpoint the Router could never dial is rejected at startup instead of failing
 every query later. The local radix tree is used only when no Indexer endpoint is
 configured. The per-query deadline defaults to 100ms and can be changed with
@@ -190,10 +191,22 @@ Prefix queries carry no Indexer-imposed block cap beyond the caller's
 16,384 hashes. The in-memory backend scans the request in one pass over a single
 consistent snapshot, holding O(1) matching state per candidate worker and
 considering only workers that hold the first block, so request length costs time
-but not memory. Server work is bounded by `max_blocks` when the caller supplies
-one and by the gRPC message-size limit. The Router's per-query deadline bounds
-how long it waits for an answer, but does not cancel a synchronous scan already
-in progress. A first-block miss returns immediately with `blocks_read=1`.
+but not memory. Block hashes use packed `sfixed64` encoding, and the server
+accepts decoded gRPC messages up to 8 MiB (roughly one million hashes).
+Server work is bounded by `max_blocks` when the caller supplies one and by that
+transport limit. The Router's per-query deadline bounds how long it waits for an
+answer, but does not cancel a synchronous scan already in progress. A first-block
+miss returns immediately with `blocks_read=1`.
+
+Message decoding happens before a request reaches the service, so
+`KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT` bounds the scan but not the bytes a peer
+makes the server buffer. That is bounded instead by the HTTP/2 stream limit: each
+connection is capped at 64 concurrent streams, bounding that connection to
+64 × 8 MiB of undecoded requests. For a query past the 8 MiB ceiling, the Router
+sends only the leading hashes that fit and still divides the returned prefix by
+the full request's block count. This preserves a useful lower-bound cache signal
+without overstating the match rate. If an Indexer has a lower ceiling and returns
+gRPC `OUT_OF_RANGE`, the Router falls back to minimum active load.
 
 Long scans hold the read lock throughout. Operators serving very long prompts
 should set `max_blocks` instead of relying on the message-size limit.

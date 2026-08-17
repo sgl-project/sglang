@@ -15,12 +15,17 @@ use tonic::transport::{Channel, Endpoint};
 
 use crate::pb::kv_indexer_client::KvIndexerClient;
 use crate::pb::MatchExternalKvPrefixRequest;
+use crate::service::MAX_GRPC_DECODING_MESSAGE_SIZE;
 
 /// Default per-query deadline. Indexer failures are request failures, so this
 /// absorbs normal cross-host jitter without stalling a request indefinitely.
 pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_millis(100);
 /// Default process-local bound on prefix-query RPCs issued by one client.
 pub const DEFAULT_QUERY_MAX_INFLIGHT: usize = 32;
+// Leave room for the packed field tag, length prefix, and future scalar fields.
+const PREFIX_QUERY_ENCODING_HEADROOM: usize = 16;
+const MAX_PREFIX_HASHES_PER_QUERY: usize =
+    (MAX_GRPC_DECODING_MESSAGE_SIZE - PREFIX_QUERY_ENCODING_HEADROOM) / 8;
 
 /// One worker's contiguous prefix hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +48,10 @@ pub enum PrefixIndexError {
     Timeout,
     /// The client or Indexer shed the query because its in-flight limit was hit.
     Overloaded,
+    /// The query exceeded the Indexer's gRPC message-size limit, so no worker's
+    /// prefix was scanned. Bounded by prompt length, not by load: retrying the
+    /// same prompt cannot succeed.
+    QueryTooLarge,
     /// The server rejected the request.
     Rejected(tonic::Code),
 }
@@ -53,6 +62,9 @@ impl std::fmt::Display for PrefixIndexError {
             Self::Unreachable => f.write_str("KV Indexer is unreachable"),
             Self::Timeout => f.write_str("KV Indexer query timed out"),
             Self::Overloaded => f.write_str("KV Indexer is overloaded"),
+            Self::QueryTooLarge => {
+                f.write_str("KV Indexer query exceeded the gRPC message-size limit")
+            }
             Self::Rejected(code) => write!(f, "KV Indexer rejected the query with {code}"),
         }
     }
@@ -152,21 +164,35 @@ impl GrpcPrefixIndex {
     }
 }
 
+fn truncate_prefix_query(hashes: &mut Vec<i64>) -> Option<usize> {
+    let total = hashes.len();
+    hashes.truncate(MAX_PREFIX_HASHES_PER_QUERY);
+    (hashes.len() != total).then_some(total)
+}
+
 #[tonic::async_trait]
 impl PrefixIndex for GrpcPrefixIndex {
-    async fn match_prefix(&self, hashes: Vec<i64>) -> Result<PrefixOutcome, PrefixIndexError> {
+    async fn match_prefix(&self, mut hashes: Vec<i64>) -> Result<PrefixOutcome, PrefixIndexError> {
         if hashes.is_empty() {
             return Ok(PrefixOutcome::Empty);
         }
+
+        if let Some(total_hashes) = truncate_prefix_query(&mut hashes) {
+            tracing::warn!(
+                total_hashes,
+                queried_hashes = hashes.len(),
+                "KV Indexer query truncated to the gRPC message-size limit"
+            );
+        }
+
         let _permit = self.try_acquire_prefix_query()?;
 
         let mut client = KvIndexerClient::new(self.channel.clone());
         let mut request = tonic::Request::new(MatchExternalKvPrefixRequest {
-            // The bridge encodes block hashes as decimal strings; mirror it.
-            hashes: hashes.iter().map(|hash| hash.to_string()).collect(),
-            // No caller-side truncation. The policy still scores against the full
-            // query, never `blocks_read`, so a partial scan cannot turn a fraction
-            // of the request into a perfect hit.
+            hashes,
+            // The policy retains the full query length as its denominator, so a
+            // transport-limited prefix cannot turn a partial scan into a perfect
+            // hit.
             max_blocks: 0,
         });
         // On the wire so the indexer can drop a query this caller already stopped
@@ -235,12 +261,19 @@ fn classify(code: tonic::Code) -> PrefixIndexError {
         // This client cancels a query for no other reason.
         tonic::Code::DeadlineExceeded | tonic::Code::Cancelled => PrefixIndexError::Timeout,
         tonic::Code::ResourceExhausted => PrefixIndexError::Overloaded,
+        // The indexer's decoder refuses a message past its size limit with
+        // OUT_OF_RANGE. A prompt too long to carry is not a disagreement about
+        // the request contract, so it stays separable from `Rejected` and the
+        // caller can degrade instead of failing the request.
+        tonic::Code::OutOfRange => PrefixIndexError::QueryTooLarge,
         _ => PrefixIndexError::Rejected(code),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use prost::Message;
+
     use super::*;
 
     #[test]
@@ -248,6 +281,37 @@ mod tests {
         assert_eq!(
             classify(tonic::Code::ResourceExhausted),
             PrefixIndexError::Overloaded
+        );
+    }
+
+    /// An over-limit query must stay distinguishable from a contract rejection:
+    /// the caller degrades on the former and fails the request on the latter.
+    #[test]
+    fn classifies_over_limit_message_as_too_large() {
+        assert_eq!(
+            classify(tonic::Code::OutOfRange),
+            PrefixIndexError::QueryTooLarge
+        );
+        assert_eq!(
+            classify(tonic::Code::InvalidArgument),
+            PrefixIndexError::Rejected(tonic::Code::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn oversized_query_keeps_a_prefix_within_the_transport_limit() {
+        let total = MAX_PREFIX_HASHES_PER_QUERY + 1;
+        let mut hashes = vec![-1; total];
+
+        assert_eq!(truncate_prefix_query(&mut hashes), Some(total));
+        assert_eq!(hashes.len(), MAX_PREFIX_HASHES_PER_QUERY);
+        assert!(
+            MatchExternalKvPrefixRequest {
+                hashes,
+                max_blocks: 0,
+            }
+            .encoded_len()
+                <= MAX_GRPC_DECODING_MESSAGE_SIZE
         );
     }
 

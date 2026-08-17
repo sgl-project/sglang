@@ -10,12 +10,11 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
 use sgl_kv_indexer::pb::kv_indexer_client::KvIndexerClient;
-use sgl_kv_indexer::pb::kv_indexer_server::KvIndexerServer;
 use sgl_kv_indexer::pb::{
     ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, TierType,
 };
 use sgl_kv_indexer::{
-    GrpcPrefixIndex, InMemoryKvIndexerBackend, KvIndexerService, PrefixIndexConfig,
+    server_builder, GrpcPrefixIndex, InMemoryKvIndexerBackend, KvIndexerService, PrefixIndexConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry;
@@ -27,7 +26,6 @@ use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Server;
 use tower::ServiceExt;
 
 use crate::common::cache_aware_fixture::{config, MODEL};
@@ -51,10 +49,8 @@ async fn external_indexer_routes_to_the_cached_worker() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
-        Server::builder()
-            .add_service(KvIndexerServer::new(KvIndexerService::new(
-                InMemoryKvIndexerBackend::new(),
-            )))
+        server_builder()
+            .add_service(KvIndexerService::new(InMemoryKvIndexerBackend::new()).into_server())
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .unwrap();
@@ -68,7 +64,7 @@ async fn external_indexer_routes_to_the_cached_worker() {
             actions: vec![ExternalKvAction {
                 r#type: ExternalKvActionType::ActionReport as i32,
                 tier: TierType::TierHbm as i32,
-                hashes: hashes.iter().map(ToString::to_string).collect(),
+                hashes: hashes.clone(),
                 component_masks: Vec::new(),
                 block_sizes: Vec::new(),
             }],

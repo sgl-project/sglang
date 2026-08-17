@@ -5,12 +5,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::{env, io};
 
-use sgl_kv_indexer::pb::kv_indexer_server::KvIndexerServer;
 use sgl_kv_indexer::{
-    shutdown_signal, stamp_arrival, InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService,
-    DEFAULT_PREFIX_QUERY_MAX_INFLIGHT,
+    server_builder, shutdown_signal, stamp_arrival, InMemoryKvIndexerBackend, KvIndexerBackend,
+    KvIndexerService, DEFAULT_PREFIX_QUERY_MAX_INFLIGHT, MAX_CONCURRENT_STREAMS,
 };
-use tonic::transport::Server;
+use tonic::service::interceptor::InterceptedService;
 use tracing::info;
 
 const PREFIX_QUERY_MAX_INFLIGHT_ENV: &str = "KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT";
@@ -31,17 +30,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let backend: Arc<dyn KvIndexerBackend> = Arc::new(InMemoryKvIndexerBackend::new());
     // The interceptor timestamps each request before its own task is queued,
     // which is what lets the query path shed work whose deadline expired.
-    let service = KvIndexerServer::with_interceptor(
-        KvIndexerService::with_prefix_query_max_inflight(backend, prefix_query_max_inflight),
+    let service = InterceptedService::new(
+        KvIndexerService::with_prefix_query_max_inflight(backend, prefix_query_max_inflight)
+            .into_server(),
         stamp_arrival,
     );
 
     info!(
         %addr,
         prefix_query_max_inflight,
+        max_concurrent_streams = MAX_CONCURRENT_STREAMS,
         "starting single-server in-memory SGLang KV Indexer"
     );
-    Server::builder()
+    server_builder()
         .add_service(service)
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
