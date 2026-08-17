@@ -129,7 +129,7 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
         self.assertEqual(len(caught), 0)
 
     def test_disable_tp_imbalance_check_polarity_is_inverted(self):
-        old_name = "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"
+        old_name = "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK"
         new_name = "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK"
         os.environ[old_name] = "1"
         self.addCleanup(os.environ.pop, old_name, None)

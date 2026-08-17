@@ -832,7 +832,6 @@ class Envs:
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
-    SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
 
@@ -1585,9 +1584,6 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         replacement="SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2"
     ),
     # The legacy DISABLE flags have the opposite polarity of their replacement.
-    "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": _DeprecatedEnv(
-        replacement="SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", transform=_invert_bool
-    ),
     "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": _DeprecatedEnv(
         replacement="SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", transform=_invert_bool
     ),
