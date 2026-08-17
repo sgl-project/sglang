@@ -104,13 +104,6 @@ _flashinfer_pr4266_prefer_direct = None
 _flashinfer_pr4266_run_direct_dense = None
 _enable_bf16_splitk_gemm = False
 
-_FLASHINFER_SPLITK_GEMM_HINT = (
-    "The BF16 Split-K GEMM path needs the direct dense kernel added by "
-    "FlashInfer PR #4266. Reinstall a newer FlashInfer, or set "
-    "SGLANG_ENABLE_BF16_SPLITK_GEMM=0 to disable this path."
-)
-
-
 # Oakhaven-Max TP16 tactics measured on GB300 under CUDA graph replay with PDL
 # and L2-defeating weight rotation. Every entry passed the strict correctness
 # gate and beat SGLang's existing dispatch by at least 1.26x. Unlisted M/N/K,
@@ -211,19 +204,15 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
 
     _enable_bf16_splitk_gemm = False
     if should_enable_bf16_splitk_gemm(backend):
+        from sglang.kernels.ops.gemm.flashinfer_pr4266_dense_bf16_gemm_sm100_direct import (
+            default_tactic,
+            prefer_direct_bf16_gemm_sm100,
+            run_direct_dense,
+        )
         from sglang.kernels.ops.gemm.flashinfer_pr4266_dense_bf16_gemm_sm100_splitk import (
             SplitKTactic,
             run_splitk_dense,
         )
-
-        try:
-            from flashinfer.gemm.kernels.dense_bf16_gemm_direct import (
-                default_tactic,
-                prefer_direct_bf16_gemm_sm100,
-                run_direct_dense,
-            )
-        except ImportError as exc:
-            raise ImportError(_FLASHINFER_SPLITK_GEMM_HINT) from exc
 
         _flashinfer_pr4266_splitk_tactic = SplitKTactic
         _flashinfer_pr4266_run_splitk_dense = run_splitk_dense
