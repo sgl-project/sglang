@@ -34,7 +34,7 @@ if [ -n "${TRANSFORMERS_VERSION_FOR_SGLANG}" ];then
     echo "Install transformers ${TRANSFORMERS_VERSION_FOR_SGLANG} locally."
     TRANSFORMERS_PKG_PATH_TARGET=/tmp/transformers/${TRANSFORMERS_VERSION_FOR_SGLANG}
     mkdir -p "${TRANSFORMERS_PKG_PATH_TARGET}"
-    cp "${TRANSFORMERS_PKG_PATH_SOURCE}/*" "${TRANSFORMERS_PKG_PATH_TARGET}/"
+    cp "${TRANSFORMERS_PKG_PATH_SOURCE}/"* "${TRANSFORMERS_PKG_PATH_TARGET}/"
     pip install --no-index --find-links="${TRANSFORMERS_PKG_PATH_TARGET}" transformers=="${TRANSFORMERS_VERSION_FOR_SGLANG}"
   fi
   echo "===== Install transformers for sglang in virtual env - End ====="

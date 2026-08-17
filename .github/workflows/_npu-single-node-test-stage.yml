@@ -375,15 +375,17 @@ jobs:
 
           # Nightly additionally persists the full suite log to ${log_path}/${tc_name}.log
           # under the structured path; PR runs only tee to /tmp/test_output.log.
-          LOG_TEE_TARGET=""
+          # Use an array so the extra target is omitted when empty: passing an empty
+          # string arg makes GNU tee fail (exit code 1) and flips the pipeline exit code.
+          LOG_TEE_TARGETS=("/tmp/test_output.log")
           if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
-            LOG_TEE_TARGET="${log_path}/${tc_name}.log"
+            LOG_TEE_TARGETS+=("${log_path}/${tc_name}.log")
           fi
 
           # Run NPU test suite with run_suite.py.
           # Capture mode (--enable-retry --max-attempts 1) keeps test subprocesses off the
           # tee pipe, so leftover server processes cannot block the pipeline on exit.
-          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log ${LOG_TEE_TARGET} || test_exit_code=$?
+          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
 
           echo "Finished test: ${tc_name}"
 
