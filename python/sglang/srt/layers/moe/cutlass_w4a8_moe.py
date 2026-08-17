@@ -332,26 +332,21 @@ def cutlass_w4a8_moe_deepep_normal(
         topk_ids_, num_experts
     )
     num_total_tokens = reorder_topk_ids.numel()
-    gateup_input_pre_reorder = torch.empty(
+    gateup_input = torch.empty(
         (int(num_total_tokens), a.shape[1]),
         device=device,
-        dtype=a.dtype,
+        dtype=torch.float8_e4m3fn,
     )
     deepep_permute_triton_kernel[(a.shape[0],)](
         a,
-        gateup_input_pre_reorder,
+        gateup_input,
         src2dst,
         topk_ids_.to(torch.int64),
-        None,
+        a1_scale.float(),
         topk,
         a.shape[1],
         BLOCK_SIZE=512,
     )
-    gateup_input = torch.empty(
-        gateup_input_pre_reorder.shape, dtype=torch.float8_e4m3fn, device=device
-    )
-    per_tensor_quant_fp8(gateup_input_pre_reorder, gateup_input, a1_scale.float(), True)
-    del gateup_input_pre_reorder
     local_topk_ids = topk_ids_
     local_topk_ids = (
         torch.where(local_topk_ids == -1, num_experts, topk_ids_).to(torch.int32)
