@@ -314,18 +314,27 @@ def _varlen_path(q, k, v, key_mask, softmax_scale):
     if indices.shape[0] == 0:
         return torch.zeros_like(q)
     q_unpad, k_unpad, v_unpad = fused_pack_qkv(q, k, v, indices)
-    out_unpad = flash_attn_varlen_func(
-        q=q_unpad,
-        k=k_unpad,
-        v=v_unpad,
-        cu_seqlens_q=meta["cu_seqlens"],
-        cu_seqlens_k=meta["cu_seqlens"],
-        max_seqlen_q=meta["max_seqlen"],
-        max_seqlen_k=meta["max_seqlen"],
-        softmax_scale=softmax_scale,
-        causal=False,
-        ver=_fa_backend.fa_ver,
-    )
+    try:
+        out_unpad = flash_attn_varlen_func(
+            q=q_unpad,
+            k=k_unpad,
+            v=v_unpad,
+            cu_seqlens_q=meta["cu_seqlens"],
+            cu_seqlens_k=meta["cu_seqlens"],
+            max_seqlen_q=meta["max_seqlen"],
+            max_seqlen_k=meta["max_seqlen"],
+            softmax_scale=softmax_scale,
+            causal=False,
+            ver=_fa_backend.fa_ver,
+        )
+    except ImportError as exc:  # pragma: no cover - image-dependent
+        # ``flash_attn_varlen_func`` resolves its backend lazily, so an image
+        # without the selected FlashAttention build raises here rather than at
+        # import.  This file also runs on the B200 lane (for the causal-Conv3d
+        # section), which ships no ``flash_attn`` -- skip only this end-to-end
+        # comparison there; the pack/scatter kernels themselves are covered
+        # unit-wise above on every lane.
+        pytest.skip(f"FlashAttention varlen v{_fa_backend.fa_ver} unavailable: {exc}")
     return fused_scatter_to_padded(out_unpad, meta["inv_indices"], bs, seq)
 
 

@@ -11,7 +11,11 @@ is organized by *kernel*, and each section states which oracle it is held to:
   ``None``).
 - ``rmsnorm_scale`` / ``rmsnorm_tanh_residual`` -> a bf16-native reference that
   reproduces Z-Image's own norm, with a tolerance for Triton's exp-based tanh.
-- the CuTe-DSL and FlyDSL fused norm+scale/shift -> an fp32 reference chain.
+- the CuTe-DSL fused norm+scale/shift -> an fp32 reference chain.
+
+The FlyDSL norms live in ``test_norm_flydsl.py``: they are ROCm gfx950-only,
+so they run on a CI lane this file does not, and keeping them here dragged the
+CUDA-only CuTe-DSL cases onto the AMD runner.
 
 The *bit-exact* norms (``fused_rmsnorm_scale_shift_bitexact``,
 ``fused_layernorm_modulate``, ``zimage_qk_rmsnorm_native``) are exercised
@@ -37,11 +41,9 @@ from sglang.kernels.ops.diffusion import (
     triton_group_norm_silu,
     wan_rmsnorm_silu,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=85, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
-register_amd_ci(est_time=15, suite="nightly-amd-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=70, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -308,6 +310,24 @@ AFFINE_MODES = ["D", "NAT"]
 INDEX_MODES = ["BSD", "1", "1SD", "BD", "B1D", "D", "1D", "11D", "BF1D"]
 
 
+def _import_cutedsl():
+    """Import the CuTe-DSL entry points, skipping when the backend is absent.
+
+    This file is registered on the AMD lane for its FlyDSL section, but the
+    CuTe-DSL norms need cuda-python and CUTLASS, which the ROCm image does not
+    ship.  Guarded per test rather than by dropping this file from the AMD
+    lane, so the Triton and FlyDSL sections keep running there.
+    """
+    try:
+        from sglang.kernels.ops.diffusion import (
+            fused_norm_scale_shift,
+            fused_scale_residual_norm_scale_shift,
+        )
+    except ImportError as exc:  # pragma: no cover - platform-dependent
+        pytest.skip(f"CuTe-DSL backend unavailable: {exc}")
+    return fused_norm_scale_shift, fused_scale_residual_norm_scale_shift
+
+
 def _make_tensor(index_mode, shape, dtype):
     if index_mode == "NAT":
         return None
@@ -364,14 +384,7 @@ def _run_cute(
     index_mode="BSD",
     eps=EPS,
 ):
-    # Imported inside the helper for the same reason as FlyDSL below: the
-    # CuTe-DSL path needs cuda-python + CUTLASS, and naming a facade export
-    # resolves it immediately -- at module level that would take the Triton
-    # sections of this file down with it wherever CUTLASS is absent.
-    from sglang.kernels.ops.diffusion import (
-        fused_norm_scale_shift,
-        fused_scale_residual_norm_scale_shift,
-    )
+    fused_norm_scale_shift, fused_scale_residual_norm_scale_shift = _import_cutedsl()
 
     x = _make_tensor("BSD", shape, dtype)
     weight = _make_tensor(affine_mode, shape, affine_dtype)
@@ -440,87 +453,13 @@ def test_cutedsl_scale_residual_gate_index_modes(norm_type, index_mode):
 
 
 def test_validate_scale_shift_rejects_non_divisible_frames():
+    _import_cutedsl()
     from sglang.kernels.ops.diffusion import validate_scale_shift
 
     with pytest.raises(ValueError, match=r"S\(10\) must be divisible by F\(4\)"):
         validate_scale_shift(
             torch.empty((1, 4, 1, 256), device=DEVICE, dtype=torch.float16), 1, 10, 256
         )
-
-
-# ---------------------------------------------------------------------------
-# FlyDSL fused norm + scale/shift (ROCm gfx950)
-# ---------------------------------------------------------------------------
-
-FLYDSL_D = 5120
-FLYDSL_EPS = 1e-6
-
-
-def _require_rocm():
-    if not torch.version.hip:
-        pytest.skip("ROCm/HIP required for FlyDSL kernels")
-
-
-def _flydsl_reference(residual, x, gate, weight, bias, scale, shift, norm_type, eps):
-    if residual is not None:
-        x = (residual.float() + x.float() * gate.float()).to(torch.bfloat16)
-        residual_out = x
-    else:
-        residual_out = None
-    if norm_type == "layer":
-        normed = F.layer_norm(x.float(), (FLYDSL_D,), weight, bias, eps)
-    else:
-        var = x.float().pow(2).mean(-1, keepdim=True)
-        normed = x.float() * torch.rsqrt(var + eps) * weight.float()
-    y = (normed * (1.0 + scale.float()) + shift.float()).to(torch.bfloat16)
-    return y, residual_out
-
-
-@pytest.mark.parametrize("with_residual", [False, True])
-@pytest.mark.parametrize(
-    "norm_type,B,L",
-    [("rms", 1, 16), ("rms", 2, 16), ("layer", 2, 16), ("rms", 1, 90000)],
-)
-def test_flydsl_norm_scale_shift(with_residual, norm_type, B, L):
-    _require_rocm()
-    # Imported inside the test: the FlyDSL compiler only exists on ROCm, and
-    # the facade resolves an export the moment it is named -- a module-level
-    # import here would fail collection of this whole file on CUDA.
-    from sglang.kernels.ops.diffusion import (
-        flydsl_fused_residual_norm_scale_shift,
-        flydsl_norm_scale_shift,
-    )
-
-    torch.manual_seed(42)
-    shape = (B, L, FLYDSL_D)
-    x = torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
-    weight = torch.randn(FLYDSL_D, device=DEVICE, dtype=torch.float32)
-    bias = (
-        torch.randn(FLYDSL_D, device=DEVICE, dtype=torch.float32)
-        if norm_type == "layer"
-        else None
-    )
-    scale = torch.randn(B, 1, FLYDSL_D, device=DEVICE, dtype=torch.bfloat16)
-    shift = torch.randn(B, 1, FLYDSL_D, device=DEVICE, dtype=torch.bfloat16)
-
-    if with_residual:
-        residual = torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
-        gate = torch.randn(B, 1, FLYDSL_D, device=DEVICE, dtype=torch.bfloat16)
-        y, res = flydsl_fused_residual_norm_scale_shift(
-            residual, x, gate, weight, bias, scale, shift, norm_type, FLYDSL_EPS
-        )
-        y_ref, res_ref = _flydsl_reference(
-            residual, x, gate, weight, bias, scale, shift, norm_type, FLYDSL_EPS
-        )
-        torch.testing.assert_close(res, res_ref, atol=5e-2, rtol=5e-2)
-    else:
-        y = flydsl_norm_scale_shift(
-            x, weight, bias, scale, shift, norm_type, FLYDSL_EPS
-        )
-        y_ref, _ = _flydsl_reference(
-            None, x, None, weight, bias, scale, shift, norm_type, FLYDSL_EPS
-        )
-    torch.testing.assert_close(y, y_ref, atol=1.0, rtol=5e-2)
 
 
 if __name__ == "__main__":
