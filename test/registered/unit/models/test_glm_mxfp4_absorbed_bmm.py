@@ -56,8 +56,9 @@ class TestGlmMxfp4AbsorbedWeightSelection(CustomTestCase):
         with (
             envs.SGLANG_USE_MXFP4_MLA_BMM.override(False),
             mock.patch.object(weight_loader, "_use_aiter_gfx95", True),
-            mock.patch(
-                "sglang.srt.layers.quantization.fp8_utils.input_to_float8",
+            mock.patch.object(
+                weight_loader,
+                "input_to_float8",
                 return_value=(fp8_weight, fp8_scale),
             ) as input_to_float8,
             mock.patch.object(
@@ -92,9 +93,7 @@ class TestGlmMxfp4AbsorbedWeightSelection(CustomTestCase):
                 create=True,
                 return_value=(w_kc, w_scale_k, w_vc, w_scale_v),
             ) as quark_post_load_weights,
-            mock.patch(
-                "sglang.srt.layers.quantization.fp8_utils.input_to_float8"
-            ) as input_to_float8,
+            mock.patch.object(weight_loader, "input_to_float8") as input_to_float8,
         ):
             loader.post_load_weights(
                 weight_names=["model.layers.0.self_attn.kv_b_proj"]
