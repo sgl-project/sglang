@@ -627,7 +627,9 @@ struct ArSconvNormKernel {
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(residual_out);
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(hs_out);
     TensorMatcher({D}).with_dtype<DType>().with_device(dev).verify(norm_weight);
-    TensorMatcher({-1, W1s, D}).with_dtype<DType>().with_device(dev).verify(cache);
+    // Permit a strided (unified page-major) conv-state: the kernel is stride-aware
+    // (indexes via cache.stride(0)/(1)); only the channel dim must stay contiguous.
+    TensorMatcher({-1, W1s, D}).with_strides({-1, -1, 1}).with_dtype<DType>().with_device(dev).verify(cache);
     TensorMatcher({T}).with_dtype<int32_t>().with_device(dev).verify(cache_indices);
     TensorMatcher({T}).with_device(dev).verify(cache_mask);
     TensorMatcher({D, Wd}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(conv_weight);
@@ -752,7 +754,9 @@ struct ArSconvNormVerifyKernel {
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(residual_out);
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(hs_out);
     TensorMatcher({D}).with_dtype<DType>().with_device(dev).verify(norm_weight);
-    TensorMatcher({-1, W1s, D}).with_dtype<DType>().with_device(dev).verify(cache);
+    // Permit a strided (unified page-major) conv-state: the kernel is stride-aware
+    // (indexes via cache.stride(0)/(1)); only the channel dim must stay contiguous.
+    TensorMatcher({-1, W1s, D}).with_strides({-1, -1, 1}).with_dtype<DType>().with_device(dev).verify(cache);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(dev).verify(cache_indices);
     TensorMatcher({B}).with_device(dev).verify(cache_mask);
     TensorMatcher({D, Wd}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(conv_weight);
