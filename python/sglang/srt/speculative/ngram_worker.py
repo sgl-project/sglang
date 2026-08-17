@@ -8,6 +8,7 @@ from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
+from sglang.kernels.ops.speculative.ngram_mask import build_ngram_full_tree_mask
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -331,25 +332,39 @@ class NGRAMWorker(BaseSpecWorker):
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
         if USE_FULL_MASK and not _is_cpu:
-            tree_mask = []
-            mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
-            # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
-            for i in range(bs):
-                seq_len = batch.seq_lens_cpu[i]
-                req_mask = torch.ones(
-                    (self.draft_token_num, seq_len), device=self.device
-                )
-                req_mask = torch.cat(
-                    (
-                        req_mask,
-                        torch.from_numpy(mask[i]).to(
-                            device=self.device, non_blocking=True
-                        ),
-                    ),
-                    dim=1,
-                ).to(torch.bool)
-                tree_mask.append(req_mask.flatten())
-            tree_mask = torch.cat(tree_mask, dim=0)
+            D = self.draft_token_num
+            draft_mask = tree_mask.view(bs, D, D)
+
+            assert (
+                batch.seq_lens_cpu is not None
+            ), "NGRAM FULL_MASK requires batch.seq_lens_cpu"
+
+            tree_mask_buf, _ = (
+                self.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
+            )
+
+            host_seq_lens_sum = (
+                int(batch.seq_lens_sum)
+                if batch.seq_lens_sum is not None
+                else int(batch.seq_lens_cpu.sum().item())
+            )
+            exact = D * host_seq_lens_sum + D * D * bs
+
+            seq = batch.seq_lens.to(dtype=torch.int32)
+            sizes = D * (seq + D)
+            offsets = torch.zeros(bs, dtype=torch.int32, device=self.device)
+            if bs > 1:
+                torch.cumsum(sizes[:-1], dim=0, out=offsets[1:])
+
+            out = build_ngram_full_tree_mask(
+                draft_mask,
+                seq,
+                offsets,
+                D,
+                required_numel=exact,
+                tree_mask_buf=tree_mask_buf,
+            )
+            tree_mask = out[:exact]
 
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.input_ids = draft_tokens
