@@ -187,6 +187,19 @@ checkpoint's calibration scales automatically.
   `S` (lazy strategy, or `--disable-radix-cache` for S=1); the
   [calculator](#mamba-ratio-calculator) re-derives the ratio for the new `S`.
   The balanced ratio itself is VRAM-independent.
+- `--mamba-ssm-dtype`: the GDN state slot is **146.8MB at `float32`** (the
+  checkpoint's declared precision) and **74.8MB at `bfloat16`**, so bf16 roughly
+  halves the state pool and hands the difference to KV — measured on an RTX 5090
+  with no speculation, 97,280 KV tokens at bf16 against 68,588 at fp32. On 32GB
+  cards it also decides whether a config fits at all: EAGLE needs
+  `--mem-fraction-static 0.94` at fp32 but 0.92 at bf16. Speed is **not** a
+  one-way trade — the narrower state costs a little draft acceptance, so with
+  speculative decoding fp32 sometimes wins (NVFP4 + EAGLE: 152.9 vs 144.5
+  tok/s/user, accept 2.93 vs 2.92) and sometimes loses (FP8 + EAGLE: 106.3 vs
+  116.1, accept 3.24 vs 3.50); measure both for your quantization. Treat
+  `bfloat16` as an accuracy gate and validate it for your workload. bf16 state
+  requires the Triton linear-attn prefill path (the FlashInfer GDN prefill
+  kernels require an fp32 `initial_state`), which is already the SM120 default.
 - `--chunked-prefill-size 2048`: decode steps stall behind each prefill chunk
   on hybrid GDN models, and 8192-token chunks stall them ~600ms at a time.
   2048 keeps decode inter-token latency smooth under mixed load and also

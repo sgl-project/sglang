@@ -53,23 +53,196 @@ export const config = {
     { id: "default", label: "Default" },
   ],
   // BF16/FP8 are the official Qwen checkpoints; NVFP4 is the RadixArk
-  // W4A4 build. NVFP4 is W4A4 with FP8 projections and declares
-  // `kv_cache_quant_algo: FP8`, so under the default `--kv-cache-dtype auto` its
-  // KV pool runs fp8_e4m3 off the checkpoint's own calibration scales — no
-  // `--kv-cache-dtype` flag in the recipe, and nothing accuracy-degrading added
-  // by the cell.
+  // W4A4 build. Every cell now pins `--kv-cache-dtype fp8_e4m3` explicitly at
+  // the maintainers' direction. For NVFP4 this is a no-op made visible: that
+  // checkpoint declares `kv_cache_quant_algo: FP8`, so `auto` already resolved
+  // to fp8_e4m3 off its own calibration scales. For BF16/FP8 it is a real
+  // change — it halves kv_bytes_per_token (65.5 KB -> 32.8 KB) and doubles the
+  // KV pool at a fixed --mamba-full-memory-ratio, but those checkpoints carry
+  // no fp8 KV calibration, so it is a quality/capacity trade, not free.
   quantizations: [
     { id: "bf16",  label: "BF16"  },
     { id: "fp8",   label: "FP8"   },
     { id: "nvfp4", label: "NVFP4" },
   ],
-  // The source page documents ONE operating point: a single general-purpose
-  // launch command with no latency/throughput toggle. MTP is described as an
-  // opt-in in the tips, not as a second named recipe, so it rides the
-  // Playground's speculative axis instead of splitting the strategy dimension.
-  strategies: [
-    { id: "balanced", label: "Balanced" },
-    { id: "high-throughput", label: "High-Throughput" },
+  // Speculative decoding and GDN state precision are ORTHOGONAL knobs, so they
+  // are overlay rows, not match dims: they layer flags onto the matched cell
+  // instead of multiplying the cell count (3 x 2 would turn 12 cells into 72).
+  // The former `strategies` row (Balanced / High-Throughput) is gone — its only
+  // real content was "does the MTP head run", which the Speculative Decoding row
+  // now states directly.
+  // Options are inline, not `optionsKey`: the engine accepts either, but
+  // docs/scripts/check_cookbook_configs.mjs only reads `dim.options`, so an
+  // optionsKey form fails CI with "not an option of that dim" on every cell.
+  matchDims: [
+    { id: "variant", title: "Model Variant", options: [
+      { id: "default", label: "Default" },
+    ] },
+    { id: "quant", title: "Quantization", options: [
+      { id: "bf16",  label: "BF16"  },
+      { id: "fp8",   label: "FP8"   },
+      { id: "nvfp4", label: "NVFP4" },
+    ] },
+    { id: "nodes", title: "Nodes", options: [
+      { id: "single", label: "Single Node" },
+    ] },
+  ],
+
+  overlayDims: [
+    {
+      // EAGLE is the in-checkpoint MTP head (the page's old `high-throughput`
+      // tier); DSpark is a separately-published trained draft model. Both run
+      // on every quantization AND every card except one: the 32GB RTX 5090,
+      // where only NVFP4 leaves room for a draft head on top of the weights
+      // (FP8 is ~28.5GB and BF16 does not fit at all, so neither has a cell
+      // there in the first place). Same predicate as the GDN-state row below.
+      id: "spec",
+      title: "Speculative Decoding",
+      default: "none",
+      options: [
+        { id: "none", label: "None" },
+        {
+          id: "eagle", label: "EAGLE",
+          disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
+          disableReason:
+            "On the 32GB RTX 5090 the MTP head only fits on top of the NVFP4 weights",
+          // ReplaySSM spec-verify rides with EAGLE on EVERY platform at the
+          // maintainers' direction. It replaces the per-draft full-state
+          // snapshots with a fold-every-commit ring, which takes the D
+          // intermediate SSM states off the per-request slot budget (so the
+          // mamba ratio is computed with D=0, not the draft-token count --
+          // see the compute-mamba-ratio skill's ReplaySSM caveat). On the
+          // 32GB 5090 that is the difference between booting and a negative
+          // total_rest_memory. Requires a linear draft chain (topk 1, set
+          // just above) and a triton/flashinfer linear-attn decode backend,
+          // which is the default everywhere here.
+          // MEASURED on the 5090 (8192/1024, conc 1, radix on): the cell's
+          // 0.9 does NOT boot EAGLE -- the state pool lands at K=1 against a
+          // required ratio of 4 -- and 0.92 does. The two spec options fail in
+          // OPPOSITE directions on this card (EAGLE starves the state pool at
+          // boot and wants mem-fraction UP; DSpark starves runtime activations
+          // and wants it DOWN), so one cell value cannot serve both. Strip and
+          // re-pin per option rather than emit the flag twice.
+          stripPrefixes: (sel) =>
+            sel.hw === "rtx5090" ? ["--mem-fraction-static"] : [],
+          flags: (sel) => [
+            "--speculative-algorithm EAGLE",
+            "--speculative-num-steps 3",
+            "--speculative-eagle-topk 1",
+            "--speculative-num-draft-tokens 4",
+            "--enable-linear-replayssm-spec",
+            // MEASURED: bf16 state serves at 0.92; fp32 state does NOT (K=3
+            // against a required 4) and needs 0.94. fp32 slots are 146.81 MB
+            // vs bf16's 74.81, so the state pool needs a bigger slice.
+            ...(sel.hw === "rtx5090"
+              ? [sel.ssmDtype === "float32"
+                  ? "--mem-fraction-static 0.94"
+                  : "--mem-fraction-static 0.92"]
+              : []),
+          ],
+        },
+        {
+          id: "dspark", label: "DSPARK",
+          // Two 5090 constraints, and the fp32 one is the MIRROR of the guard
+          // on the float32 state option: DSpark + fp32 state does not fit this
+          // card at any mem-fraction (measured), so each greys the other and
+          // the pair can never be co-selected. EAGLE is deliberately exempt --
+          // fp32 + EAGLE is a valid, measured, and slightly FASTER combination
+          // (146.8 vs 142.2 tok/s/user), because ReplaySSM takes D to 0.
+          disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
+          disableReason:
+            "On the 32GB RTX 5090 the DSpark draft model only fits on top of the NVFP4 weights",
+          // MEASURED on the 5090: DSpark boots at the cell's 0.9 but then OOMs
+          // at RUNTIME on the first prefill (75 MB free of 31.36 GB), because
+          // the static pools leave nothing for an 8192-token single-chunk
+          // prefill. 0.88 serves cleanly. Note this is the OPPOSITE direction
+          // to EAGLE above -- see that comment.
+          // NO --min-free-slots-delay here. Its semantic is *disable* the
+          // MinFreeSlotsDelayer, and at the cell's --max-running-requests 1 it
+          // is a strict no-op: resolve_min_free_slots (managers/
+          // min_free_slots_delayer.py:4-22) returns None both ways, since the
+          // DFlash auto-enable needs mrr >= 8 and an explicit 1 fails its own
+          // `threshold > 1` test. Shipping it would only bite later — anyone
+          // raising --max-running-requests to 8+ would silently lose the
+          // delayer SGLang auto-enables for this (DFlash-family) algorithm.
+          stripPrefixes: (sel) =>
+            sel.hw === "rtx5090" ? ["--mem-fraction-static"] : [],
+          flags: (sel) => [
+            "--speculative-algorithm DSPARK",
+            "--speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark",
+            "--speculative-draft-attention-backend flashinfer",
+            // MEASURED at the engine-default 2048 prefill chunk: bf16 state
+            // serves at 0.90 (0.88 was only needed to dodge the old 8192-chunk
+            // runtime OOM) and fp32 state needs 0.92 -- at 0.90/0.88 its state
+            // cache lands K=3/K=2 against a required 4.
+            ...(sel.hw === "rtx5090"
+              ? [sel.ssmDtype === "float32"
+                  ? "--mem-fraction-static 0.92"
+                  : "--mem-fraction-static 0.90"]
+              : []),
+          ],
+        },
+      ],
+    },
+    {
+      // Serving tier, expressed through the GDN radix-cache strategy -- the
+      // knob that sets S, state slots reserved per running request
+      // (kv_cache_configurator._calculate_mamba_ratio):
+      //   extra_buffer       S = 5   track buffer reserved up front
+      //   extra_buffer_lazy  S = 4   allocated lazily at the track boundary
+      // Fewer slots per request means more requests fit the same state pool,
+      // so lazy is the throughput tier and the eager buffer the latency tier.
+      // S also feeds the balanced ratio, and the page's calculator reads this
+      // row directly (strategy -> slots), so the two stay in step.
+      id: "tier",
+      title: "Serving Strategy",
+      default: "high-throughput",
+      // Owns the flag outright: strip whatever a cell pinned, then re-emit.
+      stripPrefixes: ["--mamba-radix-cache-strategy"],
+      options: [
+        { id: "low-latency", label: "Low-Latency",
+          flags: ["--mamba-radix-cache-strategy extra_buffer"] },
+        { id: "high-throughput", label: "High-Throughput",
+          flags: ["--mamba-radix-cache-strategy extra_buffer_lazy"] },
+      ],
+    },
+    {
+      // One GDN state slot is 154.7 MB at fp32 and 79.2 MB at bf16 — the single
+      // biggest lever on the state pool, which is what bounds concurrency on
+      // small-VRAM cards. bf16 needs the Triton linear-attn prefill path (the
+      // FlashInfer GDN prefill kernels hard-require an fp32 initial_state);
+      // Triton is already the SM120 default, so no extra flag is implied here.
+      // On the 32GB RTX 5090 there is exactly ONE valid state precision per
+      // quantization, so the row is forced rather than free there: NVFP4 must
+      // run bf16 (an fp32 slot is 154.7 MB against 79.2 MB, and the fp32 pool
+      // caps usable context far below the bf16 one on this card), while the
+      // BF16/FP8 checkpoints have no serviceable cell to run bf16 state on.
+      // `reseatHiddenPicks` moves the row off a disabled pick automatically,
+      // so selecting the 5090 lands on bfloat16 without the user touching it.
+      id: "ssmDtype",
+      title: "Mamba SSM Dtype",
+      default: "float32",
+      options: [
+        // float32 is open on every platform including the 5090. An fp32 slot
+        // is 146.81 MB against bf16's 74.81, so it roughly doubles both the
+        // state pool and the balanced ratio; on a 32GB card that is a real
+        // squeeze but it serves. bf16 remains the better default there (bigger
+        // KV pool at identical latency) -- this is a choice, not a trap.
+        // float32 is open everywhere, including with DSPARK on the 5090.
+        // It was blocked on evidence gathered at --chunked-prefill-size 8192;
+        // once the cell dropped to the engine default (2048) the runtime
+        // activation pressure fell and DSpark+fp32 serves at mf 0.92.
+        { id: "float32", label: "float32", flags: ["--mamba-ssm-dtype float32"] },
+        {
+          id: "bfloat16", label: "bfloat16",
+          disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
+          disableReason:
+            "On the 32GB RTX 5090 the bf16 GDN state pool is only a live choice for NVFP4; " +
+            "the BF16 and FP8 checkpoints have no serviceable cell on this card",
+          flags: ["--mamba-ssm-dtype bfloat16"],
+        },
+      ],
+    },
   ],
   nodesOptions: [
     { id: "single", label: "Single Node" },
@@ -201,9 +374,9 @@ export const config = {
       },
       {
         // Halving kv_bytes_per_token (65.5 KB bf16 -> 32.8 KB fp8) doubles the
-        // KV pool at a fixed --mamba-full-memory-ratio. Accuracy-degrading over
-        // a bf16-KV checkpoint, so it stays an opt-in and is never in a cell —
-        // the NVFP4 checkpoint gets fp8 KV on its own via kv_cache_quant_algo.
+        // KV pool at a fixed --mamba-full-memory-ratio. Every deployment cell
+        // now pins fp8_e4m3, so this row is the opt-OUT: pick BFloat16 to undo
+        // it on the BF16/FP8 checkpoints, which carry no fp8 KV calibration.
         id: "kvCacheDtype", title: "KV Cache Precision",
         stripPrefixes: ["--kv-cache-dtype"],
         options: [
@@ -276,12 +449,13 @@ export const config = {
       // No NVFP4 cell on this card: SM90 has no FP4 tensor cores, so the W4A4
       // checkpoint's MLP would fall back to the Marlin W4A16 weight-only path —
       // runnable, but not a recipe this page ships.
-      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "h200", variant: "default", quant: "fp8", nodes: "single" },
       verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 32768",
@@ -294,12 +468,13 @@ export const config = {
     },
     {
       // H200, BF16 reference checkpoint (~54GB of weights).
-      match: { hw: "h200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      match: { hw: "h200", variant: "default", quant: "bf16", nodes: "single" },
       verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 32768",
@@ -313,12 +488,13 @@ export const config = {
     {
       // The page's headline recipe: NVFP4 W4A4 on the 96GB workstation card,
       // ~16.5GB of weights, fp8 KV auto-enabled by the checkpoint.
-      match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "rtx6000", variant: "default", quant: "nvfp4", nodes: "single" },
       verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 2048",
@@ -330,12 +506,13 @@ export const config = {
     },
     {
       // FP8 blockwise, ~28.5GB of weights — comfortable on 96GB.
-      match: { hw: "rtx6000", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "rtx6000", variant: "default", quant: "fp8", nodes: "single" },
       verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 2048",
@@ -347,12 +524,13 @@ export const config = {
     },
     {
       // BF16, the reference checkpoint.
-      match: { hw: "rtx6000", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      match: { hw: "rtx6000", variant: "default", quant: "bf16", nodes: "single" },
       verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 2048",
@@ -368,15 +546,19 @@ export const config = {
       // does not fit, so neither has a cell. On this card the GDN state pool —
       // not KV — bounds concurrency: lower S with the Playground's radix-cache
       // strategy (or turn the prefix cache off for S=1) and recompute the ratio.
-      match: { hw: "rtx5090", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "rtx5090", variant: "default", quant: "nvfp4", nodes: "single" },
       verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--mem-fraction-static 0.85",
+        "--kv-cache-dtype fp8_e4m3",
+        "--mem-fraction-static 0.9",
         "--attention-backend flashinfer",
-        "--chunked-prefill-size 2048",
+        "--mamba-backend triton",
+        "--linear-attn-backend triton",
+        "--max-running-requests 1",
+        "--cuda-graph-max-bs 1",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -390,11 +572,12 @@ export const config = {
     // fraction, and prefill CUDA graphs disabled. Unvalidated on SM121 /
     // aarch64.
     {
-      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.95",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 8192",
@@ -406,11 +589,12 @@ export const config = {
       ],
     },
     {
-      match: { hw: "dgx-spark", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "dgx-spark", variant: "default", quant: "fp8", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.95",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 8192",
@@ -422,11 +606,12 @@ export const config = {
       ],
     },
     {
-      match: { hw: "dgx-spark", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      match: { hw: "dgx-spark", variant: "default", quant: "bf16", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.95",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 8192",
@@ -445,12 +630,13 @@ export const config = {
     // `high-throughput` strategy adds the in-checkpoint MTP head
     // (EAGLE / NEXTN semantics, num-steps 3, topk 1, draft-tokens 4).
     {
-      match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "gb300", variant: "default", quant: "nvfp4", nodes: "single" },
       verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
@@ -460,31 +646,13 @@ export const config = {
       ],
     },
     {
-      match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "gb300", variant: "default", quant: "fp8", nodes: "single" },
       verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--mem-fraction-static 0.85",
-        "--chunked-prefill-size 2048",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
-        "--speculative-algorithm EAGLE",
-        "--speculative-num-steps 3",
-        "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 4",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--trust-remote-code",
-        "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
@@ -494,54 +662,17 @@ export const config = {
       ],
     },
     {
-      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "gb300", variant: "default", quant: "bf16", nodes: "single" },
       verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
-        "--speculative-algorithm EAGLE",
-        "--speculative-num-steps 3",
-        "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 4",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--trust-remote-code",
-        "--model-path {{MODEL_NAME}}",
-        "--mem-fraction-static 0.85",
-        "--chunked-prefill-size 2048",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--trust-remote-code",
-        "--model-path {{MODEL_NAME}}",
-        "--mem-fraction-static 0.85",
-        "--chunked-prefill-size 2048",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
-        "--speculative-algorithm EAGLE",
-        "--speculative-num-steps 3",
-        "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 4",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
