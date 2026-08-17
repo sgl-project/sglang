@@ -7,11 +7,12 @@ replace any site independently with a promoted Step-3/4/5/6 configuration.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import field
 from functools import cache
 from typing import Any, Mapping
 
 import pydantic
+from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
     SHARED_RANK_DEFAULT_CONFIG,
@@ -60,14 +61,19 @@ def _is_power_of_two(value: int) -> bool:
 
 
 def _validate_flat_config(name: str, config: Mapping[str, int]) -> None:
-    if not isinstance(config, Mapping) or not config:
+    # Key/value types are enforced by the strict pydantic fields.
+    if not config:
         raise ValueError(f"{name} must be a non-empty launch-config mapping")
-    for key, value in config.items():
-        if not isinstance(key, str) or not isinstance(value, int):
-            raise TypeError(f"{name} launch parameters must be string -> int")
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
+@pydantic_dataclass(
+    frozen=True,
+    slots=True,
+    kw_only=True,
+    # strict: no value coercion; extra="forbid": an unknown site key in a
+    # tiles rule aborts bind instead of silently serving default tiles.
+    config=pydantic.ConfigDict(strict=True, extra="forbid"),
+)
 class MoeLoraLaunchConfig:
     """Site-specific launch settings; no token/rank/device config."""
 
@@ -78,14 +84,14 @@ class MoeLoraLaunchConfig:
     # values explicit also charges the extra route build in composed timing.
     routing_block_size: int = 16
     gate_a_routing_block_size: int = 16
-    gate_a: Mapping[str, int] = field(default_factory=_a_default)
-    gate_b: Mapping[str, int] = field(default_factory=_b_default)
-    down_a: Mapping[str, int] = field(default_factory=_a_default)
-    down_b: Mapping[str, int] = field(default_factory=_b_default)
-    b_activation: Mapping[str, int] = field(
+    gate_a: dict[str, int] = field(default_factory=_a_default)
+    gate_b: dict[str, int] = field(default_factory=_b_default)
+    down_a: dict[str, int] = field(default_factory=_a_default)
+    down_b: dict[str, int] = field(default_factory=_b_default)
+    b_activation: dict[str, int] = field(
         default_factory=lambda: dict(FUSED_B_ACT_DEFAULT_CONFIG)
     )
-    shared_finalize: Mapping[str, Mapping[str, int]] = field(
+    shared_finalize: dict[str, dict[str, int]] = field(
         default_factory=lambda: _copy_nested(SHARED_RANK_DEFAULT_CONFIG)
     )
 

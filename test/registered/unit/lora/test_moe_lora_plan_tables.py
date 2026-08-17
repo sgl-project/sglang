@@ -270,6 +270,24 @@ class TestResolution:
                     physical_rank=16,
                 )
 
+    def test_unknown_tile_site_key_fails_closed(self, tmp_path):
+        # A typo'd SITE key must abort bind, not silently serve the
+        # built-in default tiles for that site (extra="forbid" on the
+        # launch-config dataclass — rule-level extra="forbid" alone does
+        # not reach inside "sites").
+        packaged = json.load(open(f"{ep._CONFIG_DIR}/gb300.tiles.json"))
+        rule = packaged["rules"]["decode.per_expert"][0]
+        rule["sites"]["gate_bee"] = rule["sites"].pop("gate_b")
+        json.dump(packaged, open(tmp_path / "gb300.tiles.json", "w"))
+        with envs.SGLANG_LORA_MOE_CONFIG_DIR.override(str(tmp_path)):
+            _clear_caches()
+            with pytest.raises(ValueError, match="gate_bee"):
+                resolve_tiles(
+                    architecture_value="gb300",
+                    plan_key_name="decode.per_expert",
+                    physical_rank=16,
+                )
+
 
 class TestLoraMoeRunnerBackend:
     """The MoE LoRA engine is selected by --moe-runner-backend lora."""

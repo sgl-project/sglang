@@ -8,6 +8,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import pydantic
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-c-test-cpu")
@@ -84,9 +86,10 @@ def _plan(**changes) -> MoeLoraExecutionPlan:
 
 class TestFactorAndKernelSpecs(unittest.TestCase):
     def test_specs_require_a_bool_ownership_flag(self):
-        with self.assertRaises(TypeError):
+        # strict pydantic fields: no int -> bool coercion
+        with self.assertRaises(pydantic.ValidationError):
             _a(Site.GATE_UP, is_shared_outer=1)  # type: ignore[arg-type]
-        with self.assertRaises(TypeError):
+        with self.assertRaises(pydantic.ValidationError):
             _b(Site.DOWN, is_shared_outer=1)  # type: ignore[arg-type]
 
     def test_a_rejects_unqualified_family_site_ownership_and_layout(self):
@@ -131,10 +134,23 @@ class TestFactorAndKernelSpecs(unittest.TestCase):
             )
 
     def test_specs_require_typed_enums(self):
-        with self.assertRaises(TypeError):
+        # strict pydantic fields: no str -> enum coercion
+        with self.assertRaises(pydantic.ValidationError):
             LoraASpec("gate_up", LoraAFamily.GROUPED)  # type: ignore[arg-type]
-        with self.assertRaises(TypeError):
+        with self.assertRaises(pydantic.ValidationError):
             LoraBSpec(Site.GATE_UP, "one_launch_sliced")  # type: ignore[arg-type]
+
+    def test_specs_reject_unknown_field_names(self):
+        # extra="forbid": a mistyped kwarg (including through
+        # dataclasses.replace) is a hard error, exactly as it was for the
+        # stdlib dataclasses — never a silently unchanged copy.
+        with self.assertRaises(pydantic.ValidationError):
+            LoraASpec(Site.GATE_UP, LoraAFamily.GROUPED, nonsense=True)  # type: ignore
+        with self.assertRaises(pydantic.ValidationError):
+            dataclasses.replace(
+                SERIAL_MATERIALIZED_REFERENCE,
+                down_b_scater=True,  # type: ignore[call-arg]
+            )
 
     def test_only_gate_a_and_down_b_may_be_shared_outer(self):
         self.assertEqual(

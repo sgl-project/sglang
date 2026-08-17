@@ -29,8 +29,17 @@ from enum import Enum
 from functools import cache
 
 import pydantic
+from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 logger = logging.getLogger(__name__)
+
+# The spec classes are pydantic dataclasses: field types (enums, bools,
+# nested specs) are enforced at construction, so the validate() methods
+# carry only cross-field semantics.  Strict mode keeps the fail-closed
+# posture — no silent coercion of strings or ints into enums and bools —
+# and extra="forbid" keeps unknown constructor kwargs a hard error the
+# way stdlib dataclasses were (pydantic's default silently drops them).
+_STRICT = pydantic.ConfigDict(strict=True, extra="forbid")
 
 
 class Site(str, Enum):
@@ -108,13 +117,6 @@ class LateOverlap(str, Enum):
     DOWN_A_B = "down_a_b"
 
 
-def _require_enum(value: object, enum_type: type[Enum], field: str) -> None:
-    if not isinstance(value, enum_type):
-        raise TypeError(
-            f"{field} must be {enum_type.__name__}, got {type(value).__name__}"
-        )
-
-
 def _require_bool(value: object, field: str) -> None:
     if not isinstance(value, bool):
         raise TypeError(f"{field} must be bool, got {type(value).__name__}")
@@ -126,7 +128,7 @@ def _aligned_requirement(is_shared_outer: bool) -> RouteRequirement:
     return RouteRequirement.ALIGNED_PER_EXPERT
 
 
-@dataclass(frozen=True, slots=True)
+@pydantic_dataclass(frozen=True, slots=True, config=_STRICT)
 class StageContract:
     """The factor and bridge contract of one logical A or B stage."""
 
@@ -138,9 +140,6 @@ class StageContract:
         self.validate()
 
     def validate(self) -> StageContract:
-        _require_enum(self.site, Site, "site")
-        _require_bool(self.is_shared_outer, "is_shared_outer")
-        _require_enum(self.layout, BridgeLayout, "layout")
         if self.site is Site.DOWN and self.layout is BridgeLayout.TOKEN_MAJOR:
             raise ValueError(
                 "the down bridge is inherently pair-major: each routed expert "
@@ -149,7 +148,7 @@ class StageContract:
         return self
 
 
-@dataclass(frozen=True, slots=True)
+@pydantic_dataclass(frozen=True, slots=True, config=_STRICT)
 class LoraASpec:
     """One standalone LoRA-A execution stage."""
 
@@ -166,12 +165,7 @@ class LoraASpec:
         return StageContract(self.site, self.is_shared_outer, self.output_layout)
 
     def validate(self) -> LoraASpec:
-        _require_enum(self.site, Site, "site")
-        _require_enum(self.family, LoraAFamily, "family")
-        _require_bool(self.is_shared_outer, "is_shared_outer")
-        _require_enum(self.output_layout, BridgeLayout, "output_layout")
         self.contract.validate()
-
         if self.site is Site.DOWN and self.is_shared_outer:
             raise ValueError(
                 "down A is always per-expert; only gate/up A may be shared-outer"
@@ -207,7 +201,7 @@ class LoraASpec:
         return frozenset((_aligned_requirement(self.is_shared_outer),))
 
 
-@dataclass(frozen=True, slots=True)
+@pydantic_dataclass(frozen=True, slots=True, config=_STRICT)
 class LoraBSpec:
     """One standalone LoRA-B execution stage."""
 
@@ -224,12 +218,7 @@ class LoraBSpec:
         return StageContract(self.site, self.is_shared_outer, self.input_layout)
 
     def validate(self) -> LoraBSpec:
-        _require_enum(self.site, Site, "site")
-        _require_enum(self.family, LoraBFamily, "family")
-        _require_bool(self.is_shared_outer, "is_shared_outer")
-        _require_enum(self.input_layout, BridgeLayout, "input_layout")
         self.contract.validate()
-
         if self.site is Site.GATE_UP and self.is_shared_outer:
             raise ValueError(
                 "gate/up B is always per-expert; only down B may be shared-outer"
@@ -259,7 +248,7 @@ class LoraBSpec:
         return frozenset((_aligned_requirement(self.is_shared_outer),))
 
 
-@dataclass(frozen=True, slots=True)
+@pydantic_dataclass(frozen=True, slots=True, config=_STRICT)
 class MiddleSpec:
     """Activation boundary and the gate/up B stage optionally fused into it.
 
@@ -276,10 +265,7 @@ class MiddleSpec:
         self.validate()
 
     def validate(self) -> MiddleSpec:
-        _require_enum(self.family, MiddleFamily, "family")
-        _require_enum(self.activation, ActivationFamily, "activation")
         if self.consumed_gate_b is not None:
-            self.consumed_gate_b.validate()
             if self.consumed_gate_b.site is not Site.GATE_UP:
                 raise ValueError("consumed_gate_b must describe the gate/up site")
             if self.consumed_gate_b.is_shared_outer:
@@ -299,7 +285,7 @@ class MiddleSpec:
         return frozenset((_aligned_requirement(self.consumed_gate_b.is_shared_outer),))
 
 
-@dataclass(frozen=True, slots=True)
+@pydantic_dataclass(frozen=True, slots=True, config=_STRICT)
 class FinalizeSpec:
     """Final combine family and an optional down-B stage consumed by it."""
 
@@ -310,7 +296,6 @@ class FinalizeSpec:
         self.validate()
 
     def validate(self) -> FinalizeSpec:
-        _require_enum(self.family, FinalizeFamily, "family")
         consumes_down_b = self.family is not FinalizeFamily.MATERIALIZED
         if (self.consumed_down_b is not None) != consumes_down_b:
             raise ValueError(
@@ -318,7 +303,6 @@ class FinalizeSpec:
                 f"{'requires' if consumes_down_b else 'does not consume'} down B"
             )
         if self.consumed_down_b is not None:
-            self.consumed_down_b.validate()
             if self.consumed_down_b.site is not Site.DOWN:
                 raise ValueError("consumed_down_b must describe the down site")
         if self.family is FinalizeFamily.SHARED_RANK_REDUCE:
@@ -339,7 +323,7 @@ class FinalizeSpec:
         return frozenset((RouteRequirement.RAW,))
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
+@pydantic_dataclass(frozen=True, slots=True, kw_only=True, config=_STRICT)
 class MoeLoraExecutionPlan:
     """One immutable whole-pipeline MoE-LoRA execution strategy."""
 
@@ -395,35 +379,6 @@ class MoeLoraExecutionPlan:
         return consumed
 
     def validate(self) -> MoeLoraExecutionPlan:
-        if not isinstance(self.gate_a, LoraASpec):
-            raise TypeError("gate_a must be LoraASpec")
-        if not isinstance(self.middle, MiddleSpec):
-            raise TypeError("middle must be MiddleSpec")
-        if not isinstance(self.finalize, FinalizeSpec):
-            raise TypeError("finalize must be FinalizeSpec")
-        for field, value, expected in (
-            ("gate_b", self.gate_b, LoraBSpec),
-            ("down_a", self.down_a, LoraASpec),
-            ("down_b", self.down_b, LoraBSpec),
-        ):
-            if value is not None and not isinstance(value, expected):
-                raise TypeError(f"{field} must be {expected.__name__} or None")
-        _require_enum(self.early_overlap, EarlyOverlap, "early_overlap")
-        _require_enum(self.late_overlap, LateOverlap, "late_overlap")
-        _require_enum(self.route_builder, RouteBuilderFamily, "route_builder")
-        if not isinstance(self.down_b_scatter, bool):
-            raise TypeError("down_b_scatter must be bool")
-
-        self.gate_a.validate()
-        self.middle.validate()
-        self.finalize.validate()
-        if self.gate_b is not None:
-            self.gate_b.validate()
-        if self.down_a is not None:
-            self.down_a.validate()
-        if self.down_b is not None:
-            self.down_b.validate()
-
         if self.gate_a.site is not Site.GATE_UP:
             raise ValueError("gate_a must describe the gate/up site")
         if self.gate_b is not None and self.gate_b.site is not Site.GATE_UP:
@@ -680,17 +635,20 @@ def architecture_for_capability(major: int, minor: int) -> DeviceArchitecture:
 
 
 class _PlanSpecModel(pydantic.BaseModel):
+    """One row's plan spec. Enum-typed, so a malformed value in ANY row
+    fails at table load, not only when the row is selected."""
+
     model_config = pydantic.ConfigDict(extra="forbid")
 
-    gate_a_family: str = "grouped"
-    down_a_family: str = "grouped"
-    gate_b_family: str = "one_launch_sliced"
-    down_b_family: str = "one_launch_sliced"
-    middle_family: str = "materialized"
-    finalize_family: str = "materialized"
-    early_overlap: str = "none"
-    late_overlap: str = "none"
-    route_builder: str = "standard"
+    gate_a_family: LoraAFamily = LoraAFamily.GROUPED
+    down_a_family: LoraAFamily = LoraAFamily.GROUPED
+    gate_b_family: LoraBFamily = LoraBFamily.ONE_LAUNCH_SLICED
+    down_b_family: LoraBFamily = LoraBFamily.ONE_LAUNCH_SLICED
+    middle_family: MiddleFamily = MiddleFamily.MATERIALIZED
+    finalize_family: FinalizeFamily = FinalizeFamily.MATERIALIZED
+    early_overlap: EarlyOverlap = EarlyOverlap.NONE
+    late_overlap: LateOverlap = LateOverlap.NONE
+    route_builder: RouteBuilderFamily = RouteBuilderFamily.STANDARD
     down_b_scatter: bool = False
 
 
@@ -769,14 +727,14 @@ def build_plan(
     The activation is a property of the layer, injected at construction —
     rows are activation-agnostic by decision (2026-08-16).
     """
-    gate_a_family = LoraAFamily(spec.gate_a_family)
+    gate_a_family = spec.gate_a_family
     gate_layout = (
         BridgeLayout.TOKEN_MAJOR
         if gate_a_family is LoraAFamily.TOKEN_DEDUP_GROUPED
         else BridgeLayout.PAIR_MAJOR
     )
-    middle_family = MiddleFamily(spec.middle_family)
-    finalize_family = FinalizeFamily(spec.finalize_family)
+    middle_family = spec.middle_family
+    finalize_family = spec.finalize_family
     gate_b_contract = StageContract(Site.GATE_UP, False, gate_layout)
     down_b_contract = StageContract(Site.DOWN, is_shared_outer, BridgeLayout.PAIR_MAJOR)
     consumes_gate_b = middle_family is MiddleFamily.B_ACTIVATION
@@ -786,16 +744,14 @@ def build_plan(
         gate_b=(
             None
             if consumes_gate_b
-            else LoraBSpec(
-                Site.GATE_UP, LoraBFamily(spec.gate_b_family), False, gate_layout
-            )
+            else LoraBSpec(Site.GATE_UP, spec.gate_b_family, False, gate_layout)
         ),
         middle=MiddleSpec(
             middle_family, activation, gate_b_contract if consumes_gate_b else None
         ),
         down_a=LoraASpec(
             Site.DOWN,
-            LoraAFamily(spec.down_a_family),
+            spec.down_a_family,
             False,
             BridgeLayout.PAIR_MAJOR,
         ),
@@ -804,7 +760,7 @@ def build_plan(
             if consumes_down_b
             else LoraBSpec(
                 Site.DOWN,
-                LoraBFamily(spec.down_b_family),
+                spec.down_b_family,
                 is_shared_outer,
                 BridgeLayout.PAIR_MAJOR,
             )
@@ -812,9 +768,9 @@ def build_plan(
         finalize=FinalizeSpec(
             finalize_family, down_b_contract if consumes_down_b else None
         ),
-        early_overlap=EarlyOverlap(spec.early_overlap),
-        late_overlap=LateOverlap(spec.late_overlap),
-        route_builder=RouteBuilderFamily(spec.route_builder),
+        early_overlap=spec.early_overlap,
+        late_overlap=spec.late_overlap,
+        route_builder=spec.route_builder,
         down_b_scatter=spec.down_b_scatter,
     )
     return plan.validate_ownership(is_shared_outer)
