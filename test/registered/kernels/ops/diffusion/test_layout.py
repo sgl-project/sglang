@@ -74,6 +74,12 @@ def _cl3d(shape, dtype):
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.skipif(
+    bool(torch.version.hip),
+    reason="the USP merge-heads JIT fast path is CUDA-only by design -- "
+    "can_use_usp_merge_heads() returns False under HIP, and the aten fallback "
+    "it degrades to is covered by the unsupported-inputs test below",
+)
 def test_usp_merge_heads_bitwise(dtype, world, seq, batch, h_local, head_dim):
     generator = torch.Generator(device=DEVICE).manual_seed(4321)
     x = torch.randn(
