@@ -793,9 +793,10 @@ class Envs:
     # LoRA (MoE LoRA engine)
     # Root of the MoE LoRA config tree (see
     # sglang/srt/lora/moe/configs/README.md): per-architecture
-    # <arch>.json kernel tables at the top level, M-bucketed base-GEMM
-    # launch tables under gemm/. Files here take precedence over the
-    # packaged configs/ directory; unset = the packaged sweep winners.
+    # <arch>.plans.json and <arch>.tiles.json at the top level, M-bucketed
+    # base-GEMM launch tables under base_gemm/. Files here take precedence
+    # per file over the packaged configs/ directory; unset = the packaged
+    # sweep winners.
     # This is the deployment surface for configs produced by
     # benchmark/kernels/lora_moe/tune_lora_config.py when onboarding a
     # model whose geometry the shipped files do not cover.

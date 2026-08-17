@@ -114,29 +114,7 @@ class MoeBaseProvider:
         """
         raise NotImplementedError
 
-    def configure_base_pdl(self, *, gateup_to_middle: bool) -> None:
-        """Prepare requested base-GEMM producer variants before graph capture."""
-
-        if gateup_to_middle:
-            raise NotImplementedError(
-                f"{self.contract.key} does not implement plan-local base-GEMM PDL"
-            )
-
-    def base_pdl_state(self) -> dict[str, object]:
-        return {
-            "provider": self.contract.key,
-            "producer_signal_supported": False,
-            "gateup_signal_compiled": False,
-            "down_signal_compiled": False,
-        }
-
-    def gateup(
-        self,
-        ws,
-        out: torch.Tensor,
-        *,
-        produce_pdl: bool = False,
-    ) -> None:
+    def gateup(self, ws, out: torch.Tensor) -> None:
         raise NotImplementedError
 
     def release_prepared_inputs(self, ws) -> None:

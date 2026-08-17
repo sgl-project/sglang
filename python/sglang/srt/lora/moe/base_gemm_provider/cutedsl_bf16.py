@@ -224,7 +224,7 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
                 for tile in self._config_table.tiles
             )
             tile_set = tuple(sorted(widths.items()))
-        self._compiled: dict[int, dict[tuple[str, bool], CuteDslStageCall]] = {}
+        self._compiled: dict[int, dict[str, CuteDslStageCall]] = {}
         self._tile_configs: dict[int, object] = {}
         for token_width, persistent_clusters in tile_set:
             config = MaskedGroupedGemmConfig(
@@ -239,20 +239,14 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
             )
             self._tile_configs[token_width] = config
             self._compiled[token_width] = {}
-            self._compile_stage(token_width, "gemm1", produce_pdl=False)
-            self._compile_stage(token_width, "gemm2", produce_pdl=False)
+            self._compile_stage(token_width, "gemm1")
+            self._compile_stage(token_width, "gemm2")
         torch.cuda.synchronize(device)
 
-    def _compile_stage(
-        self,
-        token_width: int,
-        stage: str,
-        *,
-        produce_pdl: bool,
-    ) -> None:
-        """Compile and warm one exact stage/producer role at attach time."""
+    def _compile_stage(self, token_width: int, stage: str) -> None:
+        """Compile and warm one exact stage at attach time."""
 
-        call_key = (stage, produce_pdl)
+        call_key = stage
         if call_key in self._compiled[token_width]:
             return
         if stage == "gemm1":
@@ -261,10 +255,7 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
             weight = self.quant_info.w2_weight
         else:
             raise ValueError(f"unknown CuTeDSL base stage {stage!r}")
-        config = msgspec.structs.replace(
-            self._tile_configs[token_width],
-            produce_pdl=produce_pdl,
-        )
+        config = self._tile_configs[token_width]
         device = weight.device
         experts = self.quant_info.num_local_experts
         k = weight.shape[2]
@@ -306,33 +297,6 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
             compiled_fn=compiled_fn,
             b_arg=self._as_dynamic_cute_tensor(weight, leading_dim=2),
         )
-
-    def configure_base_pdl(self, *, gateup_to_middle: bool) -> None:
-        """Compile only the requested producer-on stages before graph capture."""
-
-        requested = (("gemm1", gateup_to_middle),)
-        compiled = False
-        for token_width in self._compiled:
-            for stage, enabled in requested:
-                if enabled and (stage, True) not in self._compiled[token_width]:
-                    self._compile_stage(token_width, stage, produce_pdl=True)
-                    compiled = True
-        if compiled:
-            torch.cuda.synchronize(self.quant_info.w13_weight.device)
-
-    def base_pdl_state(self) -> dict[str, object]:
-        """Observed plan-local producer variants for benchmark provenance."""
-
-        return {
-            "provider": self.contract.key,
-            "producer_signal_supported": True,
-            "gateup_signal_compiled": all(
-                ("gemm1", True) in stages for stages in self._compiled.values()
-            ),
-            "down_signal_compiled": all(
-                ("gemm2", True) in stages for stages in self._compiled.values()
-            ),
-        }
 
     def _token_width_for(self, m_max: int, expected_m: int) -> int:
         """Performance width first, then escalate through COMPILED widths
@@ -450,18 +414,16 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
         ws: CuteDslMaskedWorkspace,
         schedule: torch.Tensor,
         tiles: torch.Tensor,
-        *,
-        produce_pdl: bool,
     ) -> None:
         import cuda.bindings.driver as cuda_driver
         from cutlass.cute.runtime import from_dlpack
 
         try:
-            call = self._compiled[ws.token_width][(stage, produce_pdl)]
+            call = self._compiled[ws.token_width][stage]
         except KeyError as exc:
             raise RuntimeError(
-                f"CuTeDSL {stage} token width {ws.token_width}, producer "
-                f"PDL={produce_pdl} was not compiled at plan attach"
+                f"CuTeDSL {stage} token width {ws.token_width} was not "
+                "compiled at plan attach"
             ) from exc
 
         def dyn(tensor: torch.Tensor, leading_dim: int):
@@ -480,13 +442,7 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
             stream,
         )
 
-    def gateup(
-        self,
-        ws: CuteDslMaskedWorkspace,
-        out: torch.Tensor,
-        *,
-        produce_pdl: bool = False,
-    ) -> None:
+    def gateup(self, ws: CuteDslMaskedWorkspace, out: torch.Tensor) -> None:
         self._launch(
             "gemm1",
             ws.hidden_permuted,
@@ -494,7 +450,6 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
             ws,
             ws.gemm1_schedule,
             ws.gemm1_tiles,
-            produce_pdl=produce_pdl,
         )
 
     def down(
@@ -503,8 +458,6 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
         act_out: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
-        # No consumer takes a PDL edge off GEMM2, so only the
-        # producer-off stage is ever compiled (see configure_base_pdl).
         self._launch(
             "gemm2",
             act_out,
@@ -512,7 +465,6 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
             ws,
             ws.gemm2_schedule,
             ws.gemm2_tiles,
-            produce_pdl=False,
         )
 
 
@@ -912,14 +864,7 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
         self,
         ws: CuteDslContiguousWorkspace,
         out: torch.Tensor,
-        *,
-        produce_pdl: bool = False,
     ) -> None:
-        if produce_pdl:
-            raise NotImplementedError(
-                "cutedsl_contiguous compiles no base-GEMM producer twins: "
-                "the eligible plan family excludes base-GEMM PDL edges"
-            )
         self._launch(
             "gemm1", ws.hidden_compact, out, ws, ws.gemm1_schedule, ws.gemm1_tiles
         )

@@ -36,7 +36,22 @@ IN ORDER, so put more specific rows (rank bands) above catch-alls. `layout`
 ("per_expert"/"shared") and `phase` ("decode"/"prefill") are exact keys
 (absent = wildcard); `max_rank` admits ranks up to its bound. Rows are
 activation-agnostic: the layer injects its own activation when the plan is
-built. `plan` carries kernel families, fusion shape, overlap windows, and
+built. That was a deliberate collapse (2026-08-16) and it retired three
+measured rows, so a ReLU2 MoE is now served by the SwiGLU winners:
+
+- shared layout, both phases: the old ReLU2 twins were byte-identical to
+  their SwiGLU rows, so nothing changed;
+- per-expert decode: same plan shape, but the ReLU2 row carried its own tile
+  set and now inherits the SwiGLU ladder (which is banded by token count,
+  where the ReLU2 row was not);
+- per-expert prefill on SM100: materially different — the retired
+  `prefill.relu2` ran the masked `cutedsl` provider with an early gate/up-A
+  window and a late down-A+B window and no scatter, where `prefill.serial`
+  runs `cutedsl_contiguous` strictly serially with the scatter epilogue.
+
+Both are numerically correct (every provider registers relu2 for the fused
+middle); the ReLU2-tuned schedules are simply no longer served. Re-adding
+them means re-adding an `activation` predicate to the row model. `plan` carries kernel families, fusion shape, overlap windows, and
 route builder (see `build_plan` in execution_plan.py for the field list).
 Every served row is validated through the execution-plan contracts at bind
 time — a malformed row fails startup, never serves.

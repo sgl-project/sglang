@@ -1,8 +1,11 @@
-"""Explicit launch parameters for a forced MoE-LoRA execution plan.
+"""Per-site launch tiles for a MoE-LoRA execution plan, and the tables
+that pick them.
 
-This is configuration transport, not a selector.  Defaults are correctness
-baselines shared by serving and the composed benchmark; a benchmark may
-replace any site independently with a promoted Step-3/4/5/6 configuration.
+Rules load from ``{arch}.tiles.json``; ``resolve_tiles`` filters them against
+the bound rank once at weight bind, and ``TileTable.config_for`` makes the
+single per-forward decision left in the engine -- the M bucket.  The
+dataclass defaults are correctness baselines, served when a plan row has no
+tuned rules.
 """
 
 from __future__ import annotations

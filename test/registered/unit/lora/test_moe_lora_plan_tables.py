@@ -173,6 +173,25 @@ class TestH200:
 
 
 class TestResolution:
+    def test_activation_does_not_select_a_row_but_is_injected(self):
+        # Rows are activation-agnostic by decision: ReLU2 resolves the SAME
+        # rows as SwiGLU on every in-domain table, and the layer's activation
+        # reaches the plan only through the middle spec.
+        for architecture in (_GB300, _H200):
+            for layout in (False, True):
+                swiglu = _resolve(architecture=architecture, layout=layout)
+                relu2 = _resolve(
+                    architecture=architecture, layout=layout, act=ActivationFamily.RELU2
+                )
+                assert {p: s.name for p, s in relu2.items()} == {
+                    p: s.name for p, s in swiglu.items()
+                }
+                for phase, sel in relu2.items():
+                    assert sel.plan.middle.activation is ActivationFamily.RELU2
+                    assert (
+                        swiglu[phase].plan.middle.activation is ActivationFamily.SWIGLU
+                    )
+
     def test_out_of_domain_serves_the_serial_deepgemm_fallback(self):
         selected = _resolve(hidden=8192, experts=1024)
         decode = selected[Phase.DECODE]

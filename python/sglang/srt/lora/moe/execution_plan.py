@@ -1,10 +1,11 @@
-"""Typed execution plans for the BF16 MoE-LoRA pipeline.
+"""Typed execution plans for the BF16 MoE-LoRA pipeline, and the tables
+that pick one.
 
-This module describes *what* one forward executes.  It deliberately contains
-no CUDA imports, launch configuration, device thresholds, or selection
-logic.
-The runner and benchmark can therefore validate a forced whole-pipeline plan
-before allocating a workspace or launching any kernel.
+This module describes *what* one forward executes and resolves which plan a
+layer runs: rows load from ``{arch}.plans.json`` and ``resolve_plans`` picks
+one per phase, once, at weight bind.  It holds no CUDA imports and no launch
+tiles (those are ``launch_config``), so a plan can be validated before any
+workspace is allocated.
 
 An A kernel writes a rank bridge and the matching B kernel reads it.  The
 bridge contract is explicit at each site:
@@ -638,6 +639,20 @@ def build_plan(
     return plan
 
 
+@cache
+def _warn_out_of_domain(
+    architecture: DeviceArchitecture, hidden_size: int, num_local_experts: int
+) -> None:
+    """Warn once per geometry, not once per layer (60-94 layers per model)."""
+    logger.warning(
+        "MoE LoRA geometry (hidden=%d, local_experts=%d) is outside the tuned "
+        "domain of table %r; serving the serial fallback",
+        hidden_size,
+        num_local_experts,
+        architecture.value,
+    )
+
+
 def resolve_plans(
     *,
     architecture: DeviceArchitecture,
@@ -660,13 +675,7 @@ def resolve_plans(
     ) and num_local_experts <= table.domain.get("max_local_experts", 1 << 30)
     rows = table.scenarios if in_domain else []
     if not in_domain:
-        logger.warning(
-            "MoE LoRA geometry (hidden=%d, local_experts=%d) is outside the "
-            "tuned domain of table %r; serving the serial fallback",
-            hidden_size,
-            num_local_experts,
-            architecture.value,
-        )
+        _warn_out_of_domain(architecture, hidden_size, num_local_experts)
     selected: dict[Phase, SelectedPlan] = {}
     for phase in Phase:
         row = next(

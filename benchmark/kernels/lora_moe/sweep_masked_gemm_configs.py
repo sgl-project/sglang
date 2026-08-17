@@ -119,8 +119,8 @@ def sweep_cutedsl(args, buckets, device) -> dict[int, dict]:
             direct_schedule=True,
         )
         provider._compiled[token_width] = {}
-        provider._compile_stage(token_width, "gemm1", produce_pdl=False)
-        provider._compile_stage(token_width, "gemm2", produce_pdl=False)
+        provider._compile_stage(token_width, "gemm1")
+        provider._compile_stage(token_width, "gemm2")
     torch.cuda.synchronize(device)
 
     clusters_of = {

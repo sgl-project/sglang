@@ -96,13 +96,7 @@ class DeepGemmBf16Provider(MaskedRowDomainProvider):
         self,
         ws: MaskedRowWorkspace,
         out: torch.Tensor,
-        *,
-        produce_pdl: bool = False,
     ) -> None:
-        if produce_pdl:
-            raise NotImplementedError(
-                "DeepGEMM does not expose a plan-local GEMM1 producer twin"
-            )
         self._grouped_gemm_bf16_masked(
             ws.hidden_permuted,
             self.quant_info.w13_weight,
@@ -171,13 +165,7 @@ class DeepGemmBf16ContiguousProvider(ContiguousRowDomainProvider):
         self,
         ws: ContiguousRowWorkspace,
         out: torch.Tensor,
-        *,
-        produce_pdl: bool = False,
     ) -> None:
-        if produce_pdl:
-            raise NotImplementedError(
-                "DeepGEMM does not expose a plan-local GEMM1 producer twin"
-            )
         self._grouped_gemm_bf16_contig(
             ws.hidden_compact, self.quant_info.w13_weight, out, ws.grouped_layout
         )
