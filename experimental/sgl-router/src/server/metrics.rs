@@ -27,6 +27,7 @@
 //! | `sgl_router_ingress_read_seconds` | Histogram | `model_id` |
 //! | `sgl_router_resolve_seconds` | Histogram | `model_id` |
 //! | `sgl_router_tokenize_seconds` | Histogram | `model_id` |
+//! | `sgl_router_admit_seconds` | Histogram | `model_id` |
 //! | `sgl_router_request_build_seconds` | Histogram | `model_id` |
 //! | `sgl_router_dispatch_seconds` | Histogram | `model_id` |
 //! | `sgl_router_itl_seconds` | Histogram | `model_id` |
@@ -551,6 +552,11 @@ pub struct MetricsRegistry {
     /// Ingress probe-parse plus model/policy/worker resolution, per model — the
     /// first term of `ttft_overhead_seconds`, before tokenize.
     resolve_seconds: Mutex<HashMap<String, Histogram>>,
+    /// Worker selection plus slot claim (and parking, if any), per model — the
+    /// admission term of `ttft_overhead_seconds`. A superset of
+    /// `admission_wait_seconds`, which sees only requests that parked. See
+    /// [`Self::observe_admit`].
+    admit_seconds: Mutex<HashMap<String, Histogram>>,
     /// Outgoing-body build (id/bootstrap injection, re-serialize), per model —
     /// the last term of `ttft_overhead_seconds`, after admission.
     request_build_seconds: Mutex<HashMap<String, Histogram>>,
@@ -654,6 +660,7 @@ impl Default for MetricsRegistry {
             tokenize_seconds: Default::default(),
             ingress_read_seconds: Default::default(),
             resolve_seconds: Default::default(),
+            admit_seconds: Default::default(),
             request_build_seconds: Default::default(),
             dispatch_seconds: Default::default(),
             itl_seconds: Default::default(),
@@ -1084,6 +1091,40 @@ impl MetricsRegistry {
         let hist = guard
             .entry(model_id.to_owned())
             .or_insert_with(|| Histogram::new(ROUTER_PHASE_BUCKETS));
+        hist.observe(seconds);
+    }
+
+    /// Observe admission cost (seconds) for `sgl_router_admit_seconds` — worker
+    /// SELECTION plus slot claim, plus parking when every candidate is at its
+    /// cap.
+    ///
+    /// Selection is the part with no other coverage and the part that can
+    /// actually grow: under the cache-aware policy it hashes the prompt into
+    /// blocks, walks the radix tree, consults the block-size oracle and scores
+    /// every candidate by overlap and load. That work scales with prompt length
+    /// and fleet size, and until this metric existed it was visible only in the
+    /// 1-in-N `admit_ms` debug line.
+    ///
+    /// Distinct from `sgl_router_admission_wait_seconds`, and a strict superset
+    /// of it: that metric is recorded after the parking `await` resolves, so it
+    /// sees ONLY requests that queued — a fast-path claim returns before it and
+    /// records nothing. Consequently `admission_wait_count / admit_count` is the
+    /// park rate, and `admit − admission_wait` is selection plus claim. Both are
+    /// kept, rather than widening the older metric, because dashboards already
+    /// read `admission_wait` as queue time and silently redefining it would
+    /// misreport every one of them.
+    ///
+    /// Uses [`ADMISSION_WAIT_BUCKETS`] — it contains the parking wait, so it
+    /// needs that grid's tall top, not the phase ladder's 5 s.
+    pub fn observe_admit(&self, model_id: &str, seconds: f64) {
+        // See `observe_request_duration` — drop non-finite before the map.
+        if !seconds.is_finite() {
+            return;
+        }
+        let mut guard = self.admit_seconds.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(ADMISSION_WAIT_BUCKETS));
         hist.observe(seconds);
     }
 
@@ -1648,6 +1689,21 @@ impl MetricsRegistry {
             let hist = guard.get(model_id).unwrap();
             let label_body = format!("model_id=\"{}\"", escape_label(model_id));
             render_histogram(&mut out, "sgl_router_resolve_seconds", &label_body, hist);
+        }
+        drop(guard);
+
+        // admit histogram
+        out.push_str(
+            "# HELP sgl_router_admit_seconds Worker selection (prompt hashing, radix-tree walk, oracle consult, candidate scoring) plus slot claim and any parking, in seconds; the admission term of sgl_router_ttft_overhead_seconds. Strict superset of sgl_router_admission_wait_seconds, which sees only requests that parked.\n",
+        );
+        out.push_str("# TYPE sgl_router_admit_seconds histogram\n");
+        let guard = self.admit_seconds.lock();
+        let mut models: Vec<&String> = guard.keys().collect();
+        models.sort();
+        for model_id in models {
+            let hist = guard.get(model_id).unwrap();
+            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
+            render_histogram(&mut out, "sgl_router_admit_seconds", &label_body, hist);
         }
         drop(guard);
 
@@ -2607,6 +2663,7 @@ mod tests {
         reg.observe_resolve("tiny", 0.0003);
         reg.observe_tokenize("tiny", 0.002);
         reg.observe_admission_wait("tiny", 0.5);
+        reg.observe_admit("tiny", 0.6);
         reg.observe_request_build("tiny", 0.0008);
         reg.observe_dispatch("tiny", 0.4);
         let out = reg.render();
@@ -2615,6 +2672,7 @@ mod tests {
             "sgl_router_resolve_seconds",
             "sgl_router_tokenize_seconds",
             "sgl_router_admission_wait_seconds",
+            "sgl_router_admit_seconds",
             "sgl_router_request_build_seconds",
             "sgl_router_dispatch_seconds",
         ] {

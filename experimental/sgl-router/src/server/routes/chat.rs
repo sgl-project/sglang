@@ -462,6 +462,14 @@ async fn chat_completions_inner(
         p.set(RequestPhase::Dispatch);
     }
     let at_post_admit = start.elapsed();
+    // Selection + claim + any parking. Recorded for EVERY admitted request,
+    // unlike `admission_wait_seconds`, which the fast path returns before ever
+    // reaching — leaving worker selection (prompt hashing, radix-tree walk,
+    // oracle consult, candidate scoring) unmeasured on the common path.
+    ctx.metrics.observe_admit(
+        &model_str,
+        at_post_admit.saturating_sub(at_post_tokenize).as_secs_f64(),
+    );
     // Diagnostic: count this request as holding a slot inside the synchronous
     // handler (post-acquire → response returned). Drops when the function
     // returns (headers time for streaming), so HANDLER_INFLIGHT reflects slots

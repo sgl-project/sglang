@@ -180,6 +180,7 @@ async fn request_records_every_phase_histogram() {
         "sgl_router_ingress_read_seconds",
         "sgl_router_resolve_seconds",
         "sgl_router_tokenize_seconds",
+        "sgl_router_admit_seconds",
         "sgl_router_request_build_seconds",
         "sgl_router_dispatch_seconds",
     ] {
