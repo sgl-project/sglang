@@ -133,10 +133,31 @@ class TestFlashinferCuteDSLMoeBackendNvFp4Online(
 
 
 class TestFlashinferCuteDSLMoeBackendNvFp4OnlineW4A16(
-    TestFlashinferCuteDSLMoeBackendNvFp4Online
+    FlashinferNvFp4OnlineMoeBackendBase, CustomTestCase
 ):
+    backend = "flashinfer_cutedsl"
+    model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"
+    extra_args = [
+        "--reasoning-parser",
+        "nemotron_3",
+        "--tool-call-parser",
+        "qwen3_coder",
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+    ]
+    eval_args = {"max_tokens": 16000, "temperature": 1.0, "top_p": 0.95}
+    spec_accept_length_threshold = 2.5
     extra_env = {
-        **TestFlashinferCuteDSLMoeBackendNvFp4Online.extra_env,
+        "FLASHINFER_NVFP4_4OVER6": "1",
+        "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
+        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
+        "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1",
         "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16": "1",
     }
 
