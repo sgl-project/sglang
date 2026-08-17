@@ -9098,14 +9098,10 @@ class ServerArgs:
                     "--speculative-adaptive"
                 )
                 # Every stage rebuilds the same verify input from the relayed
-                # per-request state, so all stages must see the same batch
-                # composition. Mixed-chunk splices decode requests into an
-                # extend batch (whose relayed next_token_ids are prefill
-                # placeholders), and DP attention partitions the batch per DP
-                # rank; both break that invariant.
-                assert (
-                    not self.enable_mixed_chunk
-                ), "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-mixed-chunk"
+                # per-request state, so all stages must see the same batch.
+                # DP attention partitions it per DP rank. (Mixed chunk would
+                # break the same invariant, but the EAGLE arg hook already
+                # forces it off.)
                 assert (
                     not self.enable_dp_attention
                 ), "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
