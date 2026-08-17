@@ -341,9 +341,13 @@ def _is_bf16_cuda(t: torch.Tensor) -> bool:
     return t.is_cuda and t.dtype is torch.bfloat16
 
 
-def _is_sm120_or_newer() -> bool:
+def _qk_head_launch_config() -> tuple[int, int]:
     arch = get_jit_cuda_arch()
-    return arch.major * 10 + arch.minor >= 120
+    if arch.major == 10 and arch.minor == 3:
+        return 32, 1
+    if arch.major * 10 + arch.minor >= 120:
+        return 8, 4
+    return 64, 2
 
 
 def _mod_row_stride(t: torch.Tensor, batch: int, hidden: int) -> int | None:
@@ -460,12 +464,10 @@ def fused_qk_head_layernorm(
     launch, bit-exact vs the eager aten kernel."""
     head_dim = q.shape[-1]
     n_rows = q.numel() // head_dim
-    # SM120 has a smaller register file per SM than H200.  Grouping 64 exact
-    # Welford rows in one program depresses occupancy on RTX 5090; an exhaustive
-    # production-shape sweep selects 8 rows / 4 warps there (about 10% faster).
-    # Preserve the independently tuned SM90 launch byte-for-byte.
-    is_sm120 = _is_sm120_or_newer()
-    rows = 8 if is_sm120 else 64
+    # Architecture sweeps at the production GLM shape select 32 rows / 1 warp
+    # on B300 (SM103) and 8 rows / 4 warps on RTX 5090 (SM120). Preserve the
+    # independently tuned H100/H200 launch on all other architectures.
+    rows, num_warps = _qk_head_launch_config()
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
     with torch.cuda.device(q.device):
@@ -481,6 +483,6 @@ def fused_qk_head_layernorm(
             ROWS=rows,
             # H200-tuned: 62us at (1, 4360, 32, 128) vs the 301us of the two
             # aten launches (one 128-thread block per head_dim-element row).
-            num_warps=4 if is_sm120 else 2,
+            num_warps=num_warps,
         )
     return q_out, k_out

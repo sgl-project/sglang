@@ -20,13 +20,27 @@ from typing import Iterable, Optional, Union
 import torch
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from transformers import Cache, DynamicCache, LlavaConfig, Mistral3Config, MistralConfig
+from transformers import (
+    Cache,
+    DynamicCache,
+    GenerationMixin,
+    LlavaConfig,
+    Ministral3Config,
+    Mistral3Config,
+    MistralConfig,
+)
 from transformers.activations import ACT2FN
 from transformers.masking_utils import (
     create_causal_mask,
     create_sliding_window_causal_mask,
 )
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
+from transformers.models.ministral3.modeling_ministral3 import (
+    Ministral3PreTrainedModel,
+)
 from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3CausalLMOutputWithPast,
     Mistral3ModelOutputWithPast,
@@ -126,10 +140,29 @@ def _can_use_unmasked_causal_attention(
     return bool(torch.all(attention_mask > 0).item())
 
 
+def _get_llama_4_attn_scale(
+    position_ids: torch.Tensor,
+    beta: float | None,
+    original_max_position_embeddings: int | None,
+) -> torch.Tensor | None:
+    if beta is None or original_max_position_embeddings is None:
+        return None
+    scale = 1 + beta * torch.log(
+        1 + torch.floor(position_ids / original_max_position_embeddings)
+    )
+    return scale[:, None, :, None]
+
+
 class MistralAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: MistralConfig, layer_idx: int):
+    def __init__(
+        self,
+        config: MistralConfig,
+        layer_idx: int,
+        *,
+        allow_cudnn_sdp: bool = True,
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -139,6 +172,11 @@ class MistralAttention(nn.Module):
         )
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
+        rope_parameters = getattr(config, "rope_parameters", {}) or {}
+        self.llama_4_scaling_beta = rope_parameters.get("llama_4_scaling_beta")
+        self.original_max_position_embeddings = rope_parameters.get(
+            "original_max_position_embeddings"
+        )
         self.total_num_heads = config.num_attention_heads
         self.total_num_key_value_heads = config.num_key_value_heads
         tp_size = _tp_world_size()
@@ -197,7 +235,7 @@ class MistralAttention(nn.Module):
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
             },
-            allow_cudnn_sdp=True,
+            allow_cudnn_sdp=allow_cudnn_sdp,
         )
 
     def forward(
@@ -205,6 +243,7 @@ class MistralAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
@@ -232,6 +271,14 @@ class MistralAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin
         )
+        if position_ids is not None:
+            query_scale = _get_llama_4_attn_scale(
+                position_ids,
+                self.llama_4_scaling_beta,
+                self.original_max_position_embeddings,
+            )
+            if query_scale is not None:
+                query_states = query_states * query_scale.to(query_states.dtype)
 
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -284,10 +331,20 @@ class MistralTPMLP(nn.Module):
 
 
 class MistralDecoderLayer(nn.Module):
-    def __init__(self, config: MistralConfig, layer_idx: int):
+    def __init__(
+        self,
+        config: MistralConfig,
+        layer_idx: int,
+        *,
+        allow_cudnn_sdp: bool = True,
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = MistralAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = MistralAttention(
+            config=config,
+            layer_idx=layer_idx,
+            allow_cudnn_sdp=allow_cudnn_sdp,
+        )
         self.mlp = MistralTPMLP(config)
         self.input_layernorm = MistralRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -333,7 +390,7 @@ class MistralDecoderLayer(nn.Module):
 
 
 class MistralModel(MistralPreTrainedModel):
-    def __init__(self, config: MistralConfig):
+    def __init__(self, config: MistralConfig, *, allow_cudnn_sdp: bool = True):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -343,7 +400,11 @@ class MistralModel(MistralPreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                MistralDecoderLayer(config, layer_idx)
+                MistralDecoderLayer(
+                    config,
+                    layer_idx,
+                    allow_cudnn_sdp=allow_cudnn_sdp,
+                )
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -432,6 +493,78 @@ class MistralModel(MistralPreTrainedModel):
             hidden_states=hidden_states_pool,
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
+        )
+
+
+class Ministral3ForCausalLM(
+    Ministral3PreTrainedModel, GenerationMixin, LayerwiseOffloadableModuleMixin
+):
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    layerwise_offload_dit_group_enabled = False
+    layer_names = ["model.layers"]
+
+    def __init__(self, config: Ministral3Config):
+        super().__init__(config)
+        self.model = MistralModel(config, allow_cudnn_sdp=False)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, value):
+        self.lm_head = value
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs,
+    ) -> CausalLMOutputWithPast:
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
+        logits = self.lm_head(outputs.last_hidden_state[:, slice_indices, :])
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                **kwargs,
+            )
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
         )
 
 
