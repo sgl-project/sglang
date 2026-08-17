@@ -66,12 +66,24 @@ carry `seeded_for` (both written by the tuner below).
 
 Every value in the shipped files is a measured sweep winner from the
 2026-08 best-config campaign (bs 1–32, 4k/1k, mlpb=4, r16/32; Qwen3.5-35B,
-Qwen3.5-397B, Inkling-Small on GB300/B200/H200). gb300's claim over
-the whole SM100 family was re-validated on B200 (2026-08-14, 14-arm e2e
-sweep): every swept axis — decode B family, split-K, row domain, overlap
-windows, route builder, route PDL — confirmed the shipped winner.
+Qwen3.5-397B, Inkling-Small on GB300/B200/H200).
+
+`gb300.*` keys the whole SM100 family, so what that claim rests on, exactly:
+
+- Plans, confirmed on B200 (2026-08-14, 14-arm e2e sweep, three models):
+  decode B family, split-K, row domain, overlap windows, route builder and
+  route PDL all picked the same winner as on GB300.
+- Tiles, partly confirmed on B200: the per-expert decode ladder was measured
+  against the same five candidate tile sets across r8–r128, and B200 chose
+  the same winner as GB300 at every rank with matching magnitudes (using the
+  wrong tile costs ~25% at r8 on both dies), which is what the rank rule in
+  `gb300.tiles.json` encodes.
+- NOT measured on B200: tile values for the other sites and M buckets
+  (prefill rows, shared decode, the ≤4/≤16 token buckets) and the optional
+  tp{2,4,8} tile-forcing confirmation. Those inherit GB300's numbers.
+
 Provenance and the full axis inventory: the campaign's best-config tables
-document.
+document, plus `B200_POLICY_ADJUDICATION_20260814.md`.
 
 To onboard a model whose geometry the shipped `domain`/rows do not cover:
 
