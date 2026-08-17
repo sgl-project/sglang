@@ -59,7 +59,10 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
 <Note>
   The RTX 5090 and RTX PRO 6000 cells above — including every Speculative
   Decoding / Serving Strategy / SSM dtype combination — were validated at
-  ISL 8192 / OSL 1024, concurrency 1. The other platforms' recipes carry their
+  ISL 8192 / OSL 1024, concurrency 1. The DGX Spark cells cover that same full
+  combination set, but to a weaker standard: each was confirmed to **boot and
+  serve** at ISL 8192 / OSL 1024, concurrency 1, with no throughput or
+  acceptance-length numbers taken. The remaining platforms' recipes carry their
   original validation, which covers the default overlay picks (plus MTP on
   GB300); non-default overlay picks there are valid but unmeasured.
 </Note>
@@ -182,8 +185,9 @@ checkpoint's calibration scales automatically.
   three checkpoints fit, and its cells reuse the RTX PRO 6000 recipe verbatim
   rather than a separate operating point. **Validated on SM121 / aarch64**: all
   36 configurations (3 checkpoints x Speculative Decoding x Serving Strategy x
-  Mamba SSM Dtype) served on GB10 under `lmsysorg/sglang:qwen38-27b` at
-  ISL 8192 / OSL 1024, concurrency 1 — including the FlashInfer `plan` /
+  Mamba SSM Dtype) booted and served on GB10 under `lmsysorg/sglang:qwen38-27b`
+  at ISL 8192 / OSL 1024, concurrency 1. That is boot-and-serve coverage only —
+  no throughput or acceptance-length numbers — and it includes the FlashInfer `plan` /
   `uniform_q_len` path above, which raised no arity error on that image. Two
   host quirks when reproducing on GB10: docker GPU access is CDI-only
   (`--device nvidia.com/gpu=all`, as no `nvidia` runtime is registered), and

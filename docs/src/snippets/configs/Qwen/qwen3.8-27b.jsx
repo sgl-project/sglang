@@ -483,15 +483,18 @@ export const config = {
     // cell. These cells reuse the RTX PRO 6000 recipe verbatim rather than a
     // separate SM121 operating point: both cards are SM12x Blackwell, and
     // GB10's 128GB unified pool is larger than the 6000's 96GB, so a recipe
-    // that fits the smaller card has headroom here. Still unvalidated on
-    // VALIDATED on SM121 / aarch64: all 36 configurations (3 checkpoints x
-    // Speculative Decoding 3 x Serving Strategy 2 x Mamba SSM Dtype 2) served on
-    // GB10 under this recipe, so the inheritance is now backed by measurement.
+    // that fits the smaller card has headroom here.
+    //
+    // Validated on GB10 (SM121 / aarch64): all 36 configurations booted and
+    // served at ISL 8192 / OSL 1024, concurrency 1. Boot-and-serve only -- no
+    // throughput or acceptance-length numbers were taken, so this is a weaker
+    // standard than the SM120 pair's validation, and the Deploy-panel Note says
+    // so.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", nodes: "single" },
-      // MEASURED on GB10: all 12 configurations served, same envelope and
-      // protocol as the FP8 and BF16 cells below. DSPARK here also exercises
-      // the 4-bit `lm_head` this checkpoint quantizes, with no shape error.
+      // All 12 overlay combinations served on GB10. DSPARK here also
+      // exercises the 4-bit `lm_head` this checkpoint quantizes, with no shape
+      // error.
       verified: true,
       env: [],
       flags: [
@@ -509,8 +512,7 @@ export const config = {
     },
     {
       match: { hw: "dgx-spark", variant: "default", quant: "fp8", nodes: "single" },
-      // MEASURED on GB10: all 12 configurations served, same envelope and
-      // protocol as the BF16 cell above.
+      // All 12 overlay combinations served on GB10.
       verified: true,
       env: [],
       flags: [
@@ -528,9 +530,8 @@ export const config = {
     },
     {
       match: { hw: "dgx-spark", variant: "default", quant: "bf16", nodes: "single" },
-      // MEASURED on GB10 (SM121 / aarch64): all 12 configurations served --
-      // Speculative Decoding {None, EAGLE, DSPARK} x Serving Strategy {both} x
-      // Mamba SSM Dtype {both}, at 8192-in/1024-out concurrency 1.
+      // All 12 overlay combinations served on GB10. Heaviest checkpoint, so
+      // it holds the sweep's tightest cell: DSPARK + float32 + extra_buffer.
       verified: true,
       env: [],
       flags: [
