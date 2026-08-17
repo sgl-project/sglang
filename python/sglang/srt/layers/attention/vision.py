@@ -969,6 +969,7 @@ class VisionIntelXPUAttention(nn.Module):
         bsz: int,
         seq_len: int,
         softmax_scale: Optional[float] = None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -980,10 +981,15 @@ class VisionIntelXPUAttention(nn.Module):
         window_size = kwargs.get("window_size", (-1, -1))
         s_aux = kwargs.get("s_aux", None)
 
-        cu_seqlens_source = cu_seqlens
-        cu_seqlens = resolve_seqlens(cu_seqlens_source, bsz, seq_len, device=q.device)
-        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-        max_seqlen = resolve_max_seqlen(cu_seqlens_source, cu_seqlens)
+        if forward_metadata is not None:
+            cu_seqlens = forward_metadata.cu_seqlens
+            max_seqlen = forward_metadata.max_seqlen
+        else:
+            cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+            cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+            max_seqlen = resolve_precomputed_max_seqlen(
+                cu_seqlens, kwargs.get("max_seqlen")
+            )
 
         fa_kwargs = dict(
             cu_seqlens_q=cu_seqlens,
