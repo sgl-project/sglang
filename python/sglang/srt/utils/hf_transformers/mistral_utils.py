@@ -634,4 +634,58 @@ def patch_mistral_common_tokenizer(tokenizer):
         return tokenizer._orig_apply_chat_template(messages, **kwargs)
 
     tokenizer.apply_chat_template = _safe_apply_chat_template
+
+    def init_xgrammar():
+        """Build XGrammar's TokenizerInfo from the underlying Tekken vocabulary.
+
+        XGrammar's ``from_huggingface`` path cannot read this tokenizer: its
+        ``get_vocab()`` is keyed by decoded text, so byte-level pieces collide and
+        most ids come back as 0. The raw byte pieces are only reachable through the
+        inner Tekkenizer, so build the ordered vocabulary directly.
+        """
+        from xgrammar import TokenizerInfo
+
+        tekken = getattr(
+            getattr(tokenizer.tokenizer, "instruct_tokenizer", None), "tokenizer", None
+        )
+        if tekken is None or not hasattr(tekken, "id_to_byte_piece"):
+            logger.warning(
+                "Cannot build XGrammar TokenizerInfo: no Tekkenizer found under %s",
+                type(tokenizer).__name__,
+            )
+            return None, None
+
+        vocab_size = tekken._vocab_size
+        num_special = tekken.num_special_tokens
+        special_names = {
+            entry["rank"]: entry["token_str"] for entry in tekken._all_special_tokens
+        }
+
+        # XGrammar reads a b"\x00"-prefixed token as its own special marker, so any
+        # real byte piece starting with NUL has to be renamed out of the way.
+        placeholder = "<|xg_special_token_{}|>"
+        encoded_vocab = []
+        for token_id in range(vocab_size):
+            if token_id < num_special:
+                encoded_vocab.append(
+                    special_names.get(token_id, placeholder.format(token_id))
+                )
+                continue
+            piece = tekken.id_to_byte_piece(token_id)
+            if piece.startswith(b"\x00"):
+                piece = placeholder.format(f"nul{token_id}")
+            encoded_vocab.append(piece)
+
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        override_stop_tokens = [eos_token_id] if eos_token_id is not None else None
+        try:
+            tokenizer_info = TokenizerInfo(
+                encoded_vocab, stop_token_ids=override_stop_tokens
+            )
+        except Exception as e:
+            logger.warning("Failed to build XGrammar TokenizerInfo: %s", e)
+            return None, None
+        return tokenizer_info, override_stop_tokens
+
+    tokenizer.init_xgrammar = init_xgrammar
     return tokenizer
