@@ -1188,6 +1188,8 @@ def _fused_append_shared_experts_kernel(
     scale_factor,  # runtime scalar
     K: tl.constexpr,
     S: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_S: tl.constexpr,
 ):
     """
     for m in range(M):
@@ -1205,20 +1207,22 @@ def _fused_append_shared_experts_kernel(
     out_ids_row_ptr = pid * (K + S)
     out_w_row_ptr = pid * (K + S)
 
-    offs_k = tl.arange(0, K)
-    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k)
-    ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_k = offs_k < K
+    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=mask_k)
+    ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k, mask=mask_k)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids)
-    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws)
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
+    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=mask_k)
 
-    offs_s = tl.arange(0, S)
+    offs_s = tl.arange(0, BLOCK_S)
+    mask_s = offs_s < S
 
     shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
-    shared_ws = tl.full([S], scale_factor, dtype=ws.dtype)
+    shared_ws = tl.full([BLOCK_S], scale_factor, dtype=ws.dtype)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids)
-    tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws)
+    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=mask_s)
+    tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws, mask=mask_s)
 
 
 def fused_append_shared_experts(
@@ -1244,6 +1248,8 @@ def fused_append_shared_experts(
         scale_factor=scale_factor,
         K=k,
         S=s,
+        BLOCK_K=triton.next_power_of_2(k),
+        BLOCK_S=triton.next_power_of_2(s),
         num_warps=1,
     )
     return out_ids, out_weights

@@ -628,6 +628,18 @@ class DeepseekV2MoE(nn.Module):
             dsa_enable_prefill_cp=dsa_enable_prefill_cp,
             mla_enable_prefill_cp=mla_enable_prefill_cp,
         )
+        if (
+            is_deepseek_v4
+            and self.num_fused_shared_experts == 1
+            and self.gate.e_score_correction_bias is not None
+        ):
+            # The fused top-k path used to append semantic expert 384 requires
+            # float32 correction bias. Keep the parameter itself in fp32 so the
+            # checkpoint loader writes converted values into the tensor TopK
+            # already references.
+            self.gate.e_score_correction_bias.data = (
+                self.gate.e_score_correction_bias.data.float()
+            )
 
         # scaling factor for fused shared experts on AMD-platform.
         # DeepEP/MegaMOE doesn't need this: shared expert is only computed on home rank
@@ -658,6 +670,11 @@ class DeepseekV2MoE(nn.Module):
             swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
         )
+        if is_deepseek_v4 and self.num_fused_shared_experts == 1:
+            # DeepSeek-V4's shared expert remains native FP8. Its checkpoint
+            # tensors are intercepted by FusedMoE and passed separately to
+            # AITER FHMoE instead of being requantized into the MXFP4 row.
+            self.experts.use_aiter_fhmoe = True
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(

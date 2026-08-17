@@ -87,8 +87,15 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+    should_use_dp_reduce_scatterv,
+)
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.moe_runner.aiter import (
+    aiter_fused_moe_supports_heterogeneous_shared_expert,
+)
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.fp8_utils import (
     view_aiter_fused_rms_transposed_fp8_scale,
@@ -137,6 +144,7 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     try_fused_hc_post_pre,
 )
 from sglang.srt.models.deepseek_common.utils import (
+    _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     is_wint4afp8_or_wint4a16_config,
 )
@@ -147,7 +155,13 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_server_args,
+)
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -2652,9 +2666,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
-        """V4 only fuses when explicitly asked to, and then the checkpoint must
-        carry exactly one shared expert. Asked by the loader before any layer is
-        built."""
+        """Return why heterogeneous AITER FHMoE cannot be enabled."""
         if not get_exec().moe.enforce_shared_experts_fusion:
             return "Config does not support fused shared expert(s)."
         if hf_config.n_shared_experts != 1:
@@ -2662,6 +2674,53 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "DeepSeek V4 shared-experts fusion expects exactly one shared "
                 f"expert, but got n_shared_experts={hf_config.n_shared_experts}."
             )
+        if not _is_hip or not is_gfx95_supported():
+            return "DeepSeek V4 heterogeneous shared-expert fusion requires gfx950."
+        if not _use_aiter:
+            return "DeepSeek V4 heterogeneous shared-expert fusion requires AITER."
+        if not aiter_fused_moe_supports_heterogeneous_shared_expert():
+            return "Installed AITER does not expose the heterogeneous FHMoE ABI."
+        runner = get_moe_runner_backend()
+        if not (runner.is_auto() or runner.is_aiter()):
+            return "DeepSeek V4 heterogeneous shared-expert fusion requires the AITER MoE runner."
+        if not get_moe_a2a_backend().is_none():
+            return "DeepSeek V4 heterogeneous shared-expert fusion does not support MoE A2A/EP."
+        parallel = get_parallel()
+        if parallel.tp_size != 8 or parallel.moe_ep_size != 1:
+            return "DeepSeek V4 heterogeneous shared-expert fusion requires TP=8 and EP disabled."
+        if get_exec().moe.enable_eplb:
+            return (
+                "DeepSeek V4 heterogeneous shared-expert fusion does not support EPLB."
+            )
+        if getattr(get_server_args(), "cpu_offload_gb", 0):
+            return "DeepSeek V4 heterogeneous shared-expert fusion does not support weight offload."
+        expected_geometry = {
+            "n_routed_experts": 384,
+            "num_experts_per_tok": 6,
+            "hidden_size": 7168,
+            "moe_intermediate_size": 3072,
+            "hidden_act": "silu",
+        }
+        for name, expected in expected_geometry.items():
+            if getattr(hf_config, name, None) != expected:
+                return (
+                    "DeepSeek V4 heterogeneous shared-expert fusion requires "
+                    f"{name}={expected}."
+                )
+        if (
+            quant_config is None
+            or not getattr(quant_config, "is_fp4_experts", False)
+            or not getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+            or getattr(quant_config, "weight_block_size", None) != [128, 128]
+        ):
+            return (
+                "DeepSeek V4 heterogeneous shared-expert fusion requires MXFP4 "
+                "routed experts and serialized 128x128 block-FP8 shared weights."
+            )
+        if getattr(quant_config, "ignored_layers", None):
+            return "DeepSeek V4 heterogeneous shared-expert fusion does not support ignored layers."
+        if not envs.SGLANG_USE_AITER_MOE_GU_ITLV.get():
+            return "DeepSeek V4 heterogeneous shared-expert fusion requires gate/up interleaving."
         return None
 
     def determine_num_fused_shared_experts(self):
@@ -2970,7 +3029,11 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
-            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+            log_info_on_rank0(
+                logger,
+                "AITER heterogeneous shared-expert fusion enabled "
+                "(semantic top-k=6; internal E=385, top-k=7).",
+            )
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []

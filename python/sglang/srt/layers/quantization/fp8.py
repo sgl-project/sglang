@@ -140,6 +140,154 @@ def _require_fp4_dtype():
     return fp4_dtype
 
 
+def _e8m0_scale_bytes(scale: torch.Tensor) -> torch.Tensor:
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if scale.dtype == torch.uint8:
+        return scale.contiguous()
+    if e8m0_dtype is not None and scale.dtype == e8m0_dtype:
+        return scale.contiguous().view(torch.uint8)
+    if scale.is_floating_point() and e8m0_dtype is not None:
+        e8m0 = scale.to(e8m0_dtype)
+        if not torch.equal(e8m0.float(), scale.float()):
+            raise ValueError(
+                "AITER FHMoE requires shared-expert scales exactly representable "
+                "as E8M0."
+            )
+        return e8m0.contiguous().view(torch.uint8)
+    raise ValueError("AITER FHMoE shared-expert scales must be E8M0 or uint8.")
+
+
+def _prepare_aiter_fhmoe_shared_expert(
+    layer: Module, padded_intermediate_size: int, gate_up_interleaved: bool
+) -> None:
+    """Prepare native block-FP8 shared weights for AITER's FHMoE ABI."""
+    if not getattr(layer, "use_aiter_fhmoe", False):
+        return
+    if not gate_up_interleaved:
+        raise ValueError("AITER DeepSeek-V4 FHMoE requires gate/up interleaving.")
+
+    weights = layer._fhmoe_native_weights
+    scales = layer._fhmoe_native_scales
+    expected = {"w1", "w2", "w3"}
+    if set(weights) != expected or set(scales) != expected:
+        raise RuntimeError(
+            "Incomplete native FP8 shared-expert checkpoint tensors for AITER "
+            f"FHMoE: weights={sorted(weights)}, scales={sorted(scales)}."
+        )
+
+    device = layer.w13_weight.device
+    tensors_are_tp_sharded = getattr(layer, "_fhmoe_native_is_tp_sharded", False)
+    tp_size = 1 if tensors_are_tp_sharded else get_parallel().moe_tp_size
+    tp_rank = 0 if tensors_are_tp_sharded else get_parallel().moe_tp_rank
+    native_intermediate = weights["w1"].shape[0]
+    hidden_size = weights["w1"].shape[1]
+    if native_intermediate % tp_size:
+        raise ValueError("Shared-expert intermediate size must divide TP size.")
+    intermediate_per_partition = native_intermediate // tp_size
+    if padded_intermediate_size < intermediate_per_partition:
+        raise ValueError("FHMoE padded intermediate size is smaller than its TP shard.")
+
+    def shard_weight(name: str) -> torch.Tensor:
+        weight = weights[name].to(device=device)
+        if weight.dtype != torch.float8_e4m3fn or weight.ndim != 2:
+            raise ValueError("AITER FHMoE shared weights must be 2D FP8 E4M3.")
+        if name == "w2":
+            if weight.shape != (hidden_size, native_intermediate):
+                raise ValueError("Shared down-projection shape does not match gate/up.")
+            return weight.narrow(
+                1, tp_rank * intermediate_per_partition, intermediate_per_partition
+            ).contiguous()
+        if weight.shape != (native_intermediate, hidden_size):
+            raise ValueError("Shared gate/up projection shapes do not match.")
+        return weight.narrow(
+            0, tp_rank * intermediate_per_partition, intermediate_per_partition
+        ).contiguous()
+
+    def shard_scale(name: str) -> torch.Tensor:
+        scale = _e8m0_scale_bytes(scales[name].to(device=device))
+        if native_intermediate % 128 or hidden_size % 128:
+            raise ValueError(
+                "FHMoE shared dimensions must align to 128x128 FP8 blocks."
+            )
+        if name == "w2":
+            expected_shape = (hidden_size // 128, native_intermediate // 128)
+            if tuple(scale.shape) != expected_shape:
+                raise ValueError(
+                    f"Expected shared W2 scale shape {expected_shape}, got "
+                    f"{tuple(scale.shape)}."
+                )
+            block_cols = intermediate_per_partition // 128
+            return scale.narrow(1, tp_rank * block_cols, block_cols).contiguous()
+        expected_shape = (native_intermediate // 128, hidden_size // 128)
+        if tuple(scale.shape) != expected_shape:
+            raise ValueError(
+                f"Expected shared {name.upper()} scale shape {expected_shape}, got "
+                f"{tuple(scale.shape)}."
+            )
+        block_rows = intermediate_per_partition // 128
+        return scale.narrow(0, tp_rank * block_rows, block_rows).contiguous()
+
+    gate = shard_weight("w1")
+    up = shard_weight("w3")
+    down = shard_weight("w2")
+    gate_scale = shard_scale("w1").repeat_interleave(128, 0).repeat_interleave(4, 1)
+    up_scale = shard_scale("w3").repeat_interleave(128, 0).repeat_interleave(4, 1)
+    down_scale = shard_scale("w2").repeat_interleave(128, 0).repeat_interleave(4, 1)
+
+    shared_w1 = torch.zeros(
+        (1, 2 * padded_intermediate_size, hidden_size),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    shared_w1[0, :intermediate_per_partition].copy_(gate)
+    shared_w1[
+        0,
+        padded_intermediate_size : padded_intermediate_size
+        + intermediate_per_partition,
+    ].copy_(up)
+    shared_w2 = torch.zeros(
+        (1, hidden_size, padded_intermediate_size),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    shared_w2[0, :, :intermediate_per_partition].copy_(down)
+
+    neutral_e8m0 = 0x7F
+    shared_w1_scale = torch.full(
+        (2 * padded_intermediate_size, hidden_size // 32),
+        neutral_e8m0,
+        dtype=torch.uint8,
+        device=device,
+    )
+    shared_w1_scale[:intermediate_per_partition].copy_(gate_scale)
+    shared_w1_scale[
+        padded_intermediate_size : padded_intermediate_size + intermediate_per_partition
+    ].copy_(up_scale)
+    shared_w2_scale = torch.full(
+        (hidden_size, padded_intermediate_size // 32),
+        neutral_e8m0,
+        dtype=torch.uint8,
+        device=device,
+    )
+    shared_w2_scale[:, : intermediate_per_partition // 32].copy_(down_scale)
+
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0_dtype is not None:
+        shared_w1_scale = shared_w1_scale.view(e8m0_dtype)
+        shared_w2_scale = shared_w2_scale.view(e8m0_dtype)
+
+    layer.fhmoe_shared_w1 = shuffle_weight(
+        shared_w1, (16, 16), is_guinterleave=True, gate_up=True
+    ).contiguous()
+    layer.fhmoe_shared_w2 = shuffle_weight(
+        shared_w2, (16, 16), is_guinterleave=True, gate_up=False
+    ).contiguous()
+    layer.fhmoe_shared_w1_scale = shuffle_scale(
+        shared_w1_scale, 1, True, True
+    ).contiguous()
+    layer.fhmoe_shared_w2_scale = shuffle_scale(shared_w2_scale).contiguous()
+
+
 if _use_aiter or _use_hip_int4:
     from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 
@@ -1435,17 +1583,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
             fp4_weight_dtype = _require_fp4_dtype()
 
-            # DeepSeek V4 MoE is implemented by the FlyDSL kernel, which supports
-            # tile_k=128, so we only need to pad dim to 128. This lets DeepSeek-V4-Pro
-            # at TP8 skip padding 384 -> 512, reducing routed-expert memory by ~25%.
-            # shuffle_scale also supports non-256 shapes since aiter PR#4130.
-            fp4_k_align = 128
+            # Ordinary DeepSeek-V4 FlyDSL supports tile_k=128 and can keep the
+            # TP8 shard at 384. FHMoE's validated mixed-precision schedule uses
+            # inter_dim=512, so its routed dummy geometry and native shared
+            # tensors must both pad 384 -> 512.
+            fp4_k_align = 256 if getattr(layer, "use_aiter_fhmoe", False) else 128
             E, w13_N, w13_K_packed = layer.w13_weight.shape
             _, w2_N, w2_K_packed = layer.w2_weight.shape
             inter_per_part = w13_N // 2
             padded_inter = (
                 (inter_per_part + fp4_k_align - 1) // fp4_k_align * fp4_k_align
             )
+            if getattr(layer, "use_aiter_fhmoe", False):
+                if E != 385 or layer.moe_runner_config.top_k != 7:
+                    raise ValueError(
+                        "DeepSeek-V4 FHMoE requires E=385 and internal top-k=7."
+                    )
+                # Expert 384 is a semantic placeholder. Its native FP8 tensors
+                # are passed separately and this MXFP4 row must never contain
+                # converted shared-expert data.
+                layer.w13_weight.data[-1].zero_()
+                layer.w2_weight.data[-1].zero_()
+                layer.w13_weight_scale_inv.data[-1].zero_()
+                layer.w2_weight_scale_inv.data[-1].zero_()
             # Record the padding so fused_moe is told the real intermediate size
             # (aiter fused_moe needs intermediate_pad = padded - real; ATOM passes
             # 128, SGLang previously defaulted to 0 -> computed the padded region).
@@ -1538,6 +1698,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
             layer.w13_weight.is_shuffled = is_shuffled
             layer.w2_weight.is_shuffled = is_shuffled
+            _prepare_aiter_fhmoe_shared_expert(layer, padded_inter, gu_intv)
             return
 
         if self.convert_mxfp8_to_block:
@@ -2674,6 +2835,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),
+            shared_w1=getattr(layer, "fhmoe_shared_w1", None),
+            shared_w2=getattr(layer, "fhmoe_shared_w2", None),
+            shared_w1_scale=getattr(layer, "fhmoe_shared_w1_scale", None),
+            shared_w2_scale=getattr(layer, "fhmoe_shared_w2_scale", None),
+            shared_expert_id=(384 if getattr(layer, "use_aiter_fhmoe", False) else -1),
         )
 
 

@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
+import threading
 from enum import Enum
 from functools import cached_property
 from typing import Dict, List, Optional, Tuple
@@ -303,6 +304,15 @@ class FusedMoE(torch.nn.Module):
         self._has_fused_shared = num_fused_shared_experts > 0
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
+        self._fhmoe_load_lock = threading.Lock()
+        self.use_aiter_fhmoe = False
+        self._fhmoe_native_weights: dict[str, torch.Tensor] = {}
+        self._fhmoe_native_scales: dict[str, torch.Tensor] = {}
+        self._fhmoe_native_is_tp_sharded = False
+        self.register_buffer("fhmoe_shared_w1", None, persistent=False)
+        self.register_buffer("fhmoe_shared_w2", None, persistent=False)
+        self.register_buffer("fhmoe_shared_w1_scale", None, persistent=False)
+        self.register_buffer("fhmoe_shared_w2_scale", None, persistent=False)
 
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
@@ -798,6 +808,7 @@ class FusedMoE(torch.nn.Module):
         is_scale = "weight_scale_inv" in weight_name and loaded_weight.dtype in (
             torch.float8_e8m0fnu,
             torch.float32,
+            torch.uint8,
         )
         if not is_weight and not is_scale:
             return False
@@ -810,18 +821,67 @@ class FusedMoE(torch.nn.Module):
             return False
 
         key = (expert_id, shard_id)
-        if is_weight:
-            fp8_weight = loaded_weight
-            fp8_scale = self._pending_fp8_shared_scales.pop(key, None)
-            if fp8_scale is None:
-                self._pending_fp8_shared_weights[key] = loaded_weight
-                return True
-        else:
-            fp8_weight = self._pending_fp8_shared_weights.pop(key, None)
-            fp8_scale = loaded_weight
-            if fp8_weight is None:
-                self._pending_fp8_shared_scales[key] = loaded_weight
-                return True
+        with self._fhmoe_load_lock:
+            if is_weight:
+                fp8_weight = loaded_weight
+                fp8_scale = self._pending_fp8_shared_scales.pop(key, None)
+                if fp8_scale is None:
+                    self._pending_fp8_shared_weights[key] = loaded_weight
+                    return True
+            else:
+                fp8_weight = self._pending_fp8_shared_weights.pop(key, None)
+                fp8_scale = loaded_weight
+                if fp8_weight is None:
+                    self._pending_fp8_shared_scales[key] = loaded_weight
+                    return True
+
+        if self.use_aiter_fhmoe:
+            if expert_id != self._num_local_routed:
+                raise ValueError(
+                    "AITER FHMoE expects exactly one shared expert after all "
+                    "local routed experts."
+                )
+
+            def _tp_shard(tensor: torch.Tensor) -> torch.Tensor:
+                if self.moe_tp_size == 1 or self.use_presharded_weights:
+                    return tensor.contiguous().clone()
+                if tensor.shape[shard_dim] % self.moe_tp_size:
+                    raise ValueError(
+                        "Native FP8 shared-expert tensor cannot be evenly TP-sharded."
+                    )
+                shard_size = tensor.shape[shard_dim] // self.moe_tp_size
+                return (
+                    tensor.narrow(shard_dim, tp_rank * shard_size, shard_size)
+                    .contiguous()
+                    .clone()
+                )
+
+            with self._fhmoe_load_lock:
+                # Keep only this rank's shard. Retaining all full checkpoint
+                # tensors would consume tens of GiB for DeepSeek-V4-Pro.
+                self._fhmoe_native_weights[shard_id] = _tp_shard(fp8_weight)
+                self._fhmoe_native_scales[shard_id] = _tp_shard(fp8_scale)
+                self._fhmoe_native_is_tp_sharded = True
+
+                # Startup post-processing prepares these buffers once all
+                # weights are loaded. In-place checkpoint reloads do not rerun
+                # quantization post-processing, so refresh derived FHMoE
+                # tensors immediately after each complete projection pair.
+                if (
+                    self.fhmoe_shared_w1 is not None
+                    and {"w1", "w2", "w3"} <= self._fhmoe_native_weights.keys()
+                    and {"w1", "w2", "w3"} <= self._fhmoe_native_scales.keys()
+                ):
+                    from sglang.srt.layers.quantization.fp8 import (
+                        _prepare_aiter_fhmoe_shared_expert,
+                    )
+
+                    _prepare_aiter_fhmoe_shared_expert(
+                        self,
+                        self.w13_weight.shape[1] // 2,
+                        envs.SGLANG_USE_AITER_MOE_GU_ITLV.get(),
+                    )
+            return True
 
         logging.getLogger(__name__).warning_once(
             "Loading FP8 shared expert weights into FP4 fused MoE weights. "
