@@ -563,8 +563,27 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-context-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
 .sgd-builder-context-note { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--sgdb-line); }
 .sgd-builder-context-note p { margin: 0; color: var(--sgdb-muted); font-size: 11px; line-height: 1.5; }
-.sgd-builder-context-note a { display: inline-block; margin-top: 6px; color: var(--sgdb-serve); font-size: 11px; font-weight: 500; text-decoration: none; }
+.sgd-builder-context-note a {
+  display: inline-flex;
+  margin-top: 8px;
+  min-height: 24px;
+  align-items: center;
+  gap: 5px;
+  color: var(--sgdb-serve);
+  font-size: 11px;
+  font-weight: 500;
+  text-decoration: none;
+  transition: color var(--sgdb-ease-dur) var(--sgdb-ease);
+}
 .sgd-builder-context-note a + a { margin-left: 16px; }
+.sgd-builder-context-note a svg { flex: none; transition: transform var(--sgdb-ease-dur) var(--sgdb-ease); }
+/* Hover answers: the label underlines and the glyph leans in. */
+.sgd-builder-context-note a:hover {
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+.sgd-builder-context-note a:hover svg { transform: translateX(1px) scale(1.08); }
 .sgd-builder-scope-panel[data-scope="request"] .sgd-builder-context-note a { color: var(--sgdb-request); }
 .sgd-builder-request-stepper { display: grid; grid-template-columns: 40px 52px 40px auto; gap: 6px; align-items: center; margin-top: 14px; }
 .sgd-builder-request-stepper input {

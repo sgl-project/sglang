@@ -1980,8 +1980,20 @@ export const Deployment = ({ config, benchmarks }) => {
           {(currentOption?.description || dim.learnMore) && (
             <div className="sgd-builder-context-note">
               {currentOption?.description && <p>{currentOption.description}</p>}
-              {dim.learnMore && <a href={dim.learnMore}>Learn more →</a>}
-              {dim.docsHref && <a href={dim.docsHref}>SGLang docs →</a>}
+              {/* Icons name the destination: section lines = an anchor on
+                  this page, book = the runtime documentation. */}
+              {dim.learnMore && (
+                <a href={dim.learnMore}>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true"><line x1="4" y1="6" x2="20" y2="6" /><line x1="4" y1="12" x2="16" y2="12" /><line x1="4" y1="18" x2="11" y2="18" /></svg>
+                  Learn more
+                </a>
+              )}
+              {dim.docsHref && (
+                <a href={dim.docsHref}>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" /></svg>
+                  SGLang docs
+                </a>
+              )}
             </div>
           )}
         </section>
