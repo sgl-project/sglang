@@ -34,7 +34,17 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import fastapi
 import numpy as np
@@ -132,6 +142,7 @@ from sglang.srt.utils import (
     freeze_gc,
     get_bool_env_var,
     get_or_create_event_loop,
+    graceful_kill_process_tree,
     kill_process_tree,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
@@ -157,6 +168,25 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+
+def shutdown_scheduler_and_child_processes(
+    dispatch_shutdown: Callable[[], None],
+) -> None:
+    try:
+        dispatch_shutdown()
+    except Exception:
+        logger.exception("Failed to dispatch scheduler shutdown request")
+    else:
+        deadline = time.monotonic() + envs.SGLANG_SCHEDULER_SHUTDOWN_TIMEOUT.get()
+        while time.monotonic() < deadline and collect_scheduler_processes():
+            time.sleep(0.1)
+
+    graceful_kill_process_tree(
+        os.getpid(),
+        include_parent=False,
+        timeout=envs.SGLANG_CHILD_PROCESS_SHUTDOWN_TIMEOUT.get(),
+    )
 
 
 def _reject_missing_dispatched_encoder_embedding(server_args, request_obj, mm_inputs):
@@ -3131,7 +3161,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 self.dump_requests_before_crash()
                 self.force_exit_handler()
-                break
+                kill_process_tree(os.getpid(), include_parent=True)
+                sys.exit(0)
 
             elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
                 # if force shutdown flag set, exit immediately
@@ -3139,7 +3170,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Signal SIGTERM received while force shutdown flag set. Force exiting."
                 )
                 self.force_exit_handler()
-                break
+                kill_process_tree(os.getpid(), include_parent=True)
+                sys.exit(0)
 
             logger.info(
                 f"Gracefully exiting... Remaining number of requests {remain_num_req}. Remaining requests {remaining_rids=}."
@@ -3149,17 +3181,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 break
 
-        # Stop the watchdog: child exits are expected during shutdown, not crashes.
+        # Child exits are expected after this point.
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
-        # Ask schedulers to release resources in userspace and exit (see
-        # ShutdownReq), then wait for them before hard-killing the rest.
-        self._dispatch_to_scheduler(ShutdownReq())
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and collect_scheduler_processes():
-            time.sleep(0.1)
-        kill_process_tree(os.getpid(), include_parent=True)
-        sys.exit(0)
+        if self.server_args.tokenizer_worker_num == 1:
+            # Do not disable the soft watchdog here: handle_loop already holds
+            # that context while parked on recv, and disable() is not reentrant.
+            shutdown_scheduler_and_child_processes(
+                lambda: self._dispatch_to_scheduler(ShutdownReq())
+            )
+
+        # SystemExit is absorbed by the task wrapper.
+        os._exit(0)
 
     def force_exit_handler(self):
         """Put some custom force exit logic here."""

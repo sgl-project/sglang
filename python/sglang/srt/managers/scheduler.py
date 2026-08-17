@@ -313,7 +313,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import install_graceful_sigterm_handler, is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -5021,6 +5021,18 @@ def run_scheduler_process(
     # worker's own publish.
     publish(server_args, role="scheduler")
     parent_process = psutil.Process().parent()
+    scheduler = None
+
+    install_graceful_sigterm_handler(
+        logger,
+        f"scheduler process (TP{tp_rank} PP{pp_rank})",
+        on_shutdown=lambda: (
+            setattr(scheduler, "gracefully_exit", True)
+            if scheduler is not None
+            else None
+        ),
+        is_shutting_down=lambda: (scheduler is not None and scheduler.gracefully_exit),
+    )
 
     # Set up tracing
     if server_args.enable_trace:
@@ -5037,7 +5049,6 @@ def run_scheduler_process(
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
 
     # Create a scheduler and run the event loop
-    scheduler = None
     try:
         scheduler = Scheduler(
             server_args,
