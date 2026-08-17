@@ -867,9 +867,12 @@ class UnifiedMambaPool(MambaPool):
     # Inherited MambaPool state ops (copy_from/clear_slots/get_cpu_copy/load_cpu_copy)
     # take PHYSICAL slot ids; callers translate via the slot allocator first.
 
-    def _copy_from_physical(self, src_index: torch.Tensor, dst_index: torch.Tensor):
-        # Physical-slot copy used by the allocator's `_compact_pending`.
-        MambaPool.copy_from(self, src_index, dst_index)
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # The cross-pool physical-move contract (same signature every pool the
+        # MultiEndedAllocator wraps implements): compaction moves state
+        # envelopes with it. Ids are PHYSICAL slots; MambaPool.copy_from takes
+        # (src, dst), hence the swap.
+        MambaPool.copy_from(self, src_loc, tgt_loc)
 
     # -- PD state transfer (StateType.MAMBA) --
     # The transfer item is the whole per-slot envelope, addressed as

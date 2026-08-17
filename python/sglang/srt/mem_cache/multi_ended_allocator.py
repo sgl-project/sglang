@@ -1392,16 +1392,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
             # Un-translated copy: the public copy_from translates virtual ids,
             # which we must NOT do here.
-            move_fn = getattr(self._kvcache, "move_kv_cache", None)
-            if move_fn is not None:
-                move_fn(dst_t, src_t)
-            else:
-                copy_phys = getattr(self._kvcache, "_copy_from_physical", None)
-                assert copy_phys is not None, (
-                    f"sub-pool {self.sub_pool_name!r} supports neither move_kv_cache "
-                    "nor _copy_from_physical"
-                )
-                copy_phys(src_t, dst_t)
+            self._kvcache.move_kv_cache(dst_t, src_t)
             # Clear the vacated band, then re-bind the relocated dst pages.
             self.physical_to_virtual[vacated_lo:vacated_hi] = -1
             self.virtual_to_physical[v_moved] = dst_pages
@@ -1910,16 +1901,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 )
                 src_t = (src_pages_t[:, None] * self.page_size + offsets).reshape(-1)
                 dst_t = (dst_pages_t[:, None] * self.page_size + offsets).reshape(-1)
-            move_fn = getattr(self._kvcache, "move_kv_cache", None)
-            if move_fn is not None:
-                move_fn(dst_t, src_t)
-            else:
-                copy_phys = getattr(self._kvcache, "_copy_from_physical", None)
-                assert copy_phys is not None, (
-                    f"sub-pool {self.sub_pool_name!r} supports neither "
-                    "move_kv_cache nor _copy_from_physical"
-                )
-                copy_phys(src_t, dst_t)
+            self._kvcache.move_kv_cache(dst_t, src_t)
             # ONE bulk remap (single-writer on schedule_stream).
             self.virtual_to_physical[v_moveds_t] = dst_pages_t
             self.physical_to_virtual[dst_pages_t] = v_moveds_t

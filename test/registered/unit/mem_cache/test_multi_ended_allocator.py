@@ -1727,8 +1727,8 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         full_kv.attach_allocator = lambda allocator: None
         mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
         mamba_kv.attach_allocator = lambda allocator: None
-        # _copy_from_physical for the mamba sub-pool (kept un-translated).
-        mamba_kv._copy_from_physical = lambda src, dst: None
+        # The physical-move contract for the mamba sub-pool (un-translated);
+        # _FakeKVCache already provides move_kv_cache, so nothing extra.
 
         class _FakeHybridLinearKVPool:
             full_kv_pool = full_kv
