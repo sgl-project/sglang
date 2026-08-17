@@ -3934,6 +3934,22 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         super().set_inflight_forward(forward_done, out_cache_loc_virtual)
         self.mamba_allocator.set_inflight_forward(forward_done, None)
 
+    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
+        """Joint-aware eviction: evicting one tri-lifetime tree node frees
+        bytes on several sides at once, and the default single pass's per-side
+        shortfall math can leave the JOINT gate short. Bounded re-check loop:
+        evict until the joint availability covers the ask or a pass stops
+        making progress (then the capacity gate reports the shortfall)."""
+        from sglang.srt.mem_cache.common import evict_from_tree_cache
+
+        for _ in range(4):
+            before = self.available_size()
+            if before >= num_tokens:
+                return
+            evict_from_tree_cache(tree_cache, num_tokens)
+            if self.available_size() <= before:
+                return  # no progress
+
     def verify_byte_accounting(self) -> List[str]:
         return (
             _chain_byte_accounting_violations(

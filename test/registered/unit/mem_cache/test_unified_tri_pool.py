@@ -1057,6 +1057,28 @@ class TestTriPoolHardening(unittest.TestCase):
         self.assertLessEqual(moved, live_before)
         self.assertEqual(allocator.verify_byte_accounting(), [])
 
+    def test_check_decode_capacity_retract_convergence(self):
+        # Simulated retract loop: requests' token blocks freed one at a time
+        # until the next-step allocation fits; must converge before bs=1 and
+        # never report capacity while the gate is short.
+        _, allocator, _, _ = self._build(n_full=32, n_swa=24, n_state=8)
+        reqs = []
+        while True:
+            v = allocator.alloc(4)
+            if v is None or allocator.available_size() < 4:
+                if v is not None:
+                    reqs.append(v)
+                break
+            reqs.append(v)
+        self.assertGreater(len(reqs), 2)
+        # Pool saturated: a large decode step does not fit.
+        need = 16
+        while not allocator.check_decode_capacity(num_tokens=need, tree_cache=None):
+            self.assertGreater(len(reqs), 1, "retract must converge before bs=1")
+            allocator.free(reqs.pop())
+        self.assertGreaterEqual(allocator.available_size(), need)
+        self.assertEqual(allocator.verify_byte_accounting(), [])
+
     def test_alternating_pressure_copy_traffic_bounded(self):
         # Alternating full-grow / swa-churn cycles: total float moves stay
         # bounded (hole recycling + absorption do the steady-state work; the
@@ -1082,6 +1104,15 @@ class TestTriPoolHardening(unittest.TestCase):
             "steady-state churn must be predominantly zero-copy",
         )
         self.assertEqual(allocator.verify_byte_accounting(), [])
+
+    def test_joint_eviction_loop_stops_without_progress(self):
+        # tree_cache=None: the default helper no-ops; the bounded loop must
+        # return promptly (no infinite re-check) and the gate reports honestly.
+        _, allocator, _, _ = self._build()
+        big = allocator.available_size() + 64
+        self.assertFalse(
+            allocator.check_decode_capacity(num_tokens=big, tree_cache=None)
+        )
 
 
 if __name__ == "__main__":
