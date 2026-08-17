@@ -1,13 +1,16 @@
-"""Unit tests for fused append + per-rank shared-slot remap.
+"""Unit tests for the two ways shared experts reach the top-k tensors on GPU.
 
 Covers ``fused_append_remap_shared_experts_deepep``, which collapses
 ``fused_append_shared_experts()`` followed by
 ``remap_topk_for_per_rank_shared_slots()`` into a
-single Triton launch on the per-rank shared-slot path. The kernel is GPU-only
-(Triton), so these tests are skipped when no accelerator is present.
+single Triton launch on the per-rank shared-slot path, and the aiter
+grouped-topk fast path, which pre-populates the shared columns of a persistent
+buffer instead of appending them per layer. Both are GPU-only, so these tests
+are skipped when no accelerator is present.
 """
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -15,9 +18,11 @@ from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     fused_append_remap_shared_experts_deepep,
     fused_append_shared_experts,
 )
+from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.topk import (
     TopKConfig,
     _use_aiter,
+    biased_grouped_topk_gpu,
     remap_topk_for_per_rank_shared_slots,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -181,6 +186,141 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
         )
         self.assertTrue(torch.equal(got_ids, topk_ids))
         self.assertTrue(torch.equal(got_w, topk_weights))
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and _use_aiter,
+    "the persistent shared-column buffer only exists on the aiter grouped-topk path",
+)
+class TestAiterGroupedTopkSharedFuse(CustomTestCase):
+    """The pre-populated buffer must return what the plain append would have.
+
+    ``biased_grouped_topk_gpu`` fills the shared columns of a persistent buffer
+    once and lets aiter write only the routed columns, so no per-layer append
+    kernel runs. When a batch is larger than the buffer it returns the routed
+    columns alone and ``select_experts`` appends the shared experts itself. The
+    two spellings are supposed to be bit-identical; that is what is asserted
+    here, since a divergence would silently change routing weights.
+    """
+
+    # (num_tokens, num_experts, num_expert_group, topk_group, topk_routed,
+    #  n_shared, routed_scaling_factor) on the DeepSeek-V3 / GLM-5 routing shape:
+    # a decode step, a ragged prefill chunk, and two larger chunks. aiter folds
+    # the routed scaling into the routed weights, so each size carries a
+    # different one -- unset, unscaled, and the two values models configure.
+    CASES = [
+        (1, 256, 8, 4, 8, 1, 2.5),
+        (37, 256, 8, 4, 8, 1, None),
+        (128, 256, 8, 4, 8, 1, 1.0),
+        (512, 256, 8, 4, 8, 1, 1.5),
+    ]
+
+    def setUp(self):
+        super().setUp()
+        # The buffer and the token budget are module-level caches; a stale entry
+        # from another test would decide this one's path.
+        topk_module._aiter_topk_fuse_shared_bufs.clear()
+        topk_module._aiter_topk_fuse_shared_max_tokens_cache = None
+
+    def _make_inputs(self, num_tokens, num_experts):
+        device = get_device()
+        g = torch.Generator(device="cpu").manual_seed(num_tokens * 31 + num_experts)
+        hidden_states = torch.randn(
+            (num_tokens, 16), generator=g, dtype=torch.bfloat16
+        ).to(device)
+        gating_output = torch.randn(
+            (num_tokens, num_experts), generator=g, dtype=torch.bfloat16
+        ).to(device)
+        correction_bias = torch.randn(
+            (num_experts,), generator=g, dtype=torch.float32
+        ).to(device)
+        return hidden_states, gating_output, correction_bias
+
+    def _topk(
+        self, inputs, num_expert_group, topk_group, topk_routed, n_shared, rsf, factor
+    ):
+        hidden_states, gating_output, correction_bias = inputs
+        return biased_grouped_topk_gpu(
+            hidden_states,
+            gating_output,
+            correction_bias,
+            topk_routed,
+            renormalize=True,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            num_fused_shared_experts=n_shared,
+            routed_scaling_factor=rsf,
+            apply_routed_scaling_factor_on_output=False,
+            fused_shared_experts_scaling_factor=factor,
+        )
+
+    def test_prepopulated_buffer_matches_plain_append(self):
+        # None and 1 are the two spellings models use for an unscaled shared
+        # expert; both must land on the same weight.
+        for factor in (None, 1):
+            for case in self.CASES:
+                num_tokens, num_experts, groups, topk_group, topk_routed, s, rsf = case
+                with self.subTest(num_tokens=num_tokens, rsf=rsf, factor=factor):
+                    inputs = self._make_inputs(num_tokens, num_experts)
+
+                    with get_parallel().override(moe_ep_size=1):
+                        fused_w, fused_ids = self._topk(
+                            inputs, groups, topk_group, topk_routed, s, rsf, factor
+                        )
+                        # The return aliases the persistent buffer, which the
+                        # next case overwrites.
+                        fused_w, fused_ids = fused_w.clone(), fused_ids.clone()
+
+                        # A zero budget puts every batch over the buffer, which
+                        # is exactly the fallback select_experts appends to.
+                        with patch.object(
+                            topk_module,
+                            "_get_aiter_topk_fuse_shared_max_tokens",
+                            return_value=0,
+                        ):
+                            plain_w, plain_ids = self._topk(
+                                inputs, groups, topk_group, topk_routed, s, rsf, factor
+                            )
+
+                    self.assertEqual(tuple(plain_ids.shape), (num_tokens, topk_routed))
+                    plain_ids, plain_w = fused_append_shared_experts(
+                        plain_ids,
+                        plain_w,
+                        s,
+                        1.0 if factor is None else factor,
+                        num_experts,  # shared-expert base id
+                    )
+
+                    self.assertEqual(
+                        tuple(fused_ids.shape), (num_tokens, topk_routed + s)
+                    )
+                    self.assertTrue(torch.equal(fused_ids, plain_ids))
+                    self.assertTrue(torch.equal(fused_w, plain_w))
+
+    def test_expert_parallelism_takes_the_plain_path(self):
+        """Shared columns are only local to a rank when EP is off, so ep_size > 1
+        must not fuse -- select_experts mirrors this check to decide whether to
+        append."""
+        num_tokens, num_experts, groups, topk_group, topk_routed, s, rsf = self.CASES[1]
+        inputs = self._make_inputs(num_tokens, num_experts)
+        with get_parallel().override(moe_ep_size=2):
+            _, topk_ids = self._topk(inputs, groups, topk_group, topk_routed, s, rsf, 1)
+        self.assertEqual(tuple(topk_ids.shape), (num_tokens, topk_routed))
+
+    def test_uninitialized_expert_parallel_group_falls_back(self):
+        """Reaching this path before the MoE EP group exists must drop to the
+        plain append rather than raise out of the parallel-state accessor."""
+        num_tokens, num_experts, groups, topk_group, topk_routed, s, rsf = self.CASES[0]
+        inputs = self._make_inputs(num_tokens, num_experts)
+        with patch.object(
+            topk_module,
+            "get_parallel",
+            side_effect=AssertionError(
+                "expert model parallel group is not initialized"
+            ),
+        ):
+            _, topk_ids = self._topk(inputs, groups, topk_group, topk_routed, s, rsf, 1)
+        self.assertEqual(tuple(topk_ids.shape), (num_tokens, topk_routed))
 
 
 if __name__ == "__main__":
