@@ -75,6 +75,7 @@ from sglang.srt.runtime_context import (
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
     max_speculative_num_draft_tokens,
+    pre_capture_activation_reserve_mb,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -1782,7 +1783,7 @@ class KVCacheConfigurator:
             # Mamba state is a fixed pre-capture allocation, so it can't ride the ~0 post-capture slack.
             slack_gb = max(
                 slack_gb,
-                self.server_args.pre_capture_activation_reserve_mb(
+                pre_capture_activation_reserve_mb(
                     get_device_memory_capacity(self.device)
                 )
                 / 1024,
