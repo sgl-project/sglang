@@ -1171,14 +1171,14 @@ class ServerArgs:
         "Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
         NS("parallel"),
     ] = False
-    shared_experts_attn_tp: A[
+    enable_shared_experts_attn_tp: A[
         bool,
-        "Keep shared experts sharded over attention TP when using an expert-parallel all-to-all backend.",
+        "Shard shared expert weights across the attention TP group when using an expert-parallel all-to-all backend.",
         NS("parallel"),
     ] = False
-    dense_mlp_attn_tp: A[
+    enable_dense_mlp_attn_tp: A[
         bool,
-        "Keep dense MLPs sharded over attention TP under DP attention.",
+        "Shard dense MLP weights across the attention TP group under DP attention.",
         NS("parallel"),
     ] = False
     disable_attn_tp_gather: A[
