@@ -3134,6 +3134,23 @@ def kill_itself_when_parent_died():
         )
 
 
+def ignore_external_stop_signals():
+    """Make a worker subprocess ignore SIGINT and SIGTERM.
+
+    Server shutdown is coordinated by the tokenizer manager: on a stop signal it
+    drains in-flight requests, then explicitly stops the workers (ShutdownReq,
+    then SIGKILL via kill_process_tree). Orchestrators commonly deliver stop
+    signals to the whole process group (Modal, Kubernetes, Ctrl-C in a
+    terminal), which would otherwise kill workers mid-forward at signal time and
+    sever every in-flight request before the drain can run. SIGKILL and SIGQUIT
+    are unaffected, so hard kills and crash cleanup still work.
+    """
+    if sys.platform == "win32":
+        return
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
 class UvicornAccessLogFilter(logging.Filter):
     """Filter uvicorn access logs by request path.
 

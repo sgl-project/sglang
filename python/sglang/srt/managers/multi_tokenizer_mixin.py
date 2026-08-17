@@ -64,6 +64,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
+    ignore_external_stop_signals,
     kill_itself_when_parent_died,
     kill_process_tree,
 )
@@ -627,6 +628,7 @@ def run_multi_detokenizer_router_process(
     server_args: ServerArgs,
     port_args: PortArgs,
 ):
+    ignore_external_stop_signals()
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer_router")
     configure_logger(server_args)

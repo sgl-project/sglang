@@ -307,6 +307,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_int_env_var,
+    ignore_external_stop_signals,
     is_cuda,
     is_hip,
     is_mps,
@@ -5014,6 +5015,10 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
+    # Shutdown is coordinated by the tokenizer manager (drain, then ShutdownReq /
+    # SIGKILL); group-delivered SIGINT/SIGTERM must not kill this rank mid-forward.
+    ignore_external_stop_signals()
+
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     dp_rank = configure_scheduler_process(
