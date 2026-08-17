@@ -222,5 +222,78 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         self.assertGreater(fa._chain_capacity_epoch(), e0)
 
 
+class TestTriCapacityMemoCoherence(unittest.TestCase):
+    """Tri-composite twins of the 2-pool cases: the joint view walks THREE
+    bands (mamba end, swa float, full end), so a mutation on ANY of them must
+    invalidate the composite memo — including the two mutations only the tri
+    has: a mamba-end state draw and a float span move behind the composite."""
+
+    def _build_tri(self, lazy=False):
+        from test_unified_tri_pool import TestUnifiedTriPool
+
+        inst = TestUnifiedTriPool(
+            [m for m in dir(TestUnifiedTriPool) if m.startswith("test_")][0]
+        )
+        pool, allocator, kvcache, mamba_kv = inst._build(lazy_compaction=lazy)
+        return inst, allocator
+
+    def _assert_memos_fresh(self, allocator):
+        self.assertEqual(
+            allocator.available_size(), allocator._compute_available_size()
+        )
+        for band in (
+            allocator.full_attn_allocator,
+            allocator.swa_attn_allocator,
+            allocator.mamba_allocator,
+        ):
+            self.assertEqual(
+                band.available_size(),
+                band._available_tokens(),
+                msg=f"stale available_size memo on {band.sub_pool_name!r}",
+            )
+        self.assertEqual(allocator.verify_byte_accounting(), [])
+
+    def test_memos_track_tri_mutation_kinds(self):
+        for lazy in (False, True):
+            with self.subTest(lazy_compaction=lazy):
+                inst, allocator = self._build_tri(lazy)
+                ma = allocator.mamba_allocator
+                self._assert_memos_fresh(allocator)
+
+                v1 = allocator.alloc(8)  # composite alloc (full + swa bind)
+                self.assertIsNotNone(v1)
+                self._assert_memos_fresh(allocator)
+
+                s1 = ma.alloc(2)  # mamba end alloc
+                self.assertIsNotNone(s1)
+                self._assert_memos_fresh(allocator)
+
+                allocator.free_swa(v1[2:6])  # interior float holes
+                self._assert_memos_fresh(allocator)
+
+                allocator.free(v1)  # both-side free
+                self._assert_memos_fresh(allocator)
+
+                ma.free(s1)  # mamba free
+                self._assert_memos_fresh(allocator)
+
+                allocator.clear()
+                ma.clear()
+                self._assert_memos_fresh(allocator)
+
+    def test_joint_memo_invalidates_on_mamba_only_mutation(self):
+        """The joint view depends on the mamba end's frontier through the
+        chain walk; a mamba-only mutation must invalidate the composite memo
+        even though neither KV side moved."""
+        inst, allocator = self._build_tri()
+        ma = allocator.mamba_allocator
+        before = allocator.available_size()
+        slots = ma.alloc(4)
+        self.assertIsNotNone(slots)
+        after = allocator.available_size()
+        self.assertEqual(after, allocator._compute_available_size())
+        self.assertLessEqual(after, before)
+
+
 if __name__ == "__main__":
     unittest.main()
