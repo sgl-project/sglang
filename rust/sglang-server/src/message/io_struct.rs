@@ -41,9 +41,8 @@ wire_struct! {
         lora_id: (),
         custom_logit_processor: (),
         positional_embed_overrides: (),
-        /// PD-disaggregation block — the last fields emitted; everything after
-        /// `disagg_prefill_dp_rank` in Python has a msgspec default and is
-        /// omitted (short arrays decode with defaulted tails).
+        /// PD-disaggregation block. The selector below requires emitting the
+        /// intervening defaulted fields as positional fillers.
         bootstrap_host: Option<&'a str>,
         bootstrap_port: Option<i64>,
         bootstrap_room: Option<i64>,
@@ -51,6 +50,23 @@ wire_struct! {
         decode_tp_size: Option<i64>,
         routed_dp_rank: Option<i64>,
         disagg_prefill_dp_rank: Option<i64>,
+        /// Tail fields through Python's `ngram_corpus_id`. These fillers are
+        /// required because msgspec's array-like wire format is positional.
+        routing_key: (),
+        require_reasoning: bool,
+        priority: (),
+        extra_key: (),
+        no_logs: bool,
+        return_bytes: bool,
+        return_entropy: bool,
+        need_wait_for_mm_inputs: (),
+        num_items_assigned: (),
+        mm_data_mooncake: (),
+        encoder_urls: (),
+        multi_item_delimiter_indices: (),
+        time_stats: (),
+        cache_salt: (),
+        ngram_corpus_id: Option<&'a str>,
     }
 }
 
@@ -69,6 +85,20 @@ control_messages! {
 
     /// `/server_info`'s control request: a bare `BaseReq` with no extra fields.
     GetInternalStateReq {}
+
+    /// Load already-tokenized external NGRAM corpus chunks.
+    AddExternalCorpusReqInput {
+        corpus_id: Option<String>,
+        file_path: (),
+        documents: (),
+        token_chunks: Vec<Vec<i32>>,
+    }
+
+    RemoveExternalCorpusReqInput {
+        corpus_id: String,
+    }
+
+    ListExternalCorporaReqInput {}
 }
 
 /// Borrow a request as its wire struct, resolving `Option` scalars to the wire
@@ -112,11 +142,50 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             decode_tp_size: req.decode_tp_size,
             routed_dp_rank: req.routed_dp_rank,
             disagg_prefill_dp_rank: req.disagg_prefill_dp_rank,
+            routing_key: (),
+            require_reasoning: false,
+            priority: (),
+            extra_key: (),
+            no_logs: false,
+            return_bytes: false,
+            return_entropy: false,
+            need_wait_for_mm_inputs: (),
+            num_items_assigned: (),
+            mm_data_mooncake: (),
+            encoder_urls: (),
+            multi_item_delimiter_indices: (),
+            time_stats: (),
+            cache_salt: (),
+            ngram_corpus_id: req.ngram_corpus_id.as_deref(),
         }
     }
 }
 
 impl GetInternalStateReq {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
+    }
+}
+
+impl AddExternalCorpusReqInput {
+    pub fn new(rid: String, corpus_id: String, token_chunks: Vec<Vec<i32>>) -> Self {
+        Self {
+            rid,
+            corpus_id: Some(corpus_id),
+            file_path: (),
+            documents: (),
+            token_chunks,
+        }
+    }
+}
+
+impl RemoveExternalCorpusReqInput {
+    pub fn new(rid: String, corpus_id: String) -> Self {
+        Self { rid, corpus_id }
+    }
+}
+
+impl ListExternalCorporaReqInput {
     pub fn new(rid: String) -> Self {
         Self { rid }
     }
@@ -155,6 +224,45 @@ mod tests {
         assert!(arr[5].is_nil());
     }
 
+    #[test]
+    fn external_corpus_control_messages_match_python_layout() {
+        let add = AddExternalCorpusReqInput::new(
+            "load-rid".into(),
+            "docs".into(),
+            vec![vec![1, 2], vec![i32::MIN, 3]],
+        )
+        .encode()
+        .unwrap();
+        let value = rmpv::decode::read_value(&mut &add[..]).unwrap();
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 7);
+        assert_eq!(arr[0].as_str(), Some("AddExternalCorpusReqInput"));
+        assert_eq!(arr[3].as_str(), Some("docs"));
+        assert!(arr[4].is_nil(), "file_path");
+        assert!(arr[5].is_nil(), "documents");
+        assert!(arr[6].is_array(), "token_chunks");
+
+        let remove = RemoveExternalCorpusReqInput::new(
+            "remove-rid".into(),
+            "docs".into(),
+        )
+        .encode()
+        .unwrap();
+        let value = rmpv::decode::read_value(&mut &remove[..]).unwrap();
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 4);
+        assert_eq!(arr[0].as_str(), Some("RemoveExternalCorpusReqInput"));
+        assert_eq!(arr[3].as_str(), Some("docs"));
+
+        let list = ListExternalCorporaReqInput::new("list-rid".into())
+            .encode()
+            .unwrap();
+        let value = rmpv::decode::read_value(&mut &list[..]).unwrap();
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0].as_str(), Some("ListExternalCorporaReqInput"));
+    }
+
     /// The header must be positionally aligned: `input_embeds` (idx 5) /
     /// `token_type_ids` (idx 7) present as nil so `sampling_params` lands at idx 8 and
     /// the array reaches msgspec's min length. Regression guard for that decode failure.
@@ -172,15 +280,16 @@ mod tests {
             logprob_start_len: -1,
             top_logprobs_num: 3,
             return_hidden_states: true,
+            ngram_corpus_id: Some("docs".into()),
             stream: true,
             ..Default::default()
         };
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // msgspec requires >= 14 (through `stream`); we emit 32 (through
-        // `disagg_prefill_dp_rank`). Trailing defaulted fields are omitted.
-        assert_eq!(arr.len(), 32, "header ends at disagg_prefill_dp_rank");
+        // msgspec requires >= 14 (through `stream`); the selector is appended
+        // after every pre-existing field, at the true positional tail.
+        assert_eq!(arr.len(), 47, "header ends at ngram_corpus_id");
         assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
@@ -208,6 +317,13 @@ mod tests {
             Some(true),
             "return_hidden_states at idx 16"
         );
+        assert_eq!(arr[36].as_bool(), Some(false), "no_logs at idx 36");
+        assert_eq!(arr[37].as_bool(), Some(false), "return_bytes at idx 37");
+        assert_eq!(arr[38].as_bool(), Some(false), "return_entropy at idx 38");
+        for (i, slot) in arr.iter().enumerate().take(46).skip(39) {
+            assert!(slot.is_nil(), "idx {i} must be a nil default");
+        }
+        assert_eq!(arr[46].as_str(), Some("docs"), "ngram_corpus_id at idx 46");
     }
 
     /// The PD block must land on Python's wire indices 25–31, with the filler

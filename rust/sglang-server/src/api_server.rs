@@ -55,15 +55,17 @@ pub async fn serve(
     };
     // Each endpoint module registers its own routes and merges here.
     let router = Router::new()
-        .merge(common::routes())
+        .merge(common::routes(&server_args))
         .merge(native_api::routes())
         .merge(openai::routes());
 
-    // TODO(auth): no API-key boundary yet. Python gates every route (except
-    // /health*, /metrics*, OPTIONS) via `add_api_key_middleware`; until ported,
-    // a configured `api_key` does NOT protect these routes.
+    // TODO(auth): the general Python API-key boundary has not been ported yet.
+    // The external-corpus management routes enforce their ADMIN_OPTIONAL key
+    // policy locally because they mutate server state; other routes remain as
+    // documented by the existing Rust-server limitation.
     //
-    // No body limit, matching the Python server.
+    // No global body limit, matching the Python server. Routes that deserialize
+    // unusually large nested inputs install their own tighter limit.
     let mut app = router
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(state);

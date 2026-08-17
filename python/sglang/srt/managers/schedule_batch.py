@@ -840,6 +840,7 @@ class Req(ReqDllmMixin):
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
+        ngram_corpus_id: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
         time_stats: Optional[
@@ -929,6 +930,7 @@ class Req(ReqDllmMixin):
         self.cache_salt = cache_salt or None
         self.lora_id = lora_id
         self.routing_key = routing_key
+        self.ngram_corpus_id = ngram_corpus_id
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None

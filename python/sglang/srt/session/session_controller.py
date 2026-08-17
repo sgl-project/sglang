@@ -313,6 +313,7 @@ class Session:
             routing_key=req.routing_key,
             extra_key=req.extra_key,
             cache_salt=req.cache_salt,
+            ngram_corpus_id=req.ngram_corpus_id,
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
         )

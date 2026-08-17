@@ -2,13 +2,16 @@
 
 import logging
 from collections.abc import Iterable, Sequence
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 from sglang.kernels.ops.speculative.ngram_corpus import get_ngram_corpus_cls
 
 logger = logging.getLogger(__name__)
+
+_ALL_CORPORA_HANDLE = -1
+_NO_CORPUS_HANDLE = 0
 
 
 class NgramCorpus:
@@ -38,8 +41,13 @@ class NgramCorpus:
         self.external_corpus_max_tokens = external_corpus_max_tokens
         self._req_id_to_state_id: Dict[str, int] = {}
         self._next_state_id: int = 0
-        self._corpus_token_counts: Dict[str, int] = {}
+        # Published id -> (request-facing handle, token count).
+        self._corpora: Dict[str, Tuple[int, int]] = {}
+        self._next_corpus_handle: int = 1
         self._total_loaded_tokens: int = 0
+        self._staging_corpus_id: Optional[str] = None
+        self._staging_corpus_handle: Optional[int] = None
+        self._staging_token_count: int = 0
 
     def _get_state_id(self, req_id: str) -> int:
         sid = self._req_id_to_state_id.get(req_id)
@@ -62,32 +70,89 @@ class NgramCorpus:
     def load_external_corpus_named(
         self, corpus_id: str, chunks: Iterable[Sequence[int]]
     ) -> int:
-        if corpus_id in self._corpus_token_counts:
+        if not corpus_id:
+            raise ValueError("External corpus id must be non-empty.")
+        if any(delimiter in corpus_id for delimiter in "\t\n\r"):
+            raise ValueError(
+                "External corpus id must not contain tabs or line breaks."
+            )
+        if corpus_id in self._corpora:
             raise ValueError(
                 f"External corpus '{corpus_id}' already exists. Remove it before "
                 f"adding a new corpus with the same id."
             )
-        # Note(kpham-sgl): remaining_token_budget is stale (e.g if there are removes
-        # during the load), which makes the budget more conservative than it should be.
-        # This is acceptable because otherwise load_external_corpus_named would need to check the budget after each chunk,
-        # which would be inefficient.
+        if self._staging_corpus_id is not None:
+            raise RuntimeError(
+                f"External corpus '{self._staging_corpus_id}' is still staged. "
+                "Commit or cancel it before starting another load."
+            )
+        corpus_handle = self._next_corpus_handle
+        self._next_corpus_handle += 1
+        # A concurrent removal can only make this snapshot conservative.
         _, loaded_token_count = self._obj.load_external_corpus_named(
-            corpus_id, chunks, self.remaining_token_budget
+            corpus_id, corpus_handle, chunks, self.remaining_token_budget
         )
+        self._staging_corpus_id = corpus_id
+        self._staging_corpus_handle = corpus_handle
+        self._staging_token_count = loaded_token_count
         return loaded_token_count
 
-    # Commit corpus bookkeeping after successful load. Call only at background thread join.
-    # (or after synchronous load_external_corpus_named returns)
     def commit_external_corpus_load(
         self, corpus_id: str, loaded_token_count: int
     ) -> None:
-        self._corpus_token_counts[corpus_id] = loaded_token_count
-        self._total_loaded_tokens += loaded_token_count
+        """Atomically publish the finalized staging corpus to local readers."""
+        if self._staging_corpus_id != corpus_id:
+            raise RuntimeError(
+                "No staged external corpus matches "
+                f"'{corpus_id}' (staged: {self._staging_corpus_id!r})."
+            )
+        if loaded_token_count != self._staging_token_count:
+            raise RuntimeError(
+                f"Staged corpus '{corpus_id}' has {self._staging_token_count} "
+                f"tokens, not {loaded_token_count}."
+            )
+        assert self._staging_corpus_handle is not None
+        # Install the single Python metadata entry first. It has no observers
+        # during this scheduler-thread call, and can be removed if the C++
+        # commit reports a normal validation error. After C++ publication only
+        # non-failing attribute assignments remain.
+        new_total = self._total_loaded_tokens + loaded_token_count
+        self._corpora[corpus_id] = (
+            self._staging_corpus_handle,
+            loaded_token_count,
+        )
+        try:
+            self._obj.commit_corpus(corpus_id)
+        except Exception:
+            self._corpora.pop(corpus_id, None)
+            raise
+        self._total_loaded_tokens = new_total
+        self._clear_staging_metadata()
+
+    def cancel_external_corpus_load(self, corpus_id: Optional[str] = None) -> None:
+        """Discard an unpublished staging corpus; published corpora are untouched."""
+        if (
+            corpus_id is not None
+            and self._staging_corpus_id is not None
+            and corpus_id != self._staging_corpus_id
+        ):
+            raise RuntimeError(
+                f"Cannot cancel staged corpus '{self._staging_corpus_id}' as "
+                f"'{corpus_id}'."
+            )
+        self._obj.cancel_corpus_load()
+        self._clear_staging_metadata()
+
+    def _clear_staging_metadata(self) -> None:
+        self._staging_corpus_id = None
+        self._staging_corpus_handle = None
+        self._staging_token_count = 0
 
     def remove_external_corpus(self, corpus_id: str) -> None:
         self._obj.remove_corpus(corpus_id)
-        old_count = self._corpus_token_counts.pop(corpus_id, 0)
-        self._total_loaded_tokens -= old_count
+        metadata = self._corpora.pop(corpus_id, None)
+        if metadata is not None:
+            self._total_loaded_tokens -= metadata[1]
 
     def list_external_corpora(self) -> Dict[str, int]:
         return self._obj.list_corpora()
@@ -102,9 +167,40 @@ class NgramCorpus:
         req_ids: List[str],
         batch_tokens: List[List[int]],
         total_lens: List[int],
+        corpus_ids: Optional[List[Optional[str]]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
+        if len(req_ids) != len(batch_tokens) or len(req_ids) != len(total_lens):
+            raise ValueError(
+                "req_ids, batch_tokens, and total_lens must have the same batch size"
+            )
+        if corpus_ids is not None and len(corpus_ids) != len(req_ids):
+            raise ValueError(
+                "corpus_ids must be omitted or match the request batch size "
+                f"({len(corpus_ids)} != {len(req_ids)})"
+            )
+        if corpus_ids is not None and any(
+            corpus_id is not None and not isinstance(corpus_id, str)
+            for corpus_id in corpus_ids
+        ):
+            raise ValueError("Every corpus_id must be a string or None.")
         state_ids = [self._get_state_id(rid) for rid in req_ids]
-        return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
+        corpus_handles = None
+        if corpus_ids is not None:
+            corpus_handles = []
+            for corpus_id in corpus_ids:
+                if corpus_id is None:
+                    corpus_handles.append(_ALL_CORPORA_HANDLE)
+                elif not corpus_id:
+                    corpus_handles.append(_NO_CORPUS_HANDLE)
+                else:
+                    corpus_handles.append(
+                        self._corpora.get(
+                            corpus_id, (_NO_CORPUS_HANDLE, 0)
+                        )[0]
+                    )
+        return self._obj.match_stateful(
+            state_ids, batch_tokens, total_lens, corpus_handles
+        )
 
     def erase_match_state(self, req_ids: List[str]):
         state_ids = []

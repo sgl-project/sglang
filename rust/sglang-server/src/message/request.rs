@@ -82,6 +82,10 @@ pub struct GenerateBody {
     pub token_ids_logprob: Option<OneOrMany<TokenIds>>,
     #[serde(default)]
     pub return_hidden_states: Option<OneOrMany<bool>>,
+    /// Per-request external NGRAM corpus selector. `null` preserves the legacy
+    /// all-corpus search while an empty string explicitly selects trie-only.
+    #[serde(default)]
+    pub ngram_corpus_id: Option<OneOrMany<Option<String>>>,
     /// Scalar-only in Python too (`return_text_in_logprobs: bool`).
     #[serde(default)]
     pub return_text_in_logprobs: Option<bool>,
@@ -144,6 +148,7 @@ impl GenerateBody {
             top_logprobs_num,
             token_ids_logprob,
             return_hidden_states,
+            ngram_corpus_id,
             return_text_in_logprobs,
             bootstrap_host,
             bootstrap_port,
@@ -319,6 +324,13 @@ impl GenerateBody {
         let logprob_start_lens = fan_out(logprob_start_len, n, "logprob_start_len")?;
         let top_logprobs_nums = fan_out(top_logprobs_num, n, "top_logprobs_num")?;
         let return_hidden = fan_out(return_hidden_states, n, "return_hidden_states")?;
+        if !is_batch && matches!(&ngram_corpus_id, Some(OneOrMany::Many(_))) {
+            return Err(Error::Validation(
+                "ngram_corpus_id must be a string for a single request".into(),
+            ));
+        }
+        let ngram_corpus_ids =
+            flatten_column(fan_out(ngram_corpus_id, n, "ngram_corpus_id")?);
 
         // PD fields fan out like Python `_normalize_bootstrap_params`: scalars
         // broadcast — except a scalar `bootstrap_room`, which becomes `room + i`
@@ -370,6 +382,7 @@ impl GenerateBody {
             top_logprobs_nums,
             tid_logprobs,
             return_hidden,
+            ngram_corpus_ids,
             bootstrap_hosts,
             bootstrap_ports,
             bootstrap_rooms,
@@ -390,6 +403,7 @@ impl GenerateBody {
                 top_logprobs_num,
                 token_ids_logprob,
                 return_hidden_states,
+                ngram_corpus_id,
                 bootstrap_host,
                 bootstrap_port,
                 bootstrap_room,
@@ -416,6 +430,7 @@ impl GenerateBody {
                 token_ids_logprob: token_ids_logprob.filter(|ids| !ids.is_empty()),
                 return_sampling_mask: false, // TODO: port Python's `return_sampling_mask`
                 return_hidden_states: return_hidden_states.unwrap_or(false),
+                ngram_corpus_id,
                 return_text_in_logprobs,
                 bootstrap_host,
                 bootstrap_port,
@@ -613,6 +628,8 @@ pub struct GenerateRequest {
     pub token_ids_logprob: Option<TokenIds>,
     pub return_sampling_mask: bool,
     pub return_hidden_states: bool,
+    /// `None` keeps the legacy all-SAM behavior; `Some("")` means trie-only.
+    pub ngram_corpus_id: Option<String>,
     /// Decode logprob token ids to text in each `[logprob, token_id, text]` tuple
     /// (default leaves the text slot null). Deliberately NOT in the scheduler
     /// header — Python's `TokenizedGenerateReqInput` has no such field either;
@@ -839,6 +856,35 @@ mod tests {
         let (ps, is_batch) = requests(r#"{"text": ["only"]}"#).unwrap();
         assert!(is_batch, "single-element list is still a batch");
         assert_eq!(ps.len(), 1);
+    }
+
+    #[test]
+    fn ngram_corpus_id_broadcasts_and_preserves_null_and_empty() {
+        let (ps, _) = requests(
+            r#"{"text": ["a", "b"], "ngram_corpus_id": ["docs", null]}"#,
+        )
+        .unwrap();
+        assert_eq!(ps[0].ngram_corpus_id.as_deref(), Some("docs"));
+        assert_eq!(ps[1].ngram_corpus_id, None);
+
+        let (ps, _) = requests(
+            r#"{"text": ["a", "b"], "ngram_corpus_id": ""}"#,
+        )
+        .unwrap();
+        assert_eq!(ps[0].ngram_corpus_id.as_deref(), Some(""));
+        assert_eq!(ps[1].ngram_corpus_id.as_deref(), Some(""));
+
+        let err = requests(
+            r#"{"text": ["a", "b"], "ngram_corpus_id": ["docs"]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ngram_corpus_id"), "{err}");
+
+        let err = requests(
+            r#"{"text": "a", "ngram_corpus_id": ["docs"]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("single request"), "{err}");
     }
 
     /// Scalar `sampling_params` broadcasts to every item; a list maps per item.

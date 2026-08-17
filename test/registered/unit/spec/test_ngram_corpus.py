@@ -757,6 +757,42 @@ class TestNgramCorpusMatchBenchmark(CustomTestCase):
 class TestNgramCorpusMultiSam(CustomTestCase):
     """Verify multi-SAM add/remove/list and budget splitting."""
 
+    def test_staged_corpus_is_invisible_until_commit(self):
+        corpus = _make_corpus("BFS", draft_token_num=6, external_sam_budget=4)
+        loaded_token_count = corpus.load_external_corpus_named(
+            "staged", [[1, 2, 3, 40, 41]]
+        )
+
+        self.assertEqual(corpus.list_external_corpora(), {})
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        self.assertNotIn(
+            40,
+            {
+                token
+                for path in corpus.leaf_paths_from_mask(
+                    ids.tolist(), masks.reshape(6, 6).tolist()
+                )
+                for token in path
+            },
+        )
+
+        corpus.commit_external_corpus_load("staged", loaded_token_count)
+        self.assertEqual(corpus.list_external_corpora(), {"staged": 5})
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        self.assertIn(
+            [3, 40, 41],
+            corpus.leaf_paths_from_mask(
+                ids.tolist(), masks.reshape(6, 6).tolist()
+            ),
+        )
+
+    def test_corpus_id_rejects_list_delimiters(self):
+        corpus = _make_corpus("BFS", external_sam_budget=1)
+        for corpus_id in ("bad\tid", "bad\nid", "bad\rid"):
+            with self.subTest(corpus_id=repr(corpus_id)):
+                with self.assertRaisesRegex(ValueError, "tabs or line breaks"):
+                    corpus.load_external_corpus_named(corpus_id, [[1, 2]])
+
     def test_add_and_list(self):
         corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
         loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
@@ -896,7 +932,7 @@ class TestMultiSamHttpMock(CustomTestCase):
         try:
             from starlette.testclient import TestClient
 
-            from sglang.srt.entrypoints.http_server import app, set_global_state
+            from sglang.srt.entrypoints import http_server
         except (ImportError, OSError):
             raise unittest.SkipTest(
                 "http_server import requires CUDA libraries not available on CPU"
@@ -929,9 +965,16 @@ class TestMultiSamHttpMock(CustomTestCase):
                 success=True, corpus_token_counts={"a": 100, "b": 200}
             )
         )
-        set_global_state(mock_state)
-        cls.client = TestClient(app)
+        cls.http_server = http_server
+        cls.client = TestClient(http_server.app)
+        cls.prior_global_state = http_server.get_global_state()
+        http_server.set_global_state(mock_state)
         cls.mock_tm = tm
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.close()
+        cls.http_server._global_state = cls.prior_global_state
 
     def test_add_corpus(self):
         resp = self.client.post(
@@ -967,12 +1010,372 @@ class TestMultiSamHttpMock(CustomTestCase):
         )
         self.assertEqual(resp.status_code, 400)
 
+    def test_remove_corpus_rejects_invalid_json_shapes(self):
+        for payload in ([], {"corpus_id": 1}, {"corpus_id": "x", "extra": True}):
+            with self.subTest(payload=payload):
+                resp = self.client.post("/remove_external_corpus", json=payload)
+                self.assertEqual(resp.status_code, 400)
+
     def test_list_corpora(self):
         resp = self.client.get("/list_external_corpora")
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
         self.assertTrue(data["success"])
         self.assertEqual(data["corpus_token_counts"], {"a": 100, "b": 200})
+
+
+class TestNgramCorpusRequestScoped(CustomTestCase):
+    """Phase 3: per-request external corpus selection.
+
+    ``corpus_ids`` is lossless -- it only changes which SAM proposes drafts (the
+    target still verifies every token). ``None`` preserves the legacy all-SAM
+    search in every batch position; an empty string explicitly selects trie-only.
+    """
+
+    @staticmethod
+    def _two_corpora(draft_token_num=6, external_sam_budget=4):
+        # Two corpora sharing prefix [1,2,3] with distinct continuations, so a
+        # match against [1,2,3] reveals which SAM(s) were consulted.
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=draft_token_num,
+            external_sam_budget=external_sam_budget,
+        )
+        loaded = corpus.load_external_corpus_named("a", [[1, 2, 3, 10, 11]])
+        corpus.commit_external_corpus_load("a", loaded)
+        loaded = corpus.load_external_corpus_named("b", [[1, 2, 3, 20, 21]])
+        corpus.commit_external_corpus_load("b", loaded)
+        return corpus
+
+    @staticmethod
+    def _leaf_paths(corpus, ids, masks, req_idx, d):
+        row_ids = ids.reshape(-1, d)[req_idx].tolist()
+        row_masks = masks.reshape(-1, d, d)[req_idx].tolist()
+        return corpus.leaf_paths_from_mask(row_ids, row_masks)
+
+    def test_single_id_selects_only_that_corpus(self):
+        corpus = self._two_corpora()
+        ids, masks = corpus.batch_get(
+            req_ids=["r0"],
+            batch_tokens=[[1, 2, 3]],
+            total_lens=[3],
+            corpus_ids=["a"],
+        )
+        leaf = self._leaf_paths(corpus, ids, masks, 0, 6)
+        self.assertIn([3, 10, 11], leaf)
+        self.assertNotIn([3, 20, 21], leaf)
+
+    def test_multi_selector_isolated_within_batch(self):
+        corpus = self._two_corpora()
+        ids, masks = corpus.batch_get(
+            req_ids=["r0", "r1"],
+            batch_tokens=[[1, 2, 3], [1, 2, 3]],
+            total_lens=[3, 3],
+            corpus_ids=["a", "b"],
+        )
+        leaf0 = self._leaf_paths(corpus, ids, masks, 0, 6)
+        leaf1 = self._leaf_paths(corpus, ids, masks, 1, 6)
+        self.assertIn([3, 10, 11], leaf0)
+        self.assertNotIn([3, 20, 21], leaf0)
+        self.assertIn([3, 20, 21], leaf1)
+        self.assertNotIn([3, 10, 11], leaf1)
+
+    def test_unknown_id_uses_trie_only_no_cross_sam(self):
+        corpus = self._two_corpora()
+        ids, masks = corpus.batch_get(
+            req_ids=["r0"],
+            batch_tokens=[[1, 2, 3]],
+            total_lens=[3],
+            corpus_ids=["does-not-exist"],
+        )
+        leaf = self._leaf_paths(corpus, ids, masks, 0, 6)
+        flat = {tok for path in leaf for tok in path}
+        # Online trie is empty; an unknown id must NOT fall back to all-SAM.
+        self.assertNotIn(10, flat)
+        self.assertNotIn(20, flat)
+
+    def test_none_in_mixed_batch_uses_legacy_all_sam(self):
+        corpus = self._two_corpora()
+        ids, masks = corpus.batch_get(
+            req_ids=["r0", "r1"],
+            batch_tokens=[[1, 2, 3], [1, 2, 3]],
+            total_lens=[3, 3],
+            corpus_ids=["a", None],
+        )
+        leaf0 = self._leaf_paths(corpus, ids, masks, 0, 6)
+        leaf1 = self._leaf_paths(corpus, ids, masks, 1, 6)
+        self.assertIn([3, 10, 11], leaf0)
+        self.assertIn([3, 10, 11], leaf1)
+        self.assertIn([3, 20, 21], leaf1)
+
+    def test_remove_then_selection_misses(self):
+        corpus = self._two_corpora()
+        corpus.remove_external_corpus("a")
+        ids, masks = corpus.batch_get(
+            req_ids=["r0", "r1"],
+            batch_tokens=[[1, 2, 3], [1, 2, 3]],
+            total_lens=[3, 3],
+            corpus_ids=["a", "b"],
+        )
+        leaf0 = self._leaf_paths(corpus, ids, masks, 0, 6)
+        leaf1 = self._leaf_paths(corpus, ids, masks, 1, 6)
+        # "a" was removed -> its handle is now unknown -> trie-only.
+        flat0 = {tok for path in leaf0 for tok in path}
+        self.assertNotIn(10, flat0)
+        # "b" is still selectable.
+        self.assertIn([3, 20, 21], leaf1)
+
+    def test_legacy_all_search_when_corpus_ids_none(self):
+        corpus = self._two_corpora()
+        # No corpus_ids -> both SAMs contribute (backward compatible).
+        ids, masks = corpus.batch_get(
+            req_ids=["r0"],
+            batch_tokens=[[1, 2, 3]],
+            total_lens=[3],
+        )
+        leaf = self._leaf_paths(corpus, ids, masks, 0, 6)
+        self.assertIn([3, 10, 11], leaf)
+        self.assertIn([3, 20, 21], leaf)
+
+
+class TestExternalCorpusManagerLifecycle(CustomTestCase):
+    def test_pending_load_only_blocks_same_id_remove(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from sglang.srt.managers.io_struct import RemoveExternalCorpusReqInput
+        from sglang.srt.speculative.external_corpus_manager import (
+            ExternalCorpusManager,
+        )
+
+        worker = SimpleNamespace(remove_external_corpus=Mock())
+        manager = ExternalCorpusManager(worker, Mock(), lambda result: result, Mock())
+        manager._pending_load = (SimpleNamespace(corpus_id="loading"), Mock())
+
+        same_id = manager.remove(RemoveExternalCorpusReqInput(corpus_id="loading"))
+        other_id = manager.remove(RemoveExternalCorpusReqInput(corpus_id="existing"))
+
+        self.assertFalse(same_id.success)
+        self.assertIn("pending", same_id.message)
+        self.assertTrue(other_id.success)
+        worker.remove_external_corpus.assert_called_once_with("existing")
+
+    def test_distributed_build_failure_cancels_staging(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from sglang.srt.managers.io_struct import AddExternalCorpusReqOutput
+        from sglang.srt.speculative.external_corpus_manager import (
+            ExternalCorpusManager,
+        )
+
+        worker = SimpleNamespace(commit_corpus_load=Mock())
+        send_response = Mock()
+        cancel = Mock()
+        failure = AddExternalCorpusReqOutput(success=False, message="rank failed")
+        synchronize = Mock(
+            side_effect=[
+                failure,
+                AddExternalCorpusReqOutput(success=True, corpus_id="docs"),
+            ]
+        )
+        manager = ExternalCorpusManager(worker, send_response, synchronize, cancel)
+        thread = Mock()
+        thread.is_alive.return_value = False
+        request = SimpleNamespace(corpus_id="docs")
+        manager._pending_load = (request, thread)
+        manager._load_result = AddExternalCorpusReqOutput(
+            success=True, corpus_id="docs", loaded_token_count=7
+        )
+
+        manager.check_pending_load()
+
+        cancel.assert_called_once_with("docs")
+        worker.commit_corpus_load.assert_not_called()
+        send_response.assert_called_once_with(failure, request)
+
+    def test_peer_commit_failure_rolls_back_local_publication(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from sglang.srt.managers.io_struct import AddExternalCorpusReqOutput
+        from sglang.srt.speculative.external_corpus_manager import (
+            ExternalCorpusManager,
+        )
+
+        worker = SimpleNamespace(
+            commit_corpus_load=Mock(), remove_external_corpus=Mock()
+        )
+        send_response = Mock()
+        cancel = Mock()
+        build_result = AddExternalCorpusReqOutput(
+            success=True, corpus_id="docs", loaded_token_count=7
+        )
+        commit_failure = AddExternalCorpusReqOutput(
+            success=False, message="peer commit failed"
+        )
+        synchronize = Mock(
+            side_effect=[
+                build_result,
+                commit_failure,
+                AddExternalCorpusReqOutput(success=True, corpus_id="docs"),
+            ]
+        )
+        manager = ExternalCorpusManager(worker, send_response, synchronize, cancel)
+        thread = Mock()
+        thread.is_alive.return_value = False
+        request = SimpleNamespace(corpus_id="docs")
+        manager._pending_load = (request, thread)
+        manager._load_result = build_result
+
+        manager.check_pending_load()
+
+        worker.commit_corpus_load.assert_called_once_with("docs", 7)
+        worker.remove_external_corpus.assert_called_once_with("docs")
+        cancel.assert_not_called()
+        self.assertEqual(synchronize.call_count, 3)
+        send_response.assert_called_once_with(commit_failure, request)
+
+
+class TestExactTokenChunks(CustomTestCase):
+    """Phase 3: client-provided exact token_chunks are used verbatim
+    (no re-tokenization) and validated before scheduler dispatch."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from sglang.srt.managers.io_struct import (
+                AddExternalCorpusReqInput,
+                AddExternalCorpusReqOutput,
+            )
+            from sglang.srt.managers.tokenizer_control_mixin import (
+                TokenizerControlMixin,
+            )
+            from sglang.srt.speculative.cpp_ngram.external_corpus import (
+                SEPARATOR_TOKEN,
+            )
+        except (ImportError, OSError) as e:  # pragma: no cover - env dependent
+            raise unittest.SkipTest(
+                f"tokenizer_control_mixin import unavailable: {e}"
+            )
+        cls.Mixin = TokenizerControlMixin
+        cls.ReqIn = AddExternalCorpusReqInput
+        cls.ReqOut = AddExternalCorpusReqOutput
+        cls.SEP = SEPARATOR_TOKEN
+
+    def _make_self(self, max_tokens=100, vocab_size=100, communicator=None):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        server_args = SimpleNamespace(
+            speculative_algorithm="NGRAM",
+            speculative_ngram_external_sam_budget=1,
+            speculative_ngram_external_corpus_max_tokens=max_tokens,
+            dp_size=1,
+            pp_size=1,
+        )
+        if communicator is None:
+            communicator = AsyncMock(
+                return_value=[
+                    self.ReqOut(
+                        success=True,
+                        corpus_id="cid",
+                        message="ok",
+                        loaded_token_count=0,
+                    )
+                ]
+            )
+        return SimpleNamespace(
+            server_args=server_args,
+            model_config=SimpleNamespace(vocab_size=vocab_size),
+            auto_create_handle_loop=lambda: None,
+            add_external_corpus_communicator=communicator,
+        )
+
+    def _call(self, fake_self, obj):
+        import asyncio
+
+        return asyncio.run(self.Mixin.add_external_corpus(fake_self, obj))
+
+    def test_exact_chunks_used_verbatim(self):
+        from unittest.mock import AsyncMock
+
+        comm = AsyncMock(
+            return_value=[
+                self.ReqOut(
+                    success=True,
+                    corpus_id="cid",
+                    message="ok",
+                    loaded_token_count=7,
+                )
+            ]
+        )
+        fake = self._make_self(communicator=comm)
+        chunks = [[1, 2, 3], [self.SEP, 4, 5, 6]]
+        obj = self.ReqIn(corpus_id="c", token_chunks=[list(c) for c in chunks])
+        out = self._call(fake, obj)
+        self.assertTrue(out.success)
+        self.assertEqual(out.corpus_id, "cid")
+        self.assertEqual(out.loaded_token_count, 7)
+        comm.assert_called_once()
+        passed = comm.call_args.args[0]
+        # Verbatim: no re-tokenization, and documents/file_path cleared.
+        self.assertEqual(passed.token_chunks, chunks)
+        self.assertIsNone(passed.file_path)
+        self.assertIsNone(passed.documents)
+
+    def test_empty_chunk_rejected(self):
+        from unittest.mock import AsyncMock
+
+        comm = AsyncMock()
+        fake = self._make_self(communicator=comm)
+        obj = self.ReqIn(corpus_id="c", token_chunks=[[1, 2], []])
+        out = self._call(fake, obj)
+        self.assertFalse(out.success)
+        self.assertIn("non-empty", out.message)
+        comm.assert_not_called()
+
+    def test_empty_chunk_list_rejected(self):
+        from unittest.mock import AsyncMock
+
+        comm = AsyncMock()
+        fake = self._make_self(communicator=comm)
+        obj = self.ReqIn(corpus_id="c", token_chunks=[])
+        out = self._call(fake, obj)
+        self.assertFalse(out.success)
+        self.assertIn("non-empty", out.message)
+        comm.assert_not_called()
+
+    def test_over_limit_rejected(self):
+        from unittest.mock import AsyncMock
+
+        comm = AsyncMock()
+        fake = self._make_self(max_tokens=5, communicator=comm)
+        obj = self.ReqIn(corpus_id="c", token_chunks=[[1, 2, 3], [4, 5, 6]])
+        out = self._call(fake, obj)
+        self.assertFalse(out.success)
+        self.assertIn("exceeds", out.message)
+        comm.assert_not_called()
+
+    def test_separator_token_allowed(self):
+        from unittest.mock import AsyncMock
+
+        comm = AsyncMock(
+            return_value=[
+                self.ReqOut(
+                    success=True,
+                    corpus_id="cid",
+                    message="ok",
+                    loaded_token_count=5,
+                )
+            ]
+        )
+        fake = self._make_self(communicator=comm)
+        obj = self.ReqIn(corpus_id="c", token_chunks=[[1, 2], [self.SEP, 3, 4]])
+        out = self._call(fake, obj)
+        self.assertTrue(out.success)
+        self.assertEqual(out.loaded_token_count, 5)
+        comm.assert_called_once()
 
 
 if __name__ == "__main__":

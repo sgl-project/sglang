@@ -58,6 +58,13 @@ def get_ngram_corpus_cls():
                 raise ValueError(
                     f"Unknown match_type: '{match_type}'. Must be 'BFS' or 'PROB'."
                 )
+            if not 0 <= external_sam_budget < draft_token_num:
+                raise ValueError(
+                    "external_sam_budget must be non-negative and smaller than "
+                    "draft_token_num"
+                )
+            if external_corpus_max_tokens <= 0:
+                raise ValueError("external_corpus_max_tokens must be positive")
             self.__ffi_init__(
                 capacity,
                 max_trie_depth,
@@ -79,18 +86,41 @@ def get_ngram_corpus_cls():
             state_ids: List[int],
             batch_tokens: List[List[int]],
             total_lens: List[int],
+            corpus_handles: List[int] | None = None,
         ) -> Tuple[np.ndarray, np.ndarray]:
             tokens_flat, offsets = _to_csr(batch_tokens)
             batch_size = len(batch_tokens)
+            if len(state_ids) != batch_size or len(total_lens) != batch_size:
+                raise ValueError(
+                    "state_ids, batch_tokens, and total_lens must have the same "
+                    "batch size"
+                )
+            if corpus_handles is not None and len(corpus_handles) != batch_size:
+                raise ValueError(
+                    "corpus_handles must be omitted or match the batch size "
+                    f"({len(corpus_handles)} != {batch_size})"
+                )
             d = self._draft_token_num
 
             state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
             total_lens_t = torch.tensor(total_lens, dtype=torch.int64)
+            # Per-request corpus handles (int64). Empty tensor keeps
+            # the legacy all-SAM search path in C++.
+            corpus_handles_t = torch.tensor(
+                corpus_handles if corpus_handles is not None else [],
+                dtype=torch.int64,
+            )
             out_tokens = torch.zeros(batch_size * d, dtype=torch.int32)
             out_mask = torch.zeros(batch_size * d * d, dtype=torch.uint8)
 
             self.batch_match_stateful(  # type: ignore
-                state_ids_t, tokens_flat, offsets, total_lens_t, out_tokens, out_mask
+                state_ids_t,
+                tokens_flat,
+                offsets,
+                total_lens_t,
+                corpus_handles_t,
+                out_tokens,
+                out_mask,
             )
 
             return out_tokens.numpy().astype(np.int64), out_mask.numpy().astype(
@@ -102,8 +132,15 @@ def get_ngram_corpus_cls():
             self.erase_match_state(state_ids_t)  # type: ignore
 
         def load_external_corpus_named(
-            self, corpus_id: str, chunks: Iterable[Sequence[int]], max_tokens: int
+            self,
+            corpus_id: str,
+            corpus_handle: int,
+            chunks: Iterable[Sequence[int]],
+            max_tokens: int,
         ) -> Tuple[int, int]:
+            """Build and finalize a corpus in staging without publishing it."""
+            if not corpus_id:
+                raise ValueError("corpus_id must be non-empty")
             self.start_external_corpus_load()  # type: ignore
             chunk_count = 0
             loaded_token_count = 0
@@ -118,11 +155,19 @@ def get_ngram_corpus_cls():
                     loaded_token_count += len(tokens_t)
                     self.append_external_corpus_tokens(tokens_t)  # type: ignore
                     chunk_count += 1
-                self.finish_external_corpus_load(corpus_id)  # type: ignore
+                self.finish_external_corpus_load(  # type: ignore
+                    corpus_id, corpus_handle
+                )
             except Exception:
                 self.cancel_external_corpus_load()  # type: ignore
                 raise
             return chunk_count, loaded_token_count
+
+        def commit_corpus(self, corpus_id: str) -> None:
+            self.commit_external_corpus_load(corpus_id)  # type: ignore
+
+        def cancel_corpus_load(self) -> None:
+            self.cancel_external_corpus_load()  # type: ignore
 
         def remove_corpus(self, corpus_id: str) -> None:
             self.remove_external_corpus(corpus_id)  # type: ignore

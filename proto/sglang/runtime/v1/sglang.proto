@@ -103,6 +103,7 @@ message TextGenerateRequest {
   optional int32 priority = 15;
   optional bool require_reasoning = 16;
   optional uint32 max_thinking_tokens = 17;
+  optional string ngram_corpus_id = 18;
 }
 
 message TextGenerateResponse {
@@ -130,6 +131,7 @@ message GenerateRequest {
   optional int32 priority = 14;
   optional bool require_reasoning = 15;
   optional uint32 max_thinking_tokens = 16;
+  optional string ngram_corpus_id = 17;
 }
 
 message GenerateResponse {

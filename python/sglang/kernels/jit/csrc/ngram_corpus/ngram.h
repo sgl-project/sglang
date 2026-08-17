@@ -20,17 +20,26 @@ namespace sglang {
 namespace ngram {
 
 class Ngram {
+  struct ExternalCorpus {
+    std::string id;
+    std::unique_ptr<SuffixAutomaton> sam;
+  };
+
   std::unique_ptr<Trie> trie_;
-  std::unordered_map<std::string, std::unique_ptr<SuffixAutomaton>> sams_;
-  // FIXME: single staging slot — only one corpus can be loaded at a time.
-  // To support concurrent loads, move staging into a per-load local variable.
+  // SAM ownership is keyed by the request-facing handle. A single secondary
+  // id index supports duplicate checks and removal without raw-pointer indexes.
+  std::unordered_map<int64_t, ExternalCorpus> sams_;
+  std::unordered_map<std::string, int64_t> sam_handle_by_id_;
+  // A finalized staged SAM remains outside every query index until commit.
+  // ExternalCorpusManager serializes loads, so one staging slot is sufficient.
   std::unique_ptr<SuffixAutomaton> staging_sam_;
+  std::string staging_corpus_id_;
+  int64_t staging_corpus_handle_ = 0;
   Param param_;
 
-  // NOTE: protects trie_, sams_, and pending_count_. staging_sam_ is NOT
-  // protected by mutex_ — it is only accessed from the corpus loading thread.
-  // finishExternalCorpusLoad briefly acquires mutex_ to move the completed
-  // SAM into sams_.
+  // NOTE: protects trie_, published SAM indexes, and pending_count_. Staging
+  // is built by one loading thread and is only finalized/committed/cancelled
+  // after that thread has stopped.
   mutable std::mutex mutex_;
   mutable std::condition_variable sync_cv_;
   // NOTE: tracks inserts from enqueue through trie_->insert() completion,
@@ -52,8 +61,11 @@ class Ngram {
 
   void appendExternalCorpusTokens(const std::vector<int32_t>& tokens);
 
-  // Publishes the staged corpus. Duplicate corpus_id is rejected.
-  void finishExternalCorpusLoad(const std::string& corpus_id);
+  // Finalizes the staged corpus but does not make it queryable.
+  void finishExternalCorpusLoad(const std::string& corpus_id, int64_t corpus_handle);
+
+  // Atomically installs the finalized staged corpus into all query indexes.
+  void commitExternalCorpusLoad(const std::string& corpus_id);
 
   void removeExternalCorpus(const std::string& corpus_id);
 
@@ -66,7 +78,8 @@ class Ngram {
   Result batchMatch(
       const std::vector<int64_t>& state_ids,
       const std::vector<std::vector<int32_t>>& tokens,
-      const std::vector<size_t>& total_lens);
+      const std::vector<size_t>& total_lens,
+      const std::vector<int64_t>& corpus_handles = {});
 
   void eraseMatchState(const std::vector<int64_t>& state_ids);
 

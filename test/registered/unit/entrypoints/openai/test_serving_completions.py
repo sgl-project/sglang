@@ -72,10 +72,12 @@ class ServingCompletionTestCase(unittest.TestCase):
             max_tokens=1,
             cache_salt="tenant-a",
             extra_key="classification",
+            ngram_corpus_id="docs",
         )
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.cache_salt, "tenant-a")
         self.assertEqual(internal.extra_key, "classification")
+        self.assertEqual(internal.ngram_corpus_id, "docs")
 
     def test_single_request_rejects_batched_cache_salt(self):
         req = CompletionRequest(
@@ -83,6 +85,30 @@ class ServingCompletionTestCase(unittest.TestCase):
             prompt=[1, 2, 3, 4],
             max_tokens=1,
             cache_salt=["tenant-a"],
+        )
+        internal, _ = self.sc._convert_to_internal_request(req)
+        with self.assertRaisesRegex(ValueError, "single request"):
+            internal.normalize_batch_and_arguments()
+
+    def test_single_prompt_accepts_one_corpus_id(self):
+        for prompt in ("hello", [1, 2, 3, 4]):
+            with self.subTest(prompt=prompt):
+                req = CompletionRequest(
+                    model="x",
+                    prompt=prompt,
+                    max_tokens=1,
+                    ngram_corpus_id=["docs"],
+                )
+                internal, _ = self.sc._convert_to_internal_request(req)
+                internal.normalize_batch_and_arguments()
+                self.assertEqual(internal.ngram_corpus_id, "docs")
+
+    def test_single_token_ids_prompt_rejects_multiple_corpus_ids(self):
+        req = CompletionRequest(
+            model="x",
+            prompt=[1, 2, 3, 4],
+            max_tokens=1,
+            ngram_corpus_id=["docs", "other"],
         )
         internal, _ = self.sc._convert_to_internal_request(req)
         with self.assertRaisesRegex(ValueError, "single request"):

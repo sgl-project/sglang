@@ -951,7 +951,9 @@ class Scheduler(
 
             self.external_corpus_manager = ExternalCorpusManager(
                 self.draft_worker,
-                self.ipc_channels.send_to_tokenizer.send_output,
+                self._send_control_output,
+                self._synchronize_external_corpus_load_result,
+                self.draft_worker.ngram_corpus.cancel_external_corpus_load,
             )
         else:
             self.external_corpus_manager = None
@@ -1899,19 +1901,119 @@ class Scheduler(
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 if self.rust_server is not None:
-                    # Embedded Rust server: every control-request response goes
-                    # back through the egress ring (the zmq tokenizer socket is
-                    # not consumed); the Rust api_server shapes it per-endpoint.
-                    self.rust_server.push_control_output(recv_req, output)
+                    self._send_control_output(output, recv_req)
                 elif isinstance(output, RpcReqOutput):
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
                 else:
-                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+                    self._send_control_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+
+    def _send_control_output(self, output, recv_req) -> None:
+        """Route synchronous and deferred control replies to the active frontend."""
+        rust_server = self.rust_server
+        if rust_server is not None:
+            # The embedded Rust frontend does not consume the tokenizer ZMQ
+            # socket, so every control reply must return through its egress ring.
+            rust_server.push_control_output(recv_req, output)
+        elif envs.SGLANG_RUST_SERVER.get():
+            # Non-entry TP ranks execute broadcast control requests too, but
+            # only the rank hosting the Rust frontend owns a waiting HTTP sink.
+            return
+        else:
+            self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+
+    def _synchronize_external_corpus_load_result(
+        self, result: Optional[AddExternalCorpusReqOutput]
+    ) -> Optional[AddExternalCorpusReqOutput]:
+        """Return a result only after every local control rank reports one.
+
+        Pending polls exchange one byte. The more expensive Python-object
+        gather happens only once all ranks are ready (and at the commit/cleanup
+        fences, where every caller is already ready).
+        """
+        group = self._external_corpus_control_group()
+        if group is None:
+            return result
+
+        ready = torch.tensor(
+            0 if result is None else 1, dtype=torch.uint8, device="cpu"
+        )
+        torch.distributed.all_reduce(
+            ready,
+            op=torch.distributed.ReduceOp.MIN,
+            group=group.cpu_group,
+        )
+        if not ready.item():
+            return None
+        assert result is not None
+
+        local = (
+            result.success,
+            result.corpus_id,
+            result.message,
+            result.loaded_token_count,
+        )
+        gathered = group.all_gather_object(local)
+        successful = [entry for entry in gathered if entry[0]]
+        consistent = len(successful) == len(gathered) and len(
+            {(entry[1], entry[3]) for entry in successful}
+        ) == 1
+        if consistent:
+            return result
+
+        details = "; ".join(
+            f"rank {rank}: {message or 'inconsistent corpus load result'}"
+            for rank, (success, _corpus_id, message, _count) in enumerate(gathered)
+            if not success
+        )
+        if not details:
+            details = "worker ranks reported inconsistent corpus ids or token counts"
+        return AddExternalCorpusReqOutput(
+            success=False,
+            message=f"External corpus load failed across worker ranks: {details}",
+        )
+
+    def _external_corpus_control_group(self) -> Optional[Any]:
+        """Return the TP group that receives NGRAM control broadcasts.
+
+        NGRAM startup rejects DP attention, so its request receiver always
+        broadcasts control messages across the ordinary TP group.
+        """
+        return self.tp_group if self.ps.tp_size > 1 else None
+
+    def _merge_external_corpus_control_output(self, output):
+        """Merge a synchronous corpus-control result across broadcast ranks."""
+        group = self._external_corpus_control_group()
+        if group is None:
+            return output
+
+        payload = (
+            tuple(sorted(output.corpus_token_counts.items()))
+            if isinstance(output, ListExternalCorporaReqOutput)
+            else None
+        )
+        gathered = group.all_gather_object(
+            (output.success, output.message, payload)
+        )
+
+        failures = [
+            f"rank {rank}: {message or 'operation failed'}"
+            for rank, (success, message, _payload) in enumerate(gathered)
+            if not success
+        ]
+        payloads = {entry[2] for entry in gathered if entry[0]}
+        if not failures and len(payloads) <= 1:
+            return output
+        if not failures:
+            failures.append("worker ranks returned inconsistent corpus lists")
+        message = "; ".join(failures)
+        if isinstance(output, ListExternalCorporaReqOutput):
+            return ListExternalCorporaReqOutput(success=False, message=message)
+        return RemoveExternalCorpusReqOutput(success=False, message=message)
 
     def _materialize_cuda_vmm_inputs(self, recv_req):
         """Release VMM slices before request handling can reject the request."""
@@ -2433,6 +2535,7 @@ class Scheduler(
                 routing_key=recv_req.routing_key,
                 extra_key=recv_req.extra_key,
                 cache_salt=recv_req.cache_salt,
+                ngram_corpus_id=recv_req.ngram_corpus_id,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
@@ -4007,31 +4110,37 @@ class Scheduler(
         self, recv_req: AddExternalCorpusReqInput
     ) -> Optional[AddExternalCorpusReqOutput]:
         if self.external_corpus_manager is None:
-            return AddExternalCorpusReqOutput(
+            output = AddExternalCorpusReqOutput(
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
             )
-        return self.external_corpus_manager.add(recv_req)
+        else:
+            output = self.external_corpus_manager.add(recv_req)
+        return output
 
     def remove_external_corpus(
         self, recv_req: RemoveExternalCorpusReqInput
     ) -> RemoveExternalCorpusReqOutput:
         if self.external_corpus_manager is None:
-            return RemoveExternalCorpusReqOutput(
+            output = RemoveExternalCorpusReqOutput(
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
             )
-        return self.external_corpus_manager.remove(recv_req)
+        else:
+            output = self.external_corpus_manager.remove(recv_req)
+        return self._merge_external_corpus_control_output(output)
 
     def list_external_corpora(
         self, recv_req: ListExternalCorporaReqInput
     ) -> ListExternalCorporaReqOutput:
         if self.external_corpus_manager is None:
-            return ListExternalCorporaReqOutput(
+            output = ListExternalCorporaReqOutput(
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
             )
-        return self.external_corpus_manager.list(recv_req)
+        else:
+            output = self.external_corpus_manager.list(recv_req)
+        return self._merge_external_corpus_control_output(output)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:

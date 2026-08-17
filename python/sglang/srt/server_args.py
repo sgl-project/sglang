@@ -2307,12 +2307,12 @@ class ServerArgs:
     ] = None
     speculative_ngram_external_sam_budget: A[
         int,
-        "Number of draft nodes reserved for the external SAM subtree in ngram speculative decoding.",
+        "Number of draft nodes reserved for external SAMs in ngram speculative decoding. Set a positive value to enable external corpora.",
         NS("spec"),
     ] = 0
     speculative_ngram_external_corpus_max_tokens: A[
         int,
-        "Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
+        "Maximum total tokens across loaded external ngram corpora. Tune this based on your CPU memory budget.",
         NS("spec"),
     ] = 10000000
 

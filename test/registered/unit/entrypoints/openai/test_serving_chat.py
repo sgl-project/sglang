@@ -383,6 +383,7 @@ class ServingChatTestCase(unittest.TestCase):
             return_prompt_token_ids=True,
             cache_salt="tenant-a",
             extra_key="classification",
+            ngram_corpus_id="docs",
         )
 
         with patch(
@@ -398,6 +399,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
         self.assertEqual(adapted.cache_salt, "tenant-a")
         self.assertEqual(adapted.extra_key, "classification")
+        self.assertEqual(adapted.ngram_corpus_id, "docs")
         conv_mock.assert_not_called()
 
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):

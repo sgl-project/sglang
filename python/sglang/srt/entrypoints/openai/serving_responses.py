@@ -456,6 +456,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         session_id=request.session_id,
                         extra_key=request.extra_key,
                         cache_salt=request.cache_salt,
+                        ngram_corpus_id=request.ngram_corpus_id,
                         # background+stream streams on this connection, so don't detach.
                         background=request.background and not request.stream,
                         require_reasoning=require_reasoning,
@@ -2565,6 +2566,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 session_id=adapted_request.session_id,
                 extra_key=adapted_request.extra_key,
                 cache_salt=adapted_request.cache_salt,
+                ngram_corpus_id=adapted_request.ngram_corpus_id,
                 return_logprob=adapted_request.return_logprob,
                 logprob_start_len=adapted_request.logprob_start_len,
                 top_logprobs_num=adapted_request.top_logprobs_num,

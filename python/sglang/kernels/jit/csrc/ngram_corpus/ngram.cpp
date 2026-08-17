@@ -9,6 +9,10 @@ namespace sglang {
 
 namespace ngram {
 
+namespace {
+constexpr int64_t kAllCorporaHandle = -1;
+}
+
 Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
   if (!(param_.max_trie_depth > 1)) {
     throw std::runtime_error(
@@ -65,14 +69,15 @@ void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
   }
 }
 
-// NOTE: staging operations (start/append/finish) are called from a background
-// thread during async corpus loading. They do NOT hold mutex_ because
-// staging_sam_ is disjoint from sams_ / trie_. Only finishExternalCorpusLoad
-// briefly acquires mutex_ when moving the completed SAM into sams_.
+// NOTE: staging operations (start/append/finish) are called from one background
+// thread during async corpus loading. The staged SAM is disjoint from every
+// query-visible index until commitExternalCorpusLoad.
 void Ngram::startExternalCorpusLoad() {
   if (staging_sam_) {
     throw std::runtime_error("startExternalCorpusLoad called while another load is in progress");
   }
+  staging_corpus_id_.clear();
+  staging_corpus_handle_ = 0;
   staging_sam_ = std::make_unique<SuffixAutomaton>();
 }
 
@@ -80,49 +85,91 @@ void Ngram::appendExternalCorpusTokens(const std::vector<int32_t>& tokens) {
   if (!staging_sam_) {
     throw std::runtime_error("appendExternalCorpusTokens called without startExternalCorpusLoad");
   }
+  if (!staging_corpus_id_.empty()) {
+    throw std::runtime_error("appendExternalCorpusTokens called after finishExternalCorpusLoad");
+  }
   staging_sam_->appendTokens(tokens);
 }
 
-void Ngram::finishExternalCorpusLoad(const std::string& corpus_id) {
+void Ngram::finishExternalCorpusLoad(const std::string& corpus_id, int64_t corpus_handle) {
   if (!staging_sam_) {
     throw std::runtime_error("finishExternalCorpusLoad called without startExternalCorpusLoad");
   }
+  if (corpus_id.empty()) {
+    throw std::runtime_error("External corpus id must be non-empty");
+  }
+  if (corpus_id.find_first_of("\t\n\r") != std::string::npos) {
+    throw std::runtime_error("External corpus id must not contain tabs or line breaks");
+  }
+  if (corpus_handle <= 0) {
+    throw std::runtime_error("External corpus handle must be a positive int64");
+  }
   staging_sam_->finalize();
   if (staging_sam_->empty()) {
-    staging_sam_.reset();
+    resetStagingSam();
     throw std::runtime_error("External corpus is empty — no tokens were loaded.");
   }
-  // Only lock briefly to install the completed SAM.
+  // Validate against the current published indexes, but deliberately keep the
+  // finalized SAM in staging. Distributed callers publish only after every
+  // participating rank reports a successful build.
   std::unique_lock<std::mutex> lock(mutex_);
-  if (sams_.find(corpus_id) != sams_.end()) {
+  if (sam_handle_by_id_.find(corpus_id) != sam_handle_by_id_.end()) {
     throw std::runtime_error(
         "External corpus '" + corpus_id + "' already exists. Remove it before adding a new corpus with the same id.");
   }
-  sams_.emplace(corpus_id, std::move(staging_sam_));
+  if (sams_.find(corpus_handle) != sams_.end()) {
+    throw std::runtime_error("External corpus handle " + std::to_string(corpus_handle) + " already exists");
+  }
+  staging_corpus_id_ = corpus_id;
+  staging_corpus_handle_ = corpus_handle;
+}
+
+void Ngram::commitExternalCorpusLoad(const std::string& corpus_id) {
+  if (!staging_sam_ || staging_corpus_id_.empty()) {
+    throw std::runtime_error("commitExternalCorpusLoad called without a finalized staged corpus");
+  }
+  if (corpus_id != staging_corpus_id_) {
+    throw std::runtime_error(
+        "commitExternalCorpusLoad corpus id mismatch: expected '" + staging_corpus_id_ + "', got '" + corpus_id +
+        "'");
+  }
+
+  std::unique_lock<std::mutex> lock(mutex_);
+  const int64_t corpus_handle = staging_corpus_handle_;
+  sams_.emplace(corpus_handle, ExternalCorpus{corpus_id, std::move(staging_sam_)});
+  sam_handle_by_id_.emplace(corpus_id, corpus_handle);
+  staging_corpus_id_.clear();
+  staging_corpus_handle_ = 0;
 }
 
 void Ngram::removeExternalCorpus(const std::string& corpus_id) {
   std::unique_lock<std::mutex> lock(mutex_);
-  sams_.erase(corpus_id);
+  auto handle_it = sam_handle_by_id_.find(corpus_id);
+  if (handle_it != sam_handle_by_id_.end()) {
+    sams_.erase(handle_it->second);
+    sam_handle_by_id_.erase(handle_it);
+  }
 }
 
 void Ngram::resetStagingSam() {
-  // staging_sam_ is only accessed from the loading thread — no lock needed.
   staging_sam_.reset();
+  staging_corpus_id_.clear();
+  staging_corpus_handle_ = 0;
 }
 
 void Ngram::clearExternalCorpus() {
   std::unique_lock<std::mutex> lock(mutex_);
+  sam_handle_by_id_.clear();
   sams_.clear();
-  staging_sam_.reset();
+  resetStagingSam();
 }
 
 std::vector<std::pair<std::string, int64_t>> Ngram::listExternalCorpora() const {
   std::unique_lock<std::mutex> lock(mutex_);
   std::vector<std::pair<std::string, int64_t>> entries;
   entries.reserve(sams_.size());
-  for (const auto& [id, sam] : sams_) {
-    entries.emplace_back(id, sam->tokenCount());
+  for (const auto& [_, corpus] : sams_) {
+    entries.emplace_back(corpus.id, corpus.sam->tokenCount());
   }
   return entries;
 }
@@ -144,9 +191,17 @@ void Ngram::insertWorker() {
 Result Ngram::batchMatch(
     const std::vector<int64_t>& state_ids,
     const std::vector<std::vector<int32_t>>& tokens,
-    const std::vector<size_t>& total_lens) {
+    const std::vector<size_t>& total_lens,
+    const std::vector<int64_t>& corpus_handles) {
   if (state_ids.size() != tokens.size() || state_ids.size() != total_lens.size()) {
     throw std::runtime_error("batchMatch expects state_ids, tokens, and total_lens to match in size");
+  }
+  // An empty vector preserves the legacy all-SAM behavior. In an aligned
+  // per-request vector, -1 selects all SAMs, 0 (or any unknown handle) selects
+  // no external SAM, and a known positive handle selects exactly one SAM.
+  const bool per_request = !corpus_handles.empty();
+  if (per_request && corpus_handles.size() != state_ids.size()) {
+    throw std::runtime_error("batchMatch expects corpus_handles to match state_ids in size");
   }
 
   std::unique_lock<std::mutex> lock(mutex_);
@@ -183,6 +238,31 @@ Result Ngram::batchMatch(
 
     auto& state = match_state_[state_ids[i]];
 
+    const bool use_all_sams = !per_request || corpus_handles[i] == kAllCorporaHandle;
+    if (!use_all_sams) {
+      const SuffixAutomaton* sam = nullptr;
+      const int64_t handle = corpus_handles[i];
+      if (handle > 0) {
+        auto it = sams_.find(handle);
+        if (it != sams_.end()) {
+          sam = it->second.sam.get();
+        }
+      }
+      const size_t sam_budget =
+          sam ? std::min(param_.external_sam_budget, total_draft_token_num) : size_t{0};
+      const size_t req_trie_budget = total_draft_token_num - sam_budget;
+      Result res = (trie_.get()->*trie_result_build_fn)(
+          suffix.data(), suffix.size(), suffix.back(), req_trie_budget, param_, state, total_lens[i]);
+      if (sam_budget > 0) {
+        auto sam_res =
+            (sam->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), sam_budget, param_);
+        res = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), res, sam_res);
+      }
+      merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
+      merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
+      continue;
+    }
+
     if (total_sam_budget == 0 || per_sam_budget == 0) {
       auto res = (trie_.get()->*trie_result_build_fn)(
           suffix.data(), suffix.size(), suffix.back(), total_draft_token_num, param_, state, total_lens[i]);
@@ -194,7 +274,8 @@ Result Ngram::batchMatch(
     auto combined = (trie_.get()->*trie_result_build_fn)(
         suffix.data(), suffix.size(), suffix.back(), trie_budget, param_, state, total_lens[i]);
 
-    for (const auto& [_, sam] : sams_) {
+    for (const auto& [_, corpus] : sams_) {
+      const auto& sam = corpus.sam;
       auto sam_res =
           (sam.get()->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), per_sam_budget, param_);
       combined = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), combined, sam_res);

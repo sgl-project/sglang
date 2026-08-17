@@ -23,6 +23,7 @@ use dynamo_protocols::types::{
     TopLogprobs,
 };
 use futures::StreamExt;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
@@ -43,12 +44,20 @@ pub(super) fn routes() -> Router<AppState> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
 }
 
+#[derive(Deserialize)]
+struct ChatCompletionRequestWithExtensions {
+    #[serde(flatten)]
+    request: CreateChatCompletionRequest,
+    #[serde(default)]
+    ngram_corpus_id: Option<String>,
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
-    body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
+    body: Result<Json<ChatCompletionRequestWithExtensions>, JsonRejection>,
 ) -> Response {
-    let request = match body {
-        Ok(Json(request)) => request,
+    let (request, ngram_corpus_id) = match body {
+        Ok(Json(body)) => (body.request, body.ngram_corpus_id),
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
@@ -196,6 +205,7 @@ async fn chat_completions(
             logprob_start_len: -1,
             top_logprobs_num: request.top_logprobs.unwrap_or(0) as i64,
             return_text_in_logprobs: want_logprobs.then_some(true),
+            ngram_corpus_id: ngram_corpus_id.clone(),
             ..Default::default()
         };
         let rx = match submit_generation(&state, native, stream, &mut guard).await {
@@ -848,14 +858,15 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{chat_submitted, chunk, senders};
+    use super::super::test_utils::{app_state, chat_submitted, chunk, post_json, senders};
     use super::{
-        SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
-        merge_template_stops, unary_chat,
+        ChatCompletionRequestWithExtensions, SamplingDefaults, chat_event_stream, chat_logprobs,
+        chat_sampling_params, merge_template_stops, unary_chat,
     };
     use crate::api_server::guard::AbortGuard;
-    use crate::message::ChunkExtras;
+    use crate::message::{ChunkExtras, RequestKind};
     use crate::runtime::DefaultSamplingParams;
+    use crate::tokenizer_manager::TmEvent;
     use axum::http::StatusCode;
     use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
     use futures::StreamExt;
@@ -866,6 +877,56 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn ngram_corpus_extension_is_not_dropped() {
+        let body: ChatCompletionRequestWithExtensions =
+            serde_json::from_value(serde_json::json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "ngram_corpus_id": "docs"
+            }))
+            .unwrap();
+        assert_eq!(body.ngram_corpus_id.as_deref(), Some("docs"));
+    }
+
+    #[tokio::test]
+    async fn ngram_corpus_extension_reaches_submitted_request() {
+        let (tm, tm_rx) = flume::unbounded();
+        let mut channels = senders();
+        channels.tm = tm;
+        let mut state = app_state(channels);
+        let chatml = super::super::template::builtin_template("chatml").unwrap();
+        state.chat_formatter = Some(super::super::ChatFormatter::Legacy(Box::new(
+            super::super::template::LegacyFormatter { spec: chatml },
+        )));
+        let app = super::routes().with_state(state);
+        let response_task = tokio::spawn(post_json(
+            app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "ngram_corpus_id": "docs"
+            }),
+        ));
+
+        let event = tm_rx.recv_async().await.unwrap();
+        let TmEvent::Ingress(request) = event else {
+            panic!("expected ingress request");
+        };
+        let RequestKind::Generate(native) = &request.kind else {
+            panic!("expected generation request");
+        };
+        assert_eq!(native.ngram_corpus_id.as_deref(), Some("docs"));
+        request
+            .sink
+            .try_send(chunk(request.rid.as_str(), "ok", true))
+            .unwrap();
+
+        let response = response_task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// Python `to_sampling_params` priority: user value > model generation

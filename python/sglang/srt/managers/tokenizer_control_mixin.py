@@ -87,6 +87,70 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _validate_external_corpus_token_chunks(
+    token_chunks: object,
+    *,
+    max_tokens: int,
+    vocab_size: int,
+    separator_token: int,
+) -> List[List[int]]:
+    """Validate the public ``List[List[int]]`` contract in place."""
+    if not isinstance(token_chunks, list):
+        raise ValueError("token_chunks must be a list of token lists.")
+    if not token_chunks:
+        raise ValueError("token_chunks must be non-empty.")
+
+    total_tokens = 0
+    int32_min = -(2**31)
+    int32_max = 2**31 - 1
+
+    for chunk_idx, chunk in enumerate(token_chunks):
+        if not isinstance(chunk, list):
+            raise ValueError(
+                f"token_chunks[{chunk_idx}] must be a list of integer token IDs."
+            )
+        if not chunk:
+            raise ValueError(f"token_chunks[{chunk_idx}] must be non-empty.")
+
+        total_tokens += len(chunk)
+        if total_tokens > max_tokens:
+            raise ValueError(
+                f"token_chunks total {total_tokens} exceeds "
+                f"external corpus token limit {max_tokens}."
+            )
+
+        for token_idx, token in enumerate(chunk):
+            if type(token) is not int:
+                raise ValueError(
+                    f"token_chunks[{chunk_idx}][{token_idx}] must be an integer "
+                    f"token ID, got {type(token).__name__}."
+                )
+            if token < int32_min or token > int32_max:
+                raise ValueError(
+                    f"token_chunks[{chunk_idx}][{token_idx}]={token} is outside "
+                    "the signed int32 range."
+                )
+            if token != separator_token and not 0 <= token < vocab_size:
+                raise ValueError(
+                    f"token_chunks[{chunk_idx}][{token_idx}]={token} is invalid; "
+                    f"expected {separator_token} (document separator) or a token "
+                    f"ID in [0, {vocab_size})."
+                )
+
+    return token_chunks
+
+
+def _dynamic_external_corpus_topology_error(server_args: ServerArgs) -> Optional[str]:
+    if server_args.dp_size == 1 and server_args.pp_size == 1:
+        return None
+    return (
+        "Dynamic external corpus management requires dp_size=1 and pp_size=1 "
+        f"(got dp_size={server_args.dp_size}, pp_size={server_args.pp_size}). "
+        "Use the startup external-corpus option for DP/PP deployments."
+    )
+
+
 # Declarative spec: (attr_name_prefix, response_type[, mode])
 # Each entry creates self.{prefix}_communicator and registers
 # response_type -> communicator.handle_recv in the dispatch table.
@@ -190,13 +254,52 @@ class TokenizerControlMixin:
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
             )
+        if error := _dynamic_external_corpus_topology_error(self.server_args):
+            return AddExternalCorpusReqOutput(success=False, message=error)
+        if self.server_args.speculative_ngram_external_sam_budget <= 0:
+            return AddExternalCorpusReqOutput(
+                success=False,
+                message=(
+                    "Dynamic external corpus loading is disabled; set "
+                    "--speculative-ngram-external-sam-budget to a positive value."
+                ),
+            )
         truncated = False
         try:
             if not obj.corpus_id:
                 import uuid
 
                 obj.corpus_id = uuid.uuid4().hex
-            if obj.file_path is not None:
+            source_count = sum(
+                source is not None
+                for source in (obj.token_chunks, obj.file_path, obj.documents)
+            )
+            if source_count != 1:
+                return AddExternalCorpusReqOutput(
+                    success=False,
+                    message=(
+                        "Exactly one of token_chunks, file_path, or documents must "
+                        "be provided."
+                    ),
+                )
+            if obj.token_chunks is not None:
+                from sglang.srt.speculative.cpp_ngram.external_corpus import (
+                    SEPARATOR_TOKEN,
+                )
+
+                max_tokens = (
+                    self.server_args.speculative_ngram_external_corpus_max_tokens
+                )
+                # Exact IDs are never re-tokenized. The semantic validation
+                # boundary lives here so every tokenizer-manager entry path has
+                # identical range, vocabulary, and token-budget behavior.
+                obj.token_chunks = _validate_external_corpus_token_chunks(
+                    obj.token_chunks,
+                    max_tokens=max_tokens,
+                    vocab_size=self.model_config.vocab_size,
+                    separator_token=SEPARATOR_TOKEN,
+                )
+            elif obj.file_path is not None:
                 from sglang.srt.speculative.cpp_ngram.external_corpus import (
                     iter_external_corpus_chunks,
                 )
@@ -237,11 +340,6 @@ class TokenizerControlMixin:
                     total_tokens += len(token_ids)
                     has_prev = True
                 obj.token_chunks = token_chunks
-            else:
-                return AddExternalCorpusReqOutput(
-                    success=False,
-                    message="Either file_path or documents must be provided.",
-                )
             obj.file_path = None
             obj.documents = None
             results = await self.add_external_corpus_communicator(obj)
@@ -266,6 +364,8 @@ class TokenizerControlMixin:
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
             )
+        if error := _dynamic_external_corpus_topology_error(self.server_args):
+            return RemoveExternalCorpusReqOutput(success=False, message=error)
         results = await self.remove_external_corpus_communicator(
             RemoveExternalCorpusReqInput(corpus_id=corpus_id)
         )
@@ -284,9 +384,20 @@ class TokenizerControlMixin:
         results = await self.list_external_corpora_communicator(
             ListExternalCorporaReqInput()
         )
-        all_success, all_message = FanOutCommunicator.merge_results(results)
-        # Merge corpus token counts from all DP ranks (each rank loads the same set).
-        corpus_token_counts = results[0].corpus_token_counts if all_success else {}
+        all_success = all(result.success for result in results)
+        all_message = " | ".join(
+            dict.fromkeys(result.message for result in results if result.message)
+        )
+        corpus_token_counts = {}
+        if all_success:
+            corpus_token_counts = results[0].corpus_token_counts
+            if any(
+                result.corpus_token_counts != corpus_token_counts
+                for result in results[1:]
+            ):
+                all_success = False
+                all_message = "Worker replicas returned inconsistent corpus lists."
+                corpus_token_counts = {}
         return ListExternalCorporaReqOutput(
             success=all_success,
             corpus_token_counts=corpus_token_counts,
