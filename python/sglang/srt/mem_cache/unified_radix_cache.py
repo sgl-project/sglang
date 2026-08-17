@@ -697,7 +697,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 kv_indices = kv_indices[:effective_cache_len]
 
             radix_key = RadixKey(
-                token_ids, req.extra_key, is_bigram=self.tree_core.is_eagle
+                token_ids,
+                req.extra_key,
+                is_bigram=self.tree_core.is_eagle,
+                cache_salt=req.cache_salt,
             ).page_aligned(self.page_size)
             page_aligned_len = len(radix_key)
             values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
@@ -746,7 +749,7 @@ class UnifiedRadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(token_ids)
             ]
-            req.prefix_indices = kv_indices
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
@@ -770,11 +773,21 @@ class UnifiedRadixCache(BasePrefixCache):
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
 
+        radix_key = RadixKey(
+            token_ids[:effective_cache_len],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        )
+
         if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+            # The frontier lands a page below page_floor(pre_len + 1), which has to
+            # be where the insert stops, or the leaf it creates keeps less than a
+            # sliding window of live SWA and the match after the insert rejects it.
+            # The insert stops at page_floor(len(radix_key)), and a bigram key is
+            # one shorter than the tokens it spans, so measure the key.
             for comp in self._components_tuple:
-                comp.free_out_of_window_slots(
-                    req, effective_cache_len - 1, insert_params
-                )
+                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
 
         if effective_cache_len <= 0:
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
@@ -786,11 +799,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         kv_indices = kv_indices_orig[:effective_cache_len]
 
-        radix_key = RadixKey(
-            token_ids[:effective_cache_len],
-            req.extra_key,
-            is_bigram=self.tree_core.is_eagle,
-        ).page_aligned(self.page_size)
+        radix_key = radix_key.page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
@@ -919,10 +928,11 @@ class UnifiedRadixCache(BasePrefixCache):
         """Run a backup action top-down, stopping at the first failed backup."""
         written = 0
         for node_id in action.node_ids:
-            # Overlapping chain actions: skip already-backed nodes.
-            if self.tree_core.is_backuped(node_id):
-                continue
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
+            # Overlapping chain actions may revisit nodes with Full KV already
+            # backed up. Skip only when no transfer remains.
+            if device_value.numel() == 0 and not comp_xfers:
+                continue
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
             host_indices = self._execute_kv_backup(
                 node_id, device_value, comp_xfers, sidecar_xfers
@@ -1218,11 +1228,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if not self.enable_storage or self.cache_controller is None:
             return
 
-        extra_key = self.tree_core.prefetch_anchor_info(last_host_node_id)
+        extra_key, cache_salt = self.tree_core.prefetch_anchor_info(last_host_node_id)
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=extra_key,
             is_bigram=self.tree_core.is_eagle,
+            cache_salt=cache_salt,
         ).page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
         if (
@@ -1839,22 +1850,30 @@ class UnifiedRadixCache(BasePrefixCache):
                 else ()
             )
 
+        # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
+        # equal iff reclaim victim order matched on every rank.
+        digest = self.tree_core.write_back_duplicate_reclaim_digest
         ready_counts = torch.tensor(
             [
                 write_acks,
                 load_acks,
                 *storage_queue_sizes,
+                digest,
+                -digest,
             ],
-            dtype=torch.int,
+            dtype=torch.int64,
             device="cpu",
         )
         self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
+        assert (
+            count_values[-2] == -count_values[-1]
+        ), "write_back duplicate-reclaim victims diverged across TP ranks"
         return (
             count_values[0],
             count_values[1],
-            tuple(count_values[2:]),
+            tuple(count_values[2:-2]),
             extra_pool_names,
         )
 
@@ -1926,11 +1945,17 @@ class UnifiedRadixCache(BasePrefixCache):
             finish_count = 0
             if self.pp_rank == 0:
                 finish_count = self._count_ready_acks(cc.ack_load_queue)
-            finish_count_tensor = torch.tensor(
-                finish_count, dtype=torch.int, device="cpu"
+            # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
+            # equal iff reclaim victim order matched on every rank.
+            digest = self.tree_core.write_back_duplicate_reclaim_digest
+            sync_tensor = torch.tensor(
+                [finish_count, digest, -digest], dtype=torch.int64, device="cpu"
             )
-            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-            finish_count = finish_count_tensor.item()
+            self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = int(sync_tensor[0].item())
+            assert (
+                sync_tensor[1].item() == -sync_tensor[2].item()
+            ), "write_back duplicate-reclaim victims diverged across TP ranks"
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
@@ -1939,6 +1964,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
+                # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
+                self.tree_core.finish_load_back(node)
 
             if self.metrics_collector is not None:
                 for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
@@ -2070,6 +2097,14 @@ class UnifiedRadixCache(BasePrefixCache):
             and not self.tree_core.has_swa_host_pool
         )
         return swa.sliding_window_size if unified_compress_only_hicache else 0
+
+    def swa_retain_floor(self, req) -> int | None:
+        if not self.is_mamba_enabled or self._sliding_window_size is None:
+            return None
+        checkpoint = req.mamba_last_track_seqlen
+        if checkpoint is None:
+            return None
+        return checkpoint - self._sliding_window_size
 
     def supports_swa(self) -> bool:
         return self.is_swa_enabled
