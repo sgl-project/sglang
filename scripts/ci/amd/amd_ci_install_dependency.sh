@@ -276,12 +276,20 @@ DOCKERFILE="docker/rocm.Dockerfile"
 GPU_ARCH="${GPU_ARCH:-mi30x}"
 echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 
-# ROCm 7.0 keeps the Triton its base image ships; later ROCm images run on the
-# Triton AITER pins, so a rebuilt AITER has to bring its own along.
+# ROCm 7.0 keeps the Triton its base image ships; ROCm 7.2 runs on the Triton
+# AITER pins, so a rebuilt AITER has to bring its own along.
+#
+# The pip-SDK generations (7.15, 10.x) keep their own Triton as well: AITER's
+# install_triton.sh picks its index from `dpkg -l rocm-core`, which a
+# pip-installed SDK does not register, so it would fall back to the ROCm 7.2
+# index and drop a 7.2-built Triton into the container. 7.15* has to precede
+# the general 7.* case.
 IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
 case "${IMAGE_HIP_VERSION}" in
-    7.0*) INSTALL_AITER_TRITON="false" ;;
-    7.*)  INSTALL_AITER_TRITON="true" ;;
+    7.0*)  INSTALL_AITER_TRITON="false" ;;
+    7.15*) INSTALL_AITER_TRITON="false" ;;
+    7.*)   INSTALL_AITER_TRITON="true" ;;
+    10.*)  INSTALL_AITER_TRITON="false" ;;
     *)
         echo "[CI-AITER-CHECK] ERROR: Unsupported or empty HIP version: '${IMAGE_HIP_VERSION}'"
         exit 1
