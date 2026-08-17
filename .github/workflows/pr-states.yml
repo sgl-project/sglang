@@ -17,7 +17,7 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_run:
-    workflows: ["PR Test Base", "PR Test Extra"]
+    workflows: ["PR Test Base", "PR Test Extra", "PR Test ROCm 7.2 (AMD)"]
     types: [requested, completed]
   workflow_dispatch:
     inputs:
@@ -119,9 +119,11 @@ jobs:
                 repo: context.repo.repo,
                 workflow_id: workflowFile,
                 head_sha: sha,
-                per_page: 1,
+                // A label-only event can create a deliberately skipped run.
+                // Keep the latest substantive attempt visible instead.
+                per_page: 10,
               });
-              return data.workflow_runs[0] || null;
+              return data.workflow_runs.find(run => run.conclusion !== 'skipped') || null;
             }
             async function findRun(workflowFile, { preSleepMs = 0, attempts = 1, delayMs = 0 }) {
               if (preSleepMs > 0) await sleep(preSleepMs);
@@ -140,18 +142,45 @@ jobs:
             // on just-removed-label to catch removal-after-push.
             const labelOnOpts  = { preSleepMs: LABEL_ON_PRESLEEP_MS, attempts: RETRY_ATTEMPTS, delayMs: RETRY_DELAY_MS };
             const labelOffOpts = { preSleepMs: justRemovedLabel ? LABEL_OFF_PRESLEEP_MS : 0, attempts: 1 };
-            const ptRun = await findRun('pr-test.yml', hasCI ? labelOnOpts : labelOffOpts);
-            // pr-test-extra gates on BOTH labels (see check-changes there).
-            const peRun = await findRun('pr-test-extra.yml', (hasCI && hasExtra) ? labelOnOpts : labelOffOpts);
 
-            // Skipped run = "no real run" -- happens when a label is added
-            // after a commit, because GHA doesn't retrigger on `labeled`.
-            const isReal = (run) => run && run.conclusion !== 'skipped';
+            // workflow_run carries the triggering attempt even before the
+            // Actions list endpoint has indexed it. Use that payload when it
+            // belongs to the PR's current SHA; otherwise query by workflow.
+            const eventRun = context.eventName === 'workflow_run'
+              && context.payload.workflow_run.head_sha === sha
+              && context.payload.workflow_run.conclusion !== 'skipped'
+              ? context.payload.workflow_run
+              : null;
+            const findCurrentRun = (workflowFile, workflowName, opts) => (
+              eventRun && eventRun.name === workflowName
+                ? eventRun
+                : findRun(workflowFile, opts)
+            );
+
+            // Lookups are independent, so run them concurrently. The AMD
+            // workflow has a pull_request.paths filter: do one immediate
+            // lookup instead of retrying a legitimately absent run. If it
+            // does dispatch, its workflow_run event refreshes this block.
+            const [ptRun, peRun, amdRun] = await Promise.all([
+              findCurrentRun('pr-test.yml', 'PR Test Base', hasCI ? labelOnOpts : labelOffOpts),
+              // pr-test-extra gates on BOTH labels (see check-changes there).
+              findCurrentRun(
+                'pr-test-extra.yml',
+                'PR Test Extra',
+                (hasCI && hasExtra) ? labelOnOpts : labelOffOpts,
+              ),
+              findCurrentRun(
+                'pr-test-amd-rocm720.yml',
+                'PR Test ROCm 7.2 (AMD)',
+                labelOffOpts,
+              ),
+            ]);
 
             const missingCIText = ':x: **Missing `run-ci` label** -- add it to run CI tests.';
             const peBlockedByCIText = ':x: **Blocked** -- `run-ci` is required first.';
             const notExtraEnabledText = ':warning: **Not enabled** -- add `run-ci-extra` label to opt in.';
             const stalePushText = ':warning: **Not run on latest push** -- push again to dispatch.';
+            const amdNotTriggeredText = ':heavy_minus_sign: **Not triggered for this commit**.';
 
             // Status icon: body otherwise looks uniformly "dispatched" even
             // for gate-failed runs (call-gate exits on missing label).
@@ -168,16 +197,19 @@ jobs:
               }
             }
             const runLink = (run) => `${runIcon(run)} [Run #${run.id}](${run.html_url})`;
-            const ptText = isReal(ptRun)
+            const ptText = ptRun
               ? runLink(ptRun)
               : (!hasCI ? missingCIText : '_Not run yet_');
-            const peText = isReal(peRun)
+            const peText = peRun
               ? runLink(peRun)
               : !hasCI
                 ? peBlockedByCIText
                 : !hasExtra
                   ? notExtraEnabledText
                   : stalePushText;
+            const amdText = amdRun
+              ? runLink(amdRun)
+              : (!hasCI ? missingCIText : amdNotTriggeredText);
 
             const outerStart = '<!-- pr-states:start -->';
             const outerEnd   = '<!-- pr-states:end -->';
@@ -185,6 +217,8 @@ jobs:
             const ptEnd      = '<!-- slot:pr-test:end -->';
             const peStart    = '<!-- slot:pr-test-extra:start -->';
             const peEnd      = '<!-- slot:pr-test-extra:end -->';
+            const amdStart   = '<!-- slot:pr-test-amd-rocm720:start -->';
+            const amdEnd     = '<!-- slot:pr-test-amd-rocm720:end -->';
 
             const newBlock = [
               outerStart,
@@ -193,6 +227,7 @@ jobs:
               '',
               `Latest PR Test (Base): ${ptStart}${ptText}${ptEnd}`,
               `Latest PR Test (Extra): ${peStart}${peText}${peEnd}`,
+              `Latest PR Test (AMD ROCm 7.2): ${amdStart}${amdText}${amdEnd}`,
               outerEnd,
             ].join('\n');
 
