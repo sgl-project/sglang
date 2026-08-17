@@ -765,10 +765,7 @@ class SWAComponent(TreeComponent):
         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
         branching_seqlen = req.swa_branching_seqlen
-        if (
-            branching_seqlen is None
-            or branching_seqlen <= req.cache_protected_len
-        ):
+        if branching_seqlen is None or branching_seqlen <= req.cache_protected_len:
             return None
 
         # An EAGLE key with N bigrams spans N + 1 raw tokens.
