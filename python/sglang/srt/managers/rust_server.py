@@ -272,7 +272,7 @@ class NativeMmHost:
 
     @staticmethod
     def build_native_mm(spec: NativeMmSpec, entry):
-        """Drain-time adapter: wrap the Rust-produced buffers of one ``MmHandoff``
+        """Drain-time adapter: wrap the Rust-produced buffers of one ``MmEncodeResult``
         into the scheduler's ``MultimodalProcessorOutput``. Wrapping only — load,
         resize, patchify, token expansion and M-RoPE all ran in Rust.
 

@@ -4,10 +4,10 @@
 //! This file is the Python↔Rust boundary: it registers the pyo3 module
 //! (`_server`) and the classes exposed to the scheduler — [`Server`] (boot,
 //! `recv_requests`/`wait_ingress`, `push_*`, MM handoff, shutdown),
-//! [`RequestBatch`] and [`MmHandoff`]. Everything behind that boundary — receiving
-//! requests, encoding multimodal inputs, tokenizing, detokenizing, SSE streaming,
-//! and so on — is implemented purely in Rust and never touches a `PyObject`; the
-//! only Python-facing code lives in this file.
+//! [`RequestBatch`] and [`MmEncodeResult`]. Everything behind that boundary —
+//! receiving requests, encoding multimodal inputs, tokenizing, detokenizing,
+//! SSE streaming, and so on — is implemented purely in Rust and never touches a
+//! `PyObject`; the only Python-facing code lives in this file.
 
 mod http_server;
 mod message;
@@ -32,7 +32,7 @@ use crate::utils::runtime;
 /// (zero-copy into numpy), or one POSIX segment name per item when the scheduler
 /// broadcasts across TP ranks and Python wraps each in a `ShmPointerMMData`.
 #[pyclass(frozen, get_all)]
-struct MmHandoff {
+struct MmEncodeResult {
     /// *Generic.* All items' `pixel_values` concatenated, flat `f32` of logical
     /// shape `[sum(t*h*w), feature_dim]`; `Some` on the inline (single-rank) path.
     features: Option<Py<numpy::PyArray1<f32>>>,
@@ -234,7 +234,7 @@ impl Server {
     /// decode steps, so any per-byte work here — memcpy or hashing, tens of MB
     /// per image-heavy request — would stall every running request's ITL. Hence
     /// the worker-precomputed `hashes`.
-    fn take_mm(&self, py: Python<'_>, rid: &str) -> Option<MmHandoff> {
+    fn take_mm(&self, py: Python<'_>, rid: &str) -> Option<MmEncodeResult> {
         use numpy::IntoPyArray;
 
         let res = self.rt.mm_sidecar.take(rid)?;
@@ -249,7 +249,7 @@ impl Server {
                 Some(segments.into_iter().map(|s| s.into_name()).collect()),
             ),
         };
-        Some(MmHandoff {
+        Some(MmEncodeResult {
             features,
             shm_names,
             grids: res.grids.iter().map(|g| (g[0], g[1], g[2])).collect(),
@@ -306,6 +306,6 @@ fn _server(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .try_init();
     m.add_class::<Server>()?;
     m.add_class::<RequestBatch>()?;
-    m.add_class::<MmHandoff>()?;
+    m.add_class::<MmEncodeResult>()?;
     Ok(())
 }
