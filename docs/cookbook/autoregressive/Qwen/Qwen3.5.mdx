@@ -991,11 +991,7 @@ Max ITL (ms):                            1220.68
 
 #### 5.2.3 Agentic Long-Context with HiCache DRAM Offload (H200 FP8, MTP)
 
-Long-context agentic workloads (multi-turn coding traces) benefit from
-hierarchical KV cache with host-DRAM offload. On H200 the following
-configuration serves Qwen3.5-397B-A17B-FP8 at TP=8 with EAGLE MTP
-(3 speculative tokens per step) and pushes KV overflow into host DRAM
-through HiCache.
+For agentic workloads, here is how to enable HiCache and MTP.
 
 Container image (pinned for reproducibility):
 `lmsysorg/sglang:nightly-dev-cu13-20260815-a5ba081f`.
@@ -1032,11 +1028,10 @@ python3 -m sglang.launch_server \
   --hicache-write-policy write_through_selective
 ```
 
-`--hicache-size` is per-rank, per-host-pool GB: `total_host_dram_gb / tp /
-hicache_host_pool_count` (2 pools by default).
+`--hicache-size` is per-rank, per-host-pool GB.
 
-For reproducible throughput numbers, pin the golden MTP acceptance length
-(3.39 at 3 speculative tokens, thinking-on):
+Here is how to pin the golden MTP acceptance length (3.39 at 3 speculative
+tokens, thinking-on):
 
 ```bash Command
 export SGLANG_SIMULATE_ACC_LEN=3.39
