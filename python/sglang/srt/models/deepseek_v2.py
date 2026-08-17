@@ -3061,6 +3061,13 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             )
         if is_wint4afp8_or_wint4a16_config(quant_config):
             return "Deepseek V3/R1 W4AFP8/W4A16 model uses different quant method for routed experts and shared experts."
+        can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
+        if can_fuse_fn is not None and not can_fuse_fn():
+            return (
+                "Quantization keeps shared experts at a higher precision than the "
+                "routed experts, so they cannot be fused into the quantized "
+                "routed-expert path."
+            )
         return None
 
     def determine_num_fused_shared_experts(self):
