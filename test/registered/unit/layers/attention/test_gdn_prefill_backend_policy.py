@@ -24,14 +24,29 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+def _publish(testcase, **fields):
+    """Install a published config for one case and restore on its cleanup --
+    a failed case must not leave a partial publish for a later file in a
+    monolithic local run."""
+    from sglang.srt.runtime_context import get_context, get_server_args
+
+    override = get_context().override_server_args(**fields)
+    override.install()
+    testcase.addCleanup(override.restore)
+    return get_server_args()
+
+
 def make_runner(
+    testcase,
     *,
     state_dtype=torch.bfloat16,
     key_dim=128,
     value_dim=128,
     **arg_overrides,
 ):
-    args = SimpleNamespace(
+    # The policy reads the published bags, so the fixture publishes the
+    # configuration under test.
+    fields = dict(
         linear_attn_backend="triton",
         linear_attn_prefill_backend=None,
         uses_mamba_radix_cache=False,
@@ -40,8 +55,8 @@ def make_runner(
         enable_dynamic_chunking=False,
         chunked_prefill_size=8192,
     )
-    for name, value in arg_overrides.items():
-        setattr(args, name, value)
+    fields.update(arg_overrides)
+    args = _publish(testcase, **fields)
 
     return SimpleNamespace(
         server_args=args,
@@ -86,12 +101,13 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             return flashinfer_gdn_prefill_default(runner)
 
     def test_selects_flashinfer_for_supported_sm100_gdn(self):
-        self.assertEqual(self.apply_policy(make_runner()), "flashinfer")
+        self.assertEqual(self.apply_policy(make_runner(self)), "flashinfer")
 
     def test_selects_flashinfer_for_radix_cache_strategies(self):
         for strategy in ("no_buffer", "extra_buffer", "extra_buffer_lazy"):
             with self.subTest(strategy=strategy):
                 runner = make_runner(
+                    self,
                     uses_mamba_radix_cache=True,
                     mamba_radix_cache_strategy=strategy,
                 )
@@ -100,7 +116,7 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
     def test_declines_when_the_prefill_backend_is_explicit(self):
         for backend in ("triton", "flashinfer", "cutedsl"):
             with self.subTest(backend=backend):
-                runner = make_runner(linear_attn_prefill_backend=backend)
+                runner = make_runner(self, linear_attn_prefill_backend=backend)
                 self.assertIsNone(self.apply_policy(runner))
 
     def test_rejects_unsupported_capability(self):
@@ -117,11 +133,11 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         for name, runner_args, hardware in cases:
             with self.subTest(name=name):
                 self.assertIsNone(
-                    self.apply_policy(make_runner(**runner_args), **hardware)
+                    self.apply_policy(make_runner(self, **runner_args), **hardware)
                 )
 
     def test_rejects_gdn_config_without_qwen_head_dims(self):
-        runner = make_runner()
+        runner = make_runner(self)
         runner.hybrid_gdn_config = SimpleNamespace()
         self.assertIsNone(self.apply_policy(runner))
 
@@ -136,7 +152,7 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         )
         for name, runner_args in cases:
             with self.subTest(name=name):
-                self.assertIsNone(self.apply_policy(make_runner(**runner_args)))
+                self.assertIsNone(self.apply_policy(make_runner(self, **runner_args)))
 
     def test_builds_compact_checkpoint_plan_for_packed_sequences(self):
         forward_batch = SimpleNamespace(
@@ -216,6 +232,19 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
 
         tree_verify.assert_called_once()
         flashinfer_kernel.target_verify.assert_not_called()
+
+    def test_helion_backend_reports_kda_only(self):
+        cases = (
+            (LinearAttnKernelBackend.HELION, LinearAttnKernelBackend.TRITON),
+            (LinearAttnKernelBackend.TRITON, LinearAttnKernelBackend.HELION),
+        )
+        for decode_backend, prefill_backend in cases:
+            with self.subTest(
+                decode_backend=decode_backend,
+                prefill_backend=prefill_backend,
+            ):
+                with self.assertRaisesRegex(ValueError, "supports KDA only"):
+                    GDNKernelDispatcher(decode_backend, prefill_backend)
 
 
 if __name__ == "__main__":

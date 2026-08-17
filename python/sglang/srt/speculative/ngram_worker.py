@@ -9,12 +9,13 @@ from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
+from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
@@ -91,7 +92,7 @@ class NGRAMWorker(BaseSpecWorker):
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.tp_rank = ps.tp_rank
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
@@ -479,15 +480,11 @@ class NGRAMWorker(BaseSpecWorker):
                 self.token_to_kv_pool_allocator,
             )
             if batch.return_logprob:
-                # The last arg is the accept_index row width minus 1. NGRAM's
-                # accept_index is (bs, draft_token_num) -- the tree depth is not
-                # bounded by spec_steps like EAGLE's (bs, spec_steps + 1).
-                compute_spec_v2_logprobs(
+                compute_spec_logprobs(
                     batch,
                     logits_output,
                     predict,
-                    accept_index,
-                    self.draft_token_num - 1,
+                    accept_index=accept_index,
                 )
 
             if on_publish is not None:
