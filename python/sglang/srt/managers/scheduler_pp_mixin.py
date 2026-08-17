@@ -586,6 +586,11 @@ class SchedulerPPMixin:
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
         # PP+spec: per-rid chain rows seeding the next verify round.
         self._pp_spec_chain_by_rid: Dict[str, torch.Tensor] = {}
+        self._pp_spec_relay = (
+            envs.SGLANG_ENABLE_PP_SPEC.get()
+            and self.ps.pp_size > 1
+            and not self.spec_algorithm.is_none()
+        )
 
         self.send_req_work = []
         self.send_proxy_work = []
@@ -1234,10 +1239,17 @@ class SchedulerPPMixin:
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
         if is_spec:
             # Spec prefill round: the sampled first token roots round 1's chain.
-            fwd_batch = (
-                mb_metadata.fwd_batch if mb_metadata.fwd_batch is not None else batch
-            )
-            self._pp_spec_store_bonus(fwd_batch, next_token_ids)
+            # Only the chunk that finishes the prompt samples a real token; a
+            # middle chunk's next_token_ids is a placeholder no consumer reads,
+            # and storing it would seed the next verify round with a token the
+            # model never emitted.
+            if batch.contains_last_prefill_chunk:
+                fwd_batch = (
+                    mb_metadata.fwd_batch
+                    if mb_metadata.fwd_batch is not None
+                    else batch
+                )
+                self._pp_spec_store_bonus(fwd_batch, next_token_ids)
         else:
             # PP rank 0 also relays into output_tokens_buf so the next iter's
             # resolve_forward_inputs finds these tokens for the decode portion
@@ -1471,7 +1483,14 @@ class SchedulerPPMixin:
 
         # CUDA: send first
         # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
+        # PP+spec also pairs by parity: its relay carries several extra GPU
+        # tensors (accept_lens, new_seq_lens, bonus tokens, next chain), and
+        # device-side P2P stays ordered on the stream, so enqueueing that many
+        # sends before any recv can form the same ring wait on CUDA. Parity
+        # makes rank 1 post its recv first, which breaks the cycle for any
+        # pp_size > 1.
+        needs_pairing = is_xpu() or self._pp_spec_relay
+        send_first = (not needs_pairing) or ((self.ps.pp_rank % 2) == 0)
 
         def _do_send():
             return self._pp_send_output_to_next_stage(

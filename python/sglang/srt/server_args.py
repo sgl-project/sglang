@@ -9097,6 +9097,18 @@ class ServerArgs:
                     "SGLANG_ENABLE_PP_SPEC is not compatible with "
                     "--speculative-adaptive"
                 )
+                # Every stage rebuilds the same verify input from the relayed
+                # per-request state, so all stages must see the same batch
+                # composition. Mixed-chunk splices decode requests into an
+                # extend batch (whose relayed next_token_ids are prefill
+                # placeholders), and DP attention partitions the batch per DP
+                # rank; both break that invariant.
+                assert (
+                    not self.enable_mixed_chunk
+                ), "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-mixed-chunk"
+                assert (
+                    not self.enable_dp_attention
+                ), "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
             assert self.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "
                 "parallelism: allocatable slots per microbatch are bounded by "
