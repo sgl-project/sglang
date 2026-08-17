@@ -98,11 +98,11 @@ def _assert_pages_equal(
         )
 
 
-def _run_mha(element_dim: int, page_count: int) -> None:
-    pool_size = PAGE_SIZE * (page_count + 8)
+def _run_mha(element_dim: int, page_count: int, page_size: int = PAGE_SIZE) -> None:
+    pool_size = page_size * (page_count + 8)
     device_pool = MHATokenToKVPool(
         size=pool_size,
-        page_size=PAGE_SIZE,
+        page_size=page_size,
         head_num=element_dim // 128,
         head_dim=128,
         dtype=torch.bfloat16,
@@ -111,7 +111,10 @@ def _run_mha(element_dim: int, page_count: int) -> None:
         enable_memory_saver=False,
     )
     host_pool = _pinned_host_pool(
-        MHATokenToKVPoolHost, device_pool=device_pool, layout="page_first"
+        MHATokenToKVPoolHost,
+        page_size=page_size,
+        device_pool=device_pool,
+        layout="page_first",
     )
     assert can_use_write_back_jit_kernel(
         element_size=element_dim * host_pool.dtype.itemsize,
@@ -125,10 +128,12 @@ def _run_mha(element_dim: int, page_count: int) -> None:
 
     device_pages = torch.arange(2, 2 + page_count, device=DEVICE, dtype=torch.int64)
     host_pages = torch.arange(page_count, 0, -1, dtype=torch.int64)
-    device_indices = _token_indices_for_pages(device_pages)
+    device_indices = _token_indices_for_pages(device_pages, page_size=page_size)
     # host_indices stay on the CPU: this is the case the staged JIT kernel must
     # accept (kDLCPU / kDLGPUHost destination indices).
-    host_indices = _token_indices_for_pages(host_pages, device="cpu")
+    host_indices = _token_indices_for_pages(
+        host_pages, device="cpu", page_size=page_size
+    )
     assert not host_indices.is_cuda
 
     host_pool.backup_from_device_all_layer(
@@ -142,12 +147,14 @@ def _run_mha(element_dim: int, page_count: int) -> None:
             device_pool.k_buffer[layer_id],
             host_pages,
             device_pages,
+            page_size,
         )
         _assert_pages_equal(
             host_pool.v_data_refs[layer_id],
             device_pool.v_buffer[layer_id],
             host_pages,
             device_pages,
+            page_size,
         )
 
     # Load path (prefix-cache hit): exercises the hicache.cuh load matchers.
@@ -158,7 +165,7 @@ def _run_mha(element_dim: int, page_count: int) -> None:
         device_pool.v_buffer[layer_id].zero_()
 
     load_pages = torch.arange(1, 1 + page_count, device=DEVICE, dtype=torch.int64)
-    load_indices = _token_indices_for_pages(load_pages)
+    load_indices = _token_indices_for_pages(load_pages, page_size=page_size)
     host_indices_device = host_indices.to(DEVICE)
     for layer_id in range(NUM_LAYERS):
         host_pool.load_to_device_per_layer(
@@ -172,12 +179,14 @@ def _run_mha(element_dim: int, page_count: int) -> None:
             device_pool.k_buffer[layer_id],
             host_pages,
             load_pages,
+            page_size,
         )
         _assert_pages_equal(
             host_pool.v_data_refs[layer_id],
             device_pool.v_buffer[layer_id],
             host_pages,
             load_pages,
+            page_size,
         )
 
 
@@ -265,9 +274,12 @@ def test_page_first_staged_write_back_mla(element_dim: int, page_count: int) -> 
     _run_mla(element_dim, page_count)
 
 
-@pytest.mark.skipif(not is_hip(), reason="ROCm batch-copy coverage.")
-def test_page_first_staged_write_back_mla_rocm_batch_copy() -> None:
+def test_page_first_staged_write_back_mla_large_page() -> None:
     _run_mla(element_dim=576, page_count=4, page_size=256)
+
+
+def test_page_first_staged_write_back_mha_large_page() -> None:
+    _run_mha(element_dim=512, page_count=4, page_size=256)
 
 
 if __name__ == "__main__":

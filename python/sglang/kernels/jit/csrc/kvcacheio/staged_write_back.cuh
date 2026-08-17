@@ -2,6 +2,8 @@
 
 #include "hicache.cuh"
 #include "relayout.cuh"
+#include <atomic>
+#include <cstdio>
 #include <dlfcn.h>
 #include <limits>
 #include <vector>
@@ -10,17 +12,37 @@ namespace sglang {
 
 #if defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70100000
 using MemcpyBatchPtr = void*;
-using HipMemcpyBatchAsyncFn =
-    hipError_t (*)(void**, void**, size_t*, size_t, hipMemcpyAttributes*, size_t*, size_t, size_t*, hipStream_t);
+using HipMemcpyBatchAsyncFn = hipError_t (*)(
+    MemcpyBatchPtr*, MemcpyBatchPtr*, size_t*, size_t, hipMemcpyAttributes*, size_t*, size_t, size_t*, hipStream_t);
 
 inline auto get_hip_memcpy_batch_async() -> HipMemcpyBatchAsyncFn {
+  // HIP intentionally uses symbol availability as its runtime capability gate.
   static HipMemcpyBatchAsyncFn hip_memcpy_batch_async = []() {
     void* symbol = dlsym(RTLD_DEFAULT, "hipMemcpyBatchAsync");
     return reinterpret_cast<HipMemcpyBatchAsyncFn>(symbol);
   }();
   return hip_memcpy_batch_async;
 }
-#elif defined(CUDA_VERSION) && CUDA_VERSION >= 12080
+
+inline void warn_hip_batch_fallback_once(hipError_t err, size_t fail_idx) {
+  static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+  if (warned.test_and_set(std::memory_order_relaxed)) {
+    return;
+  }
+  if (fail_idx == std::numeric_limits<size_t>::max()) {
+    std::fprintf(
+        stderr,
+        "SGLang HiCache warning: hipMemcpyBatchAsync failed (%s); falling back to per-page copies.\n",
+        hipGetErrorString(err));
+  } else {
+    std::fprintf(
+        stderr,
+        "SGLang HiCache warning: hipMemcpyBatchAsync failed at copy %zu (%s); falling back to per-page copies.\n",
+        fail_idx,
+        hipGetErrorString(err));
+  }
+}
+#elif !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
 #if CUDA_VERSION >= 13000
 using MemcpyBatchPtr = const void*;
 using CudaMemcpyBatchAsyncFn = cudaError_t (*)(
@@ -101,6 +123,10 @@ inline bool try_copy_page_first_pages_batch(
   return false;
 #else
   host::RuntimeCheck(src_ptrs.size() == dst_ptrs.size(), "Source and destination tensors must have the same count");
+  const size_t num_copies = static_cast<size_t>(src_ptrs.size()) * static_cast<size_t>(num_pages);
+  if (num_copies == 0) {
+    return true;
+  }
   constexpr size_t kLargeCopyThresholdBytes = 128 * 1024;
   thread_local std::vector<MemcpyBatchPtr> batch_srcs;
   thread_local std::vector<MemcpyBatchPtr> batch_dsts;
@@ -124,7 +150,6 @@ inline bool try_copy_page_first_pages_batch(
   }
 #endif
 
-  const size_t num_copies = static_cast<size_t>(src_ptrs.size()) * static_cast<size_t>(num_pages);
   batch_srcs.clear();
   batch_dsts.clear();
   batch_sizes.clear();
@@ -165,6 +190,7 @@ inline bool try_copy_page_first_pages_batch(
   hipError_t err = copy_fn(
       batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), num_copies, nullptr, nullptr, 0, &fail_idx, stream);
   if (err == hipErrorNotSupported || err == hipErrorInvalidValue) {
+    warn_hip_batch_fallback_once(err, fail_idx);
     (void)hipGetLastError();
     return false;
   }
