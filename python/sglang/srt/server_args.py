@@ -2874,14 +2874,21 @@ class ServerArgs:
         NS("mm"),
     ] = "auto"
     mm_global_cache_backend: A[
-        str,
+        Optional[str],
         Arg(
             help="Storage backend for the multimodal global embedding cache. "
-            "Used when --enable-mm-global-cache is set.",
+            "Used when --enable-mm-global-cache is set. If unset, only the CPU host pool is used.",
             choices=["mooncake"],
         ),
         NS("mm"),
-    ] = "mooncake"
+    ] = None
+    mm_global_cache_size_gb: A[
+        float,
+        "CPU host memory pool size in GiB per encoder rank for the multimodal "
+        "global embedding cache. This controls the L2 cache only, not the "
+        "configured storage backend.",
+        NS("mm"),
+    ] = 4.0
     disable_fast_image_processor: A[
         bool,
         "Deprecated. Use --image-processor-backend=pil instead.",
@@ -4133,6 +4140,8 @@ class ServerArgs:
             and self.mm_preprocess_cache_size_mb < 0
         ):
             raise ValueError("mm_preprocess_cache_size_mb must be non-negative")
+        if self.mm_global_cache_size_gb <= 0:
+            raise ValueError("mm_global_cache_size_gb must be positive")
         if self.mm_process_config is not None:
             if not isinstance(self.mm_process_config, dict):
                 raise TypeError(

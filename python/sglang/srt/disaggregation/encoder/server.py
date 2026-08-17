@@ -551,12 +551,16 @@ class MMEncoder:
             )
             from sglang.srt.mem_cache.embedding_store import EmbeddingStoreFactory
 
-            embedding_store = EmbeddingStoreFactory.create_backend(
-                get_mm().mm_global_cache_backend,
+            backend = get_mm().mm_global_cache_backend
+            embedding_store = (
+                EmbeddingStoreFactory.create_backend(backend)
+                if backend is not None
+                else None
             )
             self.mm_global_cache = EmbeddingCacheController(
                 rank,
                 server_args.tp_size,
+                max_pool_size_gb=get_mm().mm_global_cache_size_gb,
                 embedding_store=embedding_store,
                 hidden_dims=self._embedding_dims,
                 tp_group=get_tp_group().cpu_group,
