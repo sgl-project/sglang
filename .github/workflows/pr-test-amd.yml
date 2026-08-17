@@ -70,10 +70,40 @@ on:
         required: false
         type: boolean
         default: false
+      custom_image:
+        description: 'Run every job against this exact image instead of the nightly rocm/sgl-dev lookup. Single-arch runs only; a full sweep spans mi30x and mi35x.'
+        required: false
+        type: string
+        default: ''
+      custom_image_repo:
+        description: 'Look images up in this repo instead of rocm/sgl-dev, per arch (e.g. a test registry holding release-workflow output)'
+        required: false
+        type: string
+        default: ''
+      custom_image_rocm_version:
+        description: 'ROCm spelling in the custom repo tag, when it differs from the suite default (e.g. rocm10)'
+        required: false
+        type: string
+        default: ''
   workflow_call:
     inputs:
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      custom_image:
+        description: 'Run every job against this exact image instead of the nightly rocm/sgl-dev lookup'
+        required: false
+        type: string
+        default: ''
+      custom_image_repo:
+        description: 'Look images up in this repo instead of rocm/sgl-dev, per arch'
+        required: false
+        type: string
+        default: ''
+      custom_image_rocm_version:
+        description: 'ROCm spelling in the custom repo tag, when it differs from the suite default'
         required: false
         type: string
         default: ''
@@ -113,6 +143,14 @@ env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+  # Empty on every normal run, so amd_ci_start_container.sh keeps its nightly
+  # image lookup. Set by a dispatch to validate a freshly built image with the
+  # standard suite. Prefer custom_image_repo for a full sweep: it resolves one
+  # image per arch, while custom_image pins the same reference on both mi30x
+  # and mi35x runners.
+  CUSTOM_IMAGE: ${{ inputs.custom_image }}
+  CUSTOM_IMAGE_REPO: ${{ inputs.custom_image_repo }}
+  CUSTOM_IMAGE_ROCM_VERSION: ${{ inputs.custom_image_rocm_version }}
 
 concurrency:
   # Scheduled, run_all_tests, and manual dispatch runs get unique groups (never cancel each other).

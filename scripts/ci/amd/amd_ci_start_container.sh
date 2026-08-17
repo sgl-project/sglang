@@ -31,6 +31,13 @@ MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
 # Inherited from the environment so a workflow can point every job at one image
 # without touching each call site; --custom-image still wins.
 CUSTOM_IMAGE="${CUSTOM_IMAGE:-}"
+# A whole sweep spans mi30x and mi35x runners, so one image reference cannot
+# serve it. Naming the repo instead composes the same
+# v<version>-<rocm>-<arch>-<date> tag find_latest_image builds, per job.
+CUSTOM_IMAGE_REPO="${CUSTOM_IMAGE_REPO:-}"
+CUSTOM_IMAGE_ROCM_VERSION="${CUSTOM_IMAGE_ROCM_VERSION:-}"
+CUSTOM_IMAGE_VERSION="${CUSTOM_IMAGE_VERSION:-}"
+CUSTOM_IMAGE_DATE="${CUSTOM_IMAGE_DATE:-}"
 BUILD_FROM_DOCKERFILE=""
 GPU_ARCH_BUILD=""
 
@@ -60,6 +67,10 @@ while [[ $# -gt 0 ]]; do
       echo "Environment:"
       echo "  CUSTOM_IMAGE=IMAGE"
       echo "      Same as --custom-image; lets a workflow pin every job to one image."
+      echo "  CUSTOM_IMAGE_REPO=REPO"
+      echo "      Look the image up in REPO instead of rocm/sgl-dev, composing the same"
+      echo "      v<version>-<rocm>-<arch>-<date> tag per job. Optionally refine with"
+      echo "      CUSTOM_IMAGE_ROCM_VERSION, CUSTOM_IMAGE_VERSION and CUSTOM_IMAGE_DATE."
       echo "  ENABLE_CACHE_HOST=1|0"
       echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 35x, otherwise 0. Missing host cache falls back to container-local /sgl-data."
       exit 0
@@ -236,6 +247,43 @@ find_latest_image() {
       ;;
   esac
 }
+
+# Resolve CUSTOM_IMAGE_REPO into a per-job image reference. The tag is the same
+# shape find_latest_image composes for rocm/sgl-dev, so a repo holding release
+# workflow output needs nothing but its name: the version comes from the same
+# get_version_tag.py the release job used, the arch from the runner, and the date
+# from probing back a week, so a rebuild on another day still resolves and a new
+# release tag cannot desync the two sides.
+find_image_in_repo() {
+  local rocm_version="${CUSTOM_IMAGE_ROCM_VERSION:-${ROCM_VERSION}}"
+  local version="${CUSTOM_IMAGE_VERSION:-${SGLANG_VERSION}}"
+  local base="${CUSTOM_IMAGE_REPO}:${version}-${rocm_version}-${GPU_ARCH}"
+  local days_back candidate
+
+  if [[ -n "${CUSTOM_IMAGE_DATE}" ]]; then
+    echo "${base}-${CUSTOM_IMAGE_DATE}"
+    return 0
+  fi
+
+  for days_back in {0..6}; do
+    candidate="${base}-$(date -d "${days_back} days ago" +%Y%m%d)"
+    if docker manifest inspect "${candidate}" >/dev/null 2>&1; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+
+  echo "Error: no ${base}-<date> image published in the last 7 days" >&2
+  return 1
+}
+
+# Failing here is deliberate: falling through to find_latest_image would silently
+# run the suite against the published nightly and report that as the result for
+# whatever image the caller meant to test.
+if [[ -z "${CUSTOM_IMAGE}" && -n "${CUSTOM_IMAGE_REPO}" ]]; then
+  CUSTOM_IMAGE="$(find_image_in_repo)"
+  echo "Resolved image from ${CUSTOM_IMAGE_REPO}: ${CUSTOM_IMAGE}"
+fi
 
 # Determine which image to use
 if [[ -n "${CUSTOM_IMAGE}" ]]; then
