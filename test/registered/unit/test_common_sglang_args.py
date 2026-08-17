@@ -1,5 +1,4 @@
-"""Unit tests for --device in the shared CLI parser of sglang.test.test_utils.
-"""
+"""Unit tests for --device in the shared CLI parser of sglang.test.test_utils."""
 
 import argparse
 import contextlib
