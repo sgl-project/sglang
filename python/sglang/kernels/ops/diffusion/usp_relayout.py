@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -53,6 +54,7 @@ def _usp_merge_heads_custom_op(x: torch.Tensor) -> torch.Tensor:
 def can_use_usp_merge_heads(x: torch.Tensor) -> bool:
     return (
         isinstance(x, torch.Tensor)
+        and current_platform.is_cuda()
         and torch.version.hip is None
         and x.is_cuda
         and x.dtype in _SUPPORTED_DTYPES
