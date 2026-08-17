@@ -214,6 +214,30 @@ class MambaSubPoolSpec(SubPoolSpec):
 # ---------------------------------------------------------------------------
 
 
+def _reserved_floor_bytes(sub_pool_specs: List[SubPoolSpec], page_size: int) -> int:
+    """Bytes at the bottom of the buffer reserved as the slot-0 padding sink.
+
+    Slot-0 dummy writes for every sub-pool land here; each sub-pool's first
+    allocatable slot is chosen so real data starts past it. For a PAGE-AWARE
+    sub-pool the slot-0 write touches layer blocks spread across the whole
+    page-0 envelope (page_size * entry_bytes), not just one slot envelope --
+    but a mamba sub-pool is page_size=1, so its entry is charged ONCE. Charging
+    a mamba entry per page would reserve page_size * ~100 MB of buffer that the
+    sink never touches.
+
+    Single source of truth: `UnifiedKVPool` reserves exactly this, and the
+    factories' bs=1 feasibility floors charge exactly this.
+    """
+    return max(
+        [max(s.entry_bytes() for s in sub_pool_specs)]
+        + [
+            page_size * s.entry_bytes()
+            for s in sub_pool_specs
+            if not isinstance(s, MambaSubPoolSpec)  # mamba is page_size=1
+        ]
+    )
+
+
 class UnifiedKVPool:
     """One physical `uint8` byte buffer shared by 2 sub-pools, each exposing
     strided per-layer views. Allocators keep byte ranges disjoint; no usage tracking here.
@@ -286,18 +310,7 @@ class UnifiedKVPool:
         # For a page-aware sub-pool the slot-0 write touches layer blocks spread
         # across the WHOLE page-0 envelope (up to page_size * entry_bytes), not
         # just one slot envelope — reserve the max of both.
-        # For a page-aware sub-pool the slot-0 write touches layer blocks spread
-        # across the WHOLE page-0 envelope (up to page_size * entry_bytes), not
-        # just one slot envelope — reserve the max of both.
-        entry_max = max(s.entry_bytes() for s in sub_pool_specs)
-        reserved_floor = max(
-            [entry_max]
-            + [
-                page_size * s.entry_bytes()
-                for s in sub_pool_specs
-                if not isinstance(s, MambaSubPoolSpec)  # mamba is page_size=1
-            ]
-        )
+        reserved_floor = _reserved_floor_bytes(sub_pool_specs, page_size)
 
         for spec in sub_pool_specs:
             entry_bytes = spec.entry_bytes()
@@ -1085,6 +1098,31 @@ class UnifiedPoolBundle(NamedTuple):
     req_to_token_pool: object  # UnifiedHybridReqToTokenPool
 
 
+def _check_bs1_feasibility_floor(
+    *,
+    total_bytes: int,
+    floor_terms: List[Tuple[str, int]],
+    factory: str,
+) -> None:
+    """bs=1 feasibility FLOOR — the retract loop's terminal guarantee.
+
+    The scheduler retracts requests until the LAST one fits; if one worst-case
+    request running ALONE does not fit in the buffer, under-sizing is a retract
+    LIVELOCK at runtime, not a perf bug. Fail loud at boot, before any pool
+    construction, with the itemized requirement.
+    """
+    floor = sum(b for _, b in floor_terms)
+    if total_bytes >= floor:
+        return
+    detail = " + ".join(f"{name}={b}" for name, b in floor_terms)
+    raise RuntimeError(
+        f"[unified-memory-pool] {factory}: byte budget {total_bytes} cannot fit "
+        f"ONE worst-case request (bs=1 floor {floor} = {detail}). A pool this "
+        f"size retract-livelocks at runtime. Raise --mem-fraction-static, lower "
+        f"the model context length, or reduce reserved memory."
+    )
+
+
 def init_unified_mamba_pools(
     *,
     device: str,
@@ -1176,6 +1214,18 @@ def init_unified_mamba_pools(
             max_total_num_tokens * full_spec.entry_bytes()
             + max_mamba_cache_size * mamba_spec.entry_bytes()
         )
+    # bs=1 floor: full KV at max context + the state slots ONE running request
+    # locks (1 active + 2 radix checkpoints — the checkpoint slots are a
+    # per-request FLOOR, not headroom) + the reserved slot-0 sink page.
+    _check_bs1_feasibility_floor(
+        total_bytes=total_bytes,
+        floor_terms=[
+            ("full_ctx_kv", model_context_len * full_spec.entry_bytes()),
+            ("bs1_state_slots", 3 * mamba_spec.entry_bytes()),
+            ("sink", _reserved_floor_bytes([full_spec, mamba_spec], page_size)),
+        ],
+        factory="init_unified_mamba_pools",
+    )
     # Dense MLA views are per-layer shifted, so the last layer's view reaches one
     # page envelope past the final page — allocation-only tail pad (~page bytes).
     view_tail_pad_bytes = page_size * full_spec.entry_bytes() if use_mla_backend else 0
@@ -1599,6 +1649,8 @@ def init_unified_swa_pools(
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
     unified_total_bytes: Optional[int] = None,
+    model_context_len: Optional[int] = None,
+    sliding_window_size: Optional[int] = None,
 ) -> UnifiedSWAPoolBundle:
     """Build the SWA-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.multi_ended_allocator import (
@@ -1645,6 +1697,24 @@ def init_unified_swa_pools(
         total_bytes = (
             full_max_total_num_tokens * full_spec.entry_bytes()
             + swa_max_total_num_tokens * swa_spec.entry_bytes()
+        )
+    if model_context_len is not None:
+        # bs=1 floor: full KV at max context + ONE sliding window of swa KV
+        # (+ a page of slack for the window's page-granular walk) + the
+        # reserved slot-0 sink page.
+        swa_bs1_tokens = (
+            min(model_context_len, sliding_window_size + page_size)
+            if sliding_window_size is not None
+            else model_context_len
+        )
+        _check_bs1_feasibility_floor(
+            total_bytes=total_bytes,
+            floor_terms=[
+                ("full_ctx_kv", model_context_len * full_spec.entry_bytes()),
+                ("swa_window_kv", swa_bs1_tokens * swa_spec.entry_bytes()),
+                ("sink", _reserved_floor_bytes([full_spec, swa_spec], page_size)),
+            ],
+            factory="init_unified_swa_pools",
         )
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
