@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 import os
 import sys
 from contextlib import contextmanager
@@ -856,6 +857,11 @@ class RuntimeContext:
             self._check_role_namespace(name)
         return bags[name]
 
+    def is_config_namespace_published(self, name: str) -> bool:
+        """Return whether a config namespace exists in the current context."""
+        bags = self._config_bags
+        return bags is not None and name in bags
+
     def _check_role_namespace(self, name: str) -> None:
         # Out of line so the mode gate above stays one dead-branch-prunable
         # check under dynamo in the default "off" mode (config_bag runs inside
@@ -1419,6 +1425,82 @@ def mamba_extra_buffer_lazy_enabled() -> bool:
     )
 
 
+def remote_instance_transfer_engine_enabled(load_format: str | None = None) -> bool:
+    """Whether remote-instance weight loading runs over the transfer engine.
+
+    Every input is a ``model`` leaf, so this derives from the bags and follows a
+    post-publish override; ``ServerArgs.remote_instance_weight_loader_use_transfer_engine``
+    is the pre-publish equivalent, and both go through the same helper.
+    ``load_format`` is the caller's own (a draft runner loading under
+    ``--speculative-draft-load-format`` has one the process record does not).
+    """
+    from sglang.srt.arg_groups.overrides import remote_instance_transfer_engine_of
+
+    return remote_instance_transfer_engine_of(get_model(), load_format)
+
+
+def max_prefill_buffer_tokens() -> int:
+    """The prefill-buffer ceiling: ``chunked_prefill_size``, except PP dynamic
+    chunking can grow chunks toward ``max_prefill_tokens`` and probe at 1.25x.
+
+    Every input is a published leaf (``schedule`` plus the configured PP size),
+    so this derives from the bags and follows a post-publish override;
+    ``ServerArgs.max_prefill_buffer_tokens`` is the pre-publish equivalent and
+    ``TestDerivedPredicatesAgreeAcrossTiers`` pins the two equal.
+    """
+    import math
+
+    schedule = get_schedule()
+    chunked = (
+        schedule.chunked_prefill_size
+        if schedule.chunked_prefill_size and schedule.chunked_prefill_size > 0
+        else 0
+    )
+    tokens = chunked
+    if (
+        schedule.enable_dynamic_chunking
+        and _configured_parallel("pp_size") > 1
+        and chunked
+    ):
+        tokens = max(
+            tokens, schedule.max_prefill_tokens or 0, math.ceil(chunked * 1.25)
+        )
+    return tokens
+
+
+def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
+    """The activation working-set reserve held back before cuda-graph capture.
+
+    Derived from published leaves across four bags (``disagg`` / ``schedule`` /
+    ``exec.graph`` / ``spec``) plus the configured parallel sizes, so it follows
+    a post-publish override; ``ServerArgs.pre_capture_activation_reserve_mb`` is
+    the pre-publish equivalent and
+    ``TestDerivedPredicatesAgreeAcrossTiers`` pins the two equal.
+    """
+    schedule = get_schedule()
+    if get_disagg().disaggregation_mode == "decode":
+        running_requests = (
+            schedule.max_running_requests
+            or get_exec().graph.cuda_graph_config.decode.max_bs
+            or 1
+        )
+        activation_tokens = max(
+            running_requests * (get_spec().speculative_num_draft_tokens or 1), 2048
+        )
+    elif schedule.chunked_prefill_size > 0:
+        activation_tokens = max(schedule.chunked_prefill_size, 2048)
+    else:
+        activation_tokens = max(schedule.max_prefill_tokens, 2048)
+    reserved_mem = (
+        512
+        + activation_tokens * 1.5
+        + _configured_parallel("tp_size") * _configured_parallel("pp_size") / 8 * 1024
+    )
+    if gpu_mem is not None and gpu_mem > 60 * 1024:
+        reserved_mem = max(reserved_mem, 10 * 1024)
+    return reserved_mem
+
+
 # --- Derived config accessors ------------------------------------------------
 #
 # A few values are computed from several config fields plus the HF config, so
@@ -1433,6 +1515,14 @@ def mamba_cache_chunk_size() -> int:
     """The caching point granularity for mamba state: ``max(the model's mamba
     chunk size, page_size)``. Cached on the config after the first call."""
     return get_server_args().mamba_cache_chunk_size
+
+
+def mamba_checkpoint_grid(tree_page: int) -> int:
+    """The granularity a donated mamba checkpoint's depth must land on so the
+    radix tree can name it. Pass the page the tree actually allocates on: DCP
+    widens it past ``mamba_cache_chunk_size``, and deriving that here would be a
+    second copy of a predicate that already lives in the cache builder."""
+    return math.lcm(mamba_cache_chunk_size(), tree_page)
 
 
 def max_speculative_num_draft_tokens() -> int | None:
