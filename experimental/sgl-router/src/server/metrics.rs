@@ -24,6 +24,7 @@
 //! | `sgl_router_request_duration_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_overhead_seconds` | Histogram | `model_id` |
+//! | `sgl_router_tokenize_seconds` | Histogram | `model_id` |
 //! | `sgl_router_itl_seconds` | Histogram | `model_id` |
 //! | `sgl_router_responses_total` | Counter | `route`, `method`, `status_code` |
 //! | `sgl_router_overlap_blocks` | Histogram | `model_id` |
@@ -175,6 +176,20 @@ const ADMISSION_WAIT_BUCKETS: &[f64] = &[
 /// check enforces the equality, so treat the shared range as incidental.
 const TTFT_OVERHEAD_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+];
+
+/// Histogram bucket upper bounds (seconds) for `sgl_router_tokenize_seconds` —
+/// ingress chat-encode plus tokenize, in isolation.
+///
+/// Deliberately finer at the bottom than [`TTFT_OVERHEAD_BUCKETS`]: tokenize is
+/// a CPU-bound, sub-millisecond-to-low-millisecond operation on typical prompts,
+/// and the overhead ladder's 1 ms floor puts nearly every healthy sample in the
+/// first bucket, where `histogram_quantile` cannot resolve it. The ladder starts
+/// at 100 µs and still reaches 5 s so a pathological prompt (very long input, or
+/// a cold BPE merge cache under lock contention) lands in a real bucket rather
+/// than `+Inf`.
+const TOKENIZE_BUCKETS: &[f64] = &[
+    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
 ];
 
 /// Recordable outcome for a request — narrowed to a handful of variants so
@@ -513,6 +528,12 @@ pub struct MetricsRegistry {
     /// time; see [`Self::observe_ttft_overhead`] for how its sample set relates
     /// to `ttft_seconds`.
     ttft_overhead_seconds: Mutex<HashMap<String, Histogram>>,
+    /// Ingress tokenize cost alone, per model — the first term of
+    /// `ttft_overhead_seconds`, broken out so a slow tokenizer is separable
+    /// from admission wait. Recorded on every request the ingress tokenizes,
+    /// which is a strictly wider sample set than `ttft_overhead_seconds`; see
+    /// [`Self::observe_tokenize`].
+    tokenize_seconds: Mutex<HashMap<String, Histogram>>,
     itl_seconds: Mutex<HashMap<String, Histogram>>,
     // Edge responses by route/method/status (incl. early-exit 400/413/503 and the
     // CatchPanicLayer-synthesized 500).
@@ -606,6 +627,7 @@ impl Default for MetricsRegistry {
             request_duration: Default::default(),
             ttft_seconds: Default::default(),
             ttft_overhead_seconds: Default::default(),
+            tokenize_seconds: Default::default(),
             itl_seconds: Default::default(),
             responses_total: Default::default(),
             overlap_blocks: Default::default(),
@@ -944,6 +966,50 @@ impl MetricsRegistry {
         let hist = guard
             .entry(model_id.to_owned())
             .or_insert_with(|| Histogram::new(TTFT_OVERHEAD_BUCKETS));
+        hist.observe(seconds);
+    }
+
+    /// Observe ingress tokenize cost (seconds) for `sgl_router_tokenize_seconds`.
+    ///
+    /// BOUNDARY — the span starts once the request body is fully read into
+    /// memory and ends the instant token ids are ready. Concretely it covers the
+    /// body's JSON parse, the chat-template render, and the encode. It excludes
+    /// everything on both sides: body read and header handling before it,
+    /// admission wait, request build, worker connect, send, and dispatch after
+    /// it. That exclusion is the entire point. Widen this span to include
+    /// dispatch and the metric degenerates into a second, worse measurement of
+    /// `Server-Timing: router.ttfb`, answering nothing that header does not.
+    ///
+    /// The JSON parse is inside the span deliberately — it is unavoidable work
+    /// on the path from bytes to ids, and on large multimodal payloads (the body
+    /// cap is 100 MiB) it can outweigh the encode itself. Read this metric as
+    /// "bytes to ids", not as pure BPE time.
+    ///
+    /// This is the FIRST TERM of `sgl_router_ttft_overhead_seconds`
+    /// (tokenize + admission wait + request build), broken out because the three
+    /// terms have unrelated causes and unrelated fixes: tokenize is CPU work
+    /// scaling with prompt length and BPE-cache locality, admission wait is
+    /// queueing under saturation. The aggregate cannot distinguish them, and
+    /// admission wait dominates it under load. The two metrics deliberately
+    /// overlap — do not sum them.
+    ///
+    /// Recorded for EVERY request the ingress tokenizes, on every route and
+    /// regardless of outcome, including requests later shed at admission. Its
+    /// sample set is therefore a superset of `ttft_overhead_seconds`, which is
+    /// streaming-2xx only. Expect `tokenize_count ≥ overhead_count`; the gap is
+    /// non-streaming, non-2xx, and shed requests. Requests the ingress does not
+    /// tokenize (no chat encoder and a policy that needs no tokens) record
+    /// nothing at all rather than a zero, so the histogram stays a distribution
+    /// of real tokenize work. Uses [`TOKENIZE_BUCKETS`].
+    pub fn observe_tokenize(&self, model_id: &str, seconds: f64) {
+        // See `observe_request_duration` — drop non-finite before the map.
+        if !seconds.is_finite() {
+            return;
+        }
+        let mut guard = self.tokenize_seconds.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(TOKENIZE_BUCKETS));
         hist.observe(seconds);
     }
 
@@ -1397,6 +1463,21 @@ impl MetricsRegistry {
                 &label_body,
                 hist,
             );
+        }
+        drop(guard);
+
+        // tokenize histogram
+        out.push_str(
+            "# HELP sgl_router_tokenize_seconds Ingress cost from body-fully-read to token-ids-ready (JSON parse + chat-template render + encode), in seconds. Excludes admission wait, request build and engine dispatch. The tokenize term of sgl_router_ttft_overhead_seconds, recorded for every request the router tokenizes; overlaps that metric by construction - do not sum them.\n",
+        );
+        out.push_str("# TYPE sgl_router_tokenize_seconds histogram\n");
+        let guard = self.tokenize_seconds.lock();
+        let mut models: Vec<&String> = guard.keys().collect();
+        models.sort();
+        for model_id in models {
+            let hist = guard.get(model_id).unwrap();
+            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
+            render_histogram(&mut out, "sgl_router_tokenize_seconds", &label_body, hist);
         }
         drop(guard);
 
@@ -2258,6 +2339,69 @@ mod tests {
         // le=0.25 is cumulative over both observations.
         assert!(
             out.contains(r#"sgl_router_ttft_overhead_seconds_bucket{model_id="tiny",le="0.25"} 2"#)
+        );
+    }
+
+    #[test]
+    fn observe_tokenize_writes_buckets_sum_and_count() {
+        let reg = MetricsRegistry::new();
+        reg.observe_tokenize("tiny", 0.002);
+        reg.observe_tokenize("tiny", 0.03);
+        let out = reg.render();
+        assert!(
+            out.contains("# TYPE sgl_router_tokenize_seconds histogram"),
+            "expected tokenize TYPE header; got:\n{out}",
+        );
+        assert!(
+            out.contains(r#"sgl_router_tokenize_seconds_count{model_id="tiny"} 2"#),
+            "expected tokenize count=2; got:\n{out}",
+        );
+        // 0.002 <= 0.0025, so that bucket is 1 (cumulative); 0.03 exceeds it.
+        assert!(
+            out.contains(r#"sgl_router_tokenize_seconds_bucket{model_id="tiny",le="0.0025"} 1"#),
+            "expected le=0.0025 bucket = 1; got:\n{out}",
+        );
+        // le=0.05 is cumulative over both observations.
+        assert!(
+            out.contains(r#"sgl_router_tokenize_seconds_bucket{model_id="tiny",le="0.05"} 2"#),
+            "expected le=0.05 bucket = 2; got:\n{out}",
+        );
+    }
+
+    /// The whole point of a separate ladder: a typical tokenize (~1 ms) must not
+    /// collapse into the first bucket the way it does on the overhead grid,
+    /// where everything below 1 ms is unresolvable.
+    #[test]
+    fn tokenize_buckets_resolve_sub_millisecond() {
+        let reg = MetricsRegistry::new();
+        reg.observe_tokenize("tiny", 0.0002); // 200 us
+        reg.observe_tokenize("tiny", 0.0008); // 800 us
+        let out = reg.render();
+        // Two sub-millisecond samples land in DIFFERENT buckets.
+        assert!(
+            out.contains(r#"sgl_router_tokenize_seconds_bucket{model_id="tiny",le="0.00025"} 1"#),
+            "expected 200us alone in le=0.00025; got:\n{out}",
+        );
+        assert!(
+            out.contains(r#"sgl_router_tokenize_seconds_bucket{model_id="tiny",le="0.001"} 2"#),
+            "expected both by le=0.001; got:\n{out}",
+        );
+        // Both would be indistinguishable on the overhead ladder (floor 1 ms).
+        assert_eq!(TTFT_OVERHEAD_BUCKETS[0], 0.001);
+        assert!(TOKENIZE_BUCKETS[0] < TTFT_OVERHEAD_BUCKETS[0]);
+    }
+
+    /// Non-finite input must never reach the histogram — same contract as the
+    /// other `observe_*` entry points.
+    #[test]
+    fn observe_tokenize_drops_non_finite() {
+        let reg = MetricsRegistry::new();
+        reg.observe_tokenize("tiny", f64::NAN);
+        reg.observe_tokenize("tiny", f64::INFINITY);
+        let out = reg.render();
+        assert!(
+            !out.contains(r#"sgl_router_tokenize_seconds_count{model_id="tiny"}"#),
+            "non-finite observations must not create a series; got:\n{out}",
         );
     }
 

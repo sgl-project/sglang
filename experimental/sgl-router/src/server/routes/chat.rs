@@ -338,6 +338,26 @@ async fn chat_completions_inner(
     } else {
         None
     };
+    // Ingress-tokenize cost as a metric, spanning `at_pre_tokenize` (body
+    // already fully read) to `at_post_tokenize` (ids ready) — parse + render +
+    // encode, and nothing downstream. Keep both markers adjacent to the tokenize
+    // work: extending this span past admission or dispatch would turn the metric
+    // into a duplicate of the `router.ttfb` Server-Timing header.
+    //
+    // Unsampled, unlike the diagnostic log below — a histogram is the aggregate
+    // the log's 1-in-N sample was only ever a proxy for. Recorded only when the
+    // ingress actually tokenized: a request
+    // on a model with no chat encoder, under a policy that needs no tokens,
+    // would otherwise contribute a meaningless ~0 sample and drag every
+    // quantile toward zero.
+    if want_tokens {
+        ctx.metrics.observe_tokenize(
+            &model_str,
+            at_post_tokenize
+                .saturating_sub(at_pre_tokenize)
+                .as_secs_f64(),
+        );
+    }
     // Diagnostic: ingress-tokenize cost, sampled. Fires for EVERY request that
     // reaches here — including those about to be shed at admission below — so a
     // shed request's pre-admission time (the latency the access log shows on a
