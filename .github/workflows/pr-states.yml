@@ -143,37 +143,18 @@ jobs:
             const labelOnOpts  = { preSleepMs: LABEL_ON_PRESLEEP_MS, attempts: RETRY_ATTEMPTS, delayMs: RETRY_DELAY_MS };
             const labelOffOpts = { preSleepMs: justRemovedLabel ? LABEL_OFF_PRESLEEP_MS : 0, attempts: 1 };
 
-            // workflow_run carries the triggering attempt even before the
-            // Actions list endpoint has indexed it. Use that payload when it
-            // belongs to the PR's current SHA; otherwise query by workflow.
-            const eventRun = context.eventName === 'workflow_run'
-              && context.payload.workflow_run.head_sha === sha
-              && context.payload.workflow_run.conclusion !== 'skipped'
-              ? context.payload.workflow_run
-              : null;
-            const findCurrentRun = (workflowFile, workflowName, opts) => (
-              eventRun && eventRun.name === workflowName
-                ? eventRun
-                : findRun(workflowFile, opts)
-            );
-
             // Lookups are independent, so run them concurrently. The AMD
             // workflow has a pull_request.paths filter: do one immediate
             // lookup instead of retrying a legitimately absent run. If it
             // does dispatch, its workflow_run event refreshes this block.
             const [ptRun, peRun, amdRun] = await Promise.all([
-              findCurrentRun('pr-test.yml', 'PR Test Base', hasCI ? labelOnOpts : labelOffOpts),
+              findRun('pr-test.yml', hasCI ? labelOnOpts : labelOffOpts),
               // pr-test-extra gates on BOTH labels (see check-changes there).
-              findCurrentRun(
+              findRun(
                 'pr-test-extra.yml',
-                'PR Test Extra',
                 (hasCI && hasExtra) ? labelOnOpts : labelOffOpts,
               ),
-              findCurrentRun(
-                'pr-test-amd-rocm720.yml',
-                'PR Test ROCm 7.2 (AMD)',
-                labelOffOpts,
-              ),
+              findRun('pr-test-amd-rocm720.yml', labelOffOpts),
             ]);
 
             const missingCIText = ':x: **Missing `run-ci` label** -- add it to run CI tests.';
