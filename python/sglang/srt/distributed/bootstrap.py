@@ -239,7 +239,7 @@ def _init_parallel_groups(
         duplicate_attn_cp_group=(
             is_hip()
             and server_args.enable_two_batch_overlap
-            and server_args.enable_dsa_prefill_context_parallel
+            and get_parallel().enable_dsa_prefill_context_parallel
         ),
         enable_symm_mem=server_args.enable_symm_mem,
         recovered_rank=is_ep_joiner,
