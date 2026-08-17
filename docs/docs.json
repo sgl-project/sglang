@@ -964,6 +964,7 @@
               "docs/advanced_features/observability",
               "docs/advanced_features/model_loading",
               "docs/advanced_features/object_storage",
+              "docs/advanced_features/matrixhub",
               "docs/advanced_features/checkpoint_engine",
               "docs/advanced_features/sglang_for_rl"
             ]
