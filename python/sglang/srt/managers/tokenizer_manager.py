@@ -145,6 +145,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
+    resolve_image_processor_backend,
 )
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
@@ -466,7 +467,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         server_args = self.server_args
 
         # Initialize tokenizer and processor
-        if self.model_config.is_multimodal:
+        if self.model_config.is_multimodal and not server_args.language_model_only:
             import_processors("sglang.srt.multimodal.processors")
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
@@ -1023,6 +1024,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         contains_mm_input = obj.contains_mm_input()
+        if contains_mm_input and self.server_args.language_model_only:
+            raise ValueError(
+                "Multimodal inputs are not supported when --language-model-only "
+                "is set; the encoder is not loaded. Restart without the flag."
+            )
         is_mossvl = (
             "MossVLForConditionalGeneration"
             in self.model_config.hf_config.architectures
@@ -1040,6 +1046,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.audio_data = [obj.audio_data]
             if contains_mm_input:
                 self._validate_mm_limits(obj)
+                # mm_content_hashes is a GenerateReqInput field; EmbeddingReqInput
+                # has no such attribute.
+                if isinstance(obj, GenerateReqInput):
+                    self._normalize_mm_content_hashes(obj)
 
             mm_inputs = None
             mm_processor_input = (
@@ -1143,6 +1153,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
+
+    @staticmethod
+    def _normalize_mm_content_hashes(obj: GenerateReqInput) -> None:
+        """Merge Native/OpenAI content identities and validate their alignment."""
+        from sglang.srt.multimodal.cache import parse_content_hash
+        from sglang.srt.utils import ImageData
+
+        images = obj.image_data or []
+        explicit = obj.mm_content_hashes
+        inline = [
+            image.content_hash if isinstance(image, ImageData) else None
+            for image in images
+        ]
+        if explicit is None and not any(inline):
+            return
+        if explicit is None:
+            explicit = inline
+        if len(explicit) != len(images):
+            raise ValueError(
+                f"mm_content_hashes has {len(explicit)} entries for "
+                f"{len(images)} images"
+            )
+
+        normalized = []
+        for index, (provided, embedded) in enumerate(zip(explicit, inline)):
+            provided = parse_content_hash(provided)
+            embedded = parse_content_hash(embedded)
+            if provided is not None and embedded is not None and provided != embedded:
+                raise ValueError(f"Conflicting content hashes for image_data[{index}]")
+            normalized.append(provided or embedded)
+        obj.mm_content_hashes = normalized
 
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
@@ -1393,6 +1434,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
+                cache_salt=obj.cache_salt,
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
@@ -2004,6 +2046,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 await self._wait_for_model_update_from_disk(obj)
             )
 
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -3556,34 +3600,15 @@ async def print_exception_wrapper(func):
 
 
 def get_processor_wrapper(server_args):
-    try:
-        processor = get_processor(
-            server_args.tokenizer_path,
-            tokenizer_mode=server_args.tokenizer_mode,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            use_fast=not server_args.disable_fast_image_processor,
-            tokenizer_backend=server_args.tokenizer_backend,
-            model_name=server_args.model_path,
-        )
-    except ValueError as e:
-        error_message = str(e)
-        if "does not have a slow version" in error_message:
-            logger.info(
-                f"Processor {server_args.tokenizer_path} does not have a slow version. Automatically use fast version"
-            )
-            processor = get_processor(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-                use_fast=True,
-                tokenizer_backend=server_args.tokenizer_backend,
-                model_name=server_args.model_path,
-            )
-        else:
-            raise e
-    return processor
+    return get_processor(
+        server_args.tokenizer_path,
+        tokenizer_mode=server_args.tokenizer_mode,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.revision,
+        image_processor_backend=resolve_image_processor_backend(server_args),
+        tokenizer_backend=server_args.tokenizer_backend,
+        model_name=server_args.model_path,
+    )
 
 
 def determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:

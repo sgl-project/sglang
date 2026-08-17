@@ -89,6 +89,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",
                     "fp8_gemm_runner_backend",
+                    "fp4_gemm_runner_backend",
                     "disable_custom_all_reduce",
                     "enable_aiter_allreduce_fusion",
                     "enable_symm_mem",
@@ -1771,29 +1772,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {"moe_runner_backend": "flashinfer_cutlass"},
             )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
-
-    def test_cutlass_moe_env_override_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _cutlass_moe_env_override,
-        )
-
-        with patch("sglang.srt.environ.envs.SGLANG_CUTLASS_MOE") as e:
-            e.get.return_value = True
-            self.assertEqual(
-                _cutlass_moe_env_override(
-                    ResolvedView(SimpleNamespace(quantization="fp8"))
-                ),
-                {"moe_runner_backend": "cutlass"},
-            )
-            with self.assertRaises(AssertionError):
-                _cutlass_moe_env_override(
-                    ResolvedView(SimpleNamespace(quantization=None))
-                )
-            e.get.return_value = False
-            self.assertEqual(
-                _cutlass_moe_env_override(ResolvedView(SimpleNamespace())), {}
-            )
 
     def test_gguf_quantization_pass(self):
         from sglang.srt.arg_groups.overrides import ResolvedView, _gguf_quantization

@@ -41,6 +41,8 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
     eight otherwise-idle ranks during encoding.
     """
 
+    layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
+
     supports_dp_encode = True
 
     @staticmethod
@@ -145,10 +147,6 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
         call_kwargs: dict[str, Any] = {
             "input_ids": ids,
             "attention_mask": torch.ones_like(ids),
-            "output_attentions": False,
-            "output_hidden_states": False,
-            "return_dict": True,
-            "use_cache": False,
         }
         if position_ids is not None:
             call_kwargs["position_ids"] = position_ids.to(self.device)
@@ -161,7 +159,7 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             )
             call_kwargs["video_grid_thw"] = host_video_grid_thw
 
-        hidden = self.model(**call_kwargs).last_hidden_state[0].to(torch.bfloat16)
+        hidden = self(**call_kwargs).last_hidden_state[0].to(torch.bfloat16)
         expected_shape = [int(ids.shape[1]), self.hidden_dim]
         if list(hidden.shape) != expected_shape:
             raise ValueError(

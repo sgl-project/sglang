@@ -8,10 +8,14 @@ contract accepts packed inference keyword arguments and returns packed logits.
 from __future__ import annotations
 
 import math
-from typing import Any
+import os
+import struct
+from contextlib import ExitStack
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
+from safetensors.torch import safe_open
 
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
@@ -21,6 +25,7 @@ from sglang.kernels.ops.diffusion.qknorm_rope import (
     fused_inplace_qknorm_rope,
 )
 from sglang.kernels.ops.diffusion.triton.indexed_modulation import (
+    indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
 )
@@ -32,12 +37,14 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTArchConfig,
     MiniMaxH3DiTConfig,
 )
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     tensor_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
+    get_tp_rank,
     get_ulysses_ctx,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -62,9 +69,12 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
+
+logger = init_logger(__name__)
 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
@@ -239,8 +249,9 @@ def _modulate_gate(
     indices: torch.Tensor,
     *,
     dtype: torch.dtype,
+    allow_inplace: bool = True,
 ) -> torch.Tensor:
-    """Apply indexed gated residual, reusing disposable CUDA BF16 input."""
+    """Apply an indexed gated residual, optionally reusing the input buffer."""
     # Apply the per-index gated residual: x + gate[idx] * other.
     if (
         x.is_cuda
@@ -251,7 +262,9 @@ def _modulate_gate(
         and x.is_contiguous()
         and other.is_contiguous()
     ):
-        return indexed_gate_bf16_(x, gate, other, indices)
+        if allow_inplace:
+            return indexed_gate_bf16_(x, gate, other, indices)
+        return indexed_gate_bf16(x, gate, other, indices)
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
@@ -588,6 +601,14 @@ class MiniMaxH3Attention(nn.Module):
         weight = self.qkv_proj.weight
         base_loader = weight.weight_loader
 
+        def _reorder_checkpoint_weight(loaded_weight: torch.Tensor) -> torch.Tensor:
+            return _reorder_grouped_qkv_to_qkv(
+                loaded_weight,
+                num_query_groups=arch.num_attention_heads,
+                heads_per_group=1,
+                head_dim=arch.attention_head_dim,
+            )
+
         def _weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
             # The grouped checkpoint layout is
             # [num_query_groups, q_per_group + k + v] before splitting.
@@ -602,18 +623,14 @@ class MiniMaxH3Attention(nn.Module):
                 tp_size=self.tp_size,
             ):
                 return
-            reordered = _reorder_grouped_qkv_to_qkv(
-                loaded_weight,
-                num_query_groups=arch.num_attention_heads,
-                heads_per_group=1,
-                head_dim=arch.attention_head_dim,
-            )
-            base_loader(param, reordered)
+            base_loader(param, _reorder_checkpoint_weight(loaded_weight))
 
         if hasattr(weight, "_weight_loader"):
             weight._weight_loader = _weight_loader
         else:
             weight.weight_loader = _weight_loader
+        # rank-local FSDP must reorder grouped QKV before selecting each shard
+        weight.rank_local_weight_transform = _reorder_checkpoint_weight
 
     def forward(
         self,
@@ -793,6 +810,289 @@ class MiniMaxH3AdalnProj(nn.Module):
         return self.split_output(x)
 
 
+# A ref2va request carrying both a visual and an audio reference reaches four
+# distinct timesteps in one step: video, audio, the imgvid condition and the
+# audio reference. That is the widest case, so it is the default; a deployment
+# serving only narrower tasks (t2va reaches 2, fl2va 3) can shrink the slab
+# proportionally via --minimax-h3-adaln-plan-width.
+MINIMAX_H3_ADALN_MAX_PLAN_WIDTH = 4
+
+
+def _plan_key(timesteps: torch.Tensor) -> tuple[int, ...]:
+    """One denoise step's unique timesteps as their exact fp32 bit patterns."""
+    return tuple(
+        struct.unpack("<I", struct.pack("<f", float(value)))[0]
+        for value in timesteps.tolist()
+    )
+
+
+class MiniMaxH3AdalnCache(nn.Module):
+    """Precomputed AdaLN outputs for fixed FP32 timestep plans."""
+
+    _FORMAT_VERSION = "2"
+    plan_timesteps: torch.Tensor
+    plan_lengths: torch.Tensor
+    block_params: torch.Tensor
+    final_params: torch.Tensor
+
+    def __init__(
+        self,
+        arch: MiniMaxH3DiTArchConfig,
+        *,
+        path: str | None = None,
+        model_variant: str | None = None,
+        weight_files: list[str] | None = None,
+        max_plans: int = 64,
+        max_plan_width: int = MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
+    ) -> None:
+        super().__init__()
+        if (path is None) == (weight_files is None):
+            raise ValueError(
+                "MiniMax H3 AdaLN cache takes exactly one of path (prebuilt "
+                "sidecar) or weight_files (rebuild from the checkpoint)"
+            )
+        self.path = path
+        self.model_variant = model_variant
+        self.weight_files = weight_files
+        self.max_plans = max_plans
+        self.max_plan_width = max_plan_width
+        self.num_layers = arch.num_layers
+        self.hidden_size = arch.hidden_size
+        self.block_width = 6 * MINIMAX_H3_ADALN_MODALITY_NUM * arch.hidden_size
+        self.final_width = 2 * arch.hidden_size
+        # Rebuild path only: plan bit pattern -> slot, tracked on the host.
+        self._slots: dict[tuple[int, ...], int] = {}
+        self.rebuilds = 0
+
+    def load(self, device: torch.device) -> None:
+        if self.path is None:
+            self._allocate(device)
+            return
+        if not os.path.isfile(self.path):
+            raise ValueError(f"MiniMax H3 AdaLN cache does not exist: {self.path}")
+
+        with safe_open(self.path, framework="pt", device="cpu") as cache_file:
+            metadata = cache_file.metadata() or {}
+            if metadata.get("format_version") != self._FORMAT_VERSION:
+                raise ValueError(
+                    "MiniMax H3 AdaLN cache has an unsupported or missing format_version"
+                )
+            cache_variant = metadata.get("model_variant")
+            if self.model_variant is not None and cache_variant != self.model_variant:
+                raise ValueError(
+                    "MiniMax H3 AdaLN cache model_variant does not match the loaded "
+                    f"variant ({cache_variant!r} != {self.model_variant!r})"
+                )
+            plan_timesteps = cache_file.get_tensor("plan_timesteps")
+            plan_lengths = cache_file.get_tensor("plan_lengths")
+            block_params = cache_file.get_tensor("block_params")
+            final_params = cache_file.get_tensor("final_params")
+
+        expected_block_width = 6 * MINIMAX_H3_ADALN_MODALITY_NUM * self.hidden_size
+        expected_final_width = 2 * self.hidden_size
+        if (
+            plan_timesteps.dtype != _FP32_DTYPE
+            or plan_timesteps.ndim != 2
+            or plan_lengths.dtype != torch.int64
+            or plan_lengths.shape != (plan_timesteps.shape[0],)
+            or (plan_lengths < 1).any()
+            or (plan_lengths > plan_timesteps.shape[1]).any()
+        ):
+            raise ValueError("MiniMax H3 AdaLN cache has invalid timestep plans")
+        if block_params.dtype != _BF16_DTYPE or block_params.shape != (
+            plan_timesteps.shape[0],
+            plan_timesteps.shape[1],
+            self.num_layers,
+            expected_block_width,
+        ):
+            raise ValueError("MiniMax H3 AdaLN cache has invalid block_params")
+        if final_params.dtype != _BF16_DTYPE or final_params.shape != (
+            plan_timesteps.shape[0],
+            plan_timesteps.shape[1],
+            expected_final_width,
+        ):
+            raise ValueError("MiniMax H3 AdaLN cache has invalid final_params")
+
+        self.register_buffer("plan_timesteps", plan_timesteps.to(device))
+        self.register_buffer("plan_lengths", plan_lengths.to(device))
+        self.register_buffer("block_params", block_params.to(device))
+        self.register_buffer("final_params", final_params.to(device))
+
+    def _allocate(self, device: torch.device) -> None:
+        """Empty slab for the rebuild path; its pointers must never move.
+
+        ``plan_lengths`` starts at zero and that is what keeps unused slots out
+        of ``lookup``: a real plan always has at least one timestep, so a zero
+        length can never match. Breakable CUDA graph keys its replay signature
+        on tensor pointers, so this is allocated once and only written in place.
+        """
+        width = self.max_plan_width
+        self.register_buffer(
+            "plan_timesteps",
+            torch.zeros((self.max_plans, width), dtype=_FP32_DTYPE, device=device),
+        )
+        self.register_buffer(
+            "plan_lengths",
+            torch.zeros((self.max_plans,), dtype=torch.int64, device=device),
+        )
+        self.register_buffer(
+            "block_params",
+            torch.zeros(
+                (self.max_plans, width, self.num_layers, self.block_width),
+                dtype=_BF16_DTYPE,
+                device=device,
+            ),
+        )
+        self.register_buffer(
+            "final_params",
+            torch.zeros(
+                (self.max_plans, width, self.final_width),
+                dtype=_BF16_DTYPE,
+                device=device,
+            ),
+        )
+        logger.info(
+            "MiniMax H3 AdaLN rebuild slab: %d plans x %d timesteps = %.2f GiB",
+            self.max_plans,
+            width,
+            self.block_params.numel() * 2 / 2**30,
+        )
+
+    def build(
+        self,
+        step_timesteps: list[torch.Tensor],
+        *,
+        embed: Callable[[torch.Tensor], torch.Tensor],
+    ) -> None:
+        """Fill every plan this request will look up, in one streaming pass.
+
+        Each plan keeps its own timestep count as the GEMM batch size, because
+        cuBLAS selects kernels by shape and the selection is not monotonic in M:
+        against the runtime's M == 2, results at M == 4/8/16/64/96 are
+        bit-identical while M == 32 differs in 11760 of 96768 elements and
+        M == 1 (the GEMV path the first denoise step takes) differs in 69.
+        Rebuilding a plan at any other batch size silently perturbs the output.
+
+        The pass reads all 50 adaln_proj layers regardless of how many plans are
+        missing, so a request builds everything it needs before denoising rather
+        than filling in step by step.
+        """
+        wanted: dict[tuple[int, ...], torch.Tensor] = {}
+        for timesteps in step_timesteps:
+            wanted.setdefault(_plan_key(timesteps), timesteps)
+        missing = {k: v for k, v in wanted.items() if k not in self._slots}
+        if not missing:
+            return
+        if len(self._slots) + len(missing) > self.max_plans:
+            # Every plan a request looks up has to stay resident for the whole
+            # denoise loop, so an overflow means the capacity is too small --
+            # evicting part of it would only move the failure into lookup().
+            self._slots.clear()
+            self.plan_lengths.zero_()
+        if len(missing) > self.max_plans:
+            raise ValueError(
+                f"MiniMax H3 AdaLN rebuild needs {len(missing)} plans but "
+                f"max_plans is {self.max_plans}"
+            )
+        widest = max(timesteps.numel() for timesteps in missing.values())
+        if widest > self.max_plan_width:
+            raise ValueError(
+                f"MiniMax H3 AdaLN rebuild hit a {widest}-timestep plan but the "
+                f"slab was allocated for {self.max_plan_width}; raise "
+                "--minimax-h3-adaln-plan-width (t2va needs 2, fl2va 3, ref2va 4)"
+            )
+
+        device = self.block_params.device
+        slots = []
+        for key, timesteps in missing.items():
+            slot = len(self._slots)
+            self._slots[key] = slot
+            slots.append((slot, timesteps.numel(), embed(timesteps.to(device))))
+            self.plan_timesteps[slot, : timesteps.numel()] = timesteps.to(device)
+
+        # adaln_proj is a ColumnParallelLinear: each rank owns a slice of the
+        # output features and all-gathers afterwards. The rebuild has to do the
+        # same rather than read the full width in one go -- a sharded GEMM has a
+        # different N, so cuBLAS picks a different kernel and the outputs stop
+        # matching. It also cuts per-rank checkpoint reads to 1/tp.
+        tp_size = get_tp_world_size()
+        tp_rank = get_tp_rank() if tp_size > 1 else 0
+
+        with ExitStack() as stack:
+            handles = [
+                stack.enter_context(safe_open(f, framework="pt", device=str(device)))
+                for f in self.weight_files
+            ]
+            index = {name: h for h in handles for name in h.keys()}
+
+            def read_shard(name: str, out_features: int) -> torch.Tensor:
+                if tp_size == 1:
+                    return index[name].get_tensor(name)
+                shard = out_features // tp_size
+                start = tp_rank * shard
+                return index[name].get_slice(name)[start : start + shard]
+
+            def project(adaln_input: torch.Tensor, weight, bias) -> torch.Tensor:
+                out = nn.functional.linear(adaln_input, weight, bias)
+                return tensor_model_parallel_all_gather(out) if tp_size > 1 else out
+
+            for layer in range(self.num_layers):
+                prefix = f"blocks.{layer}.adaln_proj.linear"
+                weight = read_shard(f"{prefix}.weight", self.block_width)
+                bias = read_shard(f"{prefix}.bias", self.block_width)
+                for slot, length, adaln_input in slots:
+                    self.block_params[slot, :length, layer] = project(
+                        adaln_input, weight, bias
+                    )
+                del weight, bias
+            prefix = "final_layer.adaln_proj.linear"
+            weight = read_shard(f"{prefix}.weight", self.final_width)
+            bias = read_shard(f"{prefix}.bias", self.final_width)
+            for slot, length, adaln_input in slots:
+                self.final_params[slot, :length] = project(adaln_input, weight, bias)
+            del weight, bias
+
+        for slot, length, _ in slots:
+            self.plan_lengths[slot] = length
+        self.rebuilds += 1
+        logger.info(
+            "MiniMax H3 AdaLN: rebuilt %d plan(s), %d/%d resident, pass #%d",
+            len(missing),
+            len(self._slots),
+            self.max_plans,
+            self.rebuilds,
+        )
+
+    def lookup(self, unique_timesteps: torch.Tensor) -> torch.Tensor:
+        num_timesteps = unique_timesteps.shape[0]
+        matches = self.plan_lengths.eq(num_timesteps) & self.plan_timesteps[
+            :, :num_timesteps
+        ].eq(unique_timesteps).all(dim=-1)
+        if not bool(matches.any()):
+            raise ValueError(
+                "MiniMax H3 AdaLN cache does not cover the request timestep plan"
+            )
+        return matches.to(torch.int64).argmax()
+
+    def block(
+        self,
+        index: int,
+        cache_plan_index: torch.Tensor,
+        num_timesteps: int,
+    ) -> tuple[torch.Tensor, ...]:
+        params = self.block_params[cache_plan_index, :num_timesteps, index]
+        params = params.reshape(-1, 6, self.hidden_size)
+        return tuple(params.unbind(dim=1))
+
+    def final(
+        self,
+        cache_plan_index: torch.Tensor,
+        num_timesteps: int,
+    ) -> tuple[torch.Tensor, ...]:
+        params = self.final_params[cache_plan_index, :num_timesteps]
+        return tuple(params.reshape(-1, 2, self.hidden_size).unbind(dim=1))
+
+
 class MiniMaxH3TokenRefinerBlock(nn.Module):
     """Standard pre-norm transformer block without AdaLN or RoPE."""
 
@@ -881,6 +1181,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
+        use_adaln_cache: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
@@ -891,14 +1192,19 @@ class MiniMaxH3DiTBlock(nn.Module):
             prefix=f"{prefix}.attn",
         )
         self.mlp = MiniMaxH3MLP(arch, quant_config, prefix=f"{prefix}.mlp")
-        self.adaln_proj = MiniMaxH3AdalnProj(
-            arch,
-            arch.adaln_out_features,
-            quant_config,
-            prefix=f"{prefix}.adaln_proj",
-            expand_ratio=6,
-            modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
+        self.adaln_proj = (
+            None
+            if use_adaln_cache
+            else MiniMaxH3AdalnProj(
+                arch,
+                arch.adaln_out_features,
+                quant_config,
+                prefix=f"{prefix}.adaln_proj",
+                expand_ratio=6,
+                modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
+            )
         )
+        self.preserve_input_for_cache_dit = False
 
     def forward(
         self,
@@ -922,9 +1228,13 @@ class MiniMaxH3DiTBlock(nn.Module):
         norm2 -> scale/shift -> MLP -> gated residual.
         """
         if adaln_params is None:
+            if self.adaln_proj is None:
+                raise ValueError("MiniMax H3 AdaLN cache parameters are required")
             adaln_params = self.adaln_proj(adaln_input)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
-
+        # Cache-DiT retains the inputs to its Fn and Mn block ranges. Only the
+        # first gated residual writes to that tensor; the second one operates on
+        # a block-local buffer.
         residual = x
         h = self.norm1(x)
         h = _modulate_scale_shift(
@@ -939,7 +1249,14 @@ class MiniMaxH3DiTBlock(nn.Module):
             ulysses_active=ulysses_active,
             ring_active=ring_active,
         )
-        x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16_DTYPE)
+        x = _modulate_gate(
+            residual,
+            gate_msa,
+            h,
+            combined_indices,
+            dtype=_BF16_DTYPE,
+            allow_inplace=not self.preserve_input_for_cache_dit,
+        )
 
         residual = x
         h = self.norm2(x)
@@ -947,8 +1264,14 @@ class MiniMaxH3DiTBlock(nn.Module):
             h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
         )
         h = self.mlp(h)
+        # `residual` is block-local here (see above), so this stays in-place
+        # even while Cache-DiT is attached.
         return _modulate_gate(
-            residual, gate_mlp, h, combined_indices, dtype=_BF16_DTYPE
+            residual,
+            gate_mlp,
+            h,
+            combined_indices,
+            dtype=_BF16_DTYPE,
         )
 
 
@@ -959,6 +1282,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
+        use_adaln_cache: bool = False,
     ) -> None:
         super().__init__()
         video_patch_dim = (
@@ -968,13 +1292,17 @@ class MiniMaxH3FinalLayer(nn.Module):
             * arch.patch_size[2]
         )
         self.norm = _norm(arch.hidden_size, eps=arch.final_norm_eps)
-        self.adaln_proj = MiniMaxH3AdalnProj(
-            arch,
-            arch.final_adaln_out_features,
-            quant_config,
-            prefix=f"{prefix}.adaln_proj",
-            expand_ratio=2,
-            modality_num=1,
+        self.adaln_proj = (
+            None
+            if use_adaln_cache
+            else MiniMaxH3AdalnProj(
+                arch,
+                arch.final_adaln_out_features,
+                quant_config,
+                prefix=f"{prefix}.adaln_proj",
+                expand_ratio=2,
+                modality_num=1,
+            )
         )
         self.video_out = ColumnParallelLinear(
             arch.hidden_size,
@@ -1001,6 +1329,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         *,
         adaln_input: torch.Tensor,
         inverse_indices: torch.Tensor,
+        adaln_params: tuple[torch.Tensor, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project all rows into TP-local video/audio output shards.
 
@@ -1009,7 +1338,11 @@ class MiniMaxH3FinalLayer(nn.Module):
         The model gathers output columns only after selecting live media rows,
         preserving the GEMM shape while reducing collective payload.
         """
-        shift, scale = self.adaln_proj(adaln_input)
+        if adaln_params is None:
+            if self.adaln_proj is None:
+                raise ValueError("MiniMax H3 AdaLN cache parameters are required")
+            adaln_params = self.adaln_proj(adaln_input)
+        shift, scale = adaln_params
         h = self.norm(x)
         h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
         # Preserve full precision through both final output projections.
@@ -1020,18 +1353,36 @@ class MiniMaxH3FinalLayer(nn.Module):
 
 
 class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = _ARCH_DEFAULTS._fsdp_shard_conditions
+    _fsdp_shard_conditions = [is_block]
+    # refine_prompt_embeds drives a forward pass outside __call__.
+    _fsdp_forward_methods = ("refine_prompt_embeds",)
     # parameters mix fp32 (patch projections, timestep embedder, and output
     # heads) with bf16 blocks; FSDP must gather in each parameter's own dtype
     _fsdp_mixed_dtype_params = True
-    _compile_conditions = _ARCH_DEFAULTS._compile_conditions
+    _compile_conditions = [is_block]
     param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
 
+    def prepare_adaln_plans(self, step_timesteps: list[torch.Tensor]) -> None:
+        """Fill the AdaLN cache for this request before denoising starts.
+
+        No-op for a prebuilt sidecar; the rebuild path needs the model's own
+        timestep embedding so a filled plan is bit-identical to what resident
+        adaln_proj weights would have produced.
+        """
+        if self.adaln_cache is None or self.adaln_cache.weight_files is None:
+            return
+
+        def embed(timesteps: torch.Tensor) -> torch.Tensor:
+            return nn.functional.silu(self.time_embedder(timesteps)).to(_BF16_DTYPE)
+
+        self.adaln_cache.build(step_timesteps, embed=embed)
+
     def _can_batch_block_adaln(self) -> bool:
         return (
-            get_tp_world_size() > 1
+            self.adaln_cache is None
+            and get_tp_world_size() > 1
             and not torch.compiler.is_compiling()
             and not envs.SGLANG_CACHE_DIT_ENABLED
             and not hasattr(self, "_sglang_cache_dit_adapter")
@@ -1107,9 +1458,22 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         config: MiniMaxH3DiTConfig,
         hf_config: dict[str, Any],
         quant_config: QuantizationConfig | None = None,
+        adaln_cache_path: str | None = None,
+        adaln_cache_model_variant: str | None = None,
+        adaln_weight_files: list[str] | None = None,
+        adaln_plan_width: int = MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
-        arch = config.arch_config
+        if (
+            adaln_cache_path is not None or adaln_weight_files is not None
+        ) and quant_config is not None:
+            raise ValueError(
+                "MiniMax H3 AdaLN cache is only compatible with unquantized weights"
+            )
+        self._adaln_precomputed = (
+            adaln_cache_path is not None or adaln_weight_files is not None
+        )
+        arch = self.config
         self.arch = arch
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
@@ -1170,6 +1534,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     arch,
                     quant_config,
                     prefix=f"blocks.{index}",
+                    use_adaln_cache=self._adaln_precomputed,
                 )
                 for index in range(arch.num_layers)
             ]
@@ -1179,9 +1544,37 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             arch,
             quant_config,
             prefix="final_layer",
+            use_adaln_cache=self._adaln_precomputed,
+        )
+        self.adaln_cache = (
+            MiniMaxH3AdalnCache(
+                arch,
+                path=adaln_cache_path,
+                model_variant=adaln_cache_model_variant,
+                weight_files=adaln_weight_files,
+                max_plan_width=adaln_plan_width,
+            )
+            if self._adaln_precomputed
+            else None
         )
         self._resolved_attention_backend: AttentionBackendEnum | None = None
         self._mark_missing_params_required()
+
+    def set_cache_dit_input_preservation(self, enabled: bool) -> None:
+        """Stop the blocks from overwriting the input Cache-DiT holds by reference.
+
+        Cache-DiT snapshots the block-stack input to measure its residuals, so a
+        block that rewrites its own input in place makes that residual read as
+        zero. Only the first gated residual of a block writes the block input;
+        the second one operates on a buffer this block just allocated, so it is
+        left on the in-place fused path either way.
+
+        The caller owns the lifecycle. It has to be on before Cache-DiT mounts,
+        because mounting replaces `blocks` with a wrapper and the real blocks
+        stop being reachable by iterating it.
+        """
+        for block in self.blocks:
+            block.preserve_input_for_cache_dit = enabled
 
     def _resolve_attention_backend_once(self) -> None:
         if self._resolved_attention_backend is not None:
@@ -1213,6 +1606,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             raise ValueError(
                 f"rope.inv_freq must stay fp32 after load, got {rope_inv_freq.dtype}."
             )
+        if self.adaln_cache is not None:
+            self.adaln_cache.load(self.video_patch_proj.weight.device)
 
     @staticmethod
     def _pos_ids(pos_info: Any, key: str) -> torch.Tensor:
@@ -1642,7 +2037,20 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
         block_adaln_params = None
-        if self._can_batch_block_adaln():
+        adaln_cache_plan_index = None
+        if self.adaln_cache is not None:
+            adaln_cache_plan_index = self.adaln_cache.lookup(
+                unique_timesteps.view(-1).to(device)
+            )
+            block_adaln_params = tuple(
+                self.adaln_cache.block(
+                    index,
+                    adaln_cache_plan_index,
+                    adaln_input.shape[0],
+                )
+                for index in range(len(self.blocks))
+            )
+        elif self._can_batch_block_adaln():
             local_adaln = torch.stack(
                 [block.adaln_proj.project_local(adaln_input) for block in self.blocks]
             )
@@ -1675,6 +2083,14 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             hidden,
             adaln_input=adaln_input,
             inverse_indices=block_inverse,
+            adaln_params=(
+                None
+                if adaln_cache_plan_index is None
+                else self.adaln_cache.final(
+                    adaln_cache_plan_index,
+                    adaln_input.shape[0],
+                )
+            ),
         )
         if sp_ws > 1:
             from sglang.multimodal_gen.runtime.distributed.parallel_state import (

@@ -36,7 +36,6 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner._capture_chunked_prefix = False
         runner.prefill_backend_name = backend
         runner.has_mha_companion_layers = backend == Backend.BREAKABLE
-        runner.mla_pinned_under_bcg = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
         runner.max_num_tokens = 16
@@ -73,7 +72,8 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
     def test_supported_multimodal_model_upgrades_default_to_tc_piecewise(self):
         args = ServerArgs(model_path="dummy")
         args.model_config = SimpleNamespace(
-            is_multimodal_piecewise_cuda_graph_supported=True
+            is_multimodal_piecewise_cuda_graph_supported=True,
+            is_multimodal_breakable_cuda_graph_supported=False,
         )
         args.cuda_graph_config = CudaGraphConfig(
             prefill=PhaseConfig(backend=Backend.BREAKABLE)
@@ -93,12 +93,14 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.TC_PIECEWISE)
         disable_if_incompatible.assert_called_once()
 
-    def test_trtllm_mla_stays_on_breakable_and_is_disabled_by_compatibility(self):
+    def test_trtllm_mla_stays_on_breakable(self):
         args = ServerArgs(model_path="dummy")
-        # The MLA rule reads hf_config to exempt DSA models, so the stub needs
-        # an architecture that is MLA but not DSA.
+        # trtllm_mla skips the tc_piecewise upgrade and keeps breakable, which
+        # now serves MLA by falling back to the flashinfer MLA impl for extend.
         args.model_config = SimpleNamespace(
             is_multimodal_piecewise_cuda_graph_supported=True,
+            is_multimodal=False,
+            is_multimodal_breakable_cuda_graph_supported=False,
             hf_config=SimpleNamespace(architectures=["DeepseekV2ForCausalLM"]),
         )
         args.cuda_graph_config = CudaGraphConfig(
@@ -116,7 +118,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         ):
             args._apply_cuda_graph_compatibility()
 
-        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
 
     def test_explicit_tc_piecewise_overrides_trtllm_mla_default(self):
         args = ServerArgs(model_path="dummy")
@@ -144,12 +146,16 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
         self.assertTrue(runner.can_run_graph(self._make_multimodal_forward_batch()))
 
-    def test_breakable_prefill_rejects_nonzero_prefix(self):
+    def test_breakable_prefill_takes_nonzero_prefix_on_cuda_only(self):
         runner = self._make_prefill_runner(Backend.BREAKABLE)
         forward_batch = self._make_multimodal_forward_batch()
         forward_batch.extend_prefix_lens_cpu = [1]
 
-        self.assertFalse(runner.can_run_graph(forward_batch))
+        target = "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.is_cuda"
+        with patch(target, return_value=True):
+            self.assertTrue(runner.can_run_graph(forward_batch))
+        with patch(target, return_value=False):
+            self.assertFalse(runner.can_run_graph(forward_batch))
 
     def test_embedding_gemma_forces_breakable_prefill(self):
         args = ServerArgs(model_path="dummy")

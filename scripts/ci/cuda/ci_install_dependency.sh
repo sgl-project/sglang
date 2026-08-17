@@ -229,20 +229,10 @@ install_gdrcopy() {
 }
 
 clean_site_packages() {
-    # Clear torch compilation cache from every location it can be in; sglang
-    # is not installed yet, so it cannot be asked which one is in use.
-    python3 -c '
-import getpass, os, shutil, tempfile
-
-sglang_cache_dir = os.environ.get("SGLANG_CACHE_DIR") or "~/.cache/sglang"
-for cache_dir in (
-    os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
-    os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()),
-    os.path.join(os.path.expanduser(sglang_cache_dir), "inductor"),
-):
-    if cache_dir:
-        shutil.rmtree(cache_dir, ignore_errors=True)
-'
+    # The torch compilation cache is deliberately NOT wiped here: entries are
+    # content-hash addressed so stale ones are never reused, and hosts packing
+    # several runners share one cache mount - a wipe unlinks files a concurrent
+    # job is compiling against.
 
     # Remove broken dist-info directories (missing METADATA per PEP 376)
     SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
@@ -423,7 +413,7 @@ uninstall_stale_flashinfer() {
 
 install_pytorch_stack() {
     PYTORCH_SPECS=()
-    for package in torch torchaudio torchvision torchao torchcodec; do
+    for package in torch torchaudio torchvision torchcodec; do
         spec=$(grep -Po -m1 "\"${package}([<>=!~ ;][^\"]*)?\"" python/pyproject.toml | tr -d '"' || true)
         if [ -n "$spec" ]; then
             PYTORCH_SPECS+=("$spec")
@@ -470,7 +460,7 @@ require_prebuilt_rust_exts() {
         return
     fi
 
-    # Exact EXT_SUFFIX rather than a _core*.so glob: no crate sets abi3, so a module
+    # Exact EXT_SUFFIX rather than an _*.so glob: no crate sets abi3, so a module
     # built for another minor version satisfies the glob while the import system
     # ignores it, leaving is_rust_server_built() false and the Rust-server tests
     # silently skipped. Stages have no setup-python, so the interpreter is whatever
@@ -479,13 +469,13 @@ require_prebuilt_rust_exts() {
     local suffix
     suffix=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
     local missing=()
-    local pkg
-    for pkg in server grpc multimodal; do
-        [ -f "python/sglang/srt/${pkg}/_core${suffix}" ] || missing+=("${pkg}")
+    local module
+    for module in server grpc multimodal; do
+        [ -f "python/sglang/srt/rust_extensions/_${module}${suffix}" ] || missing+=("${module}")
     done
     if [ ${#missing[@]} -gt 0 ]; then
-        echo "::warning::no prebuilt _core${suffix} for: ${missing[*]}; building from source"
-        ls -l python/sglang/srt/*/_core*.so 2>/dev/null || echo "(no extension modules at all)"
+        echo "::warning::no prebuilt Rust extension ${suffix} for: ${missing[*]}; building from source"
+        ls -l python/sglang/srt/rust_extensions/_*.so 2>/dev/null || echo "(no extension modules at all)"
         export SGLANG_BUILD_RUST_EXTS=
         mark_step_done "${FUNCNAME[0]}"
         return
@@ -692,12 +682,8 @@ stabilize_flashinfer_jit_paths() {
 install_extra_deps() {
     MOONCAKE_VERSION="0.3.12.post1"
     NIXL_VERSION="1.3.0"
-    # sgl-eval is git-only and cannot be declared in python/pyproject.toml (see
-    # the note there). The nightly GSM8K eval shells out to the sgl-eval CLI and
-    # fails without it. Bumping the SHA can change zero-shot \boxed{} grading, so
-    # re-baseline MODEL_SCORE_THRESHOLDS in
-    # test/registered/eval/test_text_models_gsm8k_eval.py first.
-    SGL_EVAL_REF="b2a2703c42cae379bbcb8b7ff092df6601a61694"
+    # shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
+    source "${SCRIPT_DIR}/../utils/sgl_eval_ref.sh"
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
@@ -733,7 +719,7 @@ install_extra_deps() {
             --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
     fi
 
-    $PIP_CMD install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@${SGL_EVAL_REF}" $PIP_INSTALL_SUFFIX
+    $PIP_CMD install "$SGL_EVAL_SPEC" $PIP_INSTALL_SUFFIX
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
@@ -826,7 +812,7 @@ print(f"sglang resolves to {spec.origin}")
 # so a .so that cannot load passes find_spec and only fails inside some suite.
 import importlib
 for mod in ("server", "grpc", "multimodal"):
-    name = f"sglang.srt.{mod}._core"
+    name = f"sglang.srt.rust_extensions._{mod}"
     try:
         importlib.import_module(name)
     except Exception as exc:

@@ -49,6 +49,13 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
 )
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_spec,
+    mamba_extra_buffer_enabled,
+    max_prefill_buffer_tokens,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import (
     ceil_align,
@@ -76,14 +83,14 @@ class EagerRunner(BaseRunner):
         num_tokens_per_req = 1
         if mr.spec_algorithm.is_speculative():
             # speculative_adaptive can grow draft tokens at runtime; size to the max.
-            num_draft_tokens = sa.max_speculative_num_draft_tokens or 1
+            num_draft_tokens = max_speculative_num_draft_tokens() or 1
             if mr.is_draft_worker:
                 num_tokens_per_req = max(
-                    sa.speculative_eagle_topk or 1,
+                    get_spec().speculative_eagle_topk or 1,
                     num_draft_tokens,
                     (
-                        2 * (sa.speculative_num_steps or 0)
-                        if sa.enable_multi_layer_eagle
+                        2 * (get_spec().speculative_num_steps or 0)
+                        if get_spec().enable_multi_layer_eagle
                         else 0
                     ),
                 )
@@ -100,14 +107,14 @@ class EagerRunner(BaseRunner):
         if (
             mr.is_draft_worker
             and mr.spec_algorithm.is_frozen_kv_mtp()
-            and sa.speculative_eagle_topk > 1
+            and get_spec().speculative_eagle_topk > 1
         ):
             # Frozen-KV MTP expands the draft batch by topk on the bs axis
             # (expand_for_topk_draft) before the eager fallback.
-            max_bs *= sa.speculative_eagle_topk
+            max_bs *= get_spec().speculative_eagle_topk
         # Mirror prepare_mlp_sync_batch padding so the registry holds what load_batch copies.
         max_bs = get_eager_max_batch_size(sa, max_bs)
-        prefill_ceiling = max(mr.max_total_num_tokens, sa.max_prefill_buffer_tokens())
+        prefill_ceiling = max(mr.max_total_num_tokens, max_prefill_buffer_tokens())
         max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_req)
         if require_mlp_sync(sa):
             from sglang.srt.layers.cp.padding import get_cp_padding_align_size
@@ -123,7 +130,7 @@ class EagerRunner(BaseRunner):
             max_num_token=max_num_token,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=(
-                sa.enable_mamba_extra_buffer() and mr.spec_algorithm.is_none()
+                mamba_extra_buffer_enabled() and mr.spec_algorithm.is_none()
             ),
             is_encoder_decoder=is_encoder_decoder,
             encoder_len_fill_value=(
@@ -134,7 +141,7 @@ class EagerRunner(BaseRunner):
             encoder_lens_dtype=(
                 torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
             ),
-            dp_size=sa.dp_size,
+            dp_size=get_parallel().dp_size,
         )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
         self.warmup()
@@ -263,7 +270,17 @@ class EagerRunner(BaseRunner):
         if cp_v2_active:
             prepare_cp_forward(forward_batch)
 
-        if forward_batch.needs_forward_metadata_init() or cp_v2_active:
+        # Target verify can arrive with ``forward_metadata_ready`` set by an
+        # upstream/speculative planning step.  That mark does not initialize
+        # the final target hybrid backend, and unlike a graph replay eager has
+        # no static metadata load to fill the gap.  Re-plan target verify from
+        # the final batch every time; eager metadata is intentionally derived
+        # directly from the live ``spec_info`` tensors.
+        if (
+            forward_batch.needs_forward_metadata_init()
+            or cp_v2_active
+            or forward_batch.forward_mode.is_target_verify()
+        ):
             if model_runner.ps.attn_dcp_size > 1 and hasattr(
                 model_runner.model, "prepare_context_parallel_metadata_for_dcp"
             ):
@@ -371,14 +388,27 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
-        hidden_states = cp_gather_after_forward(
-            hidden_states, forward_batch, torch.cuda.current_stream()
-        )
+        stream = torch.cuda.current_stream()
+        hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
+        # DSpark aux tensors ride the same CP token split; gather them the same way.
+        if aux_hidden_states is not None:
+            if isinstance(aux_hidden_states, torch.Tensor):
+                aux_hidden_states = cp_gather_after_forward(
+                    aux_hidden_states, forward_batch, stream
+                )
+            else:
+                aux_hidden_states = [
+                    cp_gather_after_forward(aux, forward_batch, stream)
+                    for aux in aux_hidden_states
+                ]
         logits_kwargs = {}
         # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_before_norm = hidden_states
-            logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
+            # Mirror DeepseekV4ForCausalLM.forward: drop pre_hc_head when
+            # DSpark aux capture is on, else it overrides the packed aux.
+            if aux_hidden_states is None:
+                logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
         return model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
