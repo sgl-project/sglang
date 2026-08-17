@@ -125,8 +125,7 @@ export const config = {
       // per pool). The calculator reads this row for the balanced ratio.
       // The default equals the ENGINE default (extra_buffer), so an untouched
       // selection matches each platform's original recipe; both options were
-      // characterized on RTX 5090 / RTX PRO 6000 and the cells' `verified`
-      // functions report non-default picks on other platforms as unverified.
+      // characterized on RTX 5090 / RTX PRO 6000 only.
       id: "tier",
       title: "Serving Strategy",
       default: "low-latency",
@@ -336,13 +335,11 @@ export const config = {
     ],
   },
 
-  // Verification: RTX 5090 / RTX PRO 6000 cells are `verified: true` outright
-  // (their whole overlay envelope was measured); h200/gb300 cells use the
-  // function form so the badge covers only their measured envelope (overlay
-  // defaults, plus plain MTP on gb300); DGX Spark stays unverified (SM121 /
-  // aarch64 unvalidated). The function form needs the engine change in
-  // PR #35112 — until it merges, a function is truthy and the badge behaves
-  // exactly as the previous static `verified: true`.
+  // Verification: RTX 5090 / RTX PRO 6000 cells were measured across their
+  // whole overlay envelope; the h200/gb300 badges carry the source page's
+  // validation, which covers the overlay defaults (plus plain MTP on gb300) —
+  // non-default overlay picks there are valid but unmeasured. DGX Spark stays
+  // unverified (SM121 / aarch64 unvalidated).
   //
   // Cells carry NO --mamba-full-memory-ratio: the ratio depends on workload,
   // S, D and kv_bytes_per_token, so the page's calculator computes it live
@@ -358,11 +355,7 @@ export const config = {
       // checkpoint's MLP would fall back to the Marlin W4A16 weight-only path —
       // runnable, but not a recipe this page ships.
       match: { hw: "h200", variant: "default", quant: "fp8", nodes: "single" },
-      // Verified at the untouched overlay defaults only (see the note above
-      // cells[]).
-      verified: (sel) =>
-        sel.spec === "none" && sel.tier === "low-latency" &&
-        sel.ssmDtype === "float32",
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -381,10 +374,7 @@ export const config = {
     {
       // H200, BF16 reference checkpoint (~54GB of weights).
       match: { hw: "h200", variant: "default", quant: "bf16", nodes: "single" },
-      // Same verified envelope as the FP8 cell above.
-      verified: (sel) =>
-        sel.spec === "none" && sel.tier === "low-latency" &&
-        sel.ssmDtype === "float32",
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -551,9 +541,7 @@ export const config = {
     // Verified envelope: spec none|eagle at engine-default tier/state dtype.
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", nodes: "single" },
-      verified: (sel) =>
-        (sel.spec === "none" || sel.spec === "eagle") &&
-        sel.tier === "low-latency" && sel.ssmDtype === "float32",
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -569,10 +557,7 @@ export const config = {
     },
     {
       match: { hw: "gb300", variant: "default", quant: "fp8", nodes: "single" },
-      // Same verified envelope as the NVFP4 cell above.
-      verified: (sel) =>
-        (sel.spec === "none" || sel.spec === "eagle") &&
-        sel.tier === "low-latency" && sel.ssmDtype === "float32",
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -588,10 +573,7 @@ export const config = {
     },
     {
       match: { hw: "gb300", variant: "default", quant: "bf16", nodes: "single" },
-      // Same verified envelope as the NVFP4 cell above.
-      verified: (sel) =>
-        (sel.spec === "none" || sel.spec === "eagle") &&
-        sel.tier === "low-latency" && sel.ssmDtype === "float32",
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",

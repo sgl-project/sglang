@@ -60,7 +60,8 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
   The RTX 5090 and RTX PRO 6000 cells above — including every Speculative
   Decoding / Serving Strategy / SSM dtype combination — were validated at
   ISL 8192 / OSL 1024, concurrency 1. The other platforms' recipes carry their
-  original validation; the badge reflects each selection's status.
+  original validation, which covers the default overlay picks (plus MTP on
+  GB300); non-default overlay picks there are valid but unmeasured.
 </Note>
 
 ### Mamba ratio calculator
