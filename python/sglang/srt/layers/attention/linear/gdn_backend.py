@@ -137,17 +137,15 @@ def build_gdn_mis_metadata(forward_batch: ForwardBatch) -> GDNMISMetadata:
     )
 
 
-def validate_gdn_mis_backend(
-    server_args, prefill_backend: LinearAttnKernelBackend
-) -> None:
-    if not getattr(server_args, "enable_mis", False):
+def validate_gdn_mis_backend(prefill_backend: LinearAttnKernelBackend) -> None:
+    if not get_exec().features.enable_mis:
         return
     if not prefill_backend.is_triton():
         raise ValueError(
             "GDN multi-item scoring requires the Triton linear-attention prefill "
             "backend. Set --linear-attn-prefill-backend triton."
         )
-    if getattr(server_args, "enable_page_major_kv_layout", False):
+    if get_memory().enable_page_major_kv_layout:
         raise ValueError("GDN multi-item scoring does not support page-major layout")
 
 
@@ -466,7 +464,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        self.enable_mis = getattr(model_runner.server_args, "enable_mis", False)
+        self.enable_mis = get_exec().features.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
@@ -477,7 +475,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
         backends = model_runner.linear_attn_backends
-        validate_gdn_mis_backend(model_runner.server_args, backends.prefill)
+        validate_gdn_mis_backend(backends.prefill)
         self.kernel_dispatcher = GDNKernelDispatcher(
             backends.decode, backends.prefill, backends.verify
         )

@@ -77,16 +77,14 @@ def make_runner(
 
 class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
     def test_mis_requires_triton_prefill_backend(self):
-        runner = make_runner(enable_mis=True)
+        runner = make_runner(self, enable_mis=True)
         with self.assertRaisesRegex(ValueError, "Triton linear-attention prefill"):
-            validate_gdn_mis_backend(
-                runner.server_args, LinearAttnKernelBackend.FLASHINFER
-            )
+            validate_gdn_mis_backend(LinearAttnKernelBackend.FLASHINFER)
 
     def test_mis_rejects_page_major_layout(self):
-        runner = make_runner(enable_mis=True, enable_page_major_kv_layout=True)
+        make_runner(self, enable_mis=True, enable_page_major_kv_layout=True)
         with self.assertRaisesRegex(ValueError, "page-major"):
-            validate_gdn_mis_backend(runner.server_args, LinearAttnKernelBackend.TRITON)
+            validate_gdn_mis_backend(LinearAttnKernelBackend.TRITON)
 
     def test_non_gdn_linear_backend_rejects_mis(self):
         with self.assertRaisesRegex(ValueError, "does not support multi-item scoring"):
