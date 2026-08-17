@@ -49,7 +49,7 @@ runs:
       if: steps.artifact.outcome != 'success'
       uses: actions/cache/restore@v4
       with:
-        path: python/sglang/srt/*/_core*.so
+        path: python/sglang/srt/rust_extensions/_*.so
         key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
 
     # Job-wide, but only setup.py reads it, and only while building.
