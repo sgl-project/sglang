@@ -28,7 +28,9 @@ LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
-CUSTOM_IMAGE=""
+# Inherited from the environment so a workflow can point every job at one image
+# without touching each call site; --custom-image still wins.
+CUSTOM_IMAGE="${CUSTOM_IMAGE:-}"
 BUILD_FROM_DOCKERFILE=""
 GPU_ARCH_BUILD=""
 
@@ -56,6 +58,8 @@ while [[ $# -gt 0 ]]; do
       echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm720)"
       echo ""
       echo "Environment:"
+      echo "  CUSTOM_IMAGE=IMAGE"
+      echo "      Same as --custom-image; lets a workflow pin every job to one image."
       echo "  ENABLE_CACHE_HOST=1|0"
       echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 35x, otherwise 0. Missing host cache falls back to container-local /sgl-data."
       exit 0
