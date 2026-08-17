@@ -18,14 +18,12 @@ register_amd_ci(est_time=320, suite="stage-b-test-1-gpu-small-amd")
 
 _MAX_NEW_TOKENS = 4
 _TOP_P = 0.99
+_TOP_P_SMALL = 1e-5
 _TOP_K = 10
 _SAMPLING_SEED = 1234
 _SERVER_ARGS = (
     "--mem-fraction-static",
     "0.7",
-)
-_INVALID_SAMPLING_MASK_ERROR = (
-    "top_p-only sampling is valid but can return huge masks in the tail"
 )
 
 
@@ -80,11 +78,6 @@ class SamplingMaskTestMixin:
         for output_id, sampling_mask in zip(output_ids, sampling_masks):
             self.assertIn(output_id, sampling_mask)
         return sampling_masks
-
-    def _assert_rejects_unbounded_sampling_mask(self, sampling_params):
-        response = self._post_generate(sampling_params)
-        self.assertEqual(response.status_code, 400, response.text)
-        self.assertIn(_INVALID_SAMPLING_MASK_ERROR, response.text)
 
 
 class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
@@ -191,22 +184,58 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             expected_logprob = math.log(probs[output_id] / support_mass)
             self.assertAlmostEqual(mask_logprob, expected_logprob, delta=1e-2)
 
-    def test_generate_rejects_unbounded_sampling_mask(self):
-        self._assert_rejects_unbounded_sampling_mask(
+    def test_generate_returns_top_p_only_sampling_mask(self):
+        self._generate_sampling_masks(
             {
                 "temperature": 1.0,
-                "top_p": _TOP_P,
+                "top_p": _TOP_P_SMALL,
                 "max_new_tokens": _MAX_NEW_TOKENS,
                 "ignore_eos": True,
             }
         )
-        self._assert_rejects_unbounded_sampling_mask(
+
+    def test_chat_completions_returns_top_p_only_sampling_mask(self):
+        response = requests.post(
+            self.base_url + "/v1/chat/completions",
+            json={
+                "model": self.model,
+                "messages": [{"role": "user", "content": "Name a capital city."}],
+                "temperature": 1.0,
+                "top_p": _TOP_P_SMALL,
+                "max_tokens": _MAX_NEW_TOKENS,
+                "ignore_eos": True,
+                "return_sampling_mask": True,
+                "return_meta_info": True,
+                "return_token_ids": True,
+            },
+            timeout=60,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        choice = response.json()["choices"][0]
+        output_ids = choice["token_ids"]
+        meta_info = choice["meta_info"]
+        sampling_masks = meta_info["output_token_sampling_mask"]
+        sampling_logprobs = meta_info["output_token_sampling_logprobs"]
+
+        self.assertEqual(len(output_ids), _MAX_NEW_TOKENS)
+        self.assertEqual(len(sampling_masks), len(output_ids))
+        self.assertEqual(len(sampling_logprobs), len(output_ids))
+        for output_id, sampling_mask in zip(output_ids, sampling_masks):
+            self.assertIn(output_id, sampling_mask)
+
+    def test_generate_rejects_full_vocabulary_sampling_mask(self):
+        response = self._post_generate(
             {
                 "temperature": 1.0,
                 "top_p": 1.0,
                 "max_new_tokens": _MAX_NEW_TOKENS,
                 "ignore_eos": True,
             }
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn(
+            "return_sampling_mask cannot return the full vocabulary", response.text
         )
 
 

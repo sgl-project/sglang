@@ -59,7 +59,6 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     DeepseekV4AscendMultiStepDraftBackend,
     _apply_hadamard,
     _get_kv_indices,
-    _overlap_transform,
     _walsh_hadamard_matrix,
 )
 
@@ -180,78 +179,6 @@ class TestApplyHadamard(unittest.TestCase):
         expected = inp.matmul(H).to(torch.bfloat16)
         out = _apply_hadamard(inp, H)
         self.assertTrue(torch.equal(out, expected))
-
-
-class TestOverlapTransform(unittest.TestCase):
-    def test_shape(self):
-        # (n_chunks, ratio, 2*d) -> (n_chunks, 2*ratio, d)
-        n_chunks, r, d = 3, 2, 4
-        tensor = torch.randn(n_chunks, r, 2 * d)
-        out = _overlap_transform(tensor, value=0.0, head_dim=d)
-        self.assertEqual(out.shape, (n_chunks, 2 * r, d))
-
-    def test_first_chunk_left_half_filled_with_value(self):
-        n_chunks, r, d = 3, 2, 4
-        tensor = torch.randn(n_chunks, r, 2 * d)
-        fill = float("-inf")
-        out = _overlap_transform(tensor, value=fill, head_dim=d)
-        self.assertTrue(torch.equal(out[0, :r], torch.full((r, d), fill)))
-
-    def test_first_chunk_left_half_filled_with_zero(self):
-        n_chunks, r, d = 2, 2, 4
-        tensor = torch.randn(n_chunks, r, 2 * d)
-        out = _overlap_transform(tensor, value=0.0, head_dim=d)
-        self.assertTrue(torch.equal(out[0, :r], torch.zeros(r, d)))
-
-    def test_right_half_mirrors_tensor_second_half(self):
-        n_chunks, r, d = 3, 2, 4
-        tensor = torch.randn(n_chunks, r, 2 * d)
-        out = _overlap_transform(tensor, value=0.0, head_dim=d)
-        self.assertTrue(torch.equal(out[:, r:], tensor[..., d:]))
-
-    def test_previous_chunk_left_half(self):
-        n_chunks, r, d = 3, 2, 4
-        tensor = torch.randn(n_chunks, r, 2 * d)
-        out = _overlap_transform(tensor, value=0.0, head_dim=d)
-        self.assertTrue(torch.equal(out[1:, :r], tensor[:-1, :, :d]))
-
-    def test_single_chunk(self):
-        n_chunks, r, d = 1, 2, 4
-        tensor = torch.randn(n_chunks, r, 2 * d)
-        fill = 7.0
-        out = _overlap_transform(tensor, value=fill, head_dim=d)
-        self.assertEqual(out.shape, (1, 2 * r, d))
-        self.assertTrue(torch.equal(out[0, :r], torch.full((r, d), fill)))
-        self.assertTrue(torch.equal(out[0, r:], tensor[0, :, d:]))
-
-    def test_full_element_mapping(self):
-        n_chunks, r, d = 2, 2, 3
-        tensor = torch.arange(n_chunks * r * 2 * d, dtype=torch.float32).reshape(
-            n_chunks, r, 2 * d
-        )
-        fill = -1.0
-        out = _overlap_transform(tensor, value=fill, head_dim=d)
-
-        for c in range(n_chunks):
-            for row in range(2 * r):
-                for col in range(d):
-                    if c == 0 and row < r:
-                        expected = fill
-                    elif row >= r:
-                        expected = tensor[c, row - r, d + col].item()
-                    else:
-                        expected = tensor[c - 1, row, col].item()
-                    self.assertEqual(
-                        out[c, row, col].item(),
-                        expected,
-                        f"mismatch at (c={c}, row={row}, col={col})",
-                    )
-
-    def test_preserves_input_dtype(self):
-        n_chunks, r, d = 2, 2, 4
-        tensor = torch.randn(n_chunks, r, 2 * d, dtype=torch.bfloat16)
-        out = _overlap_transform(tensor, value=0.0, head_dim=d)
-        self.assertEqual(out.dtype, torch.bfloat16)
 
 
 class TestGetKvIndices(unittest.TestCase):

@@ -19,6 +19,7 @@ from sglang.srt.disaggregation.encode_receiver import (
     EmbeddingData,
     MMReceiverHTTP,
     MultiModalEmbeddingData,
+    _encoder_media_item,
     _select_mm_processor_prompt,
 )
 from sglang.srt.disaggregation.encode_server import MMEncoder, _get_mm_grid_dim
@@ -27,8 +28,10 @@ from sglang.srt.managers.tokenizer_manager import (
     _reject_missing_dispatched_encoder_embedding,
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+from sglang.srt.multimodal.cache import snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
     LOCAL_PREPROCESSED_KEY,
+    EncoderMediaProcessorConfig,
     EncoderPreprocessOutput,
     get_encoder_preprocessed_items,
     hash_raw_encoder_item,
@@ -41,6 +44,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 )
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import resolve_encoder_transfer_backend
+from sglang.srt.utils import ImageData
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -86,6 +90,110 @@ def test_epd_language_only_rejects_missing_dispatched_embedding():
     assert getattr(exc_info.value, "status_code", None) == 503
 
 
+def test_epd_rejection_reads_the_resolved_transfer_backend():
+    """Tripwire for step 12: this guard fires on the *resolved* backend.
+
+    The record is produced by actual resolution -- a language-only Kimi-K3
+    launch at TP2, whose `encoder_transfer_backend` starts at the argument
+    default `"auto"` (`ENCODER_TRANSFER_BACKEND_CHOICES[0]`) and is filled in
+    by `resolve_encoder_transfer_backend` to `"zmq_to_tokenizer"`. Today the
+    guard therefore rejects. When step 12 makes the instance raw, this same
+    launch hands the guard a record still at `"auto"`, the rejection silently
+    stops, and *this test fails* -- which is the signal to give this reader
+    the resolved value (per-engine overlay or bag) rather than the record.
+    Fixed doubles cannot trip on that change, so the record here must come
+    from resolution, not a SimpleNamespace.
+    """
+    import json
+    import os
+    import shutil
+    import tempfile
+
+    from sglang.srt.server_args import ServerArgs
+
+    def env_field_flags():
+        from sglang.srt.environ import EnvField, envs
+
+        return {
+            name: field._set_to_none
+            for klass in reversed(type(envs).__mro__)
+            for name, field in vars(klass).items()
+            if isinstance(field, EnvField)
+        }
+
+    config_dir = tempfile.mkdtemp(prefix="epd_tripwire_")
+    try:
+        payload = {
+            "architectures": ["KimiK3ForConditionalGeneration"],
+            "model_type": "kimi_k3",
+            "text_config": {
+                "architectures": ["DeepseekV3ForCausalLM"],
+                "model_type": "deepseek_v3",
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "moe_intermediate_size": 32,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 2,
+                "n_routed_experts": 8,
+                "n_shared_experts": 1,
+                "num_experts_per_tok": 2,
+                "first_k_dense_replace": 1,
+                "vocab_size": 128,
+                "max_position_embeddings": 2048,
+                "kv_lora_rank": 8,
+                "q_lora_rank": 8,
+                "qk_nope_head_dim": 8,
+                "qk_rope_head_dim": 8,
+                "v_head_dim": 8,
+                "topk_method": "greedy",
+                "scoring_func": "softmax",
+            },
+            "vision_config": {
+                "model_type": "kimi_k3_vision",
+                "hidden_size": 16,
+                "num_heads": 2,
+                "depth": 2,
+                "patch_size": 14,
+                "merge_kernel_size": [2, 2],
+            },
+        }
+        with open(os.path.join(config_dir, "config.json"), "w") as handle:
+            json.dump(payload, handle)
+        environ_before = dict(os.environ)
+        flags_before = env_field_flags()
+        try:
+            resolved = ServerArgs(
+                model_path=config_dir,
+                device="cuda",
+                random_seed=42,
+                language_only=True,
+                tp_size=2,
+                # Resolution branches on the host device for the hybrid
+                # state-cache sizing (extra_buffer asserts a GPU stack, which
+                # the CPU CI runner does not have); the guard under test reads
+                # `encoder_transfer_backend`, independent of that branch, so
+                # pin the strategy every host can resolve.
+                mamba_radix_cache_strategy="no_buffer",
+                disable_overlap_schedule=True,
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(environ_before)
+            from sglang.srt.environ import envs
+
+            for name, was_none in flags_before.items():
+                getattr(type(envs), name)._set_to_none = was_none
+    finally:
+        shutil.rmtree(config_dir, ignore_errors=True)
+
+    assert resolved.encoder_transfer_backend == "zmq_to_tokenizer"
+    request = SimpleNamespace(need_wait_for_mm_inputs=True)
+    with pytest.raises(HTTPException) as exc_info:
+        _reject_missing_dispatched_encoder_embedding(resolved, request, None)
+    assert getattr(exc_info.value, "status_code", None) == 503
+
+
 def test_epd_allows_local_processing_when_request_was_not_dispatched():
     server_args = SimpleNamespace(
         language_only=True,
@@ -103,6 +211,11 @@ def _encoder(model_type="kimi_k3"):
         hf_config=SimpleNamespace(
             vision_config=SimpleNamespace(merge_kernel_size=(2, 2))
         )
+    )
+    encoder.encoder_media_processor_config = (
+        KimiK3ForConditionalGeneration.encoder_media_processor_config
+        if model_type == "kimi_k3"
+        else EncoderMediaProcessorConfig()
     )
     return encoder
 
@@ -188,8 +301,21 @@ def test_kimi_k3_epd_preprocess_preserves_raw_per_image_items():
         assert item.hash is not None
         assert item.pad_value is not None
         deferred = item.model_specific_data[DEFERRED_PREPROCESSING_KEY]
-        assert deferred["image_mean"] == [0.5, 0.5, 0.5]
-        assert deferred["image_std"] == [0.5, 0.5, 0.5]
+        assert deferred.image_mean == [0.5, 0.5, 0.5]
+        assert deferred.image_std == [0.5, 0.5, 0.5]
+
+
+def test_kimi_k3_epd_preserves_verified_content_identity():
+    image = Image.new("RGB", (8, 6), color=(1, 2, 3))
+    digest = "sha256:" + "ab" * 32
+
+    output = prepare_kimi_k3_encoder_inputs(
+        [{"type": "image", "image": image, "content_hash": digest}],
+        _kimi_k3_image_processor(),
+    )
+
+    item = get_encoder_preprocessed_items(output)[0]
+    assert item.model_specific_data["content_digest"] == digest
 
 
 def test_kimi_k3_epd_model_preprocessor_receives_image_processor():
@@ -289,7 +415,7 @@ def test_kimi_k3_epd_default_cpu_materialization_is_owner_only_and_exact():
     assert len(processor.calls[0]) == 1
     assert processor.calls[0][0]["image"].getpixel((0, 0)) == (11, 0, 0)
     assert torch.all(materialized == 11)
-    assert items[0].model_specific_data[DEFERRED_PREPROCESSING_KEY]["backend"] == "cpu"
+    assert items[0].model_specific_data[DEFERRED_PREPROCESSING_KEY].backend == "cpu"
 
 
 def test_encoder_preprocess_materializes_only_local_size_balanced_items():
@@ -352,6 +478,67 @@ def test_kimi_k3_epd_selects_matching_jpeg_decode_mode(
 
     assert output is expected
     load.assert_called_once_with(b"jpeg", expected_decode_mode)
+
+
+def test_kimi_k3_epd_verifies_content_hash_before_decode():
+    payload = b"jpeg"
+    digest = snapshot_media(payload).content_digest
+    expected = torch.zeros((3, 2, 3), dtype=torch.uint8)
+    encoder = _encoder()
+    encoder.use_image_processor_gpu = False
+
+    with patch(
+        "sglang.srt.disaggregation.encode_server.load_image",
+        return_value=(expected, None),
+    ) as load:
+        output = encoder._load_single_item(
+            {"url": payload, "content_hash": digest}, Modality.IMAGE
+        )
+
+    assert output == {
+        "type": "image",
+        "image": expected,
+        "content_hash": digest,
+    }
+    load.assert_called_once_with(payload, False)
+
+
+def test_epd_receiver_keeps_content_hash_aligned_with_image():
+    digest = "sha256:" + "cd" * 32
+    receiver = MMReceiverHTTP.__new__(MMReceiverHTTP)
+    request = SimpleNamespace(
+        image_data=[
+            ImageData(
+                url="image",
+                detail="high",
+                max_dynamic_patch=12,
+                preprocess_kwargs={"crop": False},
+                content_hash=digest,
+            )
+        ],
+        video_data=None,
+        audio_data=None,
+        mm_content_hashes=[digest],
+    )
+
+    assert receiver._extract_url_data(request) == [
+        {
+            "url": "image",
+            "modality": Modality.IMAGE,
+            "detail": "high",
+            "max_dynamic_patch": 12,
+            "preprocess_kwargs": {"crop": False},
+            "content_hash": digest,
+        }
+    ]
+
+    assert _encoder_media_item(receiver._extract_url_data(request)[0]) == {
+        "url": "image",
+        "detail": "high",
+        "max_dynamic_patch": 12,
+        "preprocess_kwargs": {"crop": False},
+        "content_hash": digest,
+    }
 
 
 def test_kimi_k3_epd_aggregates_original_image_sizes_in_part_order():
