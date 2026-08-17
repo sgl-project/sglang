@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MambaPoolHost,
     PoolEntry,
 )
+from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -514,6 +515,109 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             self.assertTrue(
                 torch.equal(host.v_buffer[host_indices, layer_id], expected_v[layer_id])
             )
+
+    def test_npu_packed_mha_init_does_not_require_cuda_pointer_arrays(self):
+        target_pool = SimpleNamespace(
+            layer_num=2,
+            head_num=1,
+            head_dim=1,
+            device="cpu",
+        )
+        draft_pool = SimpleNamespace(layer_num=1)
+
+        def init_host_pool(host, device_pool, *args, **kwargs):
+            host.device_pool = device_pool
+            host.layout = "page_first_direct"
+            host.layer_num = 3
+            host.dtype = torch.bfloat16
+            host.page_num = 3
+            host.page_size = 2
+            host.kv_buffer = torch.empty(2, 3, 3, 2, 1, 1, dtype=host.dtype)
+
+        with (
+            mock.patch.object(HostKVCache, "__init__", init_host_pool),
+            mock.patch(f"{MHA_POOL_HOST_MODULE}._is_npu", True),
+        ):
+            host = MHATokenToKVPoolHost(
+                target_pool,
+                host_to_device_ratio=1,
+                host_size=0,
+                page_size=2,
+                layout="page_first_direct",
+                mtp_draft_device_pools=(draft_pool,),
+            )
+
+        self.assertEqual(host.layer_num, 3)
+        self.assertFalse(hasattr(host, "packed_device_k_data_ptrs"))
+        self.assertFalse(hasattr(host, "packed_device_v_data_ptrs"))
+
+    def test_npu_packed_mha_transfer_splits_target_and_draft_layers(self):
+        host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host.layout = "page_first_direct"
+        host.page_size = 2
+        host.kv_buffer = torch.empty(2, 2, 3, 2, 1, 1)
+
+        target_k = torch.empty(2, 3, 2, 1, 1)
+        target_v = torch.empty_like(target_k)
+        draft_k = torch.empty(1, 3, 2, 1, 1)
+        draft_v = torch.empty_like(draft_k)
+        target_pool = SimpleNamespace(
+            layer_num=2,
+            get_hicache_transfer_buffers=mock.Mock(
+                return_value=(target_k, target_v)
+            ),
+        )
+        draft_pool = SimpleNamespace(
+            layer_num=1,
+            get_hicache_transfer_buffers=mock.Mock(return_value=(draft_k, draft_v)),
+        )
+        host.mtp_draft_device_pools = (draft_pool,)
+        host_indices = _indices(0, 2)
+        device_indices = _indices(2, 4)
+        directions = SimpleNamespace(H2D="H2D", D2H="D2H")
+
+        with (
+            mock.patch(
+                f"{MHA_POOL_HOST_MODULE}.TransferDirection",
+                directions,
+                create=True,
+            ),
+            mock.patch(
+                f"{MHA_POOL_HOST_MODULE}.transfer_kv_dim_exchange",
+                create=True,
+            ) as transfer,
+        ):
+            host.backup_from_device_all_layer(
+                target_pool,
+                host_indices,
+                device_indices,
+                io_backend="kernel_ascend",
+            )
+            host.load_to_device_per_layer(
+                target_pool,
+                host_indices,
+                device_indices,
+                layer_id=0,
+                io_backend="kernel_ascend",
+            )
+
+        self.assertEqual(transfer.call_count, 4)
+        expected = (
+            (target_k, 0, 2, "D2H"),
+            (draft_k, 2, 3, "D2H"),
+            (target_k, 0, 2, "H2D"),
+            (draft_k, 2, 3, "H2D"),
+        )
+        for call, (device_k, start, end, direction) in zip(
+            transfer.call_args_list, expected
+        ):
+            self.assertIs(call.kwargs["device_k"], device_k)
+            self.assertEqual(call.kwargs["host_k"].shape[1], end - start)
+            self.assertEqual(
+                call.kwargs["host_k"].data_ptr(),
+                host.k_buffer[:, start:end].data_ptr(),
+            )
+            self.assertEqual(call.kwargs["direction"], direction)
 
     def test_npu_mha_transfer_uses_contiguous_hicache_backing(self):
         host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
