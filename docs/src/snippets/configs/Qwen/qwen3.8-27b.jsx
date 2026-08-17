@@ -576,6 +576,15 @@ export const config = {
       // strategy, or prefix cache off for S=1).
       match: { hw: "rtx5090", variant: "default", quant: "nvfp4", nodes: "single" },
       verified: true,
+      // Rendered with the cell so nobody ships the bs=1 pins into a
+      // multi-user deployment unaware.
+      warn:
+        "This recipe serves ONE request at a time: --max-running-requests 1 " +
+        "and --cuda-graph-max-bs 1 pin it to the validated single-stream " +
+        "envelope. To handle more concurrent requests, raise both flags " +
+        "together and re-derive --mamba-full-memory-ratio (and mem-fraction) " +
+        "with the [Mamba ratio calculator](#mamba-ratio-calculator) — on this " +
+        "32GB card the GDN state pool, not KV, is what runs out first.",
       env: [],
       flags: [
         "--trust-remote-code",
