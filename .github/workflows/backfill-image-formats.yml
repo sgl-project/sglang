@@ -14,7 +14,7 @@ on:
         description: "补全格式后触发 Bits 流水线同步到客户仓库"
         required: false
         type: boolean
-        default: true
+        default: false
 
 concurrency:
   group: backfill-image-formats-${{ github.run_id }}
@@ -148,45 +148,15 @@ jobs:
           BITS_PIPELINE_ID="1008460003842"
           BITS_SPACE_ID="779378790402"
 
+          echo "Images to sync:"
           for image_ref in ${IMAGE_REFS}; do
             image_ref="${image_ref//[$'\r\n']/}"
             [[ -z "$image_ref" ]] && continue
-
-            # Parse framework and tag from image_ref
-            # iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:v0.5.16.iaas.202607280000-kimi-k3-cu130
-            framework="${image_ref##*/}"   # sglang:v0.5.16...
-            framework="${framework%%:*}"   # sglang
-            tag="${image_ref##*:}"         # v0.5.16.iaas.202607280000-kimi-k3-cu130
-
-            echo "=== Triggering Bits sync for ${framework}:${tag} ==="
-
-            # Try to trigger via bytedcli + bits_pipeline_cli
-            if command -v bytedcli &>/dev/null && command -v bits_pipeline_cli &>/dev/null; then
-              JWT=$(bytedcli auth get-bytecloud-jwt-token --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['jwt'])" 2>/dev/null || echo "")
-              if [ -n "$JWT" ]; then
-                bits_pipeline_cli call \
-                  --env cn \
-                  --username hanhan.hank \
-                  --rpc RunPipeline \
-                  --path-param "pipeline_id=${BITS_PIPELINE_ID}" \
-                  --jwt-token "$JWT" \
-                  --body-json "$(python3 -c "
-import json
-print(json.dumps({
-    'run_by': 'hanhan.hank',
-    'custom_vars': [
-        {'name': 'custom.framework', 'value': {'text': '${framework}'}},
-        {'name': 'custom.tag', 'value': {'text': '${tag}'}},
-    ]
-}))
-                  ")"
-                echo "  Bits pipeline triggered: ${framework}:${tag}"
-              else
-                echo "  ::warning:: could not get JWT; trigger manually"
-              fi
-            else
-              echo "  ::notice:: bytedcli/bits_pipeline_cli not available on this runner"
-              echo "  Manual trigger: https://bits.bytedance.net/devops/${BITS_SPACE_ID}/pipeline/detail/${BITS_PIPELINE_ID}"
-              echo "  Variables: framework=${framework} tag=${tag}"
-            fi
+            framework="${image_ref##*/}"; framework="${framework%%:*}"
+            tag="${image_ref##*:}"
+            echo "  framework=${framework} tag=${tag}"
           done
+
+          echo ""
+          echo "Bits 流水线: https://bits.bytedance.net/devops/${BITS_SPACE_ID}/pipeline/detail/${BITS_PIPELINE_ID}"
+          echo "请手动触发流水线，填入对应的 framework 和 tag。"
