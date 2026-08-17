@@ -243,14 +243,17 @@ class Mamba2StateShape:
         )
 
     @staticmethod
-    def create_mamba1(
+    def create_full_rank(
         *,
         tp_world_size: int,
         intermediate_size: int,
         state_size: int,
         conv_kernel: int,
     ) -> "Mamba2StateShape":
-        """State shape for a Mamba-1 (selective-scan) mixer, e.g. Falcon-Mamba.
+        """State shape for a full-rank (``head_dim == 1``) selective-scan mixer.
+
+        This is the layout used by Mamba-1 mixers (e.g. Falcon-Mamba,
+        state-spaces Mamba).
 
         Two things differ from Mamba-2 (:meth:`create`):
 

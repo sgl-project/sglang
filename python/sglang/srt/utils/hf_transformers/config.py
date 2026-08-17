@@ -81,10 +81,10 @@ def _try_load_raw_mamba_config(model, revision: Optional[str], **kwargs):
     to the `-hf` conversions) ship a minimal `config.json` with `d_model` /
     `n_layer` / `ssm_cfg` and NO `model_type` / `architectures`, so
     `AutoConfig.from_pretrained` rejects them with "Unrecognized model ...".
-    Detect that shape and build a transformers `MambaConfig` (model_type
-    `mamba`, arch `MambaForCausalLM`) with the field-name mapping the SGLang
-    Mamba model expects. Uses `get_config_dict` (which does not require a
-    model_type) so this runs before the failing `AutoConfig` path.
+    Detect that shape and build our `MambaConfig` (model_type `mamba`, arch
+    `MambaForCausalLM`) with the field-name mapping the SGLang Mamba model
+    expects. Uses `get_config_dict` (which does not require a model_type) so
+    this runs before the failing `AutoConfig` path.
     """
     config_dict, _ = PretrainedConfig.get_config_dict(
         model, revision=revision, **kwargs
@@ -95,7 +95,7 @@ def _try_load_raw_mamba_config(model, revision: Optional[str], **kwargs):
     if "d_model" not in config_dict or "ssm_cfg" not in config_dict:
         return None
 
-    from transformers import MambaConfig
+    from sglang.srt.configs.mamba import MambaConfig
 
     d_model = config_dict["d_model"]
     # The embedding is padded up to a multiple of pad_vocab_size_multiple; match
@@ -183,9 +183,17 @@ class HfModelConfigParser(ModelConfigParserBase):
             model_type = config.model_type
             if model_type == "deepseek_vl_v2" and is_ocr:
                 model_type = "deepseek-ocr"
-            config = _CONFIG_REGISTRY[model_type].from_pretrained(
-                model, revision=revision
-            )
+            # Raw state-spaces Mamba configs are built by
+            # _try_load_raw_mamba_config with architectures injected; reloading
+            # from the checkpoint would drop them, so skip it when the config is
+            # already one of our classes.
+            from sglang.srt.configs.mamba import FalconMambaConfig, MambaConfig
+            from sglang.srt.configs.mamba2 import Mamba2Config
+
+            if not isinstance(config, (Mamba2Config, MambaConfig, FalconMambaConfig)):
+                config = _CONFIG_REGISTRY[model_type].from_pretrained(
+                    model, revision=revision
+                )
 
             # Re-check after reloading config from registry
             if _is_deepseek_ocr_model(config) or _is_deepseek_ocr2_model(config):
