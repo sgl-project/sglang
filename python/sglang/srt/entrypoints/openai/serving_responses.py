@@ -871,7 +871,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 self.tool_call_parser,
                 tokenizer=self.tokenizer_manager.tokenizer,
             )
-            detector_owns_format = parser.detector.supports_structural_tag()
+            detector_owns_format = (
+                parser.detector.supports_structural_tag()
+                or parser.detector.parses_required_natively()
+            )
             should_try_native = not is_required or detector_owns_format
             if should_try_native and parser.has_tool_call(content):
                 try:

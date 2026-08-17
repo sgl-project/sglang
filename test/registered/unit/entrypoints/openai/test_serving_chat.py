@@ -34,7 +34,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
 )
-from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE
+from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
@@ -1553,6 +1553,42 @@ class ServingChatTestCase(unittest.TestCase):
                     self.assertEqual(remaining, text)
                     self.assertEqual(finish_reason["type"], "stop")
                     self.assertNotIn("Tool call parsing error", "\n".join(logs.output))
+
+    def test_truncated_native_tool_call_logs_and_drops(self):
+        """A tools section cut off before its closing tag parses to zero calls
+        without raising; the sync path used to drop it with no log at all."""
+        self.chat.tool_call_parser = "kimi_k3"
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        truncated = TOOLS_OPEN + '<|open|>call tool="get_weather" index="1"<|sep|>'
+        for choice in ("auto", "required"):
+            with self.subTest(tool_choice=choice):
+                finish_reason = {"type": "stop", "matched": None}
+                with self.assertLogs(
+                    "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+                ) as logs:
+                    tool_calls, remaining, finish_reason = (
+                        self.chat._process_tool_calls(
+                            text=truncated,
+                            tools=tools,
+                            finish_reason=finish_reason,
+                            tool_choice=choice,
+                        )
+                    )
+                self.assertIsNone(tool_calls)
+                self.assertEqual(remaining, "")
+                self.assertEqual(finish_reason["type"], "stop")
+                self.assertIn("no complete call", "\n".join(logs.output))
 
     def test_required_tool_choice_json_fallback_tolerates_odd_shapes(self):
         """Parsers without a structural tag keep the JSON array fallback, but a

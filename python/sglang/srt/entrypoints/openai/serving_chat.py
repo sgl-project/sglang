@@ -2006,6 +2006,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 try:
                     text, call_info_list = parser.parse_non_stream(text)
                     if not call_info_list:
+                        logger.warning(
+                            "Tool call marker present but no complete call parsed "
+                            "from %s output; dropping the incomplete call",
+                            self.tool_call_parser,
+                        )
+                        logger.debug(
+                            "Unparsed tool call output (%d chars): %r",
+                            len(text),
+                            text[:2000],
+                        )
                         return ToolCallProcessingResult(None, text, finish_reason)
 
                     tool_calls = []
