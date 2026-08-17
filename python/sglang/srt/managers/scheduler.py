@@ -266,7 +266,11 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.common import (
+    maybe_cache_unfinished_req,
+    release_kv_cache,
+    retraction_discard,
+)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -965,6 +969,9 @@ class Scheduler(
     def init_memory_pools(self):
         """Allocate KV cache pools for target and draft workers."""
         self.init_target_memory_pool()
+        # Lands the retraction backend on the disagg bag before the draft
+        # worker's HiCache plan reads it.
+        kv_cache_builder.resolve_decode_retraction_backup(tp_worker=self.tp_worker)
         if self.draft_worker is not None:
             pool, allocator = self.tp_worker.get_memory_pool()
             self.draft_worker.alloc_memory_pool(
@@ -1701,12 +1708,8 @@ class Scheduler(
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
-        # Called right after each launch: order later schedule_stream work
-        # (result processing, next iteration's writes) behind the forward's
-        # shared-buffer reads. Fast path: wait on the read-done event the
-        # forward published after its snapshot (non-spec: decode graph; spec:
-        # draft_extend), then clear it. Else whole-forward wait_stream
-        # (forceable via SGLANG_FORCE_COARSE_WAR_BARRIER).
+        # WAR: keep later schedule_stream writes behind this forward's shared reads.
+        # Clearing matters: a phase that skips the publish then falls back to coarse.
         if not self._war_barrier_enabled:
             return
         runner = self.model_worker.last_shared_read_runner
@@ -2510,11 +2513,7 @@ class Scheduler(
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
-            error_msg = (
-                "DSpark speculative decoding does not support return_logprob yet."
-                if self.spec_algorithm.is_dspark() and req.return_logprob
-                else validate_dflash_request(req, self.enable_overlap)
-            )
+            error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
@@ -3875,9 +3874,11 @@ class Scheduler(
     def _relay_forward_payload(
         self, future_indices: torch.Tensor, batch_result: GenerationBatchResult
     ) -> None:
-        """Stash this iter's relay payload for next iter's resolve_forward_inputs.
-        ngram is skipped: it relays its draft via batch.spec_info, not the FutureMap."""
+        """Stash this iter's relay payload for next iter's resolve_forward_inputs."""
         if self.spec_algorithm.is_ngram():
+            if batch_result.next_draft_input is not None:
+                payload = RelayPayload.from_ngram(batch_result.next_draft_input)
+                self.future_map.stash(future_indices, payload)
             return
         if batch_result.next_draft_input is not None:
             payload = RelayPayload.from_draft_input(batch_result.next_draft_input)
@@ -4548,13 +4549,16 @@ class Scheduler(
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
 
-            # Abort requests already retracted to CPU cache
+            # Abort requests whose KV is already backed up for retraction.
             if self.disagg_decode_prealloc_queue.retracted_queue:
                 remaining_retracted = []
                 for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
                     if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        assert hasattr(decode_req, "kv_cache_cpu")
-                        del decode_req.kv_cache_cpu
+                        retraction_discard(
+                            decode_req,
+                            self.tree_cache,
+                            get_disagg().disaggregation_decode_retraction_backup,
+                        )
                         self.ipc_channels.send_to_tokenizer.send_output(
                             AbortReq(rid=decode_req.rid), decode_req
                         )

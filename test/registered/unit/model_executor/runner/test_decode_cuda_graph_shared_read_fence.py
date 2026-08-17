@@ -1,10 +1,14 @@
 import contextlib
 from types import SimpleNamespace
+from unittest.mock import create_autospec
 
 import pytest
 import torch
 
-from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.layers.attention.linear.kda_route_telemetry import (
     KDACudaGraphRoutePlans,
 )
@@ -13,69 +17,52 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    is_in_breakable_cuda_graph_capture,
-)
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
-    is_in_breakable_cuda_graph_capture as implementation_capture_probe,
-)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
-
-def test_breakable_capture_probe_is_public():
-    assert is_in_breakable_cuda_graph_capture is implementation_capture_probe
+DECODE = ForwardMode.DECODE
 
 
-class _SpecAlgorithm:
-    def __init__(self, target_verify_war: bool = False):
-        self._target_verify_war = target_verify_war
-
-    def is_last_shared_read_phase(self, forward_mode) -> bool:
-        return self._target_verify_war and forward_mode.is_target_verify()
-
-
-def _attn_backend(boundary=SharedReadBoundary.IN_REPLAY):
-    """Backend stub declaring one fixed read-end boundary for every mode."""
-    return SimpleNamespace(shared_read_boundary=lambda _forward_mode: boundary)
-
-
-def _runner(*, target_verify_war: bool = False, has_marker: bool = False):
+def _runner(*, has_marker: bool = False):
     runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
     runner.model_runner = SimpleNamespace(
-        spec_algorithm=_SpecAlgorithm(target_verify_war),
         device_timer=None,
         is_draft_worker=False,
         shared_read_done_event=None,
     )
+    runner.enable_pdmux = False
     runner.in_graph_metadata_prep_done = object() if has_marker else None
     return runner
 
 
-def test_unrelated_modes_never_publish():
-    # This runner owns the fence for decode / target verify only; every other
-    # mode stays on the coarse wait, even with a marker available.
-    assert (
-        _runner(has_marker=True)._resolve_shared_read_boundary(
-            _attn_backend(), ForwardMode.EXTEND
-        )
-        is SharedReadBoundary.UNKNOWN
-    )
+def _backend(declared: SharedReadEnds):
+    # Spec'd against the real ABC so a rename fails here, not at runtime.
+    backend = create_autospec(AttentionBackend, instance=True)
+    backend.shared_read_ends.return_value = declared
+    return backend
 
 
-def test_post_replay_declaration_is_not_advanced():
-    # A backend that keeps reading shared state across the whole graph declares
-    # POST_REPLAY. Having an in-graph marker must not pull the fence earlier.
-    assert (
-        _runner(target_verify_war=True, has_marker=True)._resolve_shared_read_boundary(
-            _attn_backend(SharedReadBoundary.POST_REPLAY), ForwardMode.TARGET_VERIFY
-        )
-        is SharedReadBoundary.POST_REPLAY
-    )
+@pytest.mark.parametrize(
+    "declared, has_marker, expected",
+    [
+        # The backend's declaration decides where the record lands.
+        (SharedReadEnds.IN_REPLAY, True, SharedReadEnds.IN_REPLAY),
+        # Nowhere to record in-graph -> fall back to the pre-replay record.
+        (SharedReadEnds.IN_REPLAY, False, SharedReadEnds.PRE_REPLAY),
+        # Only an in-graph declaration is demoted; the rest pass through.
+        (SharedReadEnds.POST_REPLAY, False, SharedReadEnds.POST_REPLAY),
+    ],
+)
+def test_resolve_shared_read_ends(declared, has_marker, expected):
+    runner = _runner(has_marker=has_marker)
+    backend = _backend(declared)
+
+    assert runner._resolve_shared_read_ends(backend, DECODE) is expected
+    backend.shared_read_ends.assert_called_once_with(DECODE)
 
 
-def _execute_harness(runner, calls, mode=ForwardMode.DECODE):
+def _execute_harness(runner, calls):
     key = ShapeKey(size=1)
     runner.kda_cuda_graph_route_plans = KDACudaGraphRoutePlans()
     runner.kda_cuda_graph_route_plans.bind("decode", key, ())
@@ -94,30 +81,30 @@ def _execute_harness(runner, calls, mode=ForwardMode.DECODE):
             return output
 
     runner.backend = Backend()
-    return SimpleNamespace(forward_mode=mode, batch_size=1)
+    return SimpleNamespace(forward_mode=DECODE, batch_size=1)
 
 
-def test_execute_publishes_the_in_graph_marker():
+def test_execute_publishes_the_in_graph_marker_with_kda_route_replay():
     runner = _runner(has_marker=True)
     marker = runner.in_graph_metadata_prep_done
-    runner.attn_backend = _attn_backend()
+    runner.attn_backend = _backend(SharedReadEnds.IN_REPLAY)
     runner.device_module = SimpleNamespace(
         Event=lambda: (_ for _ in ()).throw(
             AssertionError("execute must reuse the graph-recorded event")
         )
     )
     calls = []
-    forward_batch = _execute_harness(runner, calls)
 
-    result = runner.execute(forward_batch)
+    result = runner.execute(_execute_harness(runner, calls))
 
     assert result.tensors["hidden_states"].shape == (1, 1)
+    assert calls == ["replay"]
     assert runner.model_runner.shared_read_done_event is marker
 
 
-def test_execute_falls_back_to_pre_replay_without_marker():
+def test_execute_falls_back_before_kda_route_replay_without_marker():
     runner = _runner()
-    runner.attn_backend = _attn_backend()
+    runner.attn_backend = _backend(SharedReadEnds.IN_REPLAY)
     calls = []
 
     class Event:
@@ -125,26 +112,29 @@ def test_execute_falls_back_to_pre_replay_without_marker():
             calls.append("record")
 
     runner.device_module = SimpleNamespace(Event=Event)
-    forward_batch = _execute_harness(runner, calls)
 
-    runner.execute(forward_batch)
+    runner.execute(_execute_harness(runner, calls))
 
-    # The eager record lands before the replay so the fence stays truthful.
     assert calls == ["record", "replay"]
     assert isinstance(runner.model_runner.shared_read_done_event, Event)
 
 
-@pytest.mark.parametrize("supported", [False, True])
-def test_target_verify_requires_war_capability(supported):
-    runner = _runner(target_verify_war=supported, has_marker=True)
+def test_publish_read_done():
+    runner = _runner(has_marker=True)
+    recorded = []
+    runner.device_module = SimpleNamespace(
+        Event=lambda: SimpleNamespace(record=lambda: recorded.append("record"))
+    )
+
+    runner._publish_read_done(in_graph=True)
+    # In-graph: hand over the graph-recorded marker, do not record a new event.
     marker = runner.in_graph_metadata_prep_done
-    runner.attn_backend = _attn_backend()
-    runner.device_module = SimpleNamespace(Event=lambda: None)
+    assert runner.model_runner.shared_read_done_event is marker
+    assert recorded == []
 
-    runner.execute(_execute_harness(runner, [], ForwardMode.TARGET_VERIFY))
-
-    expected = marker if supported else None
-    assert runner.model_runner.shared_read_done_event is expected
+    runner._publish_read_done(in_graph=False)
+    assert recorded == ["record"]
+    assert runner.model_runner.shared_read_done_event is not marker
 
 
 if __name__ == "__main__":
