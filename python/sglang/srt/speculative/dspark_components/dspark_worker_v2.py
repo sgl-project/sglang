@@ -66,9 +66,11 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     prepare_mamba_track_for_verify,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_cuda
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -173,16 +175,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.gamma), device=self.device
         )
 
-        target_model = self.target_worker.model_runner.model
-        lm_head = getattr(target_model, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight"):
-            raise RuntimeError(
-                "DSpark requires the target model to expose `lm_head` with `weight`."
+        if getattr(self.draft_model, "uses_own_vocab_modules", False):
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DSpark draft uses its checkpoint-local embedding and LM head."
+                )
+        else:
+            target_model = self.target_worker.model_runner.model
+            lm_head = getattr(target_model, "lm_head", None)
+            if lm_head is None or not hasattr(lm_head, "weight"):
+                raise RuntimeError(
+                    "DSpark requires the target model to expose `lm_head` with `weight`."
+                )
+            self.draft_model.attach_shared_modules(
+                embed_tokens=self._resolve_target_embed_tokens(target_model),
+                lm_head=lm_head,
             )
-        self.draft_model.attach_shared_modules(
-            embed_tokens=self._resolve_target_embed_tokens(target_model),
-            lm_head=lm_head,
-        )
 
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
@@ -329,6 +337,12 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         with self._draft_context():
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.extra_ops_loader import (
+                    initialize_dspark_sparse_attn_ops,
+                )
+
+                initialize_dspark_sparse_attn_ops()
             self._draft_worker.init_attention_backends()
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
@@ -570,7 +584,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
-
         verify_window = alloc_verify_window(
             batch=batch,
             bs=bs,
@@ -675,7 +688,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
-
         if batch.has_grammar:
             # run_compact scatters its rows back to (bs * chain_len), so the mask
             # lines up with the logits on both verify paths.
