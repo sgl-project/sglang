@@ -30,6 +30,10 @@ graph has completed.
 Asynchronous GPU faults need a synchronization/CUPTI receipt at the owning
 launch boundary and are intentionally not assigned to a KDA layer by this
 telemetry.
+
+Set ``SGLANG_KDA_ROUTE_EVENT_LOGGING=1`` to mirror every committed event to the
+server log for diagnostic JSONL receipts.  It is disabled by default so log
+serialization and I/O do not enter the serving replay critical path.
 """
 
 from __future__ import annotations
@@ -542,8 +546,15 @@ def _raw_event_capacity_from_env() -> int:
     return value
 
 
+def _route_event_logging_enabled_from_env() -> bool:
+    """Return whether diagnostic per-route JSON logging is enabled."""
+    value = os.getenv("SGLANG_KDA_ROUTE_EVENT_LOGGING", "false").lower()
+    return value in ("true", "1")
+
+
 KDA_ROUTE_TELEMETRY = KDATerminalRouteTelemetry(
-    raw_event_capacity=_raw_event_capacity_from_env()
+    raw_event_capacity=_raw_event_capacity_from_env(),
+    emit_log=_route_event_logging_enabled_from_env(),
 )
 KDA_CUDA_GRAPH_ROUTE_PLANS = KDACudaGraphRoutePlans()
 

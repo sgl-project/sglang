@@ -2,7 +2,7 @@
 
 import unittest
 from dataclasses import FrozenInstanceError, replace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from sglang.srt.layers.attention.linear.kda_route_telemetry import (
     CAKE_PACKED_EXCEPTION,
@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.linear.kda_route_telemetry import (
     KDACudaGraphRoutePlans,
     KDATerminalRouteEvent,
     KDATerminalRouteTelemetry,
+    _route_event_logging_enabled_from_env,
     capture_kda_route_plan,
     record_kda_terminal_route,
     replay_kda_route_plan,
@@ -99,6 +100,22 @@ def _event(
 
 
 class TestKDATerminalRouteTelemetry(unittest.TestCase):
+    def test_route_event_logging_is_diagnostic_opt_in(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(_route_event_logging_enabled_from_env())
+        with patch.dict(
+            "os.environ", {"SGLANG_KDA_ROUTE_EVENT_LOGGING": "true"}, clear=True
+        ):
+            self.assertTrue(_route_event_logging_enabled_from_env())
+        with patch.dict(
+            "os.environ", {"SGLANG_KDA_ROUTE_EVENT_LOGGING": "1"}, clear=True
+        ):
+            self.assertTrue(_route_event_logging_enabled_from_env())
+        with patch.dict(
+            "os.environ", {"SGLANG_KDA_ROUTE_EVENT_LOGGING": "invalid"}, clear=True
+        ):
+            self.assertFalse(_route_event_logging_enabled_from_env())
+
     def test_direct_success_fallback_fatal_and_counter_closure(self):
         telemetry = _recorder()
         _success(telemetry, layer_id=3)
