@@ -208,10 +208,10 @@ ENV PYTORCH_ROCM_ARCH_DEFAULT="gfx942;gfx950"
 # pins and the device extra all differ, and only the gfx1250 wheels exist here.
 FROM $BASE_IMAGE_1250_ROCM7_15 AS gfx1250-rocm7_15
 
-ARG ROCM_VERSION_7_15="7.15.0a20260712"
-ARG TORCH_VERSION_7_15="2.11.0"
-ARG TORCHVISION_VERSION_7_15="0.26.0"
-ARG TRITON_VERSION_7_15="3.7.1+git0263a6a6"
+ARG ROCM_VERSION="7.15.0a20260712"
+ARG TORCH_VERSION="2.11.0"
+ARG TORCHVISION_VERSION="0.26.0"
+ARG TRITON_VERSION="3.7.1+git0263a6a6"
 ARG ROCM_INDEX_URL="https://rocm.nightlies.amd.com/whl-multi-arch/"
 ARG ROCM_EXTRA_INDEX_URL="https://rocm.devreleases.amd.com/whl-multi-arch/"
 
@@ -238,11 +238,11 @@ RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 RUN python3 -m pip install --no-cache-dir --pre \
         --index-url ${ROCM_INDEX_URL} \
         --extra-index-url ${ROCM_EXTRA_INDEX_URL} \
-        "rocm[libraries,devel,device-gfx1250]==${ROCM_VERSION_7_15}" \
-        "torch[device-gfx1250]==${TORCH_VERSION_7_15}+rocm${ROCM_VERSION_7_15}" \
-        "torchvision[device-gfx1250]==${TORCHVISION_VERSION_7_15}+rocm${ROCM_VERSION_7_15}" \
-        "torchaudio==${TORCH_VERSION_7_15}+rocm${ROCM_VERSION_7_15}" \
-        "triton==${TRITON_VERSION_7_15}.rocm${ROCM_VERSION_7_15}"
+        "rocm[libraries,devel,device-gfx1250]==${ROCM_VERSION}" \
+        "torch[device-gfx1250]==${TORCH_VERSION}+rocm${ROCM_VERSION}" \
+        "torchvision[device-gfx1250]==${TORCHVISION_VERSION}+rocm${ROCM_VERSION}" \
+        "torchaudio==${TORCH_VERSION}+rocm${ROCM_VERSION}" \
+        "triton==${TRITON_VERSION}.rocm${ROCM_VERSION}"
 
 RUN rocm-sdk init && rocm-sdk targets
 
