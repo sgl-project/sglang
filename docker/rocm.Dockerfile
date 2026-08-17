@@ -692,7 +692,7 @@ record_path = Path(dist._path) / "RECORD"
 
 txt = meta_path.read_text(encoding="utf-8")
 # Match both "Requires-Dist: triton==..." and bare "triton==..." (continuation line)
-pat = r"^((?:Requires-Dist:\s*)?triton)==(\S+)"
+pat = r"^((?:Requires-Dist:\s*)?triton)==([^;+\s]+)[^;\s]*"
 txt2, n = re.subn(pat, r"\1>=\2", txt, flags=re.MULTILINE)
 if n == 0:
     print("No triton==... pin found in torch METADATA; nothing to patch")
