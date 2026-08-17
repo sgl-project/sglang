@@ -14,6 +14,7 @@ from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
 from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
 from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 from sgl_kernel_npu.mamba.kda_state_commit import (
+    commit_kda_extended_conv_state,
     move_kda_temporal_snapshot,
     scatter_kda_conv_snapshot,
 )
@@ -633,31 +634,53 @@ class AscendKDAHybridLinearAttnBackend:
                                 src_indices_tensor,
                                 mamba_steps_to_track,
                             )
-                    else:
-                        copy_conv_state_to_track(
-                            conv_states,
-                            dst_indices_tensor,
-                            mamba_track_indices,
-                            mamba_steps_to_track,
-                        )
-
                 if not has_conv_snapshots:
-                    if dst_indices_tensor.numel() > 0:
-                        conv_state_rollback(
-                            conv_states,
-                            dst_indices_tensor,
-                            last_steps,
-                            draft_token_num,
-                        )
-
+                    # PR #35021 keeps all verify-token conv states in one
+                    # extended [window, channel] buffer. Commit tracking slots
+                    # first because they read the unmodified primary window;
+                    # then commit the primary slot in place. Both use #34944's
+                    # one-program-per-request/layer strategy and retain
+                    # conv_state_rollback only as a compatibility fallback.
                     if (
                         mamba_track_indices is not None
                         and mamba_track_indices.numel() > 0
                     ):
-                        conv_state_rollback(
+                        track_committed = commit_kda_extended_conv_state(
                             conv_states,
                             mamba_track_indices,
+                            dst_indices_tensor,
                             mamba_steps_to_track,
+                            draft_token_num,
+                        )
+                        if not track_committed:
+                            # Keep PR #35266's fixed-shape, NonZero-free copy
+                            # as the compatibility path for layouts unsupported
+                            # by the direct accepted-window commit kernel.
+                            copy_conv_state_to_track(
+                                conv_states,
+                                dst_indices_tensor,
+                                mamba_track_indices,
+                                mamba_steps_to_track,
+                            )
+                            conv_state_rollback(
+                                conv_states,
+                                mamba_track_indices,
+                                mamba_steps_to_track,
+                                draft_token_num,
+                            )
+
+                    primary_committed = commit_kda_extended_conv_state(
+                        conv_states,
+                        dst_indices_tensor,
+                        dst_indices_tensor,
+                        last_steps,
+                        draft_token_num,
+                    )
+                    if not primary_committed:
+                        conv_state_rollback(
+                            conv_states,
+                            dst_indices_tensor,
+                            last_steps,
                             draft_token_num,
                         )
 
