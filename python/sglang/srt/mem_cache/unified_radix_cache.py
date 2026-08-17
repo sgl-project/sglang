@@ -316,7 +316,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.mem_pool_host.clear()
             self.enable_storage = self.cache_controller.enable_storage
 
-        self.tree_core._record_all_cleared_event()
+        self.tree_core.kv_events.record_all_cleared()
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
