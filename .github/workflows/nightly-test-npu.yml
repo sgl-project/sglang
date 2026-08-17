@@ -122,14 +122,14 @@ jobs:
           # Write to GITHUB_OUTPUT and print to the log in one command.
           echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
 
-  nightly-mix-single-node-a2-tests:
-    name: single-node-mix-a2
+  nightly-1-npu-a2:
+    name: nightly-1-npu-a2
     if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a2-4
-      test_type: perf
+      test_type: 'perf'
       test_suite: nightly-1-npu-a2
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
@@ -422,7 +422,7 @@ jobs:
   check-all-jobs:
     if: ${{ !cancelled() }}
     needs:
-      - nightly-mix-single-node-a2-tests
+      - nightly-1-npu-a2
       - nightly-1-npu-a3
       - nightly-2-npu-a3
       - nightly-4-npu-a3
@@ -448,7 +448,7 @@ jobs:
 
       - name: Generate results table
         run: |
-          single_result_a2="${{ needs.nightly-mix-single-node-a2-tests.result }}"
+          single_result_a2="${{ needs.nightly-1-npu-a2.result }}"
           multi_result="${{ needs.nightly-poc-multi-node-tests.result }}"
           mix_result="${{ needs.nightly-poc-multi-node-mix-tests.result }}"
 
@@ -486,7 +486,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Group | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| single-node-mix-a2 | $(group_icon ${single_result_a2}) ${single_result_a2} |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-1-npu-a2 | $(group_icon ${single_result_a2}) ${single_result_a2} |" >> $GITHUB_STEP_SUMMARY
           for entry in \
             "nightly-1-npu-a3:${{ needs.nightly-1-npu-a3.result }}" \
             "nightly-2-npu-a3:${{ needs.nightly-2-npu-a3.result }}" \

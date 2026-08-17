@@ -328,10 +328,14 @@ jobs:
           mv ${ascend_test_util_path} ${ascend_test_util_path}_bak
           cp -r ${sglang_source_path}/python/sglang/test/ascend ${ascend_test_util_path}
 
+          # External env scripts may reference unset shell vars (e.g. ZSH_VERSION),
+          # which abort the whole script under `set -u`. Temporarily disable -u.
+          set +u
           source /usr/local/Ascend/cann/set_env.sh || true
           source /usr/local/Ascend/nnal/atb/set_env.sh || true
           source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash || true
           source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash || true
+          set -u
 
           # Nightly log path mirrors the output layout; PR keeps the original {date}/{testcase}.
           if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
