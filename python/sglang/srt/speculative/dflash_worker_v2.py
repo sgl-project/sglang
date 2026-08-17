@@ -1473,9 +1473,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
+            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32).to(
+                device, non_blocking=True
+            )
+            draft_seq_lens = torch.tensor(batch.prefix_lens, dtype=torch.int32).to(
+                device, non_blocking=True
             )
 
             if batch.out_cache_loc is None:

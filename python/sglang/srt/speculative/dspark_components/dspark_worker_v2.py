@@ -452,9 +452,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Must inject before prefill returns: the scheduler may update radix
         # afterward, invalidating out_cache_loc.
         device = next_token_ids.device
-        ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-        draft_seq_lens = torch.tensor(
-            batch.prefix_lens, dtype=torch.int32, device=device
+        ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32).to(
+            device, non_blocking=True
+        )
+        draft_seq_lens = torch.tensor(batch.prefix_lens, dtype=torch.int32).to(
+            device, non_blocking=True
         )
         positions, _ = compute_position(
             self.model_runner.prefill_attention_backend_str,
