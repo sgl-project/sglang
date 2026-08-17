@@ -636,6 +636,23 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   cd /sgl-workspace/mori; \
   git checkout "${MORI_COMMIT}"; \
   git submodule update --init --recursive; \
+  # ROCm 10 vendors NUMA and libdrm inside the pip SDK's rocm_sysdeps tree, which
+  # is on none of the three search paths the MORI build needs: hsakmt-config.cmake
+  # calls find_dependency(NUMA), rocm_smi.h reaches for <libdrm/drm.h>, and
+  # mori_application links -ldrm/-ldrm_amdgpu. The SDK's own libraries find these
+  # through an $ORIGIN/rocm_sysdeps/lib RPATH that MORI's do not inherit, hence
+  # the ldconfig entry; every soname in there is librocm_sysdeps_*-prefixed, so it
+  # shadows nothing system-wide. The apt ROCm 7.x images have no rocm_sysdeps
+  # tree, so the guard keeps them on their existing behaviour.
+  ROCM_SYSDEPS="${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps"; \
+  if [ -d "${ROCM_SYSDEPS}" ]; then \
+    export CMAKE_PREFIX_PATH="${ROCM_SYSDEPS}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"; \
+    export CPATH="${ROCM_SYSDEPS}/include${CPATH:+:${CPATH}}"; \
+    export LIBRARY_PATH="${ROCM_SYSDEPS}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"; \
+    echo "${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf; \
+    ldconfig; \
+    echo "[MORI] rocm_sysdeps prefix: ${ROCM_SYSDEPS}"; \
+  fi; \
   python3 setup.py develop; \
   python3 -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))" > /etc/ld.so.conf.d/torch.conf; \
   ldconfig; \
