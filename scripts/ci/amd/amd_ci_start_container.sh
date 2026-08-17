@@ -233,6 +233,22 @@ find_latest_image() {
   esac
 }
 
+# TEST-ONLY (branch bingxche/rocm10-fullflow): pin every job to the images that
+# release-docker-amd-rocm10-nightly built from this branch instead of the published
+# nightly, so the suites run against PR #35088's own Dockerfile output.
+# TEST_IMAGE_ROCM_VERSION overrides ROCM_VERSION for the tag only: the suites pass
+# their own --rocm-version (or default to rocm700) for image lookup, but the images
+# we want are tagged rocm10.
+# Revert before merging anything from this branch.
+TEST_IMAGE_REPO="${TEST_IMAGE_REPO:-}"
+TEST_IMAGE_VERSION="${TEST_IMAGE_VERSION:-}"
+TEST_IMAGE_ROCM_VERSION="${TEST_IMAGE_ROCM_VERSION:-${ROCM_VERSION}}"
+TEST_IMAGE_DATE="${TEST_IMAGE_DATE:-}"
+if [[ -z "${CUSTOM_IMAGE}" && -n "${TEST_IMAGE_REPO}" ]]; then
+  CUSTOM_IMAGE="${TEST_IMAGE_REPO}:${TEST_IMAGE_VERSION}-${TEST_IMAGE_ROCM_VERSION}-${GPU_ARCH}-${TEST_IMAGE_DATE}"
+  echo "[rocm10-fullflow] Pinning image to ${CUSTOM_IMAGE}"
+fi
+
 # Determine which image to use
 if [[ -n "${CUSTOM_IMAGE}" ]]; then
   # Use explicitly provided custom image

@@ -73,26 +73,30 @@ jobs:
           echo "Detected version: ${VERSION}"
           echo "Pretend version for pip: ${PRETEND_VERSION}"
 
-      # Pushing to rocm/sgl-dev is deliberately left off while the SDK pin is a
-      # nightly alpha; only lmsysorg/sglang-rocm is published. Re-enable this
-      # login together with the push step below once the pin moves to GA.
-      # - name: Login to Docker Hub (AMD)
-      #   uses: docker/login-action@v2
-      #   with:
-      #     username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
-      #     password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+      # TEST-ONLY (branch bingxche/rocm10-fullflow): publish to a personal repo so
+      # the AMD suites can be pinned to this branch's own images. Logging in also
+      # lifts the anonymous Docker Hub pull limit for the ubuntu:24.04 base pull.
+      # Revert to the commented-out AMD login before merging anything from here.
+      - name: Login to Docker Hub (AMD test)
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_TEST_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TEST_TOKEN }}
 
-      - name: Build ROCm 10 image
+      - name: Build ROCm 10 image and Push to bingxche/sgl-test
         run: |
           version=${{ steps.version.outputs.version }}
           pretend_version=${{ steps.version.outputs.pretend_version }}
           echo "Version: ${version}"
           echo "Pretend version: ${pretend_version}"
 
+          # rocm10 (not rocm10.0) to match the rocm700/rocm720 tag convention that
+          # amd_ci_start_container.sh's image lookup and the TEST_IMAGE_* override
+          # both compose against.
           if [ "${{ matrix.gpu_arch }}" = "gfx942-rocm10" ]; then
-            rocm_tag="rocm10.0-mi30x"
+            rocm_tag="rocm10-mi30x"
           elif [ "${{ matrix.gpu_arch }}" = "gfx950-rocm10" ]; then
-            rocm_tag="rocm10.0-mi35x"
+            rocm_tag="rocm10-mi35x"
           else
             echo "Unsupported gfx arch"
             exit 1
@@ -109,16 +113,5 @@ jobs:
           # the same wall the ROCm 7.15 stage hit (#32079).
           # UBUNTU_MIRROR forces apt over HTTPS to dodge port-80 reachability flakes
           # to Canonical's archive.ubuntu.com mirror IPs from the amd-docker-scale runner.
-          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg ENABLE_NIXL=0 --build-arg UBUNTU_CODENAME=noble --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
-          # docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
-
-      - name: Login to Docker Hub (lmsys)
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Push to lmsysorg/sglang-rocm
-        run: |
-          docker tag rocm/sgl-dev:${{ env.IMAGE_TAG }} lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
-          docker push lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
+          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg ENABLE_NIXL=0 --build-arg UBUNTU_CODENAME=noble --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t bingxche/sgl-test:${tag}-${{ env.DATE }} --no-cache
+          docker push bingxche/sgl-test:${tag}-${{ env.DATE }}
