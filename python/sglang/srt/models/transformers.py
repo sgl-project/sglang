@@ -131,6 +131,65 @@ _HF_AUTO_MODEL_KEYS = (
 )
 
 
+_MOLMO2_MODEL_TYPE = "molmo2"
+
+
+def _compute_default_rope_parameters(
+    config: Optional[PretrainedConfig] = None,
+    device: Optional[torch.device] = None,
+    seq_len: Optional[int] = None,
+    **rope_kwargs,
+) -> Tuple[torch.Tensor, float]:
+    """Plain (unscaled) RoPE inv-freq computation matching pre-5.x
+    `ROPE_INIT_FUNCTIONS['default']` semantics.
+
+    transformers 5.x dropped the `'default'` key from `ROPE_INIT_FUNCTIONS`
+    (plain RoPE is now handled inline inside each model's rotary embedding),
+    but Molmo2's `modeling_molmo2.py` still does `ROPE_INIT_FUNCTIONS[self.rope_type]`
+    with `self.rope_type == 'default'`. This is the 4.x-shaped shim used by
+    `_molmo2_rope_init_compat` below.
+    """
+    if rope_kwargs:
+        base = rope_kwargs["base"]
+        dim = rope_kwargs["dim"]
+    else:
+        base = config.rope_theta
+        partial = getattr(config, "partial_rotary_factor", 1.0)
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        dim = int(head_dim * partial)
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim)
+    )
+    attention_scaling = 1.0
+    return inv_freq, attention_scaling
+
+
+@contextmanager
+def _molmo2_rope_init_compat(config: PretrainedConfig):
+    """Inject a `'default'` entry into `transformers.ROPE_INIT_FUNCTIONS`
+    while Molmo2's custom modeling code constructs its rotary embedding.
+
+    Self-gates on `config.model_type == "molmo2"`; a no-op for every other
+    model. Only injects when the key is missing (transformers 5.x); on 4.x
+    with a native `'default'` entry this is also a no-op.
+    """
+    if getattr(config, "model_type", None) != _MOLMO2_MODEL_TYPE:
+        yield
+        return
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    injected = "default" not in ROPE_INIT_FUNCTIONS
+    if injected:
+        ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
+    try:
+        yield
+    finally:
+        if injected:
+            ROPE_INIT_FUNCTIONS.pop("default", None)
+
+
 def _hf_auto_model_class_for_config(config: PretrainedConfig):
     """Return the HF `AutoModel*` class best matching the config's auto_map.
 
@@ -646,11 +705,12 @@ class TransformersBase(nn.Module):
         if supports_backend:
             auto_model_cls = _hf_auto_model_class_for_config(self.config)
             with _init_on_device_without_buffers(torch.device("meta")):
-                self.model: PreTrainedModel = auto_model_cls.from_config(
-                    self.config,
-                    torch_dtype=torch.get_default_dtype(),
-                    trust_remote_code=True,
-                )
+                with _molmo2_rope_init_compat(self.config):
+                    self.model: PreTrainedModel = auto_model_cls.from_config(
+                        self.config,
+                        torch_dtype=torch.get_default_dtype(),
+                        trust_remote_code=True,
+                    )
         else:
             raise ValueError(
                 f"Model {model_cls} does not support custom attention backends "
