@@ -1425,6 +1425,11 @@ class KVarNHostKVCache(HostKVCache):
         self._tile_bytes = kvarn_backend.cfg.tile_bytes_aligned
         self._hk = kvarn_backend.num_kv_heads
         self._num_compressed_layers = kvarn_backend.num_layers
+        # The base __init__ reads layer_num / target_layer_num for its
+        # allocation log line; KVarN has no MTP draft pools, so both equal the
+        # device pool's layer count.
+        self.target_layer_num = device_pool.layer_num
+        self.layer_num = self.target_layer_num
 
         super().__init__(
             device_pool,
