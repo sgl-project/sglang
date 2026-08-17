@@ -15,7 +15,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.utils.common import get_device_sm, is_npu, parse_connector_type
+from sglang.srt.utils.common import is_npu, parse_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -109,71 +109,6 @@ def handle_moe_kernel_config(server_args: Any):
         assert (
             resolved_view(server_args).ep_size == 1
         ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
-
-
-def validate_cutedsl_nvfp4_w4a16(server_args: Any) -> None:
-    """Validate W4A16 after target and speculative backend resolution."""
-    if not envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
-        return
-
-    import torch
-
-    view = resolved_view(server_args)
-    model_dtype = server_args.get_model_config().dtype
-    if model_dtype != torch.bfloat16:
-        raise ValueError(
-            "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1 requires BF16 "
-            "model activations; leave --dtype auto for a BF16 checkpoint "
-            f"or pass --dtype bfloat16, got {model_dtype}."
-        )
-    if view.moe_runner_backend != "flashinfer_cutedsl":
-        raise ValueError(
-            "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1 requires "
-            "--moe-runner-backend flashinfer_cutedsl after backend "
-            f"resolution; got {view.moe_runner_backend!r}."
-        )
-    device_sm = get_device_sm()
-    if device_sm not in (100, 103):
-        raise ValueError(
-            "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1 currently supports "
-            "only NVIDIA SM100-family GPUs (SM100/SM103), "
-            f"got sm{device_sm}."
-        )
-    if envs.SGLANG_MOE_NVFP4_DISPATCH.get():
-        raise ValueError(
-            "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1 requires BF16 MoE "
-            "dispatch; unset SGLANG_MOE_NVFP4_DISPATCH."
-        )
-    if envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get():
-        raise ValueError(
-            "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 and "
-            "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION are mutually "
-            "exclusive."
-        )
-
-    supported_a2a_backends = ("none", "flashinfer")
-    if view.moe_a2a_backend not in supported_a2a_backends:
-        raise ValueError(
-            "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1 requires "
-            "moe_a2a_backend='none' or 'flashinfer'; got "
-            f"{view.moe_a2a_backend!r}."
-        )
-
-    speculative_runner_backend = (
-        view.speculative_moe_runner_backend or view.moe_runner_backend
-    )
-    speculative_a2a_backend = (
-        view.speculative_moe_a2a_backend or view.moe_a2a_backend
-    )
-    if (
-        speculative_runner_backend == "flashinfer_cutedsl"
-        and speculative_a2a_backend not in supported_a2a_backends
-    ):
-        raise ValueError(
-            "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1 does not support "
-            f"speculative MoE A2A backend {speculative_a2a_backend!r} with "
-            "a flashinfer_cutedsl runner; use none or flashinfer."
-        )
 
 
 def handle_a2a_moe(server_args: Any):
@@ -322,8 +257,17 @@ def handle_a2a_moe(server_args: Any):
         ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
         if cfg.deepep_mode != "auto":
             logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
+        use_cutedsl_w4a16 = (
+            resolved_view(server_args).moe_runner_backend == "flashinfer_cutedsl"
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        )
+        if use_cutedsl_w4a16 and envs.SGLANG_MOE_NVFP4_DISPATCH.get():
+            raise ValueError(
+                "CuTe DSL NVFP4 W4A16 requires BF16 FlashInfer MoE "
+                "dispatch; unset SGLANG_MOE_NVFP4_DISPATCH."
+            )
         if (
-            not envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+            not use_cutedsl_w4a16
             and not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set()
             and (
                 resolved_view(server_args).quantization == "modelopt_fp4"
