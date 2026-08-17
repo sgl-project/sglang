@@ -153,6 +153,12 @@ class TestSocketUtilities(CustomTestCase):
         finally:
             sock.close()
 
+    def test_is_port_available_reexported_from_package(self):
+        """`is_port_available` must remain importable from `sglang.srt.utils`."""
+        from sglang.srt.utils import is_port_available as reexported
+
+        self.assertIs(reexported, is_port_available)
+
 
 class TestReservePort(CustomTestCase):
     def test_reserve_port_returns_port_and_socket(self):
