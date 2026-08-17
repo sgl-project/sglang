@@ -158,32 +158,6 @@ class MoeLoraLaunchConfig:
                     "gate/up-A"
                 )
 
-    @property
-    def lora_a(self) -> Mapping[str, int]:
-        """Step-1–7 compatibility view for the common gate/up-A config."""
-        return self.gate_up_a
-
-    @property
-    def lora_b(self) -> Mapping[str, int]:
-        """Step-1–7 compatibility view for the common gate/up-B config."""
-        return self.gate_up_b
-
-    def to_dict(self) -> dict[str, Any]:
-        """JSON-safe complete identity used by composed benchmark records."""
-        return {
-            "routing_block_size": self.routing_block_size,
-            "gate_up_a_routing_block_size": self.gate_up_a_routing_block_size,
-            "gate_up_a": dict(self.gate_up_a),
-            "gate_up_b": dict(self.gate_up_b),
-            "down_a": dict(self.down_a),
-            "down_b": dict(self.down_b),
-            "b_activation": dict(self.b_activation),
-            "shared_finalize": _copy_nested(self.shared_finalize),
-        }
-
-
-PROVISIONAL_LAUNCH_CONFIG = MoeLoraLaunchConfig()
-
 
 # ---------------------------------------------------------------------------
 # Tile tables: pydantic-validated JSON, separate from the plan tables.
@@ -233,8 +207,8 @@ class TileTable:
     """
 
     def __init__(self, rules: list[tuple[int, MoeLoraLaunchConfig]]) -> None:
-        if not rules:
-            raise ValueError("a tile table needs at least one rule")
+        # resolve_tiles is the only constructor and always supplies at least
+        # one rule (falling back to the built-in default config).
         self._rules = rules
 
     def config_for(self, num_tokens: int) -> MoeLoraLaunchConfig:

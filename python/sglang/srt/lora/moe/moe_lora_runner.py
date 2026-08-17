@@ -74,7 +74,6 @@ from sglang.srt.lora.moe.execution_plan import (
     resolve_plans,
 )
 from sglang.srt.lora.moe.launch_config import (
-    PROVISIONAL_LAUNCH_CONFIG,
     MoeLoraLaunchConfig,
     TileTable,
     resolve_tiles,
@@ -440,7 +439,7 @@ class MoeLoraRunner:
         batch: MoeLoraBatch,
         *,
         plan: MoeLoraExecutionPlan,
-        launch_config: MoeLoraLaunchConfig = PROVISIONAL_LAUNCH_CONFIG,
+        launch_config: MoeLoraLaunchConfig,
         provider_name: str,
         output_dtype: torch.dtype | None = None,
     ) -> StandardCombineInput:

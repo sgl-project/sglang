@@ -1343,8 +1343,7 @@ class TestRunnerRouteSelectionSource(unittest.TestCase):
 
 class TestLaunchConfigRoutePreflight(unittest.TestCase):
     def test_aligned_tensor_core_plan_rejects_subwarp_route_tile(self):
-        config = dataclasses.replace(
-            LAUNCH.PROVISIONAL_LAUNCH_CONFIG,
+        config = LAUNCH.MoeLoraLaunchConfig(
             routing_block_size=8,
             gate_up_a_routing_block_size=8,
         )
@@ -1366,10 +1365,7 @@ class TestLaunchConfigRoutePreflight(unittest.TestCase):
                 input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
         )
-        config = dataclasses.replace(
-            LAUNCH.PROVISIONAL_LAUNCH_CONFIG,
-            gate_up_a_routing_block_size=64,
-        )
+        config = LAUNCH.MoeLoraLaunchConfig(gate_up_a_routing_block_size=64)
         with self.assertRaisesRegex(ValueError, "grouped per-expert"):
             config.validate_for_plan(token_dedup)
 
