@@ -1791,7 +1791,12 @@ class DeepseekV4AttnBackend(
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
             seq_lens_cpu = forward_batch.seq_lens_cpu
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             assert seq_lens_cpu is not None
+            assert extend_seq_lens_cpu is not None
+            seq_lens_cpu_list = [int(seq_len) for seq_len in seq_lens_cpu.tolist()]
+            assert len(seq_lens_cpu_list) == len(extend_seq_lens_cpu)
+
             # ``swa_window_size`` on the pool is its storage page size, not
             # the model's SWA window — pass both explicitly.
             cache = SparsePrefillChunkCache.build(
@@ -1803,7 +1808,9 @@ class DeepseekV4AttnBackend(
                 swa_window_size=SWA_WINDOW,
                 swa_page_size=token_to_kv_pool.swa_window_size,
                 num_qo_tokens=q_flat.shape[0],
-                max_seq_len=int(seq_lens_cpu.max().item()),
+                max_seq_len=max(seq_lens_cpu_list),
+                seq_lens_cpu=seq_lens_cpu_list,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
             )
             self.forward_metadata.sparse_prefill_cache = cache
 

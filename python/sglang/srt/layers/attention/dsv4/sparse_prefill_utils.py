@@ -33,7 +33,7 @@ compressed branch becomes a no-op) and any ``compress_ratio >= 1``.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import triton
@@ -188,6 +188,29 @@ def combine_topk_swa_indices(
     return combined_indices, combined_lens
 
 
+def compute_total_swa_tokens(
+    seq_lens_cpu: Sequence[int],
+    extend_seq_lens_cpu: Sequence[int],
+    swa_window: int,
+) -> int:
+    """Compute the exact SWA gather allocation size from host metadata.
+
+    Keeping this calculation on the host avoids reading the device-side cumsum
+    back with ``Tensor.item()``, which otherwise synchronizes the forward stream.
+    """
+    assert swa_window > 0
+    assert len(seq_lens_cpu) == len(extend_seq_lens_cpu)
+
+    total_swa = 0
+    for seq_len, extend_seq_len in zip(seq_lens_cpu, extend_seq_lens_cpu):
+        seq_len = int(seq_len)
+        extend_seq_len = int(extend_seq_len)
+        assert seq_len >= 0
+        assert extend_seq_len >= 0
+        total_swa += min(seq_len, extend_seq_len + swa_window - 1)
+    return total_swa
+
+
 def build_swa_token_ids(
     seq_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
@@ -195,6 +218,7 @@ def build_swa_token_ids(
     req_to_token: torch.Tensor,
     full_to_swa: torch.Tensor,
     swa_window: int,
+    total_swa: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build a flat list of physical SWA-cache token IDs covering each
     request's positional union of every query's SWA window.
@@ -216,6 +240,8 @@ def build_swa_token_ids(
         full_to_swa: (full_pool_size + extra,) int64. Maps full kv id to
             SWA-cache id.
         swa_window: int. SWA window size.
+        total_swa: Exact output size, computed from the scheduler's host-side
+            sequence-length mirrors to avoid a device-to-host synchronization.
 
     Returns:
         swa_token_ids: (total_swa,) int32, flat physical SWA-cache token IDs.
@@ -228,6 +254,7 @@ def build_swa_token_ids(
     assert req_pool_indices.dtype == torch.int32
     assert req_to_token.dtype == torch.int32
     assert full_to_swa.dtype == torch.int64
+    assert total_swa >= 0
 
     num_reqs = seq_lens.shape[0]
     device = seq_lens.device
@@ -238,7 +265,6 @@ def build_swa_token_ids(
     swa_first_pos = (seq_lens - swa_gather_lens).to(torch.int32)
     swa_offsets = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
     swa_offsets[1:] = torch.cumsum(swa_gather_lens, dim=0).to(torch.int32)
-    total_swa = int(swa_offsets[-1].item())  # one CPU sync per chunk
 
     swa_token_ids = torch.empty(total_swa, dtype=torch.int32, device=device)
     if total_swa == 0:
@@ -322,9 +348,17 @@ class SparsePrefillChunkCache:
         swa_page_size: int,
         num_qo_tokens: int,
         max_seq_len: int,
+        seq_lens_cpu: Sequence[int],
+        extend_seq_lens_cpu: Sequence[int],
     ) -> "SparsePrefillChunkCache":
         device = seq_lens.device
         num_reqs = seq_lens.shape[0]
+
+        assert len(seq_lens_cpu) == num_reqs
+        assert len(extend_seq_lens_cpu) == num_reqs
+        total_swa = compute_total_swa_tokens(
+            seq_lens_cpu, extend_seq_lens_cpu, swa_window_size
+        )
 
         query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
         query_start_loc[1:] = torch.cumsum(extend_seq_lens, dim=0).to(torch.int32)
@@ -337,6 +371,7 @@ class SparsePrefillChunkCache:
                 req_to_token=req_to_token,
                 full_to_swa=full_to_swa,
                 swa_window=swa_window_size,
+                total_swa=total_swa,
             )
         )
 

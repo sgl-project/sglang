@@ -498,6 +498,27 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             )
         )
 
+    def test_sparse_prefill_total_swa_tokens_uses_host_lengths(self):
+        from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+            compute_total_swa_tokens,
+        )
+
+        cases = (
+            ((10, 256, 1000), (10, 1, 128), 128, 393),
+            ((1, 128, 129), (1, 1, 1), 128, 257),
+            ((0, 0), (0, 0), 128, 0),
+        )
+        for seq_lens, extend_seq_lens, window, expected in cases:
+            with self.subTest(
+                seq_lens=seq_lens,
+                extend_seq_lens=extend_seq_lens,
+                window=window,
+            ):
+                self.assertEqual(
+                    compute_total_swa_tokens(seq_lens, extend_seq_lens, window),
+                    expected,
+                )
+
     def test_sparse_prefill_workspace_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
             SparsePrefillWorkspace,
