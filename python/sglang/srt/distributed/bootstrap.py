@@ -16,8 +16,12 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
+    set_flashinfer_allreduce_only,
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
+)
+from sglang.srt.distributed.parallel_state import (
+    _tag_groups_for_flashinfer_allreduce_only,
 )
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -28,6 +32,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_available_gpu_memory,
+    is_hip,
     is_host_cpu_arm64,
     is_npu,
     monkey_patch_p2p_access_check,
@@ -164,6 +169,9 @@ def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
     set_custom_all_reduce(not server_args.disable_custom_all_reduce)
     set_mscclpp_all_reduce(server_args.enable_mscclpp)
     set_torch_symm_mem_all_reduce(server_args.enable_torch_symm_mem)
+    set_flashinfer_allreduce_only(
+        server_args.flashinfer_allreduce_fusion_backend is not None
+    )
 
 
 def _init_cpu_threads_env(
@@ -228,11 +236,17 @@ def _init_parallel_groups(
         moe_data_model_parallel_size=moe_dp_size,
         decode_context_parallel_size=dcp_size,
         duplicate_tp_group=server_args.enable_pdmux,
+        duplicate_attn_cp_group=(
+            is_hip()
+            and server_args.enable_two_batch_overlap
+            and server_args.enable_dsa_prefill_context_parallel
+        ),
         enable_symm_mem=server_args.enable_symm_mem,
         recovered_rank=is_ep_joiner,
         rank_offset=rank_offset,
         max_world_size=server_args.max_ep_size,
     )
+    _tag_groups_for_flashinfer_allreduce_only()
     initialize_dp_attention(
         server_args=server_args,
         model_config=model_config,

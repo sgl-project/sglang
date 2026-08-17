@@ -340,21 +340,18 @@ class HostKVCache(abc.ABC):
         """Page size in that same logical space (the widened DCP page)."""
         return self.page_size * self.dcp_size
 
-    def dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
+    def maybe_dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
         """Transfer kernels index per-rank rows; callers hold widened logical slots.
 
         Keep this rank's slots (% dcp_size == dcp_rank), then collapse (// dcp_size).
         """
         if self.dcp_size == 1:
             return indices
-        owned = indices[indices % self.dcp_size == self.dcp_rank] // self.dcp_size
-        assert owned.numel() * self.dcp_size == indices.numel(), (
-            "HiCache DCP translation expects runs of whole widened pages "
-            f"(every residue class equally represented); got {indices.numel()} "
-            f"logical slots -> {owned.numel()} owned rows with dcp_size="
-            f"{self.dcp_size}."
+        assert indices.numel() % self.dcp_size == 0, (
+            "HiCache DCP translation expects runs of whole widened pages; got "
+            f"{indices.numel()} logical slots with dcp_size={self.dcp_size}."
         )
-        return owned
+        return indices[self.dcp_rank :: self.dcp_size] // self.dcp_size
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:

@@ -46,7 +46,9 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
     enable_moe_dense_fully_dp,
 )
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -81,6 +83,7 @@ from sglang.srt.model_executor.forward_context import (
     get_forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -93,6 +96,7 @@ from sglang.srt.utils import (
     get_device_sm,
     is_cuda,
     is_hip,
+    is_npu,
     log_info_on_rank0,
     make_layers,
 )
@@ -100,6 +104,7 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
 _device_sm = get_device_sm()
 
 _FP8_KV_DTYPES = (
@@ -124,6 +129,16 @@ if _is_hip:
         _has_rocm_qk_norm_rope = True
     except ImportError:
         _has_rocm_qk_norm_rope = False
+
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
+        split_qkv_rmsnorm_rope_pos_cache_half_npu,
+    )
+
+    from sglang.srt.hardware_backend.npu.utils import (
+        process_shared_expert,
+        wait_share_stream,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +239,14 @@ def build_minimax_fused_qkv_index(model: nn.Module) -> None:
 
 
 class MiniMaxM3MLP(nn.Module):
+    @staticmethod
+    def _swigluoai_fused(x: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
+        """swiglu_oai using fused Triton kernel (sgl_kernel_npu), no quant."""
+        from sgl_kernel_npu.activation.swiglu_oai_quant import swiglu_oai_quant
+
+        out, _ = swiglu_oai_quant(x, alpha, limit, need_quant=False)
+        return out
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -260,13 +283,18 @@ class MiniMaxM3MLP(nn.Module):
         if hidden_act == "silu":
             self.act_fn = SiluAndMul()
         elif hidden_act == "swigluoai":
-            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
-                swiglu_no_interleaved_with_alpha_and_limit,
-            )
+            if _is_npu:
+                self.act_fn = lambda x: self._swigluoai_fused(
+                    x, config.swiglu_alpha, config.swiglu_limit
+                )
+            else:
+                from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+                    swiglu_no_interleaved_with_alpha_and_limit,
+                )
 
-            self.act_fn = lambda x: swiglu_no_interleaved_with_alpha_and_limit(
-                x, config.swiglu_alpha, config.swiglu_limit
-            )
+                self.act_fn = lambda x: swiglu_no_interleaved_with_alpha_and_limit(
+                    x, config.swiglu_alpha, config.swiglu_limit
+                )
         else:
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
@@ -296,12 +324,13 @@ class MiniMaxM3MoE(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.alt_stream = alt_stream
         self.tp_size = get_parallel().tp_size
+        self.alt_stream = alt_stream
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
         self.num_fused_shared_experts = (
             0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
@@ -412,7 +441,11 @@ class MiniMaxM3MoE(nn.Module):
     ) -> torch.Tensor:
         shared_event = None
         if hidden_states.shape[0] > 0:
-            if self.alt_stream is not None:
+            if (
+                self.alt_stream is not None
+                and self.shared_experts is not None
+                and get_is_capture_mode()
+            ):
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self._forward_shared_experts(hidden_states)
@@ -426,8 +459,7 @@ class MiniMaxM3MoE(nn.Module):
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
-
-        final_hidden_states = self.experts(hidden_states, topk_output)
+            final_hidden_states = self.experts(hidden_states, topk_output)
 
         if shared_output is not None:
             if shared_event is not None:
@@ -438,13 +470,30 @@ class MiniMaxM3MoE(nn.Module):
 
         return final_hidden_states
 
+    def _forward_router_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        router_logits = self._compute_router_logits(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
+        return self.experts(hidden_states, topk_output)
+
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
+        """DeepEP MoE forward: routed experts via a2a, shared experts replicated."""
         shared_output = None
+        enable_npu_dual_stream = _is_npu and (
+            forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_decode()
+        )
         if hidden_states.shape[0] > 0:
-            shared_output = self._forward_shared_experts(hidden_states)
             router_logits = self._compute_router_logits(hidden_states)
+            if enable_npu_dual_stream:
+                # Overlap shared experts with router/experts on a separate stream.
+                shared_output = process_shared_expert(
+                    hidden_states, self._forward_shared_experts
+                )
+            else:
+                shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -460,6 +509,9 @@ class MiniMaxM3MoE(nn.Module):
         # shared experts are replicated (tp_size=1), so both add directly.
         final_hidden_states = self.experts(hidden_states, topk_output)
 
+        if enable_npu_dual_stream:
+            wait_share_stream()
+
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
@@ -469,6 +521,9 @@ class MiniMaxM3MoE(nn.Module):
         if self.bf16_router_gemm:
             if router_gemv_supported(hidden_states, self.gate.weight):
                 return router_gemv(hidden_states, self.gate.weight)
+            if _is_npu:
+                # NPU lacks aten::mm.dtype; bf16 mm then cast keeps topk semantics.
+                return torch.mm(hidden_states, self.gate.weight.t()).float()
             return torch.mm(
                 hidden_states, self.gate.weight.t(), out_dtype=torch.float32
             )
@@ -528,6 +583,7 @@ class MiniMaxM3Attention(nn.Module):
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.rotary_dim = getattr(config, "rotary_dim", self.head_dim)
 
+        self.use_qk_norm = getattr(config, "use_qk_norm", False)
         self.qk_norm_type = getattr(config, "qk_norm_type", "per_layer")
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
 
@@ -1207,6 +1263,44 @@ class MiniMaxM3Attention(nn.Module):
         )
         return q_out, index_q_out
 
+    def forward_prepare_npu(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        """NPU qkv projection + fused norm/RoPE/split; returns (None, fb, inner_state)."""
+        if hidden_states.shape[0] == 0:
+            assert (
+                not self.o_proj.reduce_results
+            ), "short-circuiting allreduce will lead to hangs"
+            return hidden_states, forward_batch, None
+
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
+            input_tensor=qkv,
+            positions=positions.reshape(-1),
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            q_hidden_size=self.q_size,
+            kv_hidden_size=self.kv_size,
+            head_dim=self.head_dim,
+            eps=self.q_norm.variance_epsilon,
+            q_weight=self.q_norm.gemma_weight,
+            k_weight=self.k_norm.gemma_weight,
+            rope_dim=self.rotary_dim,
+            cast_norm_to_bf16=True,
+        )
+        if self.is_sparse_attention_layer:
+            idx_qkv, _ = self.index_qkv_proj(hidden_states)
+            # Index attention disables the V head on all M3 sparse layers, so
+            # index_qkv_proj emits a 2-way [q|k] tensor.
+            idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+            idx_q, idx_k = self._index_qk_norm_rope(positions, idx_q, idx_k)
+            inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
+        else:
+            inner_state = (q, k, v, forward_batch)
+        return None, forward_batch, inner_state
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -1331,8 +1425,7 @@ class MiniMaxM3Attention(nn.Module):
             output, _ = self.o_proj(attn_output)
             if self.disable_index_value:
                 return output
-            # idx_replica_size ranks produce identical idx_o; pre-divide idx_o (not the
-            # o_proj weight) so the TP all-reduce sums right and stays FP8-quant-safe.
+            # Pre-divide idx_o (not the weight) so the TP all-reduce sums right.
             if self.idx_replica_size > 1:
                 idx_o = idx_o / self.idx_replica_size
             idx_output, _ = self.index_o_proj(idx_o)
@@ -1349,11 +1442,18 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        s = self.forward_prepare(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
+        if _is_npu:
+            s = self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        else:
+            s = self.forward_prepare(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
         return self.forward_core(s)
 
 
@@ -1363,8 +1463,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1403,8 +1503,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
                 alt_stream=alt_stream,
+                prefix=add_prefix("mlp", prefix),
             )
         else:
             if enable_moe_dense_fully_dp():
@@ -1550,13 +1650,15 @@ class MiniMaxM3Model(nn.Module):
             else None
         )
 
+        alt_stream = get_stream("alt") if _is_cuda else None
+
         def layer_fn(idx, prefix: str) -> nn.Module:
             return MiniMaxM3DecoderLayer(
                 config=config,
                 layer_id=idx,
                 quant_config=quant_config,
-                prefix=prefix,
                 alt_stream=alt_stream,
+                prefix=prefix,
             )
 
         self.layers, self.start_layer, self.end_layer = make_layers(
@@ -1741,6 +1843,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             ]
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+        # forward checks the per-layer ``_is_layer_to_capture`` flag, not the id
+        # list, so set it explicitly (mirrors qwen3_next/qwen2_moe).
+        for layer_id in self.model.layers_to_capture:
+            if 0 <= layer_id < len(self.model.layers):
+                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
