@@ -2170,7 +2170,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     #   - Expects W13 in default [Gate, Up] order, NOT interleaved.
     #   - Uses swizzled blockscales directly (w13_blockscale_swizzled).
     #
-    # "v2" (standard): cutedsl + none/flashinfer a2a.
+    # "v2" (route-based): cutedsl + none/flashinfer a2a, or W4A16 +
+    #   DeepEP normal dispatch.
     #   - MoeRunner fused func calls CuteDslMoEWrapper kernels.
     #   - Expects W13 in [Up, Gate] order, interleaved in 64-row chunks.
     #   - Uses MMA-layout blockscales (w13_blockscale_mma).
@@ -2178,11 +2179,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     @property
     def _is_cutedsl_v1_deepep(self) -> bool:
         """CuteDSL v1 + DeepEP low-latency path (masked grouped GEMM)."""
-        return is_flashinfer_cutedsl_v1_path()
+        return is_flashinfer_cutedsl_v1_path() and not (
+            envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        )
 
     @property
     def _is_cutedsl_v2_standard(self) -> bool:
-        """CuteDSL v2 standard path (a2a=none or flashinfer, uses CuteDslMoEWrapper)."""
+        """CuteDSL v2 route-based path using CuteDslMoEWrapper."""
         return self.enable_flashinfer_cutedsl_moe and not self._is_cutedsl_v1_deepep
 
     def prepare_weight_loader(self, layer, weight_loader):
@@ -2825,11 +2828,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
             if self._is_cutedsl_v1_deepep:
-                if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
-                    raise ValueError(
-                        "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 does not support "
-                        "the CuTe DSL v1 DeepEP masked MoE path."
-                    )
                 # v1 path: DeepEP low-latency + flashinfer_cutedsl_moe_masked.
                 # Weights are [Gate, Up] (non-interleaved) with swizzled blockscales.
                 quant_info = CuteDslFp4MoeQuantInfo(
@@ -2848,8 +2846,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 return self.runner.run(dispatch_output, quant_info)
 
-            # v2 standard path (a2a=none/flashinfer): uses CuteDslMoEWrapper
-            # with [Up, Gate] interleaved weights and MMA blockscales.
+            # v2 route-based path: uses CuteDslMoEWrapper with [Up, Gate]
+            # interleaved weights and MMA blockscales.
             ensure_cutedsl_wrapper(layer)
             w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_scales
             quant_mode = layer._cutedsl_wrapper.quant_mode

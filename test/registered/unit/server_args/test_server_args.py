@@ -1521,6 +1521,58 @@ class TestWaterfillArgs(CustomTestCase):
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
 
+class TestCuteDslW4A16DeepEPArgs(CustomTestCase):
+    @staticmethod
+    def _make_args(deepep_mode):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            moe_runner_backend="flashinfer_cutedsl",
+            deepep_mode=deepep_mode,
+        )
+        server_args.cuda_graph_config = CudaGraphConfig()
+        return server_args
+
+    def test_auto_resolves_to_normal_and_disables_cuda_graph(self):
+        server_args = self._make_args("auto")
+        with envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True):
+            server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.deepep_mode, "normal")
+        self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.DISABLED)
+        self.assertEqual(
+            server_args.cuda_graph_config.prefill.backend,
+            Backend.DISABLED,
+        )
+
+    def test_low_latency_is_rejected(self):
+        server_args = self._make_args("low_latency")
+        with (
+            envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True),
+            self.assertRaisesRegex(ValueError, "supports DeepEP normal"),
+        ):
+            server_args._handle_a2a_moe()
+
+    def test_explicit_normal_is_accepted_and_disables_cuda_graph(self):
+        server_args = self._make_args("normal")
+        with envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True):
+            server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.deepep_mode, "normal")
+        self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.DISABLED)
+        self.assertEqual(
+            server_args.cuda_graph_config.prefill.backend,
+            Backend.DISABLED,
+        )
+
+    def test_w4a4_auto_keeps_low_latency_path(self):
+        server_args = self._make_args("auto")
+        with envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(False):
+            server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.deepep_mode, "low_latency")
+
+
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
     """Validation for --prefill-only-disable-kv-cache.
 

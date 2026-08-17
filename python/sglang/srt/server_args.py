@@ -6743,9 +6743,13 @@ class ServerArgs:
                 f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
                 f"got '{view.moe_a2a_backend}'."
             )
-            if view.moe_a2a_backend == "deepep" and (
-                view.quantization == "nvfp4_online"
-                or envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+            if (
+                view.moe_a2a_backend == "deepep"
+                and not envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+                and (
+                    view.quantization == "nvfp4_online"
+                    or envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+                )
             ):
                 raise ValueError(
                     "flashinfer_cutedsl per-token NVFP4 activation requires "
@@ -6892,21 +6896,31 @@ class ServerArgs:
 
         if a2a_backend == "deepep":
             if self.moe_runner_backend == "flashinfer_cutedsl":
-                if self.deepep_mode == "auto":
-                    self.deepep_mode = "low_latency"
-                    logger.warning(
-                        "Forcing --deepep-mode low_latency: flashinfer_cutedsl "
-                        "FP4 MoE has no DeepEP normal-dispatch handler, so "
-                        "deepep auto mode would crash during prefill. "
-                        "low_latency covers both prefill and decode."
-                    )
-                elif self.deepep_mode == "normal":
-                    raise ValueError(
-                        "flashinfer_cutedsl FP4 MoE only supports DeepEP "
-                        "low_latency dispatch (masked layout). DeepEP normal "
-                        "(prefill) dispatch has no CuteDSL FP4 handler. Pass "
-                        "--deepep-mode low_latency or auto."
-                    )
+                if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
+                    if self.deepep_mode == "auto":
+                        self.deepep_mode = "normal"
+                        logger.warning(
+                            "Forcing --deepep-mode normal: flashinfer_cutedsl "
+                            "W4A16 reuses the route-based CuTe DSL MoE wrapper; "
+                            "the low-latency masked path supports W4A4 only."
+                        )
+                    elif self.deepep_mode == "low_latency":
+                        raise ValueError(
+                            "flashinfer_cutedsl W4A16 supports DeepEP normal "
+                            "dispatch only; use --deepep-mode normal or auto."
+                        )
+                else:
+                    if self.deepep_mode == "auto":
+                        self.deepep_mode = "low_latency"
+                        logger.warning(
+                            "Forcing --deepep-mode low_latency: flashinfer_cutedsl "
+                            "W4A4 uses the masked CuTe DSL MoE path."
+                        )
+                    elif self.deepep_mode == "normal":
+                        raise ValueError(
+                            "flashinfer_cutedsl W4A4 supports DeepEP low-latency "
+                            "dispatch only; use --deepep-mode low_latency or auto."
+                        )
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
