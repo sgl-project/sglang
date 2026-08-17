@@ -32,6 +32,10 @@ from sglang.kernels.ops.diffusion.fused_ln_modulate import (
     mount_fused_ln_modulate,
     unmount_fused_ln_modulate,
 )
+from sglang.kernels.ops.diffusion.hunyuan_qknorm import (
+    mount_hunyuan_qknorm,
+    unmount_hunyuan_qknorm,
+)
 from sglang.kernels.ops.diffusion.ltx2_rmsnorm_modulate import (
     mount_ltx2_rms_norm_modulate,
     unmount_ltx2_rms_norm_modulate,
@@ -89,7 +93,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -170,6 +174,11 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "fused gate RMSNorm (BF16-native Triton)",
         mount_fused_gate_rmsnorm,
         unmount_fused_gate_rmsnorm,
+    ),
+    (
+        "HunyuanVideo strided QK RMSNorm",
+        mount_hunyuan_qknorm,
+        unmount_hunyuan_qknorm,
     ),
 )
 
@@ -662,6 +671,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if self.server_args.enable_breakable_cuda_graph:
             # Cache-DiT wraps transformer.forward with step-skipping control
             # flow that must not be baked into a captured CUDA graph.
+            if self._cache_dit_requested():
+                logger.warning_once(
+                    "Cache-DiT was requested but is disabled because breakable "
+                    "CUDA graphs are enabled."
+                )
             return
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
@@ -1433,10 +1447,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 torch.mps.current_allocated_memory(),
             )
             if self._component_residency_manager is not None:
-                self._component_residency_manager.remove_nvtx_hooks_for_module(
-                    self.transformer
-                )
-                self._component_residency_manager.strategy_for.cache_clear()
+                self._component_residency_manager.finish_active_use(prefetch_next=False)
+                self._component_residency_manager.forget_module(self.transformer)
             del self.transformer
             if pipeline is not None and "transformer" in pipeline.modules:
                 del pipeline.modules["transformer"]
@@ -1531,12 +1543,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         batch: Req,
     ) -> None:
         """
-        manage dit's residency by reporting the active sequential use
-
-        only applicable for dual-dit architecture like Wan
+        manage dit residency by reporting the active sequential use
 
         Args:
-            current_model: the next active dit, transformer_1 or transformer_2
+            current_model: the next active dit
         """
         manager = self._component_residency_manager
 

@@ -121,6 +121,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arg_enum_proc_macro"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -973,9 +982,9 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "dynamo-parsers"
-version = "7.0.1"
+version = "7.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97cce1ec70f4c4896ff9a4e0bb29cd603f465e599c94bf2085b71872a3a58c70"
+checksum = "7a7f84812e7ce1d3dace1b8d69853cc6c49759cbd07dfbb59452aa928645b031"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -996,9 +1005,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-protocols"
-version = "5.1.0"
+version = "5.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "696b6df4c817c16dc0a619d43f6af5ecc4f045a6b6be7ef516bfe502f977764b"
+checksum = "97fd951c32c033f4f220b6087db91d7f7d475f1bf1f886c8e60798ac1cf4cc9a"
 dependencies = [
  "async-openai",
  "derive_builder",
@@ -1013,9 +1022,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-renderer"
-version = "5.0.0"
+version = "5.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0423da7bec83734e7567b1c8895fd2e7a1a98256253a29fe128032ac01cefac1"
+checksum = "dfe04753d666e3462e3eed4abcf2a4d05997cf2dea45858733f2bdea5b61f733"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1031,9 +1040,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-tokenizers"
-version = "1.7.0"
+version = "1.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a81f7b7693282f4693a3b4c60174e14260cf011ab493a7ca9b4deb2fa98ecee"
+checksum = "821c767e896f1f225b6411a5ce41dba7f114c2c97db862a13fd962195665075e"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -1153,21 +1162,24 @@ dependencies = [
 
 [[package]]
 name = "fastokens"
-version = "0.2.1"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8728655e193e0d08d7a95d63cf1fdb9b768d282cab0a112ecb006615bae9f067"
+checksum = "35ff8cf975d8f772e7d4c3be439659b0b23b1ae1086ebee7204573807053ff7f"
 dependencies = [
  "daachorse",
  "fancy-regex 0.17.0",
  "hf-hub",
  "icu_normalizer",
+ "libc",
  "memchr",
  "pcre2",
  "rayon",
+ "regex-syntax",
  "serde",
  "serde_json",
  "strum",
  "thiserror",
+ "ureq",
 ]
 
 [[package]]
@@ -1624,7 +1636,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2114,9 +2126,9 @@ dependencies = [
 
 [[package]]
 name = "minijinja"
-version = "2.21.0"
+version = "2.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb3d648e68cea56d9858d535ee28f9538404e2dd8cb08ed0bd05dca379477f39"
+checksum = "86886cf6dbf4e614b19c9a1eec9775f021869d7eadde0fc73921a81b90c9b4c9"
 dependencies = [
  "indexmap 2.14.0",
  "memo-map",
@@ -2126,9 +2138,9 @@ dependencies = [
 
 [[package]]
 name = "minijinja-contrib"
-version = "2.21.0"
+version = "2.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85342f6fac0be8ccd5bd00d9066be538f34f393f577b75d81b17c8398a6b43bb"
+checksum = "bd3e5f077bc2379f0f7d911e7cfdd921114ed99fc884533dca502944cb355b11"
 dependencies = [
  "minijinja",
  "serde",
@@ -2931,7 +2943,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror",
  "tokio",
  "tracing",
@@ -2969,7 +2981,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -3688,6 +3700,7 @@ dependencies = [
 name = "sglang-server"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-stream",
  "axum 0.8.9",
  "bytemuck",

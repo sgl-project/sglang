@@ -174,6 +174,52 @@ server environment.
 
 For MiniMax-H3, `--performance-mode speed` deliberately keeps the DiT eager. The current `torch.compile` path changes the model's numerical output, so it is not enabled implicitly by any recommended lossless preset. An explicit `--enable-torch-compile true` remains available for controlled experiments, but it should not be used to generate consistency ground truth.
 
+### Advanced: precomputed AdaLN cache
+
+The [model card](https://huggingface.co/MiniMaxAI/MiniMax-H3) notes that about
+13B H3 parameters are AdaLN branches whose outputs can be precomputed for
+inference. The public base checkpoint contains the original branches, not a
+ready-to-use cache. SGLang therefore keeps the standard path as the default.
+
+<Warning>
+This is an experimental deployment path. It is intentionally disabled unless
+you provide an explicitly generated cache; end-to-end numerical and peak-memory
+validation remains required before using it in production.
+</Warning>
+
+When an inference-only deployment has a fixed sampling schedule, build a cache
+from the already materialized transformer directory on CUDA, then pass it to
+the usual `sglang serve` command. This does not alter the denoising formula:
+the cache stores the BF16 outputs of the original AdaLN linears.
+
+```bash Command
+python -m sglang.multimodal_gen.tools.build_minimax_h3_adaln_cache \
+  --transformer-path "$TRANSFORMER_PATH" \
+  --model-variant fl2va \
+  --mode t2va \
+  --num-inference-steps 50 \
+  --flow-shift 12 \
+  --audio-flow-shift 3 \
+  --output /models/minimax-h3-fl2va-adaln-50step.safetensors
+
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --minimax-h3-adaln-cache-path /models/minimax-h3-fl2va-adaln-50step.safetensors \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --ulysses-degree 2 \
+  --port 30010
+```
+
+`$TRANSFORMER_PATH` is the `FL2VA/transformer` or `Ref2VA/transformer`
+directory in the normal SGLang/Hugging Face snapshot; the builder never
+downloads a second copy. A cache only covers the scheduler settings used to
+create it, including its mode, step count, flow shifts, and condition noise
+values. SGLang rejects a request outside that coverage instead of silently
+changing conditioning. Cache mode supports the matching unquantized checkpoint
+only.
+
 ## 4. Generate video and audio
 
 MiniMax-H3 uses the asynchronous OpenAI-compatible video endpoint. Choose a
@@ -383,24 +429,75 @@ Poll and download any conditioned request with the same job-status and
 content endpoints used in the T2VA example. Server-local `file://` URIs must
 refer to files visible inside the SGLang server environment.
 
-## 5. Turbo LoRA for few-step generation
+## 5. LoRA recipes
 
-[`larryvrh/MiniMax-H3-Turbo-Lora`](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora) distills the native **FL2VA** DiT for usable **4–8 step** generation. On `--model-variant fl2va`, use it with **`t2va`** or **`fl2va`** from section 4 and set `"num_inference_steps": 4` or `8` instead of `50`. **`ref2va`** uses a separate checkpoint partition and is not validated with this LoRA.
+H3 accepts both native fused adapters and standard Diffusers/PEFT adapters.
+Native adapters target modules such as `blocks.*.attn.qkv_proj`; PEFT adapters
+may instead provide separate `to_q`, `to_k`, and `to_v` projections and the
+`default` adapter namespace. SGLang normalizes both layouts.
+
+The following FL2VA adapters have distinct purposes:
+
+| Recipe | Repository and pinned file | Request setting | Prompt requirement |
+| --- | --- | --- | --- |
+| Recommended speed/quality balance | [`larryvrh/MiniMax-H3-Turbo-Lora`](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora), `minimax_h3_turbo_v4_step600_ema.safetensors` | `num_inference_steps: 9` (8 denoiser evaluations), `lora_scale: 1.0` | None |
+| Most aggressive speed preset (standard PEFT layout) | [`lightx2v/Minimax-h3-Turbo`](https://huggingface.co/lightx2v/Minimax-h3-Turbo), `minimax_h3_fl2v_turbo_4step_v0.1.safetensors` | `num_inference_steps: 5` (4 denoiser evaluations), `lora_scale: 1.0`, `lora_alpha: 8` | None |
+| Realistic people style | [`fal/MiniMax-H3-Realism-People-LoRA`](https://huggingface.co/fal/MiniMax-H3-Realism-People-LoRA), `h3-realism-people-t2v-i2v-r2v.safetensors` | Keep the normal `num_inference_steps: 50` schedule; start with `lora_scale: 0.7` | Include `r34l1sm` in the prompt |
+
+The H3 request field controls the number of sigma grid points, including the
+terminal zero; the denoising loop therefore runs one fewer model evaluation.
+This is why an adapter described as 8-step uses `9`, and a 4-step adapter uses
+`5`, in the request.
+
+All three use the same launch shape. Pinning the filename is required for
+repositories that publish multiple revisions, and is also recommended for a
+reproducible single-file recipe:
 
 ```bash Command
-curl -sS -X POST http://127.0.0.1:30010/v1/set_lora \
-  -H "Content-Type: application/json" \
-  -d '{
-    "lora_nickname": "h3-turbo",
-    "lora_path": "larryvrh/MiniMax-H3-Turbo-Lora",
-    "strength": 1.0
-  }'
+LORA_REPO=larryvrh/MiniMax-H3-Turbo-Lora
+LORA_FILE=minimax_h3_turbo_v4_step600_ema.safetensors
+LORA_NAME=h3-turbo-v4
+LORA_SCALE=1.0
+LORA_ALPHA_ARGS=()
+# LightX2V only: LORA_ALPHA_ARGS=(--lora-alpha 8)
+
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 4 \
+  --ulysses-degree 4 \
+  --performance-mode speed \
+  --lora-path "$LORA_REPO" \
+  --lora-weight-name "$LORA_FILE" \
+  --lora-nickname "$LORA_NAME" \
+  --lora-scale "$LORA_SCALE" \
+  "${LORA_ALPHA_ARGS[@]}" \
+  --lora-merge-mode auto \
+  --port 30010
 ```
 
-When the repository contains multiple safetensors files, prefer `minimax_h3_turbo_4step_ckpt500.safetensors` (upstream default) via `--lora-path` and `--lora-weight-name` on `sglang serve`, or pass the local path to that file as `lora_path`.
+`auto` merges an adapter into ordinary resident weights to avoid per-step LoRA
+matmuls, but keeps the dynamic path for FSDP-sharded weights where a full
+gather can increase peak memory. Use `dynamic` when one resident server must
+switch repeatedly between base and LoRA output.
+
+Use the filename, scale, and request schedule from the table together. The
+4-evaluation LightX2V recipe is the more aggressive latency/quality tradeoff.
+Its checkpoint has rank 128 but omits the training alpha from both the file and
+repository metadata, so `--lora-alpha 8` is required to reproduce the author's
+reference implementation. Start with the Larry 8-evaluation recipe when
+preserving fine visual detail is more important than minimum latency.
+
+These adapters were trained for the **FL2VA** partition and apply to `t2va` or
+`fl2va` requests. Do not use them with the separate `ref2va` weights unless
+the adapter author explicitly provides Ref2VA-compatible weights. Also avoid
+stacking a distilled adapter with `quality: "high"`: both alter denoising, and
+that combination has not been quality-validated.
 
 <Warning>
-LoRAs for the ComfyUI pruned MiniMax-H3 graph (for example H3-GalaxyAce) are not compatible with SGLang's native FL2VA weights.
+LoRAs trained for a pruned or structurally modified ComfyUI graph are not
+automatically compatible with the native H3 weights. Use only adapters whose
+architecture and target modules match the full native H3 checkpoint.
 </Warning>
 
 ## 6. Sampling and output controls
@@ -661,7 +758,7 @@ real H3 validation runs.
 - For throughput-oriented serving, select **DP (batched throughput)**. The picker pairs `--encoder-parallel dp` with an editable `--batching-max-size` greater than 1; compatible requests are distributed across ranks, while every rank keeps a full encoder replica. Encoder DP requires TP1 and DiT DP1, so it is disabled for the H100 TP2 + Ulysses2 and RTX 5090 TP2 recipes. It provides no benefit for a batch of one and is not bitwise-identical to the folded deployment.
 - Use explicit **Fold** to prioritize single-request latency and encoder memory on a measured high-bandwidth single-node topology. Use **Replicate** as the compatibility path when folding or encoder DP is unsuitable.
 - `--use-fsdp-inference true` shards only the DiT. MiniMax-H3 preserves the original FP32 dtype of its patch, time, and output projections during FSDP all-gather, so this path does not trade numerical correctness for memory. On 4×H100, prefer TP2 + Ulysses2 for speed; use FSDP as an explicit capacity policy rather than assuming it is faster.
-- `speed` keeps model components resident, `auto` applies the model-aware 120 GiB residency threshold, and `memory` enables the memory-saving placement policy. Explicit `--layerwise-offload-components` overrides that placement list. DiT residency/prefetch knobs are scoped to the DiT; the text encoder and video VAE decoder use one-layer prefetch and zero residency, while the H3 video VAE encoder stays resident. When `memory` is combined with explicit FSDP, H3 instead keeps the sharded DiT on GPU and layerwise-offloads the text encoder and executable VAE decoder blocks. Use `speed` only after confirming that the complete target workload fits.
+- `speed` keeps model components resident, while `auto` applies the model-aware 120 GiB residency threshold. `memory` prioritizes avoiding OOM and includes the executable VAE decoder in its default layerwise set. A measured recipe with sufficient headroom can opt into `--component-residency vae=resident`; the 2×H100 CI recipe does this because the VAE's 4.8 GiB/GPU cost avoids repeated decoder transfers during tiled decode. DiT residency and prefetch knobs remain scoped to the DiT. Use `speed` only after confirming that the complete target workload fits.
 - Breakable CUDA graph execution is an explicit opt-in, not part of the recommended `speed` preset. It requires `--enable-breakable-cuda-graph`, every served size in `--warmup-resolutions`, and `--bcg-text-buckets` that cover the live H3 condition sequence. The validated 1344×768 Ref2VA recipe uses 5504; other task profiles and reference sets may need a different value. It preserves eager output for matching captured signatures, but graph capture consumes additional GPU memory and may provide little latency benefit when Ulysses attention and collectives dominate, so benchmark it on the target topology before enabling it.
 
 ## 9. Benchmarks

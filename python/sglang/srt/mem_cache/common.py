@@ -10,9 +10,6 @@ from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-    maybe_evict_dsv4_state_on_swa,
-)
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -53,6 +50,7 @@ def free_swa_out_of_window_slots(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     is_chunk_cache: bool = False,
+    retain_floor: int | None = None,
 ) -> None:
     if req.kv is None:
         return
@@ -76,6 +74,12 @@ def free_swa_out_of_window_slots(
         # boundary (page_floor(seq_len)) so the last leaf is never all-tombstone.
         # No extra page margin is needed.
         evict_threshold = pre_len - max(sliding_window_size, page_size)
+    if retain_floor is not None and not is_chunk_cache:
+        # The caller owns where the floor is (see BasePrefixCache.swa_retain_floor);
+        # this only promises not to free past it. Chunk cache has no tree, so a
+        # retained checkpoint could never be matched and holding it is pure cost.
+        evict_threshold = min(evict_threshold, retain_floor)
+
     new_swa_evicted_seqlen = max(
         req.kv.swa_evicted_seqlen,
         evict_threshold,
@@ -89,9 +93,6 @@ def free_swa_out_of_window_slots(
             req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
         token_to_kv_pool_allocator.free_swa(free_slots)
-        maybe_evict_dsv4_state_on_swa(
-            token_to_kv_pool_allocator, req_to_token_pool, req, new_swa_evicted_seqlen
-        )
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
