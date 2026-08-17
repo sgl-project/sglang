@@ -893,6 +893,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
+        # wait_stream orders execution but does not protect deallocation: under
+        # the plan stream this ForwardBatch owns plan-stream allocations
+        # (init_new's positions / extend_start_loc, widened input_ids / hidden)
+        # that forward-stream kernels read after this method returns and the
+        # local reference dies. Pin it beside verify_forward_batch for the
+        # scheduler's 2-iteration ring window. Gated: the hazard exists only
+        # under the plan stream; the default path keeps its prior
+        # no-retention behavior.
+        if self.plan_stream:
+            if batch_result.extra_keep_alive_refs is None:
+                batch_result.extra_keep_alive_refs = []
+            batch_result.extra_keep_alive_refs.append(forward_batch)
 
         # Run draft extend batch in the main compute stream
         can_run_decode_cuda_graph = (
