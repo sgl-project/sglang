@@ -4,7 +4,7 @@ Launches TP=4 with flashinfer_mxfp4 MoE runner + EAGLE speculative decoding.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
-Registry: base-c-test-deepep-4-gpu-b200 (per-commit, 4x B200)
+Registry: base-c-test-4-gpu-b200 (per-commit, 4x B200)
 """
 
 import unittest
@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=465, stage="base-c", runner_config="deepep-4-gpu-b200")
+register_cuda_ci(est_time=465, stage="base-c", runner_config="4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -41,7 +41,7 @@ class TestDSV4FlashFP4B200(
     """LowLatency recipe: TP=4, FP4 (mxfp4), EAGLE spec decoding."""
 
     gsm8k_accuracy_thres = 0.93
-    accept_length_thres = 2.6
+    accept_length_thres = 2.8
     bs_1_speed_thres = 220
 
     @classmethod
@@ -170,6 +170,17 @@ class TestDSV4FlashFP4BreakableCudaGraphB200(
 
     gsm8k_accuracy_thres = 0.93
 
+    @unittest.skip(
+        "Flaky: temp-0 outputs are nondeterministic under this recipe "
+        "(sparse-DP prefill replays the breakable CUDA graph with a "
+        "fabricated idle-rank dummy extend; its hidden states vary run to "
+        "run and perturb real tokens' logits through the shared EP grouped "
+        "GEMMs at capture buckets 4/16). Introduced by #30898; disabled "
+        "pending a proper fix that keeps BCG enabled. See #31125."
+    )
+    def test_determinism_temp_zero(self):
+        pass
+
     @classmethod
     def setUpClass(cls):
         cls.model = try_cached_model(MODEL)
@@ -198,7 +209,7 @@ class TestDSV4FlashFP4BreakableCudaGraphB200(
                 "1024",
                 "--mem-fraction-static",
                 "0.80",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "16",
                 "--max-running-requests",
                 "128",

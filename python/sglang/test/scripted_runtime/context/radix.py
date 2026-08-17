@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Callable, Dict
 
 from sglang.srt.mem_cache.swa_radix_cache import TreeNode as SWATreeNode
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 
 if TYPE_CHECKING:
     from sglang.test.scripted_runtime.context.api import ScriptedContext
@@ -19,6 +20,8 @@ def get_all_node_lock_refs(ctx: ScriptedContext) -> Dict[int, int]:
 def _node_lock_ref(node: Any) -> int:
     if isinstance(node, SWATreeNode):
         return node.full_lock_ref + node.swa_lock_ref
+    if isinstance(node, UnifiedTreeNode):
+        return sum(cd.lock_ref for cd in node.component_data)
     return node.lock_ref
 
 

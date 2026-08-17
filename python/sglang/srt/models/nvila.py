@@ -195,11 +195,9 @@ class NVILAForConditionalGeneration(nn.Module):
             for x, block_size in zip(vision_features_list, block_sizes)
         ]
 
-        vision_features = torch.stack(
+        vision_features = torch.cat(
             [einops.rearrange(x, "1 c h w -> (h w) c") for x in vision_features_list]
         )
-
-        vision_features = einops.rearrange(vision_features, "n p d -> (n p) d")
 
         return vision_features
 
@@ -210,6 +208,10 @@ class NVILAForConditionalGeneration(nn.Module):
             if name.startswith("llm."):
                 self.llm.load_weights([(name[len("llm.") :], loaded_weight)])
             else:
+                if name not in params_dict and name.startswith(
+                    "vision_tower.vision_model."
+                ):
+                    name = "vision_tower." + name[len("vision_tower.vision_model.") :]
                 param = params_dict[name]
                 weight_loader = getattr(
                     param, "weight_loader", weight_utils.default_weight_loader

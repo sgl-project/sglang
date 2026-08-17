@@ -10,10 +10,10 @@
             "width": 1024,
             "height": 1024,
             "seed": 42,
-            "num_gpus": 1,
+            "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --dit-layerwise-offload false",
+                    "serve_args": "--warmup-mode server --dit-layerwise-offload false --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -26,10 +26,10 @@
             "width": 1024,
             "height": 1024,
             "seed": 42,
-            "num_gpus": 1,
+            "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --dit-layerwise-offload false",
+                    "serve_args": "--warmup-mode server --dit-layerwise-offload false --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -42,10 +42,10 @@
             "width": 1024,
             "height": 1024,
             "seed": 42,
-            "num_gpus": 1,
+            "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup",
+                    "serve_args": "--warmup-mode server --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -59,10 +59,10 @@
             "width": 1024,
             "height": 1024,
             "seed": 42,
-            "num_gpus": 1,
+            "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup",
+                    "serve_args": "--warmup-mode server --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -75,10 +75,10 @@
             "width": 1024,
             "height": 1024,
             "seed": 42,
-            "num_gpus": 1,
+            "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup",
+                    "serve_args": "--warmup-mode server --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -95,7 +95,7 @@
             "num_gpus": 4,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
+                    "serve_args": "--warmup-mode server --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
                     "extra_env": {}
                 }
             }
@@ -113,24 +113,7 @@
             "num_gpus": 1,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup",
-                    "extra_env": {}
-                }
-            }
-        },
-        {
-            "id": "ltx2_twostage_t2v",
-            "model": "Lightricks/LTX-2",
-            "task": "text-to-video",
-            "prompt": "A cat and a dog baking a cake together in a kitchen.",
-            "width": 768,
-            "height": 512,
-            "num_frames": 121,
-            "seed": 42,
-            "num_gpus": 2,
-            "frameworks": {
-                "sglang": {
-                    "serve_args": "--warmup --enable-cfg-parallel --pipeline-class-name LTX2TwoStagePipeline",
+                    "serve_args": "--warmup-mode server",
                     "extra_env": {}
                 }
             }
@@ -148,8 +131,41 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --pipeline-class-name LTX2TwoStagePipeline --cfg-parallel-size 2",
+                    "serve_args": "--warmup-mode server --pipeline-class-name LTX2TwoStagePipeline --cfg-parallel-size 2",
                     "extra_env": {}
+                }
+            }
+        },
+        {
+            "id": "ideogram4_fp8_t2i_2gpu",
+            "model": "ideogram-ai/ideogram-4-fp8",
+            "task": "text-to-image",
+            "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+            "width": 1024,
+            "height": 1024,
+            "seed": 42,
+            "num_gpus": 2,
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--warmup-mode server --tp-size 2 --attention-backend fa",
+                    "extra_env": {}
+                }
+            }
+        },
+        {
+            "id": "cosmos3_super_t2v_2gpu",
+            "model": "nvidia/Cosmos3-Super",
+            "task": "text-to-video",
+            "prompt": "A cat and a dog baking a cake together in a kitchen.",
+            "width": 1280,
+            "height": 720,
+            "num_frames": 81,
+            "seed": 42,
+            "num_gpus": 2,
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--warmup-mode server --tp-size 2",
+                    "extra_env": {"SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1"}
                 }
             }
         },
@@ -166,7 +182,35 @@
             "num_gpus": 4,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
+                    "serve_args": "--warmup-mode server --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
+                    "extra_env": {}
+                }
+            }
+        },
+        {
+            "id": "minimax_h3_t2va_5s",
+            "model": "MiniMaxAI/MiniMax-H3",
+            "task": "text-to-video",
+            "prompt": "At night, while their owner sleeps in a bedroom, three cats march in loudly playing tiny brass instruments, then abruptly file out.",
+            "width": 1344,
+            "height": 768,
+            "num_frames": 124,
+            "fps": 24,
+            "num_inference_steps": 50,
+            "seed": 1101,
+            "num_gpus": 4,
+            "sglang_request_extra": {
+                "task": "t2va",
+                "conditions": [],
+                "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "num_frames": null,
+                "fps": null
+            },
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--warmup-mode server --model-variant fl2va --tp-size 2 --ulysses-degree 2 --performance-mode speed --enable-torch-compile false",
                     "extra_env": {}
                 }
             }

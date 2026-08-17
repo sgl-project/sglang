@@ -91,7 +91,11 @@ class AiterRunnerOutput(RunnerOutput):
         return MoeRunnerBackend.AITER
 
 
-_AITER_ACTIVATIONS = {"silu": "Silu", "swiglu": "Swiglu"}
+_AITER_ACTIVATIONS = {
+    "silu": "Silu",
+    "swiglu": "Swiglu",
+    "situ": "Situv2",
+}
 
 
 def _aiter_activation(activation: str):
@@ -162,7 +166,15 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
-        if quant_info.swiglu_limit > 0:
+        if self.config.activation == "situ":
+            from aiter.ops.flydsl.moe_common import GateMode
+
+            extra["gate_mode"] = GateMode.SEPARATED.value
+            if self.config.gemm1_alpha is not None:
+                extra["beta"] = float(self.config.gemm1_alpha)
+            if self.config.gemm1_clamp_limit is not None:
+                extra["linear_beta"] = float(self.config.gemm1_clamp_limit)
+        elif quant_info.swiglu_limit > 0:
             # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
             # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
             # swiglu_limit==0) still run on aiter builds where this module
@@ -300,7 +312,7 @@ def _pre_permute_deepep_to_aiter(
     quant_type = quant_info.quant_type
 
     if is_mori:
-        from sglang.srt.layers.moe.rocm_moe_utils import upscale, upscale_mxfp4
+        from sglang.kernels.ops.moe.rocm_moe_utils import upscale, upscale_mxfp4
 
         a1_scale = dispatch_output.hidden_states_scale
         num_local_tokens = dispatch_output.num_recv_tokens_per_expert

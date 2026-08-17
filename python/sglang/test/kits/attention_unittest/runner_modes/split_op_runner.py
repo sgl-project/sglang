@@ -229,7 +229,6 @@ def _make_static_forward_batch(raw_batch, static_num_tokens: int, device: str):
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
-        padded_static_len=static_num_tokens,
         num_token_non_padded_cpu=raw_num_tokens,
     )
 

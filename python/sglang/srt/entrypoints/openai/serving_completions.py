@@ -22,6 +22,7 @@ from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
     process_cached_tokens_details_from_ret,
+    process_hidden_states_for_response,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
     should_include_usage,
@@ -34,8 +35,8 @@ from sglang.srt.parser.code_completion_parser import (
 from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
 
@@ -124,12 +125,16 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
+            return_prompt_token_ids=request.return_token_ids,
             rid=request.rid,
-            extra_key=self._compute_extra_key(request),
+            session_id=request.session_id,
+            extra_key=request.extra_key,
+            cache_salt=request.cache_salt,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            images_config=getattr(request, "images_config", None),
         )
 
         return adapted_request, request
@@ -164,9 +169,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         # Handle response_format constraints
         if request.response_format and request.response_format.type == "json_schema":
-            sampling_params["json_schema"] = convert_json_schema_to_str(
-                request.response_format.json_schema.schema_
-            )
+            json_schema = request.response_format.json_schema
+            schema = getattr(json_schema, "schema_", None)
+            if schema is None:
+                raise ValueError(
+                    "schema_ is required for json_schema response format request."
+                )
+            sampling_params["json_schema"] = convert_json_schema_to_str(schema)
         elif request.response_format and request.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
         elif (
@@ -218,6 +227,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # State tracking for streaming
         stream_offsets = {}
         n_prev_tokens = {}
+        n_prev_token_ids = {}
 
         # Usage tracking
         prompt_tokens = {}
@@ -307,8 +317,26 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         )
                     n_prev_tokens[index] = total_output_logprobs
 
+                chunk_token_ids = None
+                chunk_prompt_token_ids = None
+                if request.return_token_ids:
+                    output_ids = content["output_ids"]
+                    if (
+                        not self.tokenizer_manager.server_args.incremental_streaming_output
+                    ):
+                        n_prev_token_id = n_prev_token_ids.get(index, 0)
+                        chunk_token_ids = output_ids[n_prev_token_id:]
+                        n_prev_token_ids[index] = len(output_ids)
+                    else:
+                        chunk_token_ids = output_ids
+                    if is_first_chunk:
+                        chunk_prompt_token_ids = content.get("prompt_token_ids")
+
                 # Generate delta
-                delta = text[offset:]
+                if self.tokenizer_manager.server_args.incremental_streaming_output:
+                    delta = text
+                else:
+                    delta = text[offset:]
                 stream_offsets[index] = len(content["text"])
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
@@ -341,6 +369,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         if finish_reason and "matched" in finish_reason
                         else None
                     ),
+                    token_ids=chunk_token_ids,
+                    prompt_token_ids=chunk_prompt_token_ids,
                 )
                 chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -364,10 +394,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             if request.return_hidden_states and hidden_states:
                 for index, choice_hidden_states in hidden_states.items():
                     if choice_hidden_states:
-                        last_token_hidden_states = (
-                            choice_hidden_states[-1]
-                            if len(choice_hidden_states) > 1
-                            else []
+                        response_hidden_states = process_hidden_states_for_response(
+                            choice_hidden_states, request.return_hidden_states
                         )
                         hidden_states_chunk = CompletionStreamResponse(
                             id=content["meta_info"]["id"],
@@ -377,7 +405,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                                 CompletionResponseStreamChoice(
                                     index=index,
                                     text="",
-                                    hidden_states=last_token_hidden_states,
+                                    hidden_states=response_hidden_states,
                                     finish_reason=None,
                                 )
                             ],
@@ -541,6 +569,14 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
+                token_ids=(
+                    ret_item["output_ids"] if request.return_token_ids else None
+                ),
+                prompt_token_ids=(
+                    ret_item.get("prompt_token_ids")
+                    if request.return_token_ids
+                    else None
+                ),
             )
             choices.append(choice_data)
 

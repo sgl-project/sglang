@@ -56,7 +56,7 @@ class TestDeepseekV32TC(CustomTestCase):
             "131072",
             "--mem-fraction-static",
             "0.70",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "8",
             "--enable-torch-compile",
             "--disable-cuda-graph",

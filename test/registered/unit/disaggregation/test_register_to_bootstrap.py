@@ -4,14 +4,26 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+
 import unittest
 from unittest.mock import MagicMock, call, patch
 
+from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 
 
 class TestRegisterToBootstrap(CustomTestCase):
     """Tests for CommonKVManager.register_to_bootstrap retry/backoff behavior."""
+
+    def setUp(self):
+        # register_to_bootstrap reads get_parallel().load_balance_method /
+        # .enable_dsa_cache_layer_split and get_serving().port from the
+        # published config.
+        override = get_context().override_server_args(
+            load_balance_method="follow_bootstrap_room", port=30000
+        )
+        override.install()
+        self.addCleanup(override.restore)
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
@@ -165,9 +177,13 @@ class TestRegisterToBootstrap(CustomTestCase):
             "rank_port",
             "page_size",
             "kv_cache_dtype",
+            # Self-registered HTTP API port used to derive the PD retract
+            # rebootstrap /generate URL on the decode side.
+            "prefill_http_port",
         ]
         for field in required_fields:
             self.assertIn(field, payload)
+        self.assertEqual(payload["prefill_http_port"], 30000)
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
@@ -185,8 +201,8 @@ class TestRegisterToBootstrap(CustomTestCase):
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    def test_wildcard_host_0000_uses_local_ip(self, mock_put, mock_time):
-        """When --host 0.0.0.0 is used, the PUT must target local_ip not 0.0.0.0.
+    def test_wildcard_host_0000_uses_ipv4_loopback(self, mock_put, mock_time):
+        """When --host 0.0.0.0 is used, the PUT must target IPv4 loopback.
 
         Scenario: cross-node P/D disagg where each role runs on a single node
         (tp=1).  Each machine runs its own SGLang instance with --host 0.0.0.0
@@ -196,7 +212,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         aiohttp >=3.9 rejects that with HTTP 403 because 0.0.0.0 is not a
         valid Host header value.
 
-        Fix: substitute self.local_ip when bootstrap_host is a wildcard.
+        Fix: substitute same-family loopback when bootstrap_host is a wildcard.
         """
         mock_time.monotonic.return_value = 0.0
         success_resp = MagicMock()
@@ -210,12 +226,12 @@ class TestRegisterToBootstrap(CustomTestCase):
 
         url_used = mock_put.call_args[0][0]
         self.assertNotIn("0.0.0.0", url_used)
-        self.assertIn("192.168.1.10", url_used)
+        self.assertIn("127.0.0.1", url_used)
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    def test_wildcard_host_ipv6_uses_local_ip(self, mock_put, mock_time):
-        """Same fix for the IPv6 wildcard \"::\": must use local_ip instead."""
+    def test_wildcard_host_ipv6_uses_ipv6_loopback(self, mock_put, mock_time):
+        """Same fix for the IPv6 wildcard \"::\": must use IPv6 loopback."""
         mock_time.monotonic.return_value = 0.0
         success_resp = MagicMock()
         success_resp.status_code = 200
@@ -227,9 +243,9 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.register_to_bootstrap()
 
         url_used = mock_put.call_args[0][0]
-        # "::" bracketed as "[::]:port" should not appear; local_ip should
+        # "::" bracketed as "[::]:port" should not appear; loopback should.
         self.assertNotIn("[::]", url_used)
-        self.assertIn("fd00", url_used)
+        self.assertIn("[::1]", url_used)
 
     def _make_manager(self, dist_init_addr=None):
         """Create a lightweight mock manager that has the attributes needed
@@ -262,10 +278,8 @@ class TestRegisterToBootstrap(CustomTestCase):
 
         mgr.kv_args = MagicMock()
         mgr.kv_args.page_size = 16
-
-        mgr.server_args = MagicMock()
-        mgr.server_args.kv_cache_dtype = "auto"
-        mgr.server_args.load_balance_method = "follow_bootstrap_room"
+        # Resolved per-runner value threaded through KVArgs (the payload field).
+        mgr.kv_cache_dtype_str = "auto"
 
         return mgr
 

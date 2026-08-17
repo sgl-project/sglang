@@ -16,12 +16,35 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.normalization import AdaLayerNormContinuous
 
+from sglang.kernels.ops.diffusion.bitexact_gate import BitExactFusionGate
+from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
+from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
+    can_use_fused_layernorm_modulate,
+    fused_layernorm_modulate_raw,
+    is_plain_layer_norm,
+)
+from sglang.kernels.ops.diffusion.triton.silu_mul_bitexact import (
+    fused_packed_silu_mul_bitexact,
+)
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
-from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed import (
+    divide,
+    get_tp_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    build_shard_plan,
+    join_seqs,
+    shard_like,
+    shard_seq_prefix,
+    should_shard_text,
+    split_seqs,
+    tail_attn_meta,
+)
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
@@ -40,12 +63,12 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -54,31 +77,119 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
+_get_qkv_projections = get_qkv_projections
 
-def _get_qkv_projections(
-    attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
-):
-    if attn.use_fused_qkv:
-        qkv, _ = attn.to_qkv(hidden_states)
-        query, key, value = [t.contiguous() for t in qkv.chunk(3, dim=-1)]
-    else:
-        query, _ = attn.to_q(hidden_states)
-        key, _ = attn.to_k(hidden_states)
-        value, _ = attn.to_v(hidden_states)
+_FLUX2_LN_MOD = BitExactFusionGate("FLUX.2 fused LN+modulate", per_signature=True)
+_FLUX2_LN_MOD_SIGS = _FLUX2_LN_MOD.verified_sigs
+assert _FLUX2_LN_MOD_SIGS is not None
+_FLUX2_SWIGLU = BitExactFusionGate("FLUX.2 fused SwiGLU", per_signature=True)
+_FLUX2_SWIGLU_SIGS = _FLUX2_SWIGLU.verified_sigs
+assert _FLUX2_SWIGLU_SIGS is not None
 
-    encoder_query = encoder_key = encoder_value = None
-    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        if attn.use_fused_added_qkv:
-            added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-            encoder_query, encoder_key, encoder_value = [
-                t.contiguous() for t in added_qkv.chunk(3, dim=-1)
-            ]
+
+def _flux2_norm_modulate(
+    norm: nn.Module,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    """Bit-exact single-kernel ``LN(x) * (1 + scale) + shift``."""
+    # Preserve the original expression for Dynamo/Inductor.  This direct
+    # Triton dispatch is intentionally an eager fast path.
+    if torch.compiler.is_compiling():
+        return norm(x) * (1 + scale) + shift
+
+    scale_row = scale.squeeze(1) if scale.dim() == 3 and scale.shape[1] == 1 else scale
+    shift_row = shift.squeeze(1) if shift.dim() == 3 and shift.shape[1] == 1 else shift
+    if (
+        _FLUX2_LN_MOD.disabled
+        or not is_plain_layer_norm(norm, x.shape[-1])
+        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
+    ):
+        return norm(x) * (1 + scale) + shift
+
+    # The bit-exact contract is set by dtype/reduction width/affine-row
+    # layout, not by the number of independent rows.  Excluding sequence
+    # length lets the representative warmup verify the real prompt path too.
+    sig = (
+        x.dtype,
+        x.device,
+        x.shape[0],
+        x.shape[-1],
+        x.stride(-1),
+        scale_row.stride(0) if scale_row.shape[0] > 1 else x.shape[-1],
+        shift_row.stride(0) if shift_row.shape[0] > 1 else x.shape[-1],
+        norm.eps,
+    )
+    verified = sig in _FLUX2_LN_MOD_SIGS
+    if not verified and torch.cuda.is_current_stream_capturing():
+        return norm(x) * (1 + scale) + shift
+    try:
+        # Direct dispatch avoids custom-op overhead on this eager-only path.
+        out = fused_layernorm_modulate_raw(x, scale_row, shift_row, norm.eps)
+    except Exception as exc:
+        _FLUX2_LN_MOD.on_exception(exc, logger=logger)
+        return norm(x) * (1 + scale) + shift
+    if verified:
+        return out
+    ref = norm(x) * (1 + scale) + shift
+    return _FLUX2_LN_MOD.accept_or_fallback(
+        out,
+        ref,
+        sig=sig,
+        logger=logger,
+        mismatch_msg=(
+            "FLUX.2 fused LN+modulate fast path is not bit-exact on this "
+            "platform; falling back to eager"
+        ),
+    )
+
+
+def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
+    """Bit-exact fused SwiGLU for the packed FLUX.2 FFN projection."""
+    half = x.shape[-1] // 2
+    # Let Inductor fuse the reference expression in torch.compile mode.
+    if torch.compiler.is_compiling():
+        return F.silu(x[..., :half]) * x[..., half:]
+
+    # Sequence length only changes the launch grid; D and row stride define
+    # how the two packed halves are addressed and therefore need verification.
+    sig = (x.dtype, x.device, x.shape[0], x.shape[-1], x.stride(-2), x.stride(-1))
+    verified = sig in _FLUX2_SWIGLU_SIGS
+    can_fuse = (
+        not _FLUX2_SWIGLU.disabled
+        and x.is_cuda
+        and x.dtype is torch.bfloat16
+        and x.dim() == 3
+        and x.stride(-1) == 1
+        and x.stride(-2) >= x.shape[-1]
+        and x.stride(0) == x.shape[1] * x.stride(1)
+        and x.shape[-1] % 2 == 0
+        and x.numel() > 0
+    )
+    # Per-signature verification may compare tensors and synchronize.  Never
+    # verify a new layout while a CUDA graph is being captured.
+    if can_fuse and not verified and torch.cuda.is_current_stream_capturing():
+        return F.silu(x[..., :half]) * x[..., half:]
+    if can_fuse:
+        try:
+            out = fused_packed_silu_mul_bitexact(x)
+        except Exception as exc:
+            _FLUX2_SWIGLU.on_exception(exc, logger=logger)
         else:
-            encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
-            encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
-            encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
-
-    return query, key, value, encoder_query, encoder_key, encoder_value
+            if verified:
+                return out
+            return _FLUX2_SWIGLU.accept_or_fallback(
+                out,
+                F.silu(x[..., :half]) * x[..., half:],
+                sig=sig,
+                logger=logger,
+                mismatch_msg=(
+                    "FLUX.2 fused SwiGLU fast path is not bit-exact on this "
+                    "platform; falling back to eager"
+                ),
+            )
+    return F.silu(x[..., :half]) * x[..., half:]
 
 
 class Flux2SwiGLU(nn.Module):
@@ -87,14 +198,8 @@ class Flux2SwiGLU(nn.Module):
     layer fused into the first linear layer of the FF sub-block. Thus, this module has no trainable parameters.
     """
 
-    def __init__(self):
-        super().__init__()
-        self.gate_fn = nn.SiLU()
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.chunk(2, dim=-1)
-        x = self.gate_fn(x1) * x2
-        return x
+        return _flux2_swiglu(x)
 
 
 class Flux2FeedForward(nn.Module):
@@ -295,6 +400,9 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        num_replicated_prefix: int = 0,
+        attn_mask: Optional[torch.Tensor] = None,
+        attn_mask_meta: Optional[Dict[str, int]] = None,
     ) -> torch.Tensor:
         (
             query,
@@ -348,9 +456,12 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 allow_inplace=True,
             )
 
-            query = torch.cat([encoder_query, query], dim=1)
-            key = torch.cat([encoder_key, key], dim=1)
-            value = torch.cat([encoder_value, value], dim=1)
+            # join_seqs relocates any SP text tail-pad behind the image (see
+            # sp_shard.join_seqs for why).
+            sp_txt_pad = (attn_mask_meta or {}).get("local_pad", 0)
+            query = join_seqs(encoder_query, query, sp_txt_pad)
+            key = join_seqs(encoder_key, key, sp_txt_pad)
+            value = join_seqs(encoder_value, value, sp_txt_pad)
         else:
             query, key = apply_qk_norm_with_optional_rope(
                 q=query,
@@ -363,21 +474,21 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 allow_inplace=True,
             )
 
-        num_rep = (
-            encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
+        hidden_states = self.attn(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            attn_mask_meta=attn_mask_meta,
+            num_replicated_prefix=num_replicated_prefix,
         )
-        hidden_states = self.attn(query, key, value, num_replicated_prefix=num_rep)
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
         if encoder_hidden_states is not None:
-            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
-                [
-                    encoder_hidden_states.shape[1],
-                    hidden_states.shape[1] - encoder_hidden_states.shape[1],
-                ],
-                dim=1,
+            encoder_hidden_states, hidden_states = split_seqs(
+                hidden_states, encoder_hidden_states.shape[1], sp_txt_pad
             )
             encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
 
@@ -507,6 +618,11 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         num_replicated_prefix: int = 0,
         **kwargs,
     ) -> torch.Tensor:
+        attn_mask = kwargs.get("attn_mask")
+        attn_mask_meta = kwargs.get("attn_mask_meta")
+        if attn_mask is None:
+            attn_mask = attention_mask
+
         # Parallel in (QKV + MLP in) projection
         hidden_states, _ = self.to_qkv_mlp_proj(hidden_states)
         qkv, mlp_hidden_states = torch.split(
@@ -525,9 +641,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         key = key.unflatten(-1, (self.local_heads, -1))
         value = value.unflatten(-1, (self.local_heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
+        cos_sin_cache = None
         if freqs_cis is not None:
             cos, sin = freqs_cis
             cos_sin_cache = torch.cat(
@@ -537,11 +651,26 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
                 ],
                 dim=-1,
             )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
-            )
+
+        # QK-norm (+ RoPE) via the shared helper so the fused kernel path is used
+        # here too — the single-stream block previously ran norm and RoPE as separate ops.
+        query, key = apply_qk_norm_with_optional_rope(
+            q=query,
+            k=key,
+            q_norm=self.norm_q,
+            k_norm=self.norm_k,
+            head_dim=self.head_dim,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=False,
+            allow_inplace=True,
+        )
         hidden_states = self.attn(
-            query, key, value, num_replicated_prefix=num_replicated_prefix
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            attn_mask_meta=attn_mask_meta,
+            num_replicated_prefix=num_replicated_prefix,
         )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
@@ -600,6 +729,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         split_hidden_states: bool = False,
         text_seq_len: Optional[int] = None,
+        num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # If encoder_hidden_states is None, hidden_states is assumed to have encoder_hidden_states already
         # concatenated
@@ -609,18 +739,19 @@ class Flux2SingleTransformerBlock(nn.Module):
 
         mod_shift, mod_scale, mod_gate = temb_mod_params
 
-        norm_hidden_states = self.norm(hidden_states)
-        norm_hidden_states = (1 + mod_scale) * norm_hidden_states + mod_shift
+        norm_hidden_states = _flux2_norm_modulate(
+            self.norm, hidden_states, mod_scale, mod_shift
+        )
 
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             freqs_cis=freqs_cis,
-            num_replicated_prefix=text_seq_len or 0,
+            num_replicated_prefix=num_replicated_prefix,
             **joint_attention_kwargs,
         )
 
-        hidden_states = hidden_states + mod_gate * attn_output
+        hidden_states = residual_gate_add(hidden_states, attn_output, mod_gate)
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
 
@@ -700,60 +831,78 @@ class Flux2TransformerBlock(nn.Module):
         ],
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         joint_attention_kwargs = joint_attention_kwargs or {}
 
         # Modulation parameters shape: [1, 1, self.dim]
-        (shift_msa, scale_msa, gate_msa), (shift_mlp, scale_mlp, gate_mlp) = (
-            temb_mod_params_img
-        )
-        (c_shift_msa, c_scale_msa, c_gate_msa), (
-            c_shift_mlp,
-            c_scale_mlp,
-            c_gate_mlp,
+        (
+            (shift_msa, scale_msa, gate_msa),
+            (
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+            ),
+        ) = temb_mod_params_img
+        (
+            (c_shift_msa, c_scale_msa, c_gate_msa),
+            (
+                c_shift_mlp,
+                c_scale_mlp,
+                c_gate_mlp,
+            ),
         ) = temb_mod_params_txt
 
         # Img stream
-        norm_hidden_states = self.norm1(hidden_states)
-        norm_hidden_states = (1 + scale_msa) * norm_hidden_states + shift_msa
+        norm_hidden_states = _flux2_norm_modulate(
+            self.norm1, hidden_states, scale_msa, shift_msa
+        )
 
         # Conditioning txt stream
-        norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states)
-        norm_encoder_hidden_states = (
-            1 + c_scale_msa
-        ) * norm_encoder_hidden_states + c_shift_msa
+        norm_encoder_hidden_states = _flux2_norm_modulate(
+            self.norm1_context,
+            encoder_hidden_states,
+            c_scale_msa,
+            c_shift_msa,
+        )
 
         # Attention on concatenated img + txt stream
         attention_outputs = self.attn(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             freqs_cis=freqs_cis,
+            num_replicated_prefix=num_replicated_prefix,
             **joint_attention_kwargs,
         )
 
         attn_output, context_attn_output = attention_outputs
 
         # Process attention outputs for the image stream (`hidden_states`).
-        attn_output = gate_msa * attn_output
-        hidden_states = hidden_states + attn_output
+        hidden_states = residual_gate_add(hidden_states, attn_output, gate_msa)
 
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+        norm_hidden_states = _flux2_norm_modulate(
+            self.norm2, hidden_states, scale_mlp, shift_mlp
+        )
 
         ff_output = self.ff(norm_hidden_states)
-        hidden_states = hidden_states + gate_mlp * ff_output
+        hidden_states = residual_gate_add(hidden_states, ff_output, gate_mlp)
 
         # Process attention outputs for the text stream (`encoder_hidden_states`).
-        context_attn_output = c_gate_msa * context_attn_output
-        encoder_hidden_states = encoder_hidden_states + context_attn_output
+        encoder_hidden_states = residual_gate_add(
+            encoder_hidden_states, context_attn_output, c_gate_msa
+        )
 
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = (
-            norm_encoder_hidden_states * (1 + c_scale_mlp) + c_shift_mlp
+        norm_encoder_hidden_states = _flux2_norm_modulate(
+            self.norm2_context,
+            encoder_hidden_states,
+            c_scale_mlp,
+            c_shift_mlp,
         )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states + c_gate_mlp * context_ff_output
+        encoder_hidden_states = residual_gate_add(
+            encoder_hidden_states, context_ff_output, c_gate_mlp
+        )
         if encoder_hidden_states.dtype == torch.float16:
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
 
@@ -1060,9 +1209,44 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         hidden_states, _ = self.x_embedder(hidden_states)
         encoder_hidden_states, _ = self.context_embedder(encoder_hidden_states)
 
-        # 3. Calculate RoPE embeddings from image and text tokens
-        # NOTE: the below logic means that we can't support batched inference with images of different resolutions or
-        # text prompts of different lengths. Is this a use case we want to support?
+        # Shard the replicated text stream across SP ranks (image latents are
+        # already sharded); non-divisible lengths tail-pad the last rank and the
+        # per-request tail meta lets attention skip the pad for free.
+        num_replicated_prefix = num_txt_tokens
+        sp_txt_pad = 0
+        singles_freqs_cis = freqs_cis
+        if should_shard_text(num_txt_tokens):
+            txt_shard = build_shard_plan(num_txt_tokens)
+            encoder_hidden_states = shard_like(encoder_hidden_states, txt_shard)
+            if freqs_cis is not None:
+                cos, sin = freqs_cis
+                cos = shard_seq_prefix(cos, num_txt_tokens, txt_shard)
+                sin = shard_seq_prefix(sin, num_txt_tokens, txt_shard)
+                freqs_cis = (cos, sin)
+                singles_freqs_cis = freqs_cis
+            num_replicated_prefix = 0
+            num_txt_tokens = txt_shard.local_len
+            tail_meta = tail_attn_meta(
+                txt_shard,
+                encoder_hidden_states.shape[0],
+                hidden_states.device,
+                image_seq_len=hidden_states.shape[1],
+            )
+            if tail_meta is not None:
+                joint_attention_kwargs = (
+                    joint_attention_kwargs.copy() if joint_attention_kwargs else {}
+                )
+                joint_attention_kwargs["attn_mask_meta"] = tail_meta
+                sp_txt_pad = txt_shard.local_pad
+                # The single-stream trunk applies RoPE on the relocated
+                # [txt_real, img, pad] layout; reorder its cache to match.
+                if freqs_cis is not None:
+                    t_loc = txt_shard.local_len
+                    singles_freqs_cis = (
+                        join_seqs(cos[:t_loc], cos[t_loc:], sp_txt_pad, dim=0),
+                        join_seqs(sin[:t_loc], sin[t_loc:], sp_txt_pad, dim=0),
+                    )
+
         # 4. Double Stream Transformer Blocks
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
@@ -1072,9 +1256,13 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 temb_mod_params_txt=double_stream_mod_txt,
                 freqs_cis=freqs_cis,
                 joint_attention_kwargs=joint_attention_kwargs,
+                num_replicated_prefix=num_replicated_prefix,
             )
-        # Concatenate text and image streams for single-block inference
-        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        # Concatenate text and image streams for single-block inference;
+        # join_seqs relocates any SP text tail-pad behind the image once for
+        # the whole trunk (see sp_shard.join_seqs for why).
+        txt_real = num_txt_tokens - sp_txt_pad
+        hidden_states = join_seqs(encoder_hidden_states, hidden_states, sp_txt_pad)
 
         # 5. Single Stream Transformer Blocks
         for index_block, block in enumerate(self.single_transformer_blocks):
@@ -1082,12 +1270,14 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hidden_states=hidden_states,
                 encoder_hidden_states=None,
                 temb_mod_params=single_stream_mod,
-                freqs_cis=freqs_cis,
+                freqs_cis=singles_freqs_cis,
                 joint_attention_kwargs=joint_attention_kwargs,
-                text_seq_len=num_txt_tokens,
+                text_seq_len=txt_real,
+                num_replicated_prefix=num_replicated_prefix,
             )
-        # Remove text tokens from concatenated stream
-        hidden_states = hidden_states[:, num_txt_tokens:, ...]
+        # Remove text (and any tail pad) from the concatenated stream
+        img_end = hidden_states.shape[1] - sp_txt_pad
+        hidden_states = hidden_states[:, txt_real:img_end, ...]
 
         # 6. Output layers
         hidden_states = self.norm_out(hidden_states, temb)

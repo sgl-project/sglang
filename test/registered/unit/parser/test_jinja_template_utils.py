@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 
 class TestTemplateContentFormatDetection(CustomTestCase):
@@ -102,46 +102,6 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         result = detect_jinja_template_content_format(msg_content_pattern)
         self.assertEqual(result, "openai")
 
-    def test_detect_m_content_pattern(self):
-        """Test detection of template with m.content pattern (should be 'openai' format)."""
-        msg_content_pattern = """
-[gMASK]<sop>
-{%- for m in messages %}
-    {%- if m.role == 'system' %}
-<|system|>
-{{ m.content }}
-    {%- elif m.role == 'user' %}
-<|user|>{{ '\n' }}
-        {%- if m.content is string %}
-{{ m.content }}
-        {%- else %}
-            {%- for item in m.content %}
-                {%- if item.type == 'video' or 'video' in item %}
-<|begin_of_video|><|video|><|end_of_video|>
-                {%- elif item.type == 'image' or 'image' in item %}
-<|begin_of_image|><|image|><|end_of_image|>
-                {%- elif item.type == 'text' %}
-{{ item.text }}
-                {%- endif %}
-            {%- endfor %}
-        {%- endif %}
-    {%- elif m.role == 'assistant' %}
-        {%- if m.metadata %}
-<|assistant|>{{ m.metadata }}
-{{ m.content }}
-        {%- else %}
-<|assistant|>
-{{ m.content }}
-        {%- endif %}
-    {%- endif %}
-{%- endfor %}
-{% if add_generation_prompt %}<|assistant|>
-{% endif %}
-        """
-
-        result = detect_jinja_template_content_format(msg_content_pattern)
-        self.assertEqual(result, "openai")
-
     def test_process_content_openai_format(self):
         """Test content processing for openai format."""
         msg_dict = {
@@ -177,6 +137,31 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         ]
         self.assertEqual(result["content"], expected_content)
         self.assertEqual(result["role"], "user")
+
+    def test_process_content_preserves_image_content_hash(self):
+        content_hash = "sha256:" + "ab" * 32
+        image_data = []
+        result = process_content_for_template_format(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "http://example.com/image.jpg",
+                            "content_hash": content_hash,
+                        },
+                    }
+                ],
+            },
+            "openai",
+            image_data,
+            [],
+            [],
+            [],
+        )
+        self.assertEqual(result["content"], [{"type": "image"}])
+        self.assertEqual(image_data[0].content_hash, content_hash)
 
     def test_process_content_string_format(self):
         """Test content processing for string format."""

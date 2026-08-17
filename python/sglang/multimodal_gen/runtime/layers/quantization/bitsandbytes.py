@@ -17,7 +17,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
+from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
 
 def _require_bitsandbytes() -> None:

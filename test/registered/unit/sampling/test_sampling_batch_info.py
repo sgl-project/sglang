@@ -3,13 +3,15 @@
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="base-b-test-cpu")
+register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.sampling.sampling_batch_info import (
     SamplingBatchInfo,
     merge_bias_tensor,
@@ -30,6 +32,7 @@ def _make_info(batch_size=2, **overrides):
         top_ks=torch.full((batch_size,), TOP_K_ALL, dtype=torch.int32),
         min_ps=torch.zeros(batch_size),
         is_all_greedy=False,
+        is_any_greedy=False,
         need_top_p_sampling=False,
         need_top_k_sampling=False,
         need_min_p_sampling=False,
@@ -39,6 +42,11 @@ def _make_info(batch_size=2, **overrides):
     )
     defaults.update(overrides)
     return SamplingBatchInfo(**defaults)
+
+
+def _serial_batched_fill(entries, vocab_mask):
+    for entry in entries:
+        entry.grammar.fill_vocab_mask(vocab_mask, entry.row)
 
 
 class TestMergeBiasTensor(CustomTestCase):
@@ -163,13 +171,13 @@ class TestApplyLogitsBias(CustomTestCase):
         self.assertAlmostEqual(logits[0, 0].item(), 0.0, places=5)
 
     def test_applies_vocab_mask(self):
-        """Test that vocab_mask triggers the apply_mask_func callback."""
+        """Test that a grammar_mask gets applied to the logits."""
         info = _make_info(batch_size=1)
-        info.vocab_mask = torch.ones(1, VOCAB_SIZE)
-        info.apply_mask_func = MagicMock()
+        grammar = MagicMock()
+        info.grammar_mask = GrammarMask(grammar, torch.ones(1, VOCAB_SIZE))
         logits = torch.zeros(1, VOCAB_SIZE)
         info.apply_logits_bias(logits)
-        info.apply_mask_func.assert_called_once()
+        grammar.apply_vocab_mask.assert_called_once()
 
     def test_applies_penalizer_orchestrator(self):
         """Test that a required orchestrator's apply() is called on logits."""
@@ -184,7 +192,7 @@ class TestApplyLogitsBias(CustomTestCase):
         info = _make_info(batch_size=1)
         info.acc_additive_penalties = None
         info.logit_bias = None
-        info.vocab_mask = None
+        info.grammar_mask = None
         logits = torch.zeros(1, VOCAB_SIZE)
         original = logits.clone()
         info.apply_logits_bias(logits)
@@ -219,39 +227,42 @@ class TestUpdatePenalties(CustomTestCase):
 class TestUpdateRegexVocabMask(CustomTestCase):
 
     def test_no_grammars_clears_mask(self):
-        """Test that None grammars clears both vocab_mask and apply_mask_func."""
+        """Test that None grammars clears the grammar_mask."""
         info = _make_info(batch_size=1)
         info.grammars = None
         info.update_regex_vocab_mask()
-        self.assertIsNone(info.vocab_mask)
-        self.assertIsNone(info.apply_mask_func)
+        self.assertIsNone(info.grammar_mask)
 
     def test_empty_grammars_clears_mask(self):
-        """Test that empty grammars list clears vocab_mask."""
+        """Test that empty grammars list clears the grammar_mask."""
         info = _make_info(batch_size=1)
         info.grammars = []
         info.update_regex_vocab_mask()
-        self.assertIsNone(info.vocab_mask)
+        self.assertIsNone(info.grammar_mask)
 
     def test_with_grammars_allocates_and_fills(self):
         """Test that an active grammar gets allocate, fill, and move called."""
         grammar = MagicMock()
         grammar.finished = False
         grammar.is_terminated.return_value = False
+        grammar.fill_vocab_mask_batched.side_effect = _serial_batched_fill
         grammar.allocate_vocab_mask.return_value = torch.zeros(1, VOCAB_SIZE)
         grammar.move_vocab_mask.return_value = torch.zeros(1, VOCAB_SIZE)
         info = _make_info(batch_size=1)
         info.grammars = [grammar]
         info.update_regex_vocab_mask()
         grammar.allocate_vocab_mask.assert_called_once()
+        grammar.fill_vocab_mask_batched.assert_called_once()
         grammar.fill_vocab_mask.assert_called_once()
         grammar.move_vocab_mask.assert_called_once()
+        self.assertIs(info.grammar_mask.grammar, grammar)
 
     def test_mixed_grammars_only_active_fills(self):
         """Test that finished, terminated, and None grammars are skipped."""
         active = MagicMock()
         active.finished = False
         active.is_terminated.return_value = False
+        active.fill_vocab_mask_batched.side_effect = _serial_batched_fill
         active.allocate_vocab_mask.return_value = torch.zeros(3, VOCAB_SIZE)
         active.move_vocab_mask.return_value = torch.zeros(3, VOCAB_SIZE)
 
@@ -266,9 +277,33 @@ class TestUpdateRegexVocabMask(CustomTestCase):
         info.grammars = [active, finished, terminated]
         info.update_regex_vocab_mask()
 
+        active.fill_vocab_mask_batched.assert_called_once()
         active.fill_vocab_mask.assert_called_once()
         finished.fill_vocab_mask.assert_not_called()
         terminated.fill_vocab_mask.assert_not_called()
+
+    def test_batched_fill_skips_serial_loop(self):
+        """A backend with a batched kernel must not also run the serial fill."""
+        active = MagicMock()
+        active.finished = False
+        active.is_terminated.return_value = False
+        active.allocate_vocab_mask.return_value = torch.zeros(2, VOCAB_SIZE)
+        active.move_vocab_mask.return_value = torch.zeros(2, VOCAB_SIZE)
+
+        other = MagicMock()
+        other.finished = False
+        other.is_terminated.return_value = False
+
+        info = _make_info(batch_size=2)
+        info.grammars = [active, other]
+        info.update_regex_vocab_mask()
+
+        # The batched call happened with both active rows; serial fill skipped.
+        active.fill_vocab_mask_batched.assert_called_once()
+        entries, _mask = active.fill_vocab_mask_batched.call_args.args
+        self.assertEqual([e.row for e in entries], [0, 1])
+        active.fill_vocab_mask.assert_not_called()
+        other.fill_vocab_mask.assert_not_called()
 
 
 # filter_batch
@@ -421,6 +456,22 @@ class TestCopyForForward(CustomTestCase):
 # from_schedule_batch
 class TestFromScheduleBatch(CustomTestCase):
 
+    def setUp(self):
+        super().setUp()
+        # from_schedule_batch reads these two flags from the exec bag; give
+        # each test a mutable stand-in so it does not depend on a published
+        # (or leaked) process context.
+        self._exec_ns = SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=False),
+            features=SimpleNamespace(enable_custom_logit_processor=False),
+        )
+        exec_patch = patch(
+            "sglang.srt.sampling.sampling_batch_info.get_exec",
+            return_value=self._exec_ns,
+        )
+        exec_patch.start()
+        self.addCleanup(exec_patch.stop)
+
     def _make_req(
         self,
         temp=1.0,
@@ -452,11 +503,8 @@ class TestFromScheduleBatch(CustomTestCase):
         req.tokenizer.eos_token_id = eos_id
         return req
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
-    def test_basic_construction(self, mock_server_args):
+    def test_basic_construction(self):
         """Test that from_schedule_batch correctly extracts sampling params from requests."""
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = False
 
         reqs = [self._make_req(temp=0.8, top_p=0.9, top_k=50, min_p=0.1)]
         batch = MagicMock()
@@ -469,11 +517,8 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertAlmostEqual(info.top_ps[0].item(), 0.9, places=5)
         self.assertEqual(info.top_ks[0].item(), 50)
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
-    def test_greedy_detection(self, mock_server_args):
+    def test_greedy_detection(self):
         """Test that top_k=1 sets is_all_greedy=True."""
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = False
 
         reqs = [self._make_req(top_k=1)]
         batch = MagicMock()
@@ -482,11 +527,8 @@ class TestFromScheduleBatch(CustomTestCase):
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertTrue(info.is_all_greedy)
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
-    def test_logit_bias_construction(self, mock_server_args):
+    def test_logit_bias_construction(self):
         """Test that logit_bias dict is converted to a tensor with correct values."""
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = False
 
         reqs = [self._make_req(logit_bias={"5": 2.0, "10": -1.0})]
         batch = MagicMock()
@@ -498,11 +540,9 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertAlmostEqual(info.logit_bias[0, 10].item(), -1.0)
         self.assertAlmostEqual(info.logit_bias[0, 0].item(), 0.0)
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
-    def test_deterministic_seed(self, mock_server_args):
+    def test_deterministic_seed(self):
         """Test that explicit seed=123 is kept and missing seed defaults to 42."""
-        mock_server_args.return_value.enable_deterministic_inference = True
-        mock_server_args.return_value.enable_custom_logit_processor = False
+        self._exec_ns.deterministic.enable_deterministic_inference = True
 
         reqs = [self._make_req(seed=123), self._make_req(seed=None)]
         batch = MagicMock()
@@ -513,11 +553,8 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertEqual(info.sampling_seed[0].item(), 123)
         self.assertEqual(info.sampling_seed[1].item(), 42)  # default
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
-    def test_from_schedule_batch_sampling_flags(self, mock_server_args):
+    def test_from_schedule_batch_sampling_flags(self):
         """Test that sampling flags (need_top_p/top_k/min_p) are set correctly."""
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = False
 
         reqs = [self._make_req(top_p=0.9, top_k=50, min_p=0.1)]
         batch = MagicMock()
@@ -529,11 +566,8 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertTrue(info.need_min_p_sampling)  # 0.1 > 0
         self.assertFalse(info.is_all_greedy)  # top_k=50 > 1
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
-    def test_no_logit_bias_when_all_none(self, mock_server_args):
+    def test_no_logit_bias_when_all_none(self):
         """Test that logit_bias stays None when no request has logit_bias set."""
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = False
 
         reqs = [self._make_req(), self._make_req()]
         batch = MagicMock()
@@ -542,15 +576,13 @@ class TestFromScheduleBatch(CustomTestCase):
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertIsNone(info.logit_bias)
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
-    def test_custom_logit_processor_merging(self, mock_server_args):
+    def test_custom_logit_processor_merging(self):
         """Test deserialization and merging of custom logit processors."""
         from sglang.srt.sampling.custom_logit_processor import (
             DisallowedTokensLogitsProcessor,
         )
 
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = True
+        self._exec_ns.features.enable_custom_logit_processor = True
 
         proc_str = DisallowedTokensLogitsProcessor.to_str()
         req1 = self._make_req()

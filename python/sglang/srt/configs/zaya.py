@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, List, Optional
 
 from transformers.configuration_utils import PretrainedConfig
 
+from sglang.srt.runtime_context import get_parallel
+
 if TYPE_CHECKING:
     from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 
@@ -264,11 +266,8 @@ class ZayaConfig(PretrainedConfig):
         # equals the global TP group (DP attention is unsupported), so the two
         # are always identical in practice.
         try:
-            from sglang.srt.distributed import (
-                get_tensor_model_parallel_world_size,
-            )
 
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_parallel().tp_size
         except (AssertionError, RuntimeError):
             tp_size = 1
 

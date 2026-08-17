@@ -15,6 +15,7 @@ from sglang.srt.distributed.communication_op import (  # noqa
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+    QuickAllReduce,
     qr_rocm_arch_available,
 )
 from sglang.srt.distributed.parallel_state import (
@@ -256,6 +257,117 @@ def qr_variable_input(rank, world_size):
             print("Assertion failed! Allreduce results are incorrect.")
             raise
         num += 1
+
+
+def qr_graph_replay(rank, world_size, quant_mode="FP", num_replays=10):
+    """Capture ONE CUDA graph with a single quick-reduce and replay it many
+    times with changing input. Every rank contributes the same value v in a
+    round, so the true all-reduce sum is world_size * v; the FP regime is
+    lossless, so the comparison is bit-exact.
+
+    The pre-fix kernel bakes the per-block flag color into the graph launch and
+    reuses it on every replay -- the waiting peer is satisfied by the previous
+    round's residual flag and reads stale data, giving wrong results on some
+    replays. The fixed kernel advances the color on-device each replay.
+    """
+    os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] = quant_mode
+    os.environ["ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16"] = "0"
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+
+    # gloo (CPU) group: QuickAllReduce must attach to a non-NCCL group; it is
+    # used only for the one-time IPC-handle exchange.
+    dist.init_process_group(
+        backend="gloo",
+        init_method="tcp://127.0.0.1:29500",
+        rank=rank,
+        world_size=world_size,
+    )
+    qr = QuickAllReduce(group=dist.group.WORLD, device=device)
+    assert not qr.disabled, (
+        "quick-reduce unavailable on this arch/env "
+        "(needs ROCm MI300 gfx94/gfx95, even GPU count, same node, "
+        "and a non-NONE ROCM_QUICK_REDUCE_QUANTIZATION)."
+    )
+
+    N = 1 << 21  # 4 MB fp16, above the QR size threshold for the direct path
+    inp = torch.empty(N, dtype=torch.float16, device=device)
+    out = torch.empty(N, dtype=torch.float16, device=device)
+
+    # Warmup, then capture a graph with EXACTLY ONE quick-reduce.
+    inp.fill_(1.0)
+    qr.quick_all_reduce(inp, out=out)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        qr.quick_all_reduce(inp, out=out)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    try:
+        for v in range(1, num_replays + 1):
+            inp.fill_(float(v))  # in-place: same value on every rank
+            dist.barrier()
+            graph.replay()
+            torch.cuda.synchronize()
+            dist.barrier()
+            expected = float(v * world_size)
+            assert torch.all(out.float() == expected), (
+                f"[rank {rank}] round {v}: got {out.float().flatten()[0].item()}, "
+                f"expected {expected} (stale-flag corruption across replays)"
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+class TestQuickreduceGraphReplay(CustomTestCase):
+    """Regression test for the QuickReduce CUDA-graph stale-flag bug.
+
+    Unlike test_graph_allreduce (which captures a fresh graph each iteration
+    and replays it once), this captures a single graph and replays it many
+    times -- the exact scenario the on-device flag-color fix addresses.
+    """
+
+    TP_SIZES = [4, 8]
+
+    @unittest.skipIf(
+        not qr_rocm_arch_available(),
+        "Only test Quick AllReduce on ROCm architectures >= gfx94*",
+    )
+    def test_quick_allreduce_graph_replay(self):
+        for tp_size in self.TP_SIZES:
+            world_size = tp_size
+            if world_size > torch.cuda.device_count():
+                continue
+
+            multiprocessing.set_start_method("spawn", force=True)
+            timeout = 120
+            processes = []
+            for rank in range(tp_size):
+                p = multiprocessing.Process(
+                    target=qr_graph_replay, args=(rank, tp_size)
+                )
+                p.start()
+                processes.append((rank, p))
+            for rank, p in processes:
+                p.join(timeout=timeout)
+                if p.is_alive():
+                    for r, proc in processes:
+                        if proc.is_alive():
+                            proc.terminate()
+                            proc.join()
+                    raise RuntimeError(
+                        f"QuickReduce graph-replay hang detected after {timeout}s!"
+                    )
+            for rank, p in processes:
+                self.assertEqual(
+                    p.exitcode,
+                    0,
+                    f"QuickReduce graph-replay (tp={tp_size}, rank={rank}) "
+                    f"produced wrong results -- stale-flag bug not fixed.",
+                )
 
 
 class TestQuickreduceVariableInput(CustomTestCase):

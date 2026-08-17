@@ -30,6 +30,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_utils.pool import (
+    get_or_create_global_graph_memory_pool,
+)
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -55,6 +58,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
+        self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
@@ -66,7 +70,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
-            self._pool = self._device_module.graph_pool_handle()
+            self._pool = get_or_create_global_graph_memory_pool(self._device_module)
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         try:
@@ -78,15 +82,32 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self,
         shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
-        dummies: Optional[Any] = None,
+        capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
+        # When per-bs capture traces are enabled (--enable-profile-cuda-graph +
+        # SGLANG_GRAPH_BATCH_CAPTURE), the runner created a scheduled
+        # torch profiler (wait=2, active=1) and exposed it as _profiler. We step()
+        # past the two warmup runs so only the capture run is recorded, and each
+        # batch size produces its own trace via the profiler's on_trace_ready.
+        # With --enable-profile-cuda-graph alone the runner leaves _profiler None
+        # (its unscheduled profiler records the whole capture in one pass), so no
+        # stepping happens here.
+        runner = self._cuda_graph_runner
+        profiler = (
+            getattr(runner, "_profiler", None)
+            if getattr(runner, "enable_profile_cuda_graph", False)
+            else None
+        )
+
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
             forward_fn()
+            if profiler is not None:
+                profiler.step()
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
@@ -106,6 +127,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         with graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream):
             out = forward_fn()
+
+        if profiler is not None:
+            profiler.step()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out

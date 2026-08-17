@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
+from sglang.srt.runtime_context import get_parallel
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.server_args import ServerArgs
@@ -65,14 +67,20 @@ class CPAttentionBackendKind(IntEnum):
     """Attention backend calling convention used by CP strategy dispatch."""
 
     FLASH_ATTENTION = 0
+    DSA = 1
+    TRTLLM_MHA = 2
 
     @classmethod
     def from_string(cls, value: str) -> CPAttentionBackendKind:
-        if value in ("fa3", "flashinfer"):
+        if value in ("fa3", "fa4", "flashinfer"):
             return cls.FLASH_ATTENTION
+        if value in ("dsa"):
+            return cls.DSA
+        if value == "trtllm_mha":
+            return cls.TRTLLM_MHA
         raise ValueError(
             f"Unsupported attention_backend={value!r} for CP strategy; expected one "
-            "of {'fa3', 'flashinfer'}"
+            "of {'fa3', 'fa4', 'flashinfer', 'dsa', 'trtllm_mha'}"
         )
 
 
@@ -93,9 +101,8 @@ class ContextParallelStrategy(ABC):
 
     @property
     def cp_rank(self) -> int:
-        from sglang.srt.layers.dp_attention import get_attention_cp_rank
 
-        return get_attention_cp_rank()
+        return get_parallel().attn_cp_rank
 
     @property
     def per_layer_attn_cp_comm(self) -> bool:
@@ -149,6 +156,25 @@ class ContextParallelStrategy(ABC):
             f"{self.name} strategy does not support per-request sharding"
         )
 
+    def shard_local_tokens(self, input_: Any) -> Any:
+        raise NotImplementedError(
+            f"{self.name} strategy does not support local-token sharding"
+        )
+
+    def materialize_full_indexer_k_cache(
+        self, key: Any, forward_batch: ForwardBatch
+    ) -> Any:
+        raise NotImplementedError(
+            f"{self.name} strategy does not support DSA indexer key gather"
+        )
+
+    def all_gather_dsa_trtllm_fp8_kv(
+        self, forward_batch: ForwardBatch, k: Any, k_rope: Any
+    ) -> Any:
+        raise NotImplementedError(
+            f"{self.name} strategy does not support DSA trtllm FP8 KV gather"
+        )
+
     def split_before_forward(
         self,
         forward_batch: ForwardBatch,
@@ -181,11 +207,22 @@ class ContextParallelStrategy(ABC):
     def materialize_full_kv(
         self,
         forward_batch: ForwardBatch,
-        layer: Any,
-        k: Any,
-        v: Any,
-    ) -> None:
+        layer: Any = None,
+        k: Any = None,
+        v: Any = None,
+        swa_loc: Optional[Any] = None,
+    ) -> Any:
         """Write full-layout K/V to the backend cache if needed."""
+
+    @abstractmethod
+    def materialize_full_mla_kv(
+        self,
+        forward_batch: ForwardBatch,
+        layer: Any,
+        k_nope: Any,
+        k_rope: Any,
+    ) -> Any:
+        """Materialize full-layout MLA K/V for the strategy."""
 
     def reindex_attn_metadata(self, core_attn_metadata: Any) -> None:
         """Optional attention metadata rewrite for strategies that need it."""
@@ -193,13 +230,8 @@ class ContextParallelStrategy(ABC):
 
 
 def _is_dsa_active() -> bool:
-    from sglang.srt.server_args import get_global_server_args
-
-    sa = get_global_server_args()
-    return bool(
-        getattr(sa, "enable_prefill_cp", False)
-        and getattr(sa, "_is_dsa_model_arch", False)
-    )
+    # Placeholder: a real answer needs the model architecture, not config.
+    return False
 
 
 _STRATEGY: Optional[ContextParallelStrategy] = None
@@ -234,7 +266,7 @@ def init_cp_strategy(server_args: ServerArgs) -> None:
         )
 
 
-def _get_cp_strategy() -> Optional[ContextParallelStrategy]:
+def get_cp_strategy() -> Optional[ContextParallelStrategy]:
     """Return the configured strategy, initializing lazily on first call.
 
     Subprocesses re-import this module with ``_STRATEGY = None`` and never
@@ -245,31 +277,26 @@ def _get_cp_strategy() -> Optional[ContextParallelStrategy]:
     global _STRATEGY
 
     if _STRATEGY is None:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
         try:
-            server_args = get_global_server_args()
+            server_args = get_server_args()
         except ValueError:
             return None
-        if server_args is not None and getattr(server_args, "enable_prefill_cp", False):
+        if server_args is not None and get_parallel().enable_prefill_cp:
             init_cp_strategy(server_args)
     return _STRATEGY
 
 
-def get_cp_strategy() -> Optional[ContextParallelStrategy]:
-    """Return the configured CP strategy for runtime dispatch."""
-    return _get_cp_strategy()
-
-
 def get_cp_strategy_kind() -> ContextParallelStrategyKind:
-    strategy = _get_cp_strategy()
+    strategy = get_cp_strategy()
     if strategy is None:
         return ContextParallelStrategyKind.NONE
     return strategy.kind
 
 
 def is_cp_enabled() -> bool:
-    return _get_cp_strategy() is not None
+    return get_cp_strategy() is not None
 
 
 def is_zigzag() -> bool:

@@ -4,7 +4,7 @@ Launches TP=4 with flashinfer_mxfp4 MoE runner + EAGLE speculative decoding.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
-Registry: extra-b-test-deepep-4-gpu-b200 (label-gated, 4x B200)
+Registry: extra-b-test-4-gpu-b200 (label-gated, 4x B200)
 """
 
 import unittest
@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=900, stage="extra-b", runner_config="deepep-4-gpu-b200")
+register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -95,7 +95,7 @@ class TestDSV4FlashFP4B200W4A4MegaMoE(
     """Balanced recipe: TP=4, DP=4, MegaMoE."""
 
     gsm8k_accuracy_thres = 0.93
-    accept_length_thres = 2.6
+    accept_length_thres = 2.8
     bs_1_speed_thres = 100
 
     @classmethod

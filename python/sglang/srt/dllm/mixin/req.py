@@ -20,6 +20,8 @@ class DllmReqPhase(str, enum.Enum):
 class ReqDllmMixin:
     def init_diffusion_llm(self: Req, dllm_config: DllmConfig):
         self.dllm_phase: Optional[DllmReqPhase] = None
+        self.dllm_incomplete_ids = array("q")
+        self.dllm_algo_state = None
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
 
@@ -39,6 +41,10 @@ class ReqDllmMixin:
         ]
 
     def determine_dllm_phase(self: Req):
+        if self.dllm_incomplete_ids:
+            self.dllm_phase = DllmReqPhase.STAGING_DECODE
+            return
+
         prefix_length = len(self.prefix_indices)
         min_required_length = prefix_length + self.dllm_config.block_size
 
@@ -55,9 +61,20 @@ class ReqDllmMixin:
             self.dllm_phase = DllmReqPhase.STAGING_DECODE
 
     def _init_fill_ids_for_dllm(self: Req):
+        if self.dllm_incomplete_ids:
+            prefix_len = len(self.prefix_indices)
+            assert len(self.dllm_incomplete_ids) == self.dllm_config.block_size
+            self.full_untruncated_fill_ids = (
+                self.full_untruncated_fill_ids[:prefix_len] + self.dllm_incomplete_ids
+            )
+            # extend_range is (re)computed by the staging adder
+            # (add_dllm_staging_req) before this req is scheduled, mirroring the
+            # non-incomplete path which also defers it to the adder.
+            return
+
         self.dllm_block_offset = (
             0
-            if self.fill_len == 0
+            if not self.dllm_initialized
             else self.dllm_block_offset + self.dllm_config.block_size
         )
         self.full_untruncated_fill_ids = (
@@ -65,7 +82,7 @@ class ReqDllmMixin:
             + self.output_ids
             + array("q", [self.dllm_config.mask_id] * self.dllm_config.block_size)
         )
-        self.fill_len = len(self.full_untruncated_fill_ids)
+        self.dllm_initialized = True
 
     def _update_block_offset_for_dllm(self):
         prefix_len = len(self.prefix_indices)

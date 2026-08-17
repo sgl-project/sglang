@@ -7,19 +7,13 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.distributed import (
-    get_attn_tensor_model_parallel_rank,
-    get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
     get_moe_ep_group,
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-    get_moe_tensor_parallel_rank,
-    get_moe_tensor_parallel_world_size,
     get_moe_tp_group,
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
@@ -40,16 +34,10 @@ _flashinfer_allreduce_unavailable = False
 _flashinfer_create_workspace_supports_group = False
 _flashinfer_create_workspace_supports_comm_backend = False
 _flashinfer_allreduce_supports_trigger_completion = False
-_mnnvl_non_blackwell_fallback_logged = False
 
 
 def _mnnvl_supported(is_multi_node: bool) -> bool:
-    """Whether the mnnvl backend is usable on the current system.
-
-    mnnvl runs on Blackwell (SM10x) for both single- and multi-node, and on
-    SM90 for single-node only. Multi-node mnnvl on non-Blackwell is not
-    supported and must fall back to trtllm.
-    """
+    """Whether the mnnvl backend is usable on the current system."""
     if is_sm100_supported():
         return True
     return is_sm90_supported() and not is_multi_node
@@ -57,21 +45,33 @@ def _mnnvl_supported(is_multi_node: bool) -> bool:
 
 def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     """Resolve the requested FlashInfer allreduce fusion backend."""
-    global _mnnvl_non_blackwell_fallback_logged
+    if not (is_sm90_supported() or is_sm100_supported()):
+        raise ValueError(
+            "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
+        )
 
     if backend == "auto":
-        # Prefer mnnvl wherever it is supported (any Blackwell system, or SM90
-        # single-node); fall back to trtllm otherwise.
-        return "mnnvl" if _mnnvl_supported(is_multi_node) else "trtllm"
+        if is_multi_node:
+            if is_sm100_supported():
+                return "mnnvl"
+            raise ValueError(
+                "FlashInfer allreduce fusion does not support multi-node on "
+                "non-Blackwell systems."
+            )
+        if is_sm100_supported():
+            return "mnnvl"
+        return "trtllm"
+
+    if backend == "trtllm" and is_multi_node:
+        raise ValueError(
+            "FlashInfer allreduce fusion trtllm backend supports single-node only."
+        )
 
     if backend == "mnnvl" and not _mnnvl_supported(is_multi_node):
-        if not _mnnvl_non_blackwell_fallback_logged:
-            logger.info(
-                "FlashInfer allreduce fusion: forcing trtllm backend "
-                "(mnnvl requires a Blackwell system, or SM90 single-node)."
-            )
-            _mnnvl_non_blackwell_fallback_logged = True
-        return "trtllm"
+        raise ValueError(
+            "FlashInfer allreduce fusion mnnvl backend requires a Blackwell "
+            "system, or SM90 single-node."
+        )
     return backend
 
 
@@ -203,11 +203,11 @@ if is_flashinfer_available():
 #   trtllm    | Yes   | Yes   | Yes         | Yes         | No         |
 #   mnnvl     | Yes   | Yes   | Single-node | Yes         | Blackwell  |
 #
-# mnnvl runs on any Blackwell GPU (SM10x) for both single- and multi-node, and
-# on SM90 for single-node only. auto resolves to mnnvl wherever it is supported
-# and to trtllm otherwise. An explicit mnnvl request on an unsupported
-# configuration (e.g. SM90 multi-node) falls back to trtllm (see
-# _resolve_backend).
+# FlashInfer allreduce fusion requires SM90 or SM10X. auto resolves to mnnvl
+# on Blackwell (SM100/SM103) systems (single- and multi-node) and to trtllm on
+# SM90 single-node systems. SM90 multi-node and non-SM90/SM10X configurations
+# are rejected. Either mnnvl or trtllm can be requested explicitly on
+# single-node systems, and mnnvl additionally on Blackwell multi-node.
 
 
 def is_flashinfer_allreduce_unavailable() -> bool:
@@ -389,11 +389,31 @@ class FlashInferWorkspaceManager:
         self.max_token_num = None
         self.hidden_dim = None
         self.dtype = None
+        self.backend = None
+        self.use_fp32_lamport = None
         self.initialized = False
         # Track max sizes ever requested so the workspace only grows (fewer recreates)
         self._max_token_num_seen: Optional[int] = None
         self._max_hidden_dim_seen: Optional[int] = None
         self._logged_init = False
+        self._workspace_size_check_kwarg = None
+        self._workspace_size_check_strategy_type = None
+
+    def _configure_workspace_size_check(self):
+        """Cache the backend-specific size-check API for this workspace."""
+        size_check_params = inspect.signature(
+            self.workspace.is_buffer_size_sufficient
+        ).parameters
+        if "use_oneshot" in size_check_params:
+            self._workspace_size_check_kwarg = "use_oneshot"
+            self._workspace_size_check_strategy_type = None
+        elif "strategy" in size_check_params:
+            strategy_default = size_check_params["strategy"].default
+            self._workspace_size_check_kwarg = "strategy"
+            self._workspace_size_check_strategy_type = type(strategy_default)
+        else:
+            self._workspace_size_check_kwarg = None
+            self._workspace_size_check_strategy_type = None
 
     def initialize(
         self,
@@ -498,25 +518,31 @@ class FlashInferWorkspaceManager:
             if use_fp32_lamport:
                 create_kw["use_fp32_lamport"] = True
             self.workspace = _create_allreduce_fusion_workspace(**create_kw)
+            self._configure_workspace_size_check()
             self.world_size = world_size
             self.rank = rank
             self.group = (device_group, cpu_group)
             self.max_token_num = alloc_token_num
             self.hidden_dim = alloc_hidden_dim
             self.dtype = dtype or torch.bfloat16
+            self.backend = self.workspace.backend
+            self.use_fp32_lamport = (
+                self.workspace.metadata["use_fp32_lamport"]
+                if self.backend == "trtllm"
+                else None
+            )
             self.initialized = True
 
-            backend_name = getattr(self.workspace, "backend", "unknown")
             if not self._logged_init:
                 logger.info(
                     f"FlashInfer AllReduce Fusion enabled and workspace initialized: "
-                    f"backend={backend_name}, rank={rank}, world_size={world_size}, "
+                    f"backend={self.backend}, rank={rank}, world_size={world_size}, "
                     f"max_token_num={self.max_token_num}, hidden_dim={self.hidden_dim}"
                 )
                 self._logged_init = True
             else:
                 logger.debug(
-                    f"FlashInfer workspace re-initialized: backend={backend_name}, "
+                    f"FlashInfer workspace re-initialized: backend={self.backend}, "
                     f"rank={rank}, world_size={world_size}"
                 )
         except Exception as e:
@@ -526,6 +552,8 @@ class FlashInferWorkspaceManager:
                 "Disabling flashinfer allreduce fusion permanently."
             )
             self.workspace = None
+            self._workspace_size_check_kwarg = None
+            self._workspace_size_check_strategy_type = None
             self.initialized = False
             return
 
@@ -539,13 +567,25 @@ class FlashInferWorkspaceManager:
         if not self.initialized or self.workspace is None:
             return False
         try:
-            return self.workspace.is_buffer_size_sufficient(
+            check_kw = dict(
                 tp_size=self.world_size,
                 num_tokens=token_num,
                 hidden_dim=hidden_dim,
                 dtype=dtype,
-                use_oneshot=use_oneshot,
             )
+            if self._workspace_size_check_kwarg == "use_oneshot":
+                check_kw["use_oneshot"] = use_oneshot
+            elif (
+                self._workspace_size_check_kwarg == "strategy"
+                and use_oneshot is not None
+            ):
+                # FlashInfer's MNNVL workspace expresses the same choice with
+                # an enum-valued `strategy` argument rather than `use_oneshot`.
+                check_kw["strategy"] = getattr(
+                    self._workspace_size_check_strategy_type,
+                    "ONESHOT" if use_oneshot else "TWOSHOT",
+                )
+            return self.workspace.is_buffer_size_sufficient(**check_kw)
         except Exception as e:
             logger.debug(f"FlashInfer workspace size check failed: {e}")
             # Fallback: some backends may not implement is_buffer_size_sufficient;
@@ -569,6 +609,8 @@ class FlashInferWorkspaceManager:
                 logger.warning(f"Failed to cleanup FlashInfer workspace: {e}")
             finally:
                 self.workspace = None
+                self._workspace_size_check_kwarg = None
+                self._workspace_size_check_strategy_type = None
                 self.initialized = False
                 self.world_size = None
                 self.rank = None
@@ -576,17 +618,27 @@ class FlashInferWorkspaceManager:
                 self.max_token_num = None
                 self.hidden_dim = None
                 self.dtype = None
+                self.backend = None
+                self.use_fp32_lamport = None
                 self._logged_init = False
 
 
-_attn_tp_workspace_manager = FlashInferWorkspaceManager()
-_moe_tp_workspace_manager = FlashInferWorkspaceManager()
-
-
 def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManager:
-    return (
-        _attn_tp_workspace_manager if use_attn_tp_group else _moe_tp_workspace_manager
+    """The per-group fusion workspace manager; the instances live on
+    ``ctx.resources`` (one per comm group, created lazily)."""
+    from sglang.srt.runtime_context import get_resources
+
+    buffers = get_resources().buffers
+    name = (
+        "flashinfer_fusion_attn_tp_workspace"
+        if use_attn_tp_group
+        else "flashinfer_fusion_moe_tp_workspace"
     )
+    manager = buffers.get(name)
+    if manager is None:
+        manager = FlashInferWorkspaceManager()
+        buffers[name] = manager
+    return manager
 
 
 def _sync_allreduce_unavailable_across_tp():
@@ -637,17 +689,17 @@ def ensure_workspace_initialized(
         return False
 
     if use_attn_tp_group:
-        world_size = get_attn_tensor_model_parallel_world_size()
-        rank = get_attn_tensor_model_parallel_rank()
+        world_size = get_parallel().attn_tp_size
+        rank = get_parallel().attn_tp_rank
         coordinator = get_attn_tp_group()
     else:
-        if get_moe_expert_parallel_world_size() > 1:
-            world_size = get_moe_expert_parallel_world_size()
-            rank = get_moe_expert_parallel_rank()
+        if get_parallel().moe_ep_size > 1:
+            world_size = get_parallel().moe_ep_size
+            rank = get_parallel().moe_ep_rank
             coordinator = get_moe_ep_group()
         else:
-            world_size = get_moe_tensor_parallel_world_size()
-            rank = get_moe_tensor_parallel_rank()
+            world_size = get_parallel().moe_tp_size
+            rank = get_parallel().moe_tp_rank
             coordinator = get_moe_tp_group()
 
     # Always pass the coordinator's groups: flashinfer >=0.6.10 reads the
@@ -664,7 +716,7 @@ def ensure_workspace_initialized(
     token_num = token_num or max_token_num
     group_key = (device_group, cpu_group)
     effective_dtype = dtype or torch.bfloat16
-    server_args = get_global_server_args()
+    server_args = get_server_args()
     backend = resolve_flashinfer_allreduce_fusion_backend(server_args)
     if backend is None:
         return False
@@ -757,12 +809,12 @@ def flashinfer_allreduce_residual_rmsnorm(
         return None, None
 
     if use_attn_tp_group:
-        world_size = get_attn_tensor_model_parallel_world_size()
+        world_size = get_parallel().attn_tp_size
     else:
-        if get_moe_expert_parallel_world_size() > 1:
-            world_size = get_moe_expert_parallel_world_size()
+        if get_parallel().moe_ep_size > 1:
+            world_size = get_parallel().moe_ep_size
         else:
-            world_size = get_moe_tensor_parallel_world_size()
+            world_size = get_parallel().moe_tp_size
 
     if world_size <= 1:
         logger.debug("Single GPU, no need for allreduce fusion")
@@ -817,6 +869,117 @@ def flashinfer_allreduce_residual_rmsnorm(
     return norm_out, residual_out
 
 
+def can_use_flashinfer_allreduce(
+    input_: torch.Tensor,
+    *,
+    use_attn_tp_group: bool,
+    expected_world_size: int,
+    expected_group_key: Tuple[Optional[ProcessGroup], Optional[ProcessGroup]],
+) -> bool:
+    """Whether ``flashinfer_allreduce`` can service this all-reduce.
+
+    Split out from the kernel call so the decision happens in plain Python,
+    outside the custom op: the op is opaque to Dynamo and has to return a
+    tensor, so it cannot carry a data-dependent fallback of its own.
+
+    ``expected_world_size`` / ``expected_group_key`` describe the calling group;
+    the workspace is only usable when it was rendezvoused on exactly those peers.
+
+    Every check here is rank-invariant by construction, and must stay that way:
+    a rank that quietly falls back to NCCL while its peers enter the kernel
+    mismatches and hangs. The unavailable flag and workspace initialization are
+    cross-rank synced at init time (``_sync_allreduce_unavailable_across_tp``);
+    the rest are pure functions of the group identity and of tensor metadata,
+    which is identical on every rank of the group.
+    """
+    if _flashinfer_allreduce_unavailable or _flashinfer_comm is None:
+        return False
+
+    if input_.ndim != 2 or not input_.is_contiguous():
+        return False
+
+    workspace_manager = _get_workspace_manager(use_attn_tp_group)
+    if not workspace_manager.initialized or workspace_manager.workspace is None:
+        return False
+
+    # The two workspaces are keyed by attention-TP vs MoE, but the MoE one
+    # rendezvouses on either the EP or the MoE-TP group depending on topology.
+    # Under hybrid EP+TP those groups have equal world size but pair different
+    # ranks, so a mismatch here reduces across the wrong peers and silently
+    # produces garbage rather than failing. Require an exact match.
+    if (
+        workspace_manager.world_size != expected_world_size
+        or workspace_manager.group != expected_group_key
+    ):
+        return False
+
+    # Size checks stay last: they read the token dim, which is symbolic under
+    # Dynamo, so statically-off configs must short-circuit before reaching them
+    # (same ordering rule as apply_flashinfer_allreduce_fusion).
+    token_num, hidden_dim = input_.shape
+    if torch.compiler.is_compiling():
+        # Don't call into the flashinfer workspace object while tracing. The
+        # workspace was allocated for (max_token_num, hidden_dim, dtype) and
+        # vetted by is_buffer_size_sufficient() at init; the requirement is
+        # monotone in token_num/hidden_dim, so staying within the allocation
+        # (including dtype) is a conservative stand-in here.
+        return (
+            workspace_manager.max_token_num is not None
+            and workspace_manager.hidden_dim is not None
+            and workspace_manager.dtype is not None
+            and token_num <= workspace_manager.max_token_num
+            and hidden_dim <= workspace_manager.hidden_dim
+            and workspace_manager.dtype == input_.dtype
+        )
+
+    # TRT-LLM logs a warning when its validator rejects an expected fallback.
+    # Mirror only the conditions that prove its workspace is insufficient:
+    # total element capacity and FP32-Lamport compatibility. MNNVL has a
+    # byte/strategy-based contract and does not emit that warning, so its
+    # authoritative validator remains the source of truth below.
+    if workspace_manager.backend == "trtllm" and (
+        token_num * hidden_dim
+        > workspace_manager.max_token_num * workspace_manager.hidden_dim
+        or workspace_manager.use_fp32_lamport != (input_.dtype == torch.float32)
+    ):
+        return False
+
+    return workspace_manager.is_buffer_size_sufficient(
+        token_num=token_num,
+        hidden_dim=hidden_dim,
+        dtype=input_.dtype,
+    )
+
+
+def flashinfer_allreduce(
+    input_: torch.Tensor,
+    *,
+    use_attn_tp_group: bool,
+) -> torch.Tensor:
+    """Allreduce-only FlashInfer kAllReduce.
+
+    Assumes ``can_use_flashinfer_allreduce`` returned True for this call; there
+    is no fallback here. Kernel errors are deliberately not caught -- swallowing
+    one would put this rank on NCCL while its peers stay in the kernel, which
+    mismatch-hangs instead of failing.
+    """
+    workspace_manager = _get_workspace_manager(use_attn_tp_group)
+
+    output = torch.empty_like(input_)
+    kwargs = dict(
+        input=input_,
+        workspace=workspace_manager.workspace,
+        pattern=_flashinfer_comm.AllReduceFusionPattern.kAllReduce,
+        launch_with_pdl=True,
+        fp32_acc=False,
+        output=output,
+    )
+    if _flashinfer_allreduce_supports_trigger_completion:
+        kwargs["trigger_completion_at_end"] = False
+    _flashinfer_comm.allreduce_fusion(**kwargs)
+    return output
+
+
 def pre_initialize_workspaces(
     max_token_num: int,
     hidden_dim: int,
@@ -852,11 +1015,13 @@ def pre_initialize_workspaces(
 
 
 def cleanup_flashinfer_workspace():
-    global _attn_tp_workspace_manager, _moe_tp_workspace_manager
-    if _attn_tp_workspace_manager is not None:
-        _attn_tp_workspace_manager.cleanup()
-    if (
-        _moe_tp_workspace_manager is not None
-        and _moe_tp_workspace_manager is not _attn_tp_workspace_manager
+    from sglang.srt.runtime_context import get_resources
+
+    buffers = get_resources().buffers
+    for name in (
+        "flashinfer_fusion_attn_tp_workspace",
+        "flashinfer_fusion_moe_tp_workspace",
     ):
-        _moe_tp_workspace_manager.cleanup()
+        manager = buffers.get(name)
+        if manager is not None:
+            manager.cleanup()

@@ -212,6 +212,13 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
             pack_int_lists(state_dims, "I"),
             struct.pack("Q", staging_ptr),
             b"1048576",
+            b"64",
+            b"DRAM,DRAM",
+            b"".join(struct.pack("Q", item_len) for item_len in [1024, 2048]),
+            pack_int_lists([[4], [4, 5]], "I"),
+            b"".join(struct.pack("I", layer_id) for layer_id in [2, 7]),
+            b"4",
+            b"3",
         ]
 
         info = KVArgsRegisterInfo.from_zmq(msg)
@@ -228,11 +235,17 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.decode_tp_size, 4)
         self.assertEqual(info.decode_tp_rank, 1)
         self.assertEqual(info.dst_kv_item_len, 1024)
+        self.assertEqual(info.dst_kv_item_lens, [1024, 2048])
+        self.assertEqual(info.dst_num_slots, 64)
+        self.assertEqual(info.dst_kv_mem_kinds, ["DRAM", "DRAM"])
         self.assertEqual(info.dst_state_item_lens, state_item_lens)
         self.assertEqual(info.dst_state_dim_per_tensor, state_dims)
-        self.assertIsNotNone(info.staging)
-        self.assertEqual(info.staging.base_ptr, staging_ptr)
-        self.assertEqual(info.staging.total_size, 1048576)
+        self.assertEqual(info.dst_dcp_size, 4)
+        self.assertEqual(info.dst_dcp_rank, 3)
+        self.assertEqual(info.dst_state_layer_ids, [[4], [4, 5]])
+        self.assertEqual(info.dst_kv_layer_ids, [2, 7])
+        self.assertEqual(info.staging_base_ptr, staging_ptr)
+        self.assertEqual(info.staging_total_size, 1048576)
 
     def test_from_zmq_allows_missing_state_and_staging_fields(self):
         msg = [
@@ -255,7 +268,11 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_state_data_ptrs, [])
         self.assertEqual(info.dst_state_item_lens, [])
         self.assertEqual(info.dst_state_dim_per_tensor, [])
-        self.assertIsNone(info.staging)
+        self.assertEqual(info.dst_kv_item_lens, [256])
+        self.assertEqual(info.dst_dcp_size, 1)
+        self.assertEqual(info.dst_dcp_rank, 0)
+        self.assertEqual(info.staging_base_ptr, 0)
+        self.assertEqual(info.staging_total_size, 0)
 
 
 class TestNixlTransferStatus(CustomTestCase):
@@ -323,6 +340,198 @@ class TestNixlKVSenderChunkPolicy(CustomTestCase):
         self.assertTrue(sender.should_send_kv_chunk(3, last_chunk=False))
 
 
+class TestNixlAbortHandling(CustomTestCase):
+    def _make_manager(self, request_status=None):
+        mgr = object.__new__(NixlKVManager)
+        mgr.request_status = dict(request_status or {})
+        mgr._connect = MagicMock()
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+        return mgr
+
+    def test_given_known_incomplete_room_when_abort_arrives_then_room_fails_without_ack(
+        self,
+    ):
+        mgr = self._make_manager({11: KVPoll.WaitingForInput})
+
+        handled = mgr._handle_abort_notification(
+            [b"ABORT", b"11", b"127.0.0.1", b"5555"]
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(mgr.request_status[11], KVPoll.Failed)
+        self.assertEqual(
+            mgr.failure_records[11],
+            "Aborted by decode-side abort notification.",
+        )
+        mgr._connect.assert_not_called()
+
+    def test_given_successful_room_when_abort_arrives_then_status_is_preserved(self):
+        mgr = self._make_manager({12: KVPoll.Success})
+
+        handled = mgr._handle_abort_notification(
+            [b"ABORT", b"12", b"127.0.0.1", b"5556"]
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(mgr.request_status[12], KVPoll.Success)
+        self.assertEqual(mgr.failure_records, {})
+        mgr._connect.assert_not_called()
+
+    def test_given_unknown_room_when_abort_arrives_then_status_remains_absent(self):
+        mgr = self._make_manager()
+
+        handled = mgr._handle_abort_notification(
+            [b"ABORT", b"14", b"127.0.0.1", b"5557"]
+        )
+
+        self.assertTrue(handled)
+        self.assertNotIn(14, mgr.request_status)
+        self.assertEqual(mgr.failure_records, {})
+        mgr._connect.assert_not_called()
+
+    def test_given_malformed_abort_when_handled_then_no_exception_or_ack(self):
+        mgr = self._make_manager({13: KVPoll.WaitingForInput})
+
+        handled = mgr._handle_abort_notification(
+            [b"ABORT", b"invalid-room", b"127.0.0.1", b"5558"]
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(mgr.request_status[13], KVPoll.WaitingForInput)
+        self.assertEqual(mgr.failure_records, {})
+        mgr._connect.assert_not_called()
+
+
+class TestNixlUpdateStatus(CustomTestCase):
+    def _make_manager(self, request_status):
+        mgr = object.__new__(NixlKVManager)
+        mgr.request_status = dict(request_status)
+        return mgr
+
+    def test_given_failed_room_when_status_is_promoted_then_failed_is_preserved(self):
+        for status in (KVPoll.Transferring, KVPoll.Success):
+            with self.subTest(status=status):
+                mgr = self._make_manager({17: KVPoll.Failed})
+
+                mgr.update_status(17, status)
+
+                self.assertEqual(mgr.request_status[17], KVPoll.Failed)
+
+    def test_given_missing_room_when_failed_update_arrives_then_room_is_not_resurrected(
+        self,
+    ):
+        mgr = self._make_manager({})
+
+        mgr.update_status(18, KVPoll.Failed)
+
+        self.assertNotIn(18, mgr.request_status)
+
+
+class TestNixlTransferWorker(CustomTestCase):
+    def _make_manager(self, room):
+        mgr = object.__new__(NixlKVManager)
+        mgr.request_status = {room: KVPoll.WaitingForInput}
+        mgr.transfer_infos = {
+            room: {
+                "agent": TransferInfo(
+                    room=room,
+                    endpoint="127.0.0.1",
+                    dst_port=5555,
+                    agent_name="agent",
+                    dst_kv_indices=np.array([2], dtype=np.int32),
+                    dst_aux_index=0,
+                    required_dst_info_num=1,
+                    dst_state_indices=[],
+                )
+            }
+        }
+        mgr.decode_kv_args_table = {
+            "agent": SimpleNamespace(
+                decode_tp_size=1,
+                dst_kv_ptrs=[0],
+                dst_aux_ptrs=[0],
+                gpu_id=0,
+                staging_base_ptr=0,
+                staging_total_size=0,
+                kv_xfer_segments=None,
+                dst_homogeneous_mem_kind="VRAM",
+                # Non-DCP peer. Without this the worker raises AttributeError
+                # and lands in the same Failed status the assertions expect,
+                # so the transfer path would go unexercised.
+                requires_dcp_relayout=False,
+                dcp_dst_region_indices=None,
+                dcp_token_item_lens=None,
+            )
+        }
+        mgr.req_to_decode_prefix_len = {room: 4}
+        mgr.enable_staging = False
+        mgr._staging_ctx = None
+        mgr._staging_outstanding = defaultdict(int)
+        mgr.is_mla_backend = False
+        mgr.is_hybrid_mla_backend = False
+        mgr.attn_tp_size = 1
+        mgr.transfer_source_rank = 0
+        mgr.kv_args = SimpleNamespace(engine_rank=0, kv_data_ptrs=[0])
+        mgr.exceptions = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+
+        def check_xfer_state(_handle):
+            mgr.update_status(room, KVPoll.Failed)
+            return "DONE"
+
+        mgr.agent = SimpleNamespace(check_xfer_state=check_xfer_state)
+        return mgr
+
+    def _make_chunk(self, room, prefill_kv_indices, is_last_chunk):
+        return TransferKVChunk(
+            room=room,
+            prefill_kv_indices=np.array(prefill_kv_indices, dtype=np.int32),
+            index_slice=slice(0, len(prefill_kv_indices)),
+            is_last_chunk=is_last_chunk,
+            chunk_id=0,
+            prefill_aux_index=0 if is_last_chunk else None,
+            state_indices=None,
+        )
+
+    def _run_worker_once(self, mgr, chunk):
+        queue = SimpleNamespace(get=MagicMock(side_effect=[chunk, SystemExit()]))
+        with self.assertRaises(SystemExit):
+            mgr.transfer_worker(queue)
+
+    def test_given_last_chunk_aborts_mid_transfer_when_worker_finishes_then_failed_status_is_preserved(
+        self,
+    ):
+        room = 21
+        mgr = self._make_manager(room)
+        mgr.send_aux = MagicMock(return_value="aux_handle")
+        chunk = self._make_chunk(room, [], is_last_chunk=True)
+
+        self._run_worker_once(mgr, chunk)
+
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+        self.assertNotIn(room, mgr.transfer_infos)
+        self.assertNotIn(room, mgr.req_to_decode_prefix_len)
+        mgr.send_aux.assert_called_once()
+        self.assertEqual(mgr.send_aux.call_args.args[-1], "21_aux_nokv_0_0")
+
+    def test_given_non_last_chunk_aborts_mid_transfer_when_worker_finishes_then_failed_status_is_preserved(
+        self,
+    ):
+        room = 22
+        mgr = self._make_manager(room)
+        mgr.send_kvcache = MagicMock(return_value="kv_handle")
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+
+        self._run_worker_once(mgr, chunk)
+
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+        self.assertIn(room, mgr.transfer_infos)
+        self.assertIn(room, mgr.req_to_decode_prefix_len)
+        mgr.send_kvcache.assert_called_once()
+
+
 class TestNixlNotifications(CustomTestCase):
     def _make_manager(self, messages, required=None):
         mgr = object.__new__(NixlKVManager)
@@ -386,6 +595,7 @@ class TestNixlReceiverPoll(CustomTestCase):
         mgr = MagicMock()
         mgr.waiting_timeout = 5
         mgr.check_status.return_value = status
+        mgr.check_transfer_done.return_value = False
         mgr.transfer_statuses = {}
         mgr.addr_to_rooms_tracker = defaultdict(set)
         mgr.addr_to_rooms_tracker["prefill:8998"].add(11)
@@ -431,6 +641,24 @@ class TestNixlReceiverPoll(CustomTestCase):
         mgr.record_failure.assert_called_once()
         self.assertIn("timed out", mgr.record_failure.call_args[0][1])
         mgr.update_status.assert_called_once_with(11, KVPoll.Failed)
+
+    @patch("sglang.srt.disaggregation.nixl.conn.time.time")
+    def test_queued_completion_wins_over_waiting_timeout(self, mock_time):
+        # Past the deadline, but the completion is already queued/observed:
+        # draining before the timeout check must yield Success, not a false
+        # timeout, and must not send an abort.
+        mock_time.return_value = 20.0
+        receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
+        receiver.started_transfer = True
+        receiver.init_time = 10.0
+        mgr.transfer_statuses = {11: TransferStatus()}
+        mgr.check_transfer_done.return_value = True
+
+        self.assertEqual(receiver.poll(), KVPoll.Success)
+        mgr.update_transfer_status.assert_called_once_with()
+        mgr.record_failure.assert_not_called()
+        mgr.update_status.assert_not_called()
+        self.assertNotIn(11, mgr.transfer_statuses)
 
     @patch("sglang.srt.disaggregation.nixl.conn.time.time")
     def test_transfer_done_returns_success_and_cleans_room_state(self, mock_time):
@@ -513,6 +741,7 @@ class TestNixlStaging(CustomTestCase):
         mgr.agent = agent or StagingFakeAgent()
         mgr.attn_tp_size = 2
         mgr.is_mla_backend = False
+        mgr.transfer_source_rank = 1
         mgr.kv_args = SimpleNamespace(
             gpu_id=1,
             engine_rank=1,
@@ -522,6 +751,33 @@ class TestNixlStaging(CustomTestCase):
         )
         mgr.server_args = SimpleNamespace(chunked_prefill_size=4)
         return mgr
+
+    def test_register_buffer_to_engine_groups_kv_memory_kinds_in_one_pass(self):
+        agent = StagingFakeAgent(register_result=["desc"])
+        mgr = self._make_manager(agent)
+        mgr.kv_args.kv_data_ptrs = [0x1000, 0x2000, 0x3000]
+        mgr.kv_args.kv_data_lens = [64, 128, 256]
+        mgr.kv_args.kv_data_mem_kinds = ["VRAM", "DRAM", "VRAM"]
+        mgr.kv_args.aux_data_ptrs = [0x4000]
+        mgr.kv_args.aux_data_lens = [32]
+        mgr.kv_args.state_data_ptrs = []
+        mgr.kv_args.state_data_lens = []
+
+        mgr.register_buffer_to_engine()
+
+        self.assertEqual(
+            agent.register_memory_calls,
+            [
+                (
+                    [(0x1000, 64, 1, ""), (0x3000, 256, 1, "")],
+                    "VRAM",
+                ),
+                ([(0x2000, 128, 0, "")], "DRAM"),
+                ([(0x4000, 32, 0, "")], "DRAM"),
+            ],
+        )
+        self.assertEqual(mgr.kv_descs, [["desc"], ["desc"]])
+        self.assertEqual(mgr.aux_descs, ["desc"])
 
     def test_register_staging_memory_uses_vram_and_fails_on_empty_descs(self):
         agent = StagingFakeAgent(register_result=["staging"])
@@ -578,6 +834,7 @@ class TestNixlStaging(CustomTestCase):
 
     def test_do_staging_transfer_requeues_when_allocation_not_ready(self):
         mgr = self._make_manager()
+        mgr._staging_ctx = PrefillStagingContext()
         strategy = MagicMock()
         strategy.check_ready.return_value = (False, 0, -1, 0, -1)
         kv_chunk = TransferKVChunk(
@@ -601,7 +858,12 @@ class TestNixlStaging(CustomTestCase):
             },
         ):
             handle, deferred = mgr._do_staging_transfer(
-                strategy, kv_chunk, req, SimpleNamespace(), queue
+                strategy,
+                kv_chunk,
+                kv_chunk.prefill_kv_indices,
+                req,
+                SimpleNamespace(),
+                queue,
             )
 
         self.assertIsNone(handle)
@@ -640,6 +902,7 @@ class TestNixlStaging(CustomTestCase):
                 mgr._do_staging_transfer(
                     strategy,
                     kv_chunk,
+                    kv_chunk.prefill_kv_indices,
                     SimpleNamespace(room=3, agent_name="decode_agent"),
                     SimpleNamespace(),
                     FakeQueue(),
@@ -666,13 +929,16 @@ class TestNixlStaging(CustomTestCase):
             agent_name="decode_agent",
             agent_metadata=b"",
             dst_kv_ptrs=[],
+            dst_kv_mem_kinds=[],
             dst_aux_ptrs=[],
             dst_state_data_ptrs=[],
             gpu_id=5,
             decode_tp_size=1,
             decode_tp_rank=0,
             dst_kv_item_len=128,
-            staging=SimpleNamespace(base_ptr=0x8000, total_size=4096),
+            dst_kv_item_lens=[],
+            staging_base_ptr=0x8000,
+            staging_total_size=4096,
         )
         calls = []
         mgr.send_kvcache_staged = (
@@ -682,6 +948,7 @@ class TestNixlStaging(CustomTestCase):
         handle, deferred = mgr._do_staging_transfer(
             strategy,
             kv_chunk,
+            kv_chunk.prefill_kv_indices,
             SimpleNamespace(room=3, agent_name="decode_agent"),
             dst_info,
             FakeQueue(),
@@ -770,6 +1037,116 @@ class TestNixlStaging(CustomTestCase):
             )
 
         self.assertIsNone(handle)
+
+
+class DlistCaptureAgent:
+    """Records prep_xfer_dlist descriptor arrays so tests can inspect them."""
+
+    def __init__(self):
+        self.calls = []  # (peer_name, np.ndarray, mem_kind)
+
+    def prep_xfer_dlist(self, peer_name, array, mem_kind):
+        self.calls.append((peer_name, np.asarray(array), mem_kind))
+        return f"handle_{len(self.calls)}"
+
+
+class TestNixlHeteroTpReplicatedKV(CustomTestCase):
+    """Regression guard for #31295.
+
+    Prefill attention-TP1 -> decode TP4 on a model with only 2 KV heads forces
+    GQA replication: decode ranks 0,1 share KV head 0 and ranks 2,3 share KV
+    head 1. The shared source dlist must interleave one group per *unique*
+    source head-slice (2), and each peer's head_group_idx must map replicated
+    decode ranks via integer division (0,0,1,1). The pre-fix code used
+    ``num_groups = decode_tp // prefill_tp`` (=4) -- addressing 2x past the
+    registered source region, which NIXL rejects with NIXL_ERR_NOT_FOUND -- and
+    a modulo head map (0,1,0,1).
+    """
+
+    TOTAL_KV_HEADS = 2
+    DECODE_TP = 4
+    PAGE_SIZE = 1
+    BYTES_PER_HEAD = 128  # per token, per head slice
+    SRC_KV_ITEM_LEN = TOTAL_KV_HEADS * BYTES_PER_HEAD  # both heads on one prefill rank
+    DST_KV_ITEM_LEN = BYTES_PER_HEAD  # one replicated head per decode rank
+    NUM_SLOTS = 4
+    SRC_PTRS = [0x10000, 0x20000]  # K, V for the single local layer
+    REGION_LEN = NUM_SLOTS * SRC_KV_ITEM_LEN
+
+    def _make_manager(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = DlistCaptureAgent()
+        mgr.attn_tp_size = 1  # prefill attention TP = 1 (DP attention)
+        mgr.prep_handle_slice_src = None
+        mgr.prep_handles_slice_dst = {}
+        mgr.kv_args = SimpleNamespace(
+            gpu_id=0,
+            engine_rank=0,
+            page_size=self.PAGE_SIZE,
+            prefill_start_layer=0,
+            total_kv_head_num=self.TOTAL_KV_HEADS,
+            kv_head_num=self.TOTAL_KV_HEADS,
+            kv_item_lens=[self.SRC_KV_ITEM_LEN, self.SRC_KV_ITEM_LEN],
+            kv_data_ptrs=list(self.SRC_PTRS),
+            kv_data_lens=[self.REGION_LEN, self.REGION_LEN],
+        )
+        return mgr
+
+    def _decode_args(self, decode_tp_rank):
+        return SimpleNamespace(
+            agent_name=f"decode_{decode_tp_rank}",
+            decode_tp_size=self.DECODE_TP,
+            decode_tp_rank=decode_tp_rank,
+            dst_kv_item_len=self.DST_KV_ITEM_LEN,
+            dst_kv_ptrs=[0x30000, 0x40000],
+            dst_num_slots=self.NUM_SLOTS,
+            gpu_id=0,
+        )
+
+    def test_src_dlist_stays_within_registered_region_and_num_groups(self):
+        # Src dlist is built once (shared across peers) on the first call.
+        mgr = self._make_manager()
+        mgr._init_hetero_tp_prep_handle(
+            peer_name="decode_0", decode_kv_args=self._decode_args(0)
+        )
+
+        # num_groups must be 2 (one per unique KV head), not decode_tp//prefill_tp=4.
+        src_handle, num_groups, _num_ptr_pairs, _num_slots = mgr.prep_handle_slice_src
+        self.assertEqual(num_groups, 2)
+
+        # Every source descriptor [addr, addr+len) must lie inside a registered
+        # base region [ptr, ptr+REGION_LEN). Pre-fix, num_groups=4 pushed the
+        # top group's addresses past the region -> NIXL_ERR_NOT_FOUND.
+        src_call = next(c for c in mgr.agent.calls if c[0] == "")
+        src_array = src_call[1]
+        regions = [(p, p + self.REGION_LEN) for p in self.SRC_PTRS]
+        for addr, length, _dev in src_array:
+            addr = int(addr)
+            length = int(length)
+            self.assertTrue(
+                any(lo <= addr and addr + length <= hi for lo, hi in regions),
+                f"descriptor [{addr:#x}, {addr + length:#x}) escapes all "
+                f"registered source regions {[(hex(lo), hex(hi)) for lo, hi in regions]}",
+            )
+
+    def test_head_group_idx_maps_replicated_ranks_by_integer_division(self):
+        # Each decode rank's per-peer dst handle records its head_group_idx.
+        # Expected replicated-KV mapping: ranks 0,1 -> group 0; ranks 2,3 -> group 1.
+        expected = {0: 0, 1: 0, 2: 1, 3: 1}
+        for rank in range(self.DECODE_TP):
+            mgr = self._make_manager()
+            mgr._init_hetero_tp_prep_handle(
+                peer_name=f"decode_{rank}", decode_kv_args=self._decode_args(rank)
+            )
+            _dst_handle, _num_slots_dst, head_group_idx = mgr.prep_handles_slice_dst[
+                f"decode_{rank}"
+            ]
+            self.assertEqual(
+                head_group_idx,
+                expected[rank],
+                f"decode rank {rank} mapped to group {head_group_idx}, "
+                f"expected {expected[rank]} (modulo bug gives 0,1,0,1)",
+            )
 
 
 if __name__ == "__main__":

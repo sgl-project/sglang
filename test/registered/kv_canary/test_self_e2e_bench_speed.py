@@ -7,16 +7,19 @@ import unittest
 from pathlib import Path
 from typing import ClassVar, Optional
 
-from sglang.srt.entrypoints.http_server import launch_server
-from sglang.srt.server_args import ServerArgs
-from sglang.test.bench_one_batch_server_internal import (
+from sglang.bench_one_batch_server import (
     BenchArgs,
     BenchOneCaseResult,
     run_benchmark_internal,
 )
+from sglang.srt.entrypoints.http_server import launch_server
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
 
+# CUDA-only: this self-bench asserts a 1.0% kv_canary overhead budget tuned on
+# the CUDA (H100) runner. On ROCm the measured overhead is ~1.26%, so the
+# benchmark is not portable as-is; keep it off AMD CI rather than register-and-skip.
 register_cuda_ci(est_time=600, stage="extra-a", runner_config="1-gpu-large")
 
 
