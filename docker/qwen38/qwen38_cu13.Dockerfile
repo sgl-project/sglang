@@ -15,9 +15,11 @@
 #      /opt/nccl-2.30.7/lib so the srt-slurm configs can LD_PRELOAD it without
 #      a host library mount
 #   3. FlashInfer, replacing the base's release: the pinned nightly trio
-#      (python + cubin + jit-cache), which ships the Blackwell MNNVL CuTe DSL
-#      all-reduce backend (PR #4358) and the standalone BF16 direct GEMM kernel
-#      (PR #4266).
+#      (python + cubin + jit-cache), which ships the standalone BF16 direct
+#      GEMM kernel (PR #4266) and the communication infrastructure the
+#      in-tree MNNVL CuTe DSL all-reduce kernel builds on (the kernel itself
+#      lives at python/sglang/kernels/ops/communication/mnnvl_cutedsl*, a
+#      port of flashinfer#4358 pending a FlashInfer release that ships it).
 #      nvidia-cutlass-dsl is floored at 4.7.0 because the CuTe DSL kernels call
 #      PipelineTmaAsync.create(enable_multicast_signaling=..)
 #   4. this repo's SGLang code, copied from the build context and editable-installed
@@ -86,11 +88,14 @@ RUN NCCL_EXPECTED="${NCCL_PIN_VERSION}" python3 -c 'import os; from importlib.me
 # Named apart from the base's ENV FLASHINFER_VERSION, which would otherwise
 # shadow a same-named ARG and silently resolve to the base's 0.6.15.post1.
 #
-# 0.6.18.dev20260811 is the first nightly whose flashinfer-python ships
-# flashinfer.comm.mnnvl_cutedsl (PR #4358, the Blackwell MNNVL CuTe DSL
-# all-reduce backend this image's GB300 target needs), so all three packages
-# now come from the same nightly and no git-commit install is needed.
-ARG FLASHINFER_NIGHTLY_VERSION=0.6.18.dev20260811
+# The MNNVL CuTe DSL all-reduce backend (flashinfer#4358) is NOT expected
+# from this nightly: SGLang carries the kernel in-tree at
+# python/sglang/kernels/ops/communication/mnnvl_cutedsl* until a FlashInfer
+# release ships it. The nightly only supplies the communication
+# infrastructure (mnnvl probing, pattern enum, workspace ABC) plus the
+# PR #4266 GEMM kernel, so all three packages come from the same nightly
+# and no git-commit install is needed.
+ARG FLASHINFER_NIGHTLY_VERSION=0.6.18.dev20260807
 ARG FLASHINFER_JIT_CACHE_CUDA_TAG=cu130
 ARG CUTLASS_DSL_MIN_VERSION=4.7.0
 
@@ -137,19 +142,16 @@ LABEL ai.radixark.flashinfer.prebuilt_nightly="${FLASHINFER_NIGHTLY_VERSION}"
 #
 # `import flashinfer` here is load-bearing beyond resolving the path: it runs
 # flashinfer/jit/env.py, so a python/cubin/jit-cache version mismatch would
-# surface here. The two file checks then confirm the nightly actually ships the
-# kernels this image depends on -- checked as files rather than imports because
-# these modules pull in CuTe DSL, which cannot load on a CPU build host.
+# surface here. The file check then confirms the nightly actually ships the
+# GEMM kernel this image depends on -- checked as a file rather than an import
+# because the module pulls in CuTe DSL, which cannot load on a CPU build host.
+# The MNNVL CuTe DSL all-reduce kernel needs no such check: it is part of the
+# SGLang tree copied in below.
 RUN FI_ROOT="$(python3 -c 'import pathlib, flashinfer; print(pathlib.Path(flashinfer.__file__).resolve().parent.parent)')" && \
     ln -sfn "${FI_ROOT}" /opt/flashinfer-src && \
     if [ ! -f /opt/flashinfer-src/flashinfer/gemm/kernels/dense_bf16_gemm_direct.py ]; then \
         echo "ERROR: flashinfer ${FLASHINFER_NIGHTLY_VERSION} does not ship flashinfer/gemm/kernels/dense_bf16_gemm_direct.py (PR #4266)." >&2; \
         echo "       Pin a FlashInfer that carries it, or serve with SGLANG_ENABLE_BF16_SPLITK_GEMM=0." >&2; \
-        exit 1; \
-    fi && \
-    if [ ! -f /opt/flashinfer-src/flashinfer/comm/mnnvl_cutedsl/__init__.py ]; then \
-        echo "ERROR: flashinfer ${FLASHINFER_NIGHTLY_VERSION} does not ship flashinfer/comm/mnnvl_cutedsl (PR #4358)." >&2; \
-        echo "       Pin a nightly at or after 0.6.18.dev20260811." >&2; \
         exit 1; \
     fi
 

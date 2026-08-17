@@ -17,22 +17,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _import_flashinfer_backend():
+def _import_kernel_backend():
     try:
-        from flashinfer.comm import AllReduceFusionPattern, allreduce_fusion
-        from flashinfer.comm.mnnvl_cutedsl import DEFAULT_CONFIG
-        from flashinfer.comm.mnnvl_cutedsl_ar import (
+        from flashinfer.comm import AllReduceFusionPattern
+
+        from sglang.kernels.ops.communication.mnnvl_cutedsl import DEFAULT_CONFIG
+        from sglang.kernels.ops.communication.mnnvl_cutedsl_ar import (
             MNNVLCuteDSLAllReduceFusionWorkspace,
+            _mnnvl_cutedsl_allreduce_fusion,
         )
     except ImportError as error:
         raise RuntimeError(
-            "MNNVL CuTe DSL fusion requires a FlashInfer build that ships "
-            "flashinfer.comm.mnnvl_cutedsl and its dependencies, including "
-            "nvidia-cutlass-dsl and cuda-python"
+            "MNNVL CuTe DSL fusion requires FlashInfer's communication "
+            "infrastructure (flashinfer >= 0.6.15) and the CuTe DSL kernel "
+            "dependencies, including nvidia-cutlass-dsl and cuda-python"
         ) from error
     return (
         MNNVLCuteDSLAllReduceFusionWorkspace,
-        allreduce_fusion,
+        _mnnvl_cutedsl_allreduce_fusion,
         AllReduceFusionPattern,
         DEFAULT_CONFIG,
     )
@@ -135,7 +137,7 @@ class FlashInferMNNVLCuteDSLARFusion:
                 self._allreduce_fusion,
                 self._patterns,
                 default_config,
-            ) = _import_flashinfer_backend()
+            ) = _import_kernel_backend()
             # Qwen's shared-expert handoff is complete before this fused finalize
             # launch. Opt only finalize kernels into FlashInfer's faster early
             # shared load; standalone AllReduce kernels retain the safe ordering.
