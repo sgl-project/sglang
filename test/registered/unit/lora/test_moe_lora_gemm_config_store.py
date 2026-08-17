@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from sglang.srt.environ import envs
+from sglang.srt.lora.moe.base_gemm_provider import gemm_config_store
 from sglang.srt.lora.moe.base_gemm_provider.gemm_config_store import (
     GemmConfigTable,
     config_file_name,
@@ -76,6 +77,23 @@ def test_valid_table_loads_via_env_override(tmp_path: Path) -> None:
         (128, 152),
     )
     assert table.version["generated_on"] == "GB300-152SM"
+
+
+def test_an_override_dir_without_the_file_inherits_the_packaged_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The documented override flow points the env var at a tuner output dir
+    # that carries plans and tiles only. Plan and tile lookup fall back per
+    # file, so base-GEMM lookup has to as well or that dir silently disables
+    # every packaged base-GEMM table.
+    package, override = tmp_path / "pkg", tmp_path / "override"
+    override.mkdir()
+    package.mkdir()
+    _write(package, _VALID)
+    monkeypatch.setattr(gemm_config_store, "_PACKAGE_CONFIG_DIR", str(package))
+    table = _load(override)
+    assert table is not None
+    assert table.buckets[96] == {"token_width": 128}
 
 
 def test_nearest_m_pick() -> None:

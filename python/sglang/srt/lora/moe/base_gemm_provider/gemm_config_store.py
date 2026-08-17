@@ -38,6 +38,10 @@ from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
+_PACKAGE_CONFIG_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "configs"
+)
+
 
 class GemmTile(msgspec.Struct, frozen=True, kw_only=True):
     """One compiled-tile declaration for the CuTeDSL provider."""
@@ -133,30 +137,31 @@ def load_config_table(
     """Load the bucket table for one provider+geometry, or ``None``.
 
     ``None`` always means "use the built-in heuristics unchanged".  Tables
-    live under ``base_gemm/`` inside the config root: the directory named by
-    ``SGLANG_LORA_MOE_CONFIG_DIR`` when set, else the package-local
-    ``lora/moe/configs/`` directory.
+    live under ``base_gemm/`` in the directory named by
+    ``SGLANG_LORA_MOE_CONFIG_DIR``, else the package-local
+    ``lora/moe/configs/``.  The search is per file, matching how the plan and
+    tile tables resolve: an override dir that carries only some files
+    inherits the rest from the package instead of losing them.
     """
     if device_name is None:
         from sglang.srt.utils import get_device_name
 
         device_name = get_device_name()
-    root = envs.SGLANG_LORA_MOE_CONFIG_DIR.get() or os.path.join(
-        os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "configs"
+    name = config_file_name(
+        provider_key,
+        num_local_experts=num_local_experts,
+        n_gemm1=n_gemm1,
+        n_gemm2=n_gemm2,
+        k=k,
+        device_name=device_name,
     )
-    directory = os.path.join(root, "base_gemm")
-    path = os.path.join(
-        directory,
-        config_file_name(
-            provider_key,
-            num_local_experts=num_local_experts,
-            n_gemm1=n_gemm1,
-            n_gemm2=n_gemm2,
-            k=k,
-            device_name=device_name,
-        ),
-    )
-    return _load(path, tuple(sorted((expected_versions or {}).items())))
+    versions = tuple(sorted((expected_versions or {}).items()))
+    roots = (envs.SGLANG_LORA_MOE_CONFIG_DIR.get(), _PACKAGE_CONFIG_DIR)
+    for root in filter(None, roots):
+        path = os.path.join(root, "base_gemm", name)
+        if os.path.isfile(path):
+            return _load(path, versions)
+    return None
 
 
 def cutedsl_version() -> str | None:
