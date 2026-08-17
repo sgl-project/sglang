@@ -35,7 +35,7 @@ import torch.nn.functional as F
 if TYPE_CHECKING:
     from triton_kernels.tensor_details.ragged_tensor import RaggedTensorMetadata
 
-from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
+from sglang.srt.runtime_context import get_exec, get_lora, get_parallel, get_schedule
 
 try:
     from triton_kernels.tensor import make_ragged_tensor_metadata
@@ -170,10 +170,8 @@ def _get_aiter_topk_fuse_shared_max_tokens() -> int:
     (server args are fixed after startup)."""
     global _aiter_topk_fuse_shared_max_tokens_cache
     if _aiter_topk_fuse_shared_max_tokens_cache is None:
-        from sglang.srt.runtime_context import get_server_args
-
         try:
-            sa = get_server_args()
+            schedule = get_schedule()
         except ValueError:
             # Global server args not published yet (e.g. a unit test or offline
             # init that reaches the aiter grouped-topk path before startup).
@@ -182,8 +180,8 @@ def _get_aiter_topk_fuse_shared_max_tokens() -> int:
             # safety cap WITHOUT caching, so a later call (once args are set)
             # still computes and caches the real value.
             return _AITER_TOPK_FUSE_SHARED_MAX_TOKENS_CAP
-        cps = getattr(sa, "chunked_prefill_size", None) or 0
-        mpt = getattr(sa, "max_prefill_tokens", None) or 0
+        cps = schedule.chunked_prefill_size or 0
+        mpt = schedule.max_prefill_tokens or 0
         m = max(int(cps), int(mpt), 8192)  # 8192 floor for tiny configs
         if int(cps) <= 0 and int(mpt) <= 0:
             # chunked prefill disabled -> use the safety cap
