@@ -47,6 +47,7 @@ def _make_req(
     req.logprob_start_len = -1
     req.positional_embed_overrides = None
     req.extra_key = None
+    req.cache_salt = None
     req.mamba_pool_idx = None
     req.sampling_params = SimpleNamespace(max_new_tokens=128, ignore_eos=False)
     return req
@@ -97,7 +98,10 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.dp_attn_adapter.maybe_prepare_mlp_sync_batch = MagicMock(
         side_effect=lambda batch, **_: batch
     )
-    s._maybe_prepare_ngram_embedding = MagicMock(side_effect=lambda batch: batch)
+    s.ngram_embedding_manager = MagicMock()
+    s.ngram_embedding_manager.prepare_for_forward = MagicMock(
+        side_effect=lambda batch, **_: batch
+    )
     s.update_running_batch = MagicMock(side_effect=lambda batch: batch)
     s.tree_cache = tree_cache
     s.chunked_req = chunked_req

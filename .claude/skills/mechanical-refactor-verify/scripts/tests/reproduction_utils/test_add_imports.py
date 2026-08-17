@@ -34,6 +34,49 @@ def test_add_import_appends_after_last_top_level_import(tmp_path: Path) -> None:
     ).read_text() == "import os\nimport sys\nfrom pkg import Thing\n\nx = 1\n"
 
 
+# --- add_imported_name ---------------------------------------------------------
+
+
+def test_add_imported_name_extends_a_single_line_import(tmp_path: Path) -> None:
+    """A new name is appended to an existing from-import on the same statement."""
+    (tmp_path / "m.py").write_text("from pkg import a\n\nx = 1\n")
+    r = Repro("b", "t").add_imported_name("m.py", module="pkg", name="b")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "from pkg import a, b\n\nx = 1\n"
+
+
+def test_add_imported_name_carries_an_asname(tmp_path: Path) -> None:
+    """The added name keeps its `as` alias."""
+    (tmp_path / "m.py").write_text("from pkg import a\n")
+    r = Repro("b", "t").add_imported_name("m.py", module="pkg", name="b", asname="c")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "from pkg import a, b as c\n"
+
+
+def test_add_imported_name_refuses_a_commented_import(tmp_path: Path) -> None:
+    """An import carrying comments is refused, since a rebuild would drop them."""
+    (tmp_path / "m.py").write_text("from pkg import (\n    a,  # keep\n)\n")
+    r = Repro("b", "t").add_imported_name("m.py", module="pkg", name="b")
+    with pytest.raises(AssertionError):
+        _apply(r, tmp_path)
+
+
+def test_add_imported_name_rejects_a_name_already_present(tmp_path: Path) -> None:
+    """Adding a name the import already has fails loudly."""
+    (tmp_path / "m.py").write_text("from pkg import a, b\n")
+    r = Repro("b", "t").add_imported_name("m.py", module="pkg", name="b")
+    with pytest.raises(AssertionError):
+        _apply(r, tmp_path)
+
+
+def test_add_imported_name_raises_without_a_matching_import(tmp_path: Path) -> None:
+    """A file lacking a `from module import` for the module fails loudly."""
+    (tmp_path / "m.py").write_text("from other import a\n")
+    r = Repro("b", "t").add_imported_name("m.py", module="pkg", name="b")
+    with pytest.raises(AssertionError):
+        _apply(r, tmp_path)
+
+
 # --- repath_import / add_typechecking_import -----------------------------------
 
 
@@ -56,6 +99,33 @@ def test_add_typechecking_import_inserts_in_block(tmp_path: Path) -> None:
         "\n"
         "if TYPE_CHECKING:\n"
         "    from a import X\n"
+        "    from b import Y\n"
+        "\n"
+        "\n"
+        "def f():\n"
+        "    pass\n"
+    )
+
+
+def test_add_typechecking_import_creates_missing_block(tmp_path: Path) -> None:
+    """With no TYPE_CHECKING block, one is created after the trailing module import."""
+    (tmp_path / "m.py").write_text(
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "from a import X\n"
+        "\n"
+        "\n"
+        "def f():\n"
+        "    pass\n"
+    )
+    r = Repro("b", "t").add_typechecking_import("m.py", "from b import Y")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == (
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "from a import X\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
         "    from b import Y\n"
         "\n"
         "\n"
@@ -134,9 +204,81 @@ def test_add_typechecking_import_after_a_multiline_final_import(tmp_path: Path) 
     )
 
 
-def test_add_typechecking_import_raises_without_a_block(tmp_path: Path) -> None:
-    """A file lacking a TYPE_CHECKING block fails loudly."""
-    (tmp_path / "m.py").write_text("import os\n\nx = 1\n")
+def test_add_typechecking_import_raises_without_imports(tmp_path: Path) -> None:
+    """A file with no imports cannot anchor a new TYPE_CHECKING block and fails loudly."""
+    (tmp_path / "m.py").write_text("x = 1\n")
     r = Repro("b", "t").add_typechecking_import("m.py", "from b import Y")
+    with pytest.raises(AssertionError):
+        _apply(r, tmp_path)
+
+
+def test_add_typechecking_import_drops_a_lone_pass_placeholder(tmp_path: Path) -> None:
+    """Populating a `pass`-only TYPE_CHECKING block replaces the placeholder."""
+    (tmp_path / "m.py").write_text(
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    pass\n"
+        "\n"
+        "x = 1\n"
+    )
+    r = Repro("b", "t").add_typechecking_import("m.py", "from b import Y")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == (
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from b import Y\n"
+        "\n"
+        "x = 1\n"
+    )
+
+
+def test_add_typechecking_import_keeps_a_pass_that_is_not_alone(tmp_path: Path) -> None:
+    """A `pass` beside a real import is left untouched; only the new import is appended."""
+    (tmp_path / "m.py").write_text(
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from a import X\n"
+        "    pass\n"
+        "\n"
+        "x = 1\n"
+    )
+    r = Repro("b", "t").add_typechecking_import("m.py", "from b import Y")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == (
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from a import X\n"
+        "    pass\n"
+        "    from b import Y\n"
+        "\n"
+        "x = 1\n"
+    )
+
+
+# --- add_import(after=...) -----------------------------------------------------
+
+
+def test_add_import_after_anchors_into_a_split_import_block(tmp_path: Path) -> None:
+    """With `after`, the import lands right after the named import -- needed when a
+    statement splits the imports into separate blocks and the default (after the last
+    import) would land in the wrong block."""
+    (tmp_path / "m.py").write_text(
+        "import os\n\n_flag = os.getpid()\n\nfrom pkg import a\n\nx = 1\n"
+    )
+    r = Repro("b", "t").add_import("m.py", "from new import Thing", after="import os")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == (
+        "import os\nfrom new import Thing\n\n_flag = os.getpid()\n\nfrom pkg import a\n\nx = 1\n"
+    )
+
+
+def test_add_import_after_raises_when_anchor_absent(tmp_path: Path) -> None:
+    """An `after` substring that matches no top-level import raises."""
+    (tmp_path / "m.py").write_text("import os\n\nx = 1\n")
+    r = Repro("b", "t").add_import("m.py", "from new import Thing", after="import nope")
     with pytest.raises(AssertionError):
         _apply(r, tmp_path)

@@ -32,9 +32,16 @@ from sglang.srt.configs import (
     ExaoneConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
+    InklingAudioConfig,
+    InklingMMConfig,
+    InklingModelConfig,
+    InklingVisionConfig,
+    InternS2MobiusConfig,
+    InternS2MobiusTextConfig,
     InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
+    KimiK3Config,
     KimiK25Config,
     KimiLinearConfig,
     KimiVLConfig,
@@ -45,6 +52,8 @@ from sglang.srt.configs import (
     MiniCPMV4_6VisionConfig,
     MiniMaxM3VLConfig,
     MultiModalityConfig,
+    MuseGlimmerAssistantConfig,
+    MuseGlimmerConfig,
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
@@ -52,6 +61,8 @@ from sglang.srt.configs import (
     Olmo3Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
+    Qwen3_5TextConfig,
     Qwen3NextConfig,
     Step3p5Config,
     Step3p7Config,
@@ -92,6 +103,9 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Step3VLConfig,
         LongcatFlashConfig,
         Olmo3Config,
+        MuseGlimmerConfig,
+        MuseGlimmerAssistantConfig,
+        KimiK3Config,
         KimiLinearConfig,
         Qwen3NextConfig,
         FalconH1Config,
@@ -105,7 +119,11 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         DeepseekVLV2Config,
         Qwen3_5Config,
         Qwen3_5MoeConfig,
+        Qwen3_5TextConfig,
+        Qwen3_5MoeTextConfig,
         InternS2PreviewConfig,
+        InternS2MobiusConfig,
+        InternS2MobiusTextConfig,
         JetNemotronConfig,
         JetVLMConfig,
         KimiK25Config,
@@ -113,6 +131,10 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Step3p7Config,
         MiniCPMV4_6Config,
         MiniCPMV4_6VisionConfig,
+        InklingModelConfig,
+        InklingAudioConfig,
+        InklingVisionConfig,
+        InklingMMConfig,
         MiniMaxM3VLConfig,
     ]
 }
@@ -141,6 +163,36 @@ try:
     _CONFIG_REGISTRY["kimi_k2"] = _KimiK2ConfigAlias
 except ImportError:
     pass
+
+# Newer transformers versions (>=5.10.2) expose MellumConfig directly,
+# but fallback to Qwen3MoeConfig for older versions.
+try:
+    import transformers as _hf_transformers
+
+    _HFMellumConfig = getattr(_hf_transformers, "MellumConfig", None)
+
+    if _HFMellumConfig is not None:
+        _CONFIG_REGISTRY["mellum"] = _HFMellumConfig
+    else:
+        from transformers import Qwen3MoeConfig as _HFQwen3MoeConfig
+
+        class _MellumConfigAlias(_HFQwen3MoeConfig):
+            model_type = "mellum"
+
+            def __post_init__(self, **kwargs):
+                # Qwen3MoeConfig.__post_init__ wipes sliding_window unless
+                # use_sliding_window=True. Mellum gates sliding attention
+                # per-layer via layer_types, so preserve sliding_window
+                # regardless of the legacy use_sliding_window flag.
+                sliding_window = getattr(self, "sliding_window", None)
+                super().__post_init__(**kwargs)
+                self.sliding_window = sliding_window
+
+        _CONFIG_REGISTRY["mellum"] = _MellumConfigAlias
+
+except ImportError:
+    pass
+
 
 try:
     from transformers import Gemma4Config as _HFGemma4Config
@@ -234,6 +286,64 @@ def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
     with open(model, "rb") as f:
         header = f.read(4)
     return header == b"GGUF"
+
+
+def resolve_hf_gguf_reference(
+    model: str, revision: Optional[str] = None
+) -> Optional[str]:
+    """Download a .gguf named by Hub reference and return its local path.
+
+    owner/repo/path/inside/repo.gguf   -> exactly that file
+    owner/repo                         -> the only .gguf in the repo
+    """
+    from sglang.srt.utils import is_remote_url
+
+    if not model or os.path.exists(model) or is_remote_url(model):
+        return None
+
+    parts = model.strip("/").split("/")
+    if len(parts) < 2:
+        return None
+
+    from huggingface_hub import hf_hub_download
+
+    if len(parts) > 2 and model.endswith(".gguf"):
+        repo_id = "/".join(parts[:2])
+        filename = "/".join(parts[2:])
+        return hf_hub_download(repo_id, filename, revision=revision)
+
+    if len(parts) != 2:
+        return None
+
+    from huggingface_hub import HfApi
+
+    try:
+        files = [
+            s.rfilename for s in HfApi().repo_info(model, revision=revision).siblings
+        ]
+    except Exception:
+        return None
+    if any(f == "config.json" for f in files):
+        return None
+
+    candidates = [f for f in files if f.endswith(".gguf")]
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        listing = "\n  ".join(f"{model}/{f}" for f in sorted(candidates))
+        raise ValueError(
+            f"{model} contains {len(candidates)} .gguf files; name the one to "
+            f"serve:\n  {listing}"
+        )
+    return hf_hub_download(model, candidates[0], revision=revision)
+
+
+def gguf_sidecar_dir(
+    gguf_path: Union[str, os.PathLike], sentinel: str
+) -> Optional[Path]:
+    """Directory containing *sentinel* next to a .gguf file, if there is one."""
+    directory = Path(gguf_path).parent
+    return directory if (directory / sentinel).is_file() else None
 
 
 # ---------------------------------------------------------------------------
@@ -443,16 +553,30 @@ def get_generation_config(
     revision: Optional[str] = None,
     **kwargs,
 ):
+    if check_gguf_file(model):
+        sidecar = gguf_sidecar_dir(model, "generation_config.json")
+        if sidecar is not None:
+            model = str(sidecar)
+        else:
+            from .gguf_native import (
+                build_gguf_generation_config,
+                has_native_gguf_support,
+            )
+
+            if has_native_gguf_support(model):
+                return build_gguf_generation_config(model)
+
     try:
         return GenerationConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-    except FileNotFoundError:
-        return None
-    except OSError as e:
-        logger.warning(
-            "Failed to load generation config for %s: %s. "
-            "Proceeding without generation config.",
+    except (FileNotFoundError, OSError) as e:
+        # A missing generation_config.json is normal for many checkpoints and
+        # is surfaced by HF as a generic OSError (not FileNotFoundError). Treat
+        # it as benign — proceed without a generation config, at DEBUG level so
+        # normal startup logs stay quiet.
+        logger.debug(
+            "No generation config for %s: %s. Proceeding without it.",
             model,
             e,
         )
@@ -491,9 +615,13 @@ def get_tokenizer_from_processor(processor):
     return processor.tokenizer
 
 
+# Turn-final markers that some checkpoints ship without EOS metadata:
+# <|eom_id|> (Llama-3 tool use) and <|content_model_end_sampling|> (Inkling,
+# whose bundled tokenizer config leaves eos_token unset).
+_ADDITIONAL_STOP_TOKEN_TEXTS = ("<|eom_id|>", "<|content_model_end_sampling|>")
+
+
 def attach_additional_stop_token_ids(tokenizer):
     added = tokenizer.get_added_vocab()
-    if "<|eom_id|>" in added:
-        tokenizer.additional_stop_token_ids = {added["<|eom_id|>"]}
-    else:
-        tokenizer.additional_stop_token_ids = None
+    stop_ids = {added[text] for text in _ADDITIONAL_STOP_TOKEN_TEXTS if text in added}
+    tokenizer.additional_stop_token_ids = stop_ids or None

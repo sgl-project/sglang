@@ -18,8 +18,8 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm
-    from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+    from sglang.kernels.ops.quantization.gptq_marlin import gptq_marlin_gemm
+    from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 
 ScalarType, scalar_types = get_scalar_types()
 
@@ -186,10 +186,12 @@ def prepare_fp8_layer_for_marlin(
     marlin_scales = fp8_fused_exponent_bias_into_scales(marlin_scales)
     layer.weight_scale = torch.nn.Parameter(marlin_scales, requires_grad=False)
 
+    # The dense FP8 Marlin wrapper adds bias after the kernel returns, so the
+    # bias must remain in logical output-channel order. Only scales need the
+    # Marlin tile permutation.
     if hasattr(layer, "bias") and layer.bias is not None:
         assert layer.bias.shape == (part_size_n,)
-        bias = marlin_permute_bias(layer.bias)
-        layer.bias = torch.nn.Parameter(bias, requires_grad=False)
+        layer.bias = torch.nn.Parameter(layer.bias.detach(), requires_grad=False)
 
 
 def prepare_moe_fp8_layer_for_marlin(

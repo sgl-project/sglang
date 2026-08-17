@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import List, Optional
 
 import torch
 
-from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 
@@ -19,7 +18,6 @@ class NgramVerifyInput(SpecInput):
         retrieve_next_token: torch.Tensor = None,
         retrieve_next_sibling: torch.Tensor = None,
         draft_token_num: int = None,
-        grammar: BaseGrammarObject = None,
         future_indices: Optional[torch.Tensor] = None,
         new_seq_lens: Optional[torch.Tensor] = None,
         accept_tokens: Optional[torch.Tensor] = None,
@@ -33,11 +31,8 @@ class NgramVerifyInput(SpecInput):
         self.retrieve_next_token = retrieve_next_token
         self.retrieve_next_sibling = retrieve_next_sibling
         self.draft_token_num = draft_token_num
-        # DP attention recovers bs = num_tokens // num_tokens_per_req from spec_info
-        # (mirrors EAGLE's verify input); ngram contributes draft_token_num per req.
         self.num_tokens_per_req = draft_token_num
         self.num_tokens_for_logprob_per_req = draft_token_num
-        self.grammar = grammar
 
         # The triton/decode attention backends read spec_info.kv_indptr/kv_indices on
         # the decode-or-idle path (triton_backend.init_forward_metadata): a None
@@ -91,9 +86,6 @@ class NgramVerifyInput(SpecInput):
     def tree_topk(self) -> int:
         # Irregular tree: per-level branching follows the corpus matches.
         return -1
-
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.draft_token_num, self.draft_token_num
 
     def generate_attn_arg_prefill(
         self,
@@ -152,7 +144,11 @@ class NgramVerifyInput(SpecInput):
 
         return kv_indices, cum_kv_seq_len, self.qo_indptr, custom_mask
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        new_indices_cpu: Optional[List[int]] = None,
+    ):
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
         if self.new_seq_lens is not None:

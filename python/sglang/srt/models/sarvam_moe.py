@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.distributed import (
     get_pp_group,
     tensor_model_parallel_all_reduce,
@@ -19,7 +20,6 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -61,7 +61,11 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha imp
     DeepseekMHAForwardMixin,
 )
 from sglang.srt.runtime_context import (
+    attention_backends,
+    get_exec,
     get_forward,
+    get_memory,
+    get_model,
     get_parallel,
     get_server_args,
     get_stream,
@@ -81,10 +85,11 @@ _is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()
 
 if _is_cuda:
     try:
-        from sgl_kernel import bmm_fp8, merge_state_v2
+        from sgl_kernel import merge_state_v2
 
-        from sglang.jit_kernel.concat_mla import concat_mla_k
-        from sglang.srt.layers.quantization.fp8_kernel import per_tensor_quant_mla_fp8
+        from sglang.kernels.ops.attention.concat_mla import concat_mla_k
+        from sglang.kernels.ops.gemm import bmm_fp8
+        from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 
         _has_fp8_support = True
         _has_concat_mla_k = True
@@ -272,7 +277,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
         )
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -449,7 +454,7 @@ class SarvamMoEMLAAttention(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.kv_cache_dtype = get_server_args().kv_cache_dtype
+        self.kv_cache_dtype = get_model().kv_cache_dtype
 
         self._server_args = None
         self.current_attention_backend = None
@@ -606,18 +611,12 @@ class SarvamMoEMLAAttention(nn.Module):
         return k
 
     def _set_current_attention_backend(self, forward_batch: ForwardBatch) -> None:
-        if self._server_args is None:
-            self._server_args = get_server_args()
-        if forward_batch.forward_mode.is_decode_or_idle():
-            self.current_attention_backend = (
-                self._server_args.decode_attention_backend
-                or self._server_args.attention_backend
-            )
-        else:
-            self.current_attention_backend = (
-                self._server_args.prefill_attention_backend
-                or self._server_args.attention_backend
-            )
+        prefill_backend, decode_backend = attention_backends()
+        self.current_attention_backend = (
+            decode_backend
+            if forward_batch.forward_mode.is_decode_or_idle()
+            else prefill_backend
+        )
 
     def _maybe_fp8_bmm(
         self,
@@ -681,7 +680,7 @@ class SarvamMoEMLAAttention(nn.Module):
         )
 
         self._set_current_attention_backend(forward_batch)
-        can_use_prefix_cache = not self._server_args.disable_radix_cache
+        can_use_prefix_cache = not get_memory().disable_radix_cache
         do_prefix_merge = has_extend_prefix and can_use_prefix_cache
 
         if do_prefix_merge and forward_batch.num_prefix_chunks is None:
@@ -1228,7 +1227,7 @@ class SarvamMLAForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 

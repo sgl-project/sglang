@@ -5,6 +5,7 @@ should use that classmethod API; do not import from this module directly.
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
 import torch
@@ -91,7 +92,16 @@ class CustomSpecAlgo:
     def supports_target_verify_for_draft(self) -> bool:
         return False
 
+    def is_last_shared_read_phase(self, forward_mode) -> bool:
+        # The step's last shared-buffer-reading phase owns the shared-read-done publish.
+        return forward_mode.is_draft_extend_v2()
+
     def supports_ragged_verify(self) -> bool:
+        return False
+
+    def supports_grammar_overlap(self) -> bool:
+        # Whether the worker advances the grammar FSM inside verify() (via the
+        # scheduler's grammar barrier), letting spec + grammar decode overlap.
         return False
 
     def has_draft_kv(self) -> bool:
@@ -119,7 +129,7 @@ class CustomSpecAlgo:
             )
         return self.factory(server_args)
 
-    def get_num_tokens_per_bs_for_target_verify(
+    def get_num_tokens_per_req_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
     ) -> int:
         # FIXME: Remove this after the forward mode refactor. Target verify is
@@ -128,6 +138,20 @@ class CustomSpecAlgo:
         # other cases which is not target verify but fixed length prefill.
         # Here, we expose this interface to allow the other use cases.
         return num_draft_tokens
+
+    def get_num_tokens_per_bs_for_target_verify(
+        self, num_draft_tokens: int, is_draft_worker: bool
+    ) -> int:
+        # Deprecated alias; remove together with the FIXME above.
+        warnings.warn(
+            "get_num_tokens_per_bs_for_target_verify is deprecated; use "
+            "get_num_tokens_per_req_for_target_verify instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_num_tokens_per_req_for_target_verify(
+            num_draft_tokens, is_draft_worker
+        )
 
     def build_disagg_draft_input(
         self,

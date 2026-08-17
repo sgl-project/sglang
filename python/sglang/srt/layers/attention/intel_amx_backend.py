@@ -8,6 +8,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -38,7 +39,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         self.swa_out_cache_loc = None
 
         self.num_head = (
-            model_runner.model_config.num_attention_heads // model_runner.tp_size
+            model_runner.model_config.num_attention_heads // model_runner.ps.tp_size
         )
 
         # [NB]: `layer_id` set to 0 for qwen3-next models, as not all attn layers require kv pool
@@ -58,8 +59,10 @@ class IntelAMXAttnBackend(AttentionBackend):
         # sized [bs, num_head, num_kv_splits, v_head_dim + 1] to match.
         self.num_kv_splits = 8
 
+        self._attn_logits_buffers: dict[tuple[int, int], torch.Tensor] = {}
+
         # speculative decoding params
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
 
     def _build_extend_metadata(self, forward_batch: ForwardBatch):
         """Resolve (seq_lens, extend_seq_lens, extend_start_loc, tree_mask) for
@@ -212,6 +215,12 @@ class IntelAMXAttnBackend(AttentionBackend):
         seq_lens, extend_seq_lens, extend_start_loc, tree_mask = self.extend_metadata
 
         _, max_extend_len = self.forward_metadata
+        seq_lens = forward_batch.seq_lens
+        if seq_lens.dtype != torch.int64:
+            seq_lens = seq_lens.to(torch.int64)
+
+        # Gemma4's KV-shared layers pass k=v=None - the layer they share with
+        # already wrote their extend K/V to the cache
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k,
@@ -233,7 +242,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             sinks,
             tree_mask,
         )
-        return o
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
@@ -245,8 +254,6 @@ class IntelAMXAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sinks=None,
     ):
-        attn_logits, _ = self.forward_metadata
-
         if self.draft_decode_metadata is not None:
             req_to_token, seq_lens, req_pool_indices = self.draft_decode_metadata
         else:
@@ -255,6 +262,18 @@ class IntelAMXAttnBackend(AttentionBackend):
             seq_lens = forward_batch.seq_lens
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+        seq_lens = forward_batch.seq_lens
+        if seq_lens.dtype != torch.int64:
+            seq_lens = seq_lens.to(torch.int64)
+
+        if layer.v_head_dim == self.v_head_dim and layer.tp_q_head_num == self.num_head:
+            attn_logits, _ = self.forward_metadata
+        else:
+            # This layer's shape differs from the model-wide metadata buffer -
+            # size from the same seq_lens the kernel derives num_seqs from
+            attn_logits = self._get_attn_logits_buffer(
+                seq_lens.shape[0], layer.tp_q_head_num, layer.v_head_dim
+            )
 
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
@@ -284,7 +303,23 @@ class IntelAMXAttnBackend(AttentionBackend):
             forward_batch.encoder_lens,
             sinks,
         )
-        return o
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _get_attn_logits_buffer(
+        self, num_seqs: int, num_heads: int, v_head_dim: int
+    ) -> torch.Tensor:
+        key = (num_heads, v_head_dim)
+        buffer = self._attn_logits_buffers.get(key)
+        if buffer is None or buffer.shape[0] < num_seqs:
+            # decode_attention_cpu writes every element it later reads, so the
+            # buffer needs no initialization and can be reused; it only grows.
+            buffer = torch.empty(
+                (num_seqs, num_heads, self.num_kv_splits, v_head_dim + 1),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self._attn_logits_buffers[key] = buffer
+        return buffer[:num_seqs]
 
     def support_triton(self):
         return False

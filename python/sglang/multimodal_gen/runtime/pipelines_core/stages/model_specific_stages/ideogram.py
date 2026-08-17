@@ -285,6 +285,8 @@ class Ideogram4DenoisingStage(DenoisingStage):
     def _dual_transformer_execution_mode(
         self,
     ) -> DualTransformerExecutionMode | None:
+        if self.unconditional_transformer is None:
+            return None
         return DualTransformerExecutionMode.PAIRED_PER_STEP
 
     def _cache_dit_secondary_uses_primary_config(self) -> bool:
@@ -457,30 +459,34 @@ class Ideogram4DenoisingStage(DenoisingStage):
                 )
                 pos_v = pos_out[:, max_text_tokens : max_text_tokens + num_image_tokens]
 
-            self._manage_unconditional_transformer_use_site(batch)
-            with set_forward_context(
-                current_timestep=i,
-                attn_metadata=step.attn_metadata,
-                forward_batch=batch,
-            ):
-                neg_v = self._run_ideogram_transformer(
-                    self.unconditional_transformer,
-                    dict(
-                        llm_features=ctx.extra["ideogram4_neg_llm_features"],
-                        x=z,
-                        t=t,
-                        position_ids=ctx.extra["ideogram4_neg_position_ids"],
-                        segment_ids=ctx.extra["ideogram4_neg_segment_ids"],
-                        indicator=ctx.extra["ideogram4_neg_indicator"],
-                        attn_mask=ctx.extra["ideogram4_neg_attn_mask"],
-                        attn_mask_meta=ctx.extra["ideogram4_neg_attn_mask_meta"],
-                    ),
-                )
+            neg_v = None
+            if self.unconditional_transformer is not None:
+                self._manage_unconditional_transformer_use_site(batch)
+                with set_forward_context(
+                    current_timestep=i,
+                    attn_metadata=step.attn_metadata,
+                    forward_batch=batch,
+                ):
+                    neg_v = self._run_ideogram_transformer(
+                        self.unconditional_transformer,
+                        dict(
+                            llm_features=ctx.extra["ideogram4_neg_llm_features"],
+                            x=z,
+                            t=t,
+                            position_ids=ctx.extra["ideogram4_neg_position_ids"],
+                            segment_ids=ctx.extra["ideogram4_neg_segment_ids"],
+                            indicator=ctx.extra["ideogram4_neg_indicator"],
+                            attn_mask=ctx.extra["ideogram4_neg_attn_mask"],
+                            attn_mask_meta=ctx.extra["ideogram4_neg_attn_mask_meta"],
+                        ),
+                    )
 
         with maybe_nvtx_range("scheduler_step", use_nvtx):
-            velocity = (
-                guidance_schedule[i] * pos_v + (1.0 - guidance_schedule[i]) * neg_v
-            )
+            velocity = pos_v
+            if neg_v is not None:
+                velocity = (
+                    guidance_schedule[i] * pos_v + (1.0 - guidance_schedule[i]) * neg_v
+                )
             ctx.latents = z + velocity * schedule_deltas[i]
 
 

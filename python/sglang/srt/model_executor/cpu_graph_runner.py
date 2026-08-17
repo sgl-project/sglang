@@ -34,10 +34,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
     enable_num_token_non_padded,
+    get_required_capture_hidden_mode,
+    get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
 from sglang.srt.utils import (
     empty_context,
     log_info_on_rank0,
@@ -125,14 +127,13 @@ def set_torch_compile_config():
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
     # torch compile speeds up decoding by reducing python overhead on CPU
-    server_args = model_runner.server_args
     # Reuse cuda_graph_config[decode].bs here.
     # Users can customize the batch sizes supported by cpu_graph, such as:
     # --cuda-graph-bs-decode 1 2 4 8 16
-    capture_bs = server_args.cuda_graph_config.decode.bs
+    capture_bs = get_exec().graph.cuda_graph_config.decode.bs
     assert (
-        max(capture_bs) <= server_args.torch_compile_max_bs
-    ), f"{capture_bs=}, {server_args.torch_compile_max_bs=}"
+        max(capture_bs) <= get_exec().graph.torch_compile_max_bs
+    ), f"{capture_bs=}, {get_exec().graph.torch_compile_max_bs=}"
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
@@ -175,6 +176,8 @@ def register_fake_ops(tp_size: int):
         "gemma_fused_add_rmsnorm_cpu",
         "layernorm_cpu",
         "fused_add_layernorm_cpu",
+        "multimodal_rotary_embedding_cpu",
+        "apply_multidimensional_rope_cpu",
     ]
     for op in none_return_ops:
 
@@ -198,6 +201,18 @@ def register_fake_ops(tp_size: int):
         @register_cpu_compile_fake(op)
         def _(input, *args, **kwargs):
             return torch.empty_like(input)
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_cpu")
+    def _(q, k, *args, **kwargs):
+        return torch.empty_like(q), torch.empty_like(k)
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_sumsq_cpu")
+    def _(q, k):
+        return torch.empty((q.shape[0], 2), dtype=torch.float32, device=q.device)
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_apply_from_stats_cpu")
+    def _(q, k, *args, **kwargs):
+        return torch.empty_like(q), torch.empty_like(k)
 
     @register_cpu_compile_fake("shm_allgather")
     def _(data, dim):
@@ -246,26 +261,12 @@ def register_fake_ops(tp_size: int):
 
     @register_cpu_compile_fake("rotary_embedding_cpu")
     def _(positions, query, key, head_size, cos_sin_cache, is_neox):
-        if query.ndim == 2:
-            return query, key
-        else:
-            return torch.empty_like(query), torch.empty_like(key)
+        # TODO: the kernel aliases query/key for 2D and 4D but allocates for 3D,
+        # which no schema expresses; an accurate fake needs it to pick one
+        return torch.empty_like(query), torch.empty_like(key)
 
     @register_cpu_compile_fake("apply_rotary_pos_emb_cpu")
     def _(query, key, cos, sin):
-        return query, key
-
-    @register_cpu_compile_fake("multimodal_rotary_embedding_cpu")
-    def _(
-        positions,
-        query,
-        key,
-        head_size,
-        cos_sin_cache,
-        mrope_section,
-        mrope_interleaved,
-        is_neox,
-    ):
         return query, key
 
     @register_cpu_compile_fake("qkv_proj_with_rope_fused_weight")
@@ -383,7 +384,7 @@ def register_fake_ops(tp_size: int):
         return topk_weights, topk_ids
 
     @register_cpu_compile_fake("topk_sigmoid_cpu")
-    def _(hidden_states, gating_output, topk, renormalize):
+    def _(hidden_states, gating_output, topk, renormalize, correction_bias=None):
         num_tokens = hidden_states.shape[0]
         shape = (num_tokens, topk)
         return (
@@ -397,6 +398,7 @@ def register_fake_ops(tp_size: int):
         gating_output,
         topk,
         renormalize,
+        correction_bias=None,
     ):
         num_tokens = hidden_states.shape[0]
         shape = (num_tokens, topk)
@@ -490,6 +492,15 @@ def register_fake_ops(tp_size: int):
         a = mixed_ba.new_empty(batch, num_heads_v)
         return mixed_qkv, z, b, a
 
+    @register_cpu_compile_fake("fused_input_proj_cpu")
+    def _(hidden_states, qkvz_weight, ba_weight, is_vnni):
+        batch = hidden_states.shape[0]
+        qkvz_dim = qkvz_weight.shape[0]
+        ba_dim = ba_weight.shape[0]
+        return hidden_states.new_empty(batch, qkvz_dim), hidden_states.new_empty(
+            batch, ba_dim
+        )
+
     @register_cpu_compile_fake("fused_sigmoid_gating_delta_rule_update_cpu")
     def _(
         A_log,
@@ -553,9 +564,12 @@ class CPUGraphRunner:
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
-        self.enable_return_hidden_states = (
-            model_runner.server_args.enable_return_hidden_states
+        self.return_hidden_states_mode = (
+            CaptureHiddenMode.NULL
+            if model_runner.is_draft_worker
+            else get_server_return_hidden_states_mode(model_runner.server_args)
         )
+        self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         # bs -> compiled fn (text-only / skip_cross_attention=True)
         self.graphs = {}
         # bs -> compiled fn (cross-attention / skip_cross_attention=False, enc-dec only)
@@ -576,16 +590,13 @@ class CPUGraphRunner:
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.tp_size = model_runner.server_args.tp_size
-        self.dp_size = model_runner.server_args.dp_size
+        self.dp_size = get_parallel().dp_size
         self.pp_size = model_runner.server_args.pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
-        self.capture_hidden_mode = CaptureHiddenMode.NULL
-        self.num_tokens_per_bs = 1
-
-        # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
-        if self.enable_return_hidden_states:
-            self.capture_hidden_mode = CaptureHiddenMode.FULL
+        self.capture_hidden_mode = self.return_hidden_states_mode
+        # Static capture width: CPU graphs are decode-only.
+        self.captured_req_width = 1
 
         assert (
             not self.model_runner.server_args.enable_lora
@@ -618,7 +629,7 @@ class CPUGraphRunner:
         self.captured_forward_batches_cross = {}
         # Attention backend
         self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        self.max_num_token = self.max_bs * self.captured_req_width
         self.model_runner.attn_backend.init_cpu_graph_state(
             self.max_bs, self.max_num_token
         )
@@ -646,7 +657,7 @@ class CPUGraphRunner:
             self.custom_mask = torch.ones(
                 (
                     (self.seq_lens.sum().item() + self.max_num_token)
-                    * self.num_tokens_per_bs
+                    * self.captured_req_width
                 ),
                 dtype=torch.bool,
                 device=self.device,
@@ -693,21 +704,7 @@ class CPUGraphRunner:
             else forward_batch.batch_size <= self.max_bs
         )
 
-        requested_capture_hidden_mode = max(
-            forward_batch.capture_hidden_mode,
-            (
-                forward_batch.spec_info.capture_hidden_mode
-                if getattr(forward_batch.spec_info, "capture_hidden_mode", None)
-                is not None
-                else CaptureHiddenMode.NULL
-            ),
-        )
-        capture_hidden_mode_matches = (
-            requested_capture_hidden_mode == CaptureHiddenMode.NULL
-            or requested_capture_hidden_mode == self.capture_hidden_mode
-        )
-
-        return is_bs_supported and capture_hidden_mode_matches
+        return is_bs_supported
 
     def capture(self) -> None:
         capture_range = (
@@ -725,7 +722,7 @@ class CPUGraphRunner:
             with patch_model(
                 self.model_runner.model,
                 bs in self.capture_bs,
-                num_tokens=bs * self.num_tokens_per_bs,
+                num_tokens=bs * self.captured_req_width,
                 tp_group=self.model_runner.tp_group,
             ) as forward:
                 graph, output_buffers = self.capture_one_batch_size(
@@ -767,7 +764,7 @@ class CPUGraphRunner:
     def capture_one_batch_size(
         self, bs: int, forward: Callable, skip_cross_attention: bool = False
     ):
-        num_tokens = bs * self.num_tokens_per_bs
+        num_tokens = bs * self.captured_req_width
 
         # Graph inputs
         input_ids = self.input_ids[:num_tokens]
@@ -783,10 +780,10 @@ class CPUGraphRunner:
             encoder_lens = None
 
         spec_info = self.get_spec_info(num_tokens)
-        if self.capture_hidden_mode != CaptureHiddenMode.FULL:
-            self.capture_hidden_mode = (
-                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
-            )
+        self.capture_hidden_mode = get_required_capture_hidden_mode(
+            self.capture_hidden_mode,
+            spec_info,
+        )
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
@@ -860,43 +857,19 @@ class CPUGraphRunner:
                         self.captured_forward_batches_cross[bs] = forward_batch
                     return forward, out
 
-    def recapture_if_needed(self, forward_batch: ForwardBatch):
-
-        # If the required capture_hidden_mode changes, we need to recapture the graph
-
-        # These are the different factors that can influence the capture_hidden_mode
-        capture_hidden_mode_required_by_forward_batch = (
-            forward_batch.capture_hidden_mode
-        )
-        capture_hidden_mode_required_by_spec_info = getattr(
-            forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
-        )
-        capture_hidden_mode_required_for_returning_hidden_states = (
-            CaptureHiddenMode.FULL
-            if self.enable_return_hidden_states
-            else CaptureHiddenMode.NULL
-        )
-
-        # Determine the highest capture_hidden_mode required
-        # (If we have FULL, we can emulate LAST or NULL)
-        # (If we have LAST, we can emulate NULL)
-        required_capture_hidden_mode = max(
-            capture_hidden_mode_required_by_forward_batch,
-            capture_hidden_mode_required_by_spec_info,
-            capture_hidden_mode_required_for_returning_hidden_states,
-        )
-
-        # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
-        if self.capture_hidden_mode != required_capture_hidden_mode:
-            self.capture_hidden_mode = required_capture_hidden_mode
-            self.capture()
+    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
+        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
+            raise RuntimeError(
+                "The runtime hidden-state mode exceeds the fixed CPU graph "
+                f"capture mode ({self.capture_hidden_mode.name})."
+            )
 
     def prepare_replay(
         self,
         forward_batch: ForwardBatch,
         skip: bool = False,
     ):
-        self.recapture_if_needed(forward_batch)
+        self._validate_capture_hidden_mode(forward_batch)
 
         graphs = self.graphs_cross if not skip else self.graphs
         cfbs = (
@@ -916,7 +889,7 @@ class CPUGraphRunner:
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             return forward_batch
 
-        raw_num_token = raw_bs * self.num_tokens_per_bs
+        raw_num_token = raw_bs * self.captured_req_width
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
         assert bs > raw_bs
@@ -1017,9 +990,9 @@ class CPUGraphRunner:
                     retrieve_next_token=None,
                     retrieve_next_sibling=None,
                     retrieve_cum_len=None,
-                    spec_steps=self.model_runner.server_args.speculative_num_steps,
+                    spec_steps=get_spec().speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
-                    draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                    draft_token_num=get_spec().speculative_num_draft_tokens,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
