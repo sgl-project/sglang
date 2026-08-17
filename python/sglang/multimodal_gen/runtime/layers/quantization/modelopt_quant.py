@@ -7,6 +7,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 import torch
+
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
