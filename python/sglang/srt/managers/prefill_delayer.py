@@ -249,9 +249,10 @@ class PrefillDelayer:
             # and fragment prefill into many tiny batches.
             queue_condition = False
             if self._queue_trigger_enabled and global_running_batch_max > 0:
-                queue_min_effective = min(
-                    int(global_running_batch_max * self._queue_min_ratio),
-                    global_max_prefill_bs_max,
+                # queue_min must not be capped by max_prefill_bs: the tracker
+                # high-watermark can collapse while a delay is active and end it early.
+                queue_min_effective = int(
+                    global_running_batch_max * self._queue_min_ratio
                 )
                 queue_condition = (
                     queue_min_effective > 0
@@ -268,15 +269,25 @@ class PrefillDelayer:
             )
 
             if slot_condition or queue_condition:
-                # When the "max_decode_bs - running_bs < max_prefill_bs" condition is met,
-                # the first merge_batch causes the decoding to fail to reach the maximum batch size.
-                if self.skip_first_delayer:
+                # One-shot bypass is specific to the slot-condition merge concern;
+                # the queue trigger must delay from the very first batch.
+                if self.skip_first_delayer and slot_condition:
                     self.skip_first_delayer = False
                     pass
+                elif queue_condition:
+                    # Queue-triggered delay is bounded by the wall-clock
+                    # max_delay_ms only (queue_condition is cleared once
+                    # elapsed >= max_delay_ms), not by max_delay_passes.
+                    next_state = prev_state or _State()
+                    next_state = next_state.bump_delayed_count()
+                    return _NegotiateOutput(
+                        next_state=next_state,
+                        output_allow=False,
+                        output_reason="delay",
+                        **debug_info,
+                    )
                 else:
-                    # Bound the wait like the "mixed" branch: on a saturated
-                    # engine slot_condition may never turn false, so cap the
-                    # delay by max_delay_passes.
+                    # slot condition only: cap the delay by max_delay_passes.
                     prev_delayed_count = prev_state.delayed_count if prev_state else 0
                     if prev_delayed_count < self._max_delay_passes - 1:
                         next_state = prev_state or _State()
