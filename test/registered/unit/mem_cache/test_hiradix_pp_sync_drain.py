@@ -51,9 +51,9 @@ class TestPPSyncDrain(unittest.TestCase):
 class TestUnifiedPPSyncBatching(unittest.TestCase):
     def _make_cache(self, pp_rank, write_ready, load_ready):
         cache = object.__new__(UnifiedRadixCache)
+        cache.tree_core = SimpleNamespace(enable_storage=False)
         cache.pp_rank = pp_rank
         cache.pp_size = 2
-        cache.enable_storage = False
         cache.enable_storage_metrics = False
         cache.storage_metrics_collector = None
         cache._drain_async_work = MagicMock()
