@@ -2192,6 +2192,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
 
+    def has_pending_deferred_releases(self) -> bool:
+        return bool(self._deferred_releases)
+
     def resolve_deferred_releases(self) -> None:
         """Release KV pages/req-slots held for aborted mid-transfer requests once
         every prefill rank confirms its transfer drained (is_abort_release_safe),

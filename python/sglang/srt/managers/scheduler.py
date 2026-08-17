@@ -4058,7 +4058,16 @@ class Scheduler(
 
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
-        if not self.enable_hisparse:
+        # Also skipped while deferred KV releases are pending: those hold an
+        # aborted request's KV pages/req-slot out of the allocator until the
+        # prefill confirms the transfer drained (or a timeout fires), so the pool
+        # is transiently below `total` by design and would otherwise trip the
+        # idle-time leak invariant. Once the holds resolve the check resumes.
+        _transfer_q = getattr(self, "disagg_decode_transfer_queue", None)
+        _deferred_pending = (
+            _transfer_q is not None and _transfer_q.has_pending_deferred_releases()
+        )
+        if not self.enable_hisparse and not _deferred_pending:
             has_leak, messages = self.invariant_checker._check_all_pools(
                 self.pool_stats_observer.get_pool_stats(),
             )
