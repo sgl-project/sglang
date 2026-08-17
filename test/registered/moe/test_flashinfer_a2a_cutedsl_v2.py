@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=568, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 

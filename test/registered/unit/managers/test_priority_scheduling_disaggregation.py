@@ -18,7 +18,7 @@ from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestDisaggregationPriorityQueueing(unittest.TestCase):

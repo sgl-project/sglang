@@ -6,7 +6,7 @@ import torch.nn as nn
 from sglang.kernels.ops.diffusion.quality_gate import QualityGatedFusion
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 def test_quality_gate_mounts_and_unmounts_all_sites():
