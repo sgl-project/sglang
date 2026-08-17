@@ -144,6 +144,13 @@ class PipelineStage(StageDedupMixin, ABC):
         """
         pass
 
+    def iter_sequential_requests(
+        self, batch: Req, server_args: ServerArgs
+    ) -> Iterator[Req]:
+        """Expand one post-stage request into sequential downstream requests."""
+        del server_args
+        return iter((batch,))
+
     def set_component_residency_manager(self, manager) -> None:
         self._component_residency_manager = manager
 

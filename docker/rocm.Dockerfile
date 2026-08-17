@@ -37,7 +37,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -47,7 +47,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 
 # ===============================
 # Base image 950 and args
@@ -57,7 +57,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -67,7 +67,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 
 # Local source stage: with BRANCH_TYPE=local the build context is copied here and
 # used instead of git clone (mirrors docker/Dockerfile's local_src stage).
@@ -91,9 +91,6 @@ ARG BRANCH_TYPE=remote
 # Version override for setuptools_scm (used in nightly builds)
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
-ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
-ARG TRITON_COMMIT="42270451990532c67e69d753fbd026f28fcc4840"
-
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
 ENV AITER_COMMIT="${AITER_COMMIT:-${AITER_COMMIT_DEFAULT}}"
@@ -116,7 +113,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="f7e6ac6863c53821bc7afb91a578cc6ce38fcad0"
+ARG MORI_COMMIT="12d1bc32d0c93dcd5062e74f4e0f772e36e1aac4"
 
 # NIXL (upstream ai-dynamo/nixl) — KV transfer backend for prefill/decode disaggregation.
 # Built from source for ROCm; needs UCX built --with-rocm (built here from openucx).
@@ -222,8 +219,8 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # leak into AITER's version when AITER uses setuptools_scm)
 
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
-# Keep the base image's Torch-compatible Triton by default. Override with
-# AITER_USE_SYSTEM_TRITON=0 when intentionally testing aiter-managed Triton.
+# Compile AITER against the base image's Triton; the Triton step at the end of
+# this file swaps in AITER's own pin afterwards.
 ENV AITER_USE_SYSTEM_TRITON=1
 RUN pip uninstall -y aiter
 # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
@@ -285,7 +282,6 @@ ARG SETUPTOOLS_SCM_PRETEND_VERSION
 RUN pip install IPython \
     && pip install orjson \
     && pip install python-multipart \
-    && pip install torchao==0.9.0 \
     && pip install pybind11
 
 # Rust toolchain — needed by setuptools-rust to build the sglang-mm extension
@@ -317,11 +313,11 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
        fi \
     && rm -rf /tmp/local_src \
     && cd sglang \
-    && cd sgl-kernel \
+    && cd python/sglang/kernels/aot \
     && rm -f pyproject.toml \
     && mv pyproject_rocm.toml pyproject.toml \
     && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install \
-    && cd .. \
+    && cd ../../../.. \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
          export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[srt_hip,diffusion_hip]"; \
@@ -628,24 +624,6 @@ RUN cd /tmp/whl \
         ;; \
     esac
 
-
-# -----------------------
-# Hot patch: Triton
-# For ROCm 7.2, this custom build breaks pip dependency management,
-# so future `pip install` will break the ROCm stack.
-# A workaround for this is to reinstall the default triton
-# wheel with the `rocm/pytorch` image in the root directory.
-RUN if [ "$BUILD_TRITON" = "1" ]; then \
-        pip uninstall -y triton \
-     && apt install -y cmake \
-     && git clone ${TRITON_REPO} triton-custom \
-     && cd triton-custom \
-     && git checkout ${TRITON_COMMIT} \
-     && pip install -r python/requirements.txt \
-     && pip install -e . \
-     && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
-    fi
-
 # -----------------------
 # Hot patch: transformers dynamic_module_utils symlink bug (v5.12.1).
 # _compute_local_source_files_hash calls Path(...).resolve() on custom-code
@@ -675,6 +653,20 @@ else:
     path.write_text(patched)
     print("patched transformers dynamic_module_utils.py (symlink hash fix)")
 PY
+
+# -----------------------
+# Install the Triton AITER pins, replacing the base image's. No version check
+# on purpose: the pin is AITER's to move, and its installer enforces a floor.
+#
+# Keep this last. Base ROCm Torch pins triton==3.5.1 and the torch patch above
+# is what drops that pin, so installing Triton any earlier lets the next pip
+# install pull CUDA torch instead. The hip check below is the tripwire.
+RUN if [ "$BUILD_TRITON" = "1" ]; then \
+        cd /sgl-workspace/aiter \
+     && test -f .github/scripts/install_triton.sh \
+     && PIP_NO_CACHE_DIR=1 bash .github/scripts/install_triton.sh \
+     && python3 -c "import torch; from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); assert torch.version.hip is not None, torch.__version__; print(f'[Triton] ROCm Torch {torch.__version__}, Triton {v}, triton-kernels {k}')"; \
+    fi
 
 # -----------------------
 # Performance environment variable.

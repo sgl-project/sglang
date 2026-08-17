@@ -6,15 +6,18 @@ from __future__ import annotations
 
 # ruff: noqa: SIM117
 import collections
+import concurrent.futures
 import dataclasses
 import fnmatch
 import gc
 import glob
+import hashlib
 import json
 import logging
 import math
 import os
 import re
+import shutil
 import socket
 import tempfile
 import threading
@@ -44,7 +47,13 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import (
+    configured_moe_dp_size,
+    get_exec,
+    get_model,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils import get_available_gpu_memory
 
 # Try to import accelerate (optional dependency)
@@ -75,6 +84,9 @@ from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.layers.moe.utils import (
+    install_shared_experts_fusion_decision,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
@@ -91,6 +103,8 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
+    CheckpointFilePrefetchHandle,
+    _prefetch_all_checkpoints,
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -100,6 +114,7 @@ from sglang.srt.model_loader.weight_utils import (
     get_gguf_extra_tensor_names,
     get_quant_config,
     gguf_quant_weights_iterator,
+    initialize_capture_safe_weights,
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
@@ -230,6 +245,7 @@ def _get_quantization_config(
                         "q_a_proj",
                         "kv_a_proj_with_mqa",
                     ],
+                    "index_qkv_proj": ["index_q_proj", "index_k_proj"],
                 },
             }
         )
@@ -255,10 +271,11 @@ def _get_quantization_config(
                     ModelOptFp4Config,
                 )
 
-                # MTP MoE layers (model.decoder.*) are not NVFP4 quantized.
+                # Draft experts serialized under mtp.* remain source MXFP4.
+                # NextN exposes them as model.decoder.*; DSpark as stages.*.
                 nvfp4_exclude_modules = list(
                     nvfp4_meta.get("exclude_modules") or []
-                ) + ["model.decoder.*"]
+                ) + ["model.decoder.*", "stages.*"]
                 nvfp4_config = ModelOptFp4Config(
                     is_checkpoint_nvfp4_serialized=True,
                     group_size=int(nvfp4_meta["group_size"]),
@@ -305,6 +322,13 @@ def _initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
+    # Decide the shared-experts-fusion question here, once per runner, before any
+    # layer exists: this is the only place a model class is instantiated, and it
+    # is the last point that still knows both the checkpoint's quantization and
+    # (through the build scope) whether this runner is a draft.
+    install_shared_experts_fusion_decision(
+        model_class, model_config.hf_config, quant_config
+    )
     kwargs = {
         "config": model_config.hf_config,
         "quant_config": quant_config,
@@ -389,6 +413,15 @@ class DefaultModelLoader(BaseModelLoader):
                 model_config=model_config,
             )
 
+    @dataclasses.dataclass(frozen=True)
+    class ResolvedSource:
+        """A weight source whose local checkpoint files are already resolved."""
+
+        source: DefaultModelLoader.Source
+        hf_folder: str
+        weight_files: Tuple[str, ...]
+        use_safetensors: bool
+
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
 
@@ -396,6 +429,14 @@ class DefaultModelLoader(BaseModelLoader):
         super().__init__(load_config)
         extra_config = load_config.model_loader_extra_config
         allowed_keys = {"enable_multithread_load", "num_threads"}
+        if load_config.load_format == LoadFormat.FASTSAFETENSORS:
+            allowed_keys.add("enable_gds")
+            if "enable_gds" in extra_config and not isinstance(
+                extra_config["enable_gds"], bool
+            ):
+                raise ValueError(
+                    "enable_gds in --model-loader-extra-config must be a boolean"
+                )
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 
         if unexpected_keys:
@@ -484,10 +525,10 @@ class DefaultModelLoader(BaseModelLoader):
             hf_folder = model_name_or_path
 
         server_args = get_server_args()
-        if server_args and server_args.model_checksum is not None:
+        if server_args and get_model().model_checksum is not None:
             from sglang.srt.utils.model_file_verifier import verify
 
-            checksums_source = server_args.model_checksum or model_name_or_path
+            checksums_source = get_model().model_checksum or model_name_or_path
             verify(model_path=hf_folder, checksums_source=checksums_source)
 
         hf_weights_files: List[str] = []
@@ -542,22 +583,31 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: Source
+        self,
+        source: Source,
+        *,
+        resolved_source: Optional[ResolvedSource] = None,
+        startup_prefetch_started: bool = False,
+        startup_prefetch_active: bool = False,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
         use_multithread = extra_config.get("enable_multithread_load", True)
-        hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
-            source.model_or_path, source.revision, source.fall_back_to_pt
-        )
-
-        if use_safetensors and source.model_config is not None:
-            hf_weights_files = maybe_add_mtp_safetensors(
-                hf_weights_files,
-                hf_folder,
-                "model.safetensors.index.json",
-                source.model_config.hf_config,
+        if resolved_source is None:
+            hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
+                source.model_or_path, source.revision, source.fall_back_to_pt
             )
+            if use_safetensors and source.model_config is not None:
+                hf_weights_files = maybe_add_mtp_safetensors(
+                    hf_weights_files,
+                    hf_folder,
+                    "model.safetensors.index.json",
+                    source.model_config.hf_config,
+                )
+        else:
+            hf_folder = resolved_source.hf_folder
+            hf_weights_files = list(resolved_source.weight_files)
+            use_safetensors = resolved_source.use_safetensors
 
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
@@ -569,12 +619,17 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            server_args = get_server_args()
-            weight_loader_disable_mmap = server_args.weight_loader_disable_mmap
-            weight_loader_prefetch = server_args.weight_loader_prefetch_checkpoints
-            prefetch_num_threads = server_args.weight_loader_prefetch_num_threads
+            weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
+            configured_prefetch = get_model().weight_loader_prefetch_checkpoints
+            start_iterator_prefetch = (
+                configured_prefetch and not startup_prefetch_started
+            )
+            concurrent_prefetch_active = (
+                startup_prefetch_active or start_iterator_prefetch
+            )
+            prefetch_num_threads = get_model().weight_loader_prefetch_num_threads
             weight_loader_drop_cache_after_load = (
-                server_args.weight_loader_drop_cache_after_load
+                get_model().weight_loader_drop_cache_after_load
             )
 
             # Prefetch and multi-threaded loading both read the same shards,
@@ -588,7 +643,7 @@ class DefaultModelLoader(BaseModelLoader):
             # e.g. local NVMe, where prefetch is a no-op and multi-threading
             # helps.
             if (
-                weight_loader_prefetch
+                concurrent_prefetch_active
                 and not weight_loader_disable_mmap
                 and self.load_config.load_format != LoadFormat.FASTSAFETENSORS
                 and use_multithread
@@ -597,7 +652,7 @@ class DefaultModelLoader(BaseModelLoader):
                 )
             ):
                 logger.warning(
-                    "--weight-loader-prefetch-checkpoints is enabled; falling "
+                    "Checkpoint prefetching is active; falling "
                     "back to single-threaded weight loading to avoid I/O "
                     "oversubscription with the prefetch threads. Set "
                     "enable_multithread_load=true in --model-loader-extra-config "
@@ -606,8 +661,11 @@ class DefaultModelLoader(BaseModelLoader):
                 use_multithread = False
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
+                enable_gds = extra_config.get("enable_gds", True)
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
+                    enable_gds=enable_gds,
+                    drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
             elif use_multithread:
                 weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
@@ -616,7 +674,7 @@ class DefaultModelLoader(BaseModelLoader):
                         "num_threads", self.DEFAULT_NUM_THREADS
                     ),
                     disable_mmap=weight_loader_disable_mmap,
-                    prefetch=weight_loader_prefetch,
+                    prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
@@ -624,7 +682,7 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator = safetensors_weights_iterator(
                     hf_weights_files,
                     disable_mmap=weight_loader_disable_mmap,
-                    prefetch=weight_loader_prefetch,
+                    prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
@@ -684,6 +742,143 @@ class DefaultModelLoader(BaseModelLoader):
         )
         for source in secondary_weights:
             yield from self._get_weights_iterator(source)
+
+    def resolve_model_weights(
+        self,
+        model_config: ModelConfig,
+        model: nn.Module,
+    ) -> Tuple[ResolvedSource, ...]:
+        """Resolve all checkpoint files before background startup prefetching."""
+        sources = [DefaultModelLoader.Source.init_new(model_config, model)]
+        sources.extend(
+            cast(
+                Iterable[DefaultModelLoader.Source],
+                getattr(model, "secondary_weights", ()),
+            )
+        )
+
+        resolved_sources = []
+        for source in sources:
+            hf_folder, weight_files, use_safetensors = self._prepare_weights(
+                source.model_or_path,
+                source.revision,
+                source.fall_back_to_pt,
+            )
+            if use_safetensors and source.model_config is not None:
+                weight_files = maybe_add_mtp_safetensors(
+                    weight_files,
+                    hf_folder,
+                    "model.safetensors.index.json",
+                    source.model_config.hf_config,
+                )
+            resolved_sources.append(
+                DefaultModelLoader.ResolvedSource(
+                    source=source,
+                    hf_folder=hf_folder,
+                    weight_files=tuple(weight_files),
+                    use_safetensors=use_safetensors,
+                )
+            )
+        return tuple(resolved_sources)
+
+    @staticmethod
+    def start_checkpoint_prefetch(
+        resolved_sources: Tuple[ResolvedSource, ...],
+        *,
+        num_threads: int,
+    ) -> CheckpointFilePrefetchHandle:
+        """Start CPU-only page-cache staging for already-resolved sources."""
+        if not all(source.use_safetensors for source in resolved_sources):
+            raise ValueError(
+                "Startup weight-loading overlap requires safetensors checkpoints"
+            )
+        weight_files = sorted(
+            {path for source in resolved_sources for path in source.weight_files}
+        )
+        return _prefetch_all_checkpoints(weight_files, num_threads=num_threads)
+
+    def initialize_model_for_startup(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        """Build the final model structure and GPU parameter storage."""
+        target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                    quant_config,
+                )
+        return model
+
+    def prepare_model_for_capture(
+        self,
+        *,
+        model: nn.Module,
+        model_config: ModelConfig,
+    ) -> nn.Module:
+        """Initialize final storage with values safe for graph warmup.
+
+        Mirrors the post-initialization sequence of ``DummyModelLoader``, except
+        that parameters are filled with a detectable sentinel instead of random
+        values so ``commit_model_weights`` can prove every one of them was
+        replaced.
+
+        Note that this runs ``process_weights_after_loading`` on the sentinel
+        values, and ``commit_model_weights`` runs it again on the real weights,
+        so overlap invokes it once more than the serial path. That is safe for
+        the currently supported matrix, where the CUDA unquantized path is a
+        no-op, and it is not covered by the storage manifest, which proves
+        tensor identity rather than idempotence. Any quantization method that
+        mutates weights in place therefore has to be evaluated here before its
+        configuration is added to the supported set.
+        """
+        with set_default_torch_dtype(model_config.dtype):
+            initialize_capture_safe_weights(model)
+            _post_load_weights(model)
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is None:
+                    continue
+                if (
+                    hasattr(module, "is_weights_quantized")
+                    and module.is_weights_quantized()
+                ):
+                    continue
+                quant_method.process_weights_after_loading(module)
+        return model.eval()
+
+    def commit_model_weights(
+        self,
+        *,
+        model: nn.Module,
+        model_config: ModelConfig,
+        resolved_sources: Tuple[ResolvedSource, ...],
+        target_device: torch.device,
+        startup_prefetch_active: bool,
+    ) -> None:
+        """Load real checkpoint values into a capture-ready model."""
+
+        def weights_iterator():
+            for resolved_source in resolved_sources:
+                yield from self._get_weights_iterator(
+                    resolved_source.source,
+                    resolved_source=resolved_source,
+                    startup_prefetch_started=True,
+                    startup_prefetch_active=startup_prefetch_active,
+                )
+
+        with set_default_torch_dtype(model_config.dtype):
+            self.load_weights_and_postprocess(
+                model,
+                weights_iterator(),
+                target_device,
+            )
+        self.counter_after_loading_weights = time.perf_counter()
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
@@ -815,11 +1010,31 @@ class DefaultModelLoader(BaseModelLoader):
 
         quant_config = getattr(model, "quant_config", None)
         is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
+        is_modelopt_fp4_online = (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and not quant_config.is_checkpoint_nvfp4_serialized
+        )
+        is_mxfp8 = quant_config is not None and quant_config.get_name() == "mxfp8"
+        if is_mxfp8:
+            weights = (
+                (
+                    f"{name}_inv" if name.endswith(".weight_scale") else name,
+                    loaded_weight,
+                )
+                for name, loaded_weight in weights
+            )
 
-        if is_nvfp4_online:
+        if is_nvfp4_online or is_modelopt_fp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.
-            with temp_set_env(FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1"):
+            with temp_set_env(
+                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
+                FLASHINFER_NVFP4_4OVER6="1",
+                FLASHINFER_NVFP4_4OVER6_E4M3_USE_256="0",
+                FLASHINFER_NVFP4_4OVER6_ERR_MODE="MSE",
+                FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH="1",
+            ):
                 model.load_weights(weights)
             if target_device.type == "cuda":
                 torch.cuda.synchronize()
@@ -864,10 +1079,6 @@ class LayeredModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-        from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-        from sglang.srt.runtime_context import get_server_args
-
-        torchao_config = get_server_args().torchao_config
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
 
@@ -908,17 +1119,9 @@ class LayeredModelLoader(DefaultModelLoader):
                     fqn_path,
                     weights,
                 )
-                # Quantize weights if applicable
-                if torchao_config and "proj" in fqn_path:
-                    # Note: `None` here is needed to indicate no filter, see
-                    # `apply_torchao_config_to_model` for details.
-                    apply_torchao_config_to_model(module, torchao_config, None)
 
             # Start calling on root module
             fill_module(model, [], weights)
-
-        if torchao_config:
-            model.torchao_applied = True
 
         return model.eval()
 
@@ -1497,6 +1700,15 @@ class ShardedStateLoader(BaseModelLoader):
         result: Dict[str, torch.Tensor] = {}
         for group in same_storage_groups.values():
             for k, t in group:
+                if not t.is_contiguous():
+                    # End-pointer dedup assumes a flat view; non-contiguous
+                    # tensors (e.g. produced by
+                    # ``.transpose(...).contiguous().transpose(...)`` in some
+                    # quant ``post_load_weights`` paths) cannot be flattened
+                    # via ``view(-1)``. Include them directly; downstream
+                    # writers call ``.contiguous()`` before save.
+                    result[k] = t
+                    continue
                 a, b = t.data_ptr(), get_end_ptr(t)
                 for k2, t2 in group:
                     if not t2.is_contiguous():
@@ -1627,6 +1839,838 @@ class ShardedStateLoader(BaseModelLoader):
                 state_dict_part,
                 os.path.join(path, filename),
             )
+
+
+class PreshardedModelLoader(DefaultModelLoader):
+    """Dump/reload post-process weights under ``<model_path>/presharded/<subdir>/``.
+
+    Optional roots in ``model_loader_extra_config`` (subdir still appended):
+    ``presharded_path`` (target), ``draft_presharded_path`` (speculative draft).
+    Dump dir must be shared across ranks/nodes.
+    """
+
+    DEFAULT_SUBDIR = "presharded"
+    MAX_FILE_BYTES = 20 * (1024**3)
+    CHECKSUM_FILENAME = "checksum.json"
+    READY_FILENAME = "READY"
+    TMP_SUBDIR = "_tmp_presharding"
+    PLAN_VERSION = 1
+    DEFAULT_HASH_NUM_THREADS = 8
+    _CONTENT_HASH_HEX_LEN = 32
+
+    def __init__(self, load_config: LoadConfig):
+        extra = (
+            {}
+            if load_config.model_loader_extra_config is None
+            else dict(load_config.model_loader_extra_config)
+        )
+        self._presharded_path_override = extra.pop("presharded_path", None)
+        self._draft_presharded_path_override = extra.pop("draft_presharded_path", None)
+        self._max_file_bytes = int(extra.pop("max_file_bytes", self.MAX_FILE_BYTES))
+        self._hash_num_threads = int(
+            extra.pop("hash_num_threads", self.DEFAULT_HASH_NUM_THREADS)
+        )
+        self._verify_on_load = bool(extra.pop("verify_on_load", False))
+        load_config.model_loader_extra_config = extra
+        load_config.load_format = LoadFormat.AUTO
+        super().__init__(load_config)
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        presharded_dir = self._presharded_dir(model_config)
+        if not self._presharded_ready(presharded_dir):
+            super().download_model(model_config)
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        shard_config = self._collect_shard_config(model_config)
+        presharded_dir = self._presharded_dir(model_config, shard_config)
+        if self._presharded_ready(presharded_dir) and self._shard_config_matches(
+            presharded_dir, shard_config
+        ):
+            logger.info("Loading from presharded checkpoint at %s", presharded_dir)
+            return self._load_from_presharded(
+                model_config, device_config, presharded_dir
+            )
+        logger.info(
+            "No presharded checkpoint at %s; doing first-time load and dump.",
+            presharded_dir,
+        )
+        return self._first_time_load_and_dump(
+            model_config, device_config, presharded_dir, shard_config
+        )
+
+    @classmethod
+    def _presharded_ready(cls, presharded_dir: str) -> bool:
+        return os.path.isfile(os.path.join(presharded_dir, cls.READY_FILENAME))
+
+    def _presharded_dir(
+        self,
+        model_config: ModelConfig,
+        shard_config: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        if shard_config is None:
+            shard_config = self._collect_shard_config(model_config)
+        subfolder = self._build_subfolder_name(shard_config)
+        if model_config.is_draft_model:
+            root = self._draft_presharded_path_override
+        else:
+            root = self._presharded_path_override
+        if root is None:
+            root = os.path.join(model_config.model_path, self.DEFAULT_SUBDIR)
+        return os.path.join(root, subfolder)
+
+    def _collect_shard_config(self, model_config: ModelConfig) -> Dict[str, Any]:
+        def _safe(fn) -> int:
+            try:
+                return fn()
+            except (AssertionError, AttributeError, RuntimeError):
+                return 1
+
+        parallel = get_parallel()
+        return {
+            "tp": _safe(lambda: parallel.tp_size),
+            "dp": _safe(lambda: parallel.moe_dp_size),
+            "ep": _safe(lambda: parallel.moe_ep_size),
+            "pp": _safe(lambda: parallel.pp_size),
+            "moe_dense_tp_size": parallel.moe_dense_tp_size,
+            "moe_dp_size": configured_moe_dp_size(),
+            "enable_dp_lm_head": parallel.enable_dp_lm_head,
+            "enable_fp32_lm_head": get_exec().features.enable_fp32_lm_head,
+            "quantization": model_config.quantization,
+            "model_dtype": str(model_config.dtype),
+            "ep_num_redundant_experts": get_exec().moe.ep_num_redundant_experts,
+            "enable_eplb": get_exec().moe.enable_eplb,
+            "init_expert_location": self._normalize_init_expert_location(
+                get_exec().moe.init_expert_location
+            ),
+            "structural_signature": self._compute_structural_signature(model_config),
+        }
+
+    @staticmethod
+    def _normalize_init_expert_location(value: Optional[str]) -> Optional[str]:
+        if value is None or value == "trivial":
+            return value
+        if value.endswith((".json", ".pt")) and os.path.isfile(value):
+            h = hashlib.sha1()
+            with open(value, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            return f"file:{os.path.basename(value)}:sha1:{h.hexdigest()[:16]}"
+        return value
+
+    def _build_subfolder_name(self, shard_config: Dict[str, Any]) -> str:
+        combined = hashlib.sha1(
+            json.dumps(shard_config, sort_keys=True).encode()
+        ).hexdigest()[:16]
+        return f"TP-{shard_config['tp']}-sig-{combined}"
+
+    def _shard_config_matches(
+        self, presharded_dir: str, shard_config: Dict[str, Any]
+    ) -> bool:
+        try:
+            with open(os.path.join(presharded_dir, self.CHECKSUM_FILENAME)) as f:
+                stored = json.load(f).get("shard_config")
+        except (OSError, ValueError):
+            stored = None
+        current = json.loads(json.dumps(shard_config))
+        if stored == current:
+            return True
+        logger.warning(
+            "Presharded checkpoint at %s was dumped with a different shard "
+            "config than the current launch (stored=%s, current=%s). "
+            "Treating as a cache miss and re-dumping.",
+            presharded_dir,
+            stored,
+            current,
+        )
+        return False
+
+    def _compute_structural_signature(self, model_config: ModelConfig) -> Optional[str]:
+        local_sig = self._compute_local_structural_signature(model_config)
+        return self._make_rank_invariant_structural_signature(local_sig)
+
+    def _compute_local_structural_signature(
+        self, model_config: ModelConfig
+    ) -> Optional[str]:
+        from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
+
+        def _clear_meta_rope_cache() -> None:
+            meta_keys = [
+                k
+                for k, v in _ROPE_DICT.items()
+                if any(p.device.type == "meta" for p in v.parameters())
+                or any(b.device.type == "meta" for b in v.buffers())
+            ]
+            for k in meta_keys:
+                del _ROPE_DICT[k]
+
+        try:
+            quant_config = _get_quantization_config(model_config, self.load_config)
+            with set_default_torch_dtype(model_config.dtype):
+                with torch.device("meta"):
+                    meta_model = _initialize_model(
+                        model_config, self.load_config, quant_config
+                    )
+                state_dict = meta_model.state_dict()
+                sig_input = sorted(
+                    (name, tuple(t.shape), str(t.dtype))
+                    for name, t in state_dict.items()
+                )
+            del meta_model
+            return self._hash_structural_signature(sig_input)
+        except Exception as e:
+            logger.warning(
+                "Failed to build structural signature for presharded cache key "
+                "(model_type=%s): %s",
+                getattr(
+                    getattr(model_config, "hf_config", None), "model_type", "unknown"
+                ),
+                e,
+            )
+            return None
+        finally:
+            _clear_meta_rope_cache()
+
+    @classmethod
+    def _make_rank_invariant_structural_signature(
+        cls, local_sig: Optional[str]
+    ) -> Optional[str]:
+        try:
+            from sglang.srt.distributed import get_world_group
+
+            group = get_world_group()
+            if group.world_size <= 1:
+                return local_sig
+            all_sigs = group.all_gather_object(local_sig)
+        except (AssertionError, AttributeError, RuntimeError):
+            return local_sig
+
+        if all(s is None for s in all_sigs):
+            return None
+        return hashlib.sha1(repr(all_sigs).encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _hash_structural_signature(
+        sig_input: List[Tuple[str, Tuple[int, ...], str]],
+    ) -> str:
+        h = hashlib.sha1(repr(sig_input).encode())
+        return h.hexdigest()[:16]
+
+    @staticmethod
+    def _world_rank_and_size() -> Tuple[int, int]:
+        from sglang.srt.distributed import get_world_group
+
+        try:
+            g = get_world_group()
+            return g.rank_in_group, g.world_size
+        except (AssertionError, AttributeError):
+            return 0, 1
+
+    @staticmethod
+    def _world_barrier() -> None:
+        from sglang.srt.distributed import get_world_group
+
+        try:
+            get_world_group().barrier()
+        except (AssertionError, AttributeError):
+            pass
+
+    @staticmethod
+    def _new_content_hasher():
+        import xxhash
+
+        return xxhash.xxh3_128()
+
+    @staticmethod
+    def _hash_tensor(tensor: torch.Tensor) -> str:
+        # CPU copy so concurrent dump workers cannot race CUDA D2H hashing.
+        t = tensor.detach()
+        prefix = str(tuple(t.shape)).encode() + str(t.dtype).encode()
+        h = PreshardedModelLoader._new_content_hasher()
+        h.update(prefix)
+
+        if t.numel() == 0:
+            return h.hexdigest()
+
+        cpu = t.contiguous().to(device="cpu", copy=True).contiguous()
+        flat_u8 = cpu.reshape(-1).view(torch.uint8)
+        h.update(memoryview(flat_u8.numpy()))
+        return h.hexdigest()
+
+    def _verify_rank_checksum(
+        self,
+        verify_hashes: List[Tuple[str, str]],
+        plan: Dict[str, Any],
+        rank: int,
+        presharded_dir: str,
+    ) -> None:
+        expected = plan.get("rank_checksums", {}).get(str(rank))
+        if expected is None:
+            raise ValueError(
+                f"Plan at {presharded_dir} has no rank_checksums entry for "
+                f"rank {rank}; cannot verify. Set "
+                f"--model-loader-extra-config '{{\"verify_on_load\": false}}' "
+                f"to skip verification, or re-dump the checkpoint."
+            )
+
+        total = 0
+        for name, content_hash in verify_hashes:
+            d = PreshardedModelLoader._fold_name_content_digest(name, content_hash)
+            total = (total + int.from_bytes(d[:8], "big")) & 0xFFFFFFFFFFFFFFFF
+        actual = format(total, "016x")
+
+        if actual != expected:
+            raise ValueError(
+                f"Rank-{rank} checksum mismatch for presharded checkpoint at "
+                f"{presharded_dir}: expected {expected}, got {actual}. The "
+                f"checkpoint files may be corrupted; re-dump or skip "
+                f"verification with --model-loader-extra-config "
+                f"'{{\"verify_on_load\": false}}'."
+            )
+
+    @staticmethod
+    def _fold_name_content_digest(name: str, content_hash: str) -> bytes:
+        h = PreshardedModelLoader._new_content_hasher()
+        h.update((name + ":" + content_hash).encode("utf-8"))
+        return h.digest()
+
+    @staticmethod
+    def _collect_extra_tensors(model: nn.Module) -> Dict[str, torch.Tensor]:
+        seen: set = set()
+        param_storages: set = set()
+        for name, tensor in model.state_dict().items():
+            seen.add(name)
+            if tensor.numel() > 0:
+                param_storages.add((tensor.device, tensor.untyped_storage().data_ptr()))
+        extras: Dict[str, torch.Tensor] = {}
+        for module_name, module in model.named_modules():
+            prefix = f"{module_name}." if module_name else ""
+            for attr_name in list(vars(module).keys()):
+                if attr_name.startswith("_"):
+                    continue
+                try:
+                    val = getattr(module, attr_name)
+                except AttributeError:
+                    continue
+                if isinstance(val, torch.Tensor) and not isinstance(
+                    val, torch.nn.Parameter
+                ):
+                    full_name = f"{prefix}{attr_name}"
+                    if full_name in seen:
+                        continue
+                    if val.numel() > 0:
+                        key = (val.device, val.untyped_storage().data_ptr())
+                        if key in param_storages:
+                            continue
+                    extras[full_name] = val
+        return extras
+
+    @staticmethod
+    def _rebind_parameter_aliases(model: nn.Module) -> None:
+        for _, module in model.named_modules():
+            gemma_w = getattr(module, "gemma_weight", None)
+            weight = getattr(module, "weight", None)
+            if (
+                isinstance(gemma_w, torch.Tensor)
+                and isinstance(weight, torch.nn.Parameter)
+                and gemma_w.shape == weight.shape
+            ):
+                torch.add(weight.data, 1.0, out=gemma_w)
+
+            attn = getattr(module, "attn", None)
+            conv1d = getattr(module, "conv1d", None)
+            if attn is None:
+                continue
+            if hasattr(module, "A_log") and hasattr(attn, "A_log"):
+                attn.A_log = module.A_log
+            if hasattr(module, "dt_bias") and hasattr(attn, "dt_bias"):
+                attn.dt_bias = module.dt_bias
+            if conv1d is None:
+                continue
+            cweight = getattr(conv1d, "weight", None)
+            if cweight is not None and hasattr(attn, "conv_weights"):
+                if cweight.dim() == 3 and cweight.size(1) == 1:
+                    attn.conv_weights = cweight.view(cweight.size(0), cweight.size(2))
+                else:
+                    attn.conv_weights = (
+                        cweight.squeeze() if cweight.dim() > 2 else cweight
+                    )
+            if hasattr(conv1d, "bias") and hasattr(attn, "bias"):
+                attn.bias = conv1d.bias
+
+    def _ensure_presharded_dir_writable(self, presharded_dir: str) -> None:
+        rank, _ = self._world_rank_and_size()
+        try:
+            os.makedirs(presharded_dir, exist_ok=True)
+            if rank == 0:
+                probe = os.path.join(presharded_dir, ".presharded_write_probe")
+                last_err: Optional[OSError] = None
+                for _ in range(5):
+                    try:
+                        with open(probe, "w") as f:
+                            f.write("ok")
+                        os.unlink(probe)
+                        last_err = None
+                        break
+                    except OSError as e:
+                        last_err = e
+                        os.makedirs(presharded_dir, exist_ok=True)
+                        time.sleep(0.05)
+                if last_err is not None:
+                    raise last_err
+        except OSError as e:
+            raise RuntimeError(
+                f"Presharded dump directory is not writable: {presharded_dir}. "
+                "Set model_loader_extra_config "
+                '\'{"presharded_path": "..."}\' (or draft_presharded_path for '
+                "the draft model) to a writable shared filesystem path. "
+                f"Original error: {e}"
+            ) from e
+        self._world_barrier()
+
+    def _first_time_load_and_dump(
+        self,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+        presharded_dir: str,
+        shard_config: Dict[str, Any],
+    ) -> nn.Module:
+        self._ensure_presharded_dir_writable(presharded_dir)
+        target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(model_config, self.load_config, quant_config)
+            self.load_weights_and_postprocess(
+                model,
+                self._get_all_weights(model_config, model),
+                target_device,
+            )
+
+            state_dict = dict(model.state_dict())
+            extras = self._collect_extra_tensors(model)
+            self._dump_state_to_disk(state_dict, extras, presharded_dir, shard_config)
+            del state_dict
+            del extras
+            gc.collect()
+
+        self.counter_after_loading_weights = time.perf_counter()
+        return model.eval()
+
+    def _dump_state_to_disk(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        extras: Dict[str, torch.Tensor],
+        presharded_dir: str,
+        shard_config: Dict[str, Any],
+    ) -> None:
+        rank, world_size = self._world_rank_and_size()
+        tmp_dir = os.path.join(presharded_dir, self.TMP_SUBDIR)
+        if rank == 0:
+            ready_path = os.path.join(presharded_dir, self.READY_FILENAME)
+            if os.path.isfile(ready_path):
+                os.unlink(ready_path)
+            os.makedirs(tmp_dir, exist_ok=True)
+        self._world_barrier()
+
+        items: List[Tuple[str, torch.Tensor, bool]] = []
+        items.extend((n, t, False) for n, t in state_dict.items())
+        items.extend((n, t, True) for n, t in extras.items())
+
+        def _entry(item: Tuple[str, torch.Tensor, bool]) -> Tuple[str, Dict[str, Any]]:
+            name, tensor, is_extra = item
+            return name, {
+                "checksum": self._hash_tensor(tensor),
+                "size": tensor.numel() * tensor.element_size(),
+                "dtype": str(tensor.dtype),
+                "shape": list(tensor.shape),
+                "is_extra": is_extra,
+            }
+
+        manifest: Dict[str, Dict[str, Any]] = {}
+        num_workers = min(max(1, len(items)), self._hash_num_threads)
+        if num_workers <= 1:
+            for it in items:
+                name, info = _entry(it)
+                manifest[name] = info
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=num_workers,
+                thread_name_prefix="presharded-hash",
+            ) as ex:
+                for name, info in ex.map(_entry, items):
+                    manifest[name] = info
+
+        with open(os.path.join(tmp_dir, f"manifest_{rank:05d}.json"), "w") as f:
+            json.dump(manifest, f)
+        self._world_barrier()
+
+        if rank == 0:
+            plan = self._build_dump_plan(world_size, tmp_dir, self._max_file_bytes)
+            plan["shard_config"] = shard_config
+            with open(os.path.join(presharded_dir, self.CHECKSUM_FILENAME), "w") as f:
+                json.dump(plan, f, indent=2)
+        self._world_barrier()
+
+        with open(os.path.join(presharded_dir, self.CHECKSUM_FILENAME)) as f:
+            plan = json.load(f)
+        all_tensors = {**state_dict, **extras}
+        self._dump_files_for_rank(all_tensors, plan, rank, presharded_dir)
+        self._world_barrier()
+
+        if rank == 0:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            ready_path = os.path.join(presharded_dir, self.READY_FILENAME)
+            with open(ready_path, "w") as f:
+                json.dump(
+                    {
+                        "plan_version": self.PLAN_VERSION,
+                        "world_size": world_size,
+                        "created_at": time.time(),
+                    },
+                    f,
+                )
+        self._world_barrier()
+
+    @staticmethod
+    def _make_filename(
+        file_id: int, rank_list: Tuple[int, ...], is_common: bool
+    ) -> str:
+        if is_common:
+            return f"model-{file_id:05d}-common.safetensor"
+        rank_str = ",".join(f"{r:03d}" for r in rank_list)
+        return f"model-{file_id:05d}-rank-{rank_str}.safetensor"
+
+    @classmethod
+    def _build_dump_plan(
+        cls, world_size: int, tmp_dir: str, max_file_bytes: int
+    ) -> Dict[str, Any]:
+        rank_to_manifest: Dict[int, Dict[str, Dict[str, Any]]] = {}
+        for r in range(world_size):
+            manifest_path = os.path.join(tmp_dir, f"manifest_{r:05d}.json")
+            try:
+                with open(manifest_path) as f:
+                    rank_to_manifest[r] = json.load(f)
+            except FileNotFoundError as e:
+                raise FileNotFoundError(
+                    f"Rank {r} did not write {manifest_path}. The presharded "
+                    "dump directory must be on a filesystem shared by all "
+                    "ranks/nodes (set presharded_path / draft_presharded_path "
+                    "to a shared path if model_path is node-local)."
+                ) from e
+
+        checksum_to_entries: Dict[str, List[Tuple[int, str, Dict[str, Any]]]] = (
+            collections.defaultdict(list)
+        )
+        name_to_is_extra: Dict[Tuple[int, str], bool] = {}
+        for r, manifest in rank_to_manifest.items():
+            for name, info in manifest.items():
+                checksum_to_entries[info["checksum"]].append((r, name, info))
+                name_to_is_extra[(r, name)] = bool(info.get("is_extra", False))
+
+        tensor_records: List[Dict[str, Any]] = []
+        for checksum, entries in checksum_to_entries.items():
+            sizes = {info["size"] for _, _, info in entries}
+            if len(sizes) != 1:
+                raise RuntimeError(
+                    f"Checksum {checksum} maps to inconsistent sizes {sizes}; "
+                    f"this indicates a hash collision or stale manifest."
+                )
+            size = next(iter(sizes))
+            ranks = sorted({r for r, _, _ in entries})
+            rank_to_names: Dict[str, List[str]] = collections.defaultdict(list)
+            for r, n, _ in entries:
+                rank_to_names[str(r)].append(n)
+            tensor_records.append(
+                {
+                    "checksum": checksum,
+                    "size": size,
+                    "rank_list": ranks,
+                    "rank_to_names": {k: sorted(v) for k, v in rank_to_names.items()},
+                }
+            )
+
+        by_rank_list: Dict[Tuple[int, ...], List[Dict[str, Any]]] = (
+            collections.defaultdict(list)
+        )
+        for rec in tensor_records:
+            by_rank_list[tuple(rec["rank_list"])].append(rec)
+
+        files: List[Dict[str, Any]] = []
+        next_file_id = 0
+        for rank_tuple, recs in by_rank_list.items():
+            recs.sort(key=lambda r: -r["size"])
+            is_common = len(rank_tuple) == world_size and rank_tuple == tuple(
+                range(world_size)
+            )
+            writer_load = {wr: 0 for wr in rank_tuple}
+            writer_records: Dict[int, List[Dict[str, Any]]] = {
+                wr: [] for wr in rank_tuple
+            }
+            for rec in recs:
+                wr = min(rank_tuple, key=lambda r: writer_load[r])
+                writer_records[wr].append(rec)
+                writer_load[wr] += rec["size"]
+
+            for wr, wr_recs in writer_records.items():
+                cur_size = 0
+                cur_tensors: List[Dict[str, Any]] = []
+                for rec in wr_recs:
+                    if cur_tensors and cur_size + rec["size"] > max_file_bytes:
+                        files.append(
+                            {
+                                "filename": cls._make_filename(
+                                    next_file_id, rank_tuple, is_common
+                                ),
+                                "writer_rank": wr,
+                                "rank_list": (None if is_common else list(rank_tuple)),
+                                "is_common": is_common,
+                                "tensors": cur_tensors,
+                            }
+                        )
+                        next_file_id += 1
+                        cur_size = 0
+                        cur_tensors = []
+                    cur_tensors.append(
+                        {
+                            "stored_key": rec["checksum"],
+                            "size": rec["size"],
+                            "rank_to_names": rec["rank_to_names"],
+                        }
+                    )
+                    cur_size += rec["size"]
+                if cur_tensors:
+                    files.append(
+                        {
+                            "filename": cls._make_filename(
+                                next_file_id, rank_tuple, is_common
+                            ),
+                            "writer_rank": wr,
+                            "rank_list": (None if is_common else list(rank_tuple)),
+                            "is_common": is_common,
+                            "tensors": cur_tensors,
+                        }
+                    )
+                    next_file_id += 1
+
+        rank_to_reads: Dict[int, List[Dict[str, Any]]] = collections.defaultdict(list)
+        for f in files:
+            for t in f["tensors"]:
+                for r_str, names in t["rank_to_names"].items():
+                    for name in names:
+                        rank_to_reads[int(r_str)].append(
+                            {
+                                "filename": f["filename"],
+                                "stored_key": t["stored_key"],
+                                "name": name,
+                                "is_extra": name_to_is_extra.get(
+                                    (int(r_str), name), False
+                                ),
+                            }
+                        )
+
+        rank_checksums: Dict[str, str] = {}
+        for r in range(world_size):
+            total = 0
+            for rec in rank_to_reads.get(r, []):
+                d = cls._fold_name_content_digest(rec["name"], rec["stored_key"])
+                total = (total + int.from_bytes(d[:8], "big")) & 0xFFFFFFFFFFFFFFFF
+            rank_checksums[str(r)] = format(total, "016x")
+
+        return {
+            "version": cls.PLAN_VERSION,
+            "world_size": world_size,
+            "files": files,
+            "rank_to_reads": {str(r): v for r, v in rank_to_reads.items()},
+            "rank_checksums": rank_checksums,
+        }
+
+    def _dump_files_for_rank(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        plan: Dict[str, Any],
+        rank: int,
+        presharded_dir: str,
+    ) -> None:
+        from safetensors.torch import save_file
+
+        for f in plan["files"]:
+            if f["writer_rank"] != rank:
+                continue
+            tensors_to_save: Dict[str, torch.Tensor] = {}
+            for t in f["tensors"]:
+                names_for_this_rank = t["rank_to_names"].get(str(rank))
+                if not names_for_this_rank:
+                    raise RuntimeError(
+                        f"writer_rank {rank} is missing tensor {t['stored_key']} "
+                        f"for file {f['filename']}; plan is inconsistent."
+                    )
+                name_for_this_rank = names_for_this_rank[0]
+                tensor = (
+                    state_dict[name_for_this_rank]
+                    .detach()
+                    .to(device="cpu", copy=False)
+                    .contiguous()
+                )
+                tensors_to_save[t["stored_key"]] = tensor
+            save_file(tensors_to_save, os.path.join(presharded_dir, f["filename"]))
+
+    @staticmethod
+    def _read_presharded_file(
+        full_path: str, stored_keys: List[str]
+    ) -> Dict[str, torch.Tensor]:
+        from safetensors.torch import safe_open
+
+        with safe_open(full_path, framework="pt") as fh:
+            return {key: fh.get_tensor(key) for key in stored_keys}
+
+    def _apply_presharded_file(
+        self,
+        *,
+        items: List[Dict[str, Any]],
+        cached: Dict[str, torch.Tensor],
+        model: nn.Module,
+        state_dict: Dict[str, torch.Tensor],
+        target_device: torch.device,
+        loaded_param_keys: set,
+        verify_hashes: List[Tuple[str, str]],
+    ) -> None:
+        if self._verify_on_load:
+            keys = list(cached.keys())
+            n_workers = min(max(1, len(keys)), self._hash_num_threads)
+
+            def _hash_one(key, _cached=cached):
+                return key, self._hash_tensor(_cached[key])
+
+            if n_workers <= 1:
+                key_to_hash = dict(_hash_one(k) for k in keys)
+            else:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=n_workers,
+                    thread_name_prefix="presharded-verify",
+                ) as ex:
+                    key_to_hash = dict(ex.map(_hash_one, keys))
+            for r in items:
+                verify_hashes.append((r["name"], key_to_hash[r["stored_key"]]))
+
+        for r in items:
+            tensor = cached[r["stored_key"]]
+            if r.get("is_extra"):
+                module_path, _, attr_name = r["name"].rpartition(".")
+                module = model.get_submodule(module_path) if module_path else model
+                if hasattr(module, attr_name):
+                    try:
+                        delattr(module, attr_name)
+                    except AttributeError:
+                        pass
+                setattr(module, attr_name, tensor.to(target_device))
+                continue
+            if r["name"] not in state_dict:
+                continue
+            param_data = state_dict[r["name"]].data
+            param_shape = state_dict[r["name"]].shape
+            for dim, size in enumerate(tensor.shape):
+                if size < param_shape[dim]:
+                    param_data = param_data.narrow(dim, 0, size)
+            if tensor.shape != param_data.shape:
+                raise ValueError(
+                    f"Presharded tensor shape mismatch for '{r['name']}': "
+                    f"dumped {tuple(tensor.shape)} vs parameter slice "
+                    f"{tuple(param_data.shape)} (full param {tuple(param_shape)}). "
+                    "Re-dump with matching quant/parallel config, or set "
+                    "verify_on_load and check process_weights_after_loading."
+                )
+            param_data.copy_(tensor)
+            loaded_param_keys.add(r["name"])
+
+        cached.clear()
+        del cached
+
+    def _load_from_presharded(
+        self,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+        presharded_dir: str,
+    ) -> nn.Module:
+        target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
+
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(model_config, self.load_config, quant_config)
+
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+
+            rank, _ = self._world_rank_and_size()
+            with open(os.path.join(presharded_dir, self.CHECKSUM_FILENAME)) as f:
+                plan = json.load(f)
+            if plan.get("version") != self.PLAN_VERSION:
+                raise ValueError(
+                    f"Unsupported presharded plan version {plan.get('version')!r} "
+                    f"at {presharded_dir}; expected {self.PLAN_VERSION}."
+                )
+
+            state_dict = dict(model.state_dict())
+            reads = plan.get("rank_to_reads", {}).get(str(rank), [])
+
+            by_file: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
+            for r in reads:
+                by_file[r["filename"]].append(r)
+
+            loaded_param_keys: set = set()
+            verify_hashes: List[Tuple[str, str]] = []
+            for filename, items in by_file.items():
+                stored_keys = list(dict.fromkeys(r["stored_key"] for r in items))
+                cached = self._read_presharded_file(
+                    os.path.join(presharded_dir, filename), stored_keys
+                )
+                self._apply_presharded_file(
+                    items=items,
+                    cached=cached,
+                    model=model,
+                    state_dict=state_dict,
+                    target_device=target_device,
+                    loaded_param_keys=loaded_param_keys,
+                    verify_hashes=verify_hashes,
+                )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+            loaded_storages: set = set()
+            for k in loaded_param_keys:
+                t = state_dict[k]
+                if t.numel() > 0:
+                    loaded_storages.add((t.device, t.untyped_storage().data_ptr()))
+            missing = []
+            for k, t in state_dict.items():
+                if k in loaded_param_keys:
+                    continue
+                if t.numel() == 0:
+                    continue
+                storage_key = (t.device, t.untyped_storage().data_ptr())
+                if storage_key not in loaded_storages:
+                    missing.append(k)
+            if missing:
+                raise ValueError(
+                    f"Missing keys {tuple(sorted(missing))} in presharded "
+                    f"checkpoint at {presharded_dir}."
+                )
+
+            self._rebind_parameter_aliases(model)
+
+            if self._verify_on_load:
+                self._verify_rank_checksum(verify_hashes, plan, rank, presharded_dir)
+
+        self.counter_after_loading_weights = time.perf_counter()
+        return model.eval()
 
 
 class BitsAndBytesModelLoader(BaseModelLoader):
@@ -2148,8 +3192,14 @@ class GGUFModelLoader(BaseModelLoader):
                 "Please install gguf via `pip install gguf` to use gguf quantizer."
             ) from err
 
+        from sglang.srt.model_loader.gguf_name_maps import GGUF_HF_NAME_MAP_BUILDERS
+
         config = model_config.hf_config
         model_type = config.model_type
+        name_map_builder = GGUF_HF_NAME_MAP_BUILDERS.get(model_type)
+        if name_map_builder is not None:
+            return name_map_builder(config)
+
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
             model_type = "command-r"
@@ -3078,10 +4128,10 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         )
 
         server_args = get_server_args()
-        if server_args and server_args.model_checksum is not None:
+        if server_args and get_model().model_checksum is not None:
             from sglang.srt.utils.model_file_verifier import verify
 
-            checksums_source = server_args.model_checksum or model_name_or_path
+            checksums_source = get_model().model_checksum or model_name_or_path
             verify(model_path=hf_folder, checksums_source=checksums_source)
 
         hf_weights_files = list_safetensors(path=hf_folder)
@@ -3232,12 +4282,29 @@ def get_model_loader(
         logger.info("Using IncModelLoader due to AutoRound quantization config.")
         return IncModelLoader(load_config)
 
-    # ModelOptModelLoader's local-copy quantize-and-export workflow doesn't apply
-    # to non-local loaders. These loaders own their weight transport path and still
-    # initialize the model with ModelOpt quantization config where applicable.
-    model_optloader_allowed = model_config and load_config.load_format not in (
-        LoadFormat.RUNAI_STREAMER,
-        LoadFormat.REMOTE_INSTANCE,
+    modelopt_config = load_config.modelopt_config
+    modelopt_workflow_requested = modelopt_config is not None and any(
+        (
+            modelopt_config.checkpoint_restore_path,
+            modelopt_config.checkpoint_save_path,
+            modelopt_config.export_path,
+        )
+    )
+
+    # Online modelopt_fp4 converts weights through DefaultModelLoader unless the
+    # caller explicitly requests ModelOpt calibration/checkpoint/export work.
+    # Non-local loaders still own their weight transport path.
+    modelopt_fp4_online = (
+        model_config
+        and model_config.quantization == "modelopt_fp4"
+        and not model_config._is_already_quantized()
+        and not modelopt_workflow_requested
+    )
+    model_optloader_allowed = (
+        model_config
+        and not modelopt_fp4_online
+        and load_config.load_format
+        not in (LoadFormat.RUNAI_STREAMER, LoadFormat.REMOTE_INSTANCE)
     )
 
     if model_optloader_allowed and (
@@ -3270,6 +4337,9 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.SHARDED_STATE:
         return ShardedStateLoader(load_config)
+
+    if load_config.load_format == LoadFormat.PRESHARDED:
+        return PreshardedModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.BITSANDBYTES:
         return BitsAndBytesModelLoader(load_config)
@@ -3318,5 +4388,27 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.RUNAI_STREAMER:
         return RunaiModelStreamerLoader(load_config)
+
+    if load_config.load_format == LoadFormat.IPC_CACHE:
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+        from sglang.srt.weight_cache.protocol import (
+            compute_global_rank,
+            get_socket_path,
+        )
+
+        if load_config.weight_cache_socket:
+            socket_path = load_config.weight_cache_socket
+        else:
+            from sglang.srt.runtime_context import get_parallel
+
+            ps = get_parallel()
+            global_rank = compute_global_rank(ps.tp_size, ps.pp_rank, ps.tp_rank)
+            socket_path = get_socket_path(global_rank=global_rank)
+        return IpcModelLoader(
+            load_config=load_config,
+            socket_path=socket_path,
+            weight_cache_mode=load_config.weight_cache_mode,
+            fallback_load_format=load_config.fallback_load_format,
+        )
 
     return DefaultModelLoader(load_config)

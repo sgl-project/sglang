@@ -3,10 +3,10 @@ import unittest
 import sgl_kernel  # noqa: F401
 import torch
 import torch.nn.functional as F
-from utils import precision
 
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, organize_draft_results
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.cpu_test_utils import precision
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-b-test-cpu")
@@ -294,7 +294,7 @@ class TestVerifyTreeGreedy(CustomTestCase):
 
     def test_verify_tree_greedy_upstream_golden(self):
         # Golden fixture ported from the CUDA kernel UT
-        # sgl-kernel/tests/speculative/test_eagle_utils.py::test_verify_tree_greedy
+        # python/sglang/kernels/aot/tests/speculative/test_eagle_utils.py::test_verify_tree_greedy
         # (device swapped to CPU); expected outputs are the CUDA kernel's.
         candidates = torch.tensor(
             [
@@ -767,7 +767,7 @@ class TestReconstructIndicesFromTreeMask(CustomTestCase):
         bs, draft_token_num = 2, 4
         seq_lens = torch.tensor([12, 5], dtype=torch.int64)
         # Request 0: root(0) -> {1, 2}, 2 -> 3 (golden case from
-        # sgl-kernel/tests/speculative/test_ngram_utils.py).
+        # python/sglang/kernels/aot/tests/speculative/test_ngram_utils.py).
         # Request 1: plain chain 0 -> 1 -> 2 -> 3.
         tree_mask = torch.tensor(
             # fmt: off
