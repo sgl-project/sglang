@@ -57,7 +57,10 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
 <Deployment config={config} />
 
 <Note>
-  The cells above were validated at ISL 8192 / OSL 1024, concurrency 1.
+  The RTX 5090 and RTX PRO 6000 cells above — including every Speculative
+  Decoding / Serving Strategy / SSM dtype combination — were validated at
+  ISL 8192 / OSL 1024, concurrency 1. The other platforms' recipes carry their
+  original validation; the badge reflects each selection's status.
 </Note>
 
 ### Mamba ratio calculator
@@ -197,7 +200,9 @@ checkpoint's calibration scales automatically.
   `--speculative-dspark-block-size` (gamma) **+ 1**, and gamma is auto-inferred
   from the draft checkpoint when the flag is omitted (7 for this checkpoint, so
   D = 8). That `D` is a term in the balanced ratio —
-  `r = (S + D) x token_equiv / L` — so DSpark needs a materially higher
+  `r = (S + D) x token_equiv / L`, where `token_equiv` is the state slot
+  expressed in KV tokens, `state_bytes / kv_bytes_per_token` (4698 at fp32
+  state / 2394 at bf16, over fp8 KV) — so DSpark needs a materially higher
   `--mamba-full-memory-ratio` than no-spec at the same `S`, and pinning a
   different gamma changes the ratio with it. MTP is the opposite case: with
   `--enable-linear-replayssm-spec` its draft intermediates move onto a fixed
@@ -211,8 +216,8 @@ checkpoint's calibration scales automatically.
   `S` (lazy strategy, or `--disable-radix-cache` for S=1); the
   [calculator](#mamba-ratio-calculator) re-derives the ratio for the new `S`.
   The balanced ratio itself is VRAM-independent.
-- `--mamba-ssm-dtype`: the GDN state slot is **146.8MB at `float32`** (the
-  checkpoint's declared precision) and **74.8MB at `bfloat16`**, so bf16 roughly
+- `--mamba-ssm-dtype`: the GDN state slot is **153.9 MB at `float32`** (the
+  checkpoint's declared precision) and **78.4 MB at `bfloat16`**, so bf16 roughly
   halves the state pool and hands the difference to KV — measured on an RTX 5090
   with no speculation, 97,280 KV tokens at bf16 against 68,588 at fp32. On 32GB
   cards it also decides whether a config fits at all: EAGLE needs
@@ -220,9 +225,15 @@ checkpoint's calibration scales automatically.
   one-way trade — with speculative decoding fp32 sometimes wins (NVFP4 + EAGLE:
   152.9 vs 144.5 tok/s/user) and sometimes loses (FP8 + EAGLE: 106.3 vs 116.1);
   measure both for your quantization. Treat
-  `bfloat16` as an accuracy gate and validate it for your workload. bf16 state
-  requires the Triton linear-attn prefill path (the FlashInfer GDN prefill
-  kernels require an fp32 `initial_state`), which is already the SM120 default.
+  `bfloat16` as an accuracy gate and validate it for your workload. On SM120
+  both precisions run the Triton linear-attn prefill path — the FlashInfer GDN
+  prefill fast path gates on SM100, where its validated domain is in fact a
+  bf16 state pool — so no dtype forces an extra flag here. One interaction to
+  know: `--enable-linear-replayssm-spec` auto-selects fp32 state when
+  `--mamba-ssm-dtype` is unset, and an explicit non-fp32 value logs a
+  state-drift warning at boot. The SSM dtype row always emits the flag
+  explicitly, so the bf16 + EAGLE cells run with that warning — accounted for
+  in their validation.
 - `--chunked-prefill-size 2048`: decode steps stall behind each prefill chunk
   on hybrid GDN models, and 8192-token chunks stall them ~600ms at a time.
   2048 keeps decode inter-token latency smooth under mixed load and also

@@ -22,11 +22,15 @@
 // checkpoints, NVFP4 at the RadixArk W4A4 build. That page pinned
 // no sglang version for its measurements, so under the
 // migration skill's reproducible-anchor rule NO measured numbers were carried
-// over: there is no sibling `-benchmarks.jsx`. Cells are nevertheless marked
-// `verified: true` at the maintainers' direction — the badge there reflects
-// their own unpublished validation, not measured data carried by this page. The
-// DGX Spark cells are the exception and stay unverified: that recipe is
-// unvalidated on SM121 / aarch64, as both §2 and the cell comment below say.
+// over: there is no sibling `-benchmarks.jsx`. The RTX 5090 / RTX PRO 6000
+// cells are `verified: true` outright — their whole overlay envelope (tier,
+// state dtype, both spec options) was measured. The h200/gb300 cells carry
+// `verified` as a FUNCTION of the selection instead: their validation covers
+// only the untouched overlay defaults (plus plain MTP on gb300), so any other
+// overlay pick flips the badge to Not Verified rather than borrowing a green
+// badge from a different configuration. The DGX Spark cells stay unverified
+// everywhere: that recipe is unvalidated on SM121 / aarch64, as both §2 and
+// the cell comment below say.
 // `benchmarkCommands` below records the page's measurement protocol so the
 // numbers can be re-measured against a pinned build and then land as a
 // benchmarks file.
@@ -49,22 +53,16 @@ export const config = {
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "blackwell" },
   ],
 
-  variants: [
-    { id: "default", label: "Default" },
-  ],
   // BF16/FP8 are the official Qwen checkpoints; NVFP4 is the RadixArk
-  // W4A4 build. Every cell now pins `--kv-cache-dtype fp8_e4m3` explicitly at
-  // the maintainers' direction. For NVFP4 this is a no-op made visible: that
-  // checkpoint declares `kv_cache_quant_algo: FP8`, so `auto` already resolved
-  // to fp8_e4m3 off its own calibration scales. For BF16/FP8 it is a real
-  // change — it halves kv_bytes_per_token (65.5 KB -> 32.8 KB) and doubles the
-  // KV pool at a fixed --mamba-full-memory-ratio, but those checkpoints carry
-  // no fp8 KV calibration, so it is a quality/capacity trade, not free.
-  quantizations: [
-    { id: "bf16",  label: "BF16"  },
-    { id: "fp8",   label: "FP8"   },
-    { id: "nvfp4", label: "NVFP4" },
-  ],
+  // W4A4 build. Every cell pins `--kv-cache-dtype fp8_e4m3` explicitly at
+  // the maintainers' direction (recorded in the PR description). For NVFP4
+  // this is a no-op made visible: that checkpoint declares
+  // `kv_cache_quant_algo: FP8`, so `auto` already resolved to fp8_e4m3 off its
+  // own calibration scales. For BF16/FP8 it is a real change — it halves
+  // kv_bytes_per_token (65.5 KB -> 32.8 KB) and doubles the KV pool at a fixed
+  // --mamba-full-memory-ratio, but those checkpoints carry no fp8 KV
+  // calibration, so it is a quality/capacity trade, not free.
+  //
   // Speculative decoding and GDN state precision are ORTHOGONAL knobs, so they
   // are overlay rows, not match dims: they layer flags onto the matched cell
   // instead of multiplying the cell count (3 x 2 would turn 12 cells into 72).
@@ -111,9 +109,10 @@ export const config = {
           disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
           disableReason:
             "On the 32GB RTX 5090 the MTP head only fits on top of the NVFP4 weights",
-          // ReplaySSM spec-verify rides with EAGLE on EVERY platform at the
-          // maintainers' direction. It replaces the per-draft full-state
-          // snapshots with a fold-every-commit ring, which takes the D
+          // ReplaySSM spec-verify rides with EAGLE on the platforms where it
+          // has been exercised — SM120/SM121, scoped in `flags` below; h200
+          // and gb300 keep the plain MTP recipe. It replaces the per-draft
+          // full-state snapshots with a fold-every-commit ring, which takes the D
           // intermediate SSM states off the per-request slot budget (so the
           // mamba ratio is computed with D=0, not the draft-token count --
           // see the compute-mamba-ratio skill's ReplaySSM caveat). On the
@@ -144,7 +143,7 @@ export const config = {
               ? ["--enable-linear-replayssm-spec"]
               : []),
             // MEASURED: bf16 state serves at 0.92; fp32 state does NOT (K=3
-            // against a required 4) and needs 0.94. fp32 slots are 146.81 MB
+            // against a required 4) and needs 0.94. fp32 slots are 146.81 MiB
             // vs bf16's 74.81, so the state pool needs a bigger slice.
             ...(sel.hw === "rtx5090"
               ? [sel.ssmDtype === "float32"
@@ -155,12 +154,10 @@ export const config = {
         },
         {
           id: "dspark", label: "DSPARK",
-          // Two 5090 constraints, and the fp32 one is the MIRROR of the guard
-          // on the float32 state option: DSpark + fp32 state does not fit this
-          // card at any mem-fraction (measured), so each greys the other and
-          // the pair can never be co-selected. EAGLE is deliberately exempt --
-          // fp32 + EAGLE is a valid, measured, and slightly FASTER combination
-          // (146.8 vs 142.2 tok/s/user), because ReplaySSM takes D to 0.
+          // One 5090 constraint, same predicate as EAGLE above: the separate
+          // draft checkpoint only fits on top of the NVFP4 weights. Both GDN
+          // state precisions are open with DSpark on this card — fp32 needs
+          // the higher 0.92 mem-fraction re-pinned below, bf16 serves at 0.90.
           disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
           disableReason:
             "On the 32GB RTX 5090 the DSpark draft model only fits on top of the NVFP4 weights",
@@ -206,9 +203,15 @@ export const config = {
       // so lazy is the throughput tier and the eager buffer the latency tier.
       // S also feeds the balanced ratio, and the page's calculator reads this
       // row directly (strategy -> slots), so the two stay in step.
+      // The default is the ENGINE default (extra_buffer), so an untouched
+      // selection emits a command semantically identical to each platform's
+      // original recipe. Both options were characterized on RTX 5090 and
+      // RTX PRO 6000 (the full 12-cell grid); on other platforms picking the
+      // non-default option is a valid but unmeasured opt-in, and the verified
+      // badge reports it as such (see the cells' `verified` functions).
       id: "tier",
       title: "Serving Strategy",
-      default: "high-throughput",
+      default: "low-latency",
       // Owns the flag outright: strip whatever a cell pinned, then re-emit.
       stripPrefixes: ["--mamba-radix-cache-strategy"],
       options: [
@@ -219,18 +222,16 @@ export const config = {
       ],
     },
     {
-      // One GDN state slot is 154.7 MB at fp32 and 79.2 MB at bf16 — the single
-      // biggest lever on the state pool, which is what bounds concurrency on
-      // small-VRAM cards. bf16 needs the Triton linear-attn prefill path (the
-      // FlashInfer GDN prefill kernels hard-require an fp32 initial_state);
-      // Triton is already the SM120 default, so no extra flag is implied here.
-      // On the 32GB RTX 5090 there is exactly ONE valid state precision per
-      // quantization, so the row is forced rather than free there: NVFP4 must
-      // run bf16 (an fp32 slot is 154.7 MB against 79.2 MB, and the fp32 pool
-      // caps usable context far below the bf16 one on this card), while the
-      // BF16/FP8 checkpoints have no serviceable cell to run bf16 state on.
-      // `reseatHiddenPicks` moves the row off a disabled pick automatically,
-      // so selecting the 5090 lands on bfloat16 without the user touching it.
+      // One GDN state slot is 146.81 MiB at fp32 and 74.81 MiB at bf16 — the
+      // single biggest lever on the state pool, which is what bounds
+      // concurrency on small-VRAM cards. On SM120 both precisions run on the
+      // Triton linear-attn prefill path (the FlashInfer GDN prefill fast path
+      // gates on SM100, so Triton is the SM120 default regardless of dtype).
+      // The default is the ENGINE default (float32, the checkpoint's declared
+      // precision), so an untouched selection matches each platform's original
+      // recipe. Both precisions were characterized on RTX 5090 and RTX PRO
+      // 6000; elsewhere bfloat16 is a valid but unmeasured opt-in and the
+      // verified badge reports it as such.
       id: "ssmDtype",
       title: "Mamba SSM Dtype",
       default: "float32",
@@ -256,10 +257,6 @@ export const config = {
       ],
     },
   ],
-  nodesOptions: [
-    { id: "single", label: "Single Node" },
-  ],
-
   modelNames: {
     "default|bf16":  "Qwen/Qwen3.8-27B",
     "default|fp8":   "Qwen/Qwen3.8-27B-FP8",
@@ -360,8 +357,11 @@ export const config = {
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"] },
         { id: "dspark",  label: "DSpark",
+          // Same three flags as the Deploy panel's DSPARK option, so the two
+          // paths compose identical commands.
           flags: ["--speculative-algorithm DSPARK",
-                  "--speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark"] },
+                  "--speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark",
+                  "--speculative-draft-attention-backend flashinfer"] },
       ],
     },
 
@@ -462,7 +462,13 @@ export const config = {
       // checkpoint's MLP would fall back to the Marlin W4A16 weight-only path —
       // runnable, but not a recipe this page ships.
       match: { hw: "h200", variant: "default", quant: "fp8", nodes: "single" },
-      verified: true,
+      // Verified only at the untouched overlay defaults — the source page's
+      // recipe has no speculative decoding and engine-default strategy/state
+      // dtype. Any other overlay pick is a valid but unmeasured opt-in, and
+      // the badge reports it as Not Verified.
+      verified: (sel) =>
+        sel.spec === "none" && sel.tier === "low-latency" &&
+        sel.ssmDtype === "float32",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -481,7 +487,10 @@ export const config = {
     {
       // H200, BF16 reference checkpoint (~54GB of weights).
       match: { hw: "h200", variant: "default", quant: "bf16", nodes: "single" },
-      verified: true,
+      // Same verified envelope as the FP8 cell above.
+      verified: (sel) =>
+        sel.spec === "none" && sel.tier === "low-latency" &&
+        sel.ssmDtype === "float32",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -509,8 +518,6 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
-        "--mamba-backend triton",
-        "--linear-attn-backend triton",
         "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
@@ -529,8 +536,6 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
-        "--mamba-backend triton",
-        "--linear-attn-backend triton",
         "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
@@ -549,8 +554,6 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
-        "--mamba-backend triton",
-        "--linear-attn-backend triton",
         "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
@@ -560,10 +563,17 @@ export const config = {
     },
     {
       // RTX 5090 32GB. NVFP4 is the only checkpoint that fits with room to
-      // serve (~16.5GB); FP8 at ~28.5GB is not serviceable past bs<=2 and BF16
-      // does not fit, so neither has a cell. On this card the GDN state pool —
-      // not KV — bounds concurrency: lower S with the Playground's radix-cache
-      // strategy (or turn the prefix cache off for S=1) and recompute the ratio.
+      // serve; FP8 does not boot (total_rest_memory goes negative at every
+      // mem-fraction, measured) and BF16 does not fit, so neither has a cell.
+      // The published operating point is ONE request in flight:
+      // --max-running-requests 1 caps admission at the validated envelope, and
+      // --cuda-graph-max-bs 1 keeps graph capture from taxing the token pool
+      // (the default capture set costs 39,247 -> 37,347 pool tokens and
+      // K 8 -> 7, for batch shapes this card cannot admit anyway). To serve
+      // more concurrency, raise BOTH pins together and re-derive the ratio and
+      // mem-fraction with the calculator — on this card the GDN state pool,
+      // not KV, is what bounds concurrency (lower S via the radix-cache
+      // strategy, or prefix cache off for S=1).
       match: { hw: "rtx5090", variant: "default", quant: "nvfp4", nodes: "single" },
       verified: true,
       env: [],
@@ -573,8 +583,6 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.9",
         "--attention-backend flashinfer",
-        "--mamba-backend triton",
-        "--linear-attn-backend triton",
         "--max-running-requests 1",
         "--cuda-graph-max-bs 1",
         "--reasoning-parser qwen3",
@@ -640,16 +648,23 @@ export const config = {
         "--port {{PORT}}",
       ],
     },
-    // GB300 (SM103), single 288GB GPU. All six cells measured on a 4xGB300
-    // devbox on 2026-08-14 against lmsysorg/sglang:dev @ c4271c3fe1262fc2adbd162c33b25de5255251c5.
+    // GB300 (SM103), single 288GB GPU. The base and MTP arms were measured on
+    // a 4xGB300 devbox on 2026-08-14 against
+    // lmsysorg/sglang:dev @ c4271c3fe1262fc2adbd162c33b25de5255251c5.
     // With no --attention-backend pin, :dev on GB300 resolves attention to
-    // triton (the newer c7c03ec resolves trtllm_mha); the cells keep engine-default
-    // resolution so the benchmark card and the cell see the same kernel. The
-    // `high-throughput` strategy adds the in-checkpoint MTP head
-    // (EAGLE / NEXTN semantics, num-steps 3, topk 1, draft-tokens 4).
+    // triton (the newer c7c03ec resolves trtllm_mha); the cells keep
+    // engine-default resolution so cell and measurement see the same kernel —
+    // which also means the tier/ssmDtype overlays must stay at their
+    // engine-default picks for the badge to read Verified. MTP here is the
+    // Speculative Decoding row's EAGLE option, plain (no ReplaySSM on SM103).
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", nodes: "single" },
-      verified: true,
+      // Verified for the measured arms: no-spec and plain MTP, both at
+      // engine-default strategy/state dtype. DSPARK and the non-default
+      // tier/ssmDtype picks are unmeasured on this card.
+      verified: (sel) =>
+        (sel.spec === "none" || sel.spec === "eagle") &&
+        sel.tier === "low-latency" && sel.ssmDtype === "float32",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -665,7 +680,10 @@ export const config = {
     },
     {
       match: { hw: "gb300", variant: "default", quant: "fp8", nodes: "single" },
-      verified: true,
+      // Same verified envelope as the NVFP4 cell above.
+      verified: (sel) =>
+        (sel.spec === "none" || sel.spec === "eagle") &&
+        sel.tier === "low-latency" && sel.ssmDtype === "float32",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -681,7 +699,10 @@ export const config = {
     },
     {
       match: { hw: "gb300", variant: "default", quant: "bf16", nodes: "single" },
-      verified: true,
+      // Same verified envelope as the NVFP4 cell above.
+      verified: (sel) =>
+        (sel.spec === "none" || sel.spec === "eagle") &&
+        sel.tier === "low-latency" && sel.ssmDtype === "float32",
       env: [],
       flags: [
         "--trust-remote-code",
