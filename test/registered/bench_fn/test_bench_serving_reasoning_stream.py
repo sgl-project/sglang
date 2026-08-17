@@ -79,7 +79,11 @@ class _JSONHandler(BaseHTTPRequestHandler):
 
 
 def _make_chunk(
-    content=None, reasoning_content=None, reasoning=None, completion_tokens=None
+    content=None,
+    reasoning_content=None,
+    reasoning=None,
+    completion_tokens=None,
+    prompt_tokens=None,
 ):
     delta = {}
     if content is not None:
@@ -89,8 +93,15 @@ def _make_chunk(
     if reasoning is not None:
         delta["reasoning"] = reasoning
     chunk = {"choices": [{"index": 0, "delta": delta}]}
-    if completion_tokens is not None:
-        chunk["usage"] = {"completion_tokens": completion_tokens}
+    if completion_tokens is not None or prompt_tokens is not None:
+        chunk["usage"] = {
+            key: value
+            for key, value in (
+                ("completion_tokens", completion_tokens),
+                ("prompt_tokens", prompt_tokens),
+            )
+            if value is not None
+        }
     return chunk
 
 
@@ -215,13 +226,17 @@ class TestBenchServingReasoningStream(CustomTestCase):
     def test_usage_only_stream_chunk_does_not_break(self):
         chunks = [
             _make_chunk(reasoning_content="thinking"),
-            {"choices": [], "usage": {"completion_tokens": 1}},
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 17, "completion_tokens": 1},
+            },
         ]
         out = self._run(chunks)
 
         self.assertTrue(out.success, msg=f"request failed: {out.error}")
         self.assertEqual(out.generated_text, "thinking")
         self.assertGreater(out.ttft, 0.0)
+        self.assertEqual(out.prompt_len, 17)
         self.assertEqual(out.output_len, 1)
 
     def test_content_only_stream_unchanged(self):
@@ -303,13 +318,13 @@ class TestBenchServingReasoningNonStream(CustomTestCase):
             server.server_close()
 
     def test_reasoning_only_non_stream_metrics_retokenize_text(self):
-        out, request_bodies = self._run(
-            _make_response(
-                content=None,
-                reasoning_content="Let me think.",
-                completion_tokens=3,
-            )
+        response = _make_response(
+            content=None,
+            reasoning_content="Let me think.",
+            completion_tokens=3,
         )
+        response["usage"]["prompt_tokens"] = 19
+        out, request_bodies = self._run(response)
 
         self.assertTrue(out.success, msg=f"request failed: {out.error}")
         self.assertEqual(out.generated_text, "Let me think.")
@@ -324,6 +339,7 @@ class TestBenchServingReasoningNonStream(CustomTestCase):
             backend="sglang-oai-chat",
         )
         self.assertEqual(metrics.completed, 1)
+        self.assertEqual(metrics.total_input, 19)
         self.assertEqual(output_lens, [3])
         self.assertEqual(metrics.total_output_retokenized, 3)
 
@@ -342,11 +358,14 @@ class TestBenchServingReasoningNonStream(CustomTestCase):
         self.assertEqual(out.output_len, 2)
 
     def test_content_only_non_stream_unchanged(self):
-        out, _ = self._run(_make_response(content="answer", completion_tokens=1))
+        response = _make_response(content="answer", completion_tokens=1)
+        response["usage"]["prompt_tokens"] = 23
+        out, _ = self._run(response)
 
         self.assertTrue(out.success, msg=f"request failed: {out.error}")
         self.assertEqual(out.generated_text, "answer")
         self.assertGreater(out.ttft, 0.0)
+        self.assertEqual(out.prompt_len, 23)
         self.assertEqual(out.output_len, 1)
 
 

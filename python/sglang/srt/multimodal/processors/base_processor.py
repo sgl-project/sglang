@@ -29,6 +29,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
+    PreprocessCacheLookup,
     PreprocessFingerprintProvider,
     build_processor_fingerprint,
 )
@@ -191,6 +192,7 @@ class MultimodalSpecialTokens:
 
 class BaseMultimodalProcessor(ABC):
     models = []
+    _preprocess_metrics_callback = None
     gpu_image_decode = True  # Enable GPU decoding by default
     prefer_tokenized_input = False
     precompute_hash_before_cpu_transfer = False
@@ -203,6 +205,17 @@ class BaseMultimodalProcessor(ABC):
     # argument overrides this value; zero disables storage and cache-key work.
     auto_mm_preprocess_cache_size_mb = 0
     supports_mm_processor_concurrency = False
+    supports_early_mm_cache = False
+
+    async def lookup_preprocess_cache(
+        self, image_data, request_obj
+    ) -> Optional[PreprocessCacheLookup]:
+        """Return reusable per-media metadata before full preprocessing.
+
+        Processors opt in by overriding this method. The generic serving path
+        remains unaware of model-specific artifact types.
+        """
+        return None
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -254,6 +267,7 @@ class BaseMultimodalProcessor(ABC):
         self.trust_mm_content_hashes = bool(self.server_args.trust_mm_content_hashes)
         # The fingerprint is needed only to build artifact keys. Avoid inspecting
         # processor state when this processor will never retain artifacts.
+        self._preprocess_metrics_callback = None
         self.processor_fingerprint = (
             build_processor_fingerprint(self, hf_config, server_args)
             if self.mm_preprocess_cache.enabled
@@ -421,6 +435,14 @@ class BaseMultimodalProcessor(ABC):
                 self.server_args.base_gpu_id,
                 self.server_args.tp_size,
             )
+
+    def set_preprocess_metrics_callback(self, callback) -> None:
+        self._preprocess_metrics_callback = callback
+
+    def observe_preprocess_phase(self, phase: str, seconds: float) -> None:
+        callback = self._preprocess_metrics_callback
+        if callback is not None:
+            callback(phase, seconds)
 
     @property
     def keep_mm_features_on_device(self) -> bool:

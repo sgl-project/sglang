@@ -2,14 +2,35 @@ import hashlib
 import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Protocol, Sequence, runtime_checkable
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    Optional,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 
 import numpy as np
 import torch
 
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 
 LOCAL_PREPROCESSED_KEY = "encoder_local_preprocessed"
+
+
+@dataclass(frozen=True)
+class EncoderArtifactCacheConfig:
+    """Declarative EPD artifact-cache behavior supplied by a model."""
+
+    modality: Modality
+    auto_cache_size_mb: int = 0
+    per_item_metadata_fields: tuple[str, ...] = ()
+    capture_original_image_sizes: bool = False
+    split_preprocessed_items: bool = False
+    coalesce_same_turn: bool = False
+    default_max_batch_size: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -18,6 +39,19 @@ class EncoderMediaProcessorConfig:
 
     image_decode_mode: bool | str = False
     preserve_media_metadata: bool = False
+    artifact_caches: tuple[EncoderArtifactCacheConfig, ...] = ()
+
+    def artifact_cache_for(
+        self, modality: Modality
+    ) -> Optional[EncoderArtifactCacheConfig]:
+        matches = [
+            config for config in self.artifact_caches if config.modality == modality
+        ]
+        if len(matches) > 1:
+            raise ValueError(
+                f"Duplicate encoder artifact-cache config for {modality.name}"
+            )
+        return matches[0] if matches else None
 
 
 @runtime_checkable
@@ -27,6 +61,31 @@ class EncoderMediaProcessorConfigProvider(Protocol):
     encoder_media_processor_config: EncoderMediaProcessorConfig
 
 
+@runtime_checkable
+class EncoderPreprocessorProvider(Protocol):
+    def preprocess_mm_for_encoder(self, mm_data, modality, config, **kwargs): ...
+
+
+@runtime_checkable
+class EncoderThinkerProvider(Protocol):
+    thinker: Any
+
+
+@runtime_checkable
+class ImageFeatureProvider(Protocol):
+    def get_image_feature(self, items): ...
+
+
+@runtime_checkable
+class VideoFeatureProvider(Protocol):
+    def get_video_feature(self, items): ...
+
+
+@runtime_checkable
+class AudioFeatureProvider(Protocol):
+    def get_audio_feature(self, items): ...
+
+
 def resolve_encoder_media_processor_config(
     model: object,
 ) -> EncoderMediaProcessorConfig:
@@ -34,6 +93,23 @@ def resolve_encoder_media_processor_config(
     if isinstance(model, EncoderMediaProcessorConfigProvider):
         return model.encoder_media_processor_config
     return EncoderMediaProcessorConfig()
+
+
+def resolve_encoder_preprocessor(model):
+    if isinstance(model, EncoderPreprocessorProvider):
+        return model.preprocess_mm_for_encoder
+    return None
+
+
+def resolve_encoder_feature_method(model, modality: Modality):
+    target = model.thinker if isinstance(model, EncoderThinkerProvider) else model
+    if modality == Modality.IMAGE and isinstance(target, ImageFeatureProvider):
+        return target.get_image_feature
+    if modality == Modality.VIDEO and isinstance(target, VideoFeatureProvider):
+        return target.get_video_feature
+    if modality == Modality.AUDIO and isinstance(target, AudioFeatureProvider):
+        return target.get_audio_feature
+    raise TypeError(f"Model does not implement {modality.name.lower()} encoding")
 
 
 def hash_raw_encoder_item(value: Any) -> int:

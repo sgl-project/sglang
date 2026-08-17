@@ -253,6 +253,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
         manager = object.__new__(TokenizerManager)
+        manager._mm_cache_retry_contexts = {}
         transport = MagicMock()
         transport.prepare_for_dispatch.return_value = []
         manager.cuda_vmm_feature_transport = transport
@@ -314,6 +315,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
 
         manager = object.__new__(tokenizer_manager.TokenizerManager)
+        manager._mm_cache_retry_contexts = {}
         transport = MagicMock()
         manager._dispatch_to_scheduler = MagicMock()
         time_stats = MagicMock()

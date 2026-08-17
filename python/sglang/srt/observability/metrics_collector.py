@@ -235,7 +235,6 @@ class SchedulerMetricsCollectorContext:
 
 
 class SchedulerMetricsCollector(_StatLoggerDIMixin):
-
     def __init__(
         self,
         labels: Dict[str, str],
@@ -1619,6 +1618,56 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             documentation="Number of requests aborted.",
             labelnames=labels.keys(),
         )
+        self.mm_preprocess_cache_requests_total = Counter(
+            name="sglang:mm_preprocess_cache_requests_total",
+            documentation="Multimodal preprocess-cache item outcomes.",
+            labelnames=[*labels.keys(), "result"],
+        )
+        self.mm_content_identity_total = Counter(
+            name="sglang:mm_content_identity_total",
+            documentation="Multimodal identities by trust source.",
+            labelnames=[*labels.keys(), "source"],
+        )
+        self.mm_preprocess_phase_seconds = Histogram(
+            name="sglang:mm_preprocess_phase_seconds",
+            documentation="Multimodal identity and processor phase latency.",
+            labelnames=[*labels.keys(), "phase"],
+            buckets=[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5],
+        )
+        self.mm_embedding_cache_acquire_total = Counter(
+            name="sglang:mm_embedding_cache_acquire_total",
+            documentation="Per-item multimodal embedding lease outcomes.",
+            labelnames=[*labels.keys(), "result"],
+        )
+        self.mm_cache_skipped_stages_total = Counter(
+            name="sglang:mm_cache_skipped_stages_total",
+            documentation="Multimodal work skipped by a hot cache hit.",
+            labelnames=[*labels.keys(), "stage"],
+        )
+        self.mm_preprocess_cache_entries = Gauge(
+            name="sglang:mm_preprocess_cache_entries",
+            documentation="Current preprocess-cache entry count.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.mm_preprocess_cache_bytes = Gauge(
+            name="sglang:mm_preprocess_cache_bytes",
+            documentation="Current preprocess-cache CPU bytes.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.mm_preprocess_cache_evictions = Gauge(
+            name="sglang:mm_preprocess_cache_evictions",
+            documentation="Process-local preprocess-cache eviction count.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.mm_preprocess_cache_singleflight_joins = Gauge(
+            name="sglang:mm_preprocess_cache_singleflight_joins",
+            documentation="Process-local preprocess-cache single-flight join count.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
 
         if bucket_time_to_first_token is None:
             bucket_time_to_first_token = [
@@ -1836,6 +1885,41 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
 
     def observe_one_aborted_request(self, labels: Dict[str, str]):
         self.num_aborted_requests_total.labels(**labels).inc(1)
+
+    def record_mm_preprocess_cache(self, result: str, count: int = 1) -> None:
+        self.mm_preprocess_cache_requests_total.labels(
+            **self.labels, result=result
+        ).inc(count)
+
+    def record_mm_content_identity(self, source: str, count: int = 1) -> None:
+        self.mm_content_identity_total.labels(**self.labels, source=source).inc(count)
+
+    def observe_mm_preprocess_phase(self, phase: str, seconds: float) -> None:
+        self.mm_preprocess_phase_seconds.labels(**self.labels, phase=phase).observe(
+            seconds
+        )
+
+    def record_mm_embedding_acquire(self, result: str, count: int = 1) -> None:
+        self.mm_embedding_cache_acquire_total.labels(**self.labels, result=result).inc(
+            count
+        )
+
+    def record_mm_skipped_stage(self, stage: str, count: int = 1) -> None:
+        self.mm_cache_skipped_stages_total.labels(**self.labels, stage=stage).inc(count)
+
+    def set_mm_preprocess_cache_state(
+        self,
+        entries: int,
+        size_bytes: int,
+        evictions: int = 0,
+        singleflight_joins: int = 0,
+    ) -> None:
+        self.mm_preprocess_cache_entries.labels(**self.labels).set(entries)
+        self.mm_preprocess_cache_bytes.labels(**self.labels).set(size_bytes)
+        self.mm_preprocess_cache_evictions.labels(**self.labels).set(evictions)
+        self.mm_preprocess_cache_singleflight_joins.labels(**self.labels).set(
+            singleflight_joins
+        )
 
 
 @dataclass
@@ -2209,6 +2293,51 @@ class EncoderMetricsCollector(_StatLoggerDIMixin):
             documentation="Total files processed (hit + miss).",
             labelnames=list(labels.keys()) + ["modality"],
         )
+        self.preprocess_cache_items_total = Counter(
+            name="sglang:encoder_preprocess_cache_items_total",
+            documentation="Encoder preprocess-cache item outcomes.",
+            labelnames=[*labels.keys(), "result"],
+        )
+        self.content_identity_total = Counter(
+            name="sglang:encoder_content_identity_total",
+            documentation="Encoder media identities by trust source.",
+            labelnames=[*labels.keys(), "source"],
+        )
+        self.cache_skipped_stages_total = Counter(
+            name="sglang:encoder_cache_skipped_stages_total",
+            documentation="Encoder work skipped by preprocess/embedding hits.",
+            labelnames=[*labels.keys(), "stage"],
+        )
+        self.preprocess_phase_seconds = Histogram(
+            name="sglang:encoder_preprocess_phase_seconds",
+            documentation="Encoder identity, decode, and processor phase latency.",
+            labelnames=[*labels.keys(), "phase"],
+            buckets=[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5],
+        )
+        self.preprocess_cache_size_bytes = Gauge(
+            name="sglang:encoder_preprocess_cache_size_bytes",
+            documentation="Current encoder preprocess-cache CPU bytes.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.preprocess_cache_entries = Gauge(
+            name="sglang:encoder_preprocess_cache_entries",
+            documentation="Current encoder preprocess-cache entries.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.preprocess_cache_evictions = Gauge(
+            name="sglang:encoder_preprocess_cache_evictions",
+            documentation="Process-local encoder preprocess-cache eviction count.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.preprocess_cache_singleflight_joins = Gauge(
+            name="sglang:encoder_preprocess_cache_singleflight_joins",
+            documentation="Process-local encoder preprocess-cache single-flight join count.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
 
         # Total encoder requests by modality and status
         self.requests_total = Counter(
@@ -2326,6 +2455,36 @@ class EncoderMetricsCollector(_StatLoggerDIMixin):
     def set_cache_state(self, current_size: int, num_entries: int) -> None:
         self.cache_size_mb.labels(**self.labels).set(current_size / (1024 * 1024))
         self.cache_entries.labels(**self.labels).set(num_entries)
+
+    def record_preprocess_cache(self, result: str, count: int = 1) -> None:
+        self.preprocess_cache_items_total.labels(**self.labels, result=result).inc(
+            count
+        )
+
+    def record_content_identity(self, source: str, count: int = 1) -> None:
+        self.content_identity_total.labels(**self.labels, source=source).inc(count)
+
+    def record_skipped_stage(self, stage: str, count: int = 1) -> None:
+        self.cache_skipped_stages_total.labels(**self.labels, stage=stage).inc(count)
+
+    def observe_preprocess_phase(self, phase: str, seconds: float) -> None:
+        self.preprocess_phase_seconds.labels(**self.labels, phase=phase).observe(
+            seconds
+        )
+
+    def set_preprocess_cache_state(
+        self,
+        entries: int,
+        size_bytes: int,
+        evictions: int = 0,
+        singleflight_joins: int = 0,
+    ) -> None:
+        self.preprocess_cache_entries.labels(**self.labels).set(entries)
+        self.preprocess_cache_size_bytes.labels(**self.labels).set(size_bytes)
+        self.preprocess_cache_evictions.labels(**self.labels).set(evictions)
+        self.preprocess_cache_singleflight_joins.labels(**self.labels).set(
+            singleflight_joins
+        )
 
     def observe_queue_wait(
         self, latency_seconds: float, modality: str = "image"

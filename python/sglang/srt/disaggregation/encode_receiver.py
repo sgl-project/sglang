@@ -84,7 +84,6 @@ class EncoderBootstrapServer:
         health_check_timeout: Optional[float] = None,
         evicted_ttl: Optional[float] = None,
     ):
-
         self.host = host
         self.port = port
         self._urls: List[str] = urls if urls is not None else []
@@ -293,7 +292,6 @@ class EncoderBootstrapServer:
     # Lifecycle                                                          #
     # ------------------------------------------------------------------ #
     def _run_server(self):
-
         config = uvicorn.Config(
             self.app,
             host=self.host,
@@ -485,7 +483,10 @@ _GENERAL_VIDEO_META_ATTRS = (
     "video_timestamps",
     "second_per_grid_ts",
 )
-_GENERAL_IMAGE_META_ATTRS = ("original_image_sizes",)
+_GENERAL_IMAGE_META_ATTRS = (
+    "original_image_sizes",
+    "mm_feature_identities",
+)
 # MiMo-VL audio-in-video fields; appended only when model_type is MiMo.
 _MIMO_VIDEO_AUDIO_META_ATTRS = (
     "video_audio_feature_lens",
@@ -803,7 +804,6 @@ class WaitingImageRequest:
         self.start_time = time.time()
 
     def send_encode_request(self):
-
         async def _send_single_request(session, url, payload):
             try:
                 async with session.post(url, json=payload) as response:

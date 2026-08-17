@@ -433,6 +433,13 @@ class MultimodalPreprocessCache(Generic[K, V]):
         """Wait for another caller's computation without cancelling it."""
         return await asyncio.shield(asyncio.wrap_future(miss.future))
 
+    def record_singleflight_joins(self, count: int) -> None:
+        """Include external work coalesced around this cache in its metrics."""
+        if count < 0:
+            raise ValueError("single-flight join count must be non-negative")
+        with self._lock:
+            self.singleflight_joins += count
+
     def stats(self) -> dict[str, int]:
         """Return a lock-consistent snapshot of cache and single-flight state."""
         with self._lock:

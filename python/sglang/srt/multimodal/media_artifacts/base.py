@@ -24,6 +24,7 @@ media, a prompt-specific ``MultimodalDataItem``, or a ViT embedding-cache entry.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol, runtime_checkable
@@ -32,11 +33,13 @@ import numpy as np
 import torch
 from PIL import Image
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import (
     CacheLookup,
     CacheMiss,
     MediaSnapshot,
+    PreprocessCacheLookup,
     build_artifact_key,
     media_preprocess_kwargs,
     parse_content_hash,
@@ -51,12 +54,13 @@ class MediaArtifact(Protocol):
 
     ``content_digest`` identifies the media contents. ``artifact_key`` also
     includes every preprocessing choice that can change the artifact.
-    ``feature_hash`` becomes ``MultimodalDataItem.hash`` and identifies the
-    corresponding encoder embedding.
+    ``feature_identity`` is the full processor-output identity;
+    ``feature_hash`` is its compact lookup key.
     """
 
     content_digest: str
     artifact_key: str
+    feature_identity: str
     feature_hash: int
 
     @property
@@ -91,6 +95,21 @@ class MediaArtifactInput:
     media: Any
 
 
+class MediaCacheRequest(Protocol):
+    mm_content_hashes: Optional[Sequence[Optional[str]]]
+
+
+@dataclass(frozen=True)
+class MediaArtifactLookup:
+    """Verified media identity and optional cached preprocess artifact."""
+
+    content_digest: str
+    artifact_key: str
+    snapshot: Optional[MediaSnapshot]
+    cached_artifact: Optional[MediaArtifact]
+    identity_source: str
+
+
 class MediaArtifactCacheMixin:
     """Turn media inputs into ordered artifacts, reusing cached work per item.
 
@@ -104,6 +123,15 @@ class MediaArtifactCacheMixin:
 
     artifact_modality: Optional[Modality] = None
     artifact_option_defaults: Mapping[str, Any] = {"detail": "auto"}
+    supports_early_mm_cache = True
+
+    @property
+    def media_artifact_cache_enabled(self) -> bool:
+        """Whether stable artifact identities are available for cache reuse."""
+        return (
+            self.mm_preprocess_cache.enabled
+            and not envs.SGLANG_MM_SKIP_COMPUTE_HASH.get()
+        )
 
     def artifact_preprocess_kwargs(
         self, source: Any, modality: Modality
@@ -205,6 +233,12 @@ class MediaArtifactCacheMixin:
             raise ValueError("prepare_artifact_batch changed the media content digest")
         if artifact.artifact_key != entry.artifact_key:
             raise ValueError("prepare_artifact_batch changed the media artifact key")
+        try:
+            parse_content_hash(artifact.feature_identity)
+        except ValueError as error:
+            raise ValueError(
+                "Media artifact feature_identity must be a SHA-256 digest"
+            ) from error
         if (
             isinstance(artifact.feature_hash, bool)
             or not isinstance(artifact.feature_hash, int)
@@ -218,11 +252,15 @@ class MediaArtifactCacheMixin:
         self, entries: Sequence[MediaArtifactInput]
     ) -> list[MediaArtifact]:
         """Run model preprocessing locally or on the processor worker pool, return the artifact"""
-        if self.mm_processor_executor is None:
-            return self.prepare_artifact_batch(entries)
-        return await self.mm_processor_executor.run(
-            self.prepare_artifact_batch, entries
-        )
+        start = time.perf_counter()
+        try:
+            if self.mm_processor_executor is None:
+                return self.prepare_artifact_batch(entries)
+            return await self.mm_processor_executor.run(
+                self.prepare_artifact_batch, entries
+            )
+        finally:
+            self.observe_preprocess_phase("processor", time.perf_counter() - start)
 
     def _get_cached_artifact(
         self,
@@ -256,6 +294,121 @@ class MediaArtifactCacheMixin:
                 return None
         return artifact
 
+    def _normalize_content_hashes(
+        self,
+        content_hashes: Optional[Sequence[Optional[str]]],
+        media_count: int,
+        modality: Modality,
+    ) -> list[Optional[str]]:
+        if content_hashes is None:
+            content_hashes = [None] * media_count
+        if len(content_hashes) != media_count:
+            raise ValueError(
+                f"mm_content_hashes has {len(content_hashes)} entries for "
+                f"{media_count} {modality.name.lower()} items"
+            )
+        return [parse_content_hash(value) for value in content_hashes]
+
+    async def _lookup_media_artifacts(
+        self,
+        media_data: Sequence[Any],
+        *,
+        content_hashes: Optional[Sequence[Optional[str]]] = None,
+        modality: Optional[Modality] = None,
+    ) -> tuple[MediaArtifactLookup, ...]:
+        """Resolve strict identities and reusable metadata before dispatch."""
+        modality = self._resolve_artifact_modality(modality)
+        content_hashes = self._normalize_content_hashes(
+            content_hashes, len(media_data), modality
+        )
+        lookups: list[Optional[MediaArtifactLookup]] = [None] * len(media_data)
+        read_indices = []
+        for index, (source, caller_hash) in enumerate(zip(media_data, content_hashes)):
+            if self.trust_mm_content_hashes and caller_hash is not None:
+                key = self._artifact_key(caller_hash, source, modality=modality)
+                artifact = self._get_cached_artifact(
+                    key, caller_hash, modality, allow_featureless=True
+                )
+                if artifact is not None:
+                    lookups[index] = MediaArtifactLookup(
+                        content_digest=caller_hash,
+                        artifact_key=key,
+                        snapshot=None,
+                        cached_artifact=artifact,
+                        identity_source="trusted",
+                    )
+                    continue
+            read_indices.append(index)
+
+        futures = {
+            index: self.io_executor.submit(
+                self.snapshot_media_source, media_data[index], modality
+            )
+            for index in read_indices
+        }
+        for index, future in futures.items():
+            snapshot = await asyncio.wrap_future(future)
+            caller_hash = content_hashes[index]
+            if caller_hash is not None and caller_hash != snapshot.content_digest:
+                raise ValueError(
+                    f"content hash mismatch for media_data[{index}]: "
+                    f"expected {caller_hash}, got {snapshot.content_digest}"
+                )
+            key = self._artifact_key(
+                snapshot.content_digest, media_data[index], modality=modality
+            )
+            lookups[index] = MediaArtifactLookup(
+                content_digest=snapshot.content_digest,
+                artifact_key=key,
+                snapshot=snapshot,
+                cached_artifact=self._get_cached_artifact(
+                    key,
+                    snapshot.content_digest,
+                    modality,
+                    allow_featureless=True,
+                ),
+                identity_source="server_computed",
+            )
+
+        if any(lookup is None for lookup in lookups):
+            raise RuntimeError("Artifact identity lookup did not resolve every item")
+        return tuple(lookup for lookup in lookups if lookup is not None)
+
+    async def lookup_preprocess_cache(
+        self, media_data: Sequence[Any], request_obj: MediaCacheRequest
+    ) -> Optional[PreprocessCacheLookup]:
+        """Expose per-media metadata to the scheduler embedding-lease path."""
+        if (
+            not self.media_artifact_cache_enabled
+            or not media_data
+            or any(self._is_preprocessed_input(item) for item in media_data)
+        ):
+            return None
+        lookups = await self._lookup_media_artifacts(
+            media_data,
+            content_hashes=request_obj.mm_content_hashes,
+        )
+        return PreprocessCacheLookup(
+            processor_state=lookups,
+            feature_hashes=tuple(
+                (
+                    lookup.cached_artifact.feature_hash
+                    if lookup.cached_artifact is not None
+                    else None
+                )
+                for lookup in lookups
+            ),
+            feature_identities=tuple(
+                (
+                    lookup.cached_artifact.feature_identity
+                    if lookup.cached_artifact is not None
+                    else None
+                )
+                for lookup in lookups
+            ),
+            identity_sources=tuple(lookup.identity_source for lookup in lookups),
+        )
+
     async def prepare_media_artifacts(
         self,
         media_data: Sequence[Any],
@@ -263,6 +416,7 @@ class MediaArtifactCacheMixin:
         content_hashes: Optional[Sequence[Optional[str]]] = None,
         featureless_hit_mask: Optional[Sequence[bool]] = None,
         modality: Optional[Modality] = None,
+        media_lookups: Optional[Sequence[MediaArtifactLookup]] = None,
     ) -> list[MediaArtifact]:
         """Try resolving one preprocess-cache artifact for each processor input.
 
@@ -279,75 +433,69 @@ class MediaArtifactCacheMixin:
         """
         modality = self._resolve_artifact_modality(modality)
         media_count = len(media_data)
-        if content_hashes is None:
-            content_hashes = [None] * media_count
-        if len(content_hashes) != media_count:
-            raise ValueError(
-                f"mm_content_hashes has {len(content_hashes)} entries for "
-                f"{media_count} {modality.name.lower()} items"
-            )
-        content_hashes = [parse_content_hash(value) for value in content_hashes]
+        content_hashes = self._normalize_content_hashes(
+            content_hashes, media_count, modality
+        )
 
         if featureless_hit_mask is None:
             featureless_hit_mask = [False] * media_count
         if len(featureless_hit_mask) != media_count:
             raise ValueError("featureless_hit_mask must align with media_data")
 
-        # keep per-input state aligned for duplicates and partial hits
-        artifacts: list[Optional[MediaArtifact]] = [None] * media_count
-        snapshots: list[Optional[MediaSnapshot]] = [None] * media_count
-        keys: list[Optional[str]] = [None] * media_count
-
-        # 1. fast path: resolve trusted provided hash hits without reading media
-        # e.g., an image could be submitted with a provided hash:
-        # "image_url": {
-        #    "url": "https://example.com/image.jpg",
-        #    "content_hash": "sha256:<64-hex>"
-        # }
-        load_indices = []
-        for index, (source, caller_hash, allow_featureless) in enumerate(
-            zip(media_data, content_hashes, featureless_hit_mask)
-        ):
-            if self.trust_mm_content_hashes and caller_hash is not None:
-                key = self._artifact_key(caller_hash, source, modality=modality)
-                keys[index] = key
-                artifact = self._get_cached_artifact(
-                    key,
-                    caller_hash,
-                    modality,
-                    allow_featureless=allow_featureless,
-                )
-                if artifact is not None:
-                    artifacts[index] = artifact
-                    continue
-            load_indices.append(index)
-
-        # 2. read cache: build artifact key from media snapshot then try reading cache
-        snapshot_futures = {
-            index: self.io_executor.submit(
-                self.snapshot_media_source, media_data[index], modality
+        if media_lookups is None:
+            media_lookups = await self._lookup_media_artifacts(
+                media_data,
+                content_hashes=content_hashes,
+                modality=modality,
             )
-            for index in load_indices
-        }
-        for index, future in snapshot_futures.items():
-            snapshot = await asyncio.wrap_future(future)
-            caller_hash = content_hashes[index]
-            if caller_hash is not None and caller_hash != snapshot.content_digest:
+        if len(media_lookups) != media_count:
+            raise ValueError("media_lookups must align with media_data")
+
+        # 1. reuse metadata resolved before processor dispatch
+        artifacts: list[Optional[MediaArtifact]] = [None] * media_count
+        snapshots = [lookup.snapshot for lookup in media_lookups]
+        keys = [lookup.artifact_key for lookup in media_lookups]
+        load_indices = []
+        for index, (source, lookup, allow_featureless) in enumerate(
+            zip(media_data, media_lookups, featureless_hit_mask)
+        ):
+            expected_key = self._artifact_key(
+                lookup.content_digest, source, modality=modality
+            )
+            if lookup.artifact_key != expected_key:
+                raise ValueError("Media preprocess options changed after cache lookup")
+            if lookup.cached_artifact is not None and self.artifact_usable(
+                lookup.cached_artifact, allow_featureless=allow_featureless
+            ):
+                self.validate_artifact(
+                    lookup.cached_artifact,
+                    MediaArtifactInput(
+                        lookup.content_digest,
+                        lookup.artifact_key,
+                        modality,
+                        None,
+                    ),
+                )
+                artifacts[index] = lookup.cached_artifact
+            else:
+                load_indices.append(index)
+
+        # 2. a trusted metadata-only hit must read and verify before recompute
+        for index in load_indices:
+            if snapshots[index] is not None:
+                continue
+            snapshot = await asyncio.wrap_future(
+                self.io_executor.submit(
+                    self.snapshot_media_source, media_data[index], modality
+                )
+            )
+            if snapshot.content_digest != media_lookups[index].content_digest:
                 raise ValueError(
-                    f"content hash mismatch for media_data[{index}]: "
-                    f"expected {caller_hash}, got {snapshot.content_digest}"
+                    f"trusted content hash mismatch for media_data[{index}]: "
+                    f"expected {media_lookups[index].content_digest}, "
+                    f"got {snapshot.content_digest}"
                 )
             snapshots[index] = snapshot
-            key = self._artifact_key(
-                snapshot.content_digest, media_data[index], modality=modality
-            )
-            keys[index] = key
-            artifacts[index] = self._get_cached_artifact(
-                key,
-                snapshot.content_digest,
-                modality,
-                allow_featureless=featureless_hit_mask[index],
-            )
 
         # 3. deduplicate misses before decode
         first_index_by_key: dict[str, int] = {}
@@ -430,22 +578,28 @@ class MediaArtifactCacheMixin:
         try:
             # 1. decode (load media) each unique miss
             missed_media = []
-            for missed in misses_to_compute:
-                index = first_index_by_key[missed.key]
-                snapshot = snapshots[index]
-                assert snapshot is not None
-                media = await asyncio.wrap_future(
-                    self.io_executor.submit(
-                        self.decode_media_snapshot, snapshot, modality
+            decode_start = time.perf_counter()
+            try:
+                for missed in misses_to_compute:
+                    index = first_index_by_key[missed.key]
+                    snapshot = snapshots[index]
+                    assert snapshot is not None
+                    media = await asyncio.wrap_future(
+                        self.io_executor.submit(
+                            self.decode_media_snapshot, snapshot, modality
+                        )
                     )
-                )
-                missed_media.append(
-                    MediaArtifactInput(
-                        content_digest=snapshot.content_digest,
-                        artifact_key=missed.key,
-                        modality=modality,
-                        media=media,
+                    missed_media.append(
+                        MediaArtifactInput(
+                            content_digest=snapshot.content_digest,
+                            artifact_key=missed.key,
+                            modality=modality,
+                            media=media,
+                        )
                     )
+            finally:
+                self.observe_preprocess_phase(
+                    "decode", time.perf_counter() - decode_start
                 )
 
             # 2. preprocess all decoded misses as one model batch
@@ -461,12 +615,13 @@ class MediaArtifactCacheMixin:
             ):
                 self.validate_artifact(artifact, entry)
                 previous = previous_metadata.get(missed.key)
-                if (
-                    previous is not None
-                    and previous.feature_hash != artifact.feature_hash
+                if previous is not None and (
+                    previous.feature_identity != artifact.feature_identity
+                    or previous.feature_hash != artifact.feature_hash
                 ):
                     raise ValueError(
-                        "Cached media artifact feature hash changed for identical "
+                        "Cached media artifact feature identity or hash changed for "
+                        "identical "
                         f"identity {missed.key}"
                     )
                 cache_value = artifact.cache_value()
