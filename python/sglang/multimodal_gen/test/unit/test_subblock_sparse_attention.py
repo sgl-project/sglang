@@ -319,6 +319,46 @@ class TestSubBlockNumerics(unittest.TestCase):
         ref = _dense_reference(q, k, v, HEAD_DIM**-0.5)
         self.assertGreater(_cosine(out, ref), 0.999)
 
+    def test_unsorted_ragged_tail_oversubscribes_sms(self):
+        """Make tail-mask ordering observable across multiple SM waves."""
+        if torch.cuda.get_device_capability() != (9, 0):
+            self.skipTest("the reverse-consumption constraint is specific to SM90")
+
+        device = torch.device("cuda")
+        seq_len = self.seq_len + 37
+        shape = (1, seq_len, NUM_HEADS, HEAD_DIM)
+        q = torch.zeros(shape, device=device, dtype=torch.bfloat16)
+        k = torch.zeros_like(q)
+        v = torch.ones_like(q)
+
+        num_blocks = (seq_len + 63) // 64
+        num_tiles = NUM_HEADS * num_blocks
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        self.assertGreater(num_tiles, 2 * num_sms)
+
+        # The SM90 consumer visits slots from high to low and applies the tail
+        # mask to the first block. Put the ragged block in the lowest slot, so
+        # removing the adapter's sort leaves its 27 padded rows unmasked. With
+        # zero Q/K and unit V that changes the output magnitude from 1 to
+        # (7 * 64 + 37) / (8 * 64), which an assert_close cannot overlook.
+        topk = 8
+        tail_block = num_blocks - 1
+        unsorted_blocks = torch.tensor(
+            [tail_block, 0, 1, 2, 3, 4, 5, 6],
+            device=device,
+            dtype=torch.int32,
+        )
+        unsorted_index = (
+            unsorted_blocks.view(1, 1, 1, topk)
+            .expand(1, NUM_HEADS, num_blocks, topk)
+            .clone()
+        )
+        out = _run_subblock_sparse_attention(
+            q, k, v, unsorted_index, topk, HEAD_DIM**-0.5
+        )
+
+        torch.testing.assert_close(out, torch.ones_like(out), rtol=0, atol=2e-3)
+
     def test_routing_finds_the_blocks_that_carry_the_mass(self):
         """At 0.75 sparsity the router must keep the blocks that matter.
 

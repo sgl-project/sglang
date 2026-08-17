@@ -296,10 +296,11 @@ def produce_block_sparse_loads(
     mask_begin, mask_end = split_block_range(curr_mask_block_cnt, split_idx, num_splits)
     mask_empty = mask_begin == mask_end
 
-    # A zero runtime count does not keep CuTe from compiling both sides of the
-    # dynamic branches below. Specialize the mask-only representation here so
-    # the compiler never tries to index a missing full-block list.
-    if const_expr(curr_full_block_idx is None):
+    # Normalization guarantees that the full count and index are both present
+    # or both absent. ``mask_empty`` is a runtime value, so CuTe still traces
+    # both sides of the dynamic branches below; without this specialization,
+    # the full-list side would subscript ``None`` and fail to compile.
+    if const_expr(blocksparse_tensors.full_block_cnt is None):
         kv_producer_state = load_block_list(
             curr_mask_block_idx,
             mask_begin,
@@ -517,7 +518,7 @@ def consume_block_sparse_loads(
                 warp_scheduler_barrier_arrive()
 
         if (
-            const_expr(curr_full_block_idx is not None)
+            const_expr(blocksparse_tensors.full_block_cnt is not None)
             and split_full_block_cnt > 0
         ):
             full_n_block = curr_full_block_idx[full_end - 1]
@@ -593,7 +594,7 @@ def consume_block_sparse_loads(
                 O_should_accumulate = True
 
         if (
-            const_expr(curr_full_block_idx is not None)
+            const_expr(blocksparse_tensors.full_block_cnt is not None)
             and split_full_block_cnt > 0
         ):
             full_n_block = curr_full_block_idx[full_end - 1]

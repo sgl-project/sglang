@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """SubBlock block-sparse attention backend.
 
-Routes FlashInfer's 64-token block-sparse kernel with a K-side sub-block
-log-sum-exp score (see ``backends/subblock_sparse/``). Everything is training-free:
-the router runs before attention and produces the ``q2k_block_index`` the
-kernel consumes.
+Routes the same 64-token SubBlock plan to SGLang's CuTe-DSL block-sparse
+FlashAttention kernel on SM90 or FlashInfer's kernel on SM100. A log-sum-exp
+over query/key sub-block pairs selects the blocks (see ``backends/subblock_sparse/``).
+Everything is training-free: the router runs before attention and produces
+the ``q2k_block_index`` the selected kernel consumes.
 
 Sparsity is not applied everywhere. The early denoise steps settle the layout
 of the sample and tolerate approximation badly, so the backend falls back to
@@ -155,8 +156,10 @@ def _sm90_sparse_attention(
     sparse_tensors = BlockSparseTensorsTorch(
         mask_block_cnt=block_counts,
         mask_block_idx=ordered_index,
-        # There are no always-dense blocks in a SubBlock routing plan. None
-        # lets CuTe eliminate the unused full-block branch at compile time.
+        # There are no always-dense blocks in a SubBlock routing plan. The
+        # block-sparse broadcast pattern records both absent tensors as None
+        # and participates in the compile key, so mask-only and mask+full calls
+        # cannot share a compiled kernel.
         full_block_cnt=None,
         full_block_idx=None,
         block_size=(SUBBLOCK_SPARSE_BLOCK_SIZE, SUBBLOCK_SPARSE_BLOCK_SIZE),
