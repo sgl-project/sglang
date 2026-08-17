@@ -7,7 +7,7 @@ use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
 use crate::proxy::sse::{StreamCapture, StreamEnd};
 use crate::proxy::AbortReason;
-use crate::server::app::{RequestPhase, RequestPhaseCell};
+use crate::server::app::{IngressAt, RequestPhase, RequestPhaseCell};
 use crate::server::app_context::AppContext;
 use crate::server::cache_sim_extend::{self, ReplySource};
 use crate::server::error::ApiError;
@@ -184,6 +184,9 @@ pub(crate) async fn chat_completions(
     // extension) keep working — see `RequestPhaseCell`'s doc comment in
     // `crate::server::app`.
     phase: Option<Extension<Arc<RequestPhaseCell>>>,
+    // Same `Option<...>` rationale as `phase`. Carries the middleware's clock so
+    // the handler can attribute the body read that finished before it started.
+    ingress_at: Option<Extension<IngressAt>>,
     // Body-consuming extractor: MUST stay last. Every extractor before this
     // one must implement `FromRequestParts` (borrows the request head only);
     // `Bytes` is the one `FromRequest` extractor allowed per handler because
@@ -192,7 +195,14 @@ pub(crate) async fn chat_completions(
     // silently receive an empty body.
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
-    chat_completions_inner(ctx, headers, phase.map(|Extension(p)| p), body).await
+    chat_completions_inner(
+        ctx,
+        headers,
+        phase.map(|Extension(p)| p),
+        ingress_at.map(|Extension(a)| a),
+        body,
+    )
+    .await
 }
 
 /// Parse model from body, select a healthy worker via the per-model policy, then
@@ -208,9 +218,15 @@ async fn chat_completions_inner(
     ctx: Arc<AppContext>,
     headers: HeaderMap,
     phase: Option<Arc<RequestPhaseCell>>,
+    ingress_at: Option<IngressAt>,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = std::time::Instant::now();
+    // Captured now, recorded once the model is known (it needs the label). The
+    // span already closed, so holding the value costs nothing and changes it not
+    // at all. `saturating_duration_since` because the two clocks are the same
+    // monotonic source but the ordering is not enforced by the type system.
+    let pre_handler = ingress_at.map(|IngressAt(at)| start.saturating_duration_since(at));
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
     let model_str = probe
@@ -274,6 +290,15 @@ async fn chat_completions_inner(
     // tokenization and the outgoing-body injection below (and PD bootstrap
     // injection). `parse_probe` already validated the object shape.
     let at_pre_tokenize = start.elapsed();
+    // Everything before this point: probe-parse, model/policy/PD resolution.
+    // Cheap on a small body; the term that grows when `parse_probe` has to walk
+    // a multimodal payload.
+    ctx.metrics
+        .observe_resolve(&model_str, at_pre_tokenize.as_secs_f64());
+    if let Some(d) = pre_handler {
+        ctx.metrics
+            .observe_ingress_read(&model_str, d.as_secs_f64());
+    }
     let want_tokens = ctx.tokenizers.has_chat_encoder(&model_str) || policy.needs_request_tokens();
     let request_value: Option<serde_json::Value> = if want_tokens {
         Some(serde_json::from_slice(&body).map_err(|_| {
@@ -788,6 +813,10 @@ async fn chat_completions_inner(
         inject_max_tokens,
     )?;
     let at_post_build = start.elapsed();
+    ctx.metrics.observe_request_build(
+        &metrics_model,
+        at_post_build.saturating_sub(at_post_admit).as_secs_f64(),
+    );
 
     let result = if let Some(decode_worker) = decode_peer {
         // PD-disagg dispatch (Pattern B — spawn prefill, await decode).
@@ -1260,6 +1289,14 @@ async fn chat_completions_inner(
     // before the SSE pump takes over. The pump's own first-byte/drain/exit timing
     // is logged separately as `sse_pump_timing`.
     let at_post_dispatch = start.elapsed();
+    // The router/engine boundary: unlike every phase above it, this span is not
+    // router CPU — it carries the network hop and whatever the engine does
+    // before flushing headers. Recorded for streaming and buffered alike, and
+    // for non-2xx too, so an error-only regression stays visible.
+    ctx.metrics.observe_dispatch(
+        &metrics_model,
+        at_post_dispatch.saturating_sub(at_post_build).as_secs_f64(),
+    );
     if PHASE_LOG_COUNTER
         .fetch_add(1, Ordering::Relaxed)
         .is_multiple_of(PHASE_LOG_SAMPLE)

@@ -152,12 +152,17 @@ async fn plain_chat_forwards_input_ids_and_keeps_messages() {
     );
 }
 
-/// The ingress records `sgl_router_tokenize_seconds` for a request it
-/// tokenizes. The registry unit tests cover the histogram in isolation; only
-/// this asserts the chat handler is wired to it, so deleting the call site or
-/// inverting its gate fails loudly here instead of passing silently.
+/// One buffered request records the whole per-phase breakdown: resolve →
+/// tokenize → build → dispatch. The registry unit tests cover each histogram in
+/// isolation; only this asserts the chat handler is wired to all four, so
+/// deleting a call site or inverting a gate fails loudly here instead of passing
+/// silently.
+///
+/// Buffered, not streaming, on purpose: `ttft_overhead_seconds` and
+/// `ttft_seconds` are streaming-2xx only, so this also pins that the phase
+/// histograms cover the path those two do not.
 #[tokio::test]
-async fn tokenized_request_records_tokenize_seconds() {
+async fn request_records_every_phase_histogram() {
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx(mock.url.clone());
     let status = send(
@@ -171,12 +176,18 @@ async fn tokenized_request_records_tokenize_seconds() {
     assert_eq!(status, StatusCode::OK);
 
     let m = ctx.metrics.render();
-    assert!(
-        m.contains(&format!(
-            r#"sgl_router_tokenize_seconds_count{{model_id="{MODEL}"}} 1"#
-        )),
-        "ingress tokenize must be recorded once for a tokenized request; got:\n{m}"
-    );
+    for name in [
+        "sgl_router_ingress_read_seconds",
+        "sgl_router_resolve_seconds",
+        "sgl_router_tokenize_seconds",
+        "sgl_router_request_build_seconds",
+        "sgl_router_dispatch_seconds",
+    ] {
+        assert!(
+            m.contains(&format!(r#"{name}_count{{model_id="{MODEL}"}} 1"#)),
+            "{name} must be recorded once for one request; got:\n{m}"
+        );
+    }
 }
 
 #[tokio::test]

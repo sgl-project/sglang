@@ -24,7 +24,11 @@
 //! | `sgl_router_request_duration_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_overhead_seconds` | Histogram | `model_id` |
+//! | `sgl_router_ingress_read_seconds` | Histogram | `model_id` |
+//! | `sgl_router_resolve_seconds` | Histogram | `model_id` |
 //! | `sgl_router_tokenize_seconds` | Histogram | `model_id` |
+//! | `sgl_router_request_build_seconds` | Histogram | `model_id` |
+//! | `sgl_router_dispatch_seconds` | Histogram | `model_id` |
 //! | `sgl_router_itl_seconds` | Histogram | `model_id` |
 //! | `sgl_router_responses_total` | Counter | `route`, `method`, `status_code` |
 //! | `sgl_router_overlap_blocks` | Histogram | `model_id` |
@@ -178,17 +182,22 @@ const TTFT_OVERHEAD_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
 ];
 
-/// Histogram bucket upper bounds (seconds) for `sgl_router_tokenize_seconds` —
-/// ingress chat-encode plus tokenize, in isolation.
+/// Histogram bucket upper bounds (seconds) for the router-internal phase
+/// histograms — `sgl_router_resolve_seconds`, `sgl_router_tokenize_seconds`,
+/// `sgl_router_request_build_seconds`.
 ///
-/// Deliberately finer at the bottom than [`TTFT_OVERHEAD_BUCKETS`]: tokenize is
-/// a CPU-bound, sub-millisecond-to-low-millisecond operation on typical prompts,
-/// and the overhead ladder's 1 ms floor puts nearly every healthy sample in the
-/// first bucket, where `histogram_quantile` cannot resolve it. The ladder starts
-/// at 100 µs and still reaches 5 s so a pathological prompt (very long input, or
-/// a cold BPE merge cache under lock contention) lands in a real bucket rather
-/// than `+Inf`.
-const TOKENIZE_BUCKETS: &[f64] = &[
+/// Deliberately finer at the bottom than [`TTFT_OVERHEAD_BUCKETS`]: all three
+/// are CPU-bound, sub-millisecond-to-low-millisecond operations on typical
+/// requests, and the overhead ladder's 1 ms floor puts nearly every healthy
+/// sample in the first bucket, where `histogram_quantile` cannot resolve it. The
+/// ladder starts at 100 µs and still reaches 5 s so a pathological request (a
+/// very long prompt, a cold BPE merge cache under lock contention, a 100 MiB
+/// multimodal body to parse) lands in a real bucket rather than `+Inf`.
+///
+/// `sgl_router_dispatch_seconds` deliberately does NOT use this ladder — it
+/// spans the network and the engine's own queueing, so it belongs on the
+/// coarse-topped [`TTFT_OVERHEAD_BUCKETS`] grid.
+const ROUTER_PHASE_BUCKETS: &[f64] = &[
     0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
 ];
 
@@ -534,6 +543,21 @@ pub struct MetricsRegistry {
     /// which is a strictly wider sample set than `ttft_overhead_seconds`; see
     /// [`Self::observe_tokenize`].
     tokenize_seconds: Mutex<HashMap<String, Histogram>>,
+    /// Edge-middleware entry to handler entry, per model — dominated by the
+    /// request-body read. Precedes every other span, and precedes the handler
+    /// clock that `ttft_overhead_seconds` and `request_duration_seconds` are
+    /// measured from. See [`Self::observe_ingress_read`].
+    ingress_read_seconds: Mutex<HashMap<String, Histogram>>,
+    /// Ingress probe-parse plus model/policy/worker resolution, per model — the
+    /// first term of `ttft_overhead_seconds`, before tokenize.
+    resolve_seconds: Mutex<HashMap<String, Histogram>>,
+    /// Outgoing-body build (id/bootstrap injection, re-serialize), per model —
+    /// the last term of `ttft_overhead_seconds`, after admission.
+    request_build_seconds: Mutex<HashMap<String, Histogram>>,
+    /// Dispatch to upstream response headers, per model — connect, send body,
+    /// wait. The first span that is NOT router-attributable: it contains the
+    /// network and the engine's own queueing. See [`Self::observe_dispatch`].
+    dispatch_seconds: Mutex<HashMap<String, Histogram>>,
     itl_seconds: Mutex<HashMap<String, Histogram>>,
     // Edge responses by route/method/status (incl. early-exit 400/413/503 and the
     // CatchPanicLayer-synthesized 500).
@@ -628,6 +652,10 @@ impl Default for MetricsRegistry {
             ttft_seconds: Default::default(),
             ttft_overhead_seconds: Default::default(),
             tokenize_seconds: Default::default(),
+            ingress_read_seconds: Default::default(),
+            resolve_seconds: Default::default(),
+            request_build_seconds: Default::default(),
+            dispatch_seconds: Default::default(),
             itl_seconds: Default::default(),
             responses_total: Default::default(),
             overlap_blocks: Default::default(),
@@ -997,7 +1025,7 @@ impl MetricsRegistry {
     /// than a zero; an attempt yielding no ids (render failure, no tokenizable
     /// field) IS recorded — a slow *failing* render is worth seeing — so a
     /// sample can be parse-time only. Pair with
-    /// `sgl_router_ingress_tokenize_errors_total`. Uses [`TOKENIZE_BUCKETS`].
+    /// `sgl_router_ingress_tokenize_errors_total`. Uses [`ROUTER_PHASE_BUCKETS`].
     pub fn observe_tokenize(&self, model_id: &str, seconds: f64) {
         // See `observe_request_duration` — drop non-finite before the map.
         if !seconds.is_finite() {
@@ -1006,7 +1034,104 @@ impl MetricsRegistry {
         let mut guard = self.tokenize_seconds.lock();
         let hist = guard
             .entry(model_id.to_owned())
-            .or_insert_with(|| Histogram::new(TOKENIZE_BUCKETS));
+            .or_insert_with(|| Histogram::new(ROUTER_PHASE_BUCKETS));
+        hist.observe(seconds);
+    }
+
+    /// Observe the pre-handler span (seconds) for
+    /// `sgl_router_ingress_read_seconds` — edge-middleware entry to chat-handler
+    /// entry, which is the request-body read plus axum routing and extractor
+    /// overhead.
+    ///
+    /// The only span the handler cannot time itself, because axum finishes the
+    /// `Bytes` extractor before the handler body runs and starts its clock. That
+    /// makes it invisible to `request_duration_seconds` and to every phase
+    /// histogram, so a client uploading a large multimodal body sees latency the
+    /// router reports nowhere. When an upstream observer's time-to-first-token
+    /// exceeds what the router and engine together account for, this is the
+    /// first place to look.
+    ///
+    /// Labelled by model, so it is recorded after model resolution even though
+    /// the span itself ended earlier; the value is captured at handler entry and
+    /// held. Uses [`TTFT_OVERHEAD_BUCKETS`] — a slow client on a large body puts
+    /// this in seconds, well past the phase ladder's 5 s top.
+    pub fn observe_ingress_read(&self, model_id: &str, seconds: f64) {
+        // See `observe_request_duration` — drop non-finite before the map.
+        if !seconds.is_finite() {
+            return;
+        }
+        let mut guard = self.ingress_read_seconds.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(TTFT_OVERHEAD_BUCKETS));
+        hist.observe(seconds);
+    }
+
+    /// Observe ingress resolve cost (seconds) for `sgl_router_resolve_seconds` —
+    /// request receipt to just before tokenize: the minimal `parse_probe` over
+    /// the body, model-id resolution, policy lookup and PD candidate selection.
+    ///
+    /// Recorded for every request that gets far enough to have a model, so a
+    /// request rejected as unknown-model records nothing. Normally microseconds;
+    /// it earns a histogram because `parse_probe` reads a body that may be
+    /// 100 MiB, so this is where an oversized payload shows up before tokenize.
+    pub fn observe_resolve(&self, model_id: &str, seconds: f64) {
+        // See `observe_request_duration` — drop non-finite before the map.
+        if !seconds.is_finite() {
+            return;
+        }
+        let mut guard = self.resolve_seconds.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(ROUTER_PHASE_BUCKETS));
+        hist.observe(seconds);
+    }
+
+    /// Observe outgoing-body build cost (seconds) for
+    /// `sgl_router_request_build_seconds` — admission slot acquired to
+    /// dispatch-ready: `input_ids` / PD `bootstrap_*` injection and the single
+    /// re-serialize of the request body.
+    ///
+    /// Recorded for every ADMITTED request; one shed at admission never reaches
+    /// this point. Scales with body size, not prompt length, so it is the term
+    /// that grows on multimodal traffic while tokenize stays flat.
+    pub fn observe_request_build(&self, model_id: &str, seconds: f64) {
+        // See `observe_request_duration` — drop non-finite before the map.
+        if !seconds.is_finite() {
+            return;
+        }
+        let mut guard = self.request_build_seconds.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(ROUTER_PHASE_BUCKETS));
+        hist.observe(seconds);
+    }
+
+    /// Observe dispatch cost (seconds) for `sgl_router_dispatch_seconds` —
+    /// dispatch-ready to upstream response headers: connect, send body, wait.
+    ///
+    /// The router/engine boundary, and the reason this metric exists. Every
+    /// other phase histogram is router-attributable CPU; this one is not — it
+    /// contains the network hop and whatever the engine does before flushing
+    /// headers, including its own admission queueing. Subtracting the engine's
+    /// self-reported time-to-first-token from this leaves network plus
+    /// engine-side queueing, which is what an unexplained TTFT gap between an
+    /// external observer and the engine usually turns out to be.
+    ///
+    /// Recorded for every request that receives upstream headers, streaming or
+    /// buffered, 2xx or not — deliberately wider than `ttft_overhead_seconds`,
+    /// which is streaming-2xx only, so an error-only regression is still
+    /// visible. Uses [`TTFT_OVERHEAD_BUCKETS`], not [`ROUTER_PHASE_BUCKETS`]:
+    /// under engine saturation this parks for seconds and needs the tall grid.
+    pub fn observe_dispatch(&self, model_id: &str, seconds: f64) {
+        // See `observe_request_duration` — drop non-finite before the map.
+        if !seconds.is_finite() {
+            return;
+        }
+        let mut guard = self.dispatch_seconds.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(TTFT_OVERHEAD_BUCKETS));
         hist.observe(seconds);
     }
 
@@ -1475,6 +1600,76 @@ impl MetricsRegistry {
             let hist = guard.get(model_id).unwrap();
             let label_body = format!("model_id=\"{}\"", escape_label(model_id));
             render_histogram(&mut out, "sgl_router_tokenize_seconds", &label_body, hist);
+        }
+        drop(guard);
+
+        // ingress_read histogram
+        out.push_str(
+            "# HELP sgl_router_ingress_read_seconds Edge-middleware entry to handler entry (request-body read plus routing/extractor overhead), in seconds. Precedes the handler clock, so this span is NOT included in sgl_router_request_duration_seconds or any phase histogram.\n",
+        );
+        out.push_str("# TYPE sgl_router_ingress_read_seconds histogram\n");
+        let guard = self.ingress_read_seconds.lock();
+        let mut models: Vec<&String> = guard.keys().collect();
+        models.sort();
+        for model_id in models {
+            let hist = guard.get(model_id).unwrap();
+            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
+            render_histogram(
+                &mut out,
+                "sgl_router_ingress_read_seconds",
+                &label_body,
+                hist,
+            );
+        }
+        drop(guard);
+
+        // resolve histogram
+        out.push_str(
+            "# HELP sgl_router_resolve_seconds Ingress probe-parse plus model/policy/worker resolution, in seconds; the pre-tokenize term of sgl_router_ttft_overhead_seconds.\n",
+        );
+        out.push_str("# TYPE sgl_router_resolve_seconds histogram\n");
+        let guard = self.resolve_seconds.lock();
+        let mut models: Vec<&String> = guard.keys().collect();
+        models.sort();
+        for model_id in models {
+            let hist = guard.get(model_id).unwrap();
+            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
+            render_histogram(&mut out, "sgl_router_resolve_seconds", &label_body, hist);
+        }
+        drop(guard);
+
+        // request_build histogram
+        out.push_str(
+            "# HELP sgl_router_request_build_seconds Outgoing-body build (input_ids / bootstrap injection and re-serialize) for admitted requests, in seconds; the post-admission term of sgl_router_ttft_overhead_seconds.\n",
+        );
+        out.push_str("# TYPE sgl_router_request_build_seconds histogram\n");
+        let guard = self.request_build_seconds.lock();
+        let mut models: Vec<&String> = guard.keys().collect();
+        models.sort();
+        for model_id in models {
+            let hist = guard.get(model_id).unwrap();
+            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
+            render_histogram(
+                &mut out,
+                "sgl_router_request_build_seconds",
+                &label_body,
+                hist,
+            );
+        }
+        drop(guard);
+
+        // dispatch histogram
+        out.push_str(
+            "# HELP sgl_router_dispatch_seconds Dispatch to upstream response headers (connect, send body, wait), in seconds. NOT router-attributable - contains the network hop and the engine's own queueing before it flushes headers. Recorded for streaming and buffered responses alike.\n",
+        );
+        out.push_str("# TYPE sgl_router_dispatch_seconds histogram\n");
+        let guard = self.dispatch_seconds.lock();
+        let mut models: Vec<&String> = guard.keys().collect();
+        models.sort();
+        for model_id in models {
+            let hist = guard.get(model_id).unwrap();
+            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
+            render_histogram(&mut out, "sgl_router_dispatch_seconds", &label_body, hist);
         }
         drop(guard);
 
@@ -2385,7 +2580,58 @@ mod tests {
         );
         // Both would be indistinguishable on the overhead ladder (floor 1 ms).
         assert_eq!(TTFT_OVERHEAD_BUCKETS[0], 0.001);
-        assert!(TOKENIZE_BUCKETS[0] < TTFT_OVERHEAD_BUCKETS[0]);
+        assert!(ROUTER_PHASE_BUCKETS[0] < TTFT_OVERHEAD_BUCKETS[0]);
+    }
+
+    /// The pre-dispatch path decomposes into resolve + tokenize + admit + build,
+    /// and dispatch carries the span beyond the router. Renders all of them so a
+    /// missing export block fails here rather than as a silently absent series
+    /// on a dashboard.
+    #[test]
+    fn phase_histograms_all_render() {
+        let reg = MetricsRegistry::new();
+        reg.observe_ingress_read("tiny", 0.01);
+        reg.observe_resolve("tiny", 0.0003);
+        reg.observe_tokenize("tiny", 0.002);
+        reg.observe_admission_wait("tiny", 0.5);
+        reg.observe_request_build("tiny", 0.0008);
+        reg.observe_dispatch("tiny", 0.4);
+        let out = reg.render();
+        for name in [
+            "sgl_router_ingress_read_seconds",
+            "sgl_router_resolve_seconds",
+            "sgl_router_tokenize_seconds",
+            "sgl_router_admission_wait_seconds",
+            "sgl_router_request_build_seconds",
+            "sgl_router_dispatch_seconds",
+        ] {
+            assert!(
+                out.contains(&format!("# TYPE {name} histogram")),
+                "{name} must render a TYPE header; got:\n{out}",
+            );
+            assert!(
+                out.contains(&format!(r#"{name}_count{{model_id="tiny"}} 1"#)),
+                "{name} must record one sample; got:\n{out}",
+            );
+        }
+    }
+
+    /// `dispatch` spans the network and the engine's queueing, so it must sit on
+    /// the tall grid — the fine phase ladder tops out at 5 s and would dump a
+    /// saturated engine into `+Inf`, hiding exactly the case worth seeing.
+    #[test]
+    fn dispatch_uses_the_tall_bucket_grid() {
+        let reg = MetricsRegistry::new();
+        reg.observe_dispatch("tiny", 30.0);
+        let out = reg.render();
+        assert!(
+            out.contains(r#"sgl_router_dispatch_seconds_bucket{model_id="tiny",le="30"} 1"#),
+            "a 30 s dispatch must land in a real bucket, not +Inf; got:\n{out}",
+        );
+        assert!(
+            *ROUTER_PHASE_BUCKETS.last().unwrap() < *TTFT_OVERHEAD_BUCKETS.last().unwrap(),
+            "the phase ladder must top out below the dispatch ladder",
+        );
     }
 
     /// Non-finite input must never reach the histogram — same contract as the
