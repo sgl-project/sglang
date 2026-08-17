@@ -66,7 +66,7 @@ pub struct Mm {
     /// Results sidecar. Purged here when a late result arrives for a request
     /// that is no longer parked; otherwise it would leak, since only the
     /// scheduler drain pops entries.
-    pub sidecar: crate::multi_modality::Sidecar,
+    pub sidecar: crate::multi_modality::sidecar::Sidecar,
 }
 
 /// Longest client-supplied rid accepted. It keys the detok table and travels on
@@ -1492,8 +1492,8 @@ mod tests {
         // The worker parks its result, as it always does before MmEncoded.
         ingress.mm.sidecar.park(
             "mm-gone".into(),
-            crate::multi_modality::MmSidecarEntry {
-                features: crate::multi_modality::FeatureStore::Inline(vec![]),
+            crate::multi_modality::sidecar::MmSidecarEntry {
+                features: crate::multi_modality::sidecar::FeatureStore::Inline(vec![]),
                 grids: vec![],
                 hashes: vec![],
                 offsets: vec![],

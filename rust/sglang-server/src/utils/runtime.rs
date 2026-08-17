@@ -52,7 +52,7 @@ pub struct Runtime {
     pub tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>>,
     /// MM results parked between a worker's `MmEncoded` and the scheduler drain
     /// (`Server.take_mm`).
-    pub mm_sidecar: crate::multi_modality::Sidecar,
+    pub mm_sidecar: crate::multi_modality::sidecar::Sidecar,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
@@ -72,10 +72,14 @@ impl Runtime {
     /// MM preprocessing floats over that whole set (rather than owning cores
     /// that idle between bursts) and never preempts the scheduler's reserved
     /// cores.
-    pub fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::multi_modality::Context>) {
+    pub fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::multi_modality::worker::Context>) {
         let mut threads = self.threads.lock().unwrap();
         spawn_pool("mm-worker", None, workers.max(1), &mut threads, |_| {
-            crate::multi_modality::MmWorker::new(self.mm.clone(), self.tm.clone(), ctx.clone())
+            crate::multi_modality::worker::MmWorker::new(
+                self.mm.clone(),
+                self.tm.clone(),
+                ctx.clone(),
+            )
         });
     }
 
@@ -181,7 +185,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
 
     // Shared: MM workers park, the Python drain pops, tm-ingress purges.
-    let mm_sidecar: crate::multi_modality::Sidecar = Default::default();
+    let mm_sidecar: crate::multi_modality::sidecar::Sidecar = Default::default();
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
@@ -312,7 +316,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     });
                 }
                 let rt = builder.build().expect("build api runtime");
-                rt.block_on(api_server::serve(
+                rt.block_on(api_server::app::serve(
                     listener,
                     senders,
                     cfg.rust_server_args.channel_cap,

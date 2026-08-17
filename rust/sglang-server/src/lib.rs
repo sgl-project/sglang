@@ -217,7 +217,7 @@ impl Server {
     /// [`Server::take_mm`]; anything the pipeline cannot serve is rejected back to
     /// the client — there is no Python fallback.
     fn start_mm_workers(&self, spec_json: &str, workers: usize) -> PyResult<()> {
-        let ctx = multi_modality::Context::new(
+        let ctx = multi_modality::worker::Context::new(
             spec_json,
             self.rt.tokenizer.clone(),
             self.rt.mm_sidecar.clone(),
@@ -240,10 +240,12 @@ impl Server {
 
         let res = self.rt.mm_sidecar.take(rid)?;
         let (features, shm_names) = match res.features {
-            multi_modality::FeatureStore::Inline(v) => (Some(v.into_pyarray(py).unbind()), None),
+            multi_modality::sidecar::FeatureStore::Inline(v) => {
+                (Some(v.into_pyarray(py).unbind()), None)
+            }
             // The segments — and the duty to unlink — move to Python here;
             // `materialize()` unlinks after the post-broadcast clone on each rank.
-            multi_modality::FeatureStore::Shm(segments) => (
+            multi_modality::sidecar::FeatureStore::Shm(segments) => (
                 None,
                 Some(segments.into_iter().map(|s| s.into_name()).collect()),
             ),

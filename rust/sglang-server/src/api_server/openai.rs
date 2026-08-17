@@ -17,7 +17,7 @@ mod tools;
 
 pub(super) use template::ChatFormatter;
 
-use super::AppState;
+use super::app::AppState;
 use super::frame::OutputAccumulator;
 use super::guard::AbortGuard;
 use super::submit::submit;

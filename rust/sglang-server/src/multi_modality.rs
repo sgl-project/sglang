@@ -8,15 +8,9 @@
 //! pipeline cannot serve are rejected to the client — no Python fallback.
 
 pub mod payload;
+pub mod sidecar;
+pub mod worker;
 
+// `ShmSegment` never leaves the module — callers see segments only through
+// `FeatureStore`.
 mod shm;
-mod sidecar;
-mod worker;
-
-pub use sidecar::{FeatureStore, Sidecar};
-pub use worker::{Context, MmWorker};
-
-// Only tests construct parked entries from outside the module (`ShmSegment`
-// never leaves it at all — callers see segments only through `FeatureStore`).
-#[cfg(test)]
-pub use sidecar::MmSidecarEntry;

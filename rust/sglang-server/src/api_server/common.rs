@@ -13,7 +13,7 @@ use axum::{
     routing::get,
 };
 
-use super::AppState;
+use super::app::AppState;
 use super::guard::AbortGuard;
 use super::submit::submit;
 use crate::message::config::ServerArgs;

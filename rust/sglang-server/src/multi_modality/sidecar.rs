@@ -10,6 +10,9 @@ use super::shm::{ShmSegment, shm_name};
 /// expanded `input_ids` travel separately, via `TmEvent::MmEncoded`). The qwen
 /// drain shape (`sglang_mm::qwen_vl::pack_drain`); generalizes to a
 /// named-tensor handoff once a family needs a different one.
+///
+/// Constructed from outside the module only by tests; the worker parks every
+/// real entry itself.
 pub struct MmSidecarEntry {
     pub features: FeatureStore,
     pub grids: Vec<[u32; 3]>,

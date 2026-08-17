@@ -25,7 +25,7 @@ use axum::{
 };
 use tokio::sync::mpsc;
 
-use super::AppState;
+use super::app::AppState;
 use super::frame::{
     OutputAccumulator, cumulative_frame_string, frame_value, stream_frame_string, tag_value,
 };
