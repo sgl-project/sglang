@@ -956,6 +956,11 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     @property
+    def last_shared_read_runner(self):
+        # Multi-layer eagle has no draft forward, only draft extend.
+        return self._draft_worker.draft_runner
+
+    @property
     def spec_v2_attn_backends(self) -> tuple:
         return (
             self._target_worker.model_runner.attn_backend,
@@ -1033,7 +1038,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             plan_stream=self.plan_stream,
             plan_stream_ctx=self.plan_stream_ctx,
             topk=self.topk,
-            num_steps=self.speculative_num_steps,
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
             metadata_ready_pre_pad=False,
