@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -237,6 +238,64 @@ def _cutedsl_wrapper_activation_type(activation: str, activation_type_cls: Any) 
     )
 
 
+def _make_per_token_global_scale(input_tensor: torch.Tensor) -> torch.Tensor:
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        current_nvfp4_4over6_config,
+        make_nvfp4_global_scale,
+    )
+
+    return make_nvfp4_global_scale(
+        input_tensor,
+        per_token_activation=True,
+        nvfp4_4over6_config=current_nvfp4_4over6_config(),
+    )
+
+
+def refresh_cutedsl_standard_scales_for_weight_update(
+    layer: torch.nn.Module,
+) -> None:
+    w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+        resolve_cutedsl_standard_scales(layer)
+    )
+    if layer.quant_config.use_per_token_activation:
+        used_input_scale = _make_per_token_global_scale(used_input_scale)
+
+    new_scales = (w1_alpha, fc2_input_scale, w2_alpha)
+    current_scales = layer._cutedsl_scales
+    current_input_scale = layer._cutedsl_input_scale
+
+    # Decode CUDA graphs capture these tensor addresses, so reloads must update
+    # their values without replacing the tensors.
+    if (
+        not isinstance(current_scales, tuple)
+        or len(current_scales) != len(new_scales)
+        or not isinstance(current_input_scale, torch.Tensor)
+    ):
+        raise RuntimeError(
+            "CuTe DSL scale metadata changed during weight reload; "
+            "CUDA graph recapture is required."
+        )
+    scale_pairs = (
+        *zip(current_scales, new_scales),
+        (current_input_scale, used_input_scale),
+    )
+    for current, new in scale_pairs:
+        if (
+            not isinstance(current, torch.Tensor)
+            or current.shape != new.shape
+            or current.dtype != new.dtype
+            or current.device != new.device
+        ):
+            raise RuntimeError(
+                "CuTe DSL scale metadata changed during weight reload; "
+                "CUDA graph recapture is required."
+            )
+
+    with torch.no_grad():
+        for current, new in scale_pairs:
+            current.copy_(new)
+
+
 def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
 
@@ -246,9 +305,10 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     typically runs during the autotune dummy forward under inference_mode().
     We wrap the creation in inference_mode(False) so that those pre-allocated
     buffers are normal tensors -- inference tensors cannot be inplace-updated
-    during later CUDA graph capture, which runs outside inference_mode.
+    during later CUDA graph capture, which runs outside inference_mode. The
+    resolved scale tensors share this scope because reload updates them in place.
     """
-    if getattr(layer, "_cutedsl_wrapper", None) is not None:
+    if layer._cutedsl_wrapper is not None:
         return
 
     try:
@@ -296,14 +356,17 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             output_dtype=layer.moe_runner_config.params_dtype,
             device=str(layer.w13_weight.device),
+            use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
             activation_type=_cutedsl_wrapper_activation_type(
                 layer.moe_runner_config.activation, ActivationType
             ),
         )
 
-    w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
-        resolve_cutedsl_standard_scales(layer)
-    )
+        w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+            resolve_cutedsl_standard_scales(layer)
+        )
+        if layer.quant_config.use_per_token_activation:
+            used_input_scale = _make_per_token_global_scale(used_input_scale)
     layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     layer._cutedsl_input_scale = used_input_scale
 
@@ -356,6 +419,9 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     # v1 only: True when DeepEP pre-quantizes activations to NVFP4.
     use_nvfp4_dispatch: bool = False
 
+    # v2 only: quantize hidden states with per-token dynamic activation scales.
+    use_per_token_activation: bool = False
+
     # v1 only: SBO down-GEMM overlap args.
     down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
 
@@ -385,11 +451,29 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
 
-    x_fp4, x_sf = fp4_quantize(
-        hidden_states,
-        quant_info.a1_scale,
-        sf_vec_size=_FP4_SF_VEC_SIZE,
-        is_sf_swizzled_layout=False,
+    if quant_info.use_per_token_activation:
+        from flashinfer import SfLayout, nvfp4_quantize
+
+        x_fp4, x_sf, per_token_scale = nvfp4_quantize(
+            hidden_states,
+            quant_info.a1_scale,
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
+            backend="cute-dsl",
+        )
+    else:
+        x_fp4, x_sf = fp4_quantize(
+            hidden_states,
+            quant_info.a1_scale,
+            sf_vec_size=_FP4_SF_VEC_SIZE,
+            is_sf_swizzled_layout=False,
+        )
+        per_token_scale = None
+
+    seq_len, hidden_size = hidden_states.shape
+    x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
+    x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
+        seq_len, hidden_size // _FP4_SF_VEC_SIZE
     )
 
     output = quant_info.wrapper.run(
@@ -404,6 +488,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
+        per_token_scale=per_token_scale,
     )
 
     return StandardCombineInput(hidden_states=output)
@@ -444,14 +529,38 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         topk_ids = topk_ids.to(torch.int32)
 
     if x_sf is not None:
+        if quant_info.use_per_token_activation:
+            raise ValueError(
+                "flashinfer_cutedsl per-token activation requires BF16 dispatch "
+                "so the runner can forward per_token_scale to FlashInfer."
+            )
         # NVFP4 dispatch, inputs are already quantized.
         x_fp4 = hidden_states
+        per_token_scale = None
     else:
-        x_fp4, x_sf = fp4_quantize(
-            hidden_states,
-            quant_info.a1_scale,
-            sf_vec_size=_FP4_SF_VEC_SIZE,
-            is_sf_swizzled_layout=False,
+        if quant_info.use_per_token_activation:
+            from flashinfer import SfLayout, nvfp4_quantize
+
+            x_fp4, x_sf, per_token_scale = nvfp4_quantize(
+                hidden_states,
+                quant_info.a1_scale,
+                sfLayout=SfLayout.layout_linear,
+                per_token_activation=True,
+                backend="cute-dsl",
+            )
+        else:
+            x_fp4, x_sf = fp4_quantize(
+                hidden_states,
+                quant_info.a1_scale,
+                sf_vec_size=_FP4_SF_VEC_SIZE,
+                is_sf_swizzled_layout=False,
+            )
+            per_token_scale = None
+
+        seq_len, hidden_size = hidden_states.shape
+        x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
+        x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
+            seq_len, hidden_size // _FP4_SF_VEC_SIZE
         )
 
     output = quant_info.wrapper.run(
@@ -466,6 +575,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
+        per_token_scale=per_token_scale,
     )
 
     # Note: output contains routed expert results; shared_expert is handled separately
