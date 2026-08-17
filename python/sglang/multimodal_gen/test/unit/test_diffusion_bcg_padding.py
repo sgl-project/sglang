@@ -388,6 +388,20 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         ):
             self.assertIn(config_name, BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS)
 
+    def test_ltx_models_are_registered_as_bcg_supported(self):
+        for model_id in (
+            "lightricks/ltx-2",
+            "lightricks/ltx-2.3",
+        ):
+            self.assertIn(model_id, BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
+
+        self.assertIn(
+            "LTX2PipelineConfig", BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
+        )
+        self.assertIn(
+            "LTX23PipelineConfig", BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
+        )
+
     def test_dynamic_varlen_mask_meta_rebuilds_once_per_replay_token(self):
         builder = DynamicVarlenMaskMeta()
         mask = torch.tensor([[True, True, False, False]])
