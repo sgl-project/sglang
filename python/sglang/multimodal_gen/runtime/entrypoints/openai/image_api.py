@@ -329,6 +329,18 @@ async def generations(
                 request, "progressive_levels"
             ),
             progressive_delta=_get_request_field_or_extra(request, "progressive_delta"),
+            selflift_mix_ratio=_get_request_field_or_extra(
+                request, "selflift_mix_ratio"
+            ),
+            selflift_pixel_min=_get_request_field_or_extra(
+                request, "selflift_pixel_min"
+            ),
+            selflift_pixel_max=_get_request_field_or_extra(
+                request, "selflift_pixel_max"
+            ),
+            selflift_noise_shift=_get_request_field_or_extra(
+                request, "selflift_noise_shift"
+            ),
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(

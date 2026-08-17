@@ -59,6 +59,9 @@ class FluxProgressiveDenoisingStage(ProgressiveDenoisingStage):
             tuple[int, int], tuple[torch.Tensor, torch.Tensor]
         ] = {}
 
+    def _supported_progressive_modes(self) -> frozenset[str]:
+        return super()._supported_progressive_modes() | {"selflift"}
+
     # ------------------------------------------------------------------
     # Pack / Unpack overrides
     # ------------------------------------------------------------------

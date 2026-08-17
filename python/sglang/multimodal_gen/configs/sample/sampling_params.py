@@ -210,6 +210,10 @@ class SamplingParams:
     progressive_mode: str = "fullres"
     progressive_levels: int = 1
     progressive_delta: float = 0.01
+    selflift_mix_ratio: float = 0.4
+    selflift_pixel_min: float = 0.7
+    selflift_pixel_max: float = 1.0
+    selflift_noise_shift: float = 0.97
 
     # LongCat-Image parameters
     enable_cfg_renorm: bool = False
@@ -506,10 +510,10 @@ class SamplingParams:
                     f"num_inference_steps must be a positive int, got {self.num_inference_steps!r}"
                 )
 
-        if self.progressive_mode not in ("fullres", "dct", "dct_rewind"):
+        if self.progressive_mode not in ("fullres", "dct", "dct_rewind", "selflift"):
             raise ValueError(
-                "progressive_mode must be one of 'fullres', 'dct', or "
-                f"'dct_rewind', got {self.progressive_mode!r}"
+                "progressive_mode must be one of 'fullres', 'dct', "
+                f"'dct_rewind', or 'selflift', got {self.progressive_mode!r}"
             )
         if (
             isinstance(self.progressive_levels, bool)
@@ -526,6 +530,51 @@ class SamplingParams:
         ):
             raise ValueError(
                 f"progressive_delta must be in (0, 1), got {self.progressive_delta!r}"
+            )
+        if (
+            isinstance(self.selflift_mix_ratio, bool)
+            or not isinstance(self.selflift_mix_ratio, (int, float))
+            or not math.isfinite(float(self.selflift_mix_ratio))
+            or not 0 < float(self.selflift_mix_ratio) <= 1
+        ):
+            raise ValueError(
+                "selflift_mix_ratio must be in (0, 1], "
+                f"got {self.selflift_mix_ratio!r}"
+            )
+        if (
+            isinstance(self.selflift_pixel_min, bool)
+            or not isinstance(self.selflift_pixel_min, (int, float))
+            or not math.isfinite(float(self.selflift_pixel_min))
+            or not 0 <= float(self.selflift_pixel_min) <= 1
+        ):
+            raise ValueError(
+                "selflift_pixel_min must be in [0, 1], "
+                f"got {self.selflift_pixel_min!r}"
+            )
+        if (
+            isinstance(self.selflift_pixel_max, bool)
+            or not isinstance(self.selflift_pixel_max, (int, float))
+            or not math.isfinite(float(self.selflift_pixel_max))
+            or not 0 <= float(self.selflift_pixel_max) <= 1
+        ):
+            raise ValueError(
+                "selflift_pixel_max must be in [0, 1], "
+                f"got {self.selflift_pixel_max!r}"
+            )
+        if float(self.selflift_pixel_min) > float(self.selflift_pixel_max):
+            raise ValueError(
+                "selflift_pixel_min must be <= selflift_pixel_max, got "
+                f"{self.selflift_pixel_min!r} > {self.selflift_pixel_max!r}"
+            )
+        if (
+            isinstance(self.selflift_noise_shift, bool)
+            or not isinstance(self.selflift_noise_shift, (int, float))
+            or not math.isfinite(float(self.selflift_noise_shift))
+            or float(self.selflift_noise_shift) < 0
+        ):
+            raise ValueError(
+                "selflift_noise_shift must be a finite non-negative number, "
+                f"got {self.selflift_noise_shift!r}"
             )
 
         # Numeric hyperparams should not be NaN/Inf and should be within basic ranges.
@@ -1013,14 +1062,15 @@ class SamplingParams:
             help="",
         )
 
-        # Progressive resolution growing (DCT spectral upsampling)
+        # Progressive resolution growing
         add_argument(
             "--progressive-mode",
             type=str,
             dest="progressive_mode",
-            choices=["fullres", "dct", "dct_rewind"],
+            choices=["fullres", "dct", "dct_rewind", "selflift"],
             help="Progressive resolution mode. 'fullres' disables (default). "
-            "'dct_rewind' uses DCT-II upsample + scheduler sigma rewind (recommended).",
+            "'dct_rewind' uses DCT-II upsample + scheduler sigma rewind; "
+            "'selflift' uses the clean-sample latent + pixel transition.",
         )
         add_argument(
             "--progressive-levels",
@@ -1033,6 +1083,31 @@ class SamplingParams:
             type=float,
             dest="progressive_delta",
             help="Noise-dominated tolerance δ for stage-transition thresholds (default: 0.01).",
+        )
+        add_argument(
+            "--selflift-mix-ratio",
+            type=float,
+            dest="selflift_mix_ratio",
+            help="Top-ratio sparse error mask kept for SelfLift mix mode (default: 0.4).",
+        )
+        add_argument(
+            "--selflift-pixel-min",
+            type=float,
+            dest="selflift_pixel_min",
+            help="Minimum pixel-branch weight on selected SelfLift mask entries (default: 0.7).",
+        )
+        add_argument(
+            "--selflift-pixel-max",
+            type=float,
+            dest="selflift_pixel_max",
+            help="Maximum pixel-branch weight on selected SelfLift mask entries (default: 1.0).",
+        )
+        add_argument(
+            "--selflift-noise-shift",
+            type=float,
+            dest="selflift_noise_shift",
+            help="Positive multiplier applied to transition sigma before SelfLift renoising; "
+            "0 disables shifting and keeps the original sigma (default: 0.97).",
         )
 
         add_argument(

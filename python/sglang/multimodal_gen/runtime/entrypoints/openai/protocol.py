@@ -78,6 +78,10 @@ class ImageGenerationsRequest(BaseModel):
     progressive_mode: Optional[str] = None
     progressive_levels: Optional[int] = None
     progressive_delta: Optional[float] = None
+    selflift_mix_ratio: Optional[float] = None
+    selflift_pixel_min: Optional[float] = None
+    selflift_pixel_max: Optional[float] = None
+    selflift_noise_shift: Optional[float] = None
 
 
 # Video API protocol models
@@ -134,6 +138,14 @@ class VideoGenerationsRequest(BaseModel):
     max_sequence_length: Optional[int] = None
     flow_shift: Optional[float] = None
     enable_teacache: Optional[bool] = False
+    # Progressive resolution generation
+    progressive_mode: Optional[str] = None
+    progressive_levels: Optional[int] = None
+    progressive_delta: Optional[float] = None
+    selflift_mix_ratio: Optional[float] = None
+    selflift_pixel_min: Optional[float] = None
+    selflift_pixel_max: Optional[float] = None
+    selflift_noise_shift: Optional[float] = None
     # Frame interpolation
     enable_frame_interpolation: Optional[bool] = False
     frame_interpolation_exp: Optional[int] = 1  # 1=2×, 2=4×

@@ -83,6 +83,9 @@ class QwenImageProgressiveDenoisingStage(ProgressiveDenoisingStage):
             spectrum_beta=QWEN_IMAGE_SPECTRUM_BETA,
         )
 
+    def _supported_progressive_modes(self) -> frozenset[str]:
+        return super()._supported_progressive_modes() | {"selflift"}
+
     # ------------------------------------------------------------------
     # Pack / Unpack overrides
     # ------------------------------------------------------------------
@@ -101,6 +104,23 @@ class QwenImageProgressiveDenoisingStage(ProgressiveDenoisingStage):
         server_args: ServerArgs,
     ) -> torch.Tensor:
         return pack_2x2_latent(x_spatial, h_lat, w_lat)
+
+    def _selflift_spatial_to_vae_latent(
+        self, x_spatial: torch.Tensor, batch: Req, server_args: ServerArgs, vae
+    ) -> torch.Tensor:
+        del batch, server_args, vae
+        return x_spatial.unsqueeze(2)
+
+    def _selflift_vae_latent_to_spatial(
+        self, x_vae: torch.Tensor, batch: Req, server_args: ServerArgs, vae
+    ) -> torch.Tensor:
+        del batch, server_args, vae
+        if x_vae.ndim == 5 and x_vae.shape[2] == 1:
+            return x_vae.squeeze(2)
+        raise RuntimeError(
+            "Qwen-Image SelfLift expected VAE latent [B, C, 1, H, W], got "
+            f"{tuple(x_vae.shape)}"
+        )
 
     # ------------------------------------------------------------------
     # Resolution-change hook
