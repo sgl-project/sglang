@@ -989,6 +989,69 @@ Max ITL (ms):                            1220.68
 ==================================================
 ```
 
+#### 5.2.3 Agentic Long-Context with HiCache DRAM Offload (H200 FP8, MTP)
+
+Long-context agentic workloads (multi-turn coding traces) benefit from
+hierarchical KV cache with host-DRAM offload. On H200 the following
+configuration serves Qwen3.5-397B-A17B-FP8 at TP=8 with EAGLE MTP
+(3 speculative tokens per step) and pushes KV overflow into host DRAM
+through HiCache.
+
+Container image (pinned for reproducibility):
+`lmsysorg/sglang:nightly-dev-cu13-20260815-a5ba081f`.
+
+Server Launch Command:
+```bash Command
+SGLANG_ENABLE_SPEC_V2=1 \
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
+  --served-model-name Qwen/Qwen3.5-397B-A17B-FP8 \
+  --host 0.0.0.0 --port 30000 \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --data-parallel-size 1 \
+  --expert-parallel-size 1 \
+  --quantization fp8 \
+  --kv-cache-dtype fp8_e4m3 \
+  --mamba-ssm-dtype bfloat16 \
+  --attention-backend flashinfer \
+  --enable-flashinfer-allreduce-fusion \
+  --mem-fraction-static 0.8 \
+  --stream-interval 50 \
+  --scheduler-recv-interval 10 \
+  --tokenizer-worker-num 6 \
+  --enable-metrics \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --page-size 64 \
+  --enable-hierarchical-cache \
+  --hicache-size <per_pool_gb> \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first \
+  --hicache-write-policy write_through_selective
+```
+
+`--hicache-size` is per rank per host pool. Size it as
+`floor(total_host_dram_gb / tp / hicache_host_pool_count)` (2 host pools by
+default), leaving headroom for other host allocations.
+
+Throughput measurement with golden acceptance length: to compare systems at
+a fixed MTP acceptance target rather than draft-head quality, pin the
+acceptance length to the published golden curve for
+`num_speculative_tokens=3`, thinking-on (3.39):
+
+```bash Command
+export SGLANG_SIMULATE_ACC_LEN=3.39
+export SGLANG_SIMULATE_ACC_METHOD=match-expected
+export SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token
+```
+
+Leave the `SGLANG_SIMULATE_ACC_*` variables unset for accuracy evaluations;
+they commit drafted tokens regardless of the target logits and would
+generate incorrect text.
+
 ### 5.3 Vision Speed Benchmark
 
 We use SGLang's built-in benchmarking tool to conduct performance evaluation with random images. Each request has 128 input tokens, two 720p images, and 1024 output tokens.
