@@ -380,7 +380,9 @@ jobs:
           fi
 
           # Run NPU test suite with run_suite.py.
-          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log ${LOG_TEE_TARGET} || test_exit_code=$?
+          # Capture mode (--enable-retry --max-attempts 1) keeps test subprocesses off the
+          # tee pipe, so leftover server processes cannot block the pipeline on exit.
+          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log ${LOG_TEE_TARGET} || test_exit_code=$?
 
           echo "Finished test: ${tc_name}"
 
