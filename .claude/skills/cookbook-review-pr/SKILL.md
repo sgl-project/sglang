@@ -106,6 +106,13 @@ than restating.
   should be exactly what the quant chip declares, so absent a recorded
   sign-off in the PR (e.g. carried verbatim from a measured legacy recipe's
   default command), request the flag move to Playground/tips.
+- Verification badge honesty on configs with `overlayDims`: a cell's
+  `verified: true` asserts the badge for EVERY overlay combination, since
+  overlays never re-match the cell. If the PR's stated validation covers only
+  part of the overlay envelope (e.g. defaults only), the cell should use the
+  function form — `verified: (sel) => ...` / `verificationStatus: (sel) => ...`
+  (authoring-reference §2.2) — so unmeasured picks read "Not Verified". Flag a
+  static `true` whose envelope exceeds the recorded measurements.
 - Flag order: `--model-path` first (an optional `--trust-remote-code` may precede it —
   the DSv4 cells do), then parallelism, then MoE, then tuning, `--host`/`--port`
   last (the playground's insert anchors assume this).

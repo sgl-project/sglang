@@ -34,7 +34,7 @@ the full contract):
 | `quantizations` | `{id, label}[]` | 3rd-dim option list. |
 | `strategies` | `{id, label}[]` | 4th-dim option list. Canonical ids: `low-latency` / `balanced` / `high-throughput` (never model-specific ids like `mtp`). **The count follows the page's operating points**: one recipe → a single `balanced`; two → `low-latency` + `high-throughput`; three → the full trio (the ideal). Tiers apply per (hw × variant × quant) combination — a single-recipe combination parks under its semantically honest tier (clear slant → that tier, e.g. DSv4's RTX 6000 → `low-latency`; no slant → `balanced`, e.g. Qwen3.5's Xeon); the page's list is the union and the engine greys unused chips per selection. Never invent a recipe just to fill chips. When two recipes differ by MTP / speculative decoding, the assignment is deterministic: spec ON → `low-latency`, spec OFF → `high-throughput` (at saturation the draft+verify overhead outweighs the speedup — same reason DSv4's high-throughput recipes disable MTP). The recurring markers in the other direction: dp-attention ON (MLA-attention models) and EP / DP+EP ON (MoE models) → `high-throughput`. |
 | `nodesOptions` | `{id, label}[]` | 5th-dim option list. The `id` MUST be `single` or `multi-N` — the engine parses N from the id for `--nnodes`. |
-| `cells` | `{match, verified?, nnodes?, env, flags}[]` | One per supported (hw × match-dim) combination. See §2.2. `nnodes` supplies the node count when the config declares no `nodes` dim (default 1). |
+| `cells` | `{match, verified?, verificationStatus?, nnodes?, env, flags}[]` | One per supported (hw × match-dim) combination. See §2.2. `nnodes` supplies the node count when the config declares no `nodes` dim (default 1). `verified` is a boolean; `verificationStatus` overrides it with `"verified" \| "in-progress" \| "unverified"`. Either may instead be a **function of the full selection** (match + overlay dims) for recipes whose validation covers only part of their overlay envelope — see §2.2. |
 | `modelNames` | `{[key]: string}` | HF slug lookup. Keys are either `hw\|variant\|quant` (most specific) or `variant\|quant` (fallback). |
 | `placeholders` | `{[key]: {target, label, default?}}` | `{{KEY}}` interpolation map for command + curl. `target` is `'command'` or `'curl'`. Editable through the Env modal. |
 | `curl` | string | cURL template. Uses `{{MODEL_NAME}}` + placeholder keys. |
@@ -95,7 +95,17 @@ Each cell describes one verified (or auto-estimated) launch recipe.
 {
   match: { hw: "b200", variant: "flash", quant: "fp4",
            strategy: "low-latency", nodes: "single" },
-  verified: true,                  // green "Verified" badge; absence = yellow
+  verified: true,                  // green "Verified" badge; absence = yellow.
+                                   // May also be a FUNCTION of the selection
+                                   // when the cell's validation covers only
+                                   // part of its overlay envelope, e.g.
+                                   //   verified: (sel) =>
+                                   //     sel.tier === "low-latency" &&
+                                   //     sel.spec === "none",
+                                   // so an unmeasured overlay pick reads
+                                   // "Not Verified" instead of borrowing the
+                                   // cell's badge. Same for verificationStatus
+                                   // (return a status id string).
   env: [
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024",
   ],
