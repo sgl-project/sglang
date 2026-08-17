@@ -74,7 +74,12 @@ def should_use_zmq(server_args) -> bool:
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 
-_LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens"})
+_LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens", "prefix_affinity"})
+
+
+def is_load_aware_method(method: str) -> bool:
+    """Whether ``method`` requires fresh per-rank load snapshots to dispatch."""
+    return method.lower() in _LOAD_AWARE_METHODS
 
 
 def _tokenizer_load_snapshot_owner_caller(server_args) -> str:
@@ -117,7 +122,7 @@ def zmq_reader_owner(server_args, caller: str) -> bool:
     tokenizer_owner = _tokenizer_load_snapshot_owner_caller(server_args)
     if server_args.dp_size == 1:
         return caller == tokenizer_owner
-    if server_args.load_balance_method.lower() in _LOAD_AWARE_METHODS:
+    if is_load_aware_method(server_args.load_balance_method):
         return caller == "DataParallelController"
     return caller == tokenizer_owner
 
