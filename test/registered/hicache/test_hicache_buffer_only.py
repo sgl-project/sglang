@@ -20,6 +20,8 @@ admission-time load-back path); init_hicache rejects Mamba trees.
 Model selection: CI uses the SWA default below; local runs on machines
 without HF access can override via
     SGLANG_TEST_HICACHE_SWA_MODEL=<path>      (SWA hybrid class)
+The override must be a hybrid-SWA model that selects the unified radix
+tree (see the note at DEFAULT_SWA_MODEL).
 
 Usage:
     python3 -m pytest test/registered/hicache/test_hicache_buffer_only.py -v
@@ -40,17 +42,17 @@ from sglang.benchmark.utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
+    CustomTestCase,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
     popen_launch_server,
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-small")
 
-DEFAULT_SWA_MODEL = "google/gemma-3-1b-it"
+DEFAULT_SWA_MODEL = "google/gemma-4-E2B-it"
 
 
 class BufferOnlyBaseMixin:
