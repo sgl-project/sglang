@@ -1030,19 +1030,6 @@ python3 -m sglang.launch_server \
 
 `--hicache-size` is per-rank, per-host-pool GB.
 
-Here is how to pin the golden MTP acceptance length (3.39 at 3 speculative
-tokens, thinking-on):
-
-```bash Command
-export SGLANG_SIMULATE_ACC_LEN=3.39
-export SGLANG_SIMULATE_ACC_METHOD=match-expected
-export SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token
-```
-
-Leave the `SGLANG_SIMULATE_ACC_*` variables unset for accuracy evaluations;
-they commit drafted tokens regardless of the target logits and would
-generate incorrect text.
-
 ### 5.3 Vision Speed Benchmark
 
 We use SGLang's built-in benchmarking tool to conduct performance evaluation with random images. Each request has 128 input tokens, two 720p images, and 1024 output tokens.
