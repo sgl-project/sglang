@@ -243,6 +243,12 @@ pub(crate) fn build_text_generate_dict(
     if let Some(ref session_id) = req.session_id {
         d.insert("session_id".into(), serde_json::json!(session_id));
     }
+    if let Some(ref ngram_corpus_id) = req.ngram_corpus_id {
+        d.insert(
+            "ngram_corpus_id".into(),
+            serde_json::json!(ngram_corpus_id),
+        );
+    }
     insert_generation_controls(
         &mut d,
         req.priority,
@@ -296,6 +302,12 @@ pub(crate) fn build_generate_dict(
     }
     if let Some(ref session_id) = req.session_id {
         d.insert("session_id".into(), serde_json::json!(session_id));
+    }
+    if let Some(ref ngram_corpus_id) = req.ngram_corpus_id {
+        d.insert(
+            "ngram_corpus_id".into(),
+            serde_json::json!(ngram_corpus_id),
+        );
     }
     insert_generation_controls(
         &mut d,
@@ -462,6 +474,7 @@ mod tests {
             priority: Some(3),
             require_reasoning: Some(false),
             max_thinking_tokens: Some(128),
+            ngram_corpus_id: Some("docs".into()),
             ..Default::default()
         };
         let token_request = proto::GenerateRequest {
@@ -472,6 +485,7 @@ mod tests {
             priority: Some(3),
             require_reasoning: Some(false),
             max_thinking_tokens: Some(128),
+            ngram_corpus_id: Some("docs".into()),
             ..Default::default()
         };
 
@@ -482,6 +496,7 @@ mod tests {
             assert_eq!(mapped["priority"], serde_json::json!(3));
             assert_eq!(mapped["require_reasoning"], serde_json::json!(false));
             assert_eq!(mapped["max_thinking_tokens"], serde_json::json!(128));
+            assert_eq!(mapped["ngram_corpus_id"], serde_json::json!("docs"));
             assert_eq!(
                 mapped["sampling_params"]["sampling_seed"],
                 serde_json::json!(42)
@@ -495,6 +510,7 @@ mod tests {
             assert!(!mapped.contains_key("priority"));
             assert!(!mapped.contains_key("require_reasoning"));
             assert!(!mapped.contains_key("max_thinking_tokens"));
+            assert!(!mapped.contains_key("ngram_corpus_id"));
         }
     }
 

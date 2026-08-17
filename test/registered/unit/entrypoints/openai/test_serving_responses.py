@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from openai.types.responses import (
     ResponseOutputMessage,
@@ -293,6 +293,7 @@ class ReasoningRequestForwardingTestCase(unittest.TestCase):
             input="answer",
             request_id="resp_reasoning",
             store=False,
+            ngram_corpus_id="docs",
         )
 
         with (
@@ -308,7 +309,47 @@ class ReasoningRequestForwardingTestCase(unittest.TestCase):
 
         self.assertEqual(response.status, "completed")
         self.assertFalse(captured["adapted_request"].require_reasoning)
+        self.assertEqual(captured["adapted_request"].ngram_corpus_id, "docs")
         self.assertFalse(parser_cls.call_args.kwargs["force_reasoning"])
+
+    def test_builtin_tool_followup_preserves_ngram_corpus_id(self):
+        from sglang.srt.managers.io_struct import GenerateReqInput
+
+        serving = make_serving()
+        submitted = []
+
+        async def generate_request(request, raw_request):
+            submitted.append(request)
+            yield {"text": f"turn-{len(submitted)}"}
+
+        serving.tokenizer_manager.generate_request = generate_request
+        context = Mock()
+        context.need_builtin_tool_call.side_effect = [True, False]
+        context.call_tool = AsyncMock(return_value={"tool": "result"})
+        context.render_for_completion.return_value = [7, 8, 9]
+        adapted = GenerateReqInput(
+            input_ids=[1, 2, 3],
+            sampling_params={"max_new_tokens": 8},
+            ngram_corpus_id="docs",
+        )
+
+        async def consume():
+            return [
+                item
+                async for item in serving._generate_with_builtin_tools(
+                    "resp_tools",
+                    None,
+                    adapted,
+                    adapted.sampling_params,
+                    context,
+                )
+            ]
+
+        asyncio.run(consume())
+
+        self.assertEqual(len(submitted), 2)
+        self.assertEqual(submitted[0].ngram_corpus_id, "docs")
+        self.assertEqual(submitted[1].ngram_corpus_id, "docs")
 
 
 class SkipSpecialTokensForwardingTestCase(CustomTestCase):

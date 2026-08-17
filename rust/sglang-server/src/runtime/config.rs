@@ -83,6 +83,14 @@ pub struct ServerArgs {
     pub log_level: String,
     #[serde(default)]
     pub log_level_http: Option<String>,
+    /// Bearer keys protecting the HTTP API. Most Rust endpoints do not yet
+    /// implement the Python server's auth middleware, but privileged routes
+    /// must still consume these values rather than becoming an unauthenticated
+    /// side door when either key is configured.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub admin_api_key: Option<String>,
     /// Optional built-in chat-template name or path to a Jinja/legacy JSON
     /// template file. Without an override, uses the tokenizer config template.
     #[serde(default)]
@@ -116,6 +124,19 @@ pub struct ServerArgs {
     /// see [`Self::enable_pd_bootstrap`].)
     #[serde(default = "default_disaggregation_mode")]
     pub disaggregation_mode: String,
+    /// Pipeline-parallel stages. Dynamic external-corpus controls cannot be
+    /// acknowledged safely across PP's point-to-point request forwarding yet.
+    #[serde(default = "default_worker_num")]
+    pub pp_size: usize,
+    /// Data-parallel replicas expose independent Rust HTTP ports. Until a
+    /// control-plane fan-out exists, one request cannot update every replica.
+    #[serde(default = "default_worker_num")]
+    pub dp_size: usize,
+    /// Speculative decoding backend selected by Python after argument
+    /// normalization (for example `"NGRAM"`). External-corpus controls are
+    /// meaningful only for the NGRAM backend.
+    #[serde(default)]
+    pub speculative_algorithm: Option<String>,
     /// The resolved Python `ModelConfig`, attached to the blob at dump time.
     #[serde(default)]
     pub model_config: ModelConfig,
@@ -144,6 +165,14 @@ pub struct ServerArgs {
     pub version: Option<String>,
     #[serde(default)]
     pub max_total_num_tokens: Option<u64>,
+    /// Zero disables dynamic external-corpus loading. Positive values reserve
+    /// this many speculative draft slots for the selected external SAM.
+    #[serde(default)]
+    pub speculative_ngram_external_sam_budget: usize,
+    /// Per-server upper bound applied before external corpus chunks enter the
+    /// scheduler. The scheduler enforces its remaining global budget as well.
+    #[serde(default = "default_external_corpus_max_tokens")]
+    pub speculative_ngram_external_corpus_max_tokens: usize,
 }
 
 /// The slice of the resolved Python `ModelConfig` the rust server reads.
@@ -218,6 +247,10 @@ fn default_disaggregation_mode() -> String {
 }
 fn default_worker_num() -> usize {
     1
+}
+
+fn default_external_corpus_max_tokens() -> usize {
+    10_000_000
 }
 
 impl ServerArgs {

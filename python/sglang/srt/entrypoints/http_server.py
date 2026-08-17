@@ -62,6 +62,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
+from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr
 
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
@@ -114,6 +115,7 @@ from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
+    AddExternalCorpusReqInput,
     AbortReq,
     AttachHiCacheStorageReqInput,
     CheckWeightsReqInput,
@@ -961,19 +963,45 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
     )
 
 
+class AddExternalCorpusRequest(BaseModel):
+    """Strict transport schema for external corpus uploads.
+
+    Cross-field and token semantic validation is centralized in the tokenizer
+    manager so non-HTTP entry paths behave identically.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    corpus_id: Optional[StrictStr] = None
+    file_path: Optional[StrictStr] = None
+    documents: Optional[List[StrictStr]] = None
+    token_chunks: Optional[List[List[StrictInt]]] = None
+
+
+class RemoveExternalCorpusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    corpus_id: StrictStr
+
+
 @app.post("/add_external_corpus")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def add_external_corpus(request: Request):
-    """Add an external corpus for ngram speculative decoding."""
-    from sglang.srt.managers.io_struct import AddExternalCorpusReqInput
+async def add_external_corpus(
+    body: Annotated[AddExternalCorpusRequest, Body()],
+):
+    """Add an external corpus for NGRAM speculative decoding.
 
-    try:
-        obj = AddExternalCorpusReqInput(**(await request.json()))
-    except TypeError as e:
-        return ORJSONResponse(
-            {"success": False, "message": str(e)},
-            status_code=HTTPStatus.BAD_REQUEST,
-        )
+    Provide exactly one source. ``token_chunks`` preserves token IDs verbatim;
+    use ``-2147483648`` between documents when a boundary is required.
+    """
+    # Pass the validated containers through directly; model_dump() would build
+    # another nested token list before the tokenizer manager sees it.
+    obj = AddExternalCorpusReqInput(
+        corpus_id=body.corpus_id,
+        file_path=body.file_path,
+        documents=body.documents,
+        token_chunks=body.token_chunks,
+    )
     result = await _global_state.tokenizer_manager.add_external_corpus(obj)
     return ORJSONResponse(
         {
@@ -988,16 +1016,18 @@ async def add_external_corpus(request: Request):
 
 @app.post("/remove_external_corpus")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def remove_external_corpus(request: Request):
+async def remove_external_corpus(
+    body: Annotated[RemoveExternalCorpusRequest, Body()],
+):
     """Remove an external corpus by ID."""
-    body = await request.json()
-    corpus_id = body.get("corpus_id")
-    if not corpus_id:
+    if not body.corpus_id:
         return ORJSONResponse(
             {"success": False, "message": "corpus_id is required."},
             status_code=HTTPStatus.BAD_REQUEST,
         )
-    result = await _global_state.tokenizer_manager.remove_external_corpus(corpus_id)
+    result = await _global_state.tokenizer_manager.remove_external_corpus(
+        body.corpus_id
+    )
     return ORJSONResponse(
         {"success": result.success, "message": result.message},
         status_code=200 if result.success else HTTPStatus.BAD_REQUEST,

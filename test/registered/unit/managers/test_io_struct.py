@@ -566,6 +566,38 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "should be a string"):
                     req.normalize_batch_and_arguments()
 
+    def test_ngram_corpus_id_normalization(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            ngram_corpus_id=["docs", None],
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.ngram_corpus_id, ["docs", None] * 2)
+        self.assertEqual(req[0].ngram_corpus_id, "docs")
+        self.assertIsNone(req[1].ngram_corpus_id)
+
+        req = GenerateReqInput(
+            text=["Hello", "World"], ngram_corpus_id="", sampling_params=[{}, {}]
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.ngram_corpus_id, ["", ""])
+
+        with self.assertRaisesRegex(ValueError, "single request"):
+            GenerateReqInput(
+                text="Hello", ngram_corpus_id=["docs"]
+            ).normalize_batch_and_arguments()
+
+        with self.assertRaisesRegex(ValueError, "string or None"):
+            GenerateReqInput(
+                text=["Hello", "World"], ngram_corpus_id=["docs", 1]
+            ).normalize_batch_and_arguments()
+
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            GenerateReqInput(
+                text=["Hello", "World"], ngram_corpus_id=["docs"]
+            ).normalize_batch_and_arguments()
+
     def test_logprob_parameters_normalization(self):
         """Test normalization of logprob-related parameters."""
         # Test single example

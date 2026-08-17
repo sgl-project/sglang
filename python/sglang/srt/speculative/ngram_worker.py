@@ -256,6 +256,9 @@ class NGRAMWorker(BaseSpecWorker):
         req_ids = []
         batch_tokens = []
         total_lens = []
+        # Keep the legacy all-SAM fast path allocation-free. Build an aligned
+        # selector list lazily only when one request explicitly selects a corpus.
+        corpus_ids: Optional[List[Optional[str]]] = None
         assert len(batch.reqs) == len(self.prev_accept_lens)
         # Overlap mode processes results one iteration behind, so the last
         # round's accepted tokens are not yet in req.output_ids and must be
@@ -263,8 +266,7 @@ class NGRAMWorker(BaseSpecWorker):
         # results before the next draft prep, so output_ids is already
         # complete and splicing would duplicate the tail.
         use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
-        i = 0
-        for req in batch.reqs:
+        for i, req in enumerate(batch.reqs):
             prev_tokens = (
                 self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
                 if use_prev_tokens
@@ -277,12 +279,15 @@ class NGRAMWorker(BaseSpecWorker):
             )
             req_ids.append(req.rid)
             batch_tokens.append(check_token)
-            i += 1
+            if corpus_ids is not None:
+                corpus_ids.append(req.ngram_corpus_id)
+            elif req.ngram_corpus_id is not None:
+                corpus_ids = [None] * i + [req.ngram_corpus_id]
             total_lens.append(
                 len(req.origin_input_ids) + len(req.output_ids) + len(prev_tokens)
             )
         req_drafts, mask = self.ngram_corpus.batch_get(
-            req_ids, batch_tokens, total_lens
+            req_ids, batch_tokens, total_lens, corpus_ids
         )
         total_draft_token_num = len(req_drafts)
 

@@ -23,7 +23,7 @@ from sglang.test.test_utils import CustomTestCase
 VOCAB = 1 << 20
 
 
-def _recv(rid, input_ids, max_new_tokens=8):
+def _recv(rid, input_ids, max_new_tokens=8, ngram_corpus_id=None):
     return SimpleNamespace(
         rid=rid,
         input_ids=array("q", input_ids),
@@ -47,6 +47,7 @@ def _recv(rid, input_ids, max_new_tokens=8):
         routing_key=None,
         extra_key=None,
         cache_salt=None,
+        ngram_corpus_id=ngram_corpus_id,
         http_worker_ipc=None,
         time_stats=None,
     )
@@ -99,6 +100,14 @@ class TestSessionTokenShare(CustomTestCase):
         r3 = self._create("r3", [9])
         self.assertEqual(list(r3.origin_input_ids), in1 + out1 + in2 + out2 + [9])
         self.assertEqual(list(r3.full_untruncated_fill_ids), list(r3.origin_input_ids))
+
+    def test_ngram_corpus_id_is_preserved_when_session_rebuilds_req(self):
+        req = self.session.create_req(
+            _recv("r1", [1, 2, 3], ngram_corpus_id="docs"),
+            tokenizer=None,
+            vocab_size=VOCAB,
+        )
+        self.assertEqual(req.ngram_corpus_id, "docs")
 
     def test_mid_turn_abort_then_continue(self):
         in1, out1 = list(range(200, 210)), [1, 2, 3]

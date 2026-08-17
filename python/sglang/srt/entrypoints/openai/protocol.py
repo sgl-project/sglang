@@ -390,6 +390,8 @@ class CompletionRequest(BaseModel):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    # External NGRAM corpus selector. A scalar broadcasts across a prompt batch.
+    ngram_corpus_id: Optional[Union[List[Optional[str]], str]] = None
     # Priority for the request
     priority: Optional[int] = None
 
@@ -860,6 +862,8 @@ class ChatCompletionRequest(BaseModel):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    # External NGRAM corpus selector for this chat request.
+    ngram_corpus_id: Optional[str] = None
     # Priority for the request
     priority: Optional[int] = None
 
@@ -1548,6 +1552,9 @@ class ResponsesRequest(BaseModel):
     )
     cache_salt: Optional[str] = Field(
         default=None, description="Cache salt for request caching"
+    )
+    ngram_corpus_id: Optional[str] = Field(
+        default=None, description="External NGRAM corpus selector"
     )
 
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.

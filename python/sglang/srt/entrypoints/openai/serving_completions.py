@@ -97,6 +97,23 @@ class OpenAIServingCompletion(OpenAIServingBase):
         else:
             prompt_kwargs = {"input_ids": prompt}
 
+        # The OpenAI field may use a one-element list for a single prompt, while
+        # the native single-request schema expects a scalar selector.
+        ngram_corpus_id = request.ngram_corpus_id
+        if (
+            (
+                isinstance(prompt, str)
+                or (
+                    isinstance(prompt, list)
+                    and prompt
+                    and isinstance(prompt[0], int)
+                )
+            )
+            and isinstance(ngram_corpus_id, list)
+            and len(ngram_corpus_id) == 1
+        ):
+            ngram_corpus_id = ngram_corpus_id[0]
+
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
 
@@ -130,6 +147,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             session_id=request.session_id,
             extra_key=request.extra_key,
             cache_salt=request.cache_salt,
+            ngram_corpus_id=ngram_corpus_id,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,

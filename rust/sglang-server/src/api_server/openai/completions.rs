@@ -18,6 +18,7 @@ use dynamo_protocols::types::{
     CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
 use futures::StreamExt;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
@@ -34,6 +35,14 @@ use crate::message::{
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new().route("/v1/completions", post(completions))
+}
+
+#[derive(Deserialize)]
+struct CompletionRequestWithExtensions {
+    #[serde(flatten)]
+    request: CreateCompletionRequest,
+    #[serde(default)]
+    ngram_corpus_id: Option<OneOrMany<Option<String>>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -59,10 +68,10 @@ pub(super) struct ChoiceExtensions {
 
 async fn completions(
     State(state): State<AppState>,
-    body: Result<Json<CreateCompletionRequest>, JsonRejection>,
+    body: Result<Json<CompletionRequestWithExtensions>, JsonRejection>,
 ) -> Response {
-    let request = match body {
-        Ok(Json(request)) => request,
+    let (request, ngram_corpus_id) = match body {
+        Ok(Json(body)) => (body.request, body.ngram_corpus_id),
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
@@ -115,6 +124,22 @@ async fn completions(
             return openai_error(StatusCode::BAD_REQUEST, &message, false);
         }
     };
+    let ngram_corpus_ids = match ngram_corpus_id {
+        None => vec![None; prompts.len()],
+        Some(OneOrMany::One(value)) => vec![value; prompts.len()],
+        Some(OneOrMany::Many(values)) if values.len() == prompts.len() => values,
+        Some(OneOrMany::Many(values)) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "ngram_corpus_id list length {} does not match prompt count {}",
+                    values.len(),
+                    prompts.len()
+                ),
+                false,
+            );
+        }
+    };
     let mut sampling = match completion_sampling_params(&request) {
         Ok(sampling) => sampling,
         Err(message) => {
@@ -148,7 +173,11 @@ async fn completions(
     let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut submitted = Vec::with_capacity(choice_count);
 
-    for (prompt_index, prompt) in prompts.into_iter().enumerate() {
+    for (prompt_index, (prompt, ngram_corpus_id)) in prompts
+        .into_iter()
+        .zip(ngram_corpus_ids)
+        .enumerate()
+    {
         let (text, input_ids, mut prompt_echo) = match prompt {
             PromptSpec::Text(text) => {
                 let prompt_echo = if echo { text.clone() } else { String::new() };
@@ -182,6 +211,7 @@ async fn completions(
                 },
                 top_logprobs_num: request.logprobs.unwrap_or(0) as i64,
                 return_text_in_logprobs: request.logprobs.map(|_| true),
+                ngram_corpus_id: ngram_corpus_id.clone(),
                 ..Default::default()
             };
             let rx = match submit_generation(&state, native, stream, &mut guard).await {
@@ -733,13 +763,14 @@ fn append_top_logprobs(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{chunk, senders, submitted};
+    use super::super::test_utils::{app_state, chunk, post_json, senders, submitted};
     use super::{
-        ChoiceExtensions, PromptSpec, completion_event_stream, completion_logprobs,
-        completion_prompt_specs, completion_response_value, unary_completion,
+        ChoiceExtensions, CompletionRequestWithExtensions, PromptSpec, completion_event_stream,
+        completion_logprobs, completion_prompt_specs, completion_response_value, unary_completion,
     };
     use crate::api_server::guard::AbortGuard;
-    use crate::message::ChunkExtras;
+    use crate::message::{ChunkExtras, RequestKind};
+    use crate::tokenizer_manager::TmEvent;
     use axum::http::StatusCode;
     use dynamo_protocols::types::{
         Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
@@ -762,6 +793,56 @@ mod tests {
         assert!(matches!(request.prompt, Prompt::StringArray(_)));
         assert_eq!(request.n, Some(2));
         assert!(request.stream_options.unwrap().continuous_usage_stats);
+    }
+
+    #[test]
+    fn ngram_corpus_extension_is_not_dropped() {
+        let body: CompletionRequestWithExtensions =
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "prompt": ["a", "b"],
+                "ngram_corpus_id": ["docs", null]
+            }))
+            .unwrap();
+        assert!(matches!(body.request.prompt, Prompt::StringArray(_)));
+        assert!(matches!(
+            body.ngram_corpus_id,
+            Some(crate::message::OneOrMany::Many(values))
+                if values == vec![Some("docs".into()), None]
+        ));
+    }
+
+    #[tokio::test]
+    async fn ngram_corpus_extension_reaches_submitted_request() {
+        let (tm, tm_rx) = flume::unbounded();
+        let mut channels = senders();
+        channels.tm = tm;
+        let app = super::routes().with_state(app_state(channels));
+        let response_task = tokio::spawn(post_json(
+            app,
+            "/v1/completions",
+            serde_json::json!({
+                "model": "model",
+                "prompt": "hello",
+                "ngram_corpus_id": "docs"
+            }),
+        ));
+
+        let event = tm_rx.recv_async().await.unwrap();
+        let TmEvent::Ingress(request) = event else {
+            panic!("expected ingress request");
+        };
+        let RequestKind::Generate(native) = &request.kind else {
+            panic!("expected generation request");
+        };
+        assert_eq!(native.ngram_corpus_id.as_deref(), Some("docs"));
+        request
+            .sink
+            .try_send(chunk(request.rid.as_str(), "ok", true))
+            .unwrap();
+
+        let response = response_task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

@@ -36,6 +36,8 @@ class EngineBase(ABC):
         rid: Optional[Union[List[str], str]] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        *,
+        ngram_corpus_id: Optional[Union[List[Optional[str]], str]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """Generate outputs based on given inputs."""
         pass

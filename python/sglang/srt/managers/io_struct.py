@@ -296,6 +296,10 @@ class GenerateReqInput:
     # Extra cache key for caller-defined request classification.
     extra_key: Optional[Union[List[str], str]] = None
 
+    # Per-request external NGRAM corpus selector. None preserves the legacy
+    # all-SAM search; an empty string explicitly selects online-trie-only.
+    ngram_corpus_id: Optional[Union[List[Optional[str]], str]] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
     # For custom metric labels
@@ -505,6 +509,12 @@ class GenerateReqInput:
                 )
             if value == "":
                 setattr(self, field_name, None)
+        if self.ngram_corpus_id is not None and not isinstance(
+            self.ngram_corpus_id, str
+        ):
+            raise ValueError(
+                "ngram_corpus_id should be a string for a single request."
+            )
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -529,6 +539,7 @@ class GenerateReqInput:
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
+        self._normalize_ngram_corpus_id(num)
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -790,6 +801,28 @@ class GenerateReqInput:
         else:
             raise ValueError("cache_salt should be a list or a string.")
 
+    def _normalize_ngram_corpus_id(self, num):
+        """Normalize ngram_corpus_id for batch processing."""
+        if self.ngram_corpus_id is None:
+            return
+        if isinstance(self.ngram_corpus_id, str):
+            self.ngram_corpus_id = [self.ngram_corpus_id] * num
+        elif isinstance(self.ngram_corpus_id, list):
+            if len(self.ngram_corpus_id) != self.batch_size:
+                raise ValueError(
+                    "The length of ngram_corpus_id should be equal to the batch size."
+                )
+            if any(
+                value is not None and not isinstance(value, str)
+                for value in self.ngram_corpus_id
+            ):
+                raise ValueError(
+                    "Every ngram_corpus_id should be a string or None."
+                )
+            self.ngram_corpus_id = self.ngram_corpus_id * self.parallel_sample_num
+        else:
+            raise ValueError("ngram_corpus_id should be a list or a string.")
+
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
         # Normalize bootstrap_host
@@ -921,6 +954,9 @@ class GenerateReqInput:
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
+            ngram_corpus_id=(
+                self.ngram_corpus_id[i] if self.ngram_corpus_id is not None else None
+            ),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -1040,6 +1076,12 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
+
+    # Per-request external NGRAM corpus selector (resolved). Keep new fields at
+    # the end of this array-like wire struct so older field indices stay stable.
+    # None preserves the legacy all-SAM search; an empty string selects
+    # online-trie-only.
+    ngram_corpus_id: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_as_pickle(self.mm_inputs)

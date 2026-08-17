@@ -1433,6 +1433,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 extra_key=obj.extra_key,
                 cache_salt=obj.cache_salt,
                 routing_key=obj.routing_key,
+                ngram_corpus_id=obj.ngram_corpus_id,
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,

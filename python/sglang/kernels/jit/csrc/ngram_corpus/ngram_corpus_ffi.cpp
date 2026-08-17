@@ -58,6 +58,7 @@ struct NgramCorpusObj : public tvm::ffi::Object {
       const tvm::ffi::TensorView tokens_flat,
       const tvm::ffi::TensorView offsets,
       const tvm::ffi::TensorView total_lens_tv,
+      const tvm::ffi::TensorView corpus_handles_tv,
       const tvm::ffi::TensorView out_tokens,
       const tvm::ffi::TensorView out_mask) {
     auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
@@ -74,7 +75,15 @@ struct NgramCorpusObj : public tvm::ffi::Object {
       total_lens[i] = static_cast<size_t>(tlens[i]);
     }
 
-    auto result = ngram_->batchMatch(state_ids, tokens, total_lens);
+    // Optional per-request corpus handles. Empty tensor -> legacy
+    // all-SAM search; length must equal batch_size otherwise (checked in C++).
+    std::vector<int64_t> corpus_handles;
+    if (corpus_handles_tv.size(0) > 0) {
+      auto* handle = static_cast<const int64_t*>(corpus_handles_tv.data_ptr());
+      corpus_handles.assign(handle, handle + corpus_handles_tv.size(0));
+    }
+
+    auto result = ngram_->batchMatch(state_ids, tokens, total_lens, corpus_handles);
     write_result_(result, out_tokens, out_mask);
   }
 
@@ -96,8 +105,12 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     ngram_->appendExternalCorpusTokens(tokens);
   }
 
-  void finish_external_corpus_load(const std::string& corpus_id) {
-    ngram_->finishExternalCorpusLoad(corpus_id);
+  void finish_external_corpus_load(const std::string& corpus_id, int64_t corpus_handle) {
+    ngram_->finishExternalCorpusLoad(corpus_id, corpus_handle);
+  }
+
+  void commit_external_corpus_load(const std::string& corpus_id) {
+    ngram_->commitExternalCorpusLoad(corpus_id);
   }
 
   void remove_external_corpus(const std::string& corpus_id) {
@@ -162,6 +175,7 @@ void register_ngram_corpus() {
       .def("start_external_corpus_load", &NgramCorpusObj::start_external_corpus_load)
       .def("append_external_corpus_tokens", &NgramCorpusObj::append_external_corpus_tokens)
       .def("finish_external_corpus_load", &NgramCorpusObj::finish_external_corpus_load)
+      .def("commit_external_corpus_load", &NgramCorpusObj::commit_external_corpus_load)
       .def("remove_external_corpus", &NgramCorpusObj::remove_external_corpus)
       .def("cancel_external_corpus_load", &NgramCorpusObj::cancel_external_corpus_load)
       .def("clear_external_corpus", &NgramCorpusObj::clear_external_corpus)

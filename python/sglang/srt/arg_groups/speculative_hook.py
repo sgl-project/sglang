@@ -713,24 +713,29 @@ def _handle_ngram(server_args: ServerArgs) -> None:
             server_args.speculative_num_draft_tokens
             // server_args.speculative_eagle_topk
         )
+    external_sam_budget = server_args.speculative_ngram_external_sam_budget
+    external_corpus_max_tokens = (
+        server_args.speculative_ngram_external_corpus_max_tokens
+    )
+    if external_sam_budget < 0:
+        raise ValueError(
+            "--speculative-ngram-external-sam-budget must be non-negative."
+        )
+    if external_corpus_max_tokens <= 0:
+        raise ValueError(
+            "--speculative-ngram-external-corpus-max-tokens must be positive."
+        )
+    if external_sam_budget > server_args.speculative_num_draft_tokens - 1:
+        raise ValueError(
+            "--speculative-ngram-external-sam-budget must be less than or equal "
+            "to --speculative-num-draft-tokens - 1 "
+            f"({server_args.speculative_num_draft_tokens - 1})."
+        )
     if server_args.speculative_ngram_external_corpus_path is not None:
-        if server_args.speculative_ngram_external_sam_budget <= 0:
+        if external_sam_budget == 0:
             raise ValueError(
                 "--speculative-ngram-external-sam-budget must be positive when "
                 "--speculative-ngram-external-corpus-path is set."
-            )
-        if server_args.speculative_ngram_external_corpus_max_tokens <= 0:
-            raise ValueError(
-                "--speculative-ngram-external-corpus-max-tokens must be positive when "
-                "--speculative-ngram-external-corpus-path is set."
-            )
-        if (
-            server_args.speculative_ngram_external_sam_budget
-            > server_args.speculative_num_draft_tokens - 1
-        ):
-            raise ValueError(
-                "speculative_ngram_external_sam_budget must be less than or equal to "
-                f"speculative_num_draft_tokens - 1 ({server_args.speculative_num_draft_tokens - 1})."
             )
     logger.warning(
         "The mixed chunked prefill are disabled because of "

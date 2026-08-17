@@ -1350,17 +1350,25 @@ class TestNgramExternalSamArgs(CustomTestCase):
         )
         with self.assertRaises(ValueError) as context:
             handle_speculative_decoding(args)
-        self.assertIn("speculative_num_draft_tokens - 1", str(context.exception))
+        self.assertIn("--speculative-num-draft-tokens - 1", str(context.exception))
 
     def test_external_corpus_max_tokens_must_be_positive(self):
         args = self._make_dummy_ngram_args(
-            speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
             speculative_ngram_external_sam_budget=2,
             speculative_ngram_external_corpus_max_tokens=0,
         )
         with self.assertRaises(ValueError) as context:
             handle_speculative_decoding(args)
         self.assertIn("external-corpus-max-tokens", str(context.exception))
+
+    def test_external_sam_budget_is_validated_without_startup_corpus(self):
+        for budget in (-1, 12):
+            with self.subTest(budget=budget):
+                args = self._make_dummy_ngram_args(
+                    speculative_ngram_external_sam_budget=budget,
+                )
+                with self.assertRaises(ValueError):
+                    handle_speculative_decoding(args)
 
 
 class TestDecoupledSpecArgs(CustomTestCase):
