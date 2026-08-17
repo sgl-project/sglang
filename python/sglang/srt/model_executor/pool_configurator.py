@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
     get_compress_state_write_pad,
+    get_dsv4_packed_kv_bytes_per_token,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import (
@@ -716,8 +717,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     """Configurator for DSV4 compressed-attention models.
 
     Splits available memory across full / swa / c4 / c128 + c4_state / c128_state
-    pools. coeff is bytes_per_full_token (inflated by (T+D)/T when speculative
-    decode reserves a draft worker, mirroring dflash's cell_size scaling); bias = 0.
+    pools. A DSpark draft owns a content-scoped SWA sidecar, priced from its
+    packed SWA geometry rather than the target's average layer cost.
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
@@ -726,6 +727,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
+        self.swa_kv_bytes_per_token = get_dsv4_packed_kv_bytes_per_token(
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+        )
         self.context_len = kvc.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         self.compression_ratios = cfg.compress_ratios[
@@ -779,13 +784,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if self.is_speculative:
-            # Reserve memory for the speculative draft worker by inflating
-            # per-token bytes by (target+draft)/target. Equivalent to dflash's
-            # scale_kv_cell_size_per_token_for_dflash but applied to
-            # bytes_per_full_token: tokens = avail / (bpft * (T+D)/T).
-            draft_layers = 1
-            target_layers = self.num_layers_total
-            self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers
+            self.bytes_per_full_token += self._get_draft_bytes_per_full_token(kvc)
 
         # Online c128 keeps a single in-progress (max, sum, kv) state per index
         # and assumes a strict forward-only schedule. Speculative decode (MTP)
@@ -817,6 +816,21 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                     "DSV4 compressed attention: online c128 enabled (ring_size=1)"
                 )
 
+    def _get_draft_bytes_per_full_token(self, kvc: KVCacheConfigurator) -> float:
+        if kvc.spec_algorithm.is_dspark():
+            draft_layers = int(kvc.spec_aux_config.dflash_draft_num_layers or 0)
+            if draft_layers <= 0:
+                raise ValueError(
+                    "DSV4 DSpark draft SWA budgeting requires a positive stage count."
+                )
+            # Only committed draft KV enters the persistent sidecar. Verify
+            # candidates remain step-scoped until commit_lens gates the write.
+            return self.swa_ratio * self.swa_kv_bytes_per_token * draft_layers
+
+        # Preserve the existing single-average-layer reservation for other
+        # speculative algorithms until their draft pool geometry is explicit.
+        return self.bytes_per_full_token / self.num_layers_total
+
     def _assert_ring_serves_draft_tokens(self, num_draft_tokens: int) -> None:
         """A verify batch writes its whole optimistic tail into the ring, so ring
         capacity bounds the draft count."""
@@ -838,7 +852,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        kv_bytes = self.swa_kv_bytes_per_token
 
         quant_block_size = 128
         indexer_bytes = (

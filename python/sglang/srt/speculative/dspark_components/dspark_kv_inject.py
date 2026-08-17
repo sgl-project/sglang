@@ -117,6 +117,8 @@ class TargetHiddenKvInjector:
         else:
             swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
             if commit_lens is not None and cache_loc_2d is not None:
+                # Verify candidates are step-scoped. Only the committed prefix
+                # is materialized into the content-scoped draft SWA sidecar.
                 bs, verify_len = cache_loc_2d.shape
                 col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
                 committed_mask = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(
