@@ -42,6 +42,14 @@ from sglang.multimodal_gen.runtime.utils.precision import resolve_component_prec
 logger = init_logger(__name__)
 
 
+class ComponentCheckpointUnsupportedError(ValueError):
+    """A checkpoint cannot be restored by either component loading path."""
+
+
+class NativeComponentLoaderRequired(RuntimeError):
+    """The customized loader must defer to the native library loader."""
+
+
 def _load_auto_tokenizer_with_roberta_processing_compat(*args, **kwargs):
     from tokenizers import processors
 
@@ -193,14 +201,21 @@ class ComponentLoader(ABC):
             source = "sgl-diffusion"
         except ComponentResidencyError:
             raise
+        except ComponentCheckpointUnsupportedError:
+            raise
         except Exception as e:
+            native_loader_required = isinstance(e, NativeComponentLoaderRequired)
             if self.should_raise_customized_load_error(server_args, component_name):
+                if native_loader_required:
+                    raise
                 traceback.print_exc()
                 raise RuntimeError(
                     f"Failed to load customized {component_name}; native fallback "
                     "is disabled for this component configuration."
                 ) from e
-            if "Unsupported model architecture" in str(e):
+            if native_loader_required:
+                logger.info("%s", e)
+            elif "Unsupported model architecture" in str(e):
                 logger.info(
                     f"Component: {component_name} doesn't have a customized version yet, using native version"
                 )
