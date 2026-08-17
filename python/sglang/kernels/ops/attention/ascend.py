@@ -98,14 +98,10 @@ def ascend_fused_infer_attention_varlen(
             "on the query or key/value side"
         )
     actual_seq_lengths = [
-        stop
-        for stop, nonempty in zip(q_boundaries[1:], q_nonempty)
-        if nonempty
+        stop for stop, nonempty in zip(q_boundaries[1:], q_nonempty) if nonempty
     ]
     actual_seq_lengths_kv = [
-        stop
-        for stop, nonempty in zip(k_boundaries[1:], k_nonempty)
-        if nonempty
+        stop for stop, nonempty in zip(k_boundaries[1:], k_nonempty) if nonempty
     ]
     if not actual_seq_lengths:
         output = torch.empty_like(q)

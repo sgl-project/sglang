@@ -290,8 +290,7 @@ def flash_attn_varlen_func(
                 unsupported.append(name)
         if unsupported:
             raise NotImplementedError(
-                "NPU flash_attn_varlen_func does not support: "
-                + ", ".join(unsupported)
+                "NPU flash_attn_varlen_func does not support: " + ", ".join(unsupported)
             )
         return ascend_fused_infer_attention_varlen(
             q,
