@@ -297,7 +297,7 @@ class FutureMap:
         self._forward_buf_initialized = False
         self.dsa_topk_indices_buf = None
 
-        # NGRAM relay bufs, lazy-init on first stash (row width = draft_token_num).
+        # ngram-only relay bufs
         self.accept_tokens_buf: Optional[torch.Tensor] = None
         self.accept_lens_buf: Optional[torch.Tensor] = None
 
