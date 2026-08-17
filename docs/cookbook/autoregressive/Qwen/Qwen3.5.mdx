@@ -998,6 +998,7 @@ Container image (pinned for reproducibility):
 
 Server Launch Command:
 ```bash Command
+export HICACHE_SIZE_GB=<value>  # per-rank, per-host-pool GB
 SGLANG_ENABLE_SPEC_V2=1 \
 python3 -m sglang.launch_server \
   --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
@@ -1027,8 +1028,6 @@ python3 -m sglang.launch_server \
   --hicache-mem-layout page_first \
   --hicache-write-policy write_through_selective
 ```
-
-`--hicache-size` is per-rank, per-host-pool GB.
 
 ### 5.3 Vision Speed Benchmark
 
