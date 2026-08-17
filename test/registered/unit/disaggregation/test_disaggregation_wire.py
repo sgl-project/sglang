@@ -38,6 +38,7 @@ from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -254,26 +255,26 @@ class TestMooncakePPStaging(unittest.TestCase):
         )
 
 
-class TestEagleDsaSeedTransfer(unittest.TestCase):
-    @staticmethod
-    def _make_req(seed, metadata_buffer_index=0):
-        return SimpleNamespace(
-            metadata_buffer_index=metadata_buffer_index,
-            output_ids=[101],
-            cached_tokens=0,
-            cached_tokens_device=0,
-            cached_tokens_host=0,
-            cached_tokens_storage=0,
-            multimodal_inputs=None,
-            return_logprob=False,
-            return_sampling_mask=False,
-            hidden_states_tensor=torch.tensor([1.0, 2.0]),
-            output_topk_p=torch.tensor([1.0]),
-            output_topk_index=torch.tensor([7]),
-            output_dsa_topk_indices=seed,
-            bootstrap_room=9,
-        )
+def _make_metadata_req(seed, metadata_buffer_index=0):
+    return SimpleNamespace(
+        metadata_buffer_index=metadata_buffer_index,
+        output_ids=[101],
+        cached_tokens=0,
+        cached_tokens_device=0,
+        cached_tokens_host=0,
+        cached_tokens_storage=0,
+        multimodal_inputs=None,
+        return_logprob=False,
+        return_sampling_mask=False,
+        hidden_states_tensor=torch.tensor([1.0, 2.0]),
+        output_topk_p=torch.tensor([1.0]),
+        output_topk_index=torch.tensor([7]),
+        output_dsa_topk_indices=seed,
+        bootstrap_room=9,
+    )
 
+
+class TestEagleDsaSeedTransfer(CustomTestCase):
     def test_metadata_buffer_copies_seed_and_uses_invalid_sentinel(self):
         buffers = MetadataBuffers(
             size=2,
@@ -282,8 +283,8 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             output_dsa_topk_indices_dim=3,
         )
         seed = torch.tensor([4, 5, 6], dtype=torch.int32)
-        buffers.set_buf(self._make_req(seed))
-        buffers.set_buf(self._make_req(None, metadata_buffer_index=1))
+        buffers.set_buf(_make_metadata_req(seed))
+        buffers.set_buf(_make_metadata_req(None, metadata_buffer_index=1))
 
         self.assertTrue(torch.equal(buffers.output_dsa_topk_indices[0], seed))
         self.assertEqual(buffers.output_dsa_topk_indices[1].tolist(), [-1, -1, -1])
@@ -298,7 +299,7 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             torch.tensor([4, 5, 6], dtype=torch.int32),
         )
         batch = SimpleNamespace(
-            reqs=[self._make_req(seed) for seed in seeds],
+            reqs=[_make_metadata_req(seed) for seed in seeds],
             device="cpu",
             enable_overlap=False,
         )
@@ -340,7 +341,7 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             dtype=torch.int32,
         )
         batch = SimpleNamespace(
-            reqs=[self._make_req(seed) for seed in wire_positions],
+            reqs=[_make_metadata_req(seed) for seed in wire_positions],
             device="cpu",
             enable_overlap=False,
             req_pool_indices=torch.tensor([3, 1], dtype=torch.int64),
@@ -391,6 +392,33 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         )
         self.assertEqual(future_map.dsa_topk_indices_buf.shape, (4, 3))
         self.assertEqual(future_map.dsa_topk_indices_buf.dtype, torch.int32)
+
+
+class TestSamplingMaskMetadataTransfer(CustomTestCase):
+    def test_metadata_preserves_truncation(self):
+        buffers = MetadataBuffers(
+            size=1,
+            hidden_size=2,
+            hidden_states_dtype=torch.float32,
+            max_sampling_mask_tokens=3,
+        )
+        req = _make_metadata_req(None)
+        req.return_sampling_mask = True
+        req.output_token_sampling_mask = [[4, 7, 9]]
+        req.output_token_sampling_logprobs = [-1.25]
+        req.output_token_sampling_mask_truncated = [True]
+
+        buffers.set_buf(req)
+
+        metadata = buffers.output_token_sampling_mask_metadata[0]
+        self.assertEqual(int(metadata[0]), 3)
+        self.assertEqual(int(metadata[1]), 1)
+        self.assertEqual(
+            buffers.output_token_sampling_mask_idx[0, :3].tolist(), [4, 7, 9]
+        )
+        self.assertAlmostEqual(
+            float(buffers.output_token_sampling_logprobs[0, 0]), -1.25
+        )
 
 
 class TestDSV4C128StateIndices(unittest.TestCase):

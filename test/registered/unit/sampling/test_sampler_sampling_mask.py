@@ -81,7 +81,7 @@ class TestSamplingMaskCapture(CustomTestCase):
             float(output.selected_logprobs[0]), math.log(0.1 / 0.8)
         )
 
-    def test_scheduler_rejects_overflow(self):
+    def test_scheduler_applies_exact_and_bounded_overflow_policy(self):
         output = self._capture(torch.tensor([[0.4, 0.3, 0.2, 0.1]]), sampled_tokens=[3])
         materialized = LogitsProcessorOutput(
             next_token_logits=None, sampling_mask_output=output
@@ -97,10 +97,30 @@ class TestSamplingMaskCapture(CustomTestCase):
             SimpleNamespace(sampling_mask_max_tokens=3),
         )
         finish_reason = processor.get_sampling_mask_finish_reason(
-            status=materialized.next_token_sampling_mask_status[0]
+            status=materialized.next_token_sampling_mask_status[0], mode="exact"
         )
         self.assertEqual(finish_reason.status_code, 400)
-        self.assertIn("sampling-mask-max-tokens", finish_reason.message)
+        self.assertIn("sampling_mask_mode='bounded'", finish_reason.message)
+
+        bounded_req = SimpleNamespace(
+            return_sampling_mask=True,
+            sampling_mask_mode="bounded",
+            output_token_sampling_mask=[],
+            output_token_sampling_logprobs=[],
+            output_token_sampling_mask_truncated=[],
+        )
+        self.assertIsNone(
+            processor.get_sampling_mask_finish_reason(
+                status=materialized.next_token_sampling_mask_status[0], mode="bounded"
+            )
+        )
+        processor.add_sampling_mask_return_values(0, bounded_req, materialized)
+
+        self.assertEqual(bounded_req.output_token_sampling_mask_truncated, [True])
+        self.assertEqual(set(bounded_req.output_token_sampling_mask[0]), {0, 1, 3})
+        self.assertAlmostEqual(
+            bounded_req.output_token_sampling_logprobs[0], math.log(0.1)
+        )
 
     def test_sampled_token_is_not_added_to_support(self):
         output = self._capture(torch.tensor([[0.6, 0.4, 0.0]]), sampled_tokens=[2])

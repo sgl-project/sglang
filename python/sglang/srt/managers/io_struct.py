@@ -56,6 +56,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import (
     Modality,
     ReturnHiddenStatesMode,
+    SamplingMaskMode,
     get_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
@@ -215,8 +216,13 @@ class GenerateReqInput:
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
-    # Whether to return output-token sampling support and renormalized logprobs.
+    # Whether to return output-token sampling support and selected-token logprobs.
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
+    # Whether returned sampling support must be exact or may be bounded by the
+    # server's sampling-mask capacity.
+    sampling_mask_mode: Optional[Union[List[SamplingMaskMode], SamplingMaskMode]] = (
+        field(default=None, kw_only=True)
+    )
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
     # Return prompt top logprobs as flat arrays plus shape metadata instead of
@@ -505,6 +511,10 @@ class GenerateReqInput:
                 )
             if value == "":
                 setattr(self, field_name, None)
+        if self.sampling_mask_mode is None:
+            self.sampling_mask_mode = "exact"
+        elif self.sampling_mask_mode not in ("exact", "bounded"):
+            raise ValueError("sampling_mask_mode must be 'exact' or 'bounded'.")
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -710,6 +720,13 @@ class GenerateReqInput:
         self.return_sampling_mask = normalize_param(
             self.return_sampling_mask, False, "return_sampling_mask"
         )
+        self.sampling_mask_mode = normalize_param(
+            self.sampling_mask_mode,
+            "exact",
+            "sampling_mask_mode",
+        )
+        if any(mode not in ("exact", "bounded") for mode in self.sampling_mask_mode):
+            raise ValueError("sampling_mask_mode must be 'exact' or 'bounded'.")
 
         # Handle token_ids_logprob specially due to its nested structure
         if not self.token_ids_logprob:  # covers both None and []
@@ -871,6 +888,7 @@ class GenerateReqInput:
             top_logprobs_num=self.top_logprobs_num[i],
             token_ids_logprob=self.token_ids_logprob[i],
             return_sampling_mask=self.return_sampling_mask[i],
+            sampling_mask_mode=self.sampling_mask_mode[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
@@ -1040,6 +1058,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
+
+    # Appended to preserve the positional wire layout used by the Rust server.
+    sampling_mask_mode: SamplingMaskMode = "exact"
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_as_pickle(self.mm_inputs)
@@ -1435,12 +1456,13 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     output_token_ids_logprobs_val: TokenIdsLogprobValues
     output_token_ids_logprobs_idx: TokenIdsLogprobIndices
     output_token_entropy_val: Optional[List[Optional[float]]]
-    # Per-request chunks of output-token sampling supports. None when no request
-    # in the batch asks for return_sampling_mask.
+    # Per-request chunks of post-filter token IDs; None if none were requested.
     output_token_sampling_mask: Optional[List[List]]
-    # Per-request chunks of selected-token logprobs renormalized over the
-    # corresponding sampling supports. None when sampling masks are not returned.
+    # Per-request chunks of selected-token logprobs over the full realized
+    # support.
     output_token_sampling_logprobs: Optional[List[List]]
+    # Per-request chunks of per-token truncation flags.
+    output_token_sampling_mask_truncated: Optional[List[List[bool]]]
 
     # Hidden states
     output_hidden_states: OutputHiddenStates
@@ -1533,6 +1555,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # None when sampling masks are not returned.
     output_token_sampling_mask: Optional[List[List]]
     output_token_sampling_logprobs: Optional[List[List]]
+    output_token_sampling_mask_truncated: Optional[List[List[bool]]]
 
     # Hidden states
     output_hidden_states: OutputHiddenStates

@@ -365,11 +365,12 @@ class MetadataBuffers:
             self.output_top_logprobs_idx = torch.zeros(
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
-            self.output_token_sampling_mask_len = None
+            self.output_token_sampling_mask_metadata = None
             self.output_token_sampling_mask_idx = None
             self.output_token_sampling_logprobs = None
             if self.enable_sampling_mask:
-                self.output_token_sampling_mask_len = torch.zeros(
+                # Pad the metadata row to 64 bytes for RDMA.
+                self.output_token_sampling_mask_metadata = torch.zeros(
                     (size, 16), dtype=torch.int32, device=device
                 )
                 self.output_token_sampling_mask_idx = torch.zeros(
@@ -414,7 +415,7 @@ class MetadataBuffers:
         if self.enable_sampling_mask:
             bufs.extend(
                 [
-                    self.output_token_sampling_mask_len,
+                    self.output_token_sampling_mask_metadata,
                     self.output_token_sampling_mask_idx,
                     self.output_token_sampling_logprobs,
                 ]
@@ -435,11 +436,13 @@ class MetadataBuffers:
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
-        sampling_mask_len = None
+        sampling_mask_metadata = None
         sampling_mask_idx = None
         sampling_logprobs = None
         if self.enable_sampling_mask:
-            sampling_mask_len = self.output_token_sampling_mask_len[idx].clone()
+            sampling_mask_metadata = self.output_token_sampling_mask_metadata[
+                idx, :2
+            ].clone()
             sampling_mask_idx = self.output_token_sampling_mask_idx[idx].clone()
             sampling_logprobs = self.output_token_sampling_logprobs[idx].clone()
         return (
@@ -449,7 +452,7 @@ class MetadataBuffers:
             self.output_token_logprobs_idx[idx].clone(),
             self.output_top_logprobs_val[idx].clone(),
             self.output_top_logprobs_idx[idx].clone(),
-            sampling_mask_len,
+            sampling_mask_metadata,
             sampling_mask_idx,
             sampling_logprobs,
             self.output_topk_p[idx].clone(),
@@ -525,9 +528,16 @@ class MetadataBuffers:
                     "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
                 )
             # Sentinel -1: the decode side records None for this handoff token.
-            self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = -1
+            sampling_mask_metadata = self.output_token_sampling_mask_metadata[
+                req.metadata_buffer_index
+            ]
+            # Slot 0 is the returned mask length (-1 means absent); slot 1 is
+            # whether the returned mask was truncated.
+            sampling_mask_metadata[0] = -1
+            sampling_mask_metadata[1] = 0
             sampling_masks = req.output_token_sampling_mask
             sampling_logprobs = req.output_token_sampling_logprobs
+            sampling_mask_truncated = req.output_token_sampling_mask_truncated
             if sampling_masks:
                 sampling_mask = sampling_masks[0]
                 sampling_logprob = sampling_logprobs[0] if sampling_logprobs else None
@@ -540,9 +550,7 @@ class MetadataBuffers:
                             f"metadata capacity {max_mask_len}. Increase "
                             "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS."
                         )
-                    self.output_token_sampling_mask_len[req.metadata_buffer_index][
-                        0
-                    ] = mask_len
+                    sampling_mask_metadata[0] = mask_len
                     if mask_len:
                         self.output_token_sampling_mask_idx[
                             req.metadata_buffer_index, :mask_len
@@ -556,6 +564,7 @@ class MetadataBuffers:
                     self.output_token_sampling_logprobs[req.metadata_buffer_index][
                         0
                     ] = float(sampling_logprob)
+                    sampling_mask_metadata[1] = sampling_mask_truncated[0]
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
             # speculative_eagle_topk should not be greater than 16 currently

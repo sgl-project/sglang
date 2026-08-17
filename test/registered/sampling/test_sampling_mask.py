@@ -51,6 +51,7 @@ class SamplingMaskTestMixin:
         self,
         sampling_params,
         return_sampling_mask=True,
+        sampling_mask_mode=None,
         return_logprob=False,
         top_logprobs_num=0,
     ):
@@ -59,6 +60,8 @@ class SamplingMaskTestMixin:
             "sampling_params": sampling_params,
             "return_sampling_mask": return_sampling_mask,
         }
+        if sampling_mask_mode is not None:
+            payload["sampling_mask_mode"] = sampling_mask_mode
         if return_logprob:
             payload["return_logprob"] = True
             payload["top_logprobs_num"] = top_logprobs_num
@@ -72,6 +75,7 @@ class SamplingMaskTestMixin:
         meta_info = output["meta_info"]
         output_ids = output["output_ids"]
         sampling_masks = meta_info["output_token_sampling_mask"]
+        sampling_masks_truncated = meta_info["output_token_sampling_mask_truncated"]
 
         self.assertEqual(len(output_ids), _MAX_NEW_TOKENS)
         self.assertEqual(meta_info["completion_tokens"], len(output_ids))
@@ -79,6 +83,7 @@ class SamplingMaskTestMixin:
             meta_info["output_token_sampling_mask_length"], len(output_ids)
         )
         self.assertEqual(len(sampling_masks), len(output_ids))
+        self.assertEqual(sampling_masks_truncated, [False] * len(output_ids))
         for output_id, sampling_mask in zip(output_ids, sampling_masks):
             self.assertIn(output_id, sampling_mask)
         return sampling_masks
@@ -196,47 +201,7 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             expected_logprob = math.log(probs[output_id] / support_mass)
             self.assertAlmostEqual(mask_logprob, expected_logprob, delta=1e-2)
 
-    def test_generate_returns_top_p_only_sampling_mask(self):
-        self._generate_sampling_masks(
-            {
-                "temperature": 1.0,
-                "top_p": _TOP_P_SMALL,
-                "max_new_tokens": _MAX_NEW_TOKENS,
-                "ignore_eos": True,
-            }
-        )
-
-    def test_chat_completions_returns_top_p_only_sampling_mask(self):
-        response = requests.post(
-            self.base_url + "/v1/chat/completions",
-            json={
-                "model": self.model,
-                "messages": [{"role": "user", "content": "Name a capital city."}],
-                "temperature": 1.0,
-                "top_p": _TOP_P_SMALL,
-                "max_tokens": _MAX_NEW_TOKENS,
-                "ignore_eos": True,
-                "return_sampling_mask": True,
-                "return_meta_info": True,
-                "return_token_ids": True,
-            },
-            timeout=60,
-        )
-        self.assertEqual(response.status_code, 200, response.text)
-
-        choice = response.json()["choices"][0]
-        output_ids = choice["token_ids"]
-        meta_info = choice["meta_info"]
-        sampling_masks = meta_info["output_token_sampling_mask"]
-        sampling_logprobs = meta_info["output_token_sampling_logprobs"]
-
-        self.assertEqual(len(output_ids), _MAX_NEW_TOKENS)
-        self.assertEqual(len(sampling_masks), len(output_ids))
-        self.assertEqual(len(sampling_logprobs), len(output_ids))
-        for output_id, sampling_mask in zip(output_ids, sampling_masks):
-            self.assertIn(output_id, sampling_mask)
-
-    def test_top_p_only_support_above_capacity_is_rejected(self):
+    def test_top_p_only_support_uses_runtime_capacity(self):
         sampling_params = {
             "temperature": 1.0,
             "top_p": _TOP_P,
@@ -244,11 +209,27 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             "ignore_eos": True,
         }
 
-        response = self._post_generate(sampling_params)
-        self.assertEqual(response.status_code, 400, response.text)
-        self.assertIn("sampling-mask-max-tokens", response.text)
+        exact_response = self._post_generate(sampling_params)
+        self.assertEqual(exact_response.status_code, 400, exact_response.text)
+        self.assertIn("sampling_mask_mode='bounded'", exact_response.text)
 
-    def test_support_above_capacity_is_rejected(self):
+        bounded_response = self._post_generate(
+            sampling_params, sampling_mask_mode="bounded"
+        )
+        self.assertEqual(bounded_response.status_code, 200, bounded_response.text)
+        output = bounded_response.json()
+        meta_info = output["meta_info"]
+        self.assertEqual(
+            meta_info["output_token_sampling_mask_truncated"],
+            [True] * len(output["output_ids"]),
+        )
+        for output_id, sampling_mask in zip(
+            output["output_ids"], meta_info["output_token_sampling_mask"]
+        ):
+            self.assertEqual(len(sampling_mask), _SAMPLING_MASK_MAX_TOKENS)
+            self.assertIn(output_id, sampling_mask)
+
+    def test_generate_requires_bounded_mode_to_truncate_sampling_mask(self):
         sampling_params = {
             "temperature": 1.0,
             "top_k": _SAMPLING_MASK_MAX_TOKENS + 1,
@@ -256,11 +237,39 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             "ignore_eos": True,
         }
 
-        response = self._post_generate(
+        exact_response = self._post_generate(sampling_params)
+        self.assertEqual(exact_response.status_code, 400, exact_response.text)
+        self.assertIn("sampling_mask_mode='bounded'", exact_response.text)
+
+        bounded_response = self._post_generate(
             sampling_params,
+            sampling_mask_mode="bounded",
+        )
+        self.assertEqual(bounded_response.status_code, 200, bounded_response.text)
+        output = bounded_response.json()
+        meta_info = output["meta_info"]
+        self.assertEqual(
+            meta_info["output_token_sampling_mask_truncated"],
+            [True] * len(output["output_ids"]),
+        )
+        for output_id, sampling_mask in zip(
+            output["output_ids"],
+            meta_info["output_token_sampling_mask"],
+        ):
+            self.assertEqual(len(sampling_mask), _SAMPLING_MASK_MAX_TOKENS)
+            self.assertIn(output_id, sampling_mask)
+
+    def test_generate_rejects_unknown_sampling_mask_mode(self):
+        response = self._post_generate(
+            {
+                "temperature": 1.0,
+                "top_k": _TOP_K,
+                "max_new_tokens": _MAX_NEW_TOKENS,
+            },
+            sampling_mask_mode="unknown",
         )
         self.assertEqual(response.status_code, 400, response.text)
-        self.assertIn("sampling-mask-max-tokens", response.text)
+        self.assertIn("sampling_mask_mode", response.text)
 
 
 class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):

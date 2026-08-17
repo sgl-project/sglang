@@ -194,6 +194,7 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_ids_logprobs",
     "output_token_sampling_mask",
     "output_token_sampling_logprobs",
+    "output_token_sampling_mask_truncated",
 )
 
 
@@ -254,6 +255,9 @@ class ReqState:
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
     output_token_sampling_mask: List = dataclasses.field(default_factory=list)
     output_token_sampling_logprobs: List = dataclasses.field(default_factory=list)
+    output_token_sampling_mask_truncated: List[bool] = dataclasses.field(
+        default_factory=list
+    )
 
     # Cached flat-format prompt top logprob fields; rebuilt only when more
     # prefill chunks arrive, so streaming decode chunks reuse the payload.
@@ -1412,6 +1416,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 top_logprobs_num=obj.top_logprobs_num,
                 token_ids_logprob=obj.token_ids_logprob,
                 return_sampling_mask=obj.return_sampling_mask,
+                sampling_mask_mode=obj.sampling_mask_mode,
                 return_flat_raw_top_logprobs=obj.return_flat_raw_top_logprobs,
                 stream=obj.stream,
                 rid=obj.rid,
@@ -2277,6 +2282,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state.output_token_sampling_logprobs.extend(
                             output_sampling_logprobs[i]
                         )
+                    output_sampling_mask_truncated = (
+                        recv_obj.output_token_sampling_mask_truncated
+                    )
+                    if output_sampling_mask_truncated is not None:
+                        state.output_token_sampling_mask_truncated.extend(
+                            output_sampling_mask_truncated[i]
+                        )
                     meta_info["output_token_sampling_mask"] = (
                         state.output_token_sampling_mask
                     )
@@ -2285,6 +2297,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
                     meta_info["output_token_sampling_mask_length"] = len(
                         state.output_token_sampling_mask
+                    )
+                    meta_info["output_token_sampling_mask_truncated"] = (
+                        state.output_token_sampling_mask_truncated
                     )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):

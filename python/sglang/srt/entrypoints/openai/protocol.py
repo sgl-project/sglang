@@ -800,6 +800,7 @@ class ChatCompletionRequest(BaseModel):
     return_token_ids: bool = False
     return_meta_info: bool = False
     return_sampling_mask: bool = False
+    sampling_mask_mode: Literal["exact", "bounded"] = "exact"
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "

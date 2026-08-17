@@ -282,11 +282,13 @@ class ServingChatTestCase(unittest.TestCase):
             )
 
             self.basic_req.return_sampling_mask = True
+            self.basic_req.sampling_mask_mode = "bounded"
             self.basic_req.return_meta_info = True
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
             self.assertTrue(adapted.return_sampling_mask)
+            self.assertEqual(adapted.sampling_mask_mode, "bounded")
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 

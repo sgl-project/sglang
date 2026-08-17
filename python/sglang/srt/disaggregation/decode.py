@@ -1828,7 +1828,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_token_logprobs_idx,
             output_top_logprobs_val,
             output_top_logprobs_idx,
-            output_token_sampling_mask_len,
+            output_token_sampling_mask_metadata,
             output_token_sampling_mask_idx,
             output_token_sampling_logprobs,
             output_topk_p,
@@ -1956,16 +1956,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             assert (
                 output_token_sampling_mask_idx is not None
             ), "sampling mask buffer disabled on decode side"
-            sampling_mask_len = int(output_token_sampling_mask_len[0].item())
+            sampling_mask_metadata = output_token_sampling_mask_metadata.tolist()
+            sampling_mask_len, sampling_mask_truncated = sampling_mask_metadata
             if sampling_mask_len < 0:
                 decode_req.req.output_token_sampling_mask.append(None)
                 decode_req.req.output_token_sampling_logprobs.append(None)
+                decode_req.req.output_token_sampling_mask_truncated.append(False)
             else:
                 decode_req.req.output_token_sampling_mask.append(
                     output_token_sampling_mask_idx[:sampling_mask_len].cpu().tolist()
                 )
                 decode_req.req.output_token_sampling_logprobs.append(
                     float(output_token_sampling_logprobs[0].item())
+                )
+                decode_req.req.output_token_sampling_mask_truncated.append(
+                    bool(sampling_mask_truncated)
                 )
 
         decode_req.kv_receiver.clear()

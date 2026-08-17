@@ -70,6 +70,7 @@ def _make_batch_str_output() -> BatchStrOutput:
         output_token_entropy_val=[0.0, 0.0],
         output_token_sampling_mask=[[], []],
         output_token_sampling_logprobs=[[], []],
+        output_token_sampling_mask_truncated=[[True], [False]],
         output_hidden_states=[None, None],
         routed_experts=[None, None],
         indexer_topk=[None, None],
@@ -91,6 +92,7 @@ class TestMultiTokenizerMixin(unittest.TestCase):
             single_output.cached_tokens_details,
             [{"device": 1, "host": 3}],
         )
+        self.assertEqual(single_output.output_token_sampling_mask_truncated, [[False]])
 
     def test_get_tokenizer_worker_class_uses_default(self):
         self.assertIs(get_tokenizer_worker_class(DefaultServerArgs()), TokenizerWorker)

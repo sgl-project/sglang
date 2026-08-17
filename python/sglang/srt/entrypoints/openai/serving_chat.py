@@ -1009,6 +1009,7 @@ class OpenAIServingChat(OpenAIServingBase):
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
             return_sampling_mask=request.return_sampling_mask,
+            sampling_mask_mode=request.sampling_mask_mode,
             stream=request.stream,
             return_text_in_logprobs=True,
             modalities=processed_messages.modalities,

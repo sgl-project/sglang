@@ -24,6 +24,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_MATCHED_TOKEN,
     Req,
+    SamplingMaskMode,
     ScheduleBatch,
     mamba_lazy_spec_in_window,
 )
@@ -256,7 +257,8 @@ class SchedulerBatchResultProcessor:
                     statuses = logits_output.next_token_sampling_mask_status
                     status = None if statuses is None else statuses[i]
                     sampling_mask_finish_reason = self.get_sampling_mask_finish_reason(
-                        status=status
+                        status=status,
+                        mode=req.sampling_mask_mode,
                     )
                 if (
                     batch.return_hidden_states
@@ -900,7 +902,8 @@ class SchedulerBatchResultProcessor:
                 statuses = logits_output.next_token_sampling_mask_status
                 status = None if statuses is None else statuses[i]
                 sampling_mask_finish_reason = self.get_sampling_mask_finish_reason(
-                    status=status
+                    status=status,
+                    mode=req.sampling_mask_mode,
                 )
             if sampling_mask_finish_reason is not None:
                 req.to_finish = sampling_mask_finish_reason
@@ -1052,9 +1055,13 @@ class SchedulerBatchResultProcessor:
         """Attach sparse sampling support metadata to the return values."""
         mask = output.next_token_sampling_mask_idx
         logprobs = output.next_token_sampling_logprobs
+        statuses = output.next_token_sampling_mask_status
         req.output_token_sampling_mask.append(None if mask is None else mask[i])
         req.output_token_sampling_logprobs.append(
             None if logprobs is None else logprobs[i]
+        )
+        req.output_token_sampling_mask_truncated.append(
+            statuses is not None and statuses[i] == SamplingMaskStatus.TRUNCATED
         )
 
     @staticmethod
@@ -1099,14 +1106,18 @@ class SchedulerBatchResultProcessor:
         self,
         *,
         status: Optional[int],
+        mode: SamplingMaskMode,
     ) -> Optional[FINISH_ABORT]:
         if status == SamplingMaskStatus.OK:
             return None
         if status == SamplingMaskStatus.TRUNCATED:
+            if mode == "bounded":
+                return None
             return FINISH_ABORT(
                 "Sampling support exceeds --sampling-mask-max-tokens="
                 f"{self.server_args.sampling_mask_max_tokens}. Adjust top_k, "
-                "top_p, or min_p to reduce support, or increase the server limit.",
+                "top_p, or min_p to reduce support, increase the server limit, "
+                "or set sampling_mask_mode='bounded' to return a truncated mask.",
                 HTTPStatus.BAD_REQUEST,
                 "BadRequestError",
             )

@@ -767,6 +767,25 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req[0].routed_dp_rank, 3)
         self.assertEqual(req[1].routed_dp_rank, 3)
 
+    def test_sampling_mask_mode_defaults_and_propagates(self):
+        single = GenerateReqInput(
+            text="Hello", sampling_params={}, return_sampling_mask=True
+        )
+        single.normalize_batch_and_arguments()
+        self.assertEqual(single.sampling_mask_mode, "exact")
+
+        batch = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            return_sampling_mask=[True, True],
+            sampling_mask_mode=["exact", "bounded"],
+        )
+        batch.normalize_batch_and_arguments()
+        self.assertEqual(
+            [batch[i].sampling_mask_mode for i in range(2)],
+            ["exact", "bounded"],
+        )
+
 
 class TestEmbeddingReqInputGetItem(CustomTestCase):
     """Test EmbeddingReqInput.__getitem__."""

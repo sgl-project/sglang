@@ -729,7 +729,8 @@ class SchedulerDisaggregationPrefillMixin:
                     status = None if statuses is None else statuses[i]
                     sampling_mask_finish_reason = (
                         self.batch_result_processor.get_sampling_mask_finish_reason(
-                            status=status
+                            status=status,
+                            mode=req.sampling_mask_mode,
                         )
                     )
                 if sampling_mask_finish_reason is not None:

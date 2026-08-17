@@ -326,6 +326,7 @@ class _GenerationStreamAccumulator:
     output_token_ids_logprobs_idx: Optional[list] = None
     output_token_sampling_mask: Optional[list] = None
     output_token_sampling_logprobs: Optional[list] = None
+    output_token_sampling_mask_truncated: Optional[list] = None
     # Rust server mode: the Rust detokenizer reconstructs text/ids from the raw
     # output tokens itself and never consumes the scheduler's incremental-detok
     # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
@@ -358,6 +359,7 @@ class _GenerationStreamAccumulator:
         if self.return_sampling_mask:
             self.output_token_sampling_mask = []
             self.output_token_sampling_logprobs = []
+            self.output_token_sampling_mask_truncated = []
 
     def accept(self, *, req: Req) -> None:
         if req.finished():
@@ -557,10 +559,16 @@ class _GenerationStreamAccumulator:
                         send_output_sampling_mask_offset:sampling_mask_end
                     ]
                 )
+                self.output_token_sampling_mask_truncated.append(
+                    req.output_token_sampling_mask_truncated[
+                        send_output_sampling_mask_offset:sampling_mask_end
+                    ]
+                )
                 req.send_output_sampling_mask_offset = sampling_mask_end
             else:
                 self.output_token_sampling_mask.append([])
                 self.output_token_sampling_logprobs.append([])
+                self.output_token_sampling_mask_truncated.append([])
 
         if self.return_hidden_states:
             if req.return_hidden_states:
@@ -670,6 +678,9 @@ class _GenerationStreamAccumulator:
             output_token_entropy_val=None,
             output_token_sampling_mask=self.output_token_sampling_mask,
             output_token_sampling_logprobs=self.output_token_sampling_logprobs,
+            output_token_sampling_mask_truncated=(
+                self.output_token_sampling_mask_truncated
+            ),
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,

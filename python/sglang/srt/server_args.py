@@ -3508,7 +3508,8 @@ class ServerArgs:
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "
-        "are aborted if their realized sampling support exceeds this limit.",
+        "using sampling_mask_mode='exact' abort if their realized support "
+        "exceeds this limit; 'bounded' requests return a truncated mask.",
         NS("exec.features"),
     ] = 4096
     disable_outlines_disk_cache: A[

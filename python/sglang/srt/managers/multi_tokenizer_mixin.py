@@ -247,6 +247,12 @@ def _handle_output_by_index(output, i):
             output_token_sampling_logprobs=_extract_field_by_index(
                 output, "output_token_sampling_logprobs", i, check_length=False
             ),
+            output_token_sampling_mask_truncated=_extract_field_by_index(
+                output,
+                "output_token_sampling_mask_truncated",
+                i,
+                check_length=False,
+            ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
@@ -363,6 +369,12 @@ def _handle_output_by_index(output, i):
             ),
             output_token_sampling_logprobs=_extract_field_by_index(
                 output, "output_token_sampling_logprobs", i, check_length=False
+            ),
+            output_token_sampling_mask_truncated=_extract_field_by_index(
+                output,
+                "output_token_sampling_mask_truncated",
+                i,
+                check_length=False,
             ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False

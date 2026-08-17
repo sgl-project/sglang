@@ -150,6 +150,7 @@ logger = logging.getLogger(__name__)
 
 
 ReturnHiddenStatesMode = Union[bool, Literal["last"]]
+SamplingMaskMode = Literal["exact", "bounded"]
 
 
 def get_return_hidden_states_mode(
@@ -849,6 +850,7 @@ class Req(ReqDllmMixin):
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        sampling_mask_mode: SamplingMaskMode = "exact",
     ):
         # Input and output info
         self.rid = rid
@@ -1044,6 +1046,7 @@ class Req(ReqDllmMixin):
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
         self.return_sampling_mask = return_sampling_mask
+        self.sampling_mask_mode = sampling_mask_mode
         self.return_flat_raw_top_logprobs = return_flat_raw_top_logprobs
 
         # Logprobs (return values)
@@ -1069,9 +1072,11 @@ class Req(ReqDllmMixin):
         if return_sampling_mask:
             self.output_token_sampling_mask = []
             self.output_token_sampling_logprobs = []
+            self.output_token_sampling_mask_truncated = []
         else:
             self.output_token_sampling_mask = None
             self.output_token_sampling_logprobs = None
+            self.output_token_sampling_mask_truncated = None
         self.hidden_states: List[List[float]] = []
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None
