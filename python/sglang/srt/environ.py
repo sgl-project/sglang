@@ -1268,6 +1268,10 @@ class Envs:
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
     SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
+    # Fraction of currently-free device memory the transient DSV4 indexer
+    # logits tensor ([query_rows, max_c4_seq_len] fp32, unaccounted by
+    # mem_fraction_static) may occupy before query rows are sliced.
+    SGLANG_DSV4_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
