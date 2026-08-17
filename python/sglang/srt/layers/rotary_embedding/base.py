@@ -171,6 +171,11 @@ class RotaryEmbedding(BaseFusedOp):
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
+        # Keep the inv_freq that built the native cache so that
+        # _ensure_cos_sin_cache_length() can extend it consistently.
+        # Registered as a non-persistent buffer (state_dict unchanged) so
+        # meta/IPC load paths materialize it alongside cos_sin_cache.
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
         t = torch.arange(self.max_position_embeddings, dtype=torch.float)
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
@@ -191,8 +196,22 @@ class RotaryEmbedding(BaseFusedOp):
         device = self.cos_sin_cache.device
         dtype = self.cos_sin_cache.dtype
 
-        # Compute inv_freq on same device
-        inv_freq = self._compute_inv_freq(self.base).to(device=device)
+        # Reuse the inv_freq that built the native cache instead of re-deriving
+        # it from self.base. Subclasses (e.g. YaRN/DeepSeek scaling, DynamicNTK
+        # with its adjusted base) build the native cache with a different
+        # inv_freq, and the extension rows must continue the native ones.
+        stored_inv_freq = getattr(self, "inv_freq", None)
+        has_stored_inv_freq = (
+            stored_inv_freq is not None and stored_inv_freq.device.type != "meta"
+        )
+        if has_stored_inv_freq:
+            inv_freq = stored_inv_freq.to(device=device)
+        else:
+            # Historical fallback: subclasses that build their native cache
+            # without storing the inv_freq they used (e.g. Grok, Gemma3) or
+            # meta-device loads that never materialized the stored tensor get
+            # exactly the old behavior: base-class math, no row scaling.
+            inv_freq = self._compute_inv_freq(self.base).to(device=device)
 
         # Incremental computation for new positions only
         start = cur_len
@@ -200,9 +219,21 @@ class RotaryEmbedding(BaseFusedOp):
         if t_new.numel() == 0:
             return
 
+        if has_stored_inv_freq:
+            # Native rows of the scaling variants are scaled: the YaRN family
+            # multiplies cos/sin by mscale and LinearScaling divides time by the
+            # last block's scaling factor. Apply the same terms to extension rows.
+            time_scale = getattr(self, "_cache_time_scale", 1.0)
+            time_offset = getattr(self, "_cache_time_offset", 0.0)
+            if time_scale != 1.0 or time_offset != 0.0:
+                t_new = (t_new - time_offset) / time_scale
+            mscale = float(getattr(self, "mscale", 1.0))
+        else:
+            mscale = 1.0
+
         freqs_new = torch.einsum("i,j->ij", t_new, inv_freq)
-        cos_new = freqs_new.cos()
-        sin_new = freqs_new.sin()
+        cos_new = freqs_new.cos() * mscale
+        sin_new = freqs_new.sin() * mscale
         new_rows = torch.cat((cos_new, sin_new), dim=-1).to(dtype=dtype)
 
         # Update cache with new rows
@@ -533,6 +564,7 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.base)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
         cache_list: List[torch.Tensor] = []
         # offsets to the next cache in a tensor.
         # Each offset corresponds to the same index in scaling_factors.
@@ -563,6 +595,10 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
             for i, scaling_factor in enumerate(self.scaling_factors)
         }
         assert len(self.scaling_factors) == len(offsets)
+        # Cache extension continues the last scaling block: time keeps being
+        # divided by its scaling factor, relative to its block offset.
+        self._cache_time_scale = float(self.scaling_factors[-1])
+        self._cache_time_offset = float(offsets[-1])
         return torch.cat(cache_list, dim=0)
 
     @property
