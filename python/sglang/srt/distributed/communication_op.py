@@ -12,6 +12,8 @@ from .parallel_state import (
     get_moe_ep_group,
     get_moe_tp_group,
     get_tp_group,
+    get_attn_o_tp_group,
+    get_attn_o_tensor_parallel_world_size
 )
 
 
@@ -61,6 +63,27 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     return get_tp_group().fused_allreduce_rmsnorm_quant_per_group(
         input_, residual_inp_, weight_, eps, group_size, emit_bf16=emit_bf16
     )
+
+
+def attn_o_model_parallel_all_to_all(input_):
+    group = get_attn_o_tp_group().device_group
+    world_size = get_attn_o_tensor_parallel_world_size()
+    input_list = [t.contiguous() for t in torch.tensor_split(input_, world_size, 0)]
+    output_list = [torch.empty_like(input_list[i]) for i in range(world_size)]
+    torch.distributed.all_to_all(output_list, input_list, group=group)
+    output_tensor = torch.cat(output_list, dim=0)
+    return output_tensor
+
+
+def attn_o_model_parallel_reduce_scatter(input_):
+    out_shape = list(input_.shape)
+    group = get_attn_o_tp_group().device_group
+    out_shape[0] //= get_attn_o_tensor_parallel_world_size()
+    output = torch.empty(out_shape, device=input_.device, dtype=input_.dtype)
+    torch.distributed.reduce_scatter_tensor(
+        output, input_, group=group
+    )
+    return output
 
 
 def tensor_model_parallel_all_gather(
