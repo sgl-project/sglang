@@ -59,7 +59,6 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import sharded_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import set_weight_attrs
@@ -219,7 +218,6 @@ class MambaMixer1(nn.Module):
         output: Optional[torch.Tensor],
         layer_cache,
         metadata,
-        forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
     ) -> Tuple[torch.Tensor, None]:
