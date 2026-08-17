@@ -108,6 +108,7 @@ def _helion_fused_recurrent_kda_packed_decode_body(
             ssm_state_indices.stride(0),
         )
     )
+
     block_v = hl.register_block_size(1, V)
 
     for tile_b, tile_hv, tile_v in hl.tile([B, HV, V], block_size=[1, 1, block_v]):
