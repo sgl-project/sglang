@@ -1348,7 +1348,7 @@ class MQALayer(MqaAttentionBase):
                 layer=self.attn_mqa,
                 forward_batch=forward_batch,
                 compress_ratio=self.compress_ratio,
-                attn_sink=self.attn_sink,
+                attn_sink=attn_sink[: self.n_local_heads],
                 save_kv_cache=kv is not None,
             )
         else:
