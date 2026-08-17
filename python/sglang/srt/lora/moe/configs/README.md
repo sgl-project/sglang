@@ -88,7 +88,7 @@ Qwen3.5-397B, Inkling-Small on GB300/B200/H200).
 - Plans, confirmed on B200 (2026-08-14, 14-arm e2e sweep, three models):
   decode B family, split-K, row domain, overlap windows, route builder and
   route PDL all picked the same winner as on GB300.
-- Tiles, confirmed on B200 (2026-08-17, 52-arm 4-candidate forcing sweep: the
+- Tiles, confirmed on B200 (2026-08-17, 54-arm 4-candidate forcing sweep: the
   per-expert decode row at r16/32/64, the per-expert prefill row and both
   shared rows, on all three models, plus r32 at tp2 and tp8): B200 picks the
   same winner as GB300 in every cell. Forcing the wrong tile costs up to 4.9%
