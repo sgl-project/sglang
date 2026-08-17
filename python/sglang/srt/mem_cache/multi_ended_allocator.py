@@ -3612,6 +3612,13 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         self.swa_attn_allocator.bind_high_peer(self.full_attn_allocator)
         self.full_attn_allocator.bind_low_peer(self.swa_attn_allocator)
 
+        # None (not empty): the invariant checker's mamba leak-diagnosis census
+        # mixes physical free-lists with tree-held VIRTUAL ids — meaningless
+        # under the unified pool. `free_pages is None` is the checker's
+        # documented skip contract ("the dump must never crash the watchdog").
+        self.free_pages = None
+        self.release_pages = None
+
         logger.info(
             "[unified-memory-pool] UnifiedMambaSWATokenToKVPoolAllocator ready: "
             "chain=[mamba(up) | swa(float) | full(down)], "
