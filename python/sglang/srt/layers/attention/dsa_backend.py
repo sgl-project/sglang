@@ -72,10 +72,13 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils import (
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_sm100_supported,
     print_warning_once,
 )
+
+_IS_GFX95 = is_gfx95_supported()
 
 if is_cuda():
     import deep_gemm
