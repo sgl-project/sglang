@@ -44,6 +44,7 @@ class DsparkDraftSampler:
         *,
         model,
         gamma,
+        num_drafts,
         max_bs,
         device,
         tp_sync: SpecTpSync,
@@ -56,20 +57,21 @@ class DsparkDraftSampler:
         self.gamma = int(gamma)
         self.sample_from_anchor = bool(model.sample_from_anchor)
         self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
+        self.num_drafts = int(num_drafts)
         max_bs = int(max_bs)
         # Resolved once: this sampler runs inside cuda-graph capture, so the
         # branch below is baked into the captured graph anyway.
         self._fused_greedy = envs.SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV.get()
         if out is not None:
-            assert out.shape == (max_bs * self.gamma,) and out.dtype == torch.int64
+            assert out.shape == (max_bs * self.num_drafts,) and out.dtype == torch.int64
             self.out = out
         else:
             self.out = torch.empty(
-                (max_bs * self.gamma,), dtype=torch.int64, device=device
+                (max_bs * self.num_drafts,), dtype=torch.int64, device=device
             )
         self.confidence_fn = confidence_fn
         self.confidence_out = (
-            torch.empty((max_bs, self.gamma), dtype=torch.float32, device=device)
+            torch.empty((max_bs, self.num_drafts), dtype=torch.float32, device=device)
             if confidence_fn is not None
             else None
         )
@@ -89,7 +91,7 @@ class DsparkDraftSampler:
                 (max_bs, vocab), dtype=torch.float32, device=device
             )
             self.corrected_out = torch.empty(
-                (max_bs * self.gamma, vocab),
+                (max_bs * self.num_drafts, vocab),
                 dtype=_base_logits_dtype(model),
                 device=device,
             )
@@ -171,9 +173,11 @@ class DsparkDraftSampler:
                 sampler=sampler,
                 collect_corrected=self.folded_sampling,
             )
+            assert draft_tokens.shape == (bs, self.num_drafts)
             if self.folded_sampling:
-                self.corrected_out[: bs * self.gamma].copy_(
-                    corrected_logits.reshape(bs * self.gamma, -1)
+                assert corrected_logits.shape[:2] == (bs, self.num_drafts)
+                self.corrected_out[: bs * self.num_drafts].copy_(
+                    corrected_logits.reshape(bs * self.num_drafts, -1)
                 )
 
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
@@ -184,11 +188,12 @@ class DsparkDraftSampler:
                 draft_tokens=draft_tokens,
                 confidence_tap=confidence_tap,
             )
+            assert confidence.shape == (bs, self.num_drafts)
             self.confidence_out[:bs].copy_(confidence)
 
 
 def _resolve_folded_sampling(
-    *, model, gamma, max_bs, device, tp_rank, available_memory_gb: float
+    *, model, num_drafts, max_bs, device, tp_rank, available_memory_gb: float
 ) -> bool:
     """The sampling buffers are baked into the captured draft graph, so AUTO
     must decide before capture from a free-memory probe. ``available_memory_gb``
@@ -200,7 +205,7 @@ def _resolve_folded_sampling(
         return True
     vocab = int(model.lm_head.org_vocab_size)
     noise_bytes = max_bs * vocab * 4
-    logits_bytes = max_bs * gamma * vocab * _base_logits_dtype(model).itemsize
+    logits_bytes = max_bs * num_drafts * vocab * _base_logits_dtype(model).itemsize
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
     if available_memory_gb - need_gb >= _CAPTURE_HEADROOM_GB:
         return True
@@ -221,6 +226,7 @@ def maybe_build_draft_sampler(
     *,
     draft_model,
     gamma: int,
+    num_drafts: int,
     max_bs: int,
     device,
     tp_rank: int,
@@ -245,7 +251,7 @@ def maybe_build_draft_sampler(
         return _eager("no markov head")
     folded_sampling = _resolve_folded_sampling(
         model=draft_model,
-        gamma=gamma,
+        num_drafts=num_drafts,
         max_bs=max_bs,
         device=device,
         tp_rank=tp_rank,
@@ -259,6 +265,7 @@ def maybe_build_draft_sampler(
     return DsparkDraftSampler(
         model=draft_model,
         gamma=gamma,
+        num_drafts=num_drafts,
         max_bs=max_bs,
         device=device,
         tp_sync=tp_sync,
