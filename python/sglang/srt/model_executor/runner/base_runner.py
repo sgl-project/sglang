@@ -554,7 +554,6 @@ class BaseRunner(ABC):
         # Speculative metadata and hidden-state capture mode.
         spec_info = create_dummy_verify_input(
             mr.spec_algorithm,
-            mr.server_args,
             buffers.custom_mask,
             num_tokens_per_req,
             mr.is_draft_worker,
