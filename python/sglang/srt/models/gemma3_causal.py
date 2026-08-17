@@ -14,10 +14,12 @@
 # limitations under the License.
 # ==============================================================================
 import copy
+import json
 from typing import Iterable, List, Optional, Set, Tuple
 
 import einops
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import (
     ROPE_INIT_FUNCTIONS,
@@ -46,6 +48,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, make_layers
+from sglang.srt.utils.hf_transformers.common import _resolve_local_or_cached_file
 
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -374,12 +377,19 @@ class Gemma3DecoderLayer(nn.Module):
         position_embeddings_global: torch.Tensor,
         position_embeddings_local: torch.Tensor,
         forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple[
         torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        # Keep the residual live across layers so the add preceding the next
+        # RMSNorm is fused by Gemma3RMSNorm. This matches the upstream Gemma3
+        # residual layout and is safe to capture in a breakable CUDA graph.
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         # apply global RoPE to non-sliding layer only
         if self.self_attn.is_sliding:
@@ -395,15 +405,13 @@ class Gemma3DecoderLayer(nn.Module):
             **kwargs,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states, residual = self.pre_feedforward_layernorm(
+            hidden_states, residual
+        )
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
+        outputs = (hidden_states, residual)
 
         return outputs
 
@@ -626,21 +634,22 @@ class Gemma3TextModel(PreTrainedModel):
             hidden_states = input_embeds
 
         aux_hidden_states = []
+        residual = None
 
         num_layers = len(self.layers)
         if _is_cpu and _is_cpu_amx_available:
             for i, layer in enumerate(self.layers):
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(hidden_states)
-                layer_outputs = layer(
+                hidden_states, residual = layer(
                     positions=positions,
                     position_embeddings_global=None,
                     position_embeddings_local=None,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
+                    residual=residual,
                     **kwargs,
                 )
-                hidden_states = layer_outputs[0]
         else:
             if positions.dim() == 1:
                 positions = einops.rearrange(positions, "s -> 1 s")
@@ -650,15 +659,15 @@ class Gemma3TextModel(PreTrainedModel):
             for i, layer in enumerate(self.layers):
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(hidden_states)
-                layer_outputs = layer(
+                hidden_states, residual = layer(
                     positions=positions,
                     position_embeddings_global=position_embeddings_global,
                     position_embeddings_local=position_embeddings_local,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
+                    residual=residual,
                     **kwargs,
                 )
-                hidden_states = layer_outputs[0]
 
         # Capture the output of the last layer if requested.
         # layers_to_capture uses +1 offset (captures input of layer i = output of i-1),
@@ -666,7 +675,7 @@ class Gemma3TextModel(PreTrainedModel):
         if num_layers in self.layers_to_capture:
             aux_hidden_states.append(hidden_states)
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -960,8 +969,49 @@ class EmbeddingGemmaModel(Gemma3ForCausalLM):
         self.model = Gemma3TextModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=True)
+        # SentenceTransformers applies mean pooling, then its optional Dense
+        # projector modules, then L2 normalization. Keep normalization outside
+        # Pooler so this ordering is preserved.
+        self.pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=False)
+        self.projector = self._build_sentence_transformer_projector(config)
         self.capture_aux_hidden_states = False
+
+    @staticmethod
+    def _build_sentence_transformer_projector(config: Gemma3TextConfig):
+        """Create the checkpoint's SentenceTransformers Dense tail, if present."""
+        model_path = getattr(config, "_name_or_path", "")
+        try:
+            modules_path = _resolve_local_or_cached_file(model_path, "modules.json")
+            with open(modules_path) as f:
+                module_specs = json.load(f)
+
+            layers = []
+            for spec in module_specs:
+                if spec.get("type") != "sentence_transformers.models.Dense":
+                    continue
+                dense_config_path = _resolve_local_or_cached_file(
+                    model_path, f"{spec['path']}/config.json"
+                )
+                with open(dense_config_path) as f:
+                    dense_config = json.load(f)
+                if dense_config.get("activation_function") not in (
+                    None,
+                    "torch.nn.modules.linear.Identity",
+                ):
+                    raise ValueError(
+                        "EmbeddingGemma only supports identity SentenceTransformers "
+                        "Dense activations"
+                    )
+                layers.append(
+                    nn.Linear(
+                        dense_config["in_features"],
+                        dense_config["out_features"],
+                        bias=dense_config.get("bias", True),
+                    )
+                )
+            return nn.Sequential(*layers) if layers else None
+        except (FileNotFoundError, OSError, ValueError, KeyError, json.JSONDecodeError):
+            return None
 
     @torch.no_grad()
     def forward(
@@ -977,7 +1027,10 @@ class EmbeddingGemmaModel(Gemma3ForCausalLM):
         hidden_states = self.model(
             input_ids, positions, forward_batch, input_embeds, **kwargs
         )
-        return self.pooler(hidden_states, forward_batch)
+        pooled = self.pooler(hidden_states, forward_batch).embeddings
+        if self.projector is not None:
+            pooled = self.projector(pooled)
+        return EmbeddingPoolerOutput(embeddings=F.normalize(pooled, p=2, dim=-1))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load both native Gemma3 and Sentence Transformers checkpoints.
@@ -998,7 +1051,37 @@ class EmbeddingGemmaModel(Gemma3ForCausalLM):
             for name, weight in weights
             if name.startswith("model.") or name.startswith(backbone_prefixes)
         )
-        return super().load_weights(remapped_weights)
+        loaded_params = super().load_weights(remapped_weights)
+        if self.projector is not None:
+            model_path = getattr(self.config, "_name_or_path", "")
+            modules_path = _resolve_local_or_cached_file(model_path, "modules.json")
+            with open(modules_path) as f:
+                module_specs = json.load(f)
+            dense_specs = [
+                spec
+                for spec in module_specs
+                if spec.get("type") == "sentence_transformers.models.Dense"
+            ]
+            from safetensors.torch import load_file
+
+            for layer, spec in zip(self.projector, dense_specs):
+                weights_path = _resolve_local_or_cached_file(
+                    model_path, f"{spec['path']}/model.safetensors"
+                )
+                weights = load_file(weights_path, device="cpu")
+                weight_key = next(
+                    key
+                    for key in ("weight", "linear.weight", "dense.weight")
+                    if key in weights
+                )
+                layer.weight.data.copy_(weights[weight_key].to(layer.weight.device))
+                if layer.bias is not None:
+                    layer.bias.data.copy_(
+                        weights[weight_key.replace("weight", "bias")].to(
+                            layer.bias.device
+                        )
+                    )
+        return loaded_params
 
 
 EntryClass = [Gemma3ForCausalLM, EmbeddingGemmaModel]
