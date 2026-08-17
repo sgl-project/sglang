@@ -8,13 +8,31 @@ reproduces every logprob exactly under deterministic inference, which turns the
 same comparison into an exact one -- any nonzero KL is a state-reuse bug. It also
 fits on one GPU, so these run per-commit rather than on a 4-GPU stage.
 
-Each class below reproduces a specific merged regression when its fix is
-reverted; the measured pre-fix divergence is recorded in the class docstring so a
-later threshold change has to argue with a number.
+Reverting either #34184 or #29792 turns this file red, so a later threshold
+change has to argue with a number. Which case fires is architecture-dependent
+though, because prefill and decode take different fa4 kernels on SM90 and SM100.
+Measured avg_kl_div:
 
-These classes do not use UnifiedRadixTreeTestMixin: it bundles gsm8k and mmlu,
-which an undertrained checkpoint cannot gate on, and each class here runs the
-harness its regression was actually reproduced with.
+                                             fix reverted                 fix
+                                          SM100 (B200) SM90 (H200)   in place
+  #34184   test_logprobs_match                5.58e-07         0.0        0.0
+           test_prefill_cache_hit             6.22e-06    4.40e-06        0.0
+           test_decode_cache_hit                   0.0         0.0        0.0
+           multiturn branching                     0.0    2.01e-07        0.0
+           lazy test_prefill_cache_hit        5.56e-06         n/a        0.0
+  #29792   multiturn branching       9.43e-06/1.16e-05    5.14e-04        0.0
+
+The lazy row was measured in the same session as the 1.18e-05 the non-lazy
+`test_prefill_cache_hit` read on that GPU, so read the pair as "both fire",
+not as one being weaker.
+
+`test_prefill_cache_hit` is the only case that fires on both, so read the rest as
+extra coverage rather than as the guard for one fix. CI runs `1-gpu-large`, which
+is SM90.
+
+These classes do not use UnifiedRadixTreeTestMixin: it bundles a gsm8k case an
+undertrained checkpoint cannot gate on, and each class here runs the harness its
+regression was actually reproduced with.
 
 The imported `test_`-prefixed helpers are aliased so pytest does not collect them
 as tests.
@@ -51,7 +69,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=1150, stage="base-b", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
@@ -79,7 +97,7 @@ def _random_suffixes(n: int, length: int, seed: int) -> list[list[int]]:
     return [[rng.randint(1, 30000) for _ in range(length)] for _ in range(n)]
 
 
-def _base_args() -> list[str]:
+def _base_args(mamba_strategy: str = "extra_buffer") -> list[str]:
     return [
         "--trust-remote-code",
         "--attention-backend",
@@ -87,7 +105,7 @@ def _base_args() -> list[str]:
         "--page-size",
         str(PAGE_SIZE),
         "--mamba-radix-cache-strategy",
-        "extra_buffer",
+        mamba_strategy,
         "--swa-full-tokens-ratio",
         "0.1",
         "--mamba-full-memory-ratio",
@@ -109,10 +127,10 @@ class TestUnifiedHybridBitExact(CustomTestCase):
     prefix the cache restored wrong.
 
     Guards #34184 (stale track rows corrupting conv checkpoints under the prefill
-    graph). Reverting that fix here measures avg_kl_div 5.58e-07 on
-    test_logprobs_match and 6.22e-06 on test_prefill_cache_hit, against 0.0 with
-    it in place. test_decode_cache_hit is 0.0 either way -- it guards decode-region
-    state reuse in general, not that regression.
+    graph) through test_prefill_cache_hit, which is the case that fires on both
+    architectures; see the table at the top for what the other two measure.
+    test_decode_cache_hit stays 0.0 even with the fix reverted, so it covers
+    decode-region state reuse in general rather than that regression.
     """
 
     @classmethod
@@ -162,14 +180,48 @@ class TestUnifiedHybridBitExact(CustomTestCase):
         self._run(assert_decode_cache_hit)
 
 
+class TestUnifiedHybridLazyBitExact(TestUnifiedHybridBitExact):
+    """Same exactness bar on the lazy extra-buffer strategy.
+
+    Lazy is a different code path, not the same code under a flag: a request
+    holds one ping-pong slot instead of two and the second is allocated only on
+    the forward that crosses a track boundary, then freed again afterwards. The
+    checkpoint therefore lands in a slot chosen per forward rather than one the
+    request owns for its lifetime, and picking the wrong one restores another
+    request's conv window.
+
+    Admitted the same way the class it inherits from was: reverting #34184 takes
+    test_prefill_cache_hit here to 5.56e-06, so this is a guard for that class of
+    bug on the lazy path rather than coverage of a path nothing checks.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = _MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = _base_args("extra_buffer_lazy") + [
+            "--chunked-prefill-size",
+            "16384",
+        ]
+        if _MODEL_REVISION:
+            other_args += ["--revision", _MODEL_REVISION]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+        )
+
+
 class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
     """Same exactness bar with the host tier in the loop, over interleaved
     branches so hits land at many prefix lengths rather than one aligned one.
 
     Guards #29792 (decode track save picking its slot from the producer-side
-    pointer). Without that fix this measures avg_kl_div 9.43e-06 and 1.16e-05 over
-    two rounds, with 3 of 9 samples dirty and the rest exactly 0; with it in place
-    both rounds are 0.0.
+    pointer) on both architectures. The signal is sparse rather than uniform:
+    3 of 9 samples dirty and the rest exactly 0. Reverting #34184 also lands here
+    on SM90, so a red run means "state reuse broke", not "#29792 broke".
 
     Runs the multi-turn branching harness because the single-turn helpers above
     cannot produce a non-aligned hit length, which this regression needs.
@@ -245,6 +297,84 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
             max_new_tokens=512,
             sampling_temperature=0,
         )
+
+
+class TestUnifiedHybridMTPBitExact(CustomTestCase):
+    """Same exactness bar with MTP driving the decode loop.
+
+    Speculative decoding advances several tokens per forward, so a track
+    boundary can be crossed inside a verify step and the checkpoint is written
+    from the verify path. #29792 was a wrong-slot pick in the non-spec save;
+    nothing exercises the spec-side save today.
+
+    Two settings are load-bearing rather than incidental:
+
+    `--speculative-num-steps 2` matches the two MTP heads this checkpoint
+    ships; a third step has no weights and the draft head refuses to start.
+
+    `SGLANG_OPT_USE_INKLING_SHEARED_BIAS=0` is required for the exact bar. The
+    sheared relative-bias path shears on `max_seqlen_q`, so a verify pass
+    (several queries) lands the same absolute (q, k) pair on a different tile
+    than a prefill pass and one output element differs. Measured on this
+    checkpoint: with the sheared path on, 12 of 16 tokens diverge from the
+    first token past a tile boundary, up to 8.1e-03; with it off, every token
+    reads exactly 0. Tracked in
+    https://github.com/sgl-project/sglang/issues/34899 -- when the shear is
+    made query-count invariant this override should be dropped, and this class
+    is what will prove it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = _MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = _base_args() + [
+            "--speculative-algorithm",
+            "EAGLE",
+            "--enable-multi-layer-eagle",
+            "--speculative-num-steps",
+            "2",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "3",
+            "--chunked-prefill-size",
+            "16384",
+        ]
+        if _MODEL_REVISION:
+            other_args += ["--revision", _MODEL_REVISION]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            env={
+                **os.environ,
+                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+                "SGLANG_OPT_USE_INKLING_SHEARED_BIAS": "0",
+            },
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "process", None) is not None:
+            kill_process_tree(cls.process.pid)
+
+    def _run(self, helper):
+        helper(
+            self.base_url,
+            {self.model: {"kl_div": KL_DIV_THRESHOLD}},
+            self.model,
+            max_samples=32,
+            max_new_tokens=MAX_NEW_TOKENS,
+            trust_remote_code=True,
+        )
+
+    def test_logprobs_match(self):
+        self._run(assert_logprobs_match)
+
+    def test_decode_cache_hit(self):
+        self._run(assert_decode_cache_hit)
 
 
 if __name__ == "__main__":

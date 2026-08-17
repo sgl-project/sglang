@@ -230,6 +230,7 @@ def process_content_for_template_format(
                             url=image_obj["url"],
                             detail=image_obj.get("detail") or "auto",
                             max_dynamic_patch=mdp,
+                            content_hash=image_obj.get("content_hash"),
                         )
                     )
 

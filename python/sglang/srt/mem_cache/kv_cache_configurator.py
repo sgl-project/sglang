@@ -78,6 +78,7 @@ from sglang.srt.runtime_context import (
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
     max_speculative_num_draft_tokens,
+    pre_capture_activation_reserve_mb,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -90,6 +91,17 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
+    memory_config = get_memory()
+    return (
+        not memory_config.enable_hisparse
+        and not is_draft_worker
+        and not memory_config.enable_hierarchical_cache
+        and get_disagg().disaggregation_mode == "null"
+    )
+
 
 _is_hip = is_hip()
 
@@ -1002,6 +1014,10 @@ class KVCacheConfigurator:
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                 )
+            elif is_minimax_sparse(self.model_config.hf_config):
+                token_to_kv_pool = self._build_ascend_minimax_sparse_kv_pool(
+                    max_total_num_tokens=sizes.max_total_num_tokens,
+                )
             elif self.use_mla_backend:
                 token_to_kv_pool = self._build_ascend_mla_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
@@ -1087,37 +1103,18 @@ class KVCacheConfigurator:
         else:
             compression_ratios = self.model_config.compress_ratios
 
-        # NPU + DSV4 → paged-state subclass: the fused compressor kernel
-        # needs cache_mode=1 (paged); Atlas A3 rejects cache_mode=2 (ring),
-        # so the CUDA ring-buffer state path can't be shared. CUDA keeps
-        # DeepSeekV4TokenToKVPool unchanged; NPU recomputes state sizes below.
+        # NPU keeps its PA_ND KV-pool subclass, while Compressor state sizing
+        # follows the same fixed ring ownership as GPU. Do not replace the
+        # configurator's C4-SWA/C128-request budgets with a paged allocator
+        # estimate: Atlas A3 cache_mode=2 consumes explicit flat state_locs.
         if _is_npu:
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
                 DSV4NPUTokenToKVPool,
-                npu_state_pool_size,
             )
 
             pool_cls = DSV4NPUTokenToKVPool
-            # Recompute state pool sizes for the NPU paged formula (CUDA's
-            # ring sizes are dropped here). Tail-only allocation keeps the
-            # per-req-budget formula sufficient at any prefill length: long
-            # prompts allocate only ``tail+128`` (c4) / ``tail`` (c128)
-            # slots (tail = seq_len % 128), and decode is drained by
-            # sliding eviction in ``ScheduleBatch._evict_swa``.
-            c4_state_pool_size = npu_state_pool_size(
-                ratio=4,
-                page_size=get_schedule().page_size,
-                max_num_reqs=max_running_requests,
-            )
-            c128_state_pool_size = npu_state_pool_size(
-                ratio=128,
-                page_size=get_schedule().page_size,
-                max_num_reqs=max_running_requests,
-            )
         else:
             pool_cls = DeepSeekV4TokenToKVPool
-            c4_state_pool_size = c4_state_pool_size
-            c128_state_pool_size = c128_state_pool_size
 
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,
@@ -1248,6 +1245,37 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def _build_ascend_minimax_sparse_kv_pool(
+        self, *, max_total_num_tokens: int
+    ) -> KVCache:
+        _hf_config = self.model_config.hf_config
+        sparse_cfg = get_minimax_sparse_attention_config(_hf_config)
+        dense_layer_ids, sparse_layer_ids = get_minimax_sparse_layer_ids(sparse_cfg)
+        disable_value_sparse_layer_ids = get_minimax_sparse_disable_value_layer_ids(
+            sparse_cfg
+        )
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMiniMaxSparseKVPool,
+        )
+
+        token_to_kv_pool = NPUMiniMaxSparseKVPool(
+            size=max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.kv_cache_dtype,
+            index_dtype=self.model_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
+            head_dim=self.model_config.head_dim,
+            idx_head_dim=sparse_cfg["sparse_index_dim"],
+            dense_layer_ids=dense_layer_ids,
+            sparse_layer_ids=sparse_layer_ids,
+            disable_value_sparse_layer_ids=disable_value_sparse_layer_ids,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+        )
+        return token_to_kv_pool
+
     def _build_ascend_mla_kv_pool(
         self, *, max_total_num_tokens: int, is_dsa_model: bool
     ) -> KVCache:
@@ -1322,7 +1350,7 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = DSATokenToKVPool
-        if not get_memory().enable_hisparse and not self.is_draft_worker:
+        if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
                 for layer_id in range(
@@ -1813,7 +1841,7 @@ class KVCacheConfigurator:
             # Mamba state is a fixed pre-capture allocation, so it can't ride the ~0 post-capture slack.
             slack_gb = max(
                 slack_gb,
-                self.server_args.pre_capture_activation_reserve_mb(
+                pre_capture_activation_reserve_mb(
                     get_device_memory_capacity(self.device)
                 )
                 / 1024,
