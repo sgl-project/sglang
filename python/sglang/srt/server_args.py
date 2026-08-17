@@ -893,6 +893,11 @@ class ServerArgs:
         Arg(help="The number of tokens in a page.", resolvable=True),
         NS("schedule"),
     ] = None
+    c128_page_size: A[
+        int,
+        "The physical page size of the NPU DSV4 C128 KV cache. Must be a positive multiple of 16.",
+        NS("schedule"),
+    ] = 16
     swa_full_tokens_ratio: A[
         float,
         Arg(
@@ -2648,10 +2653,10 @@ class ServerArgs:
         False
     )
     hicache_ratio: A[
-        float,
-        "The ratio of the size of host KV cache memory pool to the size of device pool.",
+        Optional[float],
+        "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0, or 1.0 for host-pool decode retraction.",
         NS("memory"),
-    ] = 2.0
+    ] = None
     hicache_size: A[
         int,
         "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
@@ -3110,6 +3115,19 @@ class ServerArgs:
         "Enable async KV cache offloading on decode server (PD mode).",
         NS("disagg"),
     ] = False
+    disaggregation_decode_retraction_backup: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Storage backend for KV preserved across PD decode retraction. "
+                "'cpu_tensor' uses per-request CPU tensors. 'host_pool' uses "
+                "a reserved HiCache pool and does not fall back on exhaustion. "
+                "If omitted, the backend is inferred from the decode KV pool."
+            ),
+            choices=["cpu_tensor", "host_pool"],
+        ),
+        NS("disagg"),
+    ] = None
     num_reserved_decode_tokens: A[
         int,
         "Number of decode tokens that will have memory reserved when adding new request to the running batch.",
@@ -3584,6 +3602,7 @@ class ServerArgs:
         self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
+        self._handle_hicache_ratio_default()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -6686,7 +6705,6 @@ class ServerArgs:
         # (arg_groups/overrides.py: _moe_runner_backend_quant_constraints);
         # the compatibility asserts and fusion writes stay below.
         from sglang.srt.arg_groups.overrides import (
-            _cutlass_moe_env_override,
             _moe_runner_backend_quant_constraints,
             _moe_runner_fusion_disable,
             run_post_process_pass,
@@ -6761,11 +6779,6 @@ class ServerArgs:
         # invoked here at the legacy write slots.
         run_post_process_pass(self, _moe_runner_fusion_disable)
 
-        # The deprecated SGLANG_CUTLASS_MOE override moved to the pipeline
-        # (arg_groups/overrides.py: _cutlass_moe_env_override). It sits after
-        # the fusion blocks above on purpose: they must observe the
-        # pre-override runner value, exactly as they did imperatively.
-        run_post_process_pass(self, _cutlass_moe_env_override)
         if resolved_view(self).moe_runner_backend == "cutlass" and resolved_view(
             self
         ).quantization in [
@@ -7336,6 +7349,10 @@ class ServerArgs:
                 "workloads and backends may be supported in a future change."
             )
 
+    def _handle_hicache_ratio_default(self):
+        if self.hicache_ratio is None and self.disaggregation_mode != "decode":
+            self.hicache_ratio = 2.0
+
     def _handle_hicache(self):
         """Normalize hicache-related knobs into a valid runtime configuration.
 
@@ -7347,6 +7364,10 @@ class ServerArgs:
         if not (
             self.enable_hierarchical_cache
             or self.disaggregation_decode_enable_offload_kvcache
+            or (
+                self.disaggregation_mode == "decode"
+                and self.disaggregation_decode_retraction_backup in (None, "host_pool")
+            )
         ):
             return
 
@@ -8085,6 +8106,32 @@ class ServerArgs:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
+        if (
+            self.disaggregation_decode_retraction_backup == "host_pool"
+            and self.disaggregation_mode != "decode"
+        ):
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=host_pool is only "
+                "supported on a PD decode server."
+            )
+        if (
+            self.disaggregation_decode_retraction_backup == "host_pool"
+            and self.dcp_size > 1
+        ):
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=host_pool does not "
+                "support --dcp-size > 1."
+            )
+        if (
+            self.disaggregation_decode_retraction_backup == "host_pool"
+            and self.enable_priority_scheduling
+            and not self.disable_priority_preemption
+        ):
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=host_pool requires "
+                "--disable-priority-preemption when priority scheduling is enabled."
+            )
+
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
@@ -8099,6 +8146,12 @@ class ServerArgs:
             if self.hicache_storage_backend is None:
                 raise ValueError(
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported when hicache-storage-backend is provided."
+                )
+            if self.disaggregation_decode_retraction_backup == "host_pool":
+                raise ValueError(
+                    "The arguments disaggregation-decode-enable-offload-kvcache and "
+                    "disaggregation-decode-retraction-backup=host_pool are mutually exclusive: "
+                    "both build a decode host pool."
                 )
 
         # Validate the effective ratio: model branches may declare a reset
@@ -9690,32 +9743,6 @@ def get_global_server_args() -> ServerArgs:
     return get_context().server_args
 
 
-def _has_cli_arg(argv: List[str], flag: str) -> bool:
-    return any(arg == flag or arg.startswith(f"{flag}=") for arg in argv)
-
-
-def _apply_fuseep_mode_env_compat(
-    raw_args: argparse.Namespace, argv: List[str]
-) -> None:
-    if not envs.SGLANG_NPU_FUSED_MOE_MODE.is_set() or _has_cli_arg(
-        argv, "--fuseep-mode"
-    ):
-        return
-
-    fuseep_mode = envs.SGLANG_NPU_FUSED_MOE_MODE.get()
-    if fuseep_mode not in (1, 2):
-        raise ValueError(
-            f"Wrong value of SGLANG_NPU_FUSED_MOE_MODE={fuseep_mode}, "
-            "the NPU only supports 1 or 2."
-        )
-
-    logger.warning(
-        "The env variable SGLANG_NPU_FUSED_MOE_MODE is deprecated and will be "
-        "removed in a future release. Please use --fuseep-mode instead."
-    )
-    raw_args.fuseep_mode = fuseep_mode
-
-
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -9749,8 +9776,6 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
-
-    _apply_fuseep_mode_env_compat(raw_args, argv)
 
     return ServerArgs.from_cli_args(raw_args)
 

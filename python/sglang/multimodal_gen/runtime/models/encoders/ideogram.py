@@ -110,7 +110,7 @@ class IdeogramQwen3VLTextEncoder(TextEncoder):
             position_ids = pos_2d[None, ...].expand(4, 1, -1)
             attention_mask = torch.ones_like(cur_token_ids)
             with set_forward_context(current_timestep=0, attn_metadata=None):
-                outputs = self.forward(
+                outputs = self(
                     input_ids=cur_token_ids,
                     position_ids=position_ids,
                     attention_mask=attention_mask,
