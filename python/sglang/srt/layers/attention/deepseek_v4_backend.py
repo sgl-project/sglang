@@ -702,14 +702,38 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=out_cache_loc,
             )
 
+        return self._make_forward_metadata_decode(
+            max_seq_len=max_seq_len,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+        )
+
+    def _make_forward_metadata_decode(
+        self,
+        max_seq_len: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+    ) -> DSV4Metadata:
+        # DSV4 draft models contain only the ratio-0 NextN/DSpark attention
+        # layer. Avoid materializing the full-context page table and compressed
+        # attention metadata that only ratio-4/128 target layers consume.
+        need_compress = not self.is_draft_runner
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices,
             seq_lens_casual=seq_lens,
-            max_seq_len=max_seq_len,
+            max_seq_len=max_seq_len if need_compress else self.page_size,
             out_loc=out_cache_loc,
-            need_compress=True,
+            need_compress=need_compress,
         )
+
+        if not need_compress:
+            return DSV4Metadata(
+                core_attn_metadata=core_attn_metadata,
+                indexer_metadata=None,
+            )
 
         indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
 
@@ -1059,34 +1083,11 @@ class DeepseekV4AttnBackend(
         self,
         raw_metadata: DSV4RawDecodeMetadata,
     ) -> DSV4Metadata:
-        req_pool_indices = raw_metadata.req_pool_indices
-        seq_lens = raw_metadata.seq_lens
-        out_cache_loc = raw_metadata.out_cache_loc
-
-        core_attn_metadata = self.make_core_attn_metadata(
-            req_to_token=self.req_to_token,
-            req_pool_indices_repeated=req_pool_indices,
-            seq_lens_casual=seq_lens,
+        return self._make_forward_metadata_decode(
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
-            out_loc=out_cache_loc,
-            need_compress=True,
-        )
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
-
-        create = functools.partial(
-            create_paged_compressor_data,
-            is_prefill=False,
-            token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-        )
-
-        return DSV4Metadata(
-            core_attn_metadata,
-            indexer_metadata,
-            c4_compress_metadata=create(compress_ratio=4),
-            c128_compress_metadata=create(compress_ratio=128),
+            req_pool_indices=raw_metadata.req_pool_indices,
+            seq_lens=raw_metadata.seq_lens,
+            out_cache_loc=raw_metadata.out_cache_loc,
         )
 
     def init_forward_metadata_draft_extend(
@@ -1383,6 +1384,26 @@ class DeepseekV4AttnBackend(
                 else None
             )
 
+    def _get_captured_draft_decode_metadata(
+        self,
+        bs: int,
+    ) -> Optional[DSV4RawDecodeMetadata]:
+        """Captured decode metadata for ``bs`` reusable without re-planning, else
+        ``None`` (caller re-plans and copies).
+
+        Reusable = a ``DSV4RawDecodeMetadata`` whose ``req_pool_indices`` /
+        ``seq_lens`` view the persistent graph buffers the runner refreshes each
+        replay. The ``needs_cpu_seq_lens`` / ``is_dspark_draft`` guards reject
+        configs that still hold raw metadata but rebuild host ``seq_lens_cpu``
+        per forward, which the aliased device buffers do not carry.
+        """
+        if not self.is_draft_runner or self.needs_cpu_seq_lens or self.is_dspark_draft:
+            return None
+        metadata = self.cuda_graph_metadata_of_bucket_and_bs[
+            _GraphBucket.DECODE_OR_IDLE
+        ].get(bs)
+        return metadata if isinstance(metadata, DSV4RawDecodeMetadata) else None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
         if self.mtp_enabled and logical_forward_mode.is_idle():
@@ -1588,8 +1609,10 @@ class DeepseekV4AttnBackend(
         ):
             core = metadata.core_attn_metadata
             core.c1_flashmla_metadata = _create_flashmla_metadata()
-            core.c4_flashmla_metadata = _create_flashmla_metadata()
-            core.c128_flashmla_metadata = _create_flashmla_metadata()
+            if core.c4_flashmla_metadata is not None:
+                core.c4_flashmla_metadata = _create_flashmla_metadata()
+            if core.c128_flashmla_metadata is not None:
+                core.c128_flashmla_metadata = _create_flashmla_metadata()
 
         # PREP_IN_CUDA_GRAPH=True: warmup upgraded raw->full on the host;
         # restore raw so capture re-runs the upgrade inside the graph.
@@ -1653,6 +1676,11 @@ class DeepseekV4AttnBackend(
         attn_sink: Optional[torch.Tensor] = None,
         **_,
     ) -> torch.Tensor:
+        assert not self.is_draft_runner or compress_ratio == 0, (
+            "DSV4 draft attention only supports compress_ratio == 0, "
+            f"got {compress_ratio=}"
+        )
+
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
 
@@ -2108,46 +2136,56 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        for attn_backend in self.attn_backends:
-            attn_backend.init_forward_metadata_in_graph(forward_batch)
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
 
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        from types import SimpleNamespace
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
 
-        inner_fb = SimpleNamespace(
-            batch_size=forward_batch.batch_size,
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
             forward_mode=ForwardMode.DECODE,
-            # Propagate the real runtime mode so inner backends can detect IDLE
-            # and apply their idle substitution.
-            actual_forward_mode=getattr(
-                forward_batch, "actual_forward_mode", forward_batch.forward_mode
-            ),
-            input_ids=getattr(forward_batch, "input_ids", None),
-            positions=getattr(forward_batch, "positions", None),
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum,
-            seq_lens_cpu=forward_batch.seq_lens_cpu,
-            encoder_lens=None,
-            out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
-            spec_info=forward_batch.spec_info,
         )
+        active_backends = self.attn_backends[: self.speculative_num_steps - 1]
         if in_capture:
-            for i in range(self.speculative_num_steps):
-                self.attn_backends[i].init_forward_metadata_out_graph(
-                    inner_fb, in_capture=True
-                )
+            for backend in active_backends:
+                backend.init_forward_metadata_out_graph(inner_fb, in_capture=True)
         else:
-            if self.speculative_num_steps == 1:
+            if not active_backends:
                 return
-            self.attn_backends[0].init_forward_metadata_out_graph(inner_fb)
-            temp_metadata = self.attn_backends[0].forward_metadata
-            for i in range(1, self.speculative_num_steps - 1):
-                self.attn_backends[i].replay_cuda_graph_metadata_from(
+            # Only real DECODE can reuse captured raw metadata: it aliases the
+            # req/seq graph buffers the runner refreshes before this call. IDLE
+            # instead rebinds seq_lens/req_pool_indices to fresh ones/zeros in
+            # init_forward_metadata_out_graph, so its captured raw metadata no
+            # longer tracks those live buffers — IDLE must take the copy path.
+            captured_metadata = []
+            if inner_fb.actual_forward_mode.is_decode():
+                for backend in active_backends:
+                    metadata = backend._get_captured_draft_decode_metadata(
+                        inner_fb.batch_size
+                    )
+                    if metadata is None:
+                        break
+                    captured_metadata.append(metadata)
+            if len(captured_metadata) == len(active_backends):
+                # Capture retained direct views of EAGLE's req/seq graph
+                # buffers, which the runner refreshes before this call. The
+                # raw out-cache tensor is only a capture-time dummy: live SWA
+                # write locations are regenerated inside the graph.
+                for backend, metadata in zip(
+                    active_backends, captured_metadata, strict=True
+                ):
+                    backend.forward_metadata = metadata
+                return
+            active_backends[0].init_forward_metadata_out_graph(inner_fb)
+            temp_metadata = active_backends[0].forward_metadata
+            for backend in active_backends[1:]:
+                backend.replay_cuda_graph_metadata_from(
                     bs=forward_batch.batch_size,
                     temp_metadata=temp_metadata,
                     bucket=_GraphBucket.DECODE_OR_IDLE,
