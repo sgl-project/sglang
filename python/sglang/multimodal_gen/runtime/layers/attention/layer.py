@@ -12,7 +12,7 @@ import torch.nn as nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
-from sglang.kernels.ops.diffusion.triton.varlen_pack_pad import (
+from sglang.kernels.ops.diffusion import (
     build_inv_indices,
     fused_pack_qkv,
     fused_scatter_to_padded,

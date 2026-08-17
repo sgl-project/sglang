@@ -400,9 +400,7 @@ def test_packed_qkv_exchange_preserves_rank_and_head_order(_):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_ulysses_qkv_pack_is_bit_exact():
-    from sglang.kernels.ops.diffusion.triton.ulysses_qkv import (
-        pack_qkv_destination_major,
-    )
+    from sglang.kernels.ops.diffusion import pack_qkv_destination_major
 
     torch.manual_seed(23)
     rows, world_size, heads, head_size = 65, 8, 56, 128

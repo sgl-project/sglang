@@ -5,18 +5,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
 
-from sglang.kernels.ops.diffusion.bitexact_gate import BitExactFusionGate
-from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
-from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
-    can_use_fused_layernorm_modulate,
-    fused_layernorm_modulate_raw,
-    is_plain_layer_norm,
-)
-from sglang.kernels.ops.diffusion.triton.sana_conv_post import (
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
     can_use_fused_bias_glu,
     can_use_fused_bias_silu,
+    can_use_fused_layernorm_modulate,
     fused_bias_glu,
     fused_bias_silu,
+    fused_layernorm_modulate_raw,
+    is_plain_layer_norm,
+    residual_gate_add,
 )
 from sglang.multimodal_gen.configs.models.dits.sana import SanaConfig
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm

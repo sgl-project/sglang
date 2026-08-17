@@ -87,9 +87,7 @@ def zimage_rmsnorm_tanh_mul_add(
     enable_fused: bool = True,
 ) -> torch.Tensor:
     if enable_fused:
-        from sglang.kernels.ops.diffusion.triton.native_bf16_rmsnorm import (
-            rmsnorm_tanh_residual,
-        )
+        from sglang.kernels.ops.diffusion import rmsnorm_tanh_residual
 
         y = rmsnorm_tanh_residual(
             x,
@@ -110,9 +108,7 @@ def zimage_rmsnorm_scale(
     enable_fused: bool = True,
 ) -> torch.Tensor:
     if enable_fused:
-        from sglang.kernels.ops.diffusion.triton.native_bf16_rmsnorm import (
-            rmsnorm_scale,
-        )
+        from sglang.kernels.ops.diffusion import rmsnorm_scale
 
         y = rmsnorm_scale(
             x,
@@ -138,7 +134,7 @@ def zimage_native_qk_rmsnorm(
     with one Triton launch per tensor that reads the strided fused-qkv slices
     directly. Returns contiguous (q, k) or None when unsupported.
     """
-    from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
+    from sglang.kernels.ops.diffusion import (
         can_use_qk_rmsnorm_native,
         zimage_qk_rmsnorm_native,
     )

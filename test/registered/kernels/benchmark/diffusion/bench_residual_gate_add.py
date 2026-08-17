@@ -4,8 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add_cuda
-from sglang.kernels.ops.diffusion.triton.scale_shift import fuse_scale_shift_kernel
+from sglang.kernels.ops.diffusion import fuse_scale_shift_kernel, residual_gate_add_cuda
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
