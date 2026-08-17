@@ -31,6 +31,7 @@ class AttentionBackendEnum(enum.Enum):
     TORCH_SDPA = enum.auto()
     TORCH_CUDNN_SDPA = enum.auto()
     DYNAMIC_CUDNN_SDPA = enum.auto()
+    CPU_AMX = enum.auto()
     SAGE_ATTN = enum.auto()
     SAGE_ATTN_3 = enum.auto()
     SPARGE_ATTN = enum.auto()

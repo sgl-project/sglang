@@ -12,6 +12,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import Decodin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av import (
     LTX2RefinementStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding import (
+    MiniMaxH3DecodingStage,
+)
 
 
 class FakeVAE(nn.Module):
@@ -72,6 +75,44 @@ class TestDecodingStageParallelism(unittest.TestCase):
                 stage.parallelism_type,
                 StageParallelismType.REPLICATED,
             )
+
+    def test_minimax_h3_cpu_component_use_promotes_fp16_decode_to_bf16(self):
+        stage = MiniMaxH3DecodingStage(FakeVAE(), FakeVAE())
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                vae_precision="fp32",
+                vae_decode_precision="fp16",
+                audio_vae_precision="fp32",
+            )
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding.current_platform.is_cpu",
+            return_value=True,
+        ):
+            uses = stage.component_uses(server_args)
+
+        self.assertEqual(uses[0].target_dtype, torch.bfloat16)
+        self.assertEqual(uses[1].target_dtype, torch.float32)
+
+    def test_minimax_h3_non_cpu_component_use_keeps_configured_decode_precision(self):
+        stage = MiniMaxH3DecodingStage(FakeVAE(), FakeVAE())
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                vae_precision="fp32",
+                vae_decode_precision="fp16",
+                audio_vae_precision="fp32",
+            )
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding.current_platform.is_cpu",
+            return_value=False,
+        ):
+            uses = stage.component_uses(server_args)
+
+        self.assertEqual(uses[0].target_dtype, torch.float16)
+        self.assertEqual(uses[1].target_dtype, torch.float32)
 
     def test_torch_compile_decode_cache_is_replaced_for_new_vae_instance(self):
         vae = FakeVAE()
