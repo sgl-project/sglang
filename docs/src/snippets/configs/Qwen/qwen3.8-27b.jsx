@@ -103,9 +103,17 @@ export const config = {
         { id: "none", label: "None" },
         {
           id: "eagle", label: "EAGLE",
-          disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
+          // SM120 (RTX PRO 6000 / RTX 5090) and SM121 (DGX Spark) only. The
+          // ReplaySSM spec-verify this recipe carries has only been exercised
+          // on SM120; h200 (SM90) and gb300 (SM103) are untested with it, so
+          // MTP is not offered there rather than shipped unvalidated.
+          // On the 32GB 5090 it additionally needs the NVFP4 weights.
+          disabled: (sel) =>
+            !["rtx5090", "rtx6000", "dgx-spark"].includes(sel.hw) ||
+            (sel.hw === "rtx5090" && sel.quant !== "nvfp4"),
           disableReason:
-            "On the 32GB RTX 5090 the MTP head only fits on top of the NVFP4 weights",
+            "EAGLE / MTP is offered on SM120 (RTX PRO 6000, RTX 5090) and SM121 " +
+            "(DGX Spark) only; on the 32GB RTX 5090 it also requires NVFP4 weights",
           // ReplaySSM spec-verify rides with EAGLE on EVERY platform at the
           // maintainers' direction. It replaces the per-draft full-state
           // snapshots with a fold-every-commit ring, which takes the D
@@ -497,6 +505,8 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
+        "--mamba-backend triton",
+        "--linear-attn-backend triton",
         "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
@@ -515,6 +525,8 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
+        "--mamba-backend triton",
+        "--linear-attn-backend triton",
         "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
@@ -533,6 +545,8 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
+        "--mamba-backend triton",
+        "--linear-attn-backend triton",
         "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",

@@ -182,7 +182,17 @@ checkpoint's calibration scales automatically.
 - **DSpark**: the trained draft model is a separate checkpoint — add
   `--speculative-algorithm DSPARK --speculative-draft-model-path
   RadixArk/Qwen3.8-27B-DSpark` (the Playground's Speculative Decoding card
-  emits this pair).
+  emits this pair). DSpark does **not** take
+  `--speculative-num-draft-tokens`: its verify window is
+  `--speculative-dspark-block-size` (gamma) **+ 1**, and gamma is auto-inferred
+  from the draft checkpoint when the flag is omitted (5 for this checkpoint, so
+  D = 6). That `D` is a term in the balanced ratio —
+  `r = (S + D) x token_equiv / L` — so DSpark needs a materially higher
+  `--mamba-full-memory-ratio` than no-spec at the same `S`, and pinning a
+  different gamma changes the ratio with it. MTP is the opposite case: with
+  `--enable-linear-replayssm-spec` its draft intermediates move onto a fixed
+  ring, so `D = 0` and the ratio returns to the no-spec value. The
+  [calculator](#mamba-ratio-calculator) applies both rules.
 - **Hardware fit**: FP8 weights ~28.5GB (not serviceable beyond bs≤2 on
   32GB cards); NVFP4 weights ~16.5GB (recommended for RTX 5090-class GPUs).
 - `--mamba-radix-cache-strategy extra_buffer_lazy` lowers the state cost per
