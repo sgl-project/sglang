@@ -58,6 +58,7 @@ from cutlass._mlir import ir
 from cutlass.cutlass_dsl import (
     Boolean,
     Int32,
+    Int64,
     Integer,
     const_expr,
     dsl_user_op,
@@ -815,12 +816,12 @@ class MoEStaticPersistentTileScheduler:
 class MoEDirectPersistentTileScheduler:
     """Persistent scheduler over a routing-produced compact cluster map.
 
-    ``schedule[i]`` stores one packed int32 containing
-    ``(expert, cluster_m, cluster_n)`` in ``(10, 10, 12)`` bits. Building this
-    map belongs to routing/permutation and is deliberately outside the GEMM
-    boundary, just like TRTLLM's CTA-to-expert map. The GEMM performs one
-    coalesced int32 load per work tile instead of scanning every expert count
-    independently in each specialized warp.
+    ``schedule[i]`` stores one packed int64 containing
+    ``(expert, cluster_m, cluster_n)`` at the field widths declared in
+    ``schedule_abi``. Building this map belongs to routing/permutation and is
+    deliberately outside the GEMM boundary, just like TRTLLM's CTA-to-expert
+    map. The GEMM performs one coalesced load per work tile instead of scanning
+    every expert count independently in each specialized warp.
     """
 
     def __init__(
@@ -928,13 +929,15 @@ class MoEDirectPersistentTileScheduler:
     def _get_current_work(self, *, loc=None, ip=None) -> MoEWorkTileInfo:
         work = MoEWorkTileInfo(Int32(-1), Int32(0), Int32(0), Int32(0))
         if self._current_work_linear_idx < self.schedule_tiles[0]:
-            packed = Int32(self.schedule[self._current_work_linear_idx])
-            expert = packed & Int32(EXPERT_MASK)
-            cluster_m = (packed >> Int32(TOKEN_CLUSTER_SHIFT)) & Int32(
-                TOKEN_CLUSTER_MASK
+            # Extracted in 64-bit, narrowed once: every field is far inside
+            # int32 range by construction (see schedule_abi).
+            packed = Int64(self.schedule[self._current_work_linear_idx])
+            expert = Int32(packed & Int64(EXPERT_MASK))
+            cluster_m = Int32(
+                (packed >> Int64(TOKEN_CLUSTER_SHIFT)) & Int64(TOKEN_CLUSTER_MASK)
             )
-            cluster_n = (packed >> Int32(OUTPUT_CLUSTER_SHIFT)) & Int32(
-                OUTPUT_CLUSTER_MASK
+            cluster_n = Int32(
+                (packed >> Int64(OUTPUT_CLUSTER_SHIFT)) & Int64(OUTPUT_CLUSTER_MASK)
             )
             tile_m = (
                 cluster_m * self.params.cluster_shape_mn[0]

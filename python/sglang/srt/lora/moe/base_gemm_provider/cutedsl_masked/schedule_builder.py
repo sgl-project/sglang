@@ -1,11 +1,12 @@
 """Per-forward packed tile schedules for the direct-schedule CuTeDSL GEMMs.
 
-The direct-schedule kernel consumes a packed int32 per tile —
-``expert | token_cluster << 10 | output_cluster << 20`` — plus a device tile
-count. Both GEMM stages' schedules derive from the SAME ``masked_m`` in ONE
-launch, which is the section 45 dual-ownership rule: a schedule built from any
-other row-count source than the masked_m the GEMMs will read is silent
-corruption, so this module never accepts row counts through a second path.
+The direct-schedule kernel consumes a packed int64 per tile — expert, token
+cluster, output cluster, at the field shifts declared in ``schedule_abi`` —
+plus a device tile count. Both GEMM stages' schedules derive from the SAME
+``masked_m`` in ONE launch, which is the section 45 dual-ownership rule: a
+schedule built from any row-count source other than the masked_m the GEMMs will
+read is silent corruption, so this module never accepts row counts through a
+second path.
 
 Per-expert tile ordering follows the study's heuristic: when an expert has no
 more token clusters than output clusters, tiles iterate token-fastest
@@ -14,9 +15,9 @@ loop bound is a runtime scalar, so no per-m_max recompilation.
 
 ABI bounds are enforced HERE. Packing and the device decoder import the same
 field shifts and masks from ``schedule_abi`` so a width change cannot silently
-change only one side. Expert counts up to 1024, token clusters <= 1024 per
-expert, output clusters <= 2048 (a non-negative-word config), and the
-worst-case capacity must fit int32.
+change only one side, and the limits live there rather than restated as
+literals, because they moved once already. The worst-case entry COUNT must
+still fit int32 -- this builder's own prefix arithmetic, not the packed word.
 """
 
 from __future__ import annotations
@@ -59,8 +60,8 @@ def _dual_schedule_kernel(
     The first version ran ONE program with a serial per-entry loop across all
     experts — 17 us at prefill scale, larger than the GEMM saving it enabled
     (the measured cause of the pipeline's 0.98x prefill). Each program now
-    recomputes its own exclusive prefix from masked_m (O(E) vectorized loads,
-    E <= 1024) and fills its entries ENTRY_BLOCK at a time.
+    recomputes its own exclusive prefix from masked_m (O(E) vectorized loads
+    over the expert axis) and fills its entries ENTRY_BLOCK at a time.
     """
     expert = tl.program_id(0)
     stage = tl.program_id(1)
@@ -97,7 +98,13 @@ def _dual_schedule_kernel(
         oc_b = local - tc_b * out_clusters
         tc_i = tl.where(token_major, tc_b, tc_a)
         oc_i = tl.where(token_major, oc_b, oc_a)
-        packed = expert | (tc_i << TOKEN_SHIFT) | (oc_i << OUTPUT_SHIFT)
+        # Widen BEFORE shifting: int32 operands would overflow the upper
+        # fields silently.
+        packed = (
+            expert.to(tl.int64)
+            | (tc_i.to(tl.int64) << TOKEN_SHIFT)
+            | (oc_i.to(tl.int64) << OUTPUT_SHIFT)
+        )
         if SINGLE_STAGE:
             tl.store(schedule1_ptr + begin + local, packed, mask=valid)
         else:
@@ -147,7 +154,8 @@ def dual_stage_schedule_capacities(
     max_token_clusters = (m_max + token_width - 1) // token_width
     if num_experts > MAX_EXPERTS:
         raise ValueError(
-            f"direct schedule packs expert INDICES in 10 bits (counts up to "
+            f"direct schedule packs expert INDICES in "
+            f"{MAX_EXPERTS.bit_length() - 1} bits (counts up to "
             f"{MAX_EXPERTS}); got {num_experts}"
         )
     if max_token_clusters > MAX_TOKEN_CLUSTERS:
@@ -447,6 +455,27 @@ def contiguous_dual_stage_schedule_pack(
     )
 
 
+def _int_output(
+    output: torch.Tensor | None,
+    *,
+    elements: int,
+    device: torch.device,
+    label: str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if output is None:
+        return torch.empty(elements, dtype=dtype, device=device)
+    if (
+        output.shape != (elements,)
+        or output.dtype != dtype
+        or output.device != device
+        or not output.is_contiguous()
+    ):
+        name = str(dtype).removeprefix("torch.")
+        raise ValueError(f"{label} must be contiguous {name} [{elements}] on {device}")
+    return output
+
+
 def _schedule_output(
     output: torch.Tensor | None,
     *,
@@ -454,16 +483,9 @@ def _schedule_output(
     device: torch.device,
     label: str,
 ) -> torch.Tensor:
-    if output is None:
-        return torch.empty(elements, dtype=torch.int32, device=device)
-    if (
-        output.shape != (elements,)
-        or output.dtype != torch.int32
-        or output.device != device
-        or not output.is_contiguous()
-    ):
-        raise ValueError(f"{label} must be contiguous int32 [{elements}] on {device}")
-    return output
+    return _int_output(
+        output, elements=elements, device=device, label=label, dtype=torch.int64
+    )
 
 
 def _tile_count_output(
@@ -472,7 +494,12 @@ def _tile_count_output(
     device: torch.device,
     label: str,
 ) -> torch.Tensor:
-    return _schedule_output(output, elements=1, device=device, label=label)
+    """int32, not int64: this is the builder's own prefix arithmetic (bounded by
+    the capacity check above), and the device compares it to an Int32 work index.
+    """
+    return _int_output(
+        output, elements=1, device=device, label=label, dtype=torch.int32
+    )
 
 
 def build_single_stage_schedule(

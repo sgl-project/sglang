@@ -197,9 +197,9 @@ def _contig_seg_layout_kernel(
     seg_offsets_ptr,  # [E_local + 1] int32 aligned exclusive prefix out
     grouped_layout_ptr,  # [m_pad_ceiling] int32 out; NO host prefill needed
     m_pad_ceiling,  # host-static row ceiling; [M_pad, ceiling) gets -1
-    schedule1_ptr,  # BUILD_SCHEDULES only: [capacity1] int32 packed tiles
+    schedule1_ptr,  # BUILD_SCHEDULES only: [capacity1] int64 packed tiles
     tiles1_ptr,  # BUILD_SCHEDULES only: [1] int32 stage-1 tile count
-    schedule2_ptr,  # BUILD_SCHEDULES only: [capacity2] int32 packed tiles
+    schedule2_ptr,  # BUILD_SCHEDULES only: [capacity2] int64 packed tiles
     tiles2_ptr,  # BUILD_SCHEDULES only: [1] int32 stage-2 tile count
     token_width,
     out_clusters1,
@@ -290,7 +290,13 @@ def _contig_seg_layout_kernel(
                 oc_b = local - tc_b * out_clusters
                 tc_i = tl.where(token_major, tc_b, tc_a)
                 oc_i = tl.where(token_major, oc_b, oc_a)
-                packed = expert | (tc_i << TOKEN_SHIFT) | (oc_i << OUTPUT_SHIFT)
+                # Widen BEFORE shifting (see schedule_builder): int32
+                # operands would overflow the upper fields silently.
+                packed = (
+                    expert.to(tl.int64)
+                    | (tc_i.to(tl.int64) << TOKEN_SHIFT)
+                    | (oc_i.to(tl.int64) << OUTPUT_SHIFT)
+                )
                 if stage == 0:
                     tl.store(schedule1_ptr + begin + local, packed, mask=valid)
                 else:
@@ -381,9 +387,9 @@ class ContiguousSchedulePack(msgspec.Struct, kw_only=True):
     data instead of importing the CuTeDSL ABI.
     """
 
-    schedule1: torch.Tensor  # [capacity1] int32 packed (expert, tc, oc)
+    schedule1: torch.Tensor  # [capacity1] int64 packed (expert, tc, oc)
     tiles1: torch.Tensor  # [1] int32 stage-1 tile count
-    schedule2: torch.Tensor  # [capacity2] int32 packed (expert, tc, oc)
+    schedule2: torch.Tensor  # [capacity2] int64 packed (expert, tc, oc)
     tiles2: torch.Tensor  # [1] int32 stage-2 tile count
     token_width: int
     out_clusters1: int
@@ -420,9 +426,10 @@ def _validate_schedule_pack(
         ("token_cluster_shift", pack.token_cluster_shift),
         ("output_cluster_shift", pack.output_cluster_shift),
     ):
-        if not isinstance(value, int) or not 0 < value < 32:
+        # 63, not 64: the packed int64 is signed (see schedule_abi).
+        if not isinstance(value, int) or not 0 < value < 63:
             raise ValueError(
-                f"schedule_pack.{name} must be an int in (0, 32), got {value!r}"
+                f"schedule_pack.{name} must be an int in (0, 63), got {value!r}"
             )
     if (
         not isinstance(pack.entry_block, int)
@@ -437,20 +444,22 @@ def _validate_schedule_pack(
     # most (m_pad_ceiling / token_width) * out_clusters entries per stage —
     # the same bound the standalone builder's capacity validation proves.
     total_clusters = m_pad_ceiling // pack.token_width
-    for name, tensor, needed in (
-        ("schedule1", pack.schedule1, total_clusters * pack.out_clusters1),
-        ("schedule2", pack.schedule2, total_clusters * pack.out_clusters2),
-        ("tiles1", pack.tiles1, 1),
-        ("tiles2", pack.tiles2, 1),
+    # Tile COUNTS stay int32: builder prefix arithmetic, not the packed ABI.
+    for name, tensor, needed, dtype in (
+        ("schedule1", pack.schedule1, total_clusters * pack.out_clusters1, torch.int64),
+        ("schedule2", pack.schedule2, total_clusters * pack.out_clusters2, torch.int64),
+        ("tiles1", pack.tiles1, 1, torch.int32),
+        ("tiles2", pack.tiles2, 1, torch.int32),
     ):
         if (
             tensor.ndim != 1
-            or tensor.dtype != torch.int32
+            or tensor.dtype != dtype
             or not tensor.is_contiguous()
             or tensor.device != device
         ):
             raise ValueError(
-                f"schedule_pack.{name} must be contiguous 1-D int32 on {device}"
+                f"schedule_pack.{name} must be contiguous 1-D "
+                f"{str(dtype).removeprefix('torch.')} on {device}"
             )
         if tensor.numel() < needed:
             raise ValueError(

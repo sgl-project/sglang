@@ -23,9 +23,9 @@ Selected explicitly by the evidence-backed serving config on SM90/SM100; the
 device kernel is architecture-dispatched in ``cutedsl_masked.api``.
 
 :class:`CuteDslBf16ContiguousProvider` (bottom of this module) is the
-route-major twin over the contiguous row domain, selected by plan rows that
-name the ``cutedsl_contiguous`` provider; it dispatches to the same two
-device kernels.
+route-major twin over the contiguous row domain, selected by plan rows whose
+``base_gemm_rows`` is ``route_major``; it dispatches to the same two device
+kernels.
 """
 
 from __future__ import annotations
@@ -140,12 +140,7 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
             dual_stage_schedule_capacities,
         )
 
-        # The direct-schedule packing holds expert indices in 10 bits. Fail at
-        # ATTACH like every other admission decision — the builder's own guard
-        # would only fire on the first forward. Remediation paths if a >1024-
-        # experts-per-rank geometry ever exists: repack the int32 fields, or
-        # compile the kept static scheduler (no packing ABI), or fall back to
-        # DeepGEMM (plan section 62).
+        # Fail at ATTACH: the builder's own guard fires on the first forward.
         if quant_info.num_local_experts > MAX_EXPERTS:
             raise ValueError(
                 f"{quant_info.num_local_experts} local experts exceed the "
@@ -154,12 +149,9 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
             )
         self._build_schedules = build_dual_stage_schedules
         self._schedule_capacities = dual_stage_schedule_capacities
-        # Token widths where each compiled config remains packable: the
-        # narrow tile covers m_max up to 8 * 1024 rows/expert, the wide one to
-        # 64 * 1024. The ceiling check in prepare() uses the SAME constant the
-        # builder packs with, so guard and packing cannot drift.
         # Each compiled width packs up to width * MAX_TOKEN_CLUSTERS rows per
-        # expert; the selector escalates through compiled widths against this.
+        # expert; the SAME constant the builder packs with, so `_token_width_for`
+        # cannot escalate against a bound the packing does not have.
         self._max_token_clusters = MAX_TOKEN_CLUSTERS
 
         device = quant_info.w13_weight.device
@@ -360,7 +352,7 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
                 "schedule1_out": workspace.tensor(
                     f"{prefix}:gemm1_schedule",
                     (capacity1,),
-                    dtype=torch.int32,
+                    dtype=torch.int64,
                     device=hidden_states.device,
                 ),
                 "tiles1_out": workspace.tensor(
@@ -372,7 +364,7 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
                 "schedule2_out": workspace.tensor(
                     f"{prefix}:gemm2_schedule",
                     (capacity2,),
-                    dtype=torch.int32,
+                    dtype=torch.int64,
                     device=hidden_states.device,
                 ),
                 "tiles2_out": workspace.tensor(
@@ -505,8 +497,8 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
     Architecture dispatch matches the masked twin: tcgen05 on SM100+, the
     WGMMA sibling on SM90 — both kernels carry the segment-base fold — with
     Hopper dropping the unvalidated narrow-8 decode tile exactly as the
-    masked provider does.  Plan rows reach this class by naming the
-    ``cutedsl_contiguous`` provider, guarded by the 1024-expert packing cap
+    masked provider does.  Plan rows reach this class through
+    ``base_gemm_rows: route_major``, guarded by the expert-count packing cap
     below so every menu choice stays attachable.
     The base GEMMs are factor-layout-agnostic — resident
     weights are identical either way — so the shared-outer plan differs from
@@ -763,7 +755,7 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
                 "schedule1_out": workspace.tensor(
                     f"{prefix}:gemm1_schedule",
                     (capacity1,),
-                    dtype=torch.int32,
+                    dtype=torch.int64,
                     device=hidden_states.device,
                 ),
                 "tiles1_out": workspace.tensor(
@@ -775,7 +767,7 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
                 "schedule2_out": workspace.tensor(
                     f"{prefix}:gemm2_schedule",
                     (capacity2,),
-                    dtype=torch.int32,
+                    dtype=torch.int64,
                     device=hidden_states.device,
                 ),
                 "tiles2_out": workspace.tensor(

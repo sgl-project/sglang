@@ -2907,7 +2907,7 @@ class ServerArgs:
     moe_lora_base_gemm: A[
         str,
         Arg(
-            help="Kernel vendor for the MoE LoRA base GEMMs. The plan tables still pick the row order each phase needs (expert-major for decode, route-major for prefill); this chooses only who implements it. 'cutedsl' is the measured default; 'deepgemm' costs up to 36%% of decode throughput and is worth setting only to isolate a kernel bug or to serve a geometry CuTeDSL cannot admit.",
+            help="Kernel vendor for the MoE LoRA base GEMMs.",
             choices=["cutedsl", "deepgemm"],
         ),
         NS("lora"),

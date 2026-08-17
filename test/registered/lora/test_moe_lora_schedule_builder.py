@@ -25,10 +25,12 @@ from sglang.srt.lora.moe.base_gemm_provider.cutedsl_masked.schedule_abi import (
     TOKEN_CLUSTER_SHIFT,
 )
 from sglang.srt.lora.moe.base_gemm_provider.cutedsl_masked.schedule_builder import (
+    MAX_EXPERTS,
     MAX_OUTPUT_CLUSTERS,
     MAX_TOKEN_CLUSTERS,
     build_dual_stage_schedules,
     build_single_stage_schedule,
+    dual_stage_schedule_capacities,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -197,10 +199,10 @@ class TestMoeLoraScheduleBuilder(CustomTestCase):
     def test_packing_round_trips_at_the_top_of_the_output_field(self):
         """Every representable output-cluster index survives the round trip.
 
-        The output field sits at bit 20, so its 12th bit would be int32's sign
-        bit; the constant caps it at 11 usable bits precisely so no packed word
-        goes negative. This drives the REAL builder at the top of that range
-        (cheap: one expert, one token cluster) and decodes every entry.
+        The output field is the top one, ending one bit below int64's sign bit,
+        so saturating it is where a packed word would go negative. One expert
+        with one token cluster, so the entry count IS the field width; decoded
+        on device because 2^21 entries is slow as a Python list.
         """
         output_width = 128
         out_clusters = MAX_OUTPUT_CLUSTERS  # indices 0 .. MAX-1
@@ -214,38 +216,44 @@ class TestMoeLoraScheduleBuilder(CustomTestCase):
         )
         count = int(tiles[0].item())
         self.assertEqual(count, out_clusters)
-        values = schedule[:count].tolist()
-        self.assertTrue(all(v >= 0 for v in values), "a packed word went negative")
-        self.assertEqual(
-            [_decode(int(v)) for v in values],
-            [(0, 0, oc) for oc in range(out_clusters)],
+        values = schedule[:count]
+        self.assertGreaterEqual(
+            int(values.min().item()), 0, "a packed word went negative"
         )
+        zeros = torch.zeros(count, dtype=torch.int64, device=values.device)
+        expected_oc = torch.arange(count, dtype=torch.int64, device=values.device)
+        for actual, expected in (
+            (values & EXPERT_MASK, zeros),
+            ((values >> TOKEN_CLUSTER_SHIFT) & TOKEN_CLUSTER_MASK, zeros),
+            ((values >> OUTPUT_CLUSTER_SHIFT) & OUTPUT_CLUSTER_MASK, expected_oc),
+        ):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_rejects_geometry_the_packing_cannot_represent(self):
-        masked_m = torch.zeros(4, dtype=torch.int32, device=self.device)
+        """The ABI ceilings are enforced, checked through the pure validator.
+
+        Through ``dual_stage_schedule_capacities`` rather than the builder
+        because it takes the expert count as an int: materialising a
+        2^20-element tensor to prove 2^20 + 1 is refused would be an expensive
+        way to test nothing.
+        """
         common = dict(token_width=8, n_gemm1=128, n_gemm2=128, output_width=128)
         # m_max at token width 8 needs more token clusters than the field holds.
         with self.assertRaisesRegex(ValueError, "token clusters"):
-            build_dual_stage_schedules(
-                masked_m, m_max=(MAX_TOKEN_CLUSTERS + 1) * 8, **common
+            dual_stage_schedule_capacities(
+                num_experts=4, m_max=(MAX_TOKEN_CLUSTERS + 1) * 8, **common
             )
-        # 1024 experts (indices 0..1023) is exactly representable; 1025 is not.
-        build_dual_stage_schedules(
-            torch.zeros(1024, dtype=torch.int32, device=self.device),
-            m_max=256,
-            **common,
-        )
+        # The largest representable expert count, then one past it.
+        dual_stage_schedule_capacities(num_experts=MAX_EXPERTS, m_max=256, **common)
         with self.assertRaisesRegex(ValueError, "expert"):
-            build_dual_stage_schedules(
-                torch.zeros(1025, dtype=torch.int32, device=self.device),
-                m_max=256,
-                **common,
+            dual_stage_schedule_capacities(
+                num_experts=MAX_EXPERTS + 1, m_max=256, **common
             )
         # Fields can individually fit while the worst-case capacity overflows
         # the kernel's int32 prefix arithmetic.
         with self.assertRaisesRegex(ValueError, "capacity"):
-            build_dual_stage_schedules(
-                torch.zeros(1024, dtype=torch.int32, device=self.device),
+            dual_stage_schedule_capacities(
+                num_experts=1024,
                 m_max=1024 * 8,
                 token_width=8,
                 n_gemm1=MAX_OUTPUT_CLUSTERS * 128,
@@ -254,8 +262,8 @@ class TestMoeLoraScheduleBuilder(CustomTestCase):
             )
         # One output cluster past the usable field width.
         with self.assertRaisesRegex(ValueError, "output clusters"):
-            build_dual_stage_schedules(
-                masked_m,
+            dual_stage_schedule_capacities(
+                num_experts=4,
                 m_max=256,
                 token_width=8,
                 n_gemm1=128,
@@ -277,6 +285,36 @@ class TestMoeLoraScheduleBuilder(CustomTestCase):
             build_dual_stage_schedules(masked_m, cluster_shape_mn=(2, 1), **common)
         with self.assertRaisesRegex(ValueError, "cluster"):
             build_dual_stage_schedules(masked_m, use_2cta_instrs=True, **common)
+
+    def test_packed_word_is_int64_and_round_trips_past_the_old_int32_fields(self):
+        """The widened ABI must survive the trip through the device buffer.
+
+        4096 output clusters against the old int32 layout's cap of 2048, so
+        this fails outright on that ABI rather than passing for a wrong reason.
+        """
+        rows = [3, 0, 7]
+        token_width, output_width = 8, 128
+        out_clusters2 = 4096
+        _schedule1, _tiles1, schedule2, tiles2 = self._build(
+            rows,
+            m_max=256,
+            token_width=token_width,
+            n_gemm1=output_width,  # 1 output cluster keeps stage 1 small
+            n_gemm2=out_clusters2 * output_width,
+            output_width=output_width,
+        )
+        self.assertEqual(schedule2.dtype, torch.int64)
+        # Packed words stay non-negative: the ABI leaves bit 63 clear so the
+        # host can read entries back without sign games.
+        self.assertGreaterEqual(int(schedule2.min().item()), 0)
+
+        entries = schedule2[: int(tiles2[0].item())].tolist()
+        self.assertEqual(
+            {_decode(int(word)) for word in entries},
+            self._expected_entries(rows, token_width, out_clusters2),
+        )
+        # Confirm the field that overflows the old layout is really exercised.
+        self.assertGreater(max(_decode(int(word))[2] for word in entries), 2047)
 
 
 if __name__ == "__main__":

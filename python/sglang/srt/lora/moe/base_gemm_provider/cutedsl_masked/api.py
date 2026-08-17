@@ -191,16 +191,16 @@ def prepare(
     c_arg = _as_dynamic_cute_tensor(c, leading_dim=2)
     masked_m_arg = _as_dynamic_cute_tensor(masked_m, leading_dim=0)
     if direct_schedule is None:
-        direct_schedule = torch.zeros((1,), device=a.device, dtype=torch.int32)
+        direct_schedule = torch.zeros((1,), device=a.device, dtype=torch.int64)
     if schedule_tiles is None:
         schedule_tiles = torch.zeros((1,), device=a.device, dtype=torch.int32)
     if (
         direct_schedule.device != a.device
-        or direct_schedule.dtype != torch.int32
+        or direct_schedule.dtype != torch.int64
         or direct_schedule.ndim != 1
         or not direct_schedule.is_contiguous()
     ):
-        raise ValueError("direct_schedule must be contiguous int32 [tiles]")
+        raise ValueError("direct_schedule must be contiguous int64 [tiles]")
     if (
         schedule_tiles.device != a.device
         or schedule_tiles.dtype != torch.int32
@@ -370,16 +370,16 @@ def prepare_contiguous(
     c_arg = _as_dynamic_cute_tensor(c.unsqueeze(0), leading_dim=2)
     seg_offsets_arg = _as_dynamic_cute_tensor(seg_offsets, leading_dim=0)
     if direct_schedule is None:
-        direct_schedule = torch.zeros((1,), device=a.device, dtype=torch.int32)
+        direct_schedule = torch.zeros((1,), device=a.device, dtype=torch.int64)
     if schedule_tiles is None:
         schedule_tiles = torch.zeros((1,), device=a.device, dtype=torch.int32)
     if (
         direct_schedule.device != a.device
-        or direct_schedule.dtype != torch.int32
+        or direct_schedule.dtype != torch.int64
         or direct_schedule.ndim != 1
         or not direct_schedule.is_contiguous()
     ):
-        raise ValueError("direct_schedule must be contiguous int32 [tiles]")
+        raise ValueError("direct_schedule must be contiguous int64 [tiles]")
     if (
         schedule_tiles.device != a.device
         or schedule_tiles.dtype != torch.int32

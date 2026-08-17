@@ -163,9 +163,8 @@ class MoeLoraRunner:
         if not providers:
             raise ValueError("a MoE LoRA runner needs at least one provider")
         self.providers = dict(providers)
-        # The vendor actually bound, which is not always the one asked for:
-        # a geometry CuteDSL cannot admit falls back to DeepGEMM. Recorded so
-        # the bind log reports what ran rather than what was requested.
+        # What actually bound, not what was asked for: a device CuteDSL cannot
+        # serve falls back to DeepGEMM. The bind log reports this one.
         self.base_gemm_vendor = base_gemm_vendor
         # Every provider of a layer reads the same resident tensors, so the
         # geometry is a layer fact and lives here rather than per call.
@@ -209,17 +208,12 @@ class MoeLoraRunner:
         """
         cls._admit(base_layer)
         config = base_layer.moe_runner_config
-        num_local_experts = int(base_layer.num_local_experts)
-        if vendor == "cutedsl" and not cls.cutedsl_admits(num_local_experts):
-            # DeepGEMM admits every geometry, which is why the out-of-domain
-            # fallback rows used to name it outright. Now that the vendor is a
-            # serving choice, that guarantee lives here instead, or a geometry
-            # past CuTeDSL's limits would fail to start.
+        if vendor == "cutedsl" and torch.cuda.get_device_capability() < (9, 0):
             logger.warning(
-                "MoE LoRA base GEMM falling back to DeepGEMM: CuTeDSL cannot "
-                "admit this device/geometry (%d local experts). Decode "
-                "throughput is materially lower on DeepGEMM.",
-                num_local_experts,
+                "MoE LoRA base GEMM falling back to DeepGEMM: CuTeDSL needs "
+                "SM90 or newer, and this device is sm%d%d. Decode throughput "
+                "is materially lower on DeepGEMM.",
+                *torch.cuda.get_device_capability(),
             )
             vendor = "deepgemm"
         return cls(
@@ -330,34 +324,11 @@ class MoeLoraRunner:
             )
 
     @staticmethod
-    def cutedsl_admits(num_local_experts: int) -> bool:
-        """Whether CuTeDSL can serve this device and geometry at all.
-
-        Two gates, both ours rather than the kernel's: SM90 is the oldest
-        architecture with a masked grouped GEMM here, and the packed direct
-        schedule holds expert indices in a fixed-width field.  The remaining
-        admission input -- rows per expert against the widest compiled tile --
-        is per-forward today and cannot be answered here yet.
-        """
-        from sglang.srt.lora.moe.base_gemm_provider.cutedsl_masked.schedule_abi import (
-            MAX_EXPERTS,
-        )
-
-        if torch.cuda.get_device_capability() < (9, 0):
-            return False
-        return num_local_experts <= MAX_EXPERTS
-
-    @staticmethod
     def select_provider_cls(
         base_gemm_rows: str,
         vendor: str,
     ) -> type[MoeBaseProvider]:
-        """Resolve (row order from the plan) x (vendor from serving config).
-
-        The plan table owns the row order because the surrounding stages are
-        built for it; the vendor is a serving choice, so the pair is only
-        joined here.
-        """
+        """Resolve (row order from the plan) x (vendor from serving config)."""
         if base_gemm_rows not in ("expert_major", "route_major"):
             raise ValueError(
                 f"unknown MoE LoRA base-GEMM row order {base_gemm_rows!r}; "
@@ -1252,9 +1223,7 @@ class MoeLoraRunner:
 def _base_gemm_vendor() -> str:
     """The ``--moe-lora-base-gemm`` choice, defaulting when no server is up.
 
-    Kernel tests and offline tools construct engines without a published
-    server context; they get the shipped default rather than an error, which
-    is also what a bare library import should see.
+    Kernel tests and offline tools build engines with no published context.
     """
     try:
         from sglang.srt.server_args import get_global_server_args
@@ -1293,9 +1262,7 @@ class MoeLoraLayerEngine:
         )
         self.hidden_size = int(base_layer.w2_weight.shape[1])
         self.num_local_experts = int(base_layer.num_local_experts)
-        # Vendor for both base GEMMs, read once per layer at construction: it
-        # is a server-lifetime constant, so nothing vendor-shaped reaches the
-        # forward path or the plan tables.
+        # Server-lifetime constant, so nothing vendor-shaped reaches a forward.
         self.base_gemm_vendor = _base_gemm_vendor()
         self.workspace = workspace
         self._selected: dict[Phase, SelectedPlan] | None = None
