@@ -1,0 +1,192 @@
+name: Backfill Image Formats (zstd + nydus)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_refs:
+        description: |
+          镜像引用列表，每行一个，不含格式后缀。
+          格式: iaas-gpu-cn-beijing.cr.volces.com/serving/<framework>:<tag>
+          示例: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:v0.5.16.iaas.202607280000-kimi-k3-cu130
+        required: true
+        type: string
+      sync_to_customer:
+        description: "补全格式后触发 Bits 流水线同步到客户仓库"
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: backfill-image-formats-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    if: github.repository == 'bytedance-iaas/sglang'
+    runs-on: x64-docker-build-node
+    environment: prod
+    env:
+      VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
+      VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+      NYDUS_VERSION: "2.3.0"
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Cleanup workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Volcengine CR
+        run: |
+          set -euo pipefail
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${VOLCENGINE_CR_REGISTRY}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
+
+      - name: Install nydus tooling
+        run: |
+          set -euo pipefail
+          if command -v nydusify &>/dev/null && command -v nydus-image &>/dev/null; then
+            echo "[nydus] tools already installed: $(nydusify --version 2>&1 | head -1)"
+            exit 0
+          fi
+          tarball="nydus-static-v${NYDUS_VERSION}-linux-amd64.tgz"
+          url="https://github.com/dragonflyoss/nydus/releases/download/v${NYDUS_VERSION}/${tarball}"
+          retry() { for i in $(seq 1 5); do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; }
+          retry curl -fL --retry 5 --retry-all-errors --retry-delay 2 -o "/tmp/${tarball}" "${url}"
+          tar -xzf "/tmp/${tarball}" -C /tmp
+          sudo install -m 0755 /tmp/nydus-static/nydusify /usr/local/bin/nydusify
+          sudo install -m 0755 /tmp/nydus-static/nydus-image /usr/local/bin/nydus-image
+          nydusify --version
+          nydus-image --version
+
+      - name: Backfill image formats
+        env:
+          IMAGE_REFS: ${{ inputs.image_refs }}
+        run: |
+          set -euo pipefail
+
+          retry() {
+            for i in $(seq 1 5); do
+              "$@" && return 0
+              echo "  [retry] attempt $i/5 failed; sleeping 15s"
+              sleep 15
+            done
+            return 1
+          }
+
+          backfill_one() {
+            local image_ref="$1"
+
+            echo ""
+            echo "=== $(date '+%H:%M:%S') ${image_ref} ==="
+
+            # Verify OCI base exists
+            if ! skopeo inspect "docker://${image_ref}" >/dev/null 2>&1; then
+              echo "  ERROR: base image not found: ${image_ref}"
+              return 1
+            fi
+            local oci_digest
+            oci_digest=$(skopeo inspect "docker://${image_ref}" | jq -r '.Digest')
+            echo "  OCI digest: ${oci_digest}"
+
+            # zstd: pull then re-export with zstd compression (same as CI zstd step)
+            if skopeo inspect "docker://${image_ref}-zstd" >/dev/null 2>&1; then
+              echo "  [zstd] already exists"
+            else
+              echo "  [zstd] backfilling..."
+              docker pull "${image_ref}"
+              tmp_dockerfile=$(mktemp /tmp/Dockerfile.zstd.XXXXXX)
+              echo "FROM ${image_ref}" > "${tmp_dockerfile}"
+              docker buildx build \
+                --platform linux/amd64 \
+                --output "type=image,name=${image_ref}-zstd,push=true,compression=zstd,compression-level=3,force-compression=true,oci-mediatypes=true" \
+                -f "${tmp_dockerfile}" \
+                /tmp
+              rm -f "${tmp_dockerfile}"
+              echo "  [zstd] published ${image_ref}-zstd"
+            fi
+
+            # nydus: nydusify convert (same as CI nydus step)
+            if skopeo inspect "docker://${image_ref}-nydus" >/dev/null 2>&1; then
+              echo "  [nydus] already exists"
+            else
+              echo "  [nydus] backfilling..."
+              retry nydusify convert \
+                --nydus-image /usr/local/bin/nydus-image \
+                --source "${image_ref}" \
+                --target "${image_ref}-nydus"
+              echo "  [nydus] published ${image_ref}-nydus"
+            fi
+
+            echo "  done: ${image_ref}"
+            echo ""
+          }
+
+          while IFS= read -r line; do
+            line="${line//[$'\r\n']/}"
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            backfill_one "$line"
+          done <<< "${IMAGE_REFS}"
+
+          echo "All backfills complete."
+
+      - name: Trigger Bits sync pipeline
+        if: ${{ inputs.sync_to_customer }}
+        env:
+          IMAGE_REFS: ${{ inputs.image_refs }}
+        run: |
+          set -euo pipefail
+
+          BITS_PIPELINE_ID="1008460003842"
+          BITS_SPACE_ID="779378790402"
+
+          for image_ref in ${IMAGE_REFS}; do
+            image_ref="${image_ref//[$'\r\n']/}"
+            [[ -z "$image_ref" ]] && continue
+
+            # Parse framework and tag from image_ref
+            # iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:v0.5.16.iaas.202607280000-kimi-k3-cu130
+            framework="${image_ref##*/}"   # sglang:v0.5.16...
+            framework="${framework%%:*}"   # sglang
+            tag="${image_ref##*:}"         # v0.5.16.iaas.202607280000-kimi-k3-cu130
+
+            echo "=== Triggering Bits sync for ${framework}:${tag} ==="
+
+            # Try to trigger via bytedcli + bits_pipeline_cli
+            if command -v bytedcli &>/dev/null && command -v bits_pipeline_cli &>/dev/null; then
+              JWT=$(bytedcli auth get-bytecloud-jwt-token --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['jwt'])" 2>/dev/null || echo "")
+              if [ -n "$JWT" ]; then
+                bits_pipeline_cli call \
+                  --env cn \
+                  --username hanhan.hank \
+                  --rpc RunPipeline \
+                  --path-param "pipeline_id=${BITS_PIPELINE_ID}" \
+                  --jwt-token "$JWT" \
+                  --body-json "$(python3 -c "
+import json
+print(json.dumps({
+    'run_by': 'hanhan.hank',
+    'custom_vars': [
+        {'name': 'custom.framework', 'value': {'text': '${framework}'}},
+        {'name': 'custom.tag', 'value': {'text': '${tag}'}},
+    ]
+}))
+                  ")"
+                echo "  Bits pipeline triggered: ${framework}:${tag}"
+              else
+                echo "  ::warning:: could not get JWT; trigger manually"
+              fi
+            else
+              echo "  ::notice:: bytedcli/bits_pipeline_cli not available on this runner"
+              echo "  Manual trigger: https://bits.bytedance.net/devops/${BITS_SPACE_ID}/pipeline/detail/${BITS_PIPELINE_ID}"
+              echo "  Variables: framework=${framework} tag=${tag}"
+            fi
+          done
