@@ -171,6 +171,8 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             if disagg.disaggregation_mode == "decode"
             and not get_parallel().dcp_enabled
             and not disagg.disaggregation_decode_enable_radix_cache
+            # KV offload already owns a host pool; a second one double-books host memory.
+            and not disagg.disaggregation_decode_enable_offload_kvcache
             and not priority_preemption
             and supports_host_pool
             else "cpu_tensor"

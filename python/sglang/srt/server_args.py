@@ -8132,6 +8132,12 @@ class ServerArgs:
                 raise ValueError(
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported when hicache-storage-backend is provided."
                 )
+            if self.disaggregation_decode_retraction_backup == "host_pool":
+                raise ValueError(
+                    "The arguments disaggregation-decode-enable-offload-kvcache and "
+                    "disaggregation-decode-retraction-backup=host_pool are mutually exclusive: "
+                    "both build a decode host pool."
+                )
 
         # Validate the effective ratio: model branches may declare a reset
         # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes
