@@ -41,7 +41,7 @@ on:
           - nightly-2-gpu-mi35x-glm51-mxfp4-rocm720
           # 2-GPU DeepSeek-R1-MXFP4 TP2 (MI35x only)
           - nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2-rocm720
-          # 8-GPU GPT-OSS (MI30x mixes Grok1-FP8; MI35x mixes Qwen3-Coder-Next)
+          # 8-GPU GPT-OSS (MI35x mixes Qwen3-Coder-Next)
           - nightly-accuracy-8-gpu-rocm720
           - nightly-accuracy-8-gpu-mi35x-rocm720
           # 8-GPU Grok1-INT4 (MI30x + MI35x)
@@ -70,6 +70,7 @@ on:
           - nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720
           - nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720
           - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720
+          - nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720
           # 8-GPU Kimi-K2.6 (MI30x + MI35x)
           - nightly-8-gpu-kimi-k26-rocm720
           - nightly-8-gpu-mi35x-kimi-k26-rocm720
@@ -464,7 +465,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 8-GPU GPT-OSS (MI30x mixes Grok1-FP8; MI35x mixes Qwen3-Coder-Next)
+  # 8-GPU GPT-OSS (MI35x mixes Qwen3-Coder-Next)
   # ==============================================================================
 
   nightly-accuracy-8-gpu-rocm720:
@@ -492,6 +493,7 @@ jobs:
       - name: Accuracy Test ROCm 7.2 (8-GPU GPT-OSS)
         timeout-minutes: 180
         run: |
+          > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
@@ -499,13 +501,18 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Accuracy Test ROCm 7.2 (8-GPU Grok1-FP8)
-        timeout-minutes: 60
+      # Shares this job with the accuracy step above: it already serves the same
+      # two models, and an MI30x job spends ~49 min pulling the image and
+      # installing dependencies before it runs anything.
+      - name: Performance Test ROCm 7.2 (8-GPU GPT-OSS)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 120
         run: |
+          > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e RCCL_MSCCL_ENABLE=0 \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-grok1-fp8 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-gpt-oss --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -537,9 +544,23 @@ jobs:
       - name: Accuracy Test MI35x ROCm 7.2 (8-GPU GPT-OSS)
         timeout-minutes: 180
         run: |
+          > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      # Shares this job with the accuracy step above rather than taking its own,
+      # so the container setup and the GPT-OSS weight cache are paid for once.
+      - name: Performance Test MI35x ROCm 7.2 (8-GPU GPT-OSS)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 120
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-gpt-oss --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -1438,6 +1459,44 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro-mtp --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
+  nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720,'))
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: |
+          # --skip-test-time-deps: GSM8K doesn't need lmms-eval / human-eval.
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Accuracy + DSpark Accept Length Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro-DSpark FP4, unified_kv_triton)
+        timeout-minutes: 300
+        run: |
+          > github_summary.md  # Clear summary file
+          echo "## SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton" >> github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro-dspark --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+
   # ==============================================================================
   # 8-GPU Kimi-K2.6 (MI30x + MI35x)
   # ==============================================================================
@@ -2048,7 +2107,7 @@ jobs:
       - nightly-4-gpu-rocm720
       - nightly-2-gpu-mi35x-glm51-mxfp4-rocm720
       - nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2-rocm720
-      # 8-GPU GPT-OSS (MI30x mixes Grok1-FP8; MI35x mixes Qwen3-Coder-Next)
+      # 8-GPU GPT-OSS (MI35x mixes Qwen3-Coder-Next)
       - nightly-accuracy-8-gpu-rocm720
       - nightly-accuracy-8-gpu-mi35x-rocm720
       # 8-GPU Grok1-INT4 (MI30x + MI35x)
@@ -2077,6 +2136,7 @@ jobs:
       - nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720
       - nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720
       - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720
+      - nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720
       # 8-GPU Kimi-K2.6 (MI30x + MI35x)
       - nightly-8-gpu-kimi-k26-rocm720
       - nightly-8-gpu-mi35x-kimi-k26-rocm720

@@ -22,7 +22,6 @@ tensors remain valid across replays — we don't need Python-managed bridge
 buffers to keep break-point tensors at stable addresses.
 """
 
-import logging
 import threading
 from contextvars import ContextVar
 from typing import Any, Callable, Optional
@@ -38,8 +37,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_ut
     checkCudaErrors,
 )
 from sglang.srt.utils import get_device_module, is_hip, is_xpu
-
-logger = logging.getLogger(__name__)
 
 _is_xpu = is_xpu()
 
@@ -225,8 +222,6 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
             capture = _current_capture_var.get()
             if capture is None:
                 return inner(*args, **kwargs)
-
-            logger.debug("Break graph due to function: %s", inner.__name__)
 
             # End the segment that captured up to this break point.
             capture._end_current_segment()
