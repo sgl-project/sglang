@@ -1,5 +1,14 @@
 name: Release Docker Images Nightly ROCm10 (AMD)
 on:
+  # TEST-ONLY (branch bingxche/rocm10-fullflow): workflow_dispatch only works for
+  # workflow files that exist on the default branch, and this one is new, so
+  # dispatching it from this branch returns HTTP 404. A push trigger is not
+  # subject to that rule. Scoped to this throwaway branch so it cannot fire
+  # anywhere else. Drop this with the rest of the test-only changes -- the
+  # version intended for merge is dispatch-only.
+  push:
+    branches:
+      - 'bingxche/rocm10-fullflow'
   workflow_dispatch:
     inputs:
       job_select:
