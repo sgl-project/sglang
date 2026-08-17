@@ -52,14 +52,9 @@ class MmItemMemoryChunk:
 
     def try_to_recycle(self) -> bool:
         val = float(self.sync_flag.buffer_wrapper.item())
-        logger.debug(
-            f"[try_to_recycle] area={self.area}, flag={val}, tp_size={self.tp_size}"
-        )
-
         if val == float(self.tp_size):
             self.sync_flag.buffer_wrapper *= 0.0
             return True
-
         return False
 
 
@@ -91,8 +86,8 @@ class MmItemMemoryPool:
         self._recycle_thread.start()
 
         logger.info(
-            f"[NPU IPC Pool] Allocated NPU memory pool: size={memory_size / (1024*1024):.1f} MB, "
-            f"device=npu:{base_npu_id}, recycle_interval={recycle_interval}s"
+            f"[NPU IPC Pool] Initialized: size={memory_size / (1024*1024):.1f} MB, "
+            f"device=npu:{base_npu_id}"
         )
 
     def shutdown(self):
@@ -122,7 +117,7 @@ class MmItemMemoryPool:
                 new_sync_buffer = ShmSyncBuffer()
                 return new_sync_buffer
             except:
-                logger.info("allocate shm buffer failed")
+                logger.warning("allocate shm buffer failed")
                 raise RuntimeError
         else:
             return self.sync_flag_list.pop()
@@ -152,7 +147,6 @@ class MmItemMemoryPool:
             occupied_chunk_area, occupied_chunk_sync_flag, self.tp_size
         )
 
-        self.occupied_chunks.append(new_occupied_chunk)
         self.available_chunks.remove(selected_chunk)
 
         available_split_chunk_area = (new_occupied_chunk.end, selected_chunk.end)
@@ -161,9 +155,7 @@ class MmItemMemoryPool:
                 available_split_chunk_area, selected_chunk.sync_flag, self.tp_size
             )
             self.available_chunks.append(split_available_chunk)
-            self.occupied_chunks.pop()
-        else:
-            self.occupied_chunks.pop()
+        self.occupied_chunks.append(new_occupied_chunk)
 
         return new_occupied_chunk
 
@@ -180,16 +172,9 @@ class MmItemMemoryPool:
                 ]
                 byte_offset = selected_chunk.start
                 sync_flag = selected_chunk.sync_flag
-                logger.info(
-                    f"[NPU IPC] Pool allocated: tensor_size={tensor.numel() * tensor.element_size() / (1024*1024):.2f} MB, "
-                    f"chunk=[{selected_chunk.start}, {selected_chunk.end}], "
-                    f"pool_remaining={self.memory_pool.numel() * self.memory_pool.element_size() / (1024*1024):.1f} MB"
-                )
             else:
                 if not self._pool_full_warned:
-                    logger.warning(
-                        "[NPU IPC] Pool is FULL, falling back to CPU transport"
-                    )
+                    logger.warning("[NPU IPC] Pool is FULL")
                     self._pool_full_warned = True
 
         return sync_flag, available_slice, byte_offset
@@ -277,6 +262,9 @@ class NpuIpcTensorTransportProxy:
             )
 
         if pool_ipc_handle is not None:
+            sync_flag_meta = (
+                sync_buffer_meta.meta_data if sync_buffer_meta else None
+            )
             self.proxy_state = {
                 "ipc_extra": {
                     "pool_handle": pool_ipc_handle,
@@ -290,6 +278,7 @@ class NpuIpcTensorTransportProxy:
                     "recons_shape": info_data.shape,
                     "recons_dtype": info_data.dtype,
                     "device_type": "npu",
+                    "sync_flag_meta": sync_flag_meta,
                 },
                 "tensor_data": None,
             }
@@ -368,17 +357,9 @@ class NpuIpcTensorTransportProxy:
                 "device_type": "npu",
             }
             state["tensor_data"] = None
-            logger.info(
-                f"[NPU IPC] Created IPC handle: data_shape={data.shape}, "
-                f"device={data.device}, handle_type={type(handle).__name__}, "
-                f"handle_len={len(handle) if isinstance(handle, tuple) else 'N/A'}"
-            )
         except Exception:
             state["ipc_extra"] = None
             state["tensor_data"] = data
-            logger.warning(
-                f"[NPU IPC] Failed to create IPC handle, falling back to CPU"
-            )
 
         return state
 
@@ -409,10 +390,23 @@ class NpuIpcTensorTransportProxy:
 
     def _acknowledge_consumption(self, consumer_count: int = 1):
         try:
-            sync_data = self.get_sync_buffer_data
-            if sync_data is not None:
-                sync_data += consumer_count
-                self._consumer_acknowledged = True
+            ipc_extra = self.proxy_state.get("ipc_extra")
+            sync_flag_meta = ipc_extra.get("sync_flag_meta") if ipc_extra else None
+            if sync_flag_meta is None:
+                sync_data = self.get_sync_buffer_data
+                if sync_data is not None:
+                    sync_data += consumer_count
+                    self._consumer_acknowledged = True
+            else:
+                shm = shared_memory.SharedMemory(name=sync_flag_meta["handle"])
+                try:
+                    buffer_wrapper = np.ndarray(
+                        1, dtype=sync_flag_meta["dtype"], buffer=shm.buf
+                    )
+                    buffer_wrapper += consumer_count
+                    self._consumer_acknowledged = True
+                finally:
+                    shm.close()
         except Exception:
             pass
 
@@ -445,9 +439,6 @@ class NpuIpcTensorTransportProxy:
             recons_dtype = ipc_extra["recons_dtype"]
 
             if "pool_handle" in ipc_extra:
-                logger.info(
-                    f"[NPU IPC] Reconstruct from pool: shape={recons_shape}, device={rebuild_device}"
-                )
                 (
                     slice_tensor,
                     _target_device,
@@ -462,9 +453,6 @@ class NpuIpcTensorTransportProxy:
                 try:
                     original_handle = ipc_extra["handle"]
                     target_device = torch.device(f"npu:{rebuild_device_idx}")
-                    logger.info(
-                        f"[NPU IPC] Reconstruct from handle: device={target_device}"
-                    )
                     func, args = original_handle
                     list_args = list(args)
                     for i, arg in enumerate(list_args):
@@ -479,7 +467,6 @@ class NpuIpcTensorTransportProxy:
                         storage_offset=ipc_extra["storage_offset"],
                     )
                 except Exception as e:
-                    logger.info("Failed to deserialize from NPU IPC handle (%s).", e)
                     raise
 
             reconstructed_tensor = self._copy_slice_tensor_to_target(
@@ -490,9 +477,6 @@ class NpuIpcTensorTransportProxy:
                 consumer_count,
             )
         elif isinstance(self.proxy_state["tensor_data"], torch.Tensor):
-            logger.info(
-                f"[NPU IPC] Reconstruct from tensor_data: device={rebuild_device}"
-            )
             reconstructed_tensor = self.proxy_state["tensor_data"].to(
                 rebuild_device, non_blocking=True
             )
@@ -500,10 +484,7 @@ class NpuIpcTensorTransportProxy:
             raise TypeError("invalid proxy_state")
 
         self.reconstruct_tensor = reconstructed_tensor
-        logger.info(
-            f"[NPU IPC] Reconstruct SUCCESS: final_shape={reconstructed_tensor.shape}, "
-            f"device={reconstructed_tensor.device}, dtype={reconstructed_tensor.dtype}"
-        )
+        self._acknowledge_consumption(consumer_count)
         return self.reconstruct_tensor
 
     def get_reconstructed_tensor(
