@@ -219,17 +219,10 @@ def is_rust_server_built():
     """Return whether the embedded Rust server extension (``SGLANG_RUST_SERVER``)
     is importable.
 
-    ``sglang/srt/server/`` is not in the source tree — it is produced by
-    ``setup.py build_rust --inplace``, so on a build without it ``find_spec``
-    raises ``ModuleNotFoundError`` for the missing *parent* package rather than
-    returning ``None`` for the missing leaf. Suites gate a rust-server subclass on
-    this at class-definition time, so letting that escape would fail the whole
-    module import instead of skipping the one class.
+    The ``sglang.srt.rust_extensions`` Python package is always present; the
+    private ``_server`` module exists only when the PyO3 extension was built.
     """
-    try:
-        return importlib.util.find_spec("sglang.srt.server._core") is not None
-    except ModuleNotFoundError:
-        return False
+    return importlib.util.find_spec("sglang.srt.rust_extensions._server") is not None
 
 
 def _use_cached_default_models(model_repo: str):
@@ -2221,12 +2214,6 @@ class ModelLaunchSettings:
         for fixed_arg in fixed_args:
             if fixed_arg not in self.extra_args:
                 self.extra_args.append(fixed_arg)
-
-
-class ModelEvalMetrics:
-    def __init__(self, accuracy: float, eval_time: float):
-        self.accuracy = accuracy
-        self.eval_time = eval_time
 
 
 def extract_trace_link_from_bench_one_batch_server_output(output: str) -> str:

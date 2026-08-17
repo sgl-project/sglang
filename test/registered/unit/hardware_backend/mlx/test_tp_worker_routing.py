@@ -220,6 +220,20 @@ class TestMlxExtendRouting(CustomTestCase):
         worker._mlx_pool_initialized = True
         return worker
 
+    def test_startup_weight_overlap_is_rejected_before_mlx_model_load(self):
+        from sglang.srt.hardware_backend.mlx.model_runner_stub import (
+            MlxModelRunnerStub,
+        )
+        from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+
+        worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
+        worker.server_args = SimpleNamespace(is_startup_weight_load_overlap=True)
+
+        with self.assertRaisesRegex(ValueError, "CUDA only"):
+            MlxModelRunnerStub.validate_startup_weight_load_mode(worker.server_args)
+        with self.assertRaisesRegex(ValueError, "CUDA only"):
+            worker._init_model_runner()
+
     # ---------- the shared decision helper ----------
     # The helper takes no seq_len: length cannot distinguish a 1-token
     # continuation from a genuine decode -- request state does.
