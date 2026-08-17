@@ -60,7 +60,9 @@ from sglang.srt.lora.moe.execution_plan import (
     ActivationFamily,
     DeviceArchitecture,
     Phase,
-    iter_selected_plans,
+    SelectedPlan,
+    build_plan,
+    load_plans,
     resolve_plans,
 )
 from sglang.srt.lora.moe.launch_config import resolve_tiles
@@ -75,14 +77,23 @@ _SWIGLU = ActivationFamily.SWIGLU
 
 
 def _menu(architecture, layout, activation=_SWIGLU):
-    """The shipped rows for one layout, keyed by row name."""
+    """Every shipped row for one layout, keyed by row name.
+
+    The whole menu, built from the same table loader and plan builder
+    serving uses — minus ``resolve_plans``' phase and rank predicates,
+    which pick ONE row per phase.
+    """
+    table = load_plans(architecture)
+    layout_name = "shared" if layout else "per_expert"
     return {
-        sel.name: sel
-        for sel in iter_selected_plans(
-            architecture=architecture,
-            is_shared_outer=layout,
-            activation=activation,
+        row.name: SelectedPlan(
+            key=f"{architecture.value}.{layout_name}.{row.name}",
+            name=row.name,
+            provider=row.provider,
+            plan=build_plan(row.plan, activation=activation, is_shared_outer=layout),
         )
+        for row in (*table.scenarios, *table.fallback)
+        if row.layout in (None, layout_name)
     }
 
 

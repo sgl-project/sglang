@@ -30,7 +30,6 @@ from sglang.srt.lora.moe.execution_plan import (
     Phase,
     RouteBuilderFamily,
     architecture_for_capability,
-    iter_selected_plans,
     load_plans,
     resolve_plans,
 )
@@ -193,18 +192,18 @@ class TestResolution:
         assert selected[Phase.DECODE].name == "fallback.serial"
         assert selected[Phase.PREFILL].name == "fallback.serial_prefill"
 
-    def test_every_resolvable_plan_is_on_the_menu(self):
-        # iter_selected_plans must cover everything resolve_plans can
-        # return, for both architectures and layouts across the rank axis.
+    def test_every_resolvable_plan_is_a_declared_row(self):
+        # resolve_plans may only ever return a row the table declares for
+        # that layout — checked against the raw table, not against another
+        # helper that shares its filtering code.
         for architecture in (_GB300, _H200):
             for layout in (False, True):
-                menu = {
-                    sel.key
-                    for sel in iter_selected_plans(
-                        architecture=architecture,
-                        is_shared_outer=layout,
-                        activation=_SWIGLU,
-                    )
+                table = load_plans(architecture)
+                layout_name = "shared" if layout else "per_expert"
+                declared = {
+                    row.name
+                    for row in (*table.scenarios, *table.fallback)
+                    if row.layout in (None, layout_name)
                 }
                 for rank in (8, 16, 64, 320):
                     for hidden in (4096, 8192):
@@ -215,7 +214,7 @@ class TestResolution:
                             hidden=hidden,
                             experts=512,
                         ).values():
-                            assert sel.key in menu
+                            assert sel.name in declared, (sel.name, declared)
 
     def test_override_dir_wins(self, tmp_path):
         packaged = json.load(open(f"{ep._CONFIG_DIR}/gb300.tiles.json"))

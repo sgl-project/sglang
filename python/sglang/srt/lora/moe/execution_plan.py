@@ -767,35 +767,3 @@ def resolve_plans(
             ),
         )
     return selected
-
-
-def iter_selected_plans(
-    *,
-    architecture: DeviceArchitecture,
-    is_shared_outer: bool,
-    activation: ActivationFamily,
-) -> list[SelectedPlan]:
-    """Every buildable row for one layout — the menu, rank-unfiltered.
-
-    Tests and the offline tuner enumerate this; serving uses
-    :func:`resolve_plans`, which picks one row per phase.
-    """
-    table = load_plans(architecture)
-    layout_name = "shared" if is_shared_outer else "per_expert"
-    out: list[SelectedPlan] = []
-    for row in (*table.scenarios, *table.fallback):
-        if row.layout not in (None, layout_name):
-            continue
-        out.append(
-            SelectedPlan(
-                key=f"{architecture.value}.{layout_name}.{row.name}",
-                name=row.name,
-                provider=row.provider,
-                plan=build_plan(
-                    row.plan,
-                    activation=activation,
-                    is_shared_outer=is_shared_outer,
-                ),
-            )
-        )
-    return out
