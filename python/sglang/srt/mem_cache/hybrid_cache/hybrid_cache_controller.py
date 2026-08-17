@@ -33,11 +33,49 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 logger = logging.getLogger(__name__)
+_is_hip = is_hip()
+
+
+def _validate_rocm_kernel_host_pools(
+    mem_pool_host: Any,
+    io_backend: str,
+    new_entry: Optional[PoolEntry] = None,
+) -> None:
+    if not _is_hip or io_backend != "kernel":
+        return
+
+    if isinstance(mem_pool_host, HostPoolGroup):
+        pools = [(entry.name.value, entry.host_pool) for entry in mem_pool_host.entries]
+    else:
+        pools = [(type(mem_pool_host).__name__, mem_pool_host)]
+    if new_entry is not None:
+        pools.append((new_entry.name.value, new_entry.host_pool))
+    layer_first = [name for name, pool in pools if pool.layout == "layer_first"]
+    if layer_first:
+        raise RuntimeError(
+            "ROCm HiCache with io_backend='kernel' does not support "
+            "layout='layer_first': the GPU transfer kernel dereferences host "
+            f"CPU virtual addresses for: {', '.join(layer_first)}. Use "
+            "page_first with staged JIT write-back or use the direct IO backend."
+        )
+    unsupported = [
+        name
+        for name, pool in pools
+        if pool.layout == "page_first" and not pool.can_use_write_back_jit
+    ]
+    if unsupported:
+        raise RuntimeError(
+            "ROCm HiCache with io_backend='kernel' and layout='page_first' "
+            "requires staged JIT write-back for every host pool; unavailable "
+            f"for: {', '.join(unsupported)}. The non-JIT fallback dereferences "
+            "host CPU virtual addresses from a GPU kernel."
+        )
 
 
 class StorageOperation(BaseStorageOperation):
@@ -115,6 +153,7 @@ class HybridCacheController(BaseHiCacheController):
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
+        _validate_rocm_kernel_host_pools(mem_pool_host, io_backend)
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             mem_pool_host=mem_pool_host,
@@ -172,6 +211,9 @@ class HybridCacheController(BaseHiCacheController):
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
+        _validate_rocm_kernel_host_pools(
+            self.mem_pool_host, self.io_backend, new_entry=entry
+        )
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
