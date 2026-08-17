@@ -33,8 +33,8 @@ use super::tools::{
     parse_chat_tool_calls,
 };
 use super::{
-    AppState, ChatFormatter, collect_output, contains_media, indexed_egress_stream, openai_error,
-    streaming_error, submit_generation, unix_seconds_u32,
+    AppState, ChatFormatter, collect_output, contains_media, error_payload, indexed_egress_stream,
+    openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::ids::Rid;
 use crate::message::{ChunkExtras, EgressItem, GenerateRequest, OneOrMany, SamplingParams};
@@ -49,25 +49,29 @@ async fn chat_completions(
 ) -> Response {
     let request = match body {
         Ok(Json(request)) => request,
-        Err(rejection) => return openai_error(StatusCode::BAD_REQUEST, rejection.body_text()),
+        Err(rejection) => {
+            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
+        }
     };
     if request.model != state.server_args.served_model_name {
         return openai_error(
             StatusCode::BAD_REQUEST,
             format!("The model `{}` does not exist", request.model),
+            false,
         );
     }
     if request.messages.is_empty() {
-        return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty");
+        return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty", false);
     }
     if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
         return openai_error(
             StatusCode::BAD_REQUEST,
             "image, audio, video, and file message content is not supported",
+            false,
         );
     }
     if request.n == Some(0) {
-        return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1");
+        return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1", false);
     }
     #[allow(deprecated)]
     let max_tokens = request.max_completion_tokens.or(request.max_tokens);
@@ -75,6 +79,7 @@ async fn chat_completions(
         return openai_error(
             StatusCode::BAD_REQUEST,
             "max_completion_tokens must be positive",
+            false,
         );
     }
     if request.modalities.as_ref().is_some_and(|modalities| {
@@ -87,6 +92,7 @@ async fn chat_completions(
         return openai_error(
             StatusCode::BAD_REQUEST,
             "audio, prediction, web search, and multimodal inputs are not supported",
+            false,
         );
     }
     #[allow(deprecated)]
@@ -94,6 +100,7 @@ async fn chat_completions(
         return openai_error(
             StatusCode::BAD_REQUEST,
             "deprecated function_call/functions are not supported; use tools and tool_choice",
+            false,
         );
     }
 
@@ -110,6 +117,7 @@ async fn chat_completions(
         return openai_error(
             StatusCode::BAD_REQUEST,
             "tool calls require --tool-call-parser",
+            false,
         );
     }
     // Python gates the split on `request.separate_reasoning` (default true);
@@ -143,7 +151,9 @@ async fn chat_completions(
         &state.server_args,
     ) {
         Ok(sampling) => sampling,
-        Err(message) => return openai_error(StatusCode::BAD_REQUEST, message),
+        Err(message) => {
+            return openai_error(StatusCode::BAD_REQUEST, message, false);
+        }
     };
 
     let stream = request.stream.unwrap_or(false);
@@ -244,6 +254,7 @@ pub(super) async fn prepare_chat_request(
         return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "this model has no usable chat template",
+            false,
         ));
     };
     // Template stops first, then the request's own — Python
@@ -255,6 +266,7 @@ pub(super) async fn prepare_chat_request(
         openai_error(
             StatusCode::BAD_REQUEST,
             format!("chat template render failed: {error}"),
+            false,
         )
     })?;
     Ok((request, prompt))
@@ -428,7 +440,9 @@ pub(super) async fn unary_chat(
     for (index, rid, rx) in submitted {
         let output = match collect_output(rx, &mut guard, &rid).await {
             Ok(output) => output,
-            Err((status, message)) => return openai_error(status, message),
+            Err((status, message)) => {
+                return openai_error(status, message, false);
+            }
         };
 
         if prompt_tokens == 0 {
@@ -559,7 +573,7 @@ pub(super) fn chat_event_stream(
                     id: None,
                     event: None,
                     comment: None,
-                    error: Some(streaming_error(500, "response truncated before completion")),
+                    error: Some(error_payload(StatusCode::INTERNAL_SERVER_ERROR, "response truncated before completion").to_string()),
                 };
                 continue;
             };
@@ -576,7 +590,7 @@ pub(super) fn chat_event_stream(
                         id: None,
                         event: None,
                         comment: None,
-                        error: Some(streaming_error(error.http_status(), error.to_string())),
+                        error: Some(error_payload(StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.to_string()).to_string()),
                     };
                     continue;
                 }
@@ -592,7 +606,7 @@ pub(super) fn chat_event_stream(
                     id: None,
                     event: None,
                     comment: None,
-                    error: Some(streaming_error(code, message)),
+                    error: Some(error_payload(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), message).to_string()),
                 };
                 continue;
             }
@@ -822,6 +836,7 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
             bytes: Some(token.as_bytes().to_vec()),
             token,
             logprob,
+            token_id: u32::try_from(token_id).ok(),
             top_logprobs,
         });
     }
@@ -1006,6 +1021,7 @@ mod tests {
         let logprobs = chat_logprobs(Some(&extras));
         let token = &logprobs.content.unwrap()[0];
         assert_eq!(token.token, "x");
+        assert_eq!(token.token_id, Some(7));
         assert_eq!(token.top_logprobs.len(), 2);
         assert_eq!(token.top_logprobs[1].token, "y");
     }

@@ -12,7 +12,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_parallel,
+    process_model_config,
+)
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
 
@@ -113,7 +116,7 @@ def is_dsa_enable_prefill_cp():
         return False
     from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
-    hf_config = get_server_args().get_model_config().hf_config
+    hf_config = process_model_config().hf_config
     return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
 
 
@@ -203,7 +206,7 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
     from sglang.srt.layers.cp.padding import get_cp_padding_align_size
-    from sglang.srt.layers.cp.utils import is_cp_v2_active
+    from sglang.srt.layers.cp.utils import enable_cp_v2, is_cp_v2_active
 
     # CP-v2 already pads each rank-local shard to its physical size
     if is_cp_v2_active(forward_batch):
@@ -214,10 +217,16 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)
     attn_cp_size = get_parallel().attn_cp_size
-    # Must match the CP padding in ForwardBatch.prepare_mlp_sync_batch.
-    cp_align_size = get_cp_padding_align_size()
-    for i in range(sync_group_size):
-        global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
+    # Must mirror ForwardBatch.prepare_mlp_sync_batch, which applies cp_align_size only when
+    # CP-v2 is disabled. Under enable_cp_v2() the speculative forwards (TARGET_VERIFY /
+    # DRAFT_EXTEND_V2) reach here with is_cp_v2_active False, and q is padded to attn_tp_size only
+    # (not cp-aligned). Applying cp_align here over-pads the flashmla metadata past q, so
+    # num_splits ends up longer than q -> fwd_kvcache_mla fails "num_splits must have shape (b+1)".
+    # (attn_cp analog of the attn_tp fix in PR #30642 / issue #30296.)
+    if not enable_cp_v2():
+        cp_align_size = get_cp_padding_align_size()
+        for i in range(sync_group_size):
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
     # Reuse the mode selected when the DP buffer was prepared.
     dp_padding_mode = forward_batch.dp_padding_mode
     if dp_padding_mode is None:

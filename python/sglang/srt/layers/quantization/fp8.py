@@ -141,10 +141,7 @@ def _require_fp4_dtype():
 
 
 if _use_aiter or _use_hip_int4:
-    from aiter.ops.shuffle import (
-        shuffle_scale,
-        shuffle_weight,
-    )
+    from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -776,7 +773,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 .reshape_as(scale_u8)
                 .contiguous(),
             )
-        elif backend.is_flashinfer_cutlass():
+        elif backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
             from flashinfer import block_scale_interleave
 
             scale_u8 = layer.weight_scale_inv.data
@@ -977,7 +974,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.use_mxfp8:
             backend = self.mxfp8_dense_backend
             extra_kwargs = {}
-            if backend.is_flashinfer_cutlass():
+            if backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
                 weight_scale = layer.weight_scale_inv_swizzled
             elif backend.is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled
@@ -1033,6 +1030,24 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale_inv,
                 input_scale=None,
                 bias=bias,
+            )
+
+        if isinstance(x, tuple):
+            # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
+            # x = (fp8_input, per_tensor_input_scale[, orig_dtype]).
+            # apply_fp8_linear detects the fp8 dtype and skips re-quantizing;
+            # orig_dtype (when present) sets the GEMM output dtype.
+            qx, x_scale = x[0], x[1]
+            out_dtype = x[2] if len(x) > 2 else None
+            return apply_fp8_linear(
+                input=qx,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=x_scale,
+                bias=bias,
+                cutlass_fp8_supported=self.cutlass_fp8_supported,
+                use_per_token_if_dynamic=self.use_per_token_if_dynamic,
+                pre_quant_output_dtype=out_dtype,
             )
 
         return apply_fp8_linear(
@@ -1838,9 +1853,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return qweight.view_as(weight), scale_u8
 
-        from sglang.srt.layers.quantization.mxfp8_block_convert import (
-            _ue8m0_to_fp32,
-        )
+        from sglang.srt.layers.quantization.mxfp8_block_convert import _ue8m0_to_fp32
 
         def _quantize_for_deepgemm(weight: torch.Tensor):
             weight = weight.contiguous()
@@ -2126,11 +2139,38 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
+        if (
+            get_moe_runner_backend().is_flashinfer_trtllm()
+            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        ):
+            self._prepare_flashinfer_trtllm_activation_params(layer)
+
         if get_moe_runner_backend().is_hpc_ops():
             self._prepare_hpc_ops_weights(layer)
 
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
+
+    def _prepare_flashinfer_trtllm_activation_params(self, layer: Module) -> None:
+        """Materialize optional TRT-LLM SwiGLU parameters once per expert."""
+        num_experts = int(layer.num_local_experts)
+        device = layer.w13_weight.device
+        for name, value in (
+            ("gemm1_alpha", self.moe_runner_config.gemm1_alpha),
+            ("gemm1_beta", self.moe_runner_config.gemm1_beta),
+            ("gemm1_clamp_limit", self.moe_runner_config.gemm1_clamp_limit),
+        ):
+            tensor = (
+                None
+                if value is None
+                else torch.full(
+                    (num_experts,),
+                    float(value),
+                    dtype=torch.float32,
+                    device=device,
+                )
+            )
+            setattr(layer, f"_flashinfer_trtllm_{name}", tensor)
 
     def _prepare_hpc_ops_weights(self, layer: Module) -> None:
         """Precompute the scale layouts consumed by the HPC-Ops fused MoE kernels.
@@ -2366,6 +2406,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 None,  # alpha
                 None,  # limit
                 True,  # is_vnni
+                moe_runner_config.activation,  # activation
             )
             return StandardCombineInput(hidden_states=output)
 
@@ -2540,6 +2581,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale_inv=(
                     layer.w2_weight_scale_inv if self.block_quant else None
                 ),
+                gemm1_alpha=layer._flashinfer_trtllm_gemm1_alpha,
+                gemm1_beta=layer._flashinfer_trtllm_gemm1_beta,
+                gemm1_clamp_limit=layer._flashinfer_trtllm_gemm1_clamp_limit,
                 w13_input_scale=layer.w13_input_scale if not self.block_quant else None,
                 output1_scales_scalar=(
                     getattr(layer, "output1_scales_scalar", None)
