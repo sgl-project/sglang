@@ -207,7 +207,18 @@ class Qwen2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        query_output_dtype = (
+            self.attn.get_query_quantization_dtype(forward_batch.forward_mode)
+            if forward_batch.forward_mode.is_decode()
+            and getattr(self.rotary_emb, "supports_query_output_dtype", False)
+            else None
+        )
+        if query_output_dtype is None:
+            q, k = self.rotary_emb(positions, q, k)
+        else:
+            q, k = self.rotary_emb(
+                positions, q, k, query_output_dtype=query_output_dtype
+            )
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
