@@ -312,7 +312,7 @@ def test_dsv4_paged_host_pool_staged_roundtrip() -> None:
     target_pages = torch.tensor([5, 6], dtype=torch.int64, device=DEVICE)
     target_indices = _token_indices_for_pages(target_pages, page_size=page_size)
     for buffer in device_buffers:
-        buffer[target_pages].zero_()
+        buffer[target_pages] = 0
     host_indices_device = host_indices.to(DEVICE)
     for layer_id in range(layer_num):
         host_pool.load_to_device_per_layer(
@@ -331,7 +331,7 @@ def test_dsv4_paged_host_pool_staged_roundtrip() -> None:
         _token_indices_for_pages(mutated_target_pages, page_size=page_size)
     )
     for buffer in device_buffers:
-        buffer[mutated_target_pages].zero_()
+        buffer[mutated_target_pages] = 0
     for layer_id in range(layer_num):
         host_pool.load_to_device_per_layer(
             None,
@@ -400,7 +400,7 @@ def test_dsv4_state_host_pool_staged_roundtrip() -> None:
     target_pages = torch.tensor([5, 6], dtype=torch.int64, device=DEVICE)
     target_indices = _token_indices_for_pages(target_pages, page_size=swa_page_size)
     for page_view in host_pool.device_page_views:
-        page_view[target_pages].zero_()
+        page_view[target_pages] = 0
     host_indices_device = host_indices.to(DEVICE)
     for layer_id in range(layer_num):
         host_pool.load_to_device_per_layer(
@@ -473,7 +473,7 @@ def test_dsv4_dsa_indexer_host_pool_staged_roundtrip() -> None:
     target_pages = torch.tensor([5, 6], dtype=torch.int64, device=DEVICE)
     target_indices = _token_indices_for_pages(target_pages, page_size=page_size)
     for buffer in device_pool.index_k_with_scale_buffer:
-        buffer[target_pages].zero_()
+        buffer[target_pages] = 0
     host_indices_device = host_indices.to(DEVICE)
     for layer_id in range(layer_num):
         host_pool.load_to_device_per_layer(

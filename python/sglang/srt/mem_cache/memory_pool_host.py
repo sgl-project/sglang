@@ -50,15 +50,19 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
-def _tensor_version(tensor: torch.Tensor) -> int:
-    return 0 if tensor.is_inference() else tensor._version
+def _tensor_version(tensor: torch.Tensor) -> Optional[int]:
+    return None if tensor.is_inference() else tensor._version
 
 
 def _cached_hip_load_indices(owner, host_indices, device_indices, convert):
     """Reuse CPU page rows across the per-layer calls of one L2 load."""
     host_version = _tensor_version(host_indices)
     device_version = _tensor_version(device_indices)
-    cache = getattr(owner, "_hip_load_indices_cache", None)
+    if host_version is None or device_version is None:
+        host_rows, device_rows = convert()
+        return host_rows.cpu(), device_rows.cpu()
+
+    cache = owner._hip_load_indices_cache
     if (
         cache is not None
         and cache[0]() is host_indices
@@ -71,6 +75,8 @@ def _cached_hip_load_indices(owner, host_indices, device_indices, convert):
     host_rows, device_rows = convert()
     host_rows = host_rows.cpu()
     device_rows = device_rows.cpu()
+    # Replace the immutable tuple atomically so concurrent readers cannot see
+    # a partially updated cache entry.
     owner._hip_load_indices_cache = (
         weakref.ref(host_indices),
         weakref.ref(device_indices),
@@ -823,6 +829,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.start_layer = 0
         self.end_layer = self.layer_num
         self.lock = threading.RLock()
+        self._hip_load_indices_cache = None
 
         self.device_buffers = device_buffers
         self.gpu_device = device_buffers[0].device if device_buffers else device
@@ -1027,6 +1034,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                     element_size=self.item_bytes,
                 )
             else:
+                if _is_hip:
+                    raise RuntimeError(
+                        f"{self.pool_name} requires staged JIT write-back on ROCm"
+                    )
                 transfer_kv_all_layer_mla_lf_pf(
                     src_layers=self.device_ptrs,
                     dst=self.kv_buffer,
@@ -1252,6 +1263,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.start_layer = 0
         self.end_layer = self.layer_num
         self.lock = threading.RLock()
+        self._hip_load_indices_cache = None
 
         self.ring_size = 0
         self.state_page_bytes = 0
@@ -1449,6 +1461,10 @@ class DeepSeekV4StateHostPool(HostKVCache):
                     element_size=self.state_page_bytes,
                 )
             else:
+                if _is_hip:
+                    raise RuntimeError(
+                        f"{self.pool_name} requires staged JIT write-back on ROCm"
+                    )
                 transfer_kv_all_layer_mla_lf_pf(
                     src_layers=self.device_ptrs,
                     dst=self.kv_buffer,
@@ -1831,6 +1847,7 @@ class DSAIndexerPoolHost(HostKVCache):
         self.can_use_write_back_jit = False
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
+        self._hip_load_indices_cache = None
         self.clear()
 
     def get_size_per_token(self):
@@ -2111,6 +2128,10 @@ class DSAIndexerPoolHost(HostKVCache):
                         element_size=self.indexer_page_stride_size,
                     )
                 else:
+                    if _is_hip:
+                        raise RuntimeError(
+                            "DSA indexer requires staged JIT write-back on ROCm"
+                        )
                     transfer_kv_all_layer_mla_lf_pf(
                         src_layers=self.index_k_device_ptrs,
                         dst=self.index_k_with_scale_buffer,
