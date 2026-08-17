@@ -107,6 +107,20 @@ def _model_impl_from_architecture(architecture: str) -> ModelImpl:
     return ModelImpl.SGLANG
 
 
+# Preference order used to resolve a model class from a config's `auto_map`
+# when `AutoModel` itself is not declared. Newer VLMs (Molmo2, and generally
+# any image-text-to-text custom model) only declare a task-specific auto class
+# like `AutoModelForImageTextToText`. Order is generation-focused: multimodal
+# families before pure text families before seq2seq.
+_AUTO_MAP_MODEL_KEYS = (
+    "AutoModel",
+    "AutoModelForImageTextToText",
+    "AutoModelForVision2Seq",
+    "AutoModelForCausalLM",
+    "AutoModelForSeq2SeqLM",
+)
+
+
 def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str]):
     backend_arch = _get_transformers_backend_arch(model_config, architectures)
 
@@ -141,31 +155,41 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
             )
         model_module = getattr(transformers, arch, None)
         if model_module is None:
-            has_auto_model = "AutoModel" in auto_modules
-            if not has_auto_model and model_config.model_impl == ModelImpl.TRANSFORMERS:
+            resolved_auto_key = next(
+                (key for key in _AUTO_MAP_MODEL_KEYS if key in auto_modules),
+                None,
+            )
+            if (
+                resolved_auto_key is None
+                and model_config.model_impl == ModelImpl.TRANSFORMERS
+            ):
                 logger.warning(
-                    "Cannot resolve model class for '%s' and no auto_map.AutoModel "
-                    "is present. Skipping compatibility gate because "
-                    "--model-impl=transformers is explicitly requested.",
+                    "Cannot resolve model class for '%s' and no generative "
+                    "auto_map entry (%s) is present. Skipping compatibility "
+                    "gate because --model-impl=transformers is explicitly "
+                    "requested.",
                     arch,
+                    ", ".join(_AUTO_MAP_MODEL_KEYS),
                 )
                 continue
-            if not has_auto_model and "AutoModel" not in auto_map:
+            if resolved_auto_key is None and not any(
+                key in auto_map for key in _AUTO_MAP_MODEL_KEYS
+            ):
                 raise ValueError(
                     f"Cannot find model module. '{arch}' is not a registered "
                     "model in the Transformers library (only relevant if the "
-                    "model is meant to be in Transformers) and 'AutoModel' is "
-                    "not present in the model config's 'auto_map' (relevant "
-                    "if the model is custom)."
+                    "model is meant to be in Transformers) and none of "
+                    f"{list(_AUTO_MAP_MODEL_KEYS)} is present in the model "
+                    "config's 'auto_map' (relevant if the model is custom)."
                 )
-            if not has_auto_model:
+            if resolved_auto_key is None:
                 raise ValueError(
                     f"Cannot find model module. '{arch}' is not a registered "
                     "model in the Transformers library and loading the custom "
                     f"model from auto_map failed. The remote model code may be "
                     f"incompatible with the installed transformers version."
                 )
-            model_module = auto_modules["AutoModel"]
+            model_module = auto_modules[resolved_auto_key]
         if model_config.model_impl == ModelImpl.TRANSFORMERS:
             if hasattr(model_module, "is_backend_compatible") and (
                 not model_module.is_backend_compatible()
