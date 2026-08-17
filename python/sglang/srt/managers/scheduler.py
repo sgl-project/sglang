@@ -2367,7 +2367,9 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
-    def _apply_router_kv_hints(self, hints: Optional[dict]) -> None:
+    def _apply_router_kv_hints(
+        self, hints: Optional[dict], request_id: str
+    ) -> None:
         """Execute valid storage actions as advisory engine-local work."""
         if not isinstance(hints, dict):
             return
@@ -2431,14 +2433,16 @@ class Scheduler(
                     session_id,
                 )
                 continue
-            logger.info(
-                "Applied KV demote action_id=%s session_id=%s state=%s selected_tokens=%s message=%s",
-                action_id,
-                session_id,
-                result.get("state"),
-                result.get("selected_tokens", 0),
-                result.get("message", ""),
-            )
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "KV_STORAGE_DEMOTE event=applied request_id=%s action_id=%s session_id=%s state=%s selected_tokens=%s message=%s",
+                    request_id,
+                    action_id,
+                    session_id,
+                    result.get("state"),
+                    result.get("selected_tokens", 0),
+                    result.get("message", ""),
+                )
 
     def handle_generate_request(
         self,
@@ -2580,7 +2584,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        self._apply_router_kv_hints(recv_req.kv_hints)
+        self._apply_router_kv_hints(recv_req.kv_hints, recv_req.rid)
         req.kv_hints = recv_req.kv_hints
         self._maybe_namespace_elastic_radix_cache(req)
 
@@ -2806,6 +2810,9 @@ class Scheduler(
                     tree_cache.prefetch_from_storage(*args, force=True)
                 else:
                     tree_cache.prefetch_from_storage(*args)
+                if req.rid in tree_cache.ongoing_prefetch:
+                    req.storage_prefetch_enqueued_at = time.monotonic()
+                    req.storage_prefetch_force = force_prefetch
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -3410,11 +3417,27 @@ class Scheduler(
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    req.storage_prefetch_blocked_polls += 1
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
+                if (
+                    req.storage_prefetch_enqueued_at is not None
+                    and self.ps.tp_rank == 0
+                ):
+                    elapsed_ms = (
+                        time.monotonic() - req.storage_prefetch_enqueued_at
+                    ) * 1_000
+                    logger.info(
+                        "KV_STORAGE_PREFETCH event=admitted request_id=%s force=%s elapsed_ms=%.3f blocked_polls=%d loaded_tokens=%d",
+                        req.rid,
+                        req.storage_prefetch_force,
+                        elapsed_ms,
+                        req.storage_prefetch_blocked_polls,
+                        loaded_tokens,
+                    )
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(

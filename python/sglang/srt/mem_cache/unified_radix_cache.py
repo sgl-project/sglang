@@ -135,6 +135,7 @@ class _OngoingSessionStorageDemotion(NamedTuple):
     generation: int
     node_ids: tuple[NodeId, ...]
     selected_tokens: int
+    started_at: float
     backup_ids: set[int]
     backup_acks: dict[int, bool]
 
@@ -1322,6 +1323,7 @@ class UnifiedRadixCache(BasePrefixCache):
             generation=current_generation,
             node_ids=node_ids,
             selected_tokens=selected_tokens,
+            started_at=time.monotonic(),
             backup_ids=backup_ids,
             backup_acks={},
         )
@@ -1400,9 +1402,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 continue
             if not status[1].item():
                 logger.warning(
-                    "Session storage demote failed action_id=%s session_id=%s; device KV retained",
+                    "KV_STORAGE_DEMOTE event=failed action_id=%s session_id=%s selected_tokens=%d elapsed_ms=%.3f message=device_kv_retained",
                     action_id,
                     state.session_id,
+                    state.selected_tokens,
+                    (time.monotonic() - state.started_at) * 1_000,
                 )
                 self._finish_session_storage_demotion(action_id)
                 continue
@@ -1412,9 +1416,11 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if generation != state.generation or node_ids != state.node_ids:
                 logger.warning(
-                    "Session storage demote raced with session mutation action_id=%s session_id=%s; device KV retained",
+                    "KV_STORAGE_DEMOTE event=raced action_id=%s session_id=%s selected_tokens=%d elapsed_ms=%.3f message=device_kv_retained",
                     action_id,
                     state.session_id,
+                    state.selected_tokens,
+                    (time.monotonic() - state.started_at) * 1_000,
                 )
                 self._finish_session_storage_demotion(action_id)
                 continue
@@ -1439,11 +1445,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._demote(node.id, tracker)
 
             logger.info(
-                "Session storage demote completed action_id=%s session_id=%s selected_tokens=%d affected_tokens=%d",
+                "KV_STORAGE_DEMOTE event=completed action_id=%s session_id=%s selected_tokens=%d affected_tokens=%d elapsed_ms=%.3f",
                 action_id,
                 state.session_id,
                 state.selected_tokens,
                 tracker[BASE_COMPONENT_TYPE],
+                (time.monotonic() - state.started_at) * 1_000,
             )
             self._finish_session_storage_demotion(action_id)
 
@@ -1544,6 +1551,13 @@ class UnifiedRadixCache(BasePrefixCache):
             comp_xfers,
         )
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+        if getattr(self.cache_controller, "tp_rank", 0) == 0:
+            logger.info(
+                "KV_STORAGE_PREFETCH event=started request_id=%s force=%s requested_tokens=%d",
+                req_id,
+                force,
+                len(prefetch_key),
+            )
 
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
         return (
@@ -1682,6 +1696,18 @@ class UnifiedRadixCache(BasePrefixCache):
             released_tokens,
             self.cache_controller.prefetch_tokens_occupied,
         )
+        if getattr(self.cache_controller, "tp_rank", 0) == 0:
+            logger.info(
+                "KV_STORAGE_PREFETCH event=completed request_id=%s force=%s requested_tokens=%d completed_tokens=%d matched_tokens=%d loaded_tokens=%d released_tokens=%d elapsed_ms=%.3f",
+                req_id,
+                operation.force_prefetch,
+                len(prefetch_key),
+                min_completed_tokens,
+                insert_result.prefix_len,
+                loaded_from_storage,
+                released_tokens,
+                (time.monotonic() - operation.start_time) * 1_000,
+            )
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
         return True
