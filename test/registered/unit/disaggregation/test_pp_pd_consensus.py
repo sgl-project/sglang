@@ -60,6 +60,9 @@ class TestPPPDConsensus(CustomTestCase):
         queue.scheduler = SimpleNamespace(
             ps=SimpleNamespace(dp_rank=0, gpu_id=0),
             server_args=SimpleNamespace(disaggregation_ib_device=None),
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(kv_cache_dtype_str="auto")
+            ),
             model_config=SimpleNamespace(
                 num_hidden_layers=8,
                 get_total_num_kv_heads=lambda: 1,

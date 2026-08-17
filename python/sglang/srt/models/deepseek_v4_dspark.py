@@ -1034,7 +1034,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         return confidence
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
-        if self.is_lifecycle_only:
+        if vars(self).get("is_lifecycle_only", False):
             return
         params_dict = dict(self.named_parameters())
         loaded_params = set()
