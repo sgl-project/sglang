@@ -136,11 +136,10 @@ def _core_token_counts(max_tokens: int, tokens_per_seq: int) -> tuple[int, ...]:
     counts = set()
     batch_sizes = list(range(1, 33))
     try:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_exec
 
-        decode = getattr(
-            getattr(get_global_server_args(), "cuda_graph_config", None), "decode", None
-        )
+        cg_config = get_exec().graph.cuda_graph_config
+        decode = cg_config.decode if cg_config is not None else None
         batch_sizes = list(getattr(decode, "bs", None) or batch_sizes)
     except Exception:
         # No server context (unit tests, offline use): the dense 1..32 ladder
@@ -515,12 +514,9 @@ class Mxfp4B12xMoEMethod:
         ones = torch.ones(num_experts, dtype=torch.float32, device=device)
 
         try:
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_spec
 
-            spec_tokens = int(
-                getattr(get_global_server_args(), "speculative_num_draft_tokens", None)
-                or 1
-            )
+            spec_tokens = int(get_spec().speculative_num_draft_tokens or 1)
         except Exception:
             spec_tokens = 1
 
