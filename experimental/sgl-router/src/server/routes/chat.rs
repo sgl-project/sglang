@@ -292,6 +292,20 @@ async fn chat_completions_inner(
         .as_ref()
         .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
     let at_post_tokenize = start.elapsed();
+    // Recorded here, adjacent to the two markers, so it is evident nothing
+    // downstream is inside the span — widening it past admission or dispatch
+    // would make the metric a duplicate of the `router.ttfb` Server-Timing
+    // header. Unsampled, unlike the diagnostic log below. Gated on
+    // `want_tokens`: a request the ingress never tries to tokenize would
+    // otherwise contribute a meaningless ~0 and drag every quantile down.
+    if want_tokens {
+        ctx.metrics.observe_tokenize(
+            &model_str,
+            at_post_tokenize
+                .saturating_sub(at_pre_tokenize)
+                .as_secs_f64(),
+        );
+    }
 
     // The request id, derived HERE rather than at dispatch because both tees
     // need it and the ingress one fires now. It is the join key that lets the
@@ -338,20 +352,6 @@ async fn chat_completions_inner(
     } else {
         None
     };
-    // Keep both markers adjacent to the tokenize work: extending this span past
-    // admission or dispatch turns the metric into a duplicate of the
-    // `router.ttfb` Server-Timing header. Unsampled, unlike the log below.
-    // Gated on `want_tokens`: a request on a model with no chat encoder, under a
-    // policy needing no tokens, would otherwise contribute a meaningless ~0
-    // sample and drag every quantile toward zero.
-    if want_tokens {
-        ctx.metrics.observe_tokenize(
-            &model_str,
-            at_post_tokenize
-                .saturating_sub(at_pre_tokenize)
-                .as_secs_f64(),
-        );
-    }
     // Diagnostic: ingress-tokenize cost, sampled. Fires for EVERY request that
     // reaches here — including those about to be shed at admission below — so a
     // shed request's pre-admission time (the latency the access log shows on a

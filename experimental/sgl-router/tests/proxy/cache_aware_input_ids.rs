@@ -152,6 +152,33 @@ async fn plain_chat_forwards_input_ids_and_keeps_messages() {
     );
 }
 
+/// The ingress records `sgl_router_tokenize_seconds` for a request it
+/// tokenizes. The registry unit tests cover the histogram in isolation; only
+/// this asserts the chat handler is wired to it, so deleting the call site or
+/// inverting its gate fails loudly here instead of passing silently.
+#[tokio::test]
+async fn tokenized_request_records_tokenize_seconds() {
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(mock.url.clone());
+    let status = send(
+        Arc::clone(&ctx),
+        json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hello there friend"}],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let m = ctx.metrics.render();
+    assert!(
+        m.contains(&format!(
+            r#"sgl_router_tokenize_seconds_count{{model_id="{MODEL}"}} 1"#
+        )),
+        "ingress tokenize must be recorded once for a tokenized request; got:\n{m}"
+    );
+}
+
 #[tokio::test]
 async fn tool_request_forwards_input_ids() {
     let mock = MockWorker::start(vec![]).await;
