@@ -401,6 +401,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
+            num_drafts=self.verify_num_draft_tokens - 1,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
             tp_rank=self.ps.tp_rank,
