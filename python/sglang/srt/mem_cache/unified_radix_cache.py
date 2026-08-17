@@ -1473,7 +1473,6 @@ class UnifiedRadixCache(BasePrefixCache):
         new_input_tokens: list[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
-        force: bool = False,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -1486,26 +1485,10 @@ class UnifiedRadixCache(BasePrefixCache):
             cache_salt=cache_salt,
         ).page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
-        if prefetch_length == 0:
-            return
-        if not force and prefetch_length < self.prefetch_threshold:
-            if getattr(self.cache_controller, "tp_rank", 0) == 0:
-                logger.info(
-                    "KV_STORAGE_PREFETCH event=skipped request_id=%s force=%s requested_tokens=%d reason=below_threshold threshold=%d",
-                    req_id,
-                    force,
-                    prefetch_length,
-                    self.prefetch_threshold,
-                )
-            return
-        if not force and self.cache_controller.prefetch_rate_limited():
-            if getattr(self.cache_controller, "tp_rank", 0) == 0:
-                logger.info(
-                    "KV_STORAGE_PREFETCH event=skipped request_id=%s force=%s requested_tokens=%d reason=rate_limited",
-                    req_id,
-                    force,
-                    prefetch_length,
-                )
+        if prefetch_length == 0 or (
+            prefetch_length < self.prefetch_threshold
+            or self.cache_controller.prefetch_rate_limited()
+        ):
             return
 
         anchor_lock_params = self.inc_host_lock_ref(last_host_node_id).to_dec_params()
@@ -1554,7 +1537,6 @@ class UnifiedRadixCache(BasePrefixCache):
             prefix_keys,
             extra_pools=aux_xfers or None,
         )
-        operation.force_prefetch = force
         self.ongoing_prefetch[req_id] = _OngoingPrefetch(
             last_host_node_id,
             prefetch_key,
@@ -1564,13 +1546,6 @@ class UnifiedRadixCache(BasePrefixCache):
             comp_xfers,
         )
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
-        if getattr(self.cache_controller, "tp_rank", 0) == 0:
-            logger.info(
-                "KV_STORAGE_PREFETCH event=started request_id=%s force=%s requested_tokens=%d",
-                req_id,
-                force,
-                len(prefetch_key),
-            )
 
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
         return (
@@ -1709,18 +1684,6 @@ class UnifiedRadixCache(BasePrefixCache):
             released_tokens,
             self.cache_controller.prefetch_tokens_occupied,
         )
-        if getattr(self.cache_controller, "tp_rank", 0) == 0:
-            logger.info(
-                "KV_STORAGE_PREFETCH event=completed request_id=%s force=%s requested_tokens=%d completed_tokens=%d matched_tokens=%d loaded_tokens=%d released_tokens=%d elapsed_ms=%.3f",
-                req_id,
-                operation.force_prefetch,
-                len(prefetch_key),
-                min_completed_tokens,
-                insert_result.prefix_len,
-                loaded_from_storage,
-                released_tokens,
-                (time.monotonic() - operation.start_time) * 1_000,
-            )
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
         return True
@@ -1895,12 +1858,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     # request was aborted while the storage query was in flight
                     self._revoke_pending_prefetch(req_id)
                     continue
-                min_prefetch_tokens = (
-                    self.page_size
-                    if getattr(operation, "force_prefetch", False)
-                    else self.prefetch_threshold
-                )
-                if operation.storage_hit_count < min_prefetch_tokens:
+                if operation.storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self._revoke_pending_prefetch(req_id)
                     continue

@@ -1004,11 +1004,6 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
-        # Request-attributed HiCache restore telemetry. These values are local to the
-        # scheduler and are emitted as structured logs rather than metric labels.
-        self.storage_prefetch_enqueued_at: Optional[float] = None
-        self.storage_prefetch_force = False
-        self.storage_prefetch_blocked_polls = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early

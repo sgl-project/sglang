@@ -63,7 +63,6 @@ message KvHintAction {
   string action_version = 3;
   oneof payload {
     KvDemotePayload demote = 4;
-    KvPrefetchPayload prefetch = 5;
   }
 }
 
@@ -71,8 +70,6 @@ message KvDemotePayload {
   string session_id = 1;
   optional uint64 session_generation = 2;
 }
-
-message KvPrefetchPayload {}
 
 // Sampling parameters shared across text and tokenized RPCs.
 message SamplingParams {

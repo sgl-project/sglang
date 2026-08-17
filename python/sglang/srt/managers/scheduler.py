@@ -2585,7 +2585,6 @@ class Scheduler(
             return
 
         self._apply_router_kv_hints(recv_req.kv_hints, recv_req.rid)
-        req.kv_hints = recv_req.kv_hints
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
@@ -2777,13 +2776,6 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
-            hints = getattr(req, "kv_hints", None)
-            force_prefetch = isinstance(hints, dict) and any(
-                isinstance(action, dict)
-                and action.get("action_type") == "kv.prefetch"
-                and action.get("action_version") == "1.0"
-                for action in hints.get("actions", ())
-            )
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             if tree_cache.is_backuped(req.last_host_node) or tree_cache.is_root(
@@ -2799,20 +2791,13 @@ class Scheduler(
                     if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                args = (
+                tree_cache.prefetch_from_storage(
                     req.rid,
                     req.last_host_node,
                     new_input_tokens,
                     tree_cache.get_last_hash_value(req.last_host_node),
                     prefix_keys,
                 )
-                if force_prefetch and hasattr(tree_cache, "demote_session_to_storage"):
-                    tree_cache.prefetch_from_storage(*args, force=True)
-                else:
-                    tree_cache.prefetch_from_storage(*args)
-                if req.rid in tree_cache.ongoing_prefetch:
-                    req.storage_prefetch_enqueued_at = time.monotonic()
-                    req.storage_prefetch_force = force_prefetch
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -3417,27 +3402,11 @@ class Scheduler(
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
-                    req.storage_prefetch_blocked_polls += 1
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
-                if (
-                    req.storage_prefetch_enqueued_at is not None
-                    and self.ps.tp_rank == 0
-                ):
-                    elapsed_ms = (
-                        time.monotonic() - req.storage_prefetch_enqueued_at
-                    ) * 1_000
-                    logger.info(
-                        "KV_STORAGE_PREFETCH event=admitted request_id=%s force=%s elapsed_ms=%.3f blocked_polls=%d loaded_tokens=%d",
-                        req.rid,
-                        req.storage_prefetch_force,
-                        elapsed_ms,
-                        req.storage_prefetch_blocked_polls,
-                        loaded_tokens,
-                    )
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(

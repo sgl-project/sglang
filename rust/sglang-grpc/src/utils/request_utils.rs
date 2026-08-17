@@ -215,9 +215,6 @@ fn insert_kv_hints(
                     }
                     serde_json::Value::Object(payload)
                 }
-                ("kv.prefetch", Some(proto::kv_hint_action::Payload::Prefetch(_))) => {
-                    serde_json::Value::Object(serde_json::Map::new())
-                }
                 _ => return None,
             };
             Some(serde_json::json!({
@@ -467,31 +464,21 @@ mod tests {
     }
 
     #[test]
-    fn generate_dicts_preserve_supported_kv_actions() {
+    fn generate_dicts_preserve_kv_demote_action() {
         let hints = Some(proto::KvHints {
             protocol_version: "0.1".to_string(),
             message_id: "message-1".to_string(),
-            actions: vec![
-                proto::KvHintAction {
-                    action_id: "demote-1".to_string(),
-                    action_type: "kv.demote".to_string(),
-                    action_version: "1.0".to_string(),
-                    payload: Some(proto::kv_hint_action::Payload::Demote(
-                        proto::KvDemotePayload {
-                            session_id: "session-1".to_string(),
-                            session_generation: Some(7),
-                        },
-                    )),
-                },
-                proto::KvHintAction {
-                    action_id: "prefetch-1".to_string(),
-                    action_type: "kv.prefetch".to_string(),
-                    action_version: "1.0".to_string(),
-                    payload: Some(proto::kv_hint_action::Payload::Prefetch(
-                        proto::KvPrefetchPayload {},
-                    )),
-                },
-            ],
+            actions: vec![proto::KvHintAction {
+                action_id: "demote-1".to_string(),
+                action_type: "kv.demote".to_string(),
+                action_version: "1.0".to_string(),
+                payload: Some(proto::kv_hint_action::Payload::Demote(
+                    proto::KvDemotePayload {
+                        session_id: "session-1".to_string(),
+                        session_generation: Some(7),
+                    },
+                )),
+            }],
         });
         let request = proto::GenerateRequest {
             kv_hints: hints,
@@ -504,20 +491,12 @@ mod tests {
             Some(&serde_json::json!({
                 "protocol_version": "0.1",
                 "message_id": "message-1",
-                "actions": [
-                    {
-                        "action_id": "demote-1",
-                        "action_type": "kv.demote",
-                        "action_version": "1.0",
-                        "payload": {"session_id": "session-1", "session_generation": 7},
-                    },
-                    {
-                        "action_id": "prefetch-1",
-                        "action_type": "kv.prefetch",
-                        "action_version": "1.0",
-                        "payload": {},
-                    },
-                ],
+                "actions": [{
+                    "action_id": "demote-1",
+                    "action_type": "kv.demote",
+                    "action_version": "1.0",
+                    "payload": {"session_id": "session-1", "session_generation": 7},
+                }],
             }))
         );
     }

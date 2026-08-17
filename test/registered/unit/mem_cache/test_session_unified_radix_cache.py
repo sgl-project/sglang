@@ -253,22 +253,5 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         self.assertTrue(leaf.backuped)
         self.assertEqual(self.full.session_ref(leaf), 0)
 
-    def test_forced_storage_prefetch_bypasses_benefit_threshold(self):
-        self.cache.enable_storage = True
-        self.cache.prefetch_threshold = 256
-        self.cache.cache_controller = MagicMock()
-        self.cache.cache_controller.prefetch_tokens_occupied = 0
-        self.cache.cache_controller.prefetch.return_value = MagicMock()
-        root_id = self.cache.tree_core.root_node.id
-
-        self.cache.prefetch_from_storage("ordinary", root_id, [1, 2, 3, 4])
-        self.cache.cache_controller.prefetch.assert_not_called()
-
-        self.cache.prefetch_from_storage("forced", root_id, [1, 2, 3, 4], force=True)
-
-        self.cache.cache_controller.prefetch.assert_called_once()
-        self.assertTrue(self.cache.ongoing_prefetch["forced"].operation.force_prefetch)
-
-
 if __name__ == "__main__":
     unittest.main()
