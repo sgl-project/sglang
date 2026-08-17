@@ -69,15 +69,11 @@ pub async fn run_with_config(
     kv_index: Option<Arc<KvEventIndex>>,
     active_load: Option<Arc<ActiveLoadRegistry>>,
 ) {
-    run_with_introspector(
-        rx,
-        registry,
-        cfg,
-        kv_index,
-        active_load,
-        Arc::new(WorkerIntrospector::default()),
-    )
-    .await
+    let introspector = match cfg.as_ref().and_then(|c| c.proxy.worker_api_key.as_deref()) {
+        Some(key) => Arc::new(WorkerIntrospector::with_worker_api_key(key)),
+        None => Arc::new(WorkerIntrospector::default()),
+    };
+    run_with_introspector(rx, registry, cfg, kv_index, active_load, introspector).await
 }
 
 /// Internal entry point used by tests so they can supply a custom
