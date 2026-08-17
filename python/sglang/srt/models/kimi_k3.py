@@ -2497,7 +2497,12 @@ class KimiK3LinearModel(nn.Module):
         self._dp_attention = is_dp_attention_enabled()
         self._trim_padded_attn = require_mlp_sync(get_server_args())
 
-        if self.pp_group.is_first_rank:
+        keep_embed_for_dspark = (
+            self.pp_group.world_size > 1
+            and self.pp_group.is_last_rank
+            and get_server_args().speculative_algorithm == "DSPARK"
+        )
+        if self.pp_group.is_first_rank or keep_embed_for_dspark:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -2615,6 +2620,17 @@ class KimiK3LinearModel(nn.Module):
             and k3_sp_collective.enabled()
         )
         sp_sharded = False
+        capture_dspark = self.dspark_layers_to_capture is not None
+        # Relay accumulated aux hidden states from upstream PP ranks. Each rank
+        # captures layers only in its own [start_layer, end_layer) range; the
+        # full aux list is rebuilt by concatenating upstream-relayed aux with
+        # local aux in PP-rank order, which matches the global layer order.
+        # PPProxyTensors only carries tensors, so aux is stacked as
+        # [num_tokens, L, hidden] (token-major, dim 0 = tokens) so it matches
+        # the cuda-graph PP proxy buffer layout.
+        upstream_dspark_aux = None
+        if capture_dspark and pp_proxy_tensors is not None:
+            upstream_dspark_aux = pp_proxy_tensors.tensors.get("dspark_aux")
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if sp_sharded and not self.layers[i]._sp_moe:
@@ -2647,9 +2663,18 @@ class KimiK3LinearModel(nn.Module):
                     # full stream head (bit-identical to the fused fold).
                     hidden_states = residual + hidden_states
                 residual = attn_res.block_residual  # raw bank across ranks
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            proxy = {"hidden_states": hidden_states, "residual": residual}
+            if capture_dspark:
+                # Relay aux: stack local captures and concat with upstream's
+                # [N, L_up, H] along the layer dim (upstream first, then local).
+                parts = []
+                if upstream_dspark_aux is not None:
+                    parts.append(upstream_dspark_aux)
+                if aux_hidden_states:
+                    parts.append(torch.stack(aux_hidden_states, dim=1))
+                if parts:
+                    proxy["dspark_aux"] = torch.cat(parts, dim=1)
+            return PPProxyTensors(proxy)
 
         if hidden_states.shape[0] != 0:
             if attn_res is not None:
@@ -2691,7 +2716,16 @@ class KimiK3LinearModel(nn.Module):
                     hidden_states, _ = self.norm(hidden_states, residual)
 
         if self.dspark_layers_to_capture is not None:
-            return hidden_states, aux_hidden_states
+            # Rebuild the full aux list in global layer order: upstream-relayed
+            # layers first, then this rank's own captures. upstream_dspark_aux is
+            # [N, L_up, H]; slice dim=1 to recover per-layer [N, H] tensors.
+            full_aux = aux_hidden_states
+            if upstream_dspark_aux is not None:
+                full_aux = [
+                    upstream_dspark_aux[:, i, :]
+                    for i in range(upstream_dspark_aux.shape[1])
+                ] + full_aux
+            return hidden_states, full_aux
         return hidden_states
 
     def _dspark_capture_stream(
@@ -2714,11 +2748,16 @@ class KimiK3LinearModel(nn.Module):
             score_proj = next_layer.self_attention_res_proj
             score_norm = next_layer.self_attention_res_norm
             nvb = next_layer.prev_valid_blocks
-        else:
-            # Last layer: the model's own output-side aggregation weights.
+        elif self.pp_group.is_last_rank:
+            # Global last layer: the model's own output-side aggregation weights.
             score_proj = self.output_attn_res_proj
             score_norm = self.output_attn_res_norm
             nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
+        else:
+            # Last layer of a non-last PP rank: the output-side aggregation
+            # weights only exist on the last rank, so fall back to the fully
+            # folded hidden states (residual already materialized above).
+            return hidden_states
         return aggregate_stream(
             hidden_states, attn_res.block_residual, nvb, score_proj, score_norm
         )
@@ -2758,12 +2797,6 @@ class KimiK3LinearForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
-        if self.pp_group.world_size > 1:
-            # Capture layers living on non-last PP ranks would be silently
-            # skipped (the flag is only set on the last rank).
-            raise NotImplementedError("DSPARK aux hidden capture requires PP=1.")
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."

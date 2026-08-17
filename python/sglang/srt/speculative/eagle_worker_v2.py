@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -93,6 +94,7 @@ from sglang.srt.speculative.eagle_worker_common import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    commit_mamba_states_after_verify,
     draft_tp_context,
     fast_sample,
     get_plan_stream,
@@ -1081,6 +1083,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         self._pp_is_last_rank = target_worker.pp_group.is_last_rank
         self._pp_enabled = server_args.pp_size > 1
+        self._need_mamba_verify_commit = (
+            mambaish_config(target_worker.model_runner.model_config) is not None
+        )
 
         # Defined on every rank so PP non-last ranks (which have no draft
         # worker) still resolve the mask mode in _build_verify_input_from_pp_raw.
@@ -1749,6 +1754,50 @@ class EAGLEWorkerV2(BaseSpecWorker):
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
             pp_proxy_tensors=pp_proxy_tensors,
+        )
+
+    def commit_pp_mamba_states_after_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        accept_lens: torch.Tensor,
+        accept_index: Optional[torch.Tensor],
+        draft_token_num: int,
+    ) -> None:
+        if (
+            not self._pp_enabled
+            or self._pp_is_last_rank
+            or not self._need_mamba_verify_commit
+            or batch.forward_mode.is_idle()
+            or accept_lens.numel() == 0
+        ):
+            return
+
+        accept_lens = accept_lens.to(
+            device=batch.seq_lens.device, dtype=torch.int64, non_blocking=True
+        )
+        bs = accept_lens.numel()
+        req_pool = self.target_worker.model_runner.req_to_token_pool
+        state_indices_tensor = req_pool.translate_mamba_indices(
+            req_pool.get_mamba_indices(batch.req_pool_indices[:bs])
+        )
+        linear_attn_backend = getattr(
+            self.target_worker.model_runner.attn_backend,
+            "linear_attn_backend",
+            None,
+        )
+        commit_mamba_states_after_verify(
+            self.target_worker,
+            batch,
+            accept_lens,
+            accept_index,
+            draft_token_num,
+            state_indices_tensor=state_indices_tensor,
+            scratch_source_indices_tensor=(
+                batch.req_pool_indices[:bs]
+                if getattr(linear_attn_backend, "req_indexed_verify_scratch", False)
+                else None
+            ),
         )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):

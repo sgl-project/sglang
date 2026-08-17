@@ -1202,6 +1202,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
         req_pool_indices: Optional[torch.Tensor] = None,
+        state_indices_tensor: Optional[torch.Tensor] = None,
+        conv_source_indices_tensor: Optional[torch.Tensor] = None,
     ):
         """Update mamba states after MTP verify via a fused gather-scatter kernel.
 
@@ -1218,11 +1220,16 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices
             )
 
-        state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                :request_number
-            ]
-        )
+        if state_indices_tensor is None:
+            state_indices_tensor = (
+                self.linear_attn_backend.forward_metadata.mamba_cache_indices[
+                    :request_number
+                ]
+            )
+        else:
+            state_indices_tensor = state_indices_tensor[:request_number]
+        if conv_source_indices_tensor is not None:
+            conv_source_indices_tensor = conv_source_indices_tensor[:request_number]
 
         req_pool = self.linear_attn_backend.req_to_token_pool
         mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()
@@ -1247,6 +1254,15 @@ class HybridLinearAttnBackend(AttentionBackend):
                 last_correct_step_indices=last_correct_step_indices,
                 mamba_track_indices=mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
+                conv_source_indices=(
+                    conv_source_indices_tensor
+                    if getattr(
+                        self.linear_attn_backend,
+                        "req_indexed_verify_scratch",
+                        False,
+                    )
+                    else None
+                ),
                 null_block_id=-1,
             )
             return
@@ -1257,6 +1273,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             last_correct_step_indices,
             mamba_track_indices,
             mamba_steps_to_track,
+            src_indices_tensor=conv_source_indices_tensor,
         )
 
 

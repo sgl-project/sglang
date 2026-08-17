@@ -84,6 +84,7 @@ def _allocate_decode_buffers(
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
     allocate_logits_buffer: bool = True,
+    pp_proxy_dspark_num_layers: Optional[int] = None,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
     with torch.device(device):
@@ -120,6 +121,11 @@ def _allocate_decode_buffers(
             # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
             is_mhc = hc_hidden_size is not None
             hs = hc_hidden_size if is_mhc else hidden_size
+            # PP proxy tensors are keyed by token count, not batch size: an
+            # upstream rank sends hidden_states/residual flattened as
+            # [num_tokens, *hidden], which under speculative decoding is
+            # max_bs * num_tokens_per_req. Allocate against max_num_token so the
+            # dummy/capture buffer fits the verify-token-expanded shape.
             pp_proxy_tensors = {
                 "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
             }
@@ -129,12 +135,20 @@ def _allocate_decode_buffers(
                 residual_shape = (
                     (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
                     if pp_proxy_residual_num_blocks is not None
-                    else (max_bs, hidden_size)
+                    else (max_num_token, hidden_size)
                 )
                 pp_proxy_tensors["residual"] = torch.zeros(residual_shape, dtype=dtype)
             if pp_proxy_topk_size is not None:
                 pp_proxy_tensors["topk_indices"] = torch.zeros(
                     (max_num_token, pp_proxy_topk_size), dtype=torch.int32
+                )
+            if pp_proxy_dspark_num_layers is not None:
+                # DSpark aux: [num_tokens, L, hidden], token-major to match
+                # the PP proxy buffer slice (buffer[:src.shape[0]] on dim 0).
+                # Allocated for both mHC and non-mHC targets (DSV4 is mHC).
+                pp_proxy_tensors["dspark_aux"] = torch.zeros(
+                    (max_num_token, pp_proxy_dspark_num_layers, hidden_size),
+                    dtype=dtype,
                 )
         else:
             pp_proxy_tensors = None
@@ -365,6 +379,7 @@ class BaseRunner(ABC):
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
             allocate_logits_buffer=allocate_logits_buffer,
+            pp_proxy_dspark_num_layers=mr.get_pp_proxy_dspark_num_layers(),
         )
 
     def _dummy_run(

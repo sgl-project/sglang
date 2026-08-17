@@ -1147,7 +1147,17 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors,
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
+        from sglang.srt.speculative.dspark_components.dspark_verify import (
+            DSparkPPVerifyInputRaw,
+        )
         from sglang.srt.speculative.eagle_info import EaglePPVerifyInputRaw
+
+        def _pp_raw_cls():
+            # Dispatch the PP relay carrier class by algorithm so the non-last
+            # ranks rebuild the correct spec_info type from pp_outputs.
+            if self.spec_algorithm.is_dspark():
+                return DSparkPPVerifyInputRaw
+            return EaglePPVerifyInputRaw
 
         logits_output = None
         extend_input_len_per_req = None
@@ -1163,15 +1173,13 @@ class SchedulerPPMixin:
         batch.input_ids = next_token_ids
 
         if not self.spec_algorithm.is_none() and "pp_spec_output" in pp_outputs.tensors:
-            # Spec-v2 decode path: the last PP rank produced draft tokens for
-            # this iter; rebuild the raw draft tree so _build_verify_input_from_pp_raw
-            # can construct EagleVerifyInput on this rank.
-            batch.spec_info = EaglePPVerifyInputRaw.from_pp_outputs(pp_outputs)
+            # Spec-v2 decode path: extract next iter's draft info from pp_outputs.
+            batch.spec_info = _pp_raw_cls().from_pp_outputs(pp_outputs)
         elif not self.spec_algorithm.is_none() and batch.forward_mode.is_extend():
             if batch.contains_last_prefill_chunk:
                 # The last PP rank produces no draft tokens for prefill batches;
                 # build a dummy draft for the first decode step.
-                batch.spec_info = EaglePPVerifyInputRaw.build_dummy_for_decode(
+                batch.spec_info = _pp_raw_cls().build_dummy_for_decode(
                     batch, self.server_args.speculative_num_draft_tokens
                 )
             else:
@@ -1198,8 +1206,16 @@ class SchedulerPPMixin:
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
 
-        if isinstance(batch.spec_info, EaglePPVerifyInputRaw):
-            output_result.accept_lens = batch.spec_info.accept_lens.to(torch.int64)
+        if isinstance(
+            batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)
+        ):
+            if isinstance(batch.spec_info, DSparkPPVerifyInputRaw):
+                # DSpark relays plain-python accept_lens across PP ranks.
+                output_result.accept_lens = torch.tensor(
+                    batch.spec_info.accept_lens, dtype=torch.int64
+                )
+            else:
+                output_result.accept_lens = batch.spec_info.accept_lens.to(torch.int64)
             output_result.speculative_num_draft_tokens = (
                 self.server_args.speculative_num_draft_tokens
             )

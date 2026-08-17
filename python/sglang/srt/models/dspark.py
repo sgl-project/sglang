@@ -8,7 +8,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
@@ -376,13 +379,25 @@ class DSparkDraftMixin:
         self.gamma = int(dspark_config.resolve_gamma(default=self.block_size))
         self.markov_head = build_markov_head(config)
         self.confidence_head = build_confidence_head(config)
+
+        self.pp_group = get_pp_group()
+        self.embed_tokens: nn.Module = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            enable_tp=not is_dp_attention_enabled(),
+        )
         self.lm_head: Optional[nn.Module] = None
 
     def attach_shared_modules(
-        self, *, embed_tokens: nn.Module, lm_head: nn.Module
+        self, *, embed_tokens: Optional[nn.Module], lm_head: nn.Module
     ) -> None:
-        self.embed_tokens = embed_tokens
+        # The target keeps the modules needed by the draft on its serving rank.
         self.lm_head = lm_head
+        if embed_tokens is not None:
+            del self.embed_tokens
+            self.embed_tokens = embed_tokens
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         # Embeds with the shared target embedding INSIDE the draft graph
@@ -421,8 +436,12 @@ class DSparkDraftMixin:
         confidence_weights = []
         backbone_weights = []
         params_dict = dict(self.named_parameters())
+
+        skipped = _DSPARK_SKIPPED_WEIGHT_PREFIXES
+        if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
+            skipped = tuple(p for p in skipped if p != "embed_tokens.")
         for name, loaded_weight in weights:
-            if any(name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES):
+            if any(name.startswith(p) for p in skipped):
                 continue
             if name.startswith("confidence_head."):
                 if self.confidence_head is None:

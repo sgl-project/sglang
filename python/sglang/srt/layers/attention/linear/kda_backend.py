@@ -367,6 +367,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        spec_algorithm = model_runner.server_args.speculative_algorithm
+        self.req_indexed_verify_scratch = model_runner.server_args.pp_size > 1 and (
+            (
+                spec_algorithm == "DSPARK"
+                and model_runner.server_args.enable_linear_replayssm_spec
+            )
+            or spec_algorithm == "EAGLE"
+        )
         # Needed by the extra_buffer track path: _init_track_conv_indices reads
         # conv_states_shape[-1] as the conv window length (kernel_size - 1).
         # The KDA pool stores conv states as [kernel-1, dim] — transposed vs
@@ -746,7 +754,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "(MambaPool.SpeculativeState); none found."
             )
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
-        intermediate_state_indices = self.verify_intermediate_state_indices
+        intermediate_state_indices = (
+            forward_batch.req_pool_indices
+            if self.req_indexed_verify_scratch
+            else self.verify_intermediate_state_indices
+        )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout

@@ -90,3 +90,19 @@ def resolve_pp_proxy_residual_num_blocks(
     if block_size is None:
         return None
     return (start_layer + block_size - 1) // block_size
+
+
+def resolve_pp_proxy_dspark_num_layers(
+    *, model_runner, pp_size: int, pp_rank: int, start_layer: int
+) -> Optional[int]:
+    if pp_size <= 1 or pp_rank == 0:
+        return None
+    spec_aux_config = getattr(model_runner, "spec_aux_config", None)
+    target_layer_ids = getattr(spec_aux_config, "dflash_target_layer_ids", None)
+    use_aux = bool(getattr(spec_aux_config, "dflash_use_aux_hidden_state", False))
+    if not use_aux or not target_layer_ids:
+        return None
+    # Only layers in upstream ranks ([0, start_layer)) are relayed in; this
+    # rank's own captures are produced locally and never arrive via the proxy.
+    upstream = [lid for lid in target_layer_ids if lid < start_layer]
+    return len(upstream)

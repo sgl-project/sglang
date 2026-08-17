@@ -621,6 +621,19 @@ def run_eagle_verify(
         accept_lens,
         accept_index,
         num_draft_tokens,
+        scratch_source_indices_tensor=(
+            batch.req_pool_indices
+            if getattr(
+                getattr(
+                    target_worker.model_runner.attn_backend,
+                    "linear_attn_backend",
+                    None,
+                ),
+                "req_indexed_verify_scratch",
+                False,
+            )
+            else None
+        ),
     )
 
     if not batch.forward_mode.is_idle():

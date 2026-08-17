@@ -106,6 +106,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
+        pp_proxy_dspark_num_layers: Optional[int] = None,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -151,6 +152,14 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 if pp_proxy_topk_size is not None:
                     pp_proxy_tensors["topk_indices"] = torch.zeros(
                         (max_num_token, pp_proxy_topk_size), dtype=torch.int32
+                    )
+                if pp_proxy_dspark_num_layers is not None:
+                    # DSpark aux: [num_tokens, L, hidden], token-major to match
+                    # the PP proxy buffer slice (buffer[:src.shape[0]] on dim 0).
+                    # Allocated for both mHC and non-mHC targets (DSV4 is mHC).
+                    pp_proxy_tensors["dspark_aux"] = torch.zeros(
+                        (max_num_token, pp_proxy_dspark_num_layers, hidden_size),
+                        dtype=dtype,
                     )
             else:
                 pp_proxy_tensors = None
