@@ -273,10 +273,12 @@ class TestServerUpdateWeightsFromDiskNVFP4W4A16CuteDSL(
     UpdateWeightsFromDiskBase, CustomTestCase
 ):
     model = "nvidia/Qwen3-30B-A3B-NVFP4"
+    decode_payload = {**UpdateWeightsFromDiskBase.decode_payload, "routed_dp_rank": 0}
     launch_env = {
         "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16": "1",
         "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0",
         "SGLANG_MOE_NVFP4_DISPATCH": "0",
+        "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "4096",
     }
     backend_test_suites = (
         {
@@ -284,6 +286,9 @@ class TestServerUpdateWeightsFromDiskNVFP4W4A16CuteDSL(
             "other_args": (
                 "--tp-size",
                 "4",
+                "--dp-size",
+                "4",
+                "--enable-dp-attention",
                 "--ep-size",
                 "4",
                 "--fp4-gemm-backend",
@@ -291,7 +296,7 @@ class TestServerUpdateWeightsFromDiskNVFP4W4A16CuteDSL(
                 "--moe-runner-backend",
                 "flashinfer_cutedsl",
                 "--moe-a2a-backend",
-                "none",
+                "flashinfer",
                 "--enable-deterministic-inference",
             ),
         },
