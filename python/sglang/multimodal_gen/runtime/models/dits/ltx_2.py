@@ -1768,6 +1768,11 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hf_config.get("rope_double_precision", arch.double_precision_rope)
             )
         )
+        if rope_double_precision and _is_npu:
+            logger.warning(
+                f"Double precision is not supported by NPU. Use float32 for RoPE."
+            )
+
         self.quantize_video_rope_coords_to_hidden_dtype = bool(
             hf_config.get("quantize_video_rope_coords_to_hidden_dtype", False)
         )
@@ -1781,11 +1786,6 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         self.video_scale_factors = (8, 32, 32)
         self.audio_scale_factors = (4,)
-
-        if rope_double_precision and _is_npu:
-            logger.warning(
-                f"Double precision is not supported by NPU. Use float32 for RoPE."
-            )
 
         self.rope = LTX2AudioVideoRotaryPosEmbed(
             dim=self.hidden_size,
