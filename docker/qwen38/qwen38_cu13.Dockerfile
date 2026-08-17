@@ -91,10 +91,10 @@ RUN NCCL_EXPECTED="${NCCL_PIN_VERSION}" python3 -c 'import os; from importlib.me
 # The MNNVL CuTe DSL all-reduce backend (flashinfer#4358) is NOT expected
 # from this nightly: SGLang carries the kernel in-tree at
 # python/sglang/kernels/ops/communication/mnnvl_cutedsl* until a FlashInfer
-# release ships it. The nightly only supplies the communication
-# infrastructure (mnnvl probing, pattern enum, workspace ABC) plus the
-# PR #4266 GEMM kernel, so all three packages come from the same nightly
-# and no git-commit install is needed.
+# release ships it. The nightly only needs to supply the communication
+# infrastructure (mnnvl probing, pattern enum, workspace ABC) and the
+# PR #4266 GEMM kernel, which every candidate nightly does -- so the trio
+# installs as one consistent nightly, with no git-commit build.
 ARG FLASHINFER_NIGHTLY_VERSION=0.6.18.dev20260807
 ARG FLASHINFER_JIT_CACHE_CUDA_TAG=cu130
 ARG CUTLASS_DSL_MIN_VERSION=4.7.0

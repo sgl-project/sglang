@@ -18,7 +18,7 @@ Ported from flashinfer-ai/flashinfer#4358 at main commit 906181e (with
 sibling package mnnvl_cutedsl/), pending an installable FlashInfer release
 that ships flashinfer.comm.mnnvl_cutedsl. The base communication
 infrastructure (mnnvl probing, pattern enum, workspace ABC) still comes
-from the installed FlashInfer, which has provided it since 0.6.15.
+from the installed FlashInfer, which has provided it since 0.6.16.
 """
 
 from __future__ import annotations
@@ -48,7 +48,10 @@ from .mnnvl_cutedsl.kernel_ll.protocol import LLProtocol
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["MNNVLCuteDSLAllReduceFusionWorkspace"]
+__all__ = [
+    "MNNVLCuteDSLAllReduceFusionWorkspace",
+    "mnnvl_cutedsl_allreduce_fusion",
+]
 
 
 def _check_tensor(
@@ -574,3 +577,9 @@ def _mnnvl_cutedsl_allreduce_fusion(
         return norm_out
 
     raise AssertionError("unreachable")
+
+
+# SGLang-public name for the backend entry point. The underscore original is
+# kept verbatim for re-syncs against upstream, where a public
+# flashinfer.comm.allreduce_fusion dispatcher fronts it.
+mnnvl_cutedsl_allreduce_fusion = _mnnvl_cutedsl_allreduce_fusion

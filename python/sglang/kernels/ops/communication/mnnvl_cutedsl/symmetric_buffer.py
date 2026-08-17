@@ -23,15 +23,9 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
-
-def _enable_symm_mem_for_group(group_name: str) -> None:
-    # Local copy of flashinfer.comm.torch_symmetric_memory's helper so the
-    # fallback package never imports a private symbol from an installed
-    # flashinfer that may predate it. PyTorch 2.11+ enables groups lazily.
-    torch_version = tuple(int(x) for x in torch.__version__.split(".")[:2])
-    if torch_version >= (2, 11):
-        return
-    symm_mem.enable_symm_mem_for_group(group_name)
+# Upstream reads this helper through a package-relative import; every
+# FlashInfer this tree supports ships it, so only the spelling differs here.
+from flashinfer.comm.torch_symmetric_memory import _enable_symm_mem_for_group
 
 
 @dataclass(frozen=True, slots=True)

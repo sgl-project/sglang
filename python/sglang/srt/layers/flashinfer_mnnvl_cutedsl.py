@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import threading
 from dataclasses import dataclass, replace
@@ -20,21 +21,32 @@ logger = logging.getLogger(__name__)
 def _import_kernel_backend():
     try:
         from flashinfer.comm import AllReduceFusionPattern
-
-        from sglang.kernels.ops.communication.mnnvl_cutedsl import DEFAULT_CONFIG
-        from sglang.kernels.ops.communication.mnnvl_cutedsl_ar import (
-            MNNVLCuteDSLAllReduceFusionWorkspace,
-            _mnnvl_cutedsl_allreduce_fusion,
-        )
     except ImportError as error:
         raise RuntimeError(
             "MNNVL CuTe DSL fusion requires FlashInfer's communication "
-            "infrastructure (flashinfer >= 0.6.15) and the CuTe DSL kernel "
-            "dependencies, including nvidia-cutlass-dsl and cuda-python"
+            "infrastructure (flashinfer >= 0.6.16)"
         ) from error
+    try:
+        from sglang.kernels.ops.communication.mnnvl_cutedsl import DEFAULT_CONFIG
+        from sglang.kernels.ops.communication.mnnvl_cutedsl_ar import (
+            MNNVLCuteDSLAllReduceFusionWorkspace,
+            mnnvl_cutedsl_allreduce_fusion,
+        )
+    except ImportError as error:
+        raise RuntimeError(
+            "SGLang's in-tree MNNVL CuTe DSL kernels failed to import; check "
+            "their dependencies, including nvidia-cutlass-dsl and cuda-python"
+        ) from error
+    if importlib.util.find_spec("flashinfer.comm.mnnvl_cutedsl") is not None:
+        logger.warning(
+            "The installed FlashInfer now ships flashinfer.comm.mnnvl_cutedsl; "
+            "SGLang is still running its in-tree port "
+            "(sglang.kernels.ops.communication.mnnvl_cutedsl), which can now "
+            "be retired in favor of the upstream backend."
+        )
     return (
         MNNVLCuteDSLAllReduceFusionWorkspace,
-        _mnnvl_cutedsl_allreduce_fusion,
+        mnnvl_cutedsl_allreduce_fusion,
         AllReduceFusionPattern,
         DEFAULT_CONFIG,
     )
