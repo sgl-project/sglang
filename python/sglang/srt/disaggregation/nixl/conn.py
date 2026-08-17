@@ -597,14 +597,17 @@ class NixlKVManager(CommonKVManager):
 
         def decode_staging_thread():
             while True:
-                msg = self.server_socket.recv_multipart()
-                if msg[0] == b"STAGING_REQ":
-                    self._handle_staging_req(msg)
-                    continue
-                logger.warning(
-                    "decode_staging_thread: unexpected message tag %s",
-                    msg[0][:20],
-                )
+                try:
+                    msg = self.server_socket.recv_multipart()
+                    if msg[0] == b"STAGING_REQ":
+                        self._handle_staging_req(msg)
+                        continue
+                    logger.warning(
+                        "decode_staging_thread: unexpected message tag %s",
+                        msg[0][:20],
+                    )
+                except Exception:
+                    logger.exception("Decode staging worker failed")
 
         threading.Thread(target=decode_staging_thread, daemon=True).start()
 
@@ -2668,69 +2671,74 @@ class NixlKVManager(CommonKVManager):
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
             while True:
-                waiting_req_bytes = self.server_socket.recv_multipart()
-                logger.debug(
-                    f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
-                )
-
-                # Staging: decode reports consumption watermark back to prefill
-                if waiting_req_bytes[0] == b"WATERMARK":
-                    if self.enable_staging:
-                        from sglang.srt.disaggregation.common.staging_handler import (
-                            handle_watermark_msg,
-                        )
-
-                        handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
-                    continue
-
-                # Staging: decode replies with allocated staging offset
-                if waiting_req_bytes[0] == b"STAGING_RSP":
-                    if self.enable_staging:
-                        from sglang.srt.disaggregation.common.staging_handler import (
-                            handle_staging_rsp,
-                        )
-
-                        handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
-                    continue
-
-                if self._handle_abort_notification(waiting_req_bytes):
-                    continue
-
-                assert (
-                    waiting_req_bytes[0] == GUARD
-                ), f"First message should be {GUARD}. Foreign traffic?"
-                waiting_req_bytes = waiting_req_bytes[1:]
-                room = waiting_req_bytes[0].decode("ascii")
-                agent_name = waiting_req_bytes[3].decode("ascii")
-                if room == "None":
-                    # Register new peer and save KV base pointers.
-                    self._add_remote_peer(
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                try:
+                    waiting_req_bytes = self.server_socket.recv_multipart()
+                    logger.debug(
+                        f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
                     )
-                    logger.debug(f"Register KVArgs from {agent_name} successfully")
-                    continue
-                room = int(room)
-                if room not in self.transfer_infos:
-                    self.transfer_infos[room] = {}
-                self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
-                    waiting_req_bytes
-                )
-                required_dst_info_num = self.transfer_infos[room][
-                    agent_name
-                ].required_dst_info_num
-                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
-                if len(self.transfer_infos[room]) == required_dst_info_num:
-                    self.resolve_kv_replica_factor(self.transfer_infos[room])
-                    self.req_to_decode_prefix_len[room] = next(
-                        (
-                            info.decode_prefix_len
-                            for info in self.transfer_infos[room].values()
-                            if info.decode_prefix_len is not None
-                        ),
-                        0,
+
+                    # Staging: decode reports consumption watermark back to prefill
+                    if waiting_req_bytes[0] == b"WATERMARK":
+                        if self.enable_staging:
+                            from sglang.srt.disaggregation.common.staging_handler import (
+                                handle_watermark_msg,
+                            )
+
+                            handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
+                        continue
+
+                    # Staging: decode replies with allocated staging offset
+                    if waiting_req_bytes[0] == b"STAGING_RSP":
+                        if self.enable_staging:
+                            from sglang.srt.disaggregation.common.staging_handler import (
+                                handle_staging_rsp,
+                            )
+
+                            handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                        continue
+
+                    if self._handle_abort_notification(waiting_req_bytes):
+                        continue
+
+                    assert (
+                        waiting_req_bytes[0] == GUARD
+                    ), f"First message should be {GUARD}. Foreign traffic?"
+                    waiting_req_bytes = waiting_req_bytes[1:]
+                    room = waiting_req_bytes[0].decode("ascii")
+                    agent_name = waiting_req_bytes[3].decode("ascii")
+                    if room == "None":
+                        # Register new peer and save KV base pointers.
+                        self._add_remote_peer(
+                            KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                        )
+                        logger.debug(f"Register KVArgs from {agent_name} successfully")
+                        continue
+                    room = int(room)
+                    if room not in self.transfer_infos:
+                        self.transfer_infos[room] = {}
+                    self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
+                        waiting_req_bytes
                     )
-                    logger.debug(f"{room=} is bootstrapped")
-                    self.update_status(room, KVPoll.WaitingForInput)
+                    required_dst_info_num = self.transfer_infos[room][
+                        agent_name
+                    ].required_dst_info_num
+                    logger.debug(
+                        f"got info {room=} {agent_name=} {required_dst_info_num=}"
+                    )
+                    if len(self.transfer_infos[room]) == required_dst_info_num:
+                        self.resolve_kv_replica_factor(self.transfer_infos[room])
+                        self.req_to_decode_prefix_len[room] = next(
+                            (
+                                info.decode_prefix_len
+                                for info in self.transfer_infos[room].values()
+                                if info.decode_prefix_len is not None
+                            ),
+                            0,
+                        )
+                        logger.debug(f"{room=} is bootstrapped")
+                        self.update_status(room, KVPoll.WaitingForInput)
+                except Exception:
+                    logger.exception("Bootstrap worker failed")
 
         threading.Thread(target=bootstrap_thread).start()
 
