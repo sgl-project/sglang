@@ -187,7 +187,7 @@ __global__ void k_quant_hidden(
       *(reinterpret_cast<uint2*>(Aq + static_cast<size_t>(t) * HID) + vec) = *reinterpret_cast<uint2*>(q);
     }
     __syncthreads();  // wmax reuse across the token loop
-  }                   // token loop
+  }  // token loop
 }
 
 // ---------------------------------------------------------------------------
@@ -569,7 +569,7 @@ __global__ __launch_bounds__(256, 1) void k_gemm1(
     }
     __syncthreads();                         // epilogue smem reads done before the next block stages
     if (tid == 0) flag_release(&flags[mb]);  // interq/a2s for mb published
-  }                                          // mb loop
+  }  // mb loop
 }
 
 // ---------------------------------------------------------------------------
@@ -735,7 +735,7 @@ __global__ __launch_bounds__(128, 2) void k_gemm1_w1(
     }
     __syncthreads();                         // epilogue sA1s reads done before the next block stages
     if (tid == 0) flag_release(&flags[mb]);  // interq/a2s for mb published
-  }                                          // mb loop
+  }  // mb loop
 }
 
 // ---------------------------------------------------------------------------
@@ -949,7 +949,7 @@ __global__ __launch_bounds__(256, 1) void k_gemm1_tiny(
     }
     __syncthreads();                         // epilogue smem reads done before the next block stages
     if (tid == 0) flag_release(&flags[mb]);  // interq/a2s for mb published
-  }                                          // mb loop
+  }  // mb loop
 }
 
 // ---------------------------------------------------------------------------
