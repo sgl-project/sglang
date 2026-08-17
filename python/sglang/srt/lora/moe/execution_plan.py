@@ -14,8 +14,8 @@ bridge contract is explicit at each site:
 
 Fusion is represented by ownership, not by pretending that a consumed stage
 still runs independently.  For example, ``B_ACTIVATION`` carries the
-``consumed_gate_b`` factor contract and requires ``plan.gate_b is None``.
-This makes illegal combinations such as gate-A+B overlap plus B+activation
+``consumed_gate_up_b`` factor contract and requires ``plan.gate_up_b is None``.
+This makes illegal combinations such as gate/up-A+B overlap plus B+activation
 fusion fail before CUDA work.
 """
 
@@ -106,8 +106,8 @@ class FinalizeFamily(str, Enum):
 
 class EarlyOverlap(str, Enum):
     NONE = "none"
-    GATE_A = "gate_a"
-    GATE_A_B = "gate_a_b"
+    GATE_UP_A = "gate_up_a"
+    GATE_UP_A_B = "gate_up_a_b"
 
 
 class LateOverlap(str, Enum):
@@ -259,30 +259,32 @@ class MiddleSpec:
 
     family: MiddleFamily
     activation: ActivationFamily
-    consumed_gate_b: StageContract | None = None
+    consumed_gate_up_b: StageContract | None = None
 
     def __post_init__(self) -> None:
         self.validate()
 
     def validate(self) -> MiddleSpec:
-        if self.consumed_gate_b is not None:
-            if self.consumed_gate_b.site is not Site.GATE_UP:
-                raise ValueError("consumed_gate_b must describe the gate/up site")
-            if self.consumed_gate_b.is_shared_outer:
+        if self.consumed_gate_up_b is not None:
+            if self.consumed_gate_up_b.site is not Site.GATE_UP:
+                raise ValueError("consumed_gate_up_b must describe the gate/up site")
+            if self.consumed_gate_up_b.is_shared_outer:
                 raise ValueError("consumed gate/up B must be per-expert")
 
-        expected_gate_b = self.family is MiddleFamily.B_ACTIVATION
-        if (self.consumed_gate_b is not None) != expected_gate_b:
+        expected_gate_up_b = self.family is MiddleFamily.B_ACTIVATION
+        if (self.consumed_gate_up_b is not None) != expected_gate_up_b:
             raise ValueError(
                 f"middle family {self.family.value} "
-                f"{'requires' if expected_gate_b else 'does not consume'} gate B"
+                f"{'requires' if expected_gate_up_b else 'does not consume'} gate/up B"
             )
         return self
 
     def route_requirements(self) -> frozenset[RouteRequirement]:
-        if self.consumed_gate_b is None:
+        if self.consumed_gate_up_b is None:
             return frozenset()
-        return frozenset((_aligned_requirement(self.consumed_gate_b.is_shared_outer),))
+        return frozenset(
+            (_aligned_requirement(self.consumed_gate_up_b.is_shared_outer),)
+        )
 
 
 @pydantic_dataclass(frozen=True, slots=True, config=_STRICT)
@@ -327,10 +329,10 @@ class FinalizeSpec:
 class MoeLoraExecutionPlan:
     """One immutable whole-pipeline MoE-LoRA execution strategy."""
 
-    gate_a: LoraASpec
+    gate_up_a: LoraASpec
     middle: MiddleSpec
     finalize: FinalizeSpec
-    gate_b: LoraBSpec | None = None
+    gate_up_b: LoraBSpec | None = None
     down_a: LoraASpec | None = None
     down_b: LoraBSpec | None = None
     early_overlap: EarlyOverlap = EarlyOverlap.NONE
@@ -357,12 +359,12 @@ class MoeLoraExecutionPlan:
             or self.late_overlap is not LateOverlap.NONE
         )
 
-    def _gate_b_contract(self) -> StageContract:
-        if self.gate_b is not None:
-            return self.gate_b.contract
-        consumed = self.middle.consumed_gate_b
+    def _gate_up_b_contract(self) -> StageContract:
+        if self.gate_up_b is not None:
+            return self.gate_up_b.contract
+        consumed = self.middle.consumed_gate_up_b
         if consumed is None:
-            raise ValueError("the execution plan has no gate-B owner")
+            raise ValueError("the execution plan has no gate/up-B owner")
         return consumed
 
     def _down_a_contract(self) -> StageContract:
@@ -379,19 +381,19 @@ class MoeLoraExecutionPlan:
         return consumed
 
     def validate(self) -> MoeLoraExecutionPlan:
-        if self.gate_a.site is not Site.GATE_UP:
-            raise ValueError("gate_a must describe the gate/up site")
-        if self.gate_b is not None and self.gate_b.site is not Site.GATE_UP:
-            raise ValueError("gate_b must describe the gate/up site")
+        if self.gate_up_a.site is not Site.GATE_UP:
+            raise ValueError("gate_up_a must describe the gate/up site")
+        if self.gate_up_b is not None and self.gate_up_b.site is not Site.GATE_UP:
+            raise ValueError("gate_up_b must describe the gate/up site")
         if self.down_a is not None and self.down_a.site is not Site.DOWN:
             raise ValueError("down_a must describe the down site")
         if self.down_b is not None and self.down_b.site is not Site.DOWN:
             raise ValueError("down_b must describe the down site")
 
-        gate_b_consumed = self.middle.consumed_gate_b is not None
-        if gate_b_consumed == (self.gate_b is not None):
+        gate_up_b_consumed = self.middle.consumed_gate_up_b is not None
+        if gate_up_b_consumed == (self.gate_up_b is not None):
             raise ValueError(
-                "gate B must have exactly one owner: standalone gate_b or middle"
+                "gate/up B must have exactly one owner: standalone gate_up_b or middle"
             )
         if self.down_a is None:
             raise ValueError(
@@ -404,17 +406,19 @@ class MoeLoraExecutionPlan:
                 "down B must have exactly one owner: standalone down_b or finalize"
             )
 
-        gate_b_contract = self._gate_b_contract()
+        gate_up_b_contract = self._gate_up_b_contract()
         down_a_contract = self._down_a_contract()
         down_b_contract = self._down_b_contract()
-        if self.gate_a.output_layout is not gate_b_contract.layout:
-            raise ValueError("gate A output layout must match the gate B input layout")
+        if self.gate_up_a.output_layout is not gate_up_b_contract.layout:
+            raise ValueError(
+                "gate/up A output layout must match the gate/up B input layout"
+            )
         if down_a_contract.layout is not down_b_contract.layout:
             raise ValueError("down A output layout must match the down B input layout")
 
-        if self.early_overlap is EarlyOverlap.GATE_A_B and self.gate_b is None:
+        if self.early_overlap is EarlyOverlap.GATE_UP_A_B and self.gate_up_b is None:
             raise ValueError(
-                "gate-A+B overlap requires standalone gate B; the middle owns it"
+                "gate/up-A+B overlap requires standalone gate/up B; the middle owns it"
             )
         if (
             self.late_overlap
@@ -495,7 +499,7 @@ class MoeLoraExecutionPlan:
 
     def _route_requirements_unchecked(self) -> frozenset[RouteRequirement]:
         requirements: set[RouteRequirement] = set()
-        for stage in (self.gate_a, self.gate_b, self.down_a, self.down_b):
+        for stage in (self.gate_up_a, self.gate_up_b, self.down_a, self.down_b):
             if stage is not None:
                 requirements.update(stage.route_requirements())
         requirements.update(self.middle.route_requirements())
@@ -519,9 +523,9 @@ class MoeLoraExecutionPlan:
         """
 
         _require_bool(is_shared_outer, "is_shared_outer")
-        if self.gate_a.is_shared_outer is not is_shared_outer:
+        if self.gate_up_a.is_shared_outer is not is_shared_outer:
             raise ValueError(
-                "plan gate-A ownership does not match resident gate/up-A weights"
+                "plan gate/up-A ownership does not match resident gate/up-A weights"
             )
         if self._down_b_contract().is_shared_outer is not is_shared_outer:
             raise ValueError(
@@ -531,13 +535,13 @@ class MoeLoraExecutionPlan:
 
 
 SERIAL_MATERIALIZED_REFERENCE = MoeLoraExecutionPlan(
-    gate_a=LoraASpec(
+    gate_up_a=LoraASpec(
         Site.GATE_UP,
         LoraAFamily.GROUPED,
         False,
         BridgeLayout.PAIR_MAJOR,
     ),
-    gate_b=LoraBSpec(
+    gate_up_b=LoraBSpec(
         Site.GATE_UP,
         LoraBFamily.ONE_LAUNCH_SLICED,
         False,
@@ -571,13 +575,13 @@ def materialized_reference_plan(
     """Build the serial correctness plan for one resident layer contract."""
     _require_bool(is_shared_outer, "is_shared_outer")
     return MoeLoraExecutionPlan(
-        gate_a=LoraASpec(
+        gate_up_a=LoraASpec(
             Site.GATE_UP,
             LoraAFamily.GROUPED,
             is_shared_outer,
             BridgeLayout.PAIR_MAJOR,
         ),
-        gate_b=LoraBSpec(
+        gate_up_b=LoraBSpec(
             Site.GATE_UP,
             LoraBFamily.ONE_LAUNCH_SLICED,
             False,
@@ -640,9 +644,9 @@ class _PlanSpecModel(pydantic.BaseModel):
 
     model_config = pydantic.ConfigDict(extra="forbid")
 
-    gate_a_family: LoraAFamily = LoraAFamily.GROUPED
+    gate_up_a_family: LoraAFamily = LoraAFamily.GROUPED
     down_a_family: LoraAFamily = LoraAFamily.GROUPED
-    gate_b_family: LoraBFamily = LoraBFamily.ONE_LAUNCH_SLICED
+    gate_up_b_family: LoraBFamily = LoraBFamily.ONE_LAUNCH_SLICED
     down_b_family: LoraBFamily = LoraBFamily.ONE_LAUNCH_SLICED
     middle_family: MiddleFamily = MiddleFamily.MATERIALIZED
     finalize_family: FinalizeFamily = FinalizeFamily.MATERIALIZED
@@ -727,27 +731,31 @@ def build_plan(
     The activation is a property of the layer, injected at construction —
     rows are activation-agnostic by decision (2026-08-16).
     """
-    gate_a_family = spec.gate_a_family
-    gate_layout = (
+    gate_up_a_family = spec.gate_up_a_family
+    gate_up_layout = (
         BridgeLayout.TOKEN_MAJOR
-        if gate_a_family is LoraAFamily.TOKEN_DEDUP_GROUPED
+        if gate_up_a_family is LoraAFamily.TOKEN_DEDUP_GROUPED
         else BridgeLayout.PAIR_MAJOR
     )
     middle_family = spec.middle_family
     finalize_family = spec.finalize_family
-    gate_b_contract = StageContract(Site.GATE_UP, False, gate_layout)
+    gate_up_b_contract = StageContract(Site.GATE_UP, False, gate_up_layout)
     down_b_contract = StageContract(Site.DOWN, is_shared_outer, BridgeLayout.PAIR_MAJOR)
-    consumes_gate_b = middle_family is MiddleFamily.B_ACTIVATION
+    consumes_gate_up_b = middle_family is MiddleFamily.B_ACTIVATION
     consumes_down_b = finalize_family is not FinalizeFamily.MATERIALIZED
     plan = MoeLoraExecutionPlan(
-        gate_a=LoraASpec(Site.GATE_UP, gate_a_family, is_shared_outer, gate_layout),
-        gate_b=(
+        gate_up_a=LoraASpec(
+            Site.GATE_UP, gate_up_a_family, is_shared_outer, gate_up_layout
+        ),
+        gate_up_b=(
             None
-            if consumes_gate_b
-            else LoraBSpec(Site.GATE_UP, spec.gate_b_family, False, gate_layout)
+            if consumes_gate_up_b
+            else LoraBSpec(Site.GATE_UP, spec.gate_up_b_family, False, gate_up_layout)
         ),
         middle=MiddleSpec(
-            middle_family, activation, gate_b_contract if consumes_gate_b else None
+            middle_family,
+            activation,
+            gate_up_b_contract if consumes_gate_up_b else None,
         ),
         down_a=LoraASpec(
             Site.DOWN,

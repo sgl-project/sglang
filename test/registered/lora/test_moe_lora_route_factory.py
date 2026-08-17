@@ -331,13 +331,13 @@ def _route(
     )
 
 
-class TestDualGateARoute(unittest.TestCase):
+class TestDualGateUpARoute(unittest.TestCase):
     def setUp(self):
         self.topk_ids = torch.tensor([[0, 1]], dtype=torch.int32)
         self.token_slots = torch.tensor([0], dtype=torch.int32)
         self.workspace = _Workspace()
 
-    def _build(self, *, gate_a_block_size: int, fused_shapes: bool = True):
+    def _build(self, *, gate_up_a_block_size: int, fused_shapes: bool = True):
         """Build the reference plan with the standalone (non-dual) route path.
 
         ``fused_shapes`` keeps the stub's always-fused dispatch; ``False``
@@ -406,7 +406,7 @@ class TestDualGateARoute(unittest.TestCase):
                 num_local_experts=2,
                 max_loras=2,
                 block_size=16,
-                gate_a_block_size=gate_a_block_size,
+                gate_up_a_block_size=gate_up_a_block_size,
                 workspace=self.workspace,
             )
         return routes, calls, cached_padded_count
@@ -475,22 +475,22 @@ class TestDualGateARoute(unittest.TestCase):
                 num_local_experts=2,
                 max_loras=2,
                 block_size=16,
-                gate_a_block_size=64,
+                gate_up_a_block_size=64,
                 workspace=self.workspace,
             )
 
         self.assertEqual(len(dual_calls), 1)
         self.assertEqual(dual_calls[0]["block_sizes"], (16, 64))
         self.assertEqual(routes.aligned_per_expert.block_size, 16)
-        self.assertEqual(routes.gate_a_aligned_per_expert.block_size, 64)
+        self.assertEqual(routes.gate_up_a_aligned_per_expert.block_size, 64)
         self.assertEqual(
             routes.aligned_per_expert.maybe_num_pairs_post_padded.item(), 16
         )
         self.assertEqual(
-            routes.gate_a_aligned_per_expert.maybe_num_pairs_post_padded.item(), 64
+            routes.gate_up_a_aligned_per_expert.maybe_num_pairs_post_padded.item(), 64
         )
 
-        prefixes = ("route:aligned_per_expert", "route:gate_a_aligned_per_expert")
+        prefixes = ("route:aligned_per_expert", "route:gate_up_a_aligned_per_expert")
         fields = ("counts", "block_cumulative", "cursor", "bucket_end")
         for prefix in prefixes:
             for field in fields + ("padded_pairs",):
@@ -502,7 +502,7 @@ class TestDualGateARoute(unittest.TestCase):
             )
         for route, prefix in (
             (routes.aligned_per_expert, prefixes[0]),
-            (routes.gate_a_aligned_per_expert, prefixes[1]),
+            (routes.gate_up_a_aligned_per_expert, prefixes[1]),
         ):
             self.assertEqual(
                 route.maybe_num_pairs_post_padded.data_ptr(),
@@ -517,18 +517,18 @@ class TestDualGateARoute(unittest.TestCase):
 
     def test_m16_m64_small_shapes_keep_two_standalone_builds(self):
         """Below the fused dispatch edge the measured JIT paths run unchanged."""
-        routes, calls, _ = self._build(gate_a_block_size=64, fused_shapes=False)
+        routes, calls, _ = self._build(gate_up_a_block_size=64, fused_shapes=False)
 
         self.assertEqual(calls, [16, 64])
         self.assertEqual(routes.aligned_per_expert.block_size, 16)
-        self.assertEqual(routes.gate_a_aligned_per_expert.block_size, 64)
+        self.assertEqual(routes.gate_up_a_aligned_per_expert.block_size, 64)
         # The JIT regime owns its metadata; no fused scratch is allocated.
         self.assertEqual(self.workspace.tensors, {})
 
     def test_equal_m_tile_reuses_the_canonical_route(self):
-        routes, calls, _ = self._build(gate_a_block_size=16)
+        routes, calls, _ = self._build(gate_up_a_block_size=16)
         self.assertEqual(calls, [16])
-        self.assertIsNone(routes.gate_a_aligned_per_expert)
+        self.assertIsNone(routes.gate_up_a_aligned_per_expert)
         self.assertEqual(routes.aligned_per_expert.block_size, 16)
         self.assertEqual(
             set(self.workspace.tensors),
@@ -544,18 +544,18 @@ class TestDualGateARoute(unittest.TestCase):
             },
         )
 
-    def test_second_route_is_rejected_for_non_grouped_gate_a(self):
+    def test_second_route_is_rejected_for_non_grouped_gate_up_a(self):
         reference = PLAN.SERIAL_MATERIALIZED_REFERENCE
         token_dedup_plan = dataclasses.replace(
             reference,
-            gate_a=PLAN.LoraASpec(
+            gate_up_a=PLAN.LoraASpec(
                 PLAN.Site.GATE_UP,
                 PLAN.LoraAFamily.TOKEN_DEDUP_GROUPED,
                 True,
                 PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
-            gate_b=dataclasses.replace(
-                reference.gate_b,
+            gate_up_b=dataclasses.replace(
+                reference.gate_up_b,
                 input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
         )
@@ -569,7 +569,7 @@ class TestDualGateARoute(unittest.TestCase):
                 num_local_experts=2,
                 max_loras=2,
                 block_size=16,
-                gate_a_block_size=64,
+                gate_up_a_block_size=64,
                 workspace=self.workspace,
             )
 
@@ -586,14 +586,14 @@ class TestRoutePdlWiring(unittest.TestCase):
         )
         shared_token = dataclasses.replace(
             reference,
-            gate_a=PLAN.LoraASpec(
+            gate_up_a=PLAN.LoraASpec(
                 PLAN.Site.GATE_UP,
                 PLAN.LoraAFamily.TOKEN_DEDUP_GROUPED,
                 True,
                 PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
-            gate_b=dataclasses.replace(
-                reference.gate_b,
+            gate_up_b=dataclasses.replace(
+                reference.gate_up_b,
                 input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
         )
@@ -668,7 +668,7 @@ class TestRoutePdlWiring(unittest.TestCase):
                         num_local_experts=2,
                         max_loras=2,
                         block_size=16,
-                        gate_a_block_size=(16 if plan is shared_token else 64),
+                        gate_up_a_block_size=(16 if plan is shared_token else 64),
                         workspace=_Workspace(),
                     )
 
@@ -676,7 +676,7 @@ class TestRoutePdlWiring(unittest.TestCase):
             for prefix, value in calls:
                 by_prefix.setdefault(prefix, set()).add(value)
             # reference and shared_down retain both per-expert granularities,
-            # so their per-expert + gate-A routes ride the dual pass; the
+            # so their per-expert + gate/up-A routes ride the dual pass; the
             # token-dedup plan (equal tiles) keeps every standalone build.
             self.assertEqual(
                 set(by_prefix),
@@ -765,7 +765,7 @@ class TestRoutePdlWiring(unittest.TestCase):
                     num_local_experts=2,
                     max_loras=2,
                     block_size=16,
-                    gate_a_block_size=64,
+                    gate_up_a_block_size=64,
                     workspace=_Workspace(),
                 )
 
@@ -1064,14 +1064,14 @@ class TestSharedTokenRoute(unittest.TestCase):
         reference = PLAN.SERIAL_MATERIALIZED_REFERENCE
         shared_plan = dataclasses.replace(
             reference,
-            gate_a=PLAN.LoraASpec(
+            gate_up_a=PLAN.LoraASpec(
                 PLAN.Site.GATE_UP,
                 PLAN.LoraAFamily.TOKEN_DEDUP_GROUPED,
                 True,
                 PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
-            gate_b=dataclasses.replace(
-                reference.gate_b,
+            gate_up_b=dataclasses.replace(
+                reference.gate_up_b,
                 input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
         )
@@ -1140,14 +1140,14 @@ class TestSharedTokenRoute(unittest.TestCase):
         reference = PLAN.SERIAL_MATERIALIZED_REFERENCE
         shared_plan = dataclasses.replace(
             reference,
-            gate_a=PLAN.LoraASpec(
+            gate_up_a=PLAN.LoraASpec(
                 PLAN.Site.GATE_UP,
                 PLAN.LoraAFamily.TOKEN_DEDUP_GROUPED,
                 True,
                 PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
-            gate_b=dataclasses.replace(
-                reference.gate_b,
+            gate_up_b=dataclasses.replace(
+                reference.gate_up_b,
                 input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
             down_b=dataclasses.replace(
@@ -1295,13 +1295,13 @@ class TestRunnerRouteSelectionSource(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == name
         )
 
-    def test_only_gate_a_can_select_the_dedicated_aligned_route(self):
+    def test_only_gate_up_a_can_select_the_dedicated_aligned_route(self):
         route_for_a = ast.unparse(self._method("_route_for_a"))
         route_for_b = ast.unparse(self._method("_route_for_b"))
-        self.assertIn("routes.gate_a_aligned_per_expert", route_for_a)
+        self.assertIn("routes.gate_up_a_aligned_per_expert", route_for_a)
         self.assertIn("spec.site is Site.GATE_UP", route_for_a)
         self.assertIn("routes.aligned(spec.is_shared_outer)", route_for_a)
-        self.assertNotIn("gate_a_aligned_per_expert", route_for_b)
+        self.assertNotIn("gate_up_a_aligned_per_expert", route_for_b)
         self.assertIn("routes.aligned(spec.is_shared_outer)", route_for_b)
 
 
@@ -1310,29 +1310,29 @@ class TestLaunchConfigRoutePreflight(unittest.TestCase):
         config = dataclasses.replace(
             LAUNCH.PROVISIONAL_LAUNCH_CONFIG,
             routing_block_size=8,
-            gate_a_routing_block_size=8,
+            gate_up_a_routing_block_size=8,
         )
         with self.assertRaisesRegex(ValueError, "at least 16"):
             config.validate_for_plan(PLAN.SERIAL_MATERIALIZED_REFERENCE)
 
-    def test_distinct_gate_tile_rejects_non_grouped_gate_family(self):
+    def test_distinct_gate_up_tile_rejects_non_grouped_gate_up_family(self):
         reference = PLAN.SERIAL_MATERIALIZED_REFERENCE
         token_dedup = dataclasses.replace(
             reference,
-            gate_a=PLAN.LoraASpec(
+            gate_up_a=PLAN.LoraASpec(
                 PLAN.Site.GATE_UP,
                 PLAN.LoraAFamily.TOKEN_DEDUP_GROUPED,
                 True,
                 PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
-            gate_b=dataclasses.replace(
-                reference.gate_b,
+            gate_up_b=dataclasses.replace(
+                reference.gate_up_b,
                 input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
         )
         config = dataclasses.replace(
             LAUNCH.PROVISIONAL_LAUNCH_CONFIG,
-            gate_a_routing_block_size=64,
+            gate_up_a_routing_block_size=64,
         )
         with self.assertRaisesRegex(ValueError, "grouped per-expert"):
             config.validate_for_plan(token_dedup)

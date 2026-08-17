@@ -123,9 +123,9 @@ def test_run_routes_by_phase_and_buckets_by_batch_size(monkeypatch) -> None:
     # serves different tiles at 4 and 17 tokens
     _, mse_launch, _ = engine.run(_dispatch(16), _batch())
     _, large_launch, _ = engine.run(_dispatch(17), _batch())
-    assert tiny_launch.gate_b["BLOCK_SIZE_N"] == 128
-    assert mse_launch.gate_b["BLOCK_SIZE_N"] == 512
-    assert large_launch.gate_b["BLOCK_SIZE_N"] == 256
+    assert tiny_launch.gate_up_b["BLOCK_SIZE_N"] == 128
+    assert mse_launch.gate_up_b["BLOCK_SIZE_N"] == 512
+    assert large_launch.gate_up_b["BLOCK_SIZE_N"] == 256
 
 
 def test_run_before_binding_is_an_error(monkeypatch) -> None:

@@ -97,7 +97,7 @@ if TYPE_CHECKING:
 
 
 @dataclass(slots=True)
-class _GateLoraState:
+class _GateUpLoraState:
     rank: torch.Tensor | None = None
     delta: torch.Tensor | None = None
 
@@ -111,8 +111,8 @@ class _DownAInput:
 
 
 _EARLY_PARALLEL_REGION = {
-    EarlyOverlap.GATE_A: "early_gate_a",
-    EarlyOverlap.GATE_A_B: "early_gate_a_b",
+    EarlyOverlap.GATE_UP_A: "early_gate_up_a",
+    EarlyOverlap.GATE_UP_A_B: "early_gate_up_a_b",
 }
 _LATE_PARALLEL_REGION = {
     LateOverlap.DOWN_A: "late_down_a",
@@ -472,11 +472,11 @@ class MoeLoraRunner:
             num_local_experts=self.num_local_experts,
             max_loras=batch.slot_capacity,
             block_size=launch_config.routing_block_size,
-            gate_a_block_size=launch_config.gate_a_routing_block_size,
+            gate_up_a_block_size=launch_config.gate_up_a_routing_block_size,
             workspace=self.workspace,
         )
 
-        gate, ws, gateup_out = self._run_early(
+        gate_up, ws, gateup_out = self._run_early(
             plan,
             launch_config,
             provider,
@@ -493,7 +493,7 @@ class MoeLoraRunner:
             routes,
             ws,
             gateup_out,
-            gate,
+            gate_up,
             topk_ids,
             batch,
             num_tokens,
@@ -575,9 +575,9 @@ class MoeLoraRunner:
         if (
             spec.site is Site.GATE_UP
             and not spec.is_shared_outer
-            and routes.gate_a_aligned_per_expert is not None
+            and routes.gate_up_a_aligned_per_expert is not None
         ):
-            return routes.gate_a_aligned_per_expert
+            return routes.gate_up_a_aligned_per_expert
         return routes.aligned(spec.is_shared_outer)
 
     @staticmethod
@@ -683,7 +683,7 @@ class MoeLoraRunner:
             ),
         )
 
-    def _run_gate_a(
+    def _run_gate_up_a(
         self,
         plan: MoeLoraExecutionPlan,
         launch_config: MoeLoraLaunchConfig,
@@ -693,14 +693,14 @@ class MoeLoraRunner:
     ) -> torch.Tensor:
         return self._run_a(
             launch_config,
-            plan.gate_a,
+            plan.gate_up_a,
             hidden_states,
             batch.gate_up_lora_a.flatten(0, 1),
             routes,
-            "gate_a",
+            "gate_up_a",
         )
 
-    def _run_gate_b(
+    def _run_gate_up_b(
         self,
         plan: MoeLoraExecutionPlan,
         launch_config: MoeLoraLaunchConfig,
@@ -709,10 +709,10 @@ class MoeLoraRunner:
         batch: MoeLoraBatch,
         num_tokens: int,
     ) -> torch.Tensor:
-        if plan.gate_b is None:
-            raise ValueError("the selected middle owns gate B")
+        if plan.gate_up_b is None:
+            raise ValueError("the selected middle owns gate/up B")
         delta = self.workspace.tensor(
-            "gate_b:delta",
+            "gate_up_b:delta",
             (
                 num_tokens * self.top_k,
                 self.gate_up_slices * self.intermediate_size,
@@ -722,7 +722,7 @@ class MoeLoraRunner:
         )
         self._run_b(
             launch_config,
-            plan.gate_b,
+            plan.gate_up_b,
             rank,
             batch.gate_up_lora_b.flatten(0, 1),
             delta,
@@ -763,11 +763,11 @@ class MoeLoraRunner:
         topk_ids: torch.Tensor,
         batch: MoeLoraBatch,
         num_tokens: int,
-    ) -> tuple[_GateLoraState, object, torch.Tensor]:
-        state = _GateLoraState()
+    ) -> tuple[_GateUpLoraState, object, torch.Tensor]:
+        state = _GateUpLoraState()
 
-        def gate_a() -> None:
-            state.rank = self._run_gate_a(
+        def gate_up_a() -> None:
+            state.rank = self._run_gate_up_a(
                 plan,
                 launch_config,
                 routes,
@@ -775,10 +775,10 @@ class MoeLoraRunner:
                 batch,
             )
 
-        def gate_b() -> None:
+        def gate_up_b() -> None:
             if state.rank is None:
-                raise RuntimeError("gate B ran before gate A")
-            state.delta = self._run_gate_b(
+                raise RuntimeError("gate/up B ran before gate/up A")
+            state.delta = self._run_gate_up_b(
                 plan,
                 launch_config,
                 routes,
@@ -795,32 +795,32 @@ class MoeLoraRunner:
             )
 
         if plan.early_overlap is EarlyOverlap.NONE:
-            gate_a()
-            if plan.gate_b is not None:
-                gate_b()
+            gate_up_a()
+            if plan.gate_up_b is not None:
+                gate_up_b()
             ws, gateup = base()
-        elif plan.early_overlap is EarlyOverlap.GATE_A:
+        elif plan.early_overlap is EarlyOverlap.GATE_UP_A:
             ws, gateup = run_parallel(
                 self.workspace,
-                name=_EARLY_PARALLEL_REGION[EarlyOverlap.GATE_A],
+                name=_EARLY_PARALLEL_REGION[EarlyOverlap.GATE_UP_A],
                 device=hidden_states.device,
                 compute=base,
-                side=gate_a,
+                side=gate_up_a,
             )
-            if plan.gate_b is not None:
-                gate_b()
+            if plan.gate_up_b is not None:
+                gate_up_b()
         else:
 
-            def gate_a_b() -> None:
-                gate_a()
-                gate_b()
+            def gate_up_a_b() -> None:
+                gate_up_a()
+                gate_up_b()
 
             ws, gateup = run_parallel(
                 self.workspace,
-                name=_EARLY_PARALLEL_REGION[EarlyOverlap.GATE_A_B],
+                name=_EARLY_PARALLEL_REGION[EarlyOverlap.GATE_UP_A_B],
                 device=hidden_states.device,
                 compute=base,
-                side=gate_a_b,
+                side=gate_up_a_b,
             )
         return state, ws, gateup
 
@@ -835,7 +835,7 @@ class MoeLoraRunner:
         routes: MoeLoraRoutes,
         ws,
         gateup_out: torch.Tensor,
-        gate: _GateLoraState,
+        gate_up: _GateUpLoraState,
         topk_ids: torch.Tensor,
         batch: MoeLoraBatch,
         num_tokens: int,
@@ -869,12 +869,12 @@ class MoeLoraRunner:
         )
         if plan.middle.family is MiddleFamily.MATERIALIZED:
             assert act_pairs is not None
-            if gate.delta is None:
+            if gate_up.delta is None:
                 raise RuntimeError("materialized middle requires gate/up delta")
             provider.act_with_delta(
                 ws,
                 gateup_out,
-                gate.delta.view(
+                gate_up.delta.view(
                     num_tokens,
                     self.top_k,
                     provider.gate_up_slices * provider.intermediate_size,
@@ -886,7 +886,7 @@ class MoeLoraRunner:
             )
             return act_out, _DownAInput(act_pairs)
 
-        consumed_route = plan.middle.consumed_gate_b
+        consumed_route = plan.middle.consumed_gate_up_b
         assert consumed_route is not None
         route = routes.aligned(consumed_route.is_shared_outer)
         family, implementation = self._middle_implementation(plan)
@@ -900,11 +900,11 @@ class MoeLoraRunner:
             act_pairs=act_pairs,
             routing=route,
             config=launch_config.for_middle(plan.middle.family),
-            bridge_gateup=gate.rank,
+            bridge_gateup=gate_up.rank,
             b_gate_up=batch.gate_up_lora_b.flatten(0, 1),
             bridge_top_k=(
                 self.top_k
-                if plan.gate_a.output_layout is BridgeLayout.TOKEN_MAJOR
+                if plan.gate_up_a.output_layout is BridgeLayout.TOKEN_MAJOR
                 else 1
             ),
         )

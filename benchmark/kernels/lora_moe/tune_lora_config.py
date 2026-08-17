@@ -49,10 +49,10 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)
 PACKAGED = os.path.join(REPO, "python/sglang/srt/lora/moe/configs")
 
 SHARED_WINDOW_CANDIDATES = [
-    ("gate_a_b", "down_a_b"),  # shipped winner
-    ("gate_a", "down_a_b"),
-    ("gate_a_b", "down_a"),
-    ("gate_a", "down_a"),
+    ("gate_up_a_b", "down_a_b"),  # shipped winner
+    ("gate_up_a", "down_a_b"),
+    ("gate_up_a_b", "down_a"),
+    ("gate_up_a", "down_a"),
     ("none", "none"),  # serial reference
 ]
 
@@ -227,13 +227,12 @@ def sweep(args, seed_path: str) -> None:
                 json.load(open(tiles_src)),
                 open(os.path.join(variant_dir, f"{arch}.tiles.json"), "w"),
             )
-        tag = f"win_{early}_{late}"
-        results[tag] = bench_once(
+        tag = f"win_{early}-{late}"
+        results[(early, late)] = bench_once(
             args, {"SGLANG_LORA_MOE_CONFIG_DIR": variant_dir}, tag
         )
-        print(tag, results[tag])
-    best = max(results, key=lambda t: sum(results[t].values()))
-    early, late = best[len("win_") :].split("_", 1)
+        print(tag, results[(early, late)])
+    early, late = max(results, key=lambda pair: sum(results[pair].values()))
     print(f"window winner: early={early} late={late}")
     for row in table["scenarios"]:
         if row.get("layout") == "shared" and row.get("phase") == "decode":
@@ -246,7 +245,9 @@ def sweep(args, seed_path: str) -> None:
             row["provenance"] = f"swept:{date.today()} ({args.model_path})"
     json.dump(table, open(seed_path, "w"), indent=1)
     json.dump(
-        results, open(os.path.join(args.out, "sweep_results.json"), "w"), indent=1
+        {f"{e}-{l}": v for (e, l), v in results.items()},
+        open(os.path.join(args.out, "sweep_results.json"), "w"),
+        indent=1,
     )
 
     # Base-GEMM tiles: delegate to the masked-GEMM bucket sweep on this

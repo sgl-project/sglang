@@ -78,13 +78,13 @@ class TestSm100PerExpert:
     def test_decode_ships_indexed_pairs_b_grouped_a_wide_windows(self):
         c = _resolve(rank=32, experts=512)[Phase.DECODE]
         assert c.provider == "cutedsl"
-        assert c.plan.gate_a.family is LoraAFamily.GROUPED
-        assert c.plan.gate_b.family is LoraBFamily.INDEXED_PAIRS
+        assert c.plan.gate_up_a.family is LoraAFamily.GROUPED
+        assert c.plan.gate_up_b.family is LoraBFamily.INDEXED_PAIRS
         assert c.plan.down_a.family is LoraAFamily.GROUPED
         assert c.plan.down_b.family is LoraBFamily.INDEXED_PAIRS
         assert c.plan.middle.family is MiddleFamily.MATERIALIZED
         assert c.plan.finalize.family is FinalizeFamily.MATERIALIZED
-        assert c.plan.early_overlap is EarlyOverlap.GATE_A_B
+        assert c.plan.early_overlap is EarlyOverlap.GATE_UP_A_B
         assert c.plan.late_overlap is LateOverlap.DOWN_A_B
         assert c.plan.route_builder is RouteBuilderFamily.STANDARD
 
@@ -92,7 +92,7 @@ class TestSm100PerExpert:
         c = _resolve()[Phase.PREFILL]
         assert c.provider == "cutedsl_contiguous"
         assert c.plan.middle.family is MiddleFamily.B_ACTIVATION
-        assert c.plan.gate_b is None  # consumed by the b_activation middle
+        assert c.plan.gate_up_b is None  # consumed by the b_activation middle
         assert c.plan.down_b_scatter
         assert c.plan.early_overlap is EarlyOverlap.NONE
         assert c.plan.late_overlap is LateOverlap.NONE
@@ -106,16 +106,16 @@ class TestSm100PerExpert:
             plan_key_name="decode.per_expert",
             physical_rank=16,
         )
-        assert tiny.config_for(4).gate_b["BLOCK_SIZE_N"] == 128
-        assert tiny.config_for(4096).gate_b["BLOCK_SIZE_N"] == 128
+        assert tiny.config_for(4).gate_up_b["BLOCK_SIZE_N"] == 128
+        assert tiny.config_for(4096).gate_up_b["BLOCK_SIZE_N"] == 128
         ladder = resolve_tiles(
             architecture_value="gb300",
             plan_key_name="decode.per_expert",
             physical_rank=64,
         )
-        assert ladder.config_for(4).gate_b["BLOCK_SIZE_N"] == 128
-        assert ladder.config_for(16).gate_b["BLOCK_SIZE_N"] == 512
-        assert ladder.config_for(17).gate_b["BLOCK_SIZE_N"] == 256
+        assert ladder.config_for(4).gate_up_b["BLOCK_SIZE_N"] == 128
+        assert ladder.config_for(16).gate_up_b["BLOCK_SIZE_N"] == 512
+        assert ladder.config_for(17).gate_up_b["BLOCK_SIZE_N"] == 256
 
     def test_unknown_row_serves_the_default_launch_config(self):
         table = resolve_tiles(
@@ -130,18 +130,18 @@ class TestSm100Shared:
     def test_decode_ships_wide_window_materialized_joint(self):
         c = _resolve(layout=True, rank=32)[Phase.DECODE]
         assert c.provider == "cutedsl"
-        assert c.plan.early_overlap is EarlyOverlap.GATE_A_B
+        assert c.plan.early_overlap is EarlyOverlap.GATE_UP_A_B
         assert c.plan.late_overlap is LateOverlap.DOWN_A_B
         assert c.plan.middle.family is MiddleFamily.MATERIALIZED
         assert c.plan.finalize.family is FinalizeFamily.MATERIALIZED
-        assert c.plan.gate_b.family is LoraBFamily.ONE_LAUNCH_SLICED
+        assert c.plan.gate_up_b.family is LoraBFamily.ONE_LAUNCH_SLICED
         assert c.plan.down_b.family is LoraBFamily.ONE_LAUNCH_SLICED
         assert c.plan.route_builder is RouteBuilderFamily.JOINT_SHARED_OUTER
 
     def test_prefill_ships_token_dedup_serial(self):
         c = _resolve(layout=True, rank=32)[Phase.PREFILL]
         assert c.provider == "cutedsl_contiguous"
-        assert c.plan.gate_a.family is LoraAFamily.TOKEN_DEDUP_GROUPED
+        assert c.plan.gate_up_a.family is LoraAFamily.TOKEN_DEDUP_GROUPED
         assert c.plan.middle.family is MiddleFamily.B_ACTIVATION
         assert c.plan.route_builder is RouteBuilderFamily.JOINT_SHARED_OUTER
         assert c.plan.early_overlap is EarlyOverlap.NONE
@@ -220,7 +220,7 @@ class TestResolution:
     def test_override_dir_wins(self, tmp_path):
         packaged = json.load(open(f"{ep._CONFIG_DIR}/gb300.tiles.json"))
         # flip one tile value; the override must be what resolves
-        packaged["rules"]["decode.per_expert"][0]["sites"]["gate_a"]["num_warps"] = 8
+        packaged["rules"]["decode.per_expert"][0]["sites"]["gate_up_a"]["num_warps"] = 8
         json.dump(packaged, open(tmp_path / "gb300.tiles.json", "w"))
 
         def _tiny():
@@ -232,13 +232,13 @@ class TestResolution:
 
         with envs.SGLANG_LORA_MOE_CONFIG_DIR.override(str(tmp_path)):
             _clear_caches()
-            assert _tiny().gate_a["num_warps"] == 8
+            assert _tiny().gate_up_a["num_warps"] == 8
         _clear_caches()
-        assert _tiny().gate_a["num_warps"] != 8
+        assert _tiny().gate_up_a["num_warps"] != 8
 
     def test_malformed_plan_family_fails_closed(self, tmp_path):
         packaged = json.load(open(f"{ep._CONFIG_DIR}/gb300.plans.json"))
-        packaged["scenarios"][0]["plan"]["gate_b_family"] = "no_such_kernel"
+        packaged["scenarios"][0]["plan"]["gate_up_b_family"] = "no_such_kernel"
         json.dump(packaged, open(tmp_path / "gb300.plans.json", "w"))
         with envs.SGLANG_LORA_MOE_CONFIG_DIR.override(str(tmp_path)):
             _clear_caches()
@@ -277,11 +277,11 @@ class TestResolution:
         # not reach inside "sites").
         packaged = json.load(open(f"{ep._CONFIG_DIR}/gb300.tiles.json"))
         rule = packaged["rules"]["decode.per_expert"][0]
-        rule["sites"]["gate_bee"] = rule["sites"].pop("gate_b")
+        rule["sites"]["gate_up_bee"] = rule["sites"].pop("gate_up_b")
         json.dump(packaged, open(tmp_path / "gb300.tiles.json", "w"))
         with envs.SGLANG_LORA_MOE_CONFIG_DIR.override(str(tmp_path)):
             _clear_caches()
-            with pytest.raises(ValueError, match="gate_bee"):
+            with pytest.raises(ValueError, match="gate_up_bee"):
                 resolve_tiles(
                     architecture_value="gb300",
                     plan_key_name="decode.per_expert",

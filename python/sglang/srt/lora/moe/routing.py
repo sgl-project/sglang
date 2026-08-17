@@ -570,7 +570,7 @@ def build_virtual_expert_routing(
 #
 # The consumer is a plan whose grouped gate/up-A prefers a different M tile
 # than every other aligned site (GB300 large-prefill:
-# gate_a_routing_block_size=64 vs routing_block_size=16).  Two granularities
+# gate_up_a_routing_block_size=64 vs routing_block_size=16).  Two granularities
 # share the pair sources, the fused key, and the bucket count; only the
 # block-padding arithmetic differs.  Running the fused builder twice repeats
 # the whole T*topk key derivation and both bulk passes, so this pass fuses

@@ -46,10 +46,10 @@ Stage mapping versus the masked twin:
   compact row ``seg_offsets[e] + slot`` there instead of the masked
   ``e * m_max + slot`` re-targets them with zero kernel changes, including
   the exactly-once invalid-pair zero-write duty on the pair activation.
-  For the same reason the LoRA A/B kernels need no contiguous variants: gate
-  A is token-domain, down A consumes the canonical pair activation (or the
-  ``src2dst`` row map through ``MappedLoraAInput``), and every B kernel is
-  pair-domain.
+  For the same reason the LoRA A/B kernels need no contiguous variants:
+  gate/up A is token-domain, down A consumes the canonical pair activation
+  (or the ``src2dst`` row map through ``MappedLoraAInput``), and every B
+  kernel is pair-domain.
 
 The fused B+activation middle (:func:`fused_b_act_contiguous`) and the
 mapped grouped down-A input reuse the masked pair-domain kernels through the
@@ -58,7 +58,7 @@ EXCLUSIVELY through ``src2dst`` over flattened views, so pointing it at the
 compact 2-D buffers re-targets it with zero kernel changes, and the
 pair-to-row ABI grouped down-A consumes is the same ``src2dst``.  That is
 what admits the GB300 shared-outer SERIAL prefill winner (token-dedup shared
-gate A + fused B+activation middle + one-launch shared down B + materialized
+gate/up A + fused B+activation middle + one-launch shared down B + materialized
 finalize): every LoRA factor kernel it uses is pair/token-domain, the JOINT
 shared-outer route builder is pure pair-domain metadata whose PDL chain is
 internal to the three routing launches and independent of the row domain,

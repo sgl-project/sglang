@@ -87,18 +87,18 @@ def _build_plan(
     """The serial one-launch plan shape, built the way config.py's
     ``_build_plan`` materializes a scenario (spec classes directly)."""
     pe = False
-    consumes_gate_b = middle_family is MiddleFamily.B_ACTIVATION
-    gate_b_contract = StageContract(Site.GATE_UP, pe, BridgeLayout.PAIR_MAJOR)
+    consumes_gate_up_b = middle_family is MiddleFamily.B_ACTIVATION
+    gate_up_b_contract = StageContract(Site.GATE_UP, pe, BridgeLayout.PAIR_MAJOR)
     return MoeLoraExecutionPlan(
-        gate_a=LoraASpec(
+        gate_up_a=LoraASpec(
             Site.GATE_UP,
             LoraAFamily.GROUPED,
             is_shared_outer,
             BridgeLayout.PAIR_MAJOR,
         ),
-        gate_b=(
+        gate_up_b=(
             None
-            if consumes_gate_b
+            if consumes_gate_up_b
             else LoraBSpec(
                 Site.GATE_UP,
                 LoraBFamily.ONE_LAUNCH_SLICED,
@@ -107,7 +107,9 @@ def _build_plan(
             )
         ),
         middle=MiddleSpec(
-            middle_family, activation, gate_b_contract if consumes_gate_b else None
+            middle_family,
+            activation,
+            gate_up_b_contract if consumes_gate_up_b else None,
         ),
         down_a=LoraASpec(Site.DOWN, LoraAFamily.GROUPED, pe, BridgeLayout.PAIR_MAJOR),
         down_b=LoraBSpec(
@@ -130,7 +132,7 @@ class TestBActMiddleConfig:
         # SM90-capable DeepGEMM contiguous backend.
         serial = _menu(_H200, False)["prefill.serial"]
         assert serial.plan.middle.family is MiddleFamily.B_ACTIVATION
-        assert serial.plan.gate_b is None
+        assert serial.plan.gate_up_b is None
         assert serial.plan.down_b_scatter is True
         assert serial.provider == "deepgemm_contiguous"
 
@@ -147,7 +149,7 @@ class TestBActMiddleConfig:
                         assert (
                             choice.plan.middle.family is MiddleFamily.MATERIALIZED
                         ), name
-                        assert choice.plan.gate_b is not None, name
+                        assert choice.plan.gate_up_b is not None, name
 
     def test_out_of_domain_prefill_twins_get_the_swap(self) -> None:
         def _prefill(is_shared_outer, activation=_SWIGLU):
@@ -170,11 +172,11 @@ class TestBActMiddleConfig:
         # rows are activation-agnostic, so the ReLU2 twin ships the same
         # fused middle with its own activation injected.
         assert per_expert.plan.middle.family is MiddleFamily.B_ACTIVATION
-        assert per_expert.plan.gate_b is None
+        assert per_expert.plan.gate_up_b is None
         assert per_expert.plan.down_b_scatter is True
         assert per_expert.provider == "deepgemm_contiguous"
         assert shared.plan.middle.family is MiddleFamily.B_ACTIVATION
-        assert shared.plan.gate_b is None
+        assert shared.plan.gate_up_b is None
         assert shared.plan.down_b_scatter is False
         assert shared.provider == "deepgemm"
         assert relu2.plan.middle.family is MiddleFamily.B_ACTIVATION
@@ -279,7 +281,7 @@ def _reference_choice():
     so it doubles as the config donor for the swapped variants."""
     choice = _menu(_GB300, False)["fallback.serial"]
     assert choice.plan.middle.family is MiddleFamily.MATERIALIZED
-    assert choice.plan.gate_b is not None
+    assert choice.plan.gate_up_b is not None
     assert choice.plan.down_b_scatter is False
     assert choice.plan == _build_plan()
     return choice
@@ -362,7 +364,7 @@ def test_runner_b_act_matches_the_materialized_reference(
         middle_family=MiddleFamily.B_ACTIVATION, down_b_scatter=scatter
     )
     assert swapped_plan.middle.family is MiddleFamily.B_ACTIVATION
-    assert swapped_plan.gate_b is None
+    assert swapped_plan.gate_up_b is None
     assert swapped_plan.down_b_scatter is scatter
     num_tokens, num_experts = 64, 4
     gpu = _make_gpu_tensors(num_tokens, num_experts, device)

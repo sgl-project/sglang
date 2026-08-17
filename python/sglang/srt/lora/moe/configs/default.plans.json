@@ -11,9 +11,9 @@
    "phase": "decode",
    "provider": "deepgemm",
    "plan": {
-    "gate_a_family": "grouped",
+    "gate_up_a_family": "grouped",
     "down_a_family": "grouped",
-    "gate_b_family": "one_launch_sliced",
+    "gate_up_b_family": "one_launch_sliced",
     "down_b_family": "one_launch_sliced",
     "middle_family": "materialized",
     "finalize_family": "materialized"
@@ -25,7 +25,7 @@
    "phase": "prefill",
    "provider": "deepgemm_contiguous",
    "plan": {
-    "gate_a_family": "grouped",
+    "gate_up_a_family": "grouped",
     "down_a_family": "grouped",
     "down_b_family": "one_launch_sliced",
     "middle_family": "b_activation",
@@ -39,7 +39,7 @@
    "phase": "prefill",
    "provider": "deepgemm",
    "plan": {
-    "gate_a_family": "grouped",
+    "gate_up_a_family": "grouped",
     "down_a_family": "grouped",
     "down_b_family": "one_launch_sliced",
     "middle_family": "b_activation",

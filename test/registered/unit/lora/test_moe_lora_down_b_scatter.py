@@ -105,13 +105,13 @@ def _build_plan(
     consumes_down_b = finalize_family is not FinalizeFamily.MATERIALIZED
     down_b_contract = StageContract(Site.DOWN, is_shared_outer, BridgeLayout.PAIR_MAJOR)
     return MoeLoraExecutionPlan(
-        gate_a=LoraASpec(
+        gate_up_a=LoraASpec(
             Site.GATE_UP,
             LoraAFamily.GROUPED,
             is_shared_outer,
             BridgeLayout.PAIR_MAJOR,
         ),
-        gate_b=LoraBSpec(
+        gate_up_b=LoraBSpec(
             Site.GATE_UP,
             LoraBFamily.ONE_LAUNCH_SLICED,
             pe,

@@ -672,13 +672,13 @@ class TestMoeLoraDualGranularityRoutes(CustomTestCase):
                 num_local_experts=lora_experts_per_adapter,
                 max_loras=max_loras,
                 block_size=16,
-                gate_a_block_size=64,
+                gate_up_a_block_size=64,
                 workspace=MoeLoraWorkspace(),
             )
         self.assertEqual(dual.call_count, 1)
         for view, block_size in (
             (routes.aligned_per_expert, 16),
-            (routes.gate_a_aligned_per_expert, 64),
+            (routes.gate_up_a_aligned_per_expert, 64),
         ):
             self._assert_view_matches(
                 view,

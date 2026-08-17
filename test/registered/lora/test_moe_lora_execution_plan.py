@@ -73,8 +73,8 @@ def _factor(
 
 def _plan(**changes) -> MoeLoraExecutionPlan:
     values = {
-        "gate_a": _a(Site.GATE_UP),
-        "gate_b": _b(Site.GATE_UP),
+        "gate_up_a": _a(Site.GATE_UP),
+        "gate_up_b": _b(Site.GATE_UP),
         "middle": MiddleSpec(MiddleFamily.MATERIALIZED, ActivationFamily.SWIGLU),
         "down_a": _a(Site.DOWN),
         "down_b": _b(Site.DOWN),
@@ -152,7 +152,7 @@ class TestFactorAndKernelSpecs(unittest.TestCase):
                 down_b_scater=True,  # type: ignore[call-arg]
             )
 
-    def test_only_gate_a_and_down_b_may_be_shared_outer(self):
+    def test_only_gate_up_a_and_down_b_may_be_shared_outer(self):
         self.assertEqual(
             _a(
                 Site.GATE_UP,
@@ -181,25 +181,25 @@ class TestFactorAndKernelSpecs(unittest.TestCase):
 
 class TestFusionOwnership(unittest.TestCase):
     def test_middle_rejects_missing_duplicate_and_wrong_site_consumers(self):
-        with self.assertRaisesRegex(ValueError, "requires.*gate B"):
+        with self.assertRaisesRegex(ValueError, "requires.*gate/up B"):
             MiddleSpec(MiddleFamily.B_ACTIVATION, ActivationFamily.SWIGLU)
-        with self.assertRaisesRegex(ValueError, "does not consume.*gate B"):
+        with self.assertRaisesRegex(ValueError, "does not consume.*gate/up B"):
             MiddleSpec(
                 MiddleFamily.MATERIALIZED,
                 ActivationFamily.SWIGLU,
-                consumed_gate_b=_factor(Site.GATE_UP),
+                consumed_gate_up_b=_factor(Site.GATE_UP),
             )
         with self.assertRaisesRegex(ValueError, "gate/up site"):
             MiddleSpec(
                 MiddleFamily.B_ACTIVATION,
                 ActivationFamily.SWIGLU,
-                consumed_gate_b=_factor(Site.DOWN),
+                consumed_gate_up_b=_factor(Site.DOWN),
             )
         with self.assertRaisesRegex(ValueError, "gate/up B must be per-expert"):
             MiddleSpec(
                 MiddleFamily.B_ACTIVATION,
                 ActivationFamily.SWIGLU,
-                consumed_gate_b=_factor(Site.GATE_UP, True),
+                consumed_gate_up_b=_factor(Site.GATE_UP, True),
             )
 
     def test_finalize_rejects_missing_or_wrong_ownership_consumer(self):
@@ -222,17 +222,17 @@ class TestWholePipelineValidation(unittest.TestCase):
             frozenset((RouteRequirement.ALIGNED_PER_EXPERT,)),
         )
         with self.assertRaises(dataclasses.FrozenInstanceError):
-            SERIAL_MATERIALIZED_REFERENCE.gate_b = None  # type: ignore[misc]
+            SERIAL_MATERIALIZED_REFERENCE.gate_up_b = None  # type: ignore[misc]
 
     def test_plan_validates_against_the_resident_ownership_flag(self):
         self.assertIs(
             SERIAL_MATERIALIZED_REFERENCE.validate_ownership(False),
             SERIAL_MATERIALIZED_REFERENCE,
         )
-        with self.assertRaisesRegex(ValueError, "gate-A ownership"):
+        with self.assertRaisesRegex(ValueError, "gate/up-A ownership"):
             SERIAL_MATERIALIZED_REFERENCE.validate_ownership(True)
         with self.assertRaisesRegex(ValueError, "down-B ownership"):
-            _plan(gate_a=_a(Site.GATE_UP, is_shared_outer=True)).validate_ownership(
+            _plan(gate_up_a=_a(Site.GATE_UP, is_shared_outer=True)).validate_ownership(
                 True
             )
         with self.assertRaises(TypeError):
@@ -243,19 +243,19 @@ class TestWholePipelineValidation(unittest.TestCase):
         shared_down = _factor(Site.DOWN, is_shared_outer=True)
         plans = (
             _plan(
-                gate_b=None,
+                gate_up_b=None,
                 middle=MiddleSpec(
                     MiddleFamily.B_ACTIVATION,
                     ActivationFamily.SWIGLU,
-                    consumed_gate_b=gate,
+                    consumed_gate_up_b=gate,
                 ),
             ),
             _plan(
-                gate_b=None,
+                gate_up_b=None,
                 middle=MiddleSpec(
                     MiddleFamily.B_ACTIVATION,
                     ActivationFamily.SWIGLU,
-                    consumed_gate_b=gate,
+                    consumed_gate_up_b=gate,
                 ),
                 down_b=None,
                 finalize=FinalizeSpec(FinalizeFamily.SHARED_RANK_REDUCE, shared_down),
@@ -272,47 +272,47 @@ class TestWholePipelineValidation(unittest.TestCase):
                 middle=MiddleSpec(
                     MiddleFamily.B_ACTIVATION,
                     ActivationFamily.SWIGLU,
-                    consumed_gate_b=gate,
+                    consumed_gate_up_b=gate,
                 )
             )
         with self.assertRaisesRegex(ValueError, "exactly one owner"):
-            _plan(gate_b=None)
+            _plan(gate_up_b=None)
         with self.assertRaisesRegex(ValueError, "standalone stage"):
             _plan(down_a=None)
         with self.assertRaisesRegex(ValueError, "exactly one owner"):
             _plan(finalize=FinalizeSpec(FinalizeFamily.SHARED_RANK_REDUCE, shared_down))
 
     def test_bridge_layouts_must_match_at_both_sites(self):
-        token_gate_a = _a(
+        token_gate_up_a = _a(
             Site.GATE_UP,
             LoraAFamily.TOKEN_DEDUP_GROUPED,
             True,
             BridgeLayout.TOKEN_MAJOR,
         )
-        with self.assertRaisesRegex(ValueError, "gate A output layout"):
-            _plan(gate_a=token_gate_a)
+        with self.assertRaisesRegex(ValueError, "gate/up A output layout"):
+            _plan(gate_up_a=token_gate_up_a)
 
-        token_gate_b = _b(
+        token_gate_up_b = _b(
             Site.GATE_UP,
             LoraBFamily.ONE_LAUNCH_SLICED,
             False,
             BridgeLayout.TOKEN_MAJOR,
         )
-        plan = _plan(gate_a=token_gate_a, gate_b=token_gate_b)
+        plan = _plan(gate_up_a=token_gate_up_a, gate_up_b=token_gate_up_b)
         self.assertIs(plan.validate(), plan)
 
     def test_overlaps_reject_consumed_stages(self):
         gate = _factor(Site.GATE_UP)
         shared_down = _factor(Site.DOWN, is_shared_outer=True)
-        with self.assertRaisesRegex(ValueError, "gate-A\\+B"):
+        with self.assertRaisesRegex(ValueError, "gate/up-A\\+B"):
             _plan(
-                gate_b=None,
+                gate_up_b=None,
                 middle=MiddleSpec(
                     MiddleFamily.B_ACTIVATION,
                     ActivationFamily.SWIGLU,
-                    consumed_gate_b=gate,
+                    consumed_gate_up_b=gate,
                 ),
-                early_overlap=EarlyOverlap.GATE_A_B,
+                early_overlap=EarlyOverlap.GATE_UP_A_B,
             )
         with self.assertRaisesRegex(ValueError, "standalone down B"):
             _plan(
@@ -335,19 +335,19 @@ class TestWholePipelineValidation(unittest.TestCase):
             ),
         )
         with self.assertRaisesRegex(ValueError, "down site"):
-            _plan(gate_a=_a(Site.GATE_UP, LoraAFamily.INDEXED))
+            _plan(gate_up_a=_a(Site.GATE_UP, LoraAFamily.INDEXED))
 
 
 class TestRouteRequirementUnion(unittest.TestCase):
     def test_shared_token_a_and_per_expert_b_require_both_products(self):
         plan = _plan(
-            gate_a=_a(
+            gate_up_a=_a(
                 Site.GATE_UP,
                 LoraAFamily.TOKEN_DEDUP_GROUPED,
                 True,
                 BridgeLayout.TOKEN_MAJOR,
             ),
-            gate_b=_b(
+            gate_up_b=_b(
                 Site.GATE_UP,
                 LoraBFamily.ONE_LAUNCH_SLICED,
                 False,

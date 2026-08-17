@@ -38,7 +38,7 @@ class MoeLoraRoutes:
     aligned_shared_outer: RouteView | None = None
     # Optional second per-expert plan used only by grouped gate/up-A when its
     # best M tile differs from the canonical route shared by the other sites.
-    gate_a_aligned_per_expert: RouteView | None = None
+    gate_up_a_aligned_per_expert: RouteView | None = None
     shared_token: RouteView | None = None
 
     def raw(self, is_shared_outer: bool) -> RouteView:
@@ -208,11 +208,11 @@ def _dual_granularity_aligned_routes(
     num_local_experts: int,
     max_loras: int,
     block_size: int,
-    gate_a_block_size: int,
+    gate_up_a_block_size: int,
     use_pdl: bool | None,
     workspace: MoeLoraWorkspace,
 ) -> tuple[RouteView, RouteView]:
-    """Build the canonical and gate-A per-expert aligned routes in ONE pass.
+    """Build the canonical and gate/up-A per-expert aligned routes in ONE pass.
 
     Both views cover the same ``(topk_ids, token_slots)`` pairs with the same
     per-expert key; only the M granularity differs, so the fused dual builder
@@ -227,7 +227,7 @@ def _dual_granularity_aligned_routes(
     num_buckets = num_local_experts * max_loras + 1
     padded_counts: list[torch.Tensor] = []
     scratches: list[FusedAlignScratch] = []
-    for prefix in ("route:aligned_per_expert", "route:gate_a_aligned_per_expert"):
+    for prefix in ("route:aligned_per_expert", "route:gate_up_a_aligned_per_expert"):
         padded_counts.append(
             workspace.tensor(
                 f"{prefix}:padded_pairs",
@@ -249,7 +249,7 @@ def _dual_granularity_aligned_routes(
         token_slots,
         lora_experts_per_adapter=num_local_experts,
         max_loras=max_loras,
-        block_sizes=(block_size, gate_a_block_size),
+        block_sizes=(block_size, gate_up_a_block_size),
         num_pairs_post_padded_outs=(padded_counts[0], padded_counts[1]),
         scratches=(scratches[0], scratches[1]),
         use_pdl=use_pdl,
@@ -264,7 +264,7 @@ def build_routes(
     num_local_experts: int,
     max_loras: int,
     block_size: int,
-    gate_a_block_size: int | None = None,
+    gate_up_a_block_size: int | None = None,
     workspace: MoeLoraWorkspace,
 ) -> MoeLoraRoutes:
     """Construct the exact route bundle declared by ``plan``.
@@ -275,17 +275,17 @@ def build_routes(
     original pair route remains authoritative for every B consumer.
     """
     requirements = plan.route_requirements()
-    gate_a_block_size = (
-        block_size if gate_a_block_size is None else int(gate_a_block_size)
+    gate_up_a_block_size = (
+        block_size if gate_up_a_block_size is None else int(gate_up_a_block_size)
     )
-    separate_gate_a_route = gate_a_block_size != block_size
-    if separate_gate_a_route and not (
-        plan.gate_a.family is LoraAFamily.GROUPED
-        and not plan.gate_a.is_shared_outer
-        and RouteRequirement.ALIGNED_PER_EXPERT in plan.gate_a.route_requirements()
+    separate_gate_up_a_route = gate_up_a_block_size != block_size
+    if separate_gate_up_a_route and not (
+        plan.gate_up_a.family is LoraAFamily.GROUPED
+        and not plan.gate_up_a.is_shared_outer
+        and RouteRequirement.ALIGNED_PER_EXPERT in plan.gate_up_a.route_requirements()
     ):
         raise ValueError(
-            "a separate gate-A route is qualified only for grouped, "
+            "a separate gate/up-A route is qualified only for grouped, "
             "per-expert gate/up-A"
         )
     # Route PDL is always on where the architecture supports it: measured
@@ -344,13 +344,13 @@ def build_routes(
     need_per_expert = RouteRequirement.ALIGNED_PER_EXPERT in requirements
     need_shared = RouteRequirement.ALIGNED_SHARED_OUTER in requirements
     downstream_requirements: set[RouteRequirement] = set()
-    for stage in (plan.gate_b, plan.down_a, plan.down_b):
+    for stage in (plan.gate_up_b, plan.down_a, plan.down_b):
         if stage is not None:
             downstream_requirements.update(stage.route_requirements())
     downstream_requirements.update(plan.middle.route_requirements())
     downstream_requirements.update(plan.finalize.route_requirements())
-    gate_only_per_expert = (
-        separate_gate_a_route
+    gate_up_only_per_expert = (
+        separate_gate_up_a_route
         and plan.route_builder is RouteBuilderFamily.STANDARD
         and RouteRequirement.ALIGNED_PER_EXPERT not in downstream_requirements
     )
@@ -368,15 +368,15 @@ def build_routes(
         values["aligned_per_expert"] = per_expert
         values["aligned_shared_outer"] = shared
     else:
-        # Both the canonical and gate-A per-expert routes cover identical
+        # Both the canonical and gate/up-A per-expert routes cover identical
         # pair data with identical keys; when both are retained and the shape
         # dispatches to the fused builder anyway, one dual-granularity pass
         # replaces the two standalone triples (6 route launches -> 3).  The
         # JIT small-shape regime keeps its measured standalone paths.
         dual_granularity_fused = (
-            separate_gate_a_route
+            separate_gate_up_a_route
             and need_per_expert
-            and not gate_only_per_expert
+            and not gate_up_only_per_expert
             and uses_fused_align(
                 topk_ids,
                 num_virtual_experts=num_local_experts * max_loras,
@@ -385,18 +385,18 @@ def build_routes(
         if dual_granularity_fused:
             (
                 values["aligned_per_expert"],
-                values["gate_a_aligned_per_expert"],
+                values["gate_up_a_aligned_per_expert"],
             ) = _dual_granularity_aligned_routes(
                 topk_ids,
                 token_slots,
                 num_local_experts=num_local_experts,
                 max_loras=max_loras,
                 block_size=block_size,
-                gate_a_block_size=gate_a_block_size,
+                gate_up_a_block_size=gate_up_a_block_size,
                 use_pdl=use_pdl,
                 workspace=workspace,
             )
-        elif need_per_expert and not gate_only_per_expert:
+        elif need_per_expert and not gate_up_only_per_expert:
             values["aligned_per_expert"] = _aligned_pair_route(
                 topk_ids,
                 token_slots,
@@ -421,19 +421,19 @@ def build_routes(
                 scratch_prefix="route:aligned_shared_outer",
             )
 
-    if separate_gate_a_route and not dual_granularity_fused:
-        values["gate_a_aligned_per_expert"] = _aligned_pair_route(
+    if separate_gate_up_a_route and not dual_granularity_fused:
+        values["gate_up_a_aligned_per_expert"] = _aligned_pair_route(
             topk_ids,
             token_slots,
             is_shared_outer=False,
             num_local_experts=num_local_experts,
             max_loras=max_loras,
-            block_size=gate_a_block_size,
+            block_size=gate_up_a_block_size,
             use_pdl=(
                 use_pdl if plan.route_builder is RouteBuilderFamily.STANDARD else False
             ),
             workspace=workspace,
-            scratch_prefix="route:gate_a_aligned_per_expert",
+            scratch_prefix="route:gate_up_a_aligned_per_expert",
         )
 
     if RouteRequirement.SHARED_TOKEN_PLAN in requirements:

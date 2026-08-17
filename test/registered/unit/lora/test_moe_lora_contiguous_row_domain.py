@@ -692,14 +692,14 @@ def _make_gpu_tensors(
 
     # The shared-outer resident layout: ONE gate/up-A and ONE down-B factor
     # per adapter (expert dim 1); gate/up-B and down-A stay per-expert.
-    gate_a_experts = 1 if shared else num_experts
+    gate_up_a_experts = 1 if shared else num_experts
     down_b_experts = 1 if shared else num_experts
     tensors = {
         "hidden_states": rand_bf16((num_tokens, _HIDDEN), 0.20),
         "w13_weight": rand_bf16((num_experts, 2 * _INTERMEDIATE, _HIDDEN), 0.08),
         "w2_weight": rand_bf16((num_experts, _HIDDEN, _INTERMEDIATE), 0.08),
         "gate_up_lora_a": rand_bf16(
-            (_SLOTS, gate_a_experts, 2 * _PHYSICAL_RANK, _HIDDEN), 0.15
+            (_SLOTS, gate_up_a_experts, 2 * _PHYSICAL_RANK, _HIDDEN), 0.15
         ),
         "gate_up_lora_b": rand_bf16(
             (_SLOTS, num_experts, 2 * _INTERMEDIATE, _PHYSICAL_RANK), 0.15

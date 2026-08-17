@@ -77,15 +77,15 @@ def _validate_flat_config(name: str, config: Mapping[str, int]) -> None:
 class MoeLoraLaunchConfig:
     """Site-specific launch settings; no token/rank/device config."""
 
-    # The canonical aligned route is shared by gate-B, down-A, and down-B.
-    # Gate-A may request a second aligned plan with a different M tile.  Its
+    # The canonical aligned route is shared by gate/up-B, down-A, and down-B.
+    # Gate/up-A may request a second aligned plan with a different M tile.  Its
     # output is written by original pair ID, so the canonical B route can
     # consume that bridge without a layout conversion.  Keeping the two
     # values explicit also charges the extra route build in composed timing.
     routing_block_size: int = 16
-    gate_a_routing_block_size: int = 16
-    gate_a: dict[str, int] = field(default_factory=_a_default)
-    gate_b: dict[str, int] = field(default_factory=_b_default)
+    gate_up_a_routing_block_size: int = 16
+    gate_up_a: dict[str, int] = field(default_factory=_a_default)
+    gate_up_b: dict[str, int] = field(default_factory=_b_default)
     down_a: dict[str, int] = field(default_factory=_a_default)
     down_b: dict[str, int] = field(default_factory=_b_default)
     b_activation: dict[str, int] = field(
@@ -98,13 +98,13 @@ class MoeLoraLaunchConfig:
     def __post_init__(self) -> None:
         if not _is_power_of_two(self.routing_block_size):
             raise ValueError("routing_block_size must be a positive power of two")
-        if not _is_power_of_two(self.gate_a_routing_block_size):
+        if not _is_power_of_two(self.gate_up_a_routing_block_size):
             raise ValueError(
-                "gate_a_routing_block_size must be a positive power of two"
+                "gate_up_a_routing_block_size must be a positive power of two"
             )
         for name in (
-            "gate_a",
-            "gate_b",
+            "gate_up_a",
+            "gate_up_b",
             "down_a",
             "down_b",
             "b_activation",
@@ -116,10 +116,10 @@ class MoeLoraLaunchConfig:
             _validate_flat_config(f"shared_finalize.{name}", config)
 
     def for_a(self, site: Site) -> Mapping[str, int]:
-        return self.gate_a if site is Site.GATE_UP else self.down_a
+        return self.gate_up_a if site is Site.GATE_UP else self.down_a
 
     def for_b(self, site: Site) -> Mapping[str, int]:
-        return self.gate_b if site is Site.GATE_UP else self.down_b
+        return self.gate_up_b if site is Site.GATE_UP else self.down_b
 
     def for_middle(self, family: MiddleFamily) -> Mapping[str, int]:
         """Return the explicit config for one fused-middle kernel family."""
@@ -139,40 +139,42 @@ class MoeLoraLaunchConfig:
                 "routing_block_size must be at least 16 for aligned "
                 "tensor-core LoRA consumers"
             )
-        separate_gate_route = self.gate_a_routing_block_size != self.routing_block_size
-        if separate_gate_route:
-            gate_uses_separate_aligned = (
-                plan.gate_a.family is LoraAFamily.GROUPED
-                and not plan.gate_a.is_shared_outer
+        separate_gate_up_route = (
+            self.gate_up_a_routing_block_size != self.routing_block_size
+        )
+        if separate_gate_up_route:
+            gate_up_uses_separate_aligned = (
+                plan.gate_up_a.family is LoraAFamily.GROUPED
+                and not plan.gate_up_a.is_shared_outer
             )
-            if not gate_uses_separate_aligned:
+            if not gate_up_uses_separate_aligned:
                 raise ValueError(
-                    "a distinct gate_a_routing_block_size is valid only for "
+                    "a distinct gate_up_a_routing_block_size is valid only for "
                     "grouped per-expert gate/up-A"
                 )
-            if self.gate_a_routing_block_size < 16:
+            if self.gate_up_a_routing_block_size < 16:
                 raise ValueError(
-                    "gate_a_routing_block_size must be at least 16 for grouped "
+                    "gate_up_a_routing_block_size must be at least 16 for grouped "
                     "gate/up-A"
                 )
 
     @property
     def lora_a(self) -> Mapping[str, int]:
-        """Step-1–7 compatibility view for the common gate-A config."""
-        return self.gate_a
+        """Step-1–7 compatibility view for the common gate/up-A config."""
+        return self.gate_up_a
 
     @property
     def lora_b(self) -> Mapping[str, int]:
-        """Step-1–7 compatibility view for the common gate-B config."""
-        return self.gate_b
+        """Step-1–7 compatibility view for the common gate/up-B config."""
+        return self.gate_up_b
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-safe complete identity used by composed benchmark records."""
         return {
             "routing_block_size": self.routing_block_size,
-            "gate_a_routing_block_size": self.gate_a_routing_block_size,
-            "gate_a": dict(self.gate_a),
-            "gate_b": dict(self.gate_b),
+            "gate_up_a_routing_block_size": self.gate_up_a_routing_block_size,
+            "gate_up_a": dict(self.gate_up_a),
+            "gate_up_b": dict(self.gate_up_b),
             "down_a": dict(self.down_a),
             "down_b": dict(self.down_b),
             "b_activation": dict(self.b_activation),

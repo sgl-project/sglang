@@ -24,15 +24,15 @@
       "num_stages": 2,
       "num_warps": 4
      },
-     "gate_a": {
+     "gate_up_a": {
       "BLOCK_SIZE_K": 128,
       "BLOCK_SIZE_N": 64,
       "GROUP_SIZE_M": 8,
       "num_stages": 3,
       "num_warps": 4
      },
-     "gate_a_routing_block_size": 16,
-     "gate_b": {
+     "gate_up_a_routing_block_size": 16,
+     "gate_up_b": {
       "BLOCK_SIZE_K": 32,
       "BLOCK_SIZE_N": 128,
       "GROUP_SIZE_M": 8,
@@ -80,15 +80,15 @@
       "num_stages": 2,
       "num_warps": 4
      },
-     "gate_a": {
+     "gate_up_a": {
       "BLOCK_SIZE_K": 64,
       "BLOCK_SIZE_N": 64,
       "GROUP_SIZE_M": 8,
       "num_stages": 3,
       "num_warps": 4
      },
-     "gate_a_routing_block_size": 64,
-     "gate_b": {
+     "gate_up_a_routing_block_size": 64,
+     "gate_up_b": {
       "BLOCK_SIZE_K": 32,
       "BLOCK_SIZE_M": 16,
       "BLOCK_SIZE_N": 64,
@@ -137,15 +137,15 @@
       "num_stages": 2,
       "num_warps": 4
      },
-     "gate_a": {
+     "gate_up_a": {
       "BLOCK_SIZE_K": 128,
       "BLOCK_SIZE_N": 32,
       "GROUP_SIZE_M": 8,
       "num_stages": 3,
       "num_warps": 4
      },
-     "gate_a_routing_block_size": 16,
-     "gate_b": {
+     "gate_up_a_routing_block_size": 16,
+     "gate_up_b": {
       "BLOCK_SIZE_K": 64,
       "BLOCK_SIZE_N": 256,
       "GROUP_SIZE_M": 4,
@@ -194,15 +194,15 @@
       "num_stages": 2,
       "num_warps": 4
      },
-     "gate_a": {
+     "gate_up_a": {
       "BLOCK_SIZE_K": 64,
       "BLOCK_SIZE_N": 64,
       "GROUP_SIZE_M": 8,
       "num_stages": 3,
       "num_warps": 4
      },
-     "gate_a_routing_block_size": 16,
-     "gate_b": {
+     "gate_up_a_routing_block_size": 16,
+     "gate_up_b": {
       "BLOCK_SIZE_K": 32,
       "BLOCK_SIZE_M": 16,
       "BLOCK_SIZE_N": 64,
@@ -252,15 +252,15 @@
       "num_stages": 2,
       "num_warps": 4
      },
-     "gate_a": {
+     "gate_up_a": {
       "BLOCK_SIZE_K": 64,
       "BLOCK_SIZE_N": 64,
       "GROUP_SIZE_M": 8,
       "num_stages": 3,
       "num_warps": 4
      },
-     "gate_a_routing_block_size": 16,
-     "gate_b": {
+     "gate_up_a_routing_block_size": 16,
+     "gate_up_b": {
       "BLOCK_SIZE_K": 32,
       "BLOCK_SIZE_M": 16,
       "BLOCK_SIZE_N": 64,
@@ -310,15 +310,15 @@
       "num_stages": 2,
       "num_warps": 4
      },
-     "gate_a": {
+     "gate_up_a": {
       "BLOCK_SIZE_K": 64,
       "BLOCK_SIZE_N": 64,
       "GROUP_SIZE_M": 8,
       "num_stages": 3,
       "num_warps": 4
      },
-     "gate_a_routing_block_size": 16,
-     "gate_b": {
+     "gate_up_a_routing_block_size": 16,
+     "gate_up_b": {
       "BLOCK_SIZE_K": 32,
       "BLOCK_SIZE_M": 16,
       "BLOCK_SIZE_N": 64,
@@ -368,15 +368,15 @@
       "num_stages": 2,
       "num_warps": 4
      },
-     "gate_a": {
+     "gate_up_a": {
       "BLOCK_SIZE_K": 64,
       "BLOCK_SIZE_N": 32,
       "GROUP_SIZE_M": 8,
       "num_stages": 2,
       "num_warps": 4
      },
-     "gate_a_routing_block_size": 16,
-     "gate_b": {
+     "gate_up_a_routing_block_size": 16,
+     "gate_up_b": {
       "BLOCK_SIZE_K": 32,
       "BLOCK_SIZE_M": 16,
       "BLOCK_SIZE_N": 64,
@@ -426,15 +426,15 @@
       "num_stages": 2,
       "num_warps": 4
      },
-     "gate_a": {
+     "gate_up_a": {
       "BLOCK_SIZE_K": 64,
       "BLOCK_SIZE_N": 32,
       "GROUP_SIZE_M": 8,
       "num_stages": 2,
       "num_warps": 4
      },
-     "gate_a_routing_block_size": 16,
-     "gate_b": {
+     "gate_up_a_routing_block_size": 16,
+     "gate_up_b": {
       "BLOCK_SIZE_K": 32,
       "BLOCK_SIZE_M": 16,
       "BLOCK_SIZE_N": 64,
