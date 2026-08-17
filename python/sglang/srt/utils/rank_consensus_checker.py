@@ -26,7 +26,7 @@ _scheduler_thread: Optional[threading.Thread] = None
 
 
 def rank_consensus(func=None, *, same_params=None, same_results=None, **kwargs):
-    f"""
+    """
     Mark a function that should be consensus in PP and TP ranks.  Here consensus means,
     the same order of calling, same parameters and return values optionally.
 
