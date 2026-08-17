@@ -1020,7 +1020,9 @@ def fused_experts_impl(
         from sglang.kernels.ops.moe.glm45_fused_moe import (
             covered as glm45_fused_moe_covered,
         )
-        from sglang.kernels.ops.moe.glm45_fused_moe import glm45_fused_moe
+        from sglang.kernels.ops.moe.glm45_fused_moe import (
+            glm45_fused_moe,
+        )
 
         if glm45_fused_moe_covered(
             hidden_states,
