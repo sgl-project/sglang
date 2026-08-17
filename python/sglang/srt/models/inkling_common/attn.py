@@ -6,8 +6,8 @@ from functools import cache
 import torch
 from torch import nn
 
-from sglang.jit_kernel.inkling_rel_proj import rel_proj_small_t
-from sglang.jit_kernel.inkling_row_scale import row_compact_bf16
+from sglang.kernels.ops.attention.inkling_rel_proj import rel_proj_small_t
+from sglang.kernels.ops.attention.inkling_row_scale import row_compact_bf16
 from sglang.kernels.ops.attention.log_scaling_tau import (
     apply_log_scaling_tau as _apply_log_scaling_tau,
 )
@@ -29,14 +29,20 @@ from sglang.srt.models.inkling_common.kernels.comm import (
 from sglang.srt.models.inkling_common.norm import RMSNorm
 from sglang.srt.models.inkling_common.sconv import SconvType, ShortConvolution
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_exec,
+    get_model,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.utils import add_prefix, get_current_device_stream_fast
 
 try:
     import cutlass.cute as cute
     from cutlass.cute import Float32
 
-    from sglang.jit_kernel.flash_attn.cute.seqlen_info import SeqlenInfoQK
+    from sglang.kernels.ops.attention.flash_attn.cute.seqlen_info import SeqlenInfoQK
 except Exception as _import_error:
     cute = None
     Float32 = None
@@ -101,6 +107,30 @@ _REL_PROJ_MATMUL_MAX_T = 48
 _REL_PROJ_TAU_KERNEL_MAX_T = 32
 
 
+def serving_attention_backend(forward_batch: ForwardBatch) -> str:
+    """The pair member serving this forward.
+
+    Mirrors ``HybridAttnBackend._select_backend`` exactly: decode for
+    decode/idle, the ``speculative_attention_mode`` half for target-verify,
+    prefill otherwise -- including draft-extend, which the hybrid dispatcher
+    routes through its prefill branch. The pair the runner stamped on its
+    backend wins over the configured one, so a draft runner answers with its
+    own backend.
+    """
+    from sglang.srt.model_executor.forward_context import get_attn_backend
+
+    backend = get_attn_backend()
+    configured_prefill, configured_decode = attention_backends()
+    prefill = backend.prefill_attention_backend_str or configured_prefill
+    decode = backend.decode_attention_backend_str or configured_decode
+    mode = forward_batch.forward_mode
+    if mode.is_decode_or_idle():
+        return decode
+    if mode.is_target_verify():
+        return decode if get_spec().speculative_attention_mode == "decode" else prefill
+    return prefill
+
+
 def _rel_proj_kernel_eligible(r: torch.Tensor) -> bool:
     """rel_proj_small_t input contract: bf16 CUDA, [t, h, d_rel] with a
     contiguous (h*d_rel) inner block (token rows may be strided), d_rel a
@@ -117,7 +147,7 @@ def _rel_proj_kernel_eligible(r: torch.Tensor) -> bool:
 
 
 class RelLogitsProj(nn.Module):
-    def __init__(self, d_rel: int, rel_extent: int):
+    def __init__(self, d_rel: int, rel_extent: int, *, deterministic: bool = False):
         super().__init__()
         self.d_rel = d_rel
         self.rel_extent = rel_extent
@@ -130,7 +160,11 @@ class RelLogitsProj(nn.Module):
         # territory. Rounding moves with the fold (r*tau rounds to bf16 before
         # the GEMM instead of after); flag-off keeps the exact legacy post-scale.
         self._prescale_tau = envs.SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU.get()
-        self._proj_dispatch = envs.SGLANG_OPT_USE_INKLING_REL_PROJ_DISPATCH.get()
+        # The dispatch keys off the token count, so a row's kernel would follow
+        # the batch composition.
+        self._proj_dispatch = (
+            envs.SGLANG_OPT_USE_INKLING_REL_PROJ_DISPATCH.get() and not deterministic
+        )
 
     def _project(self, r: torch.Tensor) -> torch.Tensor:
         """``einsum("thd,de->the", r, proj)`` -- but dispatched: in production
@@ -296,7 +330,7 @@ class InklingAttention(nn.Module):
         )
         # --enable-scattered-sconv: the output reduction becomes a hidden-dim
         # reduce-scatter (the consumer attn_sconv runs on the [T, H/P] shard).
-        self.scattered_sconv = get_server_args().enable_scattered_sconv
+        self.scattered_sconv = get_exec().comm.enable_scattered_sconv
 
         if is_local:
             self.rel_extent = local_extent
@@ -305,7 +339,11 @@ class InklingAttention(nn.Module):
             self.rel_extent = rel_extent
             self.local_extent = None
 
-        self.rel_logits_proj = RelLogitsProj(self.d_rel, self.rel_extent)
+        self.rel_logits_proj = RelLogitsProj(
+            self.d_rel,
+            self.rel_extent,
+            deterministic=get_exec().deterministic.enable_deterministic_inference,
+        )
         # Fold the conditional log-scaling tau into the fused prologue's q
         # path (deletes the external scale kernel; bit-exact rounding).
         self._fused_log_tau = envs.SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU.get()
@@ -364,7 +402,8 @@ class InklingAttention(nn.Module):
 
     def _fused_attn_prologue_verify(self, q, k, v, forward_batch, log_scaling_tau=None):
         """Fused target-verify {k/v sconv + save_windows + qk-norm (+ KV store)}
-        (jit_kernel/inkling_attn_prologue.py); returns ``(q, k, v, did_store)``.
+        (kernels/ops/attention/inkling_attn_prologue.py); returns
+        ``(q, k, v, did_store)``.
 
         The fused kernel writes raw bf16 KV, so it only does the store when the
         KV pool is bf16: full layers at ``out_cache_loc`` in the full pool,
@@ -376,7 +415,9 @@ class InklingAttention(nn.Module):
         qk-norm stay fused either way. For the FA4 MXFP8 pool, the prologue can
         quantize Q and directly fill the fp8 K/V cache plus interleaved scale
         buffers, returning Q's per-token scales as ``q_descale``/``sfq``."""
-        from sglang.jit_kernel.inkling_attn_prologue import inkling_attn_prologue_verify
+        from sglang.kernels.ops.attention.inkling_attn_prologue import (
+            inkling_attn_prologue_verify,
+        )
         from sglang.srt.model_executor.forward_context import (
             get_attn_backend,
             get_token_to_kv_pool,
@@ -407,8 +448,7 @@ class InklingAttention(nn.Module):
         )
         sfk = sfv = None
         do_mxfp8_store = False
-        server_args = get_server_args()
-        if server_args.kv_cache_dtype == "mxfp8" and hasattr(
+        if get_model().kv_cache_dtype == "mxfp8" and hasattr(
             pool, "get_kv_scale_buffer"
         ):
             sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
@@ -478,7 +518,9 @@ class InklingAttention(nn.Module):
         the backend store. Store gating (bf16 NHD / FA4 MXFP8 pools, SWA loc
         translation) is identical to the verify prologue. Returns
         (q, k, v, did_store, q_descale)."""
-        from sglang.jit_kernel.inkling_attn_prologue import inkling_attn_prologue_extend
+        from sglang.kernels.ops.attention.inkling_attn_prologue import (
+            inkling_attn_prologue_extend,
+        )
         from sglang.srt.model_executor.forward_context import (
             get_attn_backend,
             get_token_to_kv_pool,
@@ -520,8 +562,7 @@ class InklingAttention(nn.Module):
         )
         sfk = sfv = None
         do_mxfp8_store = False
-        server_args = get_server_args()
-        if server_args.kv_cache_dtype == "mxfp8" and hasattr(
+        if get_model().kv_cache_dtype == "mxfp8" and hasattr(
             pool, "get_kv_scale_buffer"
         ):
             sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
@@ -610,7 +651,9 @@ class InklingAttention(nn.Module):
         kernel. Decode is one token/seq so the conv taps come from the working
         cache (no cross-token reads, no barrier). Returns
         (q, k, v, did_store, q_descale)."""
-        from sglang.jit_kernel.inkling_attn_prologue import inkling_attn_prologue_decode
+        from sglang.kernels.ops.attention.inkling_attn_prologue import (
+            inkling_attn_prologue_decode,
+        )
         from sglang.srt.model_executor.forward_context import (
             get_attn_backend,
             get_token_to_kv_pool,
@@ -638,8 +681,7 @@ class InklingAttention(nn.Module):
         )
         sfk = sfv = None
         do_mxfp8_store = False
-        server_args = get_server_args()
-        if server_args.kv_cache_dtype == "mxfp8" and hasattr(
+        if get_model().kv_cache_dtype == "mxfp8" and hasattr(
             pool, "get_kv_scale_buffer"
         ):
             sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
@@ -719,12 +761,14 @@ class InklingAttention(nn.Module):
 
         apply_log_scaling = log_scaling_tau is not None and not self.is_local
 
-        server_args = get_server_args()
-        assert server_args.attention_backend in ("fa4", "triton")
+        # The kwargs below must describe the backend `self.attn` dispatches
+        # this forward to.
+        attention_backend = serving_attention_backend(forward_batch)
+        assert attention_backend in ("fa4", "triton")
         # The overlap threads a CUDA event into the FA4 sheared-bias kernel, so it
         # is FA4-only for now.
         # TODO(triton): plumb rel_bias_event through the triton attn path too.
-        fa4 = server_args.attention_backend == "fa4"
+        fa4 = attention_backend == "fa4"
 
         rel_event = None
         prologue_did_store = False
@@ -863,7 +907,7 @@ class InklingAttention(nn.Module):
             )
 
         extra_attn_kwargs = {}
-        if server_args.kv_cache_dtype == "mxfp8":
+        if get_model().kv_cache_dtype == "mxfp8":
             # Must run AFTER v is joined above (wait_event(v_event)): v (and k)
             # may be produced by sconv on the alt stream, and quantizing them on
             # the main stream before the join reads half-written buffers under
@@ -876,7 +920,7 @@ class InklingAttention(nn.Module):
             if prologue_q_descale is not None:
                 extra_attn_kwargs["q_descale"] = prologue_q_descale
             else:
-                from sglang.srt.layers.quantization.mxfp8_quant import to_mxfp8
+                from sglang.kernels.ops.quantization.mxfp8_quant import to_mxfp8
 
                 q_mxfp = to_mxfp8(q.view(num_tokens, self.num_tp_heads, self.head_dim))
                 q = q_mxfp.data.view(num_tokens, -1)

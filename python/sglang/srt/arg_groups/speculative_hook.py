@@ -147,8 +147,10 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 def _handle_dflash(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import resolved_view
 
-    if not server_args.device.startswith("cuda"):
-        raise ValueError("DFLASH speculative decoding only supports CUDA device.")
+    if not (server_args.device.startswith("cuda") or server_args.device == "npu"):
+        raise ValueError(
+            "DFLASH speculative decoding only supports CUDA and NPU devices."
+        )
 
     if resolved_view(server_args).enable_dp_attention:
         raise ValueError(
@@ -274,24 +276,42 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 
 
 def _handle_dspark(server_args: ServerArgs) -> None:
-    if not server_args.device.startswith("cuda"):
-        raise ValueError("DSpark speculative decoding only supports CUDA device.")
+    _is_npu = server_args.device.startswith("npu")
+    if not server_args.device.startswith("cuda") and not _is_npu:
+        raise ValueError(
+            "DSpark speculative decoding only supports CUDA and NPU devices."
+        )
 
-    if server_args.enable_dp_attention:
+    # dp_size==1 with dp_attention is a degenerate flag under DSV4 CP; skip DP-only checks.
+    if server_args.enable_dp_attention and server_args.dp_size > 1:
         if not server_args.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if server_args.moe_a2a_backend != "none":
+        if not _is_npu and server_args.moe_a2a_backend not in ("none", "megamoe"):
             raise ValueError(
-                "DSpark with dp attention only supports the built-in TP MoE "
-                f"(moe_a2a_backend='none'), got {server_args.moe_a2a_backend!r}."
+                "DSpark with dp attention supports moe_a2a_backend 'none' "
+                "(built-in TP MoE) or 'megamoe', got "
+                f"{server_args.moe_a2a_backend!r}."
             )
+        if not _is_npu and server_args.moe_a2a_backend != "none":
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
+            )
+
+            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+                raise ValueError(
+                    "DSpark with dp attention + "
+                    f"moe_a2a_backend={server_args.moe_a2a_backend!r} requires "
+                    "SGLANG_RAGGED_VERIFY_MODE=static."
+                )
         if server_args.attn_cp_size > 1:
             raise ValueError(
                 "DSpark with dp attention does not support context parallel "
                 f"(attn_cp_size={server_args.attn_cp_size})."
             )
         if (
-            server_args.speculative_moe_a2a_backend is not None
+            not _is_npu
+            and server_args.speculative_moe_a2a_backend is not None
             and server_args.speculative_moe_a2a_backend != server_args.moe_a2a_backend
         ):
             raise ValueError(
@@ -438,7 +458,14 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     """
     from sglang.srt.utils import is_hip
 
-    supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
+    supported_draft_backends = (
+        "flashinfer",
+        "fa3",
+        "fa4",
+        "triton",
+        "trtllm_mha",
+        "ascend",
+    )
     # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
     fallback_backend = "triton" if is_hip() else "flashinfer"
 
@@ -453,13 +480,37 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     if draft_backend is None:
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
-        logger.warning(
-            "DFLASH draft worker does not support 'trtllm_mha' because the "
-            "draft path requires per-layer DFlash attention. Falling back to "
-            "'%s'.",
-            fallback_backend,
+        from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        draft_hf_config = get_config(
+            server_args.speculative_draft_model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.speculative_draft_model_revision,
+            model_override_args=json.loads(server_args.json_model_override_args),
         )
-        draft_backend = fallback_backend
+        draft_text_config = (
+            getattr(draft_hf_config, "text_config", None) or draft_hf_config
+        )
+        layer_types = get_dflash_layer_types(draft_hf_config)
+        num_layers = getattr(draft_text_config, "num_hidden_layers", None)
+        all_sliding = (
+            layer_types
+            and len(layer_types) == num_layers
+            and set(layer_types) == {"sliding_attention"}
+        )
+        all_causal = getattr(draft_text_config, "is_causal", False) is True
+        if not (all_sliding or all_causal):
+            logger.warning(
+                "DFLASH only enables 'trtllm_mha' when all layers use sliding "
+                "attention or the draft is explicitly causal; got "
+                "layer_types=%r, is_causal=%r. "
+                "Falling back to '%s'.",
+                layer_types,
+                getattr(draft_text_config, "is_causal", None),
+                fallback_backend,
+            )
+            draft_backend = fallback_backend
     elif draft_backend not in supported_draft_backends:
         logger.warning(
             "DFLASH draft worker only supports attention_backend in %s for now, "

@@ -127,11 +127,27 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
+    def is_last_shared_read_phase(self, forward_mode) -> bool:
+        # The step's last shared-buffer-reading phase owns the shared-read-done
+        # publish. DSPARK has no draft_extend: its draft samples inside the
+        # verify graph, so verify is that last phase.
+        if self.is_dflash_family() or self.is_dspark():
+            return forward_mode.is_target_verify()
+        return forward_mode.is_draft_extend_v2()
+
     def supports_ragged_verify(self) -> bool:
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify
         graphs in the decode cuda graph runner."""
         return self.is_dspark()
+
+    def supports_grammar_overlap(self) -> bool:
+        # Whether the worker advances the grammar FSM inside verify() (via the
+        # scheduler's grammar barrier), letting spec + grammar decode overlap.
+        # Needs a GPU draft phase to hide the grammar CPU work under: NGRAM drafts
+        # from a host corpus lookup, so it stays synchronous by design.
+        # STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
+        return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
@@ -174,6 +190,14 @@ class SpeculativeAlgorithm(Enum):
             )
 
             return build_eagle_disagg_draft_input(
+                batch, server_args, last_tokens_tensor, future_map
+            )
+        if self.is_dspark():
+            from sglang.srt.speculative.dspark_disaggregation import (
+                build_dspark_disagg_draft_input,
+            )
+
+            return build_dspark_disagg_draft_input(
                 batch, server_args, last_tokens_tensor, future_map
             )
         return None

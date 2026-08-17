@@ -7,7 +7,7 @@ SGLang runtime code and tests should import callable kernels from
     from sglang.kernels.ops.activation import silu_and_mul
     from sglang.kernels.ops.kvcache import reshape_and_cache_flash
 
-Implementations still live in ``sglang.jit_kernel`` (JIT CUDA), the
+Implementations still live in ``sglang.kernels.jit`` (JIT CUDA), the
 ``sgl_kernel`` wheel (AOT CUDA/C++), Triton op modules, etc. The ``ops.*``
 functions are thin wrappers that forward to a chosen backend; the
 :data:`~sglang.kernels.registry.registry` provides an inventory of every
@@ -18,7 +18,7 @@ with a required pure-``torch`` ``forward_native`` reference and a
 ``SGLANG_FORCE_FUSED_OP_BACKEND`` global switch.
 
 Importing this package (and any ``ops.*`` group) does not import a kernel
-backend (``sgl_kernel`` / ``sglang.jit_kernel``) or trigger JIT compilation:
+backend (``sgl_kernel`` / ``sglang.kernels.jit``) or trigger JIT compilation:
 registration is metadata-only and backends are imported lazily on first call.
 This keeps the namespace usable for inventory tooling on a CPU-only box.
 """
