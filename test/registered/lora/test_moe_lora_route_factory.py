@@ -582,6 +582,12 @@ class TestDualGateUpARoute(unittest.TestCase):
         )
 
     def test_second_route_is_rejected_for_non_grouped_gate_up_a(self):
+        """The (plan, tiles) pairing is owned by the bind-time config check.
+
+        build_routes no longer re-checks it on every forward, so this pins the
+        one place that does: a distinct gate/up-A tile is admissible only for
+        a grouped per-expert gate/up-A.
+        """
         reference = SERIAL_MATERIALIZED_REFERENCE
         token_dedup_plan = dataclasses.replace(
             reference,
@@ -597,18 +603,11 @@ class TestDualGateUpARoute(unittest.TestCase):
             ),
         )
         with self.assertRaisesRegex(
-            ValueError, "qualified only for grouped.*gate/up-A"
+            ValueError, "valid only for grouped per-expert gate/up-A"
         ):
-            ROUTE_FACTORY.build_routes(
-                token_dedup_plan,
-                topk_ids=self.topk_ids,
-                token_slots=self.token_slots,
-                num_local_experts=2,
-                max_loras=2,
-                block_size=16,
-                gate_up_a_block_size=64,
-                workspace=self.workspace,
-            )
+            LAUNCH.MoeLoraLaunchConfig(
+                gate_up_a_routing_block_size=64
+            ).validate_for_plan(token_dedup_plan)
 
 
 class TestRoutePdlWiring(unittest.TestCase):

@@ -175,7 +175,9 @@ class TestDownBScatterPlan:
         assert plan.is_fully_serial_materialized()
         assert not replace(plan, down_b_scatter=True).is_fully_serial_materialized()
 
-    def test_flag_requires_the_one_launch_family(self) -> None:
+    def test_flag_leaves_the_b_family_to_provider_capability(self) -> None:
+        # Which down-B kernel implements the scatter epilogue is asked of the
+        # provider (supports_down_b_scatter), not pinned by the plan.
         indexed = replace(
             _serial_plan(),
             down_b=LoraBSpec(
@@ -185,10 +187,7 @@ class TestDownBScatterPlan:
                 BridgeLayout.PAIR_MAJOR,
             ),
         )
-        assert indexed.down_b is not None
-        assert indexed.down_b.family is not LoraBFamily.ONE_LAUNCH_SLICED
-        with pytest.raises(ValueError, match="down-B scatter"):
-            replace(indexed, down_b_scatter=True)
+        assert replace(indexed, down_b_scatter=True).down_b_scatter is True
 
     def test_flag_requires_a_standalone_down_b(self) -> None:
         # A finalize-consumed down-B (shared-rank reduce) has no standalone

@@ -154,20 +154,10 @@ class LoraASpec:
 
     def validate(self) -> LoraASpec:
         self.contract.validate()
-        if self.site is Site.DOWN and self.is_shared_outer:
-            raise ValueError(
-                "down A is always per-expert; only gate/up A may be shared-outer"
-            )
         if self.family is LoraAFamily.GROUPED:
             if self.output_layout is not BridgeLayout.PAIR_MAJOR:
                 raise ValueError("grouped A writes a pair-major bridge")
         elif self.family is LoraAFamily.INDEXED:
-            # Step-3 qualified indexed A only as the down-site small-decode
-            # frontier; every other site keeps its aligned general kernel.
-            if self.site is not Site.DOWN:
-                raise ValueError("indexed A is retained only at the down site")
-            if self.is_shared_outer:
-                raise ValueError("indexed A is qualified only for per-expert factors")
             if self.output_layout is not BridgeLayout.PAIR_MAJOR:
                 raise ValueError("indexed A writes a pair-major bridge")
         else:
@@ -207,23 +197,9 @@ class LoraBSpec:
 
     def validate(self) -> LoraBSpec:
         self.contract.validate()
-        if self.site is Site.GATE_UP and self.is_shared_outer:
-            raise ValueError(
-                "gate/up B is always per-expert; only down B may be shared-outer"
-            )
-        if (
-            self.input_layout is BridgeLayout.TOKEN_MAJOR
-            and self.site is not Site.GATE_UP
-        ):
-            raise ValueError("a token-major B input exists only at gate/up")
         if self.family is LoraBFamily.INDEXED_PAIRS:
-            # The pair-indexed decode expand derives each pair's virtual
-            # expert key inline from the raw route; it has no shared-outer
-            # or token-major qualification.
-            if self.is_shared_outer:
-                raise ValueError(
-                    "pair-indexed B is qualified only for per-expert factors"
-                )
+            # The pair-indexed expand visits one routed pair at a time, so
+            # its bridge is inherently pair-major.
             if self.input_layout is not BridgeLayout.PAIR_MAJOR:
                 raise ValueError("pair-indexed B consumes a pair-major bridge")
         return self
@@ -256,8 +232,6 @@ class MiddleSpec:
         if self.consumed_gate_up_b is not None:
             if self.consumed_gate_up_b.site is not Site.GATE_UP:
                 raise ValueError("consumed_gate_up_b must describe the gate/up site")
-            if self.consumed_gate_up_b.is_shared_outer:
-                raise ValueError("consumed gate/up B must be per-expert")
 
         expected_gate_up_b = self.family is MiddleFamily.B_ACTIVATION
         if (self.consumed_gate_up_b is not None) != expected_gate_up_b:
@@ -295,14 +269,13 @@ class FinalizeSpec:
         if self.consumed_down_b is not None:
             if self.consumed_down_b.site is not Site.DOWN:
                 raise ValueError("consumed_down_b must describe the down site")
-        if self.family is FinalizeFamily.SHARED_RANK_REDUCE:
-            consumed_down_b = self.consumed_down_b
-            if consumed_down_b is None:
-                raise ValueError(f"{self.family.value} requires down B")
-            if not consumed_down_b.is_shared_outer:
-                raise ValueError(
-                    f"{self.family.value} requires shared-outer down-B ownership"
-                )
+        if (
+            self.family is FinalizeFamily.SHARED_RANK_REDUCE
+            and not self.consumed_down_b.is_shared_outer
+        ):
+            raise ValueError(
+                f"{self.family.value} requires shared-outer down-B ownership"
+            )
         return self
 
     def route_requirements(self) -> frozenset[RouteRequirement]:
@@ -318,10 +291,10 @@ class MoeLoraExecutionPlan:
     """One immutable whole-pipeline MoE-LoRA execution strategy."""
 
     gate_up_a: LoraASpec
+    down_a: LoraASpec
     middle: MiddleSpec
     finalize: FinalizeSpec
     gate_up_b: LoraBSpec | None = None
-    down_a: LoraASpec | None = None
     down_b: LoraBSpec | None = None
     early_overlap: EarlyOverlap = EarlyOverlap.NONE
     late_overlap: LateOverlap = LateOverlap.NONE
@@ -356,8 +329,6 @@ class MoeLoraExecutionPlan:
         return consumed
 
     def _down_a_contract(self) -> StageContract:
-        if self.down_a is None:
-            raise ValueError("the execution plan has no down-A owner")
         return self.down_a.contract
 
     def _down_b_contract(self) -> StageContract:
@@ -373,7 +344,7 @@ class MoeLoraExecutionPlan:
             raise ValueError("gate_up_a must describe the gate/up site")
         if self.gate_up_b is not None and self.gate_up_b.site is not Site.GATE_UP:
             raise ValueError("gate_up_b must describe the gate/up site")
-        if self.down_a is not None and self.down_a.site is not Site.DOWN:
+        if self.down_a.site is not Site.DOWN:
             raise ValueError("down_a must describe the down site")
         if self.down_b is not None and self.down_b.site is not Site.DOWN:
             raise ValueError("down_b must describe the down site")
@@ -382,11 +353,6 @@ class MoeLoraExecutionPlan:
         if gate_up_b_consumed == (self.gate_up_b is not None):
             raise ValueError(
                 "gate/up B must have exactly one owner: standalone gate_up_b or middle"
-            )
-        if self.down_a is None:
-            raise ValueError(
-                "down A is always a standalone stage: no retained middle "
-                "family consumes it"
             )
         down_b_consumed = self.finalize.consumed_down_b is not None
         if down_b_consumed == (self.down_b is not None):
@@ -422,23 +388,11 @@ class MoeLoraExecutionPlan:
 
         if self.down_b_scatter and not self.down_b_scatter_eligible():
             raise ValueError(
-                "down-B scatter requires a standalone one-launch sliced "
-                "down-B stage, the materialized finalize (run in "
-                "no-pair-delta mode), no late overlap window (the scatter "
-                "read-modify-writes the base down output)"
+                "down-B scatter requires a standalone down-B stage and no "
+                "late overlap window (the scatter read-modify-writes the "
+                "base down output)"
             )
 
-        requirements = self._route_requirements_unchecked()
-        if self.route_builder is RouteBuilderFamily.JOINT_SHARED_OUTER:
-            needed = {
-                RouteRequirement.ALIGNED_PER_EXPERT,
-                RouteRequirement.ALIGNED_SHARED_OUTER,
-            }
-            if not needed.issubset(requirements):
-                raise ValueError(
-                    "the joint shared-outer route builder requires both aligned "
-                    "per-expert and aligned shared-outer pair plans"
-                )
         return self
 
     def is_fully_serial(self) -> bool:
@@ -455,7 +409,6 @@ class MoeLoraExecutionPlan:
         return (
             self.early_overlap is EarlyOverlap.NONE
             and self.late_overlap is LateOverlap.NONE
-            and self.down_a is not None
             and self.down_a.family is LoraAFamily.GROUPED
             # The scatter reordering couples down-B to the base down output;
             # it is applied ON TOP of a fully serial materialized shape and
@@ -478,12 +431,10 @@ class MoeLoraExecutionPlan:
     def down_b_scatter_eligible(self) -> bool:
         """Whether the down tail admits the scatter-into-base reordering."""
 
-        return (
-            self.down_b is not None
-            and self.down_b.family is LoraBFamily.ONE_LAUNCH_SLICED
-            and self.finalize.family is FinalizeFamily.MATERIALIZED
-            and self.late_overlap is LateOverlap.NONE
-        )
+        # A standalone down-B implies the materialized finalize (any other
+        # finalize consumes it).  Which B kernel implements the epilogue is a
+        # provider capability, checked in MoeLoraRunner._validate_plan_provider.
+        return self.down_b is not None and self.late_overlap is LateOverlap.NONE
 
     def _route_requirements_unchecked(self) -> frozenset[RouteRequirement]:
         requirements: set[RouteRequirement] = set()

@@ -844,7 +844,6 @@ class MoeLoraRunner:
         mapped_down_a: MappedLoraAInput | None = None
         if (
             plan.middle.family is MiddleFamily.B_ACTIVATION
-            and plan.down_a is not None
             and plan.down_a.family is LoraAFamily.GROUPED
         ):
             mapped_down_a = provider.mapped_down_lora_a_input(ws, act_out)
@@ -920,8 +919,6 @@ class MoeLoraRunner:
         down_a_input: _DownAInput,
         batch: MoeLoraBatch,
     ) -> torch.Tensor:
-        if plan.down_a is None:
-            raise ValueError("the execution plan has no standalone down A")
         return self._run_a(
             launch_config,
             plan.down_a,

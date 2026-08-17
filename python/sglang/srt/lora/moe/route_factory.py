@@ -7,7 +7,6 @@ from dataclasses import dataclass
 import torch
 
 from sglang.srt.lora.moe.execution_plan import (
-    LoraAFamily,
     MoeLoraExecutionPlan,
     RouteBuilderFamily,
     RouteRequirement,
@@ -267,16 +266,10 @@ def build_routes(
     gate_up_a_block_size = (
         block_size if gate_up_a_block_size is None else int(gate_up_a_block_size)
     )
+    # Whether a distinct gate/up-A tile is admissible for this plan is a
+    # property of the (plan, tiles) pair, validated once at bind by
+    # MoeLoraLaunchConfig.validate_for_plan.
     separate_gate_up_a_route = gate_up_a_block_size != block_size
-    if separate_gate_up_a_route and not (
-        plan.gate_up_a.family is LoraAFamily.GROUPED
-        and not plan.gate_up_a.is_shared_outer
-        and RouteRequirement.ALIGNED_PER_EXPERT in plan.gate_up_a.route_requirements()
-    ):
-        raise ValueError(
-            "a separate gate/up-A route is qualified only for grouped, "
-            "per-expert gate/up-A"
-        )
     # Route PDL is always on where the architecture supports it: measured
     # +0.5..+2.0% decode on every model and GPU, prefill within +-1.3%
     # (2026-08 twins); no per-plan knob.

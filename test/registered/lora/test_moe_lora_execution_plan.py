@@ -112,15 +112,6 @@ class TestFactorAndKernelSpecs(unittest.TestCase):
             ),
             lambda: _a(
                 Site.GATE_UP,
-                LoraAFamily.INDEXED,
-            ),
-            lambda: _a(
-                Site.GATE_UP,
-                LoraAFamily.INDEXED,
-                True,
-            ),
-            lambda: _a(
-                Site.GATE_UP,
                 LoraAFamily.GROUPED,
                 layout=BridgeLayout.TOKEN_MAJOR,
             ),
@@ -128,6 +119,20 @@ class TestFactorAndKernelSpecs(unittest.TestCase):
         for construct in invalid:
             with self.subTest(construct=construct), self.assertRaises(ValueError):
                 construct()
+
+        # An indexed A is not pinned to a site or to per-expert ownership:
+        # the kernel visits pairs and derives shared-outer keys from the
+        # route either way.  Only its pair-major bridge is definitional.
+        for site, shared in (
+            (Site.GATE_UP, False),
+            (Site.GATE_UP, True),
+            (Site.DOWN, True),
+        ):
+            with self.subTest(site=site, shared=shared):
+                spec = _a(site, LoraAFamily.INDEXED, shared)
+                self.assertIs(spec.output_layout, BridgeLayout.PAIR_MAJOR)
+        with self.assertRaises(ValueError):
+            _a(Site.DOWN, LoraAFamily.INDEXED, layout=BridgeLayout.TOKEN_MAJOR)
 
     def test_b_rejects_down_token_layout(self):
         with self.assertRaisesRegex(ValueError, "down bridge"):
@@ -171,16 +176,11 @@ class TestFactorAndKernelSpecs(unittest.TestCase):
             ).is_shared_outer,
             True,
         )
-        with self.assertRaisesRegex(ValueError, "down A is always per-expert"):
-            _a(
-                Site.DOWN,
-                is_shared_outer=True,
-            )
-        with self.assertRaisesRegex(ValueError, "gate/up B is always per-expert"):
-            _b(
-                Site.GATE_UP,
-                is_shared_outer=True,
-            )
+        # Which sites may be shared-outer is the adapter weight format,
+        # validated where the weights load into the memory buffer — the plan
+        # model only carries the flag.
+        self.assertEqual(_a(Site.DOWN, is_shared_outer=True).is_shared_outer, True)
+        self.assertEqual(_b(Site.GATE_UP, is_shared_outer=True).is_shared_outer, True)
 
 
 class TestFusionOwnership(unittest.TestCase):
@@ -199,12 +199,16 @@ class TestFusionOwnership(unittest.TestCase):
                 ActivationFamily.SWIGLU,
                 consumed_gate_up_b=_factor(Site.DOWN),
             )
-        with self.assertRaisesRegex(ValueError, "gate/up B must be per-expert"):
+        # The consumed contract's ownership is the adapter weight format,
+        # validated at weight load; the middle only needs it to name the
+        # gate/up site.
+        self.assertIsNotNone(
             MiddleSpec(
                 MiddleFamily.B_ACTIVATION,
                 ActivationFamily.SWIGLU,
                 consumed_gate_up_b=_factor(Site.GATE_UP, True),
-            )
+            ).consumed_gate_up_b
+        )
 
     def test_finalize_rejects_missing_or_wrong_ownership_consumer(self):
         with self.assertRaisesRegex(ValueError, "requires.*down B"):
@@ -267,8 +271,8 @@ class TestWholePipelineValidation(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "exactly one owner"):
             _plan(gate_up_b=None)
-        with self.assertRaisesRegex(ValueError, "standalone stage"):
-            _plan(down_a=None)
+        with self.assertRaises(pydantic.ValidationError):
+            _plan(down_a=None)  # required field: down A always runs standalone
         with self.assertRaisesRegex(ValueError, "exactly one owner"):
             _plan(finalize=FinalizeSpec(FinalizeFamily.SHARED_RANK_REDUCE, shared_down))
 
@@ -324,8 +328,13 @@ class TestWholePipelineValidation(unittest.TestCase):
                 )
             ),
         )
-        with self.assertRaisesRegex(ValueError, "down site"):
-            _plan(gate_up_a=_a(Site.GATE_UP, LoraAFamily.INDEXED))
+        # An indexed gate/up-A is coherent (the kernel visits pairs at either
+        # site); only its pair-major bridge is pinned.
+        indexed_gate_up = _plan(gate_up_a=_a(Site.GATE_UP, LoraAFamily.INDEXED))
+        self.assertEqual(
+            indexed_gate_up.route_requirements(),
+            frozenset((RouteRequirement.RAW, RouteRequirement.ALIGNED_PER_EXPERT)),
+        )
 
 
 class TestRouteRequirementUnion(unittest.TestCase):
@@ -354,12 +363,7 @@ class TestRouteRequirementUnion(unittest.TestCase):
             ),
         )
 
-    def test_joint_builder_requires_both_aligned_pair_plans(self):
-        with self.assertRaisesRegex(ValueError, "requires both aligned"):
-            _plan(
-                route_builder=RouteBuilderFamily.JOINT_SHARED_OUTER,
-            )
-
+    def test_joint_builder_yields_both_aligned_pair_plans(self):
         shared_down_b = _b(
             Site.DOWN,
             LoraBFamily.ONE_LAUNCH_SLICED,
