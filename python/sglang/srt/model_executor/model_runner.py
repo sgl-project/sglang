@@ -1623,6 +1623,26 @@ class ModelRunner:
         if get_exec().moe.elastic_ep_backend is not None:
             self.maybe_join_ep_ranks()
 
+        # Strict SWA HiCache: decode has no flat past-KV and runs under the cuda
+        # graph, so windows at page boundaries crossed during decode are captured
+        # here -- outside the graph, after the decode forward wrote the ring and
+        # before the next step overwrites ring slot 0. No-op unless the strict SWA
+        # host pool is wired; the backend guards the rest.
+        if not self.is_draft_worker and forward_batch.forward_mode.is_decode():
+            # The capture is enqueued on the current stream, which under the
+            # overlap scheduler is the worker's forward_stream -- the same stream
+            # that ran this decode forward and that will run the next one. So the
+            # ring read is same-stream-ordered between the two ring writes whether
+            # overlap is on or off. Cross-stream consumers of the captured host
+            # page (restore H2D, L3 write-through, device-landing check) are
+            # instead ordered by the capture-completion event that
+            # capture_swa_windows_decode records and wait_capture_done awaits.
+            self.attn_backend.capture_swa_windows_decode(forward_batch)
+
+            # Decode-source c4/c4-indexer overlap-state capture. Same timing,
+            # stream and event contract as the SWA decode capture above.
+            self.attn_backend.capture_compress_state_windows_decode(forward_batch)
+
         return output
 
     def _maybe_execute_deferred_mamba_cow_and_clear(

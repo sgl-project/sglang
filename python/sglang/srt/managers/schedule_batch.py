@@ -1375,6 +1375,7 @@ class Req(ReqDllmMixin):
                     ),
                     req=self,
                     cow_mamba=cow_mamba,
+                    for_reuse=True,
                 )
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
@@ -2452,6 +2453,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
         )
+
+        # unified_kv SWA HiCache: restore reused sliding-window KV into each
+        # request positional ring now that req_pool_idx is known, before the
+        # first forward reads it. No-op unless a req stashed a window at
+        # load_back (see SWAComponent.restore_pending_swa_windows).
+        if self.tree_cache is not None:
+            self.tree_cache.restore_swa_windows(reqs, req_pool_indices_cpu)
 
         # Set fields
         input_embeds = []

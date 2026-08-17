@@ -1616,6 +1616,10 @@ class MQALayer(MqaAttentionBase):
                 x_quant=x_quant,
             )
 
+        # Snapshot the sliding-window KV at each page boundary from the flat
+        # post-norm+rope KV before the device ring overwrites it (host offload).
+        if kv is not None:
+            attn_backend.capture_swa_windows(self.attn_mqa.layer_id, kv, forward_batch)
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
         # None the store was already fused into _forward_prepare* (decode) or
         # done inline, so the backend skips its own store_cache; pass `q` as a
