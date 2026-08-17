@@ -23,7 +23,7 @@ matches HuggingFace ``FalconMambaMixer`` / the original ``MambaMixer``.
 Reuse strategy (to ride the existing Mamba2 attention backend, memory pool and
 kernels unchanged): the full-rank state is expressed on the Mamba2 head layout
 as ``num_heads == intermediate_size`` and ``head_dim == 1`` (see
-``Mamba2StateShape.create_mamba1``). Then:
+``Mamba2StateShape.create_full_rank``). Then:
 
   - the causal conv uses the shared ``causal_conv1d_fn`` / ``causal_conv1d_update``
     (Triton variants on XPU), exactly like Mamba2;

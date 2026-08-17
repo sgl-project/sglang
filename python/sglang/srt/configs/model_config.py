@@ -1194,23 +1194,9 @@ class ModelConfig:
             elif "BaichuanForCausalLM" in self.hf_config.architectures:
                 self.use_alibi = self.hf_config.hidden_size != 4096
 
-            # Pure state-space models (Mamba/Mamba2) use SSM mixers, not attention.
-            if "Mamba2ForCausalLM" in self.hf_config.architectures:
+            # Pure Mamba SSMs have no attention (head_dim set to 0 above).
+            if is_pure_ssm:
                 self.attention_arch = AttentionArch.SSM
-                # Cache params are built later in the model runner (needs tp_size).
-                self.hf_text_config.full_attention_layer_ids = []
-                # hybrid_arch.py keys off this flag.
-                self.hf_text_config._is_pure_mamba2 = True
-            elif any(
-                arch in self.hf_config.architectures
-                for arch in PURE_MAMBA1_ARCHITECTURES
-            ):
-                # Pure Mamba-1 (selective-scan) SSMs (Falcon-Mamba, state-spaces
-                # Mamba); the model file handles cosmetic differences.
-                self.attention_arch = AttentionArch.SSM
-                self.hf_text_config.full_attention_layer_ids = []
-                # hybrid_arch.py keys off this flag.
-                self.hf_text_config._is_pure_mamba1 = True
             else:
                 self.attention_arch = AttentionArch.MHA
 
@@ -1354,10 +1340,12 @@ class ModelConfig:
             if num_kv_heads is not None:
                 return num_kv_heads
 
+        # Mamba SSMs have no attention, so no KV heads.
+        if self.attention_arch == AttentionArch.SSM:
+            return 0
         # For non-grouped-query attention models, the number of KV heads is
         # equal to the number of attention heads.
-        # State-space models (Mamba2) have no KV heads.
-        return getattr(self.hf_text_config, "num_attention_heads", 0)
+        return self.hf_text_config.num_attention_heads
 
     def get_max_num_attention_heads(self) -> int:
         """Max per-layer query head count; num_attention_heads unless the
