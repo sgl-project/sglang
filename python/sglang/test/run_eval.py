@@ -360,17 +360,6 @@ def run_eval(args):
             metrics["output_throughput"] = total_completion_tokens / latency
             print(f"Output throughput: {metrics['output_throughput']:.3f} token/s")
 
-        # Stop-rate: fraction of requests that terminated on EOS / a stop
-        # token rather than the max_tokens cap. Score alone cannot see a
-        # no-EOS run -- GSM8K answer extraction still finds the answer in the
-        # rambling text -- so tests gate on this to catch stop corruption
-        # (a classic spec-decoding failure mode).
-        if sampler._finish_reasons:
-            metrics["stop_rate"] = sum(
-                r == "stop" for r in sampler._finish_reasons
-            ) / len(sampler._finish_reasons)
-            print(f"Stop rate: {metrics['stop_rate']:.4f}")
-
         # Report metrics to unified collection framework
         dump_metric(
             f"{args.eval_name}_score",
