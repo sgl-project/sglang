@@ -92,9 +92,9 @@ Qwen3.5-397B, Inkling-Small on GB300/B200/H200).
   per-expert decode row at r16/32/64, the per-expert prefill row and both
   shared rows, on all three models, plus r32 at tp2 and tp8): B200 picks the
   same winner as GB300 in every cell. Forcing the wrong tile costs up to 4.9%
-  on the rank rule and 5–26% for the built-in heuristics — the more local
-  experts, the more the table is worth — so the ladder earns its place on both
-  dies, at every TP measured.
+  on the rank rule and 5–26% for the built-in heuristics (the 26% is 397B
+  shared-outer at bs1), so the ladder earns its place on both dies, at every TP
+  measured.
 - The one place both dies wanted something the table did not have: at rank 32
   the M≤16 tiles keep winning up to 32 tokens, where the ladder used to fall
   to the wildcard row. `{"max_rank": 32, "max_tokens": 32}` encodes exactly
