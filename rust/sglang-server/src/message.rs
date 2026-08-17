@@ -13,7 +13,6 @@ mod egress;
 mod finish_reason;
 pub mod ids;
 mod io_struct;
-pub mod mm_payload;
 mod request;
 mod sampling;
 mod types;

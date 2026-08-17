@@ -523,7 +523,7 @@ pub struct MmRequest {
 }
 
 /// The parked request's fields the MM worker owns; converted to the driver input
-/// by [`super::mm_payload::to_mm_input`].
+/// by [`crate::multi_modality::payload::to_mm_input`].
 #[derive(Debug, Default)]
 pub struct MmWorkItem {
     pub text: Option<String>,
@@ -540,7 +540,8 @@ pub struct MmWorkItem {
 /// Whether an optional mm field counts as multimodal input, via the same
 /// `value_present` the MM worker's payload parser uses.
 fn mm_value_present(v: &Option<rmpv::Value>) -> bool {
-    v.as_ref().is_some_and(super::mm_payload::value_present)
+    v.as_ref()
+        .is_some_and(crate::multi_modality::payload::value_present)
 }
 
 /// Request variant — selects the ingress branch, scheduler wire message, and
@@ -644,7 +645,7 @@ pub struct MmData {
     pub video_data: Option<rmpv::Value>,
     pub audio_data: Option<rmpv::Value>,
     /// Bytes of `image_data`'s I/O-backed sources, resolved by
-    /// `api_server::prefetch` in `mm_payload::io_sources` order so MM workers
+    /// `api_server::prefetch` in `payload::io_sources` order so MM workers
     /// never block on I/O. Out-of-band: the values above stay as the client
     /// sent them.
     pub prefetched: Vec<bytes::Bytes>,

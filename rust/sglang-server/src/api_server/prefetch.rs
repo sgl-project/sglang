@@ -6,7 +6,7 @@
 //! file paths resolve here through `sglang-mm`'s `fetch_bytes_budgeted` (one
 //! owner for proxy/timeout/cap semantics) and ride out-of-band as
 //! [`crate::message::MmData::prefetched`], which
-//! [`crate::message::mm_payload::to_mm_input`] swaps back in.
+//! [`crate::multi_modality::payload::to_mm_input`] swaps back in.
 
 use std::sync::Arc;
 
@@ -15,8 +15,8 @@ use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted};
 use sglang_mm::driver::{MAX_ITEMS_PER_REQUEST, MAX_REQUEST_BYTES};
 use tokio::sync::Semaphore;
 
-use crate::message::mm_payload::{io_sources, item_count};
 use crate::message::{GenerateRequest, MmData};
+use crate::multi_modality::payload::{io_sources, item_count};
 
 /// Global bound on concurrent media fetches across all in-flight requests;
 /// excess acquisitions queue on the semaphore without holding a thread.

@@ -9,7 +9,7 @@ use bytes::Bytes;
 use rmpv::Value;
 use sglang_mm::driver::{ImageSource, MmInput};
 
-use super::request::MmWorkItem;
+use crate::message::MmWorkItem;
 
 /// True for sources the API layer must resolve before MM dispatch: I/O — network
 /// *or* disk, since a network mount can hang past any HTTP timeout — never runs
