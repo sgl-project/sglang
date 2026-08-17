@@ -353,13 +353,8 @@ def minimax_sparse_decode(
             q_scale=idx_q_scale,
             k_scale=idx_k_scale,
             v_scale=idx_v_scale,
-            # Only safe when no reduce step follows (idx heads == kv heads);
-            # otherwise the caller's buffer is the reduce output, not this one.
-            topk_out=(
-                topk_out
-                if (dense_main_attn_fn is None and idx_q.shape[1] == k_cache.shape[1])
-                else None
-            ),
+            # Only safe when no reduce step follows (idx heads == kv heads).
+            topk_out=(topk_out if dense_main_attn_fn is None else None),
         )
     num_idx_heads = idx_q.shape[1]
     num_kv_heads = k_cache.shape[1]
@@ -375,6 +370,13 @@ def minimax_sparse_decode(
                 topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
             )
         reduced_topk_idx = topk_idx
+        if topk_out is not None:
+            if topk_out.shape != reduced_topk_idx.shape:
+                raise ValueError(
+                    f"topk_out shape {tuple(topk_out.shape)} does not match "
+                    f"reduced top-k shape {tuple(reduced_topk_idx.shape)}"
+                )
+            topk_out.copy_(reduced_topk_idx)
         # Step 3: Sparse attention using topk index (main head). The MSA path
         # only replaces this step; keep the Triton path when sink is present.
         if use_msa and sink is None:

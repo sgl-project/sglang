@@ -128,7 +128,11 @@ def router_gemv_supported(x: torch.Tensor, w: torch.Tensor) -> bool:
     n = w.shape[0]
     _, block_n, block_k, _, _ = _config(m)
     return (
-        x.stride(1) == 1
+        x.device.type == "cuda"
+        and w.device == x.device
+        and x.dtype == torch.bfloat16
+        and w.dtype == torch.bfloat16
+        and x.stride(1) == 1
         and w.stride(1) == 1
         and n % block_n == 0
         and k % block_k == 0

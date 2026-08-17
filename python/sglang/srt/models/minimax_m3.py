@@ -456,6 +456,7 @@ class MiniMaxM3MoE(nn.Module):
                 shared_output = self._forward_shared_experts(hidden_states)
             router_logits = self._compute_router_logits(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -1649,8 +1650,6 @@ class MiniMaxM3Model(nn.Module):
             if (_is_cuda or _is_hip) and is_shared_experts_fusion_disabled()
             else None
         )
-
-        alt_stream = get_stream("alt") if _is_cuda else None
 
         def layer_fn(idx, prefix: str) -> nn.Module:
             return MiniMaxM3DecoderLayer(

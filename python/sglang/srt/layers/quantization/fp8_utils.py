@@ -546,6 +546,13 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     names a backend that owns an MXFP8 dense kernel."""
     backend = get_fp8_gemm_runner_backend()
 
+    if backend.is_bf16():
+        if not (_is_hip and _is_gfx95_supported):
+            raise RuntimeError(
+                "--fp8-gemm-backend bf16 is supported only for MXFP8 on AMD gfx950."
+            )
+        return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
+
     if backend.is_flashinfer_trtllm():
         if not (_is_sm100_supported and is_flashinfer_available()):
             raise RuntimeError(

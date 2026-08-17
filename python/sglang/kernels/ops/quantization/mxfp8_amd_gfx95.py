@@ -380,7 +380,12 @@ def dot_scaled_mxfp8_blockscaled_linear(
         if w_bf16 is None:
             w_bf16 = dequant_mxfp8_to_bf16(weight, weight_scale)
             weight._bf16_emul = w_bf16
-        out = F.linear(input.to(torch.bfloat16), w_bf16, bias)
+        if input_scale is not None:
+            input_2d = input.reshape(-1, input.shape[-1])
+            input_bf16 = dequant_mxfp8_to_bf16(input_2d, input_scale).view(*input.shape)
+        else:
+            input_bf16 = input.to(torch.bfloat16)
+        out = F.linear(input_bf16, w_bf16, bias)
         return out if output_dtype is None else out.to(output_dtype)
 
     input_2d = input.view(-1, input.shape[-1]).contiguous()

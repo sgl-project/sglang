@@ -673,8 +673,9 @@ def flash_prefill_with_topk_index(
         disable_index_value
         and score_type == "max"
         and sink is None
-        and q_scale is None
-        and k_scale is None
+        and q_scale in (None, 1.0)
+        and k_scale == 1.0
+        and block_size_k % page_size == 0
     ):
         # Source layers never use idx_o, so run the minimal
         # score-only kernel (~1.6x faster) with per-page K addressing
