@@ -259,7 +259,7 @@ def refresh_cutedsl_standard_scales_for_weight_update(
     )
     if (
         layer.quant_config.use_per_token_activation
-        and not envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        and layer._cutedsl_wrapper.quant_mode == "w4a4"
     ):
         used_input_scale = _make_per_token_global_scale(used_input_scale)
 
@@ -322,8 +322,8 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             "Install with: pip install flashinfer"
         ) from e
 
-    use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
-    if use_w4a16:
+    quant_mode = "w4a16" if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() else "w4a4"
+    if quant_mode == "w4a16":
         capability = torch.cuda.get_device_capability(layer.w13_weight.device)
         if capability not in ((10, 0), (10, 3)):
             raise ValueError(
@@ -357,6 +357,14 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     # _dummy_run which runs under inference_mode(); inference tensors cannot
     # be inplace-updated during later CUDA graph capture (which runs outside
     # inference_mode), so we must opt out here.
+    activation_type = _cutedsl_wrapper_activation_type(
+        layer.moe_runner_config.activation, ActivationType
+    )
+    use_fused_finalize = envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
+    if quant_mode == "w4a16" and activation_type == ActivationType.Swiglu:
+        # FlashInfer's gated W4A16 epilogue currently uses two-stage finalize.
+        use_fused_finalize = False
+
     with torch.inference_mode(False):
         layer._cutedsl_wrapper = CuteDslMoEWrapper(
             num_experts=layer.num_experts,
@@ -369,17 +377,15 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             output_dtype=layer.moe_runner_config.params_dtype,
             device=str(layer.w13_weight.device),
-            use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
-            activation_type=_cutedsl_wrapper_activation_type(
-                layer.moe_runner_config.activation, ActivationType
-            ),
-            quant_mode="w4a16" if use_w4a16 else "w4a4",
+            use_fused_finalize=use_fused_finalize,
+            activation_type=activation_type,
+            quant_mode=quant_mode,
         )
 
         w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
             resolve_cutedsl_standard_scales(layer)
         )
-        if layer.quant_config.use_per_token_activation and not use_w4a16:
+        if layer.quant_config.use_per_token_activation and quant_mode == "w4a4":
             used_input_scale = _make_per_token_global_scale(used_input_scale)
     layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     layer._cutedsl_input_scale = used_input_scale
@@ -436,8 +442,8 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     # v2 only: quantize hidden states with per-token dynamic activation scales.
     use_per_token_activation: bool = False
 
-    # v2 only: keep activations in BF16 and decode only the NVFP4 weights.
-    use_w4a16: bool = False
+    # v2 only: FlashInfer CuTe DSL activation/weight quantization mode.
+    quant_mode: str = "w4a4"
 
     # v1 only: SBO down-GEMM overlap args.
     down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
@@ -468,7 +474,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
 
-    if quant_info.use_w4a16:
+    if quant_info.quant_mode == "w4a16":
         if hidden_states.dtype != torch.bfloat16:
             raise TypeError(
                 "FlashInfer CuTe DSL NVFP4 W4A16 requires BF16 activations, "
@@ -477,30 +483,34 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         x_fp4 = hidden_states
         x_sf = None
         per_token_scale = None
-    elif quant_info.use_per_token_activation:
-        from flashinfer import SfLayout, nvfp4_quantize
+    elif quant_info.quant_mode == "w4a4":
+        if quant_info.use_per_token_activation:
+            from flashinfer import SfLayout, nvfp4_quantize
 
-        x_fp4, x_sf, per_token_scale = nvfp4_quantize(
-            hidden_states,
-            quant_info.a1_scale,
-            sfLayout=SfLayout.layout_linear,
-            per_token_activation=True,
-            backend="cute-dsl",
-        )
-    else:
-        x_fp4, x_sf = fp4_quantize(
-            hidden_states,
-            quant_info.a1_scale,
-            sf_vec_size=_FP4_SF_VEC_SIZE,
-            is_sf_swizzled_layout=False,
-        )
-        per_token_scale = None
+            x_fp4, x_sf, per_token_scale = nvfp4_quantize(
+                hidden_states,
+                quant_info.a1_scale,
+                sfLayout=SfLayout.layout_linear,
+                per_token_activation=True,
+                backend="cute-dsl",
+            )
+        else:
+            x_fp4, x_sf = fp4_quantize(
+                hidden_states,
+                quant_info.a1_scale,
+                sf_vec_size=_FP4_SF_VEC_SIZE,
+                is_sf_swizzled_layout=False,
+            )
+            per_token_scale = None
 
-    if not quant_info.use_w4a16:
         seq_len, hidden_size = hidden_states.shape
         x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
         x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
             seq_len, hidden_size // _FP4_SF_VEC_SIZE
+        )
+    else:
+        raise ValueError(
+            f"Unsupported Cute DSL FP4 quant mode: {quant_info.quant_mode}"
         )
 
     output = quant_info.wrapper.run(
@@ -511,7 +521,9 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         w1_weight=quant_info.w13_weight,
         w1_weight_sf=quant_info.w13_weight_sf,
         w1_alpha=quant_info.w1_alpha,
-        fc2_input_scale=None if quant_info.use_w4a16 else quant_info.a2_scale,
+        fc2_input_scale=(
+            None if quant_info.quant_mode == "w4a16" else quant_info.a2_scale
+        ),
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
@@ -555,7 +567,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
 
-    if quant_info.use_w4a16:
+    if quant_info.quant_mode == "w4a16":
         if x_sf is not None:
             raise ValueError(
                 "FlashInfer CuTe DSL NVFP4 W4A16 requires BF16 dispatch; "
@@ -568,39 +580,44 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
             )
         x_fp4 = hidden_states
         per_token_scale = None
-    elif x_sf is not None:
-        if quant_info.use_per_token_activation:
-            raise ValueError(
-                "flashinfer_cutedsl per-token activation requires BF16 dispatch "
-                "so the runner can forward per_token_scale to FlashInfer."
-            )
-        # NVFP4 dispatch, inputs are already quantized.
-        x_fp4 = hidden_states
-        per_token_scale = None
-    else:
-        if quant_info.use_per_token_activation:
-            from flashinfer import SfLayout, nvfp4_quantize
-
-            x_fp4, x_sf, per_token_scale = nvfp4_quantize(
-                hidden_states,
-                quant_info.a1_scale,
-                sfLayout=SfLayout.layout_linear,
-                per_token_activation=True,
-                backend="cute-dsl",
-            )
-        else:
-            x_fp4, x_sf = fp4_quantize(
-                hidden_states,
-                quant_info.a1_scale,
-                sf_vec_size=_FP4_SF_VEC_SIZE,
-                is_sf_swizzled_layout=False,
-            )
+    elif quant_info.quant_mode == "w4a4":
+        if x_sf is not None:
+            if quant_info.use_per_token_activation:
+                raise ValueError(
+                    "flashinfer_cutedsl per-token activation requires BF16 dispatch "
+                    "so the runner can forward per_token_scale to FlashInfer."
+                )
+            # NVFP4 dispatch, inputs are already quantized.
+            x_fp4 = hidden_states
             per_token_scale = None
+        else:
+            if quant_info.use_per_token_activation:
+                from flashinfer import SfLayout, nvfp4_quantize
 
-        seq_len, hidden_size = hidden_states.shape
-        x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
-        x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
-            seq_len, hidden_size // _FP4_SF_VEC_SIZE
+                x_fp4, x_sf, per_token_scale = nvfp4_quantize(
+                    hidden_states,
+                    quant_info.a1_scale,
+                    sfLayout=SfLayout.layout_linear,
+                    per_token_activation=True,
+                    backend="cute-dsl",
+                )
+            else:
+                x_fp4, x_sf = fp4_quantize(
+                    hidden_states,
+                    quant_info.a1_scale,
+                    sf_vec_size=_FP4_SF_VEC_SIZE,
+                    is_sf_swizzled_layout=False,
+                )
+                per_token_scale = None
+
+            seq_len, hidden_size = hidden_states.shape
+            x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
+            x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
+                seq_len, hidden_size // _FP4_SF_VEC_SIZE
+            )
+    else:
+        raise ValueError(
+            f"Unsupported Cute DSL FP4 quant mode: {quant_info.quant_mode}"
         )
 
     output = quant_info.wrapper.run(
@@ -611,7 +628,9 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         w1_weight=quant_info.w13_weight,
         w1_weight_sf=quant_info.w13_weight_sf,
         w1_alpha=quant_info.w1_alpha,
-        fc2_input_scale=None if quant_info.use_w4a16 else quant_info.a2_scale,
+        fc2_input_scale=(
+            None if quant_info.quant_mode == "w4a16" else quant_info.a2_scale
+        ),
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
@@ -634,11 +653,6 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
     quant_info: CuteDslFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> DeepEPLLCombineInput:
-    if quant_info.use_w4a16:
-        raise ValueError(
-            "FlashInfer CuTe DSL NVFP4 W4A16 does not support the DeepEP "
-            "masked MoE path. Use moe_a2a_backend='none' or 'flashinfer'."
-        )
     from sglang.srt.layers.moe.flashinfer_cutedsl_moe import (
         flashinfer_cutedsl_moe_masked,
     )

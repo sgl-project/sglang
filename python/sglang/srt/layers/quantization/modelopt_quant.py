@@ -2852,7 +2852,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # with [Up, Gate] interleaved weights and MMA blockscales.
             ensure_cutedsl_wrapper(layer)
             w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_scales
-            use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+            quant_mode = layer._cutedsl_wrapper.quant_mode
             quant_info = CuteDslFp4MoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -2868,9 +2868,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 a2_scale=fc2_input_scale,
                 wrapper=layer._cutedsl_wrapper,
                 use_per_token_activation=(
-                    self.quant_config.use_per_token_activation and not use_w4a16
+                    self.quant_config.use_per_token_activation and quant_mode == "w4a4"
                 ),
-                use_w4a16=use_w4a16,
+                quant_mode=quant_mode,
             )
             return self.runner.run(dispatch_output, quant_info)
 
