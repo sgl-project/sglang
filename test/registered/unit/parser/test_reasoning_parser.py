@@ -179,6 +179,50 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         self.assertEqual(detector._buffer, "")
         self.assertEqual(detector.finish().reasoning_text, "")
 
+    def test_parse_malformed_nested_tags(self):
+        """Parse nested reasoning tags without corrupting normal text."""
+        text = "<think>first<think>second</think>normal"
+
+        result = self.detector.detect_and_parse(text)
+
+        self.assertEqual(result.reasoning_text, "first<think>second")
+        self.assertEqual(result.normal_text, "normal")
+
+    def test_parse_unicode_grapheme_streaming_chunks(self):
+        """Handle Unicode grapheme clusters across streaming increments."""
+        grapheme = "e\u0301"  # "e" + combining acute accent
+
+        chunk1 = "<think>Unicode: e"
+        chunk2 = "\u0301 text</think>final response"
+
+        result1 = self.detector.parse_streaming_increment(chunk1)
+        self.assertEqual(result1.reasoning_text, "Unicode: e")
+        self.assertEqual(result1.normal_text, "")
+
+        result2 = self.detector.parse_streaming_increment(chunk2)
+        self.assertEqual(result2.reasoning_text, "\u0301 text")
+        self.assertEqual(result2.normal_text, "final response")
+
+        detector = BaseReasoningFormatDetector("<think>", "</think>")
+        streamed_reasoning = ""
+        streamed_normal = ""
+
+        for chunk in [chunk1, chunk2]:
+            result = detector.parse_streaming_increment(chunk)
+            streamed_reasoning += result.reasoning_text
+            streamed_normal += result.normal_text
+
+        final_result = detector.finish()
+        streamed_reasoning += final_result.reasoning_text
+        streamed_normal += final_result.normal_text
+
+        full_result = detector.detect_and_parse(
+            f"<think>Unicode: {grapheme} text</think>final response"
+        )
+
+        self.assertEqual(full_result.reasoning_text, streamed_reasoning)
+        self.assertEqual(full_result.normal_text, streamed_normal)
+
 
 class TestDeepSeekR1Detector(CustomTestCase):
     def setUp(self):
