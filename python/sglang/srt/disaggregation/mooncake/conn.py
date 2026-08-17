@@ -1658,6 +1658,21 @@ class MooncakeKVManager(CommonKVManager):
                     self._staging_outstanding[kv_chunk.room] += 1
                     kv_chunk.staging_counted = True
 
+                if kv_chunk.wait_event is not None:
+                    kv_chunk.wait_event.synchronize()
+                    if (
+                        kv_chunk.room not in self.request_status
+                        or self.check_status(kv_chunk.room) == KVPoll.Failed
+                    ):
+                        self._staging_outstanding.pop(kv_chunk.room, None)
+                        if self.enable_trace:
+                            kv_chunk.trace_ctx.trace_slice_end(
+                                MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
+                                MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
+                                thread_finish_flag=True,
+                            )
+                        continue
+
                 if (
                     self.enable_staging
                     and staging_strategy is None
@@ -2147,6 +2162,7 @@ class MooncakeKVManager(CommonKVManager):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        wait_event: Optional[object] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2185,6 +2201,7 @@ class MooncakeKVManager(CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                wait_event=wait_event,
                 trace_ctx=trace_ctx,
             )
         )
@@ -2266,6 +2283,7 @@ class MooncakeKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        wait_event: Optional[object] = None,
     ):
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
@@ -2281,6 +2299,7 @@ class MooncakeKVSender(CommonKVSender):
                 False,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                wait_event=wait_event,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -2292,6 +2311,7 @@ class MooncakeKVSender(CommonKVSender):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                wait_event=wait_event,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 

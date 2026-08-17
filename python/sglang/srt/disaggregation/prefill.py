@@ -634,9 +634,15 @@ class SchedulerDisaggregationPrefillMixin:
                     self.maybe_prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
                 self._apply_war_barrier()
+                defer_middle_chunk_transfer = (
+                    batch_result.delay_sample_func is not None
+                )
+                if not defer_middle_chunk_transfer:
+                    self._enqueue_middle_chunk_transfer(batch, batch_result)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+                defer_middle_chunk_transfer = False
 
             # Process the last batch
             if self.last_batch:
@@ -651,9 +657,42 @@ class SchedulerDisaggregationPrefillMixin:
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result, batch)
+            if defer_middle_chunk_transfer:
+                # Delayed sampling records copy_done here, not in run_batch.
+                self._enqueue_middle_chunk_transfer(batch, batch_result)
 
             # Update last_batch
             self.last_batch = batch
+
+    def _enqueue_middle_chunk_transfer(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> bool:
+        """Enqueue a pure middle chunk immediately after its GPU launch.
+
+        The backend worker waits on the already-recorded ``result.copy_done``,
+        which is ordered after this batch's forward. This starts transfer as
+        soon as the KV is ready while preserving the scheduler's existing
+        one-step overlap window.
+        """
+        if batch.contains_last_prefill_chunk or result.copy_done is None:
+            return False
+
+        req = batch.chunked_req
+        assert req is not None and batch.reqs == [req]
+        if req.pending_bootstrap or is_aborted(req):
+            return False
+        assert (
+            req.metadata_buffer_index >= 0
+        ), f"Req {req.rid} does not have metadata buffer allocated"
+        self.send_kv_chunk(
+            req,
+            last_chunk=False,
+            end_idx=min(req.extend_range.end, len(req.origin_input_ids)),
+            wait_event=result.copy_done,
+        )
+        return True
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -810,9 +849,13 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                         logprob_pt += num_input_logprobs
 
-                # In non-overlap-mode, KV is sent in process_prefill_chunk
-                # Only send when req's sender is initialized
-                if self.enable_overlap and not req.pending_bootstrap:
+                # Middle chunks are normally enqueued immediately after launch.
+                # Keep this as the fallback for paths that could not enqueue then.
+                if (
+                    self.enable_overlap
+                    and not req.pending_bootstrap
+                    and req.start_send_idx < req.tmp_end_idx
+                ):
                     assert (
                         req.metadata_buffer_index >= 0
                     ), f"Req {req.rid} does not have metadata buffer allocated"
@@ -1075,7 +1118,8 @@ class SchedulerDisaggregationPrefillMixin:
                         self.optimistic_release_and_requeue(req)
                 # else: still bootstrapping, keep computing without sending
             elif self.enable_overlap:
-                # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
+                # Snapshot the completed boundary. The next iteration enqueues
+                # this range with the producer batch's completion event.
                 req.tmp_end_idx = min(
                     req.extend_range.end,
                     len(req.origin_input_ids),
@@ -1133,14 +1177,18 @@ class SchedulerDisaggregationPrefillMixin:
         if self.enable_overlap:
             ev = torch.cuda.Event()
             ev.record(self.forward_stream)
-            req.disagg_kv_sender._early_send_wait_event = ev
-        self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+        else:
+            ev = None
+        self.send_kv_chunk(
+            req, last_chunk=False, end_idx=cached_end, wait_event=ev
+        )
 
     def send_kv_chunk(
         self: Scheduler,
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        wait_event: Optional[object] = None,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
@@ -1317,6 +1365,7 @@ class SchedulerDisaggregationPrefillMixin:
                 page_indices,
                 state_indices if segment_is_last else None,
                 num_kv_tokens=seg_end - seg_start,
+                wait_event=wait_event,
             )
         req.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has

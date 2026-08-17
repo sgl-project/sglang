@@ -1123,12 +1123,18 @@ class NixlKVManager(CommonKVManager):
                     self._staging_outstanding.pop(room, None)
                     continue
 
-                assert room in self.transfer_infos
-
                 # Count each chunk once; the flag survives re-enqueue on defer.
                 if not kv_chunk.staging_counted:
                     self._staging_outstanding[room] += 1
                     kv_chunk.staging_counted = True
+
+                if kv_chunk.wait_event is not None:
+                    kv_chunk.wait_event.synchronize()
+                    if self.check_status(room) == KVPoll.Failed:
+                        self._staging_outstanding.pop(room, None)
+                        continue
+
+                assert room in self.transfer_infos
 
                 # Lazily build a per-worker staging strategy bound to this
                 # worker's private staging buffer (matches mooncake).
@@ -2399,6 +2405,7 @@ class NixlKVManager(CommonKVManager):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        wait_event: Optional[object] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2430,6 +2437,7 @@ class NixlKVManager(CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                wait_event=wait_event,
             )
         )
         return None
@@ -2757,6 +2765,7 @@ class NixlKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        wait_event: Optional[object] = None,
     ):
         if self._send_failed:
             return
@@ -2781,6 +2790,7 @@ class NixlKVSender(CommonKVSender):
             self.aux_index,
             state_indices,
             num_kv_tokens,
+            wait_event,
         )
         self._record_transfer_indices(kv_indices, state_indices)
         self.chunk_id += 1

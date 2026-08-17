@@ -1165,9 +1165,8 @@ class Req(ReqDllmMixin):
         # start_send_idx = req.extend_range.end
         self.start_send_idx: int = 0
 
-        # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
-        # This is because kv is not ready in `process_prefill_chunk`.
-        # We use `tmp_end_idx` to store the end index of the kv cache to send.
+        # Fallback boundary for overlap paths that cannot enqueue this middle
+        # chunk immediately after launch (for example, optimistic bootstrap).
         self.tmp_end_idx: int = -1
         # Decode-side cached-prefix length; base of the staging chunk grid
         # (start_send_idx starts here but advances with every send).

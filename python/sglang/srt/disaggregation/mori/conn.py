@@ -1418,6 +1418,7 @@ class MoriKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        wait_event: Optional[object] = None,
     ):
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
@@ -1431,8 +1432,6 @@ class MoriKVSender(CommonKVSender):
             else None
         )
         self._record_transfer_indices(kv_indices, state_indices)
-        wait_event = getattr(self, "_early_send_wait_event", None)
-        self._early_send_wait_event = None
         self.kv_mgr.enqueue_transfer(
             _TransferChunk(
                 sender=self,
@@ -1463,6 +1462,11 @@ class MoriKVSender(CommonKVSender):
         # issuing the RDMA read (early-send overlaps that forward).
         if task.wait_event is not None:
             task.wait_event.synchronize()
+            if self.conclude_state is not None:
+                return
+            if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed:
+                self._finalize_failure()
+                return
 
         statuses, infos = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
