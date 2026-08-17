@@ -351,12 +351,9 @@ class MHATokenToKVPoolHost(HostKVCache):
             if self.layout == "page_first_direct":
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
                 if host_layer_id == 0:
-                    for (
-                        device_k,
-                        device_v,
-                        host_k,
-                        host_v,
-                    ) in self._npu_transfer_buffers(device_pool):
+                    for device_k, device_v, host_k, host_v in self._npu_transfer_buffers(
+                        device_pool
+                    ):
                         transfer_kv_dim_exchange(
                             device_indices=device_indices,
                             host_indices=host_indices,

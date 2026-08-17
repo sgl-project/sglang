@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -28,6 +29,8 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
+transfer_state_per_layer_direct_pf_lf = None
+transfer_state_all_layer_direct_lf_pf = None
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
@@ -44,9 +47,29 @@ if _is_cuda or _is_hip:
         transfer_kv_mamba_pf_lf,
     )
 if _is_npu:
-    pass
+    try:
+        from sgl_kernel_npu.kvcacheio import (
+            transfer_state_all_layer_direct_lf_pf,
+            transfer_state_per_layer_direct_pf_lf,
+        )
+    except ImportError:
+        pass
 
 logger = logging.getLogger(__name__)
+
+
+_NPU_HICACHE_MAMBA_IO_ENV = "SGLANG_NPU_HICACHE_MAMBA_IO"
+_NPU_HICACHE_MAMBA_IO_MODES = {"sync", "async"}
+
+
+def _npu_hicache_mamba_io_mode() -> str:
+    mode = os.getenv(_NPU_HICACHE_MAMBA_IO_ENV, "sync").strip().lower()
+    if mode not in _NPU_HICACHE_MAMBA_IO_MODES:
+        raise ValueError(
+            f"{_NPU_HICACHE_MAMBA_IO_ENV} must be one of "
+            f"{sorted(_NPU_HICACHE_MAMBA_IO_MODES)}, got {mode!r}."
+        )
+    return mode
 
 
 from sglang.srt.mem_cache.pool_host import HostKVCache
@@ -154,9 +177,35 @@ class MambaPoolHost(HostKVCache):
         ]
 
         self.init_kv_buffer()
+        self._configure_npu_mamba_io()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
+
+    def _configure_npu_mamba_io(self) -> None:
+        mode = _npu_hicache_mamba_io_mode()
+        if mode == "sync":
+            logger.info("NPU HiCache Mamba state transfer mode: sync torch fallback.")
+            return
+
+        required_ops = (
+            transfer_state_per_layer_direct_pf_lf,
+            transfer_state_all_layer_direct_lf_pf,
+        )
+        required_torch_ops = (
+            "transfer_state_per_layer_direct_pf_lf",
+            "transfer_state_all_layer_direct_lf_pf",
+        )
+        if any(op is None for op in required_ops) or any(
+            not hasattr(torch.ops.npu, op_name) for op_name in required_torch_ops
+        ):
+            raise RuntimeError(
+                "NPU HiCache Mamba async state transfer requires "
+                "the per-layer PF->LF and all-layer LF->PF direct operators "
+                "from sgl-kernel-npu."
+            )
+
+        logger.info("NPU HiCache Mamba state transfer mode: native async.")
 
     def init_kv_buffer(self):
         _host_alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
@@ -378,6 +427,23 @@ class MambaPoolHost(HostKVCache):
                 layer_id=layer_id,
                 page_size=1,
             )
+        elif io_backend == "kernel_ascend":
+            if _npu_hicache_mamba_io_mode() == "async":
+                transfer_state_per_layer_direct_pf_lf(
+                    src=src,
+                    dst=dst,
+                    src_indices=src_indices,
+                    dst_indices=dst_indices,
+                    layer_id=layer_id,
+                )
+            else:
+                host_indices = src_indices.to(dtype=torch.int64, device=src.device)
+                device_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
+                # Host: [slot, layer, 1, *state]; device: [slot, *state].
+                values = (
+                    src.select(1, layer_id).index_select(0, host_indices).select(1, 0)
+                )
+                dst.index_copy_(0, device_indices, values.to(device=dst.device))
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -421,6 +487,28 @@ class MambaPoolHost(HostKVCache):
                 dst_indices=dst_indices,
                 page_size=1,
             )
+        elif io_backend == "kernel_ascend":
+            if _npu_hicache_mamba_io_mode() == "async":
+                transfer_state_all_layer_direct_lf_pf(
+                    device_states=[src_layers],
+                    host_states=[dst],
+                    device_indices=src_indices,
+                    host_indices=dst_indices,
+                )
+            else:
+                device_indices = src_indices.to(
+                    dtype=torch.int64, device=src_layers.device
+                )
+                host_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
+                # Device: [layer, slot, *state]; host: [slot, layer, 1, *state].
+                values = (
+                    src_layers.index_select(1, device_indices)
+                    .movedim(0, 1)
+                    .unsqueeze(2)
+                    .contiguous()
+                    .to(device=dst.device)
+                )
+                dst.index_copy_(0, host_indices, values)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
