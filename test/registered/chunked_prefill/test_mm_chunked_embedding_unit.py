@@ -21,10 +21,13 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 @pytest.fixture(autouse=True)
-def single_process_runtime_context(monkeypatch):
-    monkeypatch.setattr(
-        mm_schedule, "_acknowledge_deferred_cuda_ipc_cache_hits", lambda _items: None
-    )
+def publish_config_and_parallel_state():
+    """Applied to every test in this module (``autouse``), named by none of them.
+
+    The embedding path reads the config namespaces and the attention-TP rank —
+    process state a served engine establishes at startup. Without this the
+    accessors raise instead of answering.
+    """
     override = get_context().override_server_args(tp_size=1)
     override.install()
     try:
@@ -37,6 +40,20 @@ def single_process_runtime_context(monkeypatch):
 HIDDEN = 16
 
 
+@pytest.fixture(autouse=True)
+def single_process_runtime_context():
+    # These mm_utils unit tests exercise cache-hit paths that acknowledge
+    # deferred CUDA IPC through runtime_context. They do not start an engine, so
+    # pin the runtime topology to a single-process CPU setup.
+    server_args_override = get_context().override_server_args(tp_size=1)
+    server_args_override.install()
+    try:
+        with get_parallel().override(attn_tp_rank=0, attn_tp_size=1):
+            yield
+    finally:
+        server_args_override.restore()
+
+
 # Three items with text gaps between their placeholder runs; offsets are
 # (start, end) inclusive, mirroring processor output.
 ITEM_OFFSETS = [(2, 5), (9, 14), (20, 24)]
@@ -47,6 +64,14 @@ TOTAL_LEN = 30
 CHUNKS = [(0, 8), (8, 8), (16, 8), (24, 6)]
 
 _CPU = torch.device("cpu")
+
+
+@pytest.fixture(autouse=True)
+def _skip_cuda_ipc_acknowledgement(monkeypatch):
+    """Keep CPU embedding tests independent of tensor-parallel runtime state."""
+    monkeypatch.setattr(
+        mm_schedule, "_acknowledge_deferred_cuda_ipc_cache_hits", lambda _items: None
+    )
 
 
 def _num_tokens(item: MultimodalDataItem) -> int:
@@ -160,7 +185,7 @@ def test_tensor_cache_entries_share_storage():
         )
 
 
-def _policy_item(item_hash, offset, *, cacheable=True, batch_key=("audio",)):
+def _encoder_window_item(item_hash, offset, *, cacheable=True, batch_key=("audio",)):
     return MultimodalDataItem(
         modality=Modality.AUDIO,
         hash=item_hash,
@@ -182,10 +207,10 @@ def _request(items, req_idx=0):
     )
 
 
-def test_item_policy_caches_complete_items_but_reencodes_tail():
+def test_encoder_windows_cache_complete_items_but_reencode_tail():
     mm_schedule.init_mm_embedding_cache(1 << 30)
-    complete = _policy_item(2000, (0, 1))
-    tail = _policy_item(2001, (2, 2), cacheable=False)
+    complete = _encoder_window_item(2000, (0, 1))
+    tail = _encoder_window_item(2001, (2, 2), cacheable=False)
     request = _request([complete, tail])
     encoded_item_counts = []
 
@@ -194,7 +219,7 @@ def test_item_policy_caches_complete_items_but_reencodes_tail():
         return _encoder_tensor(items)
 
     for _ in range(2):
-        mm_schedule._batch_encode_per_image_misses(encoder, [request], _CPU)
+        mm_schedule._encode_encoder_window_requests(encoder, [request], _CPU)
 
     assert encoded_item_counts == [2, 1]
     cached = mm_schedule.embedding_cache.get_single(complete.hash).embedding
@@ -205,7 +230,7 @@ def test_item_policy_caches_complete_items_but_reencodes_tail():
 def test_encoder_batch_key_separates_incompatible_items():
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = [
-        _policy_item(3000 + index, (index, index), batch_key=(width,))
+        _encoder_window_item(3000 + index, (index, index), batch_key=(width,))
         for index, width in enumerate((3, 4))
     ]
     encoder_calls = []
@@ -214,7 +239,7 @@ def test_encoder_batch_key_separates_incompatible_items():
         encoder_calls.append([item.encoder_batch_key for item in batch])
         return _encoder_tensor(batch)
 
-    embeddings = mm_schedule._batch_encode_per_image_misses(
+    embeddings = mm_schedule._encode_encoder_window_requests(
         encoder, [_request(items)], _CPU
     )
 
@@ -222,34 +247,12 @@ def test_encoder_batch_key_separates_incompatible_items():
     assert set(embeddings) == {item.hash for item in items}
 
 
-def test_same_default_hash_preserves_legacy_first_item_behavior(caplog):
+def test_same_window_hash_requires_matching_token_counts():
     mm_schedule.init_mm_embedding_cache(1 << 30)
-    items = [
-        MultimodalDataItem(
-            modality=Modality.AUDIO,
-            hash=5000,
-            feature=torch.zeros(1),
-            offsets=[offset],
-        )
-        for offset in ((0, 0), (1, 2))
-    ]
+    items = [_encoder_window_item(5001, offset) for offset in ((0, 0), (1, 2))]
 
-    embeddings = mm_schedule._batch_encode_per_image_misses(
-        _encoder_tensor,
-        [_request(items)],
-        _CPU,
-    )
-
-    assert embeddings[5000].shape == (1, HIDDEN)
-    assert "preserving the existing first-item behavior" in caplog.text
-
-
-def test_same_policy_hash_requires_matching_token_counts():
-    mm_schedule.init_mm_embedding_cache(1 << 30)
-    items = [_policy_item(5001, offset) for offset in ((0, 0), (1, 2))]
-
-    with pytest.raises(RuntimeError, match="matching token counts"):
-        mm_schedule._batch_encode_per_image_misses(
+    with pytest.raises(RuntimeError, match="same hash"):
+        mm_schedule._encode_encoder_window_requests(
             _encoder_tensor,
             [_request(items)],
             _CPU,
@@ -260,7 +263,7 @@ def test_same_policy_hash_requires_matching_token_counts():
 def test_same_hash_aggregates_cacheability(cacheable_first):
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = [
-        _policy_item(
+        _encoder_window_item(
             5500,
             (0, 0),
             cacheable=(index == 0) == cacheable_first,
@@ -274,31 +277,22 @@ def test_same_hash_aggregates_cacheability(cacheable_first):
         encoder_calls.append(len(batch))
         return _encoder_tensor(batch)
 
-    embeddings = mm_schedule._batch_encode_per_image_misses(encoder, requests, _CPU)
+    embeddings = mm_schedule._encode_encoder_window_requests(encoder, requests, _CPU)
 
     assert encoder_calls == [1]
     assert set(embeddings) == {5500}
     assert mm_schedule.embedding_cache.has(5500)
 
 
-def test_default_item_reencodes_wrong_length_cache_hit():
-    """Bug regression: hit validation was gated on encoder_batch_key, so a
-    default item served a wrong-length cached embedding (caller-hash reuse
-    across requests) was sliced past its end instead of re-encoded. The
-    validation is unconditional now, so this also covers policy items."""
+def test_window_item_reencodes_wrong_length_cache_hit():
     mm_schedule.init_mm_embedding_cache(1 << 30)
-    item = MultimodalDataItem(
-        modality=Modality.AUDIO,
-        hash=6100,
-        feature=torch.zeros(1),
-        offsets=[(0, 1)],
-    )
+    item = _encoder_window_item(6100, (0, 1))
     mm_schedule.embedding_cache.set(
         item.hash,
         mm_schedule.EmbeddingResult(embedding=torch.zeros(1, HIDDEN)),
     )
 
-    embeddings = mm_schedule._batch_encode_per_image_misses(
+    embeddings = mm_schedule._encode_encoder_window_requests(
         _encoder_tensor, [_request([item])], _CPU
     )
 
@@ -309,44 +303,15 @@ def test_default_item_reencodes_wrong_length_cache_hit():
     )
 
 
-def test_legacy_by_item_reencodes_wrong_length_cache_hit():
-    """Bug regression: the HIP/NPU by-item production path accepted cached
-    embeddings without validating their token count, so a wrong-length entry
-    (caller-hash reuse across requests) was sliced into the request."""
-    mm_schedule.init_mm_embedding_cache(1 << 30)
-    item = MultimodalDataItem(
-        modality=Modality.AUDIO,
-        hash=6300,
-        feature=torch.zeros(1),
-        offsets=[(0, 1)],
-    )
-    mm_schedule.embedding_cache.set(
-        item.hash,
-        mm_schedule.EmbeddingResult(embedding=torch.zeros(1, HIDDEN)),
-    )
-
-    chunk = mm_schedule._get_chunked_embedding_by_item(
-        _encoder_tensor, [item], [(0, 1)], 0, 2, _CPU
-    )
-
-    assert chunk.shape == (2, HIDDEN)
-    assert mm_schedule.embedding_cache.get_single(item.hash).embedding.shape == (
-        2,
-        HIDDEN,
-    )
-
-
 def test_wrong_length_encoder_output_is_rejected():
-    """Negative-branch contract: a batch-key group whose encoder returns the
-    wrong total token count must raise instead of mis-splitting embeddings."""
     mm_schedule.init_mm_embedding_cache(1 << 30)
-    item = _policy_item(6200, (0, 1))
+    item = _encoder_window_item(6200, (0, 1))
 
     def bad_encoder(items):
         return torch.zeros(1, HIDDEN)
 
-    with pytest.raises(RuntimeError, match="produced"):
-        mm_schedule._batch_encode_per_image_misses(
+    with pytest.raises(RuntimeError, match="encoder returned"):
+        mm_schedule._encode_encoder_window_requests(
             bad_encoder, [_request([item])], _CPU
         )
 

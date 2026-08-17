@@ -212,24 +212,23 @@ def _build_audio_window_items(
         # The mutable tail changes every request and must not evict reusable
         # complete-window embeddings, even though its Radix identity is valid.
         use_embedding_cache = index < complete_window_count
-        mm_items.append(
-            MultimodalDataItem(
-                modality=Modality.AUDIO,
-                hash=item_hash,
-                offsets=[(offset_start, offset_end)],
-                feature=window.feature,
-                use_embedding_cache=use_embedding_cache,
-                encoder_batch_key=(
-                    tuple(window.feature.shape[1:]),
-                    str(window.feature.dtype),
-                    tuple(window.attention_mask.shape[1:]),
-                    str(window.attention_mask.dtype),
-                ),
-                model_specific_data={
-                    _ITEM_ATTENTION_MASK_KEY: window.attention_mask,
-                },
-            )
+        item = MultimodalDataItem(
+            modality=Modality.AUDIO,
+            offsets=[(offset_start, offset_end)],
+            feature=window.feature,
+            use_embedding_cache=use_embedding_cache,
+            encoder_batch_key=(
+                tuple(window.feature.shape[1:]),
+                str(window.feature.dtype),
+                tuple(window.attention_mask.shape[1:]),
+                str(window.attention_mask.dtype),
+            ),
+            model_specific_data={
+                _ITEM_ATTENTION_MASK_KEY: window.attention_mask,
+            },
         )
+        item.set_hash(item_hash)
+        mm_items.append(item)
         offset_start = offset_end + 1
 
     return mm_items, expanded_ids

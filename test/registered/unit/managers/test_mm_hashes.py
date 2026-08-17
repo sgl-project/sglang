@@ -30,6 +30,15 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestMmHashesContract(CustomTestCase):
+    def test_generate_req_input_accepts_mm_hashes(self):
+        """GenerateReqInput exposes mm_hashes as an optional field."""
+        req = GenerateReqInput(
+            text="hi",
+            image_data=["http://example.com/img.png"],
+            mm_hashes=["deadbeefcafe1234"],
+        )
+        self.assertEqual(req.mm_hashes, ["deadbeefcafe1234"])
+
     def test_generate_req_input_defaults_mm_hashes_to_none(self):
         """Absent mm_hashes preserves existing (None) behavior."""
         req = GenerateReqInput(text="hi")
@@ -62,25 +71,29 @@ class TestMmHashesContract(CustomTestCase):
         self.assertEqual(len(req[1].mm_content_hashes), 2)
 
     def test_set_pad_value_honors_preset_hash(self):
-        """Disabling automatic hashing must not replace a producer hash."""
+        """set_pad_value() must use a pre-set hash without recomputing."""
         item = MultimodalDataItem(modality=Modality.IMAGE, hash=0xDEADBEEF)
         # If hash_feature is invoked, the test fails — we patch it to
         # raise so any accidental recompute is loud.
-        with (
-            patch(
-                "sglang.srt.environ.envs.SGLANG_MM_SKIP_COMPUTE_HASH.get",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.managers.mm_utils.hash_feature",
-                side_effect=AssertionError(
-                    "hash_feature must NOT be called when hash is preset"
-                ),
+        with patch(
+            "sglang.srt.managers.mm_utils.hash_feature",
+            side_effect=AssertionError(
+                "hash_feature must NOT be called when hash is preset"
             ),
         ):
             item.set_pad_value()
         self.assertEqual(item.hash, 0xDEADBEEF)
         self.assertEqual(item.pad_value, _compute_pad_value(0xDEADBEEF))
+
+    def test_set_pad_value_is_deterministic_across_items(self):
+        """Two items with the same preset hash must derive the same pad_value."""
+        a = MultimodalDataItem(modality=Modality.IMAGE, hash=0x123456789ABCDEF0)
+        b = MultimodalDataItem(modality=Modality.IMAGE, hash=0x123456789ABCDEF0)
+        # No feature payload — set_pad_value uses the preset hash.
+        a.set_pad_value()
+        b.set_pad_value()
+        self.assertEqual(a.pad_value, b.pad_value)
+        self.assertEqual(a.hash, b.hash)
 
     def test_set_pad_value_distinguishes_different_preset_hashes(self):
         """Distinct preset hashes must produce distinct pad_values."""
