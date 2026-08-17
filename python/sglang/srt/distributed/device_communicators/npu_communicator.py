@@ -69,3 +69,10 @@ class NpuCommunicator:
             input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
         )
         return output_tensor
+
+    def all_to_all(self, x: torch.Tensor) -> torch.Tensor:
+        input_list = [t.contiguous() for t in torch.tensor_split(x, self.world_size, 0)]
+        output_list = [torch.empty_like(input_list[i]) for i in range(self.world_size)]
+        dist.all_to_all(output_list, input_list, group=self.group)
+        output_tensor = torch.cat(output_list, dim=-1).contiguous()
+        return output_tensor

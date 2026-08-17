@@ -248,8 +248,12 @@ class VocabParallelEmbedding(torch.nn.Module):
                 tp_rank = get_parallel().attn_tp_rank
                 self.tp_size = get_parallel().attn_tp_size
             else:
-                tp_rank = get_parallel().tp_rank
-                self.tp_size = get_parallel().tp_size
+                if envs.SGLANG_LM_HEAD_TP.get() > 1:
+                    tp_rank = get_parallel().lmhead_tp_rank
+                    self.tp_size = get_parallel().lmhead_tp_size
+                else:
+                    tp_rank = get_parallel().tp_rank
+                    self.tp_size = get_parallel().tp_size
         else:
             assert use_attn_tp_group is False
             tp_rank = 0
