@@ -1814,27 +1814,8 @@ class DeepseekV2AttentionMLA(
 
         self.skip_topk = None
         self.next_skip_topk = None
+        self.indexer = None
         if self.use_dsa:
-            is_neox_style = not getattr(config, "indexer_rope_interleave", False)
-            self.indexer = Indexer(
-                hidden_size=hidden_size,
-                index_n_heads=get_dsa_index_n_heads(config),
-                index_head_dim=get_dsa_index_head_dim(config),
-                rope_head_dim=qk_rope_head_dim,
-                index_topk=get_dsa_index_topk(config),
-                q_lora_rank=q_lora_rank,
-                max_position_embeddings=max_position_embeddings,
-                rope_theta=rope_theta,
-                scale_fmt="ue8m0",
-                block_size=128,
-                rope_scaling=rope_scaling,
-                is_neox_style=is_neox_style,
-                prefix=add_prefix("indexer", prefix),
-                quant_config=quant_config,
-                layer_id=layer_id,
-                alt_stream=alt_stream,
-                config=config,
-            )
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
@@ -1842,13 +1823,30 @@ class DeepseekV2AttentionMLA(
                 self.skip_topk = True
                 self.next_skip_topk = True
             else:
-                index_cli_factor = getattr(config, "cli_factor", 1)
-                if index_cli_factor > 1:
-                    self.skip_topk = layer_id % index_cli_factor != 0
-                    self.next_skip_topk = (layer_id + 1) % index_cli_factor != 0
-                else:
-                    self.skip_topk = dsa_layer_skips_topk(config, layer_id)
-                    self.next_skip_topk = dsa_layer_skips_topk(config, layer_id + 1)
+                self.skip_topk = dsa_layer_skips_topk(config, layer_id)
+                self.next_skip_topk = dsa_layer_skips_topk(config, layer_id + 1)
+
+            if not self.skip_topk or is_nextn:
+                is_neox_style = not getattr(config, "indexer_rope_interleave", False)
+                self.indexer = Indexer(
+                    hidden_size=hidden_size,
+                    index_n_heads=get_dsa_index_n_heads(config),
+                    index_head_dim=get_dsa_index_head_dim(config),
+                    rope_head_dim=qk_rope_head_dim,
+                    index_topk=get_dsa_index_topk(config),
+                    q_lora_rank=q_lora_rank,
+                    max_position_embeddings=max_position_embeddings,
+                    rope_theta=rope_theta,
+                    scale_fmt="ue8m0",
+                    block_size=128,
+                    rope_scaling=rope_scaling,
+                    is_neox_style=is_neox_style,
+                    prefix=add_prefix("indexer", prefix),
+                    quant_config=quant_config,
+                    layer_id=layer_id,
+                    alt_stream=alt_stream,
+                    config=config,
+                )
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -2983,9 +2981,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, DeepseekV2MoE)
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, DeepseekV2MoE)
             }
         )
         self.capture_aux_hidden_states = False

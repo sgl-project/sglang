@@ -1,3 +1,4 @@
+import bisect
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Set, Tuple
@@ -5,9 +6,19 @@ from typing import Any, Dict, List, Set, Tuple
 import torch
 from torch.distributed.tensor import DTensor
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    COMPONENT_RESIDENCY_GROUPS,
+    LAYERWISE_OFFLOAD,
+    ComponentResidencyError,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
+    RESIDENCY_POLICIES,
+    RESIDENCY_POLICY_LEADING,
+    RESIDENCY_POLICY_STRIDED,
+    is_dit_component_name,
     layerwise_component_matches_any_selection,
     normalize_layerwise_offload_components,
 )
@@ -16,6 +27,56 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def compute_streamed_layers(
+    *, num_layers: int, resident_layers: int, policy: str
+) -> tuple[int, ...]:
+    """Which layer indices are streamed rather than held on the GPU.
+
+    Both policies stream the same *count* of layers, so they cost the same
+    memory and move the same bytes. They differ only in when those bytes move:
+
+    ``leading``  keeps layers ``0..r-1`` and streams the tail. Every streamed
+                 layer sits next to another streamed layer, so the transfers
+                 arrive as one burst confined to the last ``(n-r)/n`` of the
+                 step, and each has exactly one layer of compute to hide behind.
+
+    ``strided``  spreads the streamed layers evenly across the whole step, so
+                 the same bytes move over ``n`` layers instead of ``n-r`` and
+                 the peak concurrent traffic drops by ``n/(n-r)``.
+
+    What that buys is contention, not bandwidth and not stalls. Profiling the
+    two policies on an 8-GPU run shows the same HtoD volume to within 0.1%, the
+    copy engines about half idle in both, and only a handful of long gaps in
+    either. What differs is how much traffic is in flight beside the compute:
+    under ``strided`` the GEMM, the attention and the sequence-parallel
+    all-to-all each run measurably faster (-1.5%, -0.7%, -0.5%) without any
+    kernel changing, which is the whole of the -0.5% end to end.
+
+    Returned sorted, and always exactly ``num_layers - resident_layers`` long.
+    """
+    if policy not in RESIDENCY_POLICIES:
+        raise ValueError(
+            f"unknown residency policy {policy!r}, expected one of {RESIDENCY_POLICIES}"
+        )
+    resident = min(max(0, resident_layers), num_layers)
+    streamed_count = num_layers - resident
+    if streamed_count <= 0:
+        return ()
+    if resident <= 0:
+        return tuple(range(num_layers))
+
+    if policy == RESIDENCY_POLICY_LEADING:
+        return tuple(range(resident, num_layers))
+
+    # The step num_layers / streamed_count is >= 1 here (resident > 0 was
+    # handled above), so round() of the ramp is strictly increasing and the
+    # indices cannot collide -- the partition is total by construction, which
+    # test_both_policies_partition_the_stack pins.
+    return tuple(
+        round(index * num_layers / streamed_count) for index in range(streamed_count)
+    )
 
 
 # Adapted from skywork AI Infra diffusion optimize
@@ -43,15 +104,26 @@ class LayerwiseOffloadManager:
         pin_cpu_memory: bool = True,
         prefetch_size: int = 1,
         resident_layers: int = 0,
+        residency_policy: str = RESIDENCY_POLICY_LEADING,
     ) -> None:
         self.model = model
         self.layers_attr_str = layers_attr_str
         self.num_layers = num_layers
         self.pin_cpu_memory = pin_cpu_memory
         self.prefetch_size = min(max(1, prefetch_size), self.num_layers)
-        # Leading layers held on GPU across denoise steps, instead of being
-        # re-streamed every step like the tail.
+        # Layers held on GPU across denoise steps, instead of being re-streamed
+        # every step. `residency_policy` picks *which* layers those are; see
+        # compute_streamed_layers for why the choice is not cosmetic.
         self.resident_layers = min(max(0, int(resident_layers)), self.num_layers)
+        self.residency_policy = residency_policy
+        self._streamed_order = compute_streamed_layers(
+            num_layers=self.num_layers,
+            resident_layers=self.resident_layers,
+            policy=residency_policy,
+        )
+        self._resident_set = frozenset(range(self.num_layers)) - set(
+            self._streamed_order
+        )
         # Armed on the first denoise forward, so that the load-time prefetch below
         # does not pin the whole resident set before the DiT is the active component.
         self._residency_active = False
@@ -257,35 +329,92 @@ class LayerwiseOffloadManager:
         if not self._has_dtensor_weights:
             self.model.to(self.device)
 
-        # prefetch the first layer for warm-up
+        # prefetch the head of the stream for warm-up; residency is not armed
+        # yet, so this is layer 0 regardless of policy
         self.prepare_for_next_req(non_blocking=False)
 
         self.register_forward_hooks()
         self._configured = True
-        logger.info(
-            f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, num resident layers: {self.resident_layers}, total num layers: {self.num_layers}"
+        logger.debug(
+            f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, num resident layers: {self.resident_layers}, total num layers: {self.num_layers}, residency policy: {self.residency_policy}"
         )
+        if self.residency_policy == RESIDENCY_POLICY_STRIDED and self._streamed_order:
+            # Printed because the layout is the whole point of the policy, and
+            # "did it actually stride?" is otherwise only answerable from a
+            # profile.
+            logger.debug(
+                "Strided residency streams layers %s (%d of %d)",
+                list(self._streamed_order),
+                len(self._streamed_order),
+                self.num_layers,
+            )
+
+    def _head_of_stream(self) -> list[int]:
+        """The first layers the coming forward will have to stream in.
+
+        Before residency is armed nothing is pinned, so the forward starts at
+        layer 0 like any other; afterwards the first streamed layer is whichever
+        the policy put first, which under `strided` is not necessarily layer 0.
+        """
+        count = min(self.prefetch_size, self.num_layers)
+        if not self._residency_active:
+            return list(range(count))
+        return self._next_streamed(after=-1, count=count)
 
     def prepare_for_next_req(self, non_blocking=True):
         """
         Prepare for the next round of denoising loop with prefetching the necessary layers
         """
-        num_prefetch_layers = max(self.prefetch_size, self._retained_layers)
-        for i in range(num_prefetch_layers):
-            self.prefetch_layer(i, non_blocking=non_blocking)
+        # The resident set first: it has to be there for the whole step, and the
+        # caller decides whether to block on it.
+        for layer_idx in sorted(self._retained_set):
+            self.prefetch_layer(layer_idx, non_blocking=non_blocking)
         if not non_blocking and self.copy_stream is not None:
             torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
+        # The head of the stream is issued after that wait, and always
+        # asynchronously. wait_stream drains the whole copy stream, so issuing
+        # it first would make the caller block on a layer it does not need yet:
+        # this runs from the layer-0 pre-hook on every denoise step, and under
+        # `leading` the first streamed layer is `resident_layers` away, one full
+        # transfer (~48 ms on the 50-layer H3 DiT) ahead of a layer 0 that is
+        # already pinned. The per-layer wait_event in the pre-hook blocks
+        # exactly when the weights are needed and no earlier.
+        for layer_idx in self._head_of_stream():
+            self.prefetch_layer(layer_idx, non_blocking=True)
+
     @property
     def holds_residents(self) -> bool:
-        """True if this manager keeps a resident leading-layer set beyond the
-        streaming prefetch window, so it must be denoise-stage-scoped."""
+        """True if this manager keeps a resident layer set beyond the streaming
+        prefetch window, so it must be denoise-stage-scoped."""
         return self.enabled and self.resident_layers > 0
 
     @property
     def _retained_layers(self) -> int:
-        """Leading layers currently held across denoise steps; 0 until armed."""
+        """How many layers are currently held across denoise steps; 0 until armed."""
         return self.resident_layers if self._residency_active else 0
+
+    @property
+    def _retained_set(self) -> frozenset[int]:
+        """Which layers are currently held across denoise steps; empty until armed."""
+        return self._resident_set if self._residency_active else frozenset()
+
+    def _next_streamed(self, *, after: int, count: int) -> List[int]:
+        """The next ``count`` streamed layers after ``after``, wrapping around.
+
+        Under ``leading`` this is just the following indices, but under
+        ``strided`` the immediate successor is usually resident, so prefetching
+        ``after + 1`` would be a no-op and the real next transfer would not
+        start until its own layer was already running.
+        """
+        total = len(self._streamed_order)
+        if total == 0:
+            return []
+        start = bisect.bisect_right(self._streamed_order, after)
+        return [
+            self._streamed_order[(start + offset) % total]
+            for offset in range(min(count, total))
+        ]
 
     @torch.compiler.disable
     def _activate_residency(self) -> None:
@@ -372,12 +501,12 @@ class LayerwiseOffloadManager:
         lightweight release layer weights
         Basically set the reference count to the gpu weight tensor to zero. The weights on cpu is untouched
 
-        Leading resident layers are kept across denoise steps
+        Resident layers are kept across denoise steps
         """
         if not self.enabled or self.device is None:
             return
 
-        if not force and layer_idx < self._retained_layers:
+        if not force and layer_idx in self._retained_set:
             return
 
         # clear prefetch event, since it's useless and needs to be reset
@@ -572,8 +701,22 @@ class LayerwiseOffloadManager:
                         self._prefetch_events[i]
                     )
 
+                if self.residency_policy == RESIDENCY_POLICY_STRIDED:
+                    # Top up the stream at every layer rather than in bursts of
+                    # prefetch_size. Under `strided` the next streamed layer can
+                    # be several layers away, so a burst schedule keyed on index
+                    # arithmetic would either skip it or issue it late; asking
+                    # for "the next N streamed layers" is the same request every
+                    # layer and prefetch_layer is idempotent, so the repeats are
+                    # free. This is what buys the wider hiding window: the
+                    # transfer is issued as soon as the previous streamed layer
+                    # is done with, not one layer before it is needed.
+                    for layer_to_prefetch in self._next_streamed(
+                        after=i, count=self.prefetch_size
+                    ):
+                        self.prefetch_layer(layer_to_prefetch, non_blocking=True)
                 # trigger batch prefetch (i + prefetch_size ~ i + 2 * prefetch_size) if needed
-                if i % self.prefetch_size == 0:
+                elif i % self.prefetch_size == 0:
                     for j in range(i + self.prefetch_size, i + 2 * self.prefetch_size):
                         layer_to_prefetch = j % self.num_layers
                         self.prefetch_layer(layer_to_prefetch, non_blocking=True)
@@ -654,18 +797,23 @@ class LayerwiseOffloadableModuleMixin:
                 pin_cpu_memory=server_args.pin_cpu_memory,
                 prefetch_size=prefetch_size,
                 resident_layers=resident_layers,
+                residency_policy=(
+                    server_args.dit_layerwise_residency_policy
+                    if dit_tuning_enabled
+                    else RESIDENCY_POLICY_LEADING
+                ),
             )
             self.layerwise_offload_managers.append(manager)
             configured_layer_names.append(layer_name)
 
         if configured_layer_names:
-            logger.info(
+            logger.debug(
                 "Enabled layerwise offload for %s on modules: %s",
                 self.__class__.__name__,
                 configured_layer_names,
             )
         else:
-            logger.info(
+            logger.debug(
                 "No layerwise-offloadable ModuleList found for %s. Candidates: %s",
                 self.__class__.__name__,
                 self.layer_names,
@@ -744,7 +892,7 @@ def is_layerwise_offloaded_module(module: torch.nn.Module) -> bool:
 
 
 def is_resident_layerwise_module(module: torch.nn.Module) -> bool:
-    """True if the module keeps leading DiT layers resident beyond the streaming
+    """True if the module keeps a resident DiT layer set beyond the streaming
     prefetch window.
     """
     return isinstance(module, LayerwiseOffloadableModuleMixin) and any(
@@ -779,7 +927,7 @@ def get_layerwise_offload_component_names_for_pipeline(
         return [
             component_name
             for component_name, module in modules.items()
-            if isinstance(module, LayerwiseOffloadableModuleMixin)
+            if isinstance(module, torch.nn.Module)
         ]
 
     explicit_component_names = selected_component_names - {LAYERWISE_OFFLOAD_DIT_GROUP}
@@ -791,10 +939,12 @@ def get_layerwise_offload_component_names_for_pipeline(
         ):
             selected_pipeline_component_names.append(component_name)
             continue
-        if (
-            select_dit_group
-            and isinstance(module, LayerwiseOffloadableModuleMixin)
-            and module.layerwise_offload_dit_group_enabled
+        if select_dit_group and (
+            is_dit_component_name(component_name)
+            or (
+                isinstance(module, LayerwiseOffloadableModuleMixin)
+                and module.layerwise_offload_dit_group_enabled
+            )
         ):
             selected_pipeline_component_names.append(component_name)
     return selected_pipeline_component_names
@@ -828,12 +978,42 @@ def configure_layerwise_offload_modules(
         selected_component_names is not None
         and LAYERWISE_OFFLOAD_ALL_COMPONENTS in selected_component_names
     )
-    selected_pipeline_component_names = (
-        get_layerwise_offload_component_names_for_pipeline(
-            modules,
-            normalized_component_names,
+    exact_layerwise_selectors = {
+        selector
+        for selector, mode in (server_args.component_residency or {}).items()
+        if mode == LAYERWISE_OFFLOAD and selector not in COMPONENT_RESIDENCY_GROUPS
+    }
+    if server_args.component_residency is not None:
+        selected_pipeline_component_names = [
+            component_name
+            for component_name, module in modules.items()
+            if server_args.residency_mode(component_name) == LAYERWISE_OFFLOAD
+            and (
+                isinstance(module, torch.nn.Module)
+                or component_name in exact_layerwise_selectors
+            )
+        ]
+    else:
+        selected_pipeline_component_names = (
+            get_layerwise_offload_component_names_for_pipeline(
+                modules,
+                normalized_component_names,
+            )
         )
-    )
+
+    if (
+        warn_missing
+        and server_args.component_residency is not None
+        and server_args.disagg_role == RoleType.MONOLITHIC
+    ):
+        missing_component_names = sorted(exact_layerwise_selectors - modules.keys())
+        if missing_component_names:
+            logger.warning(
+                "Layerwise offload components are not currently loaded: %s. "
+                "Available pipeline components: %s",
+                missing_component_names,
+                sorted(modules),
+            )
 
     if warn_missing and selected_component_names is not None and not select_all:
         explicit_component_names = selected_component_names - {
@@ -857,21 +1037,45 @@ def configure_layerwise_offload_modules(
                 sorted(modules),
             )
 
-        unsupported_component_names = [
+    unsupported_component_names = [
+        component_name
+        for component_name in selected_pipeline_component_names
+        if not isinstance(modules[component_name], LayerwiseOffloadableModuleMixin)
+    ]
+    explicit_unsupported_component_names = [
+        component_name
+        for component_name in unsupported_component_names
+        if (warn_missing and server_args.component_residency is None)
+        or server_args.is_explicit_layerwise_offload_component(component_name)
+    ]
+    if explicit_unsupported_component_names:
+        raise ComponentResidencyError(
+            "Components selected for layerwise-offload do not support it: "
+            f"{sorted(explicit_unsupported_component_names)}"
+        )
+    if unsupported_component_names:
+        for component_name in unsupported_component_names:
+            server_args.record_component_layerwise_capability(
+                component_name, supported=False
+            )
+        selected_pipeline_component_names = [
             component_name
             for component_name in selected_pipeline_component_names
-            if not isinstance(modules[component_name], LayerwiseOffloadableModuleMixin)
+            if component_name not in unsupported_component_names
         ]
-        if unsupported_component_names:
-            logger.warning(
-                "Layerwise offload components do not support layerwise offload: %s",
-                sorted(unsupported_component_names),
-            )
+        logger.warning(
+            "Auto layerwise selection skipped unsupported components; their "
+            "existing placement remains active: %s",
+            sorted(unsupported_component_names),
+        )
 
     for component_name in selected_pipeline_component_names:
         module = modules[component_name]
         if not isinstance(module, LayerwiseOffloadableModuleMixin):
             continue
+        server_args.record_component_layerwise_capability(
+            component_name, supported=True
+        )
         module_id = id(module)
         if module_id in configured_module_ids:
             # avoid duplicated configures on a same module
@@ -881,14 +1085,17 @@ def configure_layerwise_offload_modules(
 
         if not is_layerwise_offloaded_module(module):
             module.configure_layerwise_offload(server_args)
-        if is_layerwise_offloaded_module(module):
-            configured_component_names.append(component_name)
+        if not is_layerwise_offloaded_module(module):
+            raise ComponentResidencyError(
+                f"Component {component_name!r} did not enable layerwise offload"
+            )
+        configured_component_names.append(component_name)
 
     if configured_component_names:
         logger.info(
             "Enabled layerwise offload for pipeline components: %s",
             configured_component_names,
         )
-    else:
-        logger.info("No pipeline component supports layerwise offload.")
+    elif warn_missing:
+        logger.debug("No selected pipeline component enabled layerwise offload")
     return configured_component_names
