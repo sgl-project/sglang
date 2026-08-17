@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import attention_backends, get_parallel
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -65,7 +65,10 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
-    if support_triton(get_exec().kernel.attention_backend):
+    # This writer's one caller is `alloc_for_extend`, so the prefill half
+    # decides; the fallback below pays several `.item()` syncs per request.
+    prefill_backend, _ = attention_backends()
+    if support_triton(prefill_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             dtype=torch.uint64,
@@ -106,8 +109,11 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    attn_backend = get_exec().kernel.attention_backend
-    uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
+    prefill_backend, decode_backend = attention_backends()
+    uses_triton_dispatch = prefill_backend not in (
+        "ascend",
+        "torch_native",
+    ) and decode_backend not in ("ascend", "torch_native")
 
     if _is_hip and uses_triton_dispatch:
         # HIP-only: the legacy get_last_loc_triton kernel emits a
