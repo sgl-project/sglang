@@ -32,7 +32,7 @@ def draft_is_deepseek_v4(*, server_args: ServerArgs) -> bool:
         draft_model_path,
         trust_remote_code=server_args.trust_remote_code,
         revision=server_args.speculative_draft_model_revision,
-        model_override_args=json.loads(server_args.json_model_override_args),
+        model_override_args=json.loads(server_args.get_draft_model_override_args()),
         model_config_parser=server_args.model_config_parser,
     )
     return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
@@ -133,7 +133,7 @@ def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
         server_args.speculative_draft_model_path,
         trust_remote_code=server_args.trust_remote_code,
         revision=server_args.speculative_draft_model_revision,
-        model_override_args=json.loads(server_args.json_model_override_args),
+        model_override_args=json.loads(server_args.get_draft_model_override_args()),
     )
     return parse_dspark_draft_config(draft_hf_config=draft_hf_config).resolve_gamma(
         default=None

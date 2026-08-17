@@ -11,6 +11,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _draft_config_kwargs(server_args: ServerArgs) -> dict:
+    kwargs = {
+        "model_override_args": json.loads(server_args.get_draft_model_override_args())
+    }
+    override_config_file = server_args.decrypted_draft_config_file
+    if override_config_file and override_config_file.strip():
+        kwargs["_configuration_file"] = override_config_file.strip()
+    return kwargs
+
+
 def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
     if server_args.device != "cpu" or server_args.disable_overlap_schedule:
         return
@@ -89,11 +99,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             "select the non-overlap (synchronous) path."
         )
 
-    kwargs = {}
-
-    override_config_file = server_args.decrypted_draft_config_file
-    if override_config_file and override_config_file.strip():
-        kwargs["_configuration_file"] = override_config_file.strip()
+    kwargs = _draft_config_kwargs(server_args)
 
     server_args.speculative_algorithm = _resolve_speculative_algorithm_alias(
         server_args.speculative_algorithm,
@@ -214,7 +220,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             parse_dflash_draft_config,
         )
 
-        model_override_args = json.loads(server_args.json_model_override_args)
+        model_override_args = json.loads(server_args.get_draft_model_override_args())
         inferred_block_size = None
         try:
             from sglang.srt.utils.hf_transformers_utils import get_config
@@ -487,7 +493,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             server_args.speculative_draft_model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.speculative_draft_model_revision,
-            model_override_args=json.loads(server_args.json_model_override_args),
+            model_override_args=json.loads(server_args.get_draft_model_override_args()),
         )
         draft_text_config = (
             getattr(draft_hf_config, "text_config", None) or draft_hf_config

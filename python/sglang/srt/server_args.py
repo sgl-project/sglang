@@ -2094,6 +2094,13 @@ class ServerArgs:
         "The specific draft model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.",
         NS("spec"),
     ] = None
+    speculative_draft_model_override_args: A[
+        Optional[str],
+        "A dictionary in JSON string format used to override the speculative "
+        "draft model configuration. When unset, the draft inherits "
+        "--json-model-override-args for backward compatibility.",
+        NS("spec"),
+    ] = None
     speculative_draft_load_format: A[
         Optional[str],
         Arg(
@@ -3595,6 +3602,13 @@ class ServerArgs:
         "The path of the JSON configuration file for msProbe. If specified, enables msProbe dump.",
         NS("observability"),
     ] = None
+
+    def get_draft_model_override_args(self) -> str:
+        return (
+            self.speculative_draft_model_override_args
+            if self.speculative_draft_model_override_args is not None
+            else self.json_model_override_args
+        )
 
     def __post_init__(self):
         self._run_resolution_pipeline()
